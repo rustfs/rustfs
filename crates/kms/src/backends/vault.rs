@@ -147,28 +147,29 @@ impl VaultKmsClient {
         let key_material = match self.decrypt_key_material(&key_data.encrypted_key_material).await {
             Ok(km) => km,
             Err(e) => {
-                warn!(key_id, error = %e, "Vault KMS key material decrypt failed; regenerating");
-                let new_key_material = generate_key_material(&key_data.algorithm)?;
-                key_data.encrypted_key_material = self.encrypt_key_material(&new_key_material).await?;
-                // Store the updated key data back to Vault
-                self.store_key_data(key_id, &key_data).await?;
-                return Ok(new_key_material);
+                // Never regenerate/overwrite the master key on a decrypt failure: that would
+                // destroy the original material and make every DEK wrapped by this key
+                // permanently undecryptable. Surface the error so the read fails recoverably
+                // instead of causing silent data loss.
+                warn!(key_id, error = %e, "Vault KMS key material could not be decoded");
+                return Err(KmsError::cryptographic_error(
+                    "decrypt",
+                    format!("Stored key material for {key_id} is corrupted: {e}"),
+                ));
             }
         };
 
-        // Validate key material length (should be 32 bytes for AES-256)
+        // Validate key material length (should be 32 bytes for AES-256).
         if key_material.len() != 32 {
-            // Try to fix: generate new key material if length is wrong
-            warn!(
-                "Key {} has invalid key material length ({} bytes), generating new key material",
-                key_id,
-                key_material.len()
-            );
-            let new_key_material = generate_key_material(&key_data.algorithm)?;
-            key_data.encrypted_key_material = self.encrypt_key_material(&new_key_material).await?;
-            // Store the updated key data back to Vault
-            self.store_key_data(key_id, &key_data).await?;
-            return Ok(new_key_material);
+            // As above: do not overwrite the stored key. Report the fault instead.
+            warn!(key_id, len = key_material.len(), "Vault KMS key material has invalid length");
+            return Err(KmsError::cryptographic_error(
+                "decrypt",
+                format!(
+                    "Stored key material for {key_id} has invalid length ({} bytes, expected 32)",
+                    key_material.len()
+                ),
+            ));
         }
 
         Ok(key_material)
@@ -812,6 +813,11 @@ impl KmsBackend for VaultKmsBackend {
         key_metadata.key_state = KeyState::Enabled;
         key_metadata.deletion_date = None;
 
+        // Persist the reset state back to Vault. Without this the key stays PendingDeletion in
+        // storage and would still be reaped, so we must fail the request if the write fails
+        // rather than report a false success.
+        self.update_key_metadata_in_storage(key_id, &key_metadata).await?;
+
         Ok(CancelKeyDeletionResponse {
             key_id: key_id.clone(),
             key_metadata,
@@ -876,5 +882,95 @@ mod tests {
 
         // Test health check
         client.health_check().await.expect("Health check failed");
+    }
+
+    fn integration_vault_config() -> VaultConfig {
+        VaultConfig {
+            address: "http://127.0.0.1:8200".to_string(),
+            auth_method: VaultAuthMethod::Token {
+                token: "dev-only-token".to_string(),
+            },
+            kv_mount: "secret".to_string(),
+            key_path_prefix: "rustfs/kms/keys".to_string(),
+            mount_path: "transit".to_string(),
+            namespace: None,
+            tls: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance (dev mode)
+    async fn test_corrupted_key_material_does_not_regenerate() {
+        // Regression: get_key_material previously "self-healed" a decrypt/length failure by
+        // minting a fresh random master key and overwriting the stored value — destroying the
+        // original key and making every DEK wrapped by it permanently undecryptable.
+        let client = VaultKmsClient::new(integration_vault_config()).await.expect("client");
+
+        let key_id = format!("corrupt-{}", uuid::Uuid::new_v4());
+        client.create_key(&key_id, "AES_256", None).await.expect("create");
+
+        // Corrupt the stored material to an invalid base64 string.
+        let mut key_data = client.get_key_data(&key_id).await.expect("read");
+        key_data.encrypted_key_material = "!!!not-base64!!!".to_string();
+        client.store_key_data(&key_id, &key_data).await.expect("store corrupt");
+
+        // Reading the material must now ERROR, not silently regenerate + overwrite.
+        assert!(
+            client.get_key_material(&key_id).await.is_err(),
+            "corrupted key material must yield an error, not a fresh key"
+        );
+
+        // And the stored (corrupted) material must be UNCHANGED.
+        let after = client.get_key_data(&key_id).await.expect("reread");
+        assert_eq!(
+            after.encrypted_key_material, "!!!not-base64!!!",
+            "get_key_material must not overwrite stored master key material on failure"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance (dev mode)
+    async fn test_vault_cancel_key_deletion_persists_state() {
+        use crate::config::{BackendConfig, KmsConfig};
+        use crate::types::{CancelKeyDeletionRequest, CreateKeyRequest, DeleteKeyRequest, KeyStatus, KeyUsage};
+
+        let kms_config = KmsConfig {
+            backend_config: BackendConfig::VaultKv2(Box::new(integration_vault_config())),
+            ..Default::default()
+        };
+        let backend = VaultKmsBackend::new(kms_config).await.expect("backend");
+
+        let key_id = format!("cancel-persist-{}", uuid::Uuid::new_v4());
+        backend
+            .create_key(CreateKeyRequest {
+                key_name: Some(key_id.clone()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                ..Default::default()
+            })
+            .await
+            .expect("create");
+
+        backend
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                pending_window_in_days: Some(7),
+                force_immediate: Some(false),
+            })
+            .await
+            .expect("schedule delete");
+
+        backend
+            .cancel_key_deletion(CancelKeyDeletionRequest { key_id: key_id.clone() })
+            .await
+            .expect("cancel");
+
+        // Re-read the PERSISTED state from Vault. Before the fix, storage still held
+        // PendingDeletion because cancel only mutated the response, never wrote back.
+        let persisted = backend.client.get_key_data(&key_id).await.expect("reread");
+        assert_eq!(
+            persisted.status,
+            KeyStatus::Active,
+            "cancel_key_deletion must persist Active status to Vault, not only mutate the response"
+        );
     }
 }

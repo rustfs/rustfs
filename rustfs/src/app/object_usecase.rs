@@ -2017,7 +2017,7 @@ async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> O
         return None;
     };
 
-    let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
+    let obj_opts = lifecycle::object_opts_from_object_info(obj_info);
     let event = predict_lifecycle_expiration(&lifecycle_config, &obj_opts).await;
     debug!(
         bucket,
@@ -4234,6 +4234,22 @@ impl DefaultObjectUsecase {
             } => (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string())),
         };
 
+        // Normalize the copy-source version id like GET/HEAD do: trim, treat "null" as the
+        // nil UUID, and reject malformed ids up front (issue #4238).
+        let version_id = match version_id {
+            Some(v) => {
+                let trimmed = v.trim();
+                if trimmed.eq_ignore_ascii_case("null") {
+                    Some(Uuid::nil().to_string())
+                } else if Uuid::parse_str(trimmed).is_ok() {
+                    Some(trimmed.to_string())
+                } else {
+                    return Err(s3_error!(InvalidArgument, "Invalid version id specified in copy source"));
+                }
+            }
+            None => None,
+        };
+
         if let Some(ref sc) = storage_class
             && !is_valid_storage_class(sc.as_str())
         {
@@ -4246,10 +4262,12 @@ impl DefaultObjectUsecase {
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         // AWS S3 allows self-copy when metadata directive is REPLACE (used to update metadata in-place),
-        // or when an explicit storage class change is requested.
-        // Reject only when neither condition applies.
+        // when an explicit storage class change is requested, or when restoring a specific historical
+        // version onto the current key (source carries a versionId). Reject only a true no-op self-copy
+        // where none of these apply (issue #4238).
         if metadata_directive.as_ref().map(|d| d.as_str()) != Some(MetadataDirective::REPLACE)
             && storage_class.is_none()
+            && version_id.is_none()
             && src_bucket == bucket
             && src_key == key
         {
@@ -7992,6 +8010,71 @@ mod tests {
         // The call fails at store init (no store in unit tests), not at validation.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_ne!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_allows_self_copy_of_historical_version() {
+        // Restoring a specific historical version onto the current key (same bucket/key with a
+        // source versionId, default COPY directive) must pass the self-copy guard (issue #4238).
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "test-bucket".into(),
+                key: "test-key".into(),
+                version_id: Some("11111111-1111-1111-1111-111111111111".into()),
+            })
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        // Must not be rejected by the self-copy guard; it fails later at store init instead.
+        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_allows_self_copy_of_null_version() {
+        // A "null" source version id is a restore of the null version, not a no-op self-copy.
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "test-bucket".into(),
+                key: "test-key".into(),
+                version_id: Some("null".into()),
+            })
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn execute_copy_object_rejects_malformed_copy_source_version_id() {
+        // A malformed (non-null, non-UUID) source version id is rejected up front.
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: "src-bucket".into(),
+                key: "src-key".into(),
+                version_id: Some("not-a-uuid".into()),
+            })
+            .bucket("dst-bucket".to_string())
+            .key("dst-key".to_string())
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
     #[tokio::test]

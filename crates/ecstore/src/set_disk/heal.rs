@@ -666,8 +666,10 @@ impl SetDisks {
             ..Default::default()
         };
 
-        result.before.drives = vec![HealDriveInfo::default(); disks.len()];
-        result.after.drives = vec![HealDriveInfo::default(); disks.len()];
+        // Filled below by pushing one entry per disk while zipping the (index-aligned) `errs`.
+        // Pre-filling here would double the reported drive list once the push loop runs.
+        result.before.drives = Vec::with_capacity(disks.len());
+        result.after.drives = Vec::with_capacity(disks.len());
 
         let errs = stat_all_dirs(&disks, bucket, object).await;
         let dangling_object = is_object_dir_dangling(&errs);

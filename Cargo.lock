@@ -9050,6 +9050,7 @@ dependencies = [
  "rustfs-filemeta",
  "rustfs-io-metrics",
  "rustfs-kms",
+ "rustfs-lifecycle",
  "rustfs-lock",
  "rustfs-madmin",
  "rustfs-object-capacity",
@@ -9335,6 +9336,25 @@ dependencies = [
  "uuid",
  "vaultrs",
  "zeroize",
+]
+
+[[package]]
+name = "rustfs-lifecycle"
+version = "1.0.0-beta.8"
+dependencies = [
+ "async-trait",
+ "rustfs-common",
+ "rustfs-config",
+ "rustfs-replication",
+ "rustfs-storage-api",
+ "s3s",
+ "serial_test",
+ "temp-env",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]

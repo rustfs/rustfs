@@ -26,6 +26,7 @@ use google_cloud_auth::credentials::Credentials;
 use google_cloud_auth::credentials::user_account::Builder;
 use google_cloud_storage as gcs;
 use google_cloud_storage::client::Storage;
+use google_cloud_storage::client::StorageControl;
 use std::convert::TryFrom;
 
 use crate::client::{
@@ -46,6 +47,7 @@ const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
 pub struct WarmBackendGCS {
     pub client: Arc<Storage>,
+    pub control: Arc<StorageControl>,
     pub bucket: String,
     pub prefix: String,
     pub storage_class: String,
@@ -70,15 +72,22 @@ impl WarmBackendGCS {
 
         let Ok(client) = Storage::builder()
             .with_endpoint(conf.endpoint.clone())
-            .with_credentials(credentials)
+            .with_credentials(credentials.clone())
             .build()
             .await
         else {
             return Err(std::io::Error::other("Storage::builder error"));
         };
         let client = Arc::new(client);
+        // Control-plane client: the data-plane `Storage` client cannot delete or list objects;
+        // delete_object/list_objects live on StorageControl.
+        let Ok(control) = StorageControl::builder().with_credentials(credentials).build().await else {
+            return Err(std::io::Error::other("StorageControl::builder error"));
+        };
+        let control = Arc::new(control);
         Ok(Self {
             client,
+            control,
             bucket: conf.bucket.clone(),
             prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
             storage_class: "".to_string(),
@@ -125,7 +134,23 @@ impl WarmBackend for WarmBackendGCS {
     }
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        let Ok(mut reader) = self.client.read_object(&self.bucket, &self.get_dest(object)).send().await else {
+        let mut req = self.client.read_object(&self.bucket, &self.get_dest(object));
+
+        // Honor the requested byte range so Range GETs on tiered objects return the exact
+        // interval instead of the whole object (matches the s3/s3sdk/rustfs warm backends).
+        if opts.start_offset >= 0 && opts.length > 0 {
+            let offset: u64 = opts
+                .start_offset
+                .try_into()
+                .map_err(|_| std::io::Error::other("invalid range: negative start_offset"))?;
+            let count: u64 = opts
+                .length
+                .try_into()
+                .map_err(|_| std::io::Error::other("invalid range: negative length"))?;
+            req = req.set_read_range(google_cloud_storage::model_ext::ReadRange::segment(offset, count));
+        }
+
+        let Ok(mut reader) = req.send().await else {
             return Err(std::io::Error::other("read_object error"));
         };
         let mut contents = Vec::new();
@@ -136,23 +161,33 @@ impl WarmBackend for WarmBackendGCS {
     }
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
-        /*self.client
-        .delete_object()
-        .set_bucket(&self.bucket)
-        .set_object(&self.get_dest(object))
-        //.set_generation(object.generation)
-        .send()
-        .await?;*/
+        // gRPC v2 DeleteObject requires the bucket in resource-name form. Without this the
+        // deleted tiered object was never removed from GCS (empty impl returned Ok), leaking
+        // remote data forever.
+        self.control
+            .delete_object()
+            .set_bucket(format!("projects/_/buckets/{}", self.bucket))
+            .set_object(self.get_dest(object))
+            .send()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
 
     async fn in_use(&self) -> Result<bool, std::io::Error> {
-        /*let result = self.client
-            .list_objects_v2(&self.bucket, &self.prefix, "", "", SLASH_SEPARATOR, 1)
-            .await?;
+        // Scope the listing to this tier's prefix (matching the other warm backends) and only
+        // need to know whether a single object exists.
+        let resp = self
+            .control
+            .list_objects()
+            .set_parent(format!("projects/_/buckets/{}", self.bucket))
+            .set_prefix(self.prefix.clone())
+            .set_page_size(1)
+            .send()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        Ok(result.common_prefixes.len() > 0 || result.contents.len() > 0)*/
-        Ok(false)
+        Ok(!resp.objects.is_empty())
     }
 }
 
