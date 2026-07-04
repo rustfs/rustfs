@@ -18,7 +18,7 @@ use crate::bucket::object_lock::objectlock_sys::{self, ObjectLockBlockReason};
 use crate::object_api::ObjectInfo;
 
 pub(crate) fn is_object_locked_by_metadata(user_defined: &HashMap<String, String>, is_delete_marker: bool) -> bool {
-    objectlock_sys::is_object_locked_by_metadata(user_defined, is_delete_marker)
+    rustfs_lifecycle::object_lock::is_object_locked_by_metadata(user_defined, is_delete_marker)
 }
 
 pub(crate) async fn check_object_lock_for_deletion(
