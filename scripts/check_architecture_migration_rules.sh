@@ -89,6 +89,7 @@ require_source_contains "docs/architecture/ecstore-module-split-plan.md" "Runtim
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaIndependence" "ECStore split plan replication crate filemeta independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateStorageApiIndependence" "ECStore split plan replication crate storage-api independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateUtilsIndependence" "ECStore split plan replication crate utils independence section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "LifecycleCrateCoreIndependence" "ECStore split plan lifecycle crate core independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "StorageApiReplicationContracts" "ECStore split plan storage-api replication contract section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Facade Group Inventory" "ECStore facade inventory group section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## External Consumer Boundaries" "ECStore facade inventory consumer boundary section"
@@ -143,6 +144,7 @@ LIFECYCLE_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_tagging_bounda
 LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_object_lock_boundary_bypass_hits.txt"
 LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_sink_bypass_hits.txt"
 LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_crate_bypass_hits.txt"
+LIFECYCLE_CRATE_CORE_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_crate_core_bypass_hits.txt"
 ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_replication_contract_bypass_hits.txt"
 STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/storage_api_replication_contract_bypass_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
@@ -863,9 +865,9 @@ if [[ -s "$STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE" ]]; then
 fi
 
 require_source_line \
-  "crates/ecstore/src/bucket/lifecycle/core.rs" \
-  "pub use crate::storage_api_contracts::lifecycle::ExpirationOptions;" \
-  "ECStore ExpirationOptions compatibility re-export"
+  "crates/lifecycle/src/core.rs" \
+  "pub use rustfs_storage_api::ExpirationOptions;" \
+  "rustfs-lifecycle ExpirationOptions storage-api re-export"
 require_source_line \
   "crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs" \
   "pub use crate::storage_api_contracts::lifecycle::TransitionedObject;" \
@@ -967,6 +969,24 @@ fi
 
 if [[ -s "$LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE" ]]; then
   report_failure "lifecycle replication status/state contracts must stay behind lifecycle replication_sink: $(paste -sd '; ' "$LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE")"
+fi
+
+if [[ -d "${ROOT_DIR}/crates/lifecycle" ]]; then
+  (
+    cd "$ROOT_DIR"
+    {
+      rg -n --with-filename 'rustfs_ecstore::|use\s+rustfs_ecstore\b|rustfs_filemeta::|use\s+rustfs_filemeta\b|rustfs_utils::|use\s+rustfs_utils\b' \
+        crates/lifecycle/Cargo.toml crates/lifecycle/src \
+        --glob '*.rs' || true
+      rg -n --with-filename 'crate::bucket::|crate::object_api|crate::storage_api_contracts' \
+        crates/lifecycle/src \
+        --glob '*.rs' || true
+    }
+  ) >"$LIFECYCLE_CRATE_CORE_BYPASS_HITS_FILE"
+
+  if [[ -s "$LIFECYCLE_CRATE_CORE_BYPASS_HITS_FILE" ]]; then
+    report_failure "rustfs-lifecycle core contracts must not import ECStore/filemeta/utils internals: $(paste -sd '; ' "$LIFECYCLE_CRATE_CORE_BYPASS_HITS_FILE")"
+  fi
 fi
 
 (

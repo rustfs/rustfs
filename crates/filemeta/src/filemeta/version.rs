@@ -2044,13 +2044,11 @@ impl MetaObject {
         }
 
         for (k, v) in &self.meta_sys {
-            let lower_k = k.to_lowercase();
-
-            if has_internal_suffix(&lower_k, SUFFIX_TIER_FV_ID) || has_internal_suffix(&lower_k, SUFFIX_TIER_FV_MARKER) {
+            if has_internal_suffix(k, SUFFIX_TIER_FV_ID) || has_internal_suffix(k, SUFFIX_TIER_FV_MARKER) {
                 continue;
             }
 
-            if lower_k == AMZ_STORAGE_CLASS.to_lowercase() && v == b"STANDARD" {
+            if k.eq_ignore_ascii_case(AMZ_STORAGE_CLASS) && v == b"STANDARD" {
                 continue;
             }
 

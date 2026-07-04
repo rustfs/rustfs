@@ -374,6 +374,9 @@ pub(crate) mod bucket {
             #[cfg(test)]
             pub(crate) const TRANSITION_PENDING: &str =
                 crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::TRANSITION_PENDING;
+            pub(crate) fn object_opts_from_object_info(obj_info: &crate::storage::storage_api::StorageObjectInfo) -> ObjectOpts {
+                crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::object_opts_from_object_info(obj_info)
+            }
             pub(crate) fn expected_expiry_time(mod_time: time::OffsetDateTime, days: i32) -> time::OffsetDateTime {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::expected_expiry_time(mod_time, days)
             }
