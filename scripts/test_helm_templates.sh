@@ -36,6 +36,33 @@ render_distributed_statefulset() {
     '
 }
 
+render_distributed_configmap() {
+  helm template rustfs "$CHART_DIR" \
+    --namespace rustfs \
+    --set secret.rustfs.access_key=test-access-key \
+    --set secret.rustfs.secret_key=test-secret-key \
+    "$@" |
+    awk '
+      /^# Source: rustfs\/templates\/configmap.yaml$/ { in_configmap = 1 }
+      in_configmap && /^---$/ { exit }
+      in_configmap { print }
+    '
+}
+
+render_server_cert() {
+  helm template rustfs "$CHART_DIR" \
+    --namespace rustfs \
+    --set secret.rustfs.access_key=test-access-key \
+    --set secret.rustfs.secret_key=test-secret-key \
+    --set mtls.enabled=true \
+    "$@" |
+    awk '
+      /^# Source: rustfs\/templates\/cert-manager-mtls\/04-server-cert.yaml$/ { in_cert = 1 }
+      in_cert && /^---$/ { exit }
+      in_cert { print }
+    '
+}
+
 recreate_output=$(render_standalone_deployment --set mode.standalone.strategy.type=Recreate)
 grep -q "type: Recreate" <<<"$recreate_output"
 if grep -q "rollingUpdate:" <<<"$recreate_output"; then
@@ -225,3 +252,47 @@ assert_extra_volumes_wired "$distributed_extra_output" "distributed StatefulSet"
 # Empty extraVolumes must not inject ca-bundle into distributed StatefulSet volumes.
 distributed_default_output=$(render_distributed_statefulset)
 assert_extra_volumes_absent "$distributed_default_output" "distributed StatefulSet"
+
+# clusterDomain (issue #3857): a custom Kubernetes cluster domain must flow into
+# the RUSTFS_VOLUMES FQDN and mTLS server cert SANs, defaulting to cluster.local.
+volumes_default=$(render_distributed_configmap | grep 'RUSTFS_VOLUMES:')
+if ! grep -q 'svc\.cluster\.local' <<<"$volumes_default"; then
+  echo "Default RUSTFS_VOLUMES must use svc.cluster.local" >&2
+  exit 1
+fi
+
+volumes_custom=$(render_distributed_configmap --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:')
+if ! grep -q 'svc\.cluster\.internal' <<<"$volumes_custom"; then
+  echo "Custom clusterDomain must appear in the RUSTFS_VOLUMES FQDN" >&2
+  exit 1
+fi
+if grep -q 'cluster\.local' <<<"$volumes_custom"; then
+  echo "Custom clusterDomain must fully replace cluster.local in RUSTFS_VOLUMES" >&2
+  exit 1
+fi
+
+# An explicit config.rustfs.volumes stays authoritative regardless of clusterDomain.
+volumes_explicit=$(render_distributed_configmap \
+  --set config.rustfs.volumes=http://example.test/data \
+  --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:')
+if ! grep -q 'RUSTFS_VOLUMES: "http://example.test/data"' <<<"$volumes_explicit"; then
+  echo "Explicit config.rustfs.volumes must remain authoritative regardless of clusterDomain" >&2
+  exit 1
+fi
+
+# mTLS server certificate SANs must honor clusterDomain too.
+cert_default=$(render_server_cert)
+if ! grep -q 'svc\.cluster\.local"' <<<"$cert_default"; then
+  echo "Default mTLS server cert SANs must use svc.cluster.local" >&2
+  exit 1
+fi
+
+cert_custom=$(render_server_cert --set clusterDomain=cluster.internal)
+if ! grep -q 'svc\.cluster\.internal"' <<<"$cert_custom"; then
+  echo "Custom clusterDomain must appear in mTLS server cert SANs" >&2
+  exit 1
+fi
+if grep -q 'svc\.cluster\.local"' <<<"$cert_custom"; then
+  echo "Custom clusterDomain must fully replace cluster.local in mTLS server cert SANs" >&2
+  exit 1
+fi
