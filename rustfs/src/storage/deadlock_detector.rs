@@ -562,11 +562,11 @@ impl DeadlockDetector {
 
         if let Some(neighbors) = graph.get(&node) {
             for neighbor in neighbors {
-                if path_set.contains(neighbor) {
-                    if let Some(cycle_start) = path.iter().position(|n| *n == *neighbor) {
-                        path.drain(0..cycle_start);
-                        return true;
-                    }
+                if path_set.contains(neighbor)
+                    && let Some(cycle_start) = path.iter().position(|n| *n == *neighbor)
+                {
+                    path.drain(0..cycle_start);
+                    return true;
                 }
                 if !visited.contains(neighbor) && Self::dfs_find_cycle(neighbor, graph, visited, path, path_set) {
                     return true;
