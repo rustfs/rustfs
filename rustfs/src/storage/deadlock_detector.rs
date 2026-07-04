@@ -58,9 +58,10 @@
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
@@ -340,13 +341,13 @@ impl DeadlockDetector {
             running.store(false, Ordering::Relaxed);
         });
 
-        *self.detector_task.lock().unwrap() = Some(handle);
+        *self.detector_task.lock() = Some(handle);
     }
 
     /// Stop the detection task.
     pub fn stop(&self) {
         let _ = self.shutdown_tx.send(());
-        if let Some(handle) = self.detector_task.lock().unwrap().take() {
+        if let Some(handle) = self.detector_task.lock().take() {
             // Don't await the handle as we're in a non-async context
             handle.abort();
         }
@@ -362,7 +363,7 @@ impl DeadlockDetector {
         let request_id = request_id.into();
         let tracker = RequestResourceTracker::new(request_id.clone(), description);
 
-        self.requests.write().unwrap().insert(request_id.clone(), tracker);
+        self.requests.write().insert(request_id.clone(), tracker);
 
         debug!(request_id = %request_id, "Request registered for deadlock tracking");
     }
@@ -373,7 +374,7 @@ impl DeadlockDetector {
             return;
         }
 
-        self.requests.write().unwrap().remove(request_id);
+        self.requests.write().remove(request_id);
 
         debug!(request_id = %request_id, "Request unregistered from deadlock tracking");
     }
@@ -384,7 +385,7 @@ impl DeadlockDetector {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.held_locks.push(lock);
         }
     }
@@ -395,7 +396,7 @@ impl DeadlockDetector {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.held_locks.retain(|l| &l.id != lock_id);
         }
     }
@@ -406,7 +407,7 @@ impl DeadlockDetector {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.waiting_lock = Some(lock);
         }
     }
@@ -417,7 +418,7 @@ impl DeadlockDetector {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.waiting_lock = None;
         }
     }
@@ -428,14 +429,14 @@ impl DeadlockDetector {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.resources.insert(resource_type, amount);
         }
     }
 
     /// Get current number of tracked requests.
     pub fn tracked_count(&self) -> usize {
-        self.requests.read().unwrap().len()
+        self.requests.read().len()
     }
 
     /// Get total deadlocks detected.
@@ -449,12 +450,14 @@ impl DeadlockDetector {
         policy: &DeadlockMonitorPolicy,
         deadlocks_detected: &Arc<AtomicU64>,
     ) {
-        let requests_guard = requests.read().unwrap();
+        let hung_request_snapshot: Vec<_> = requests
+            .read()
+            .values()
+            .filter(|r| r.is_hung(policy.hang_threshold))
+            .cloned()
+            .collect();
 
-        // Find hung requests
-        let hung_requests: Vec<_> = requests_guard.values().filter(|r| r.is_hung(policy.hang_threshold)).collect();
-
-        if hung_requests.is_empty() {
+        if hung_request_snapshot.is_empty() {
             return;
         }
 
@@ -462,10 +465,10 @@ impl DeadlockDetector {
         // Edge: request A -> request B means A is waiting for a lock that B holds
         let mut wait_graph: Vec<WaitGraphEdge> = Vec::new();
 
-        for waiting in &hung_requests {
+        for waiting in &hung_request_snapshot {
             if let Some(waiting_for) = &waiting.waiting_lock {
                 // Find who holds this lock
-                for holding in &hung_requests {
+                for holding in &hung_request_snapshot {
                     if holding.request_id == waiting.request_id {
                         continue;
                     }
@@ -490,13 +493,13 @@ impl DeadlockDetector {
             error!(
                 cycle = ?cycle,
                 wait_graph = ?wait_graph,
-                hung_requests_count = hung_requests.len(),
+                hung_requests_count = hung_request_snapshot.len(),
                 "Deadlock detected: circular lock wait chain found"
             );
 
             // Log each request in the cycle
             for request_id in &cycle {
-                if let Some(tracker) = requests_guard.get(request_id) {
+                if let Some(tracker) = hung_request_snapshot.iter().find(|tracker| &tracker.request_id == request_id) {
                     warn!(
                         request_id = %request_id,
                         description = %tracker.description,
@@ -510,7 +513,7 @@ impl DeadlockDetector {
         } else {
             // No cycle, but log hung requests for diagnosis
             debug!(
-                hung_requests_count = hung_requests.len(),
+                hung_requests_count = hung_request_snapshot.len(),
                 wait_graph_edges = wait_graph.len(),
                 "Hung requests detected but no deadlock cycle"
             );
@@ -560,10 +563,10 @@ impl DeadlockDetector {
         if let Some(neighbors) = graph.get(&node) {
             for neighbor in neighbors {
                 if path_set.contains(neighbor) {
-                    // Found cycle - trim path to just the cycle
-                    let cycle_start = path.iter().position(|n| *n == *neighbor).unwrap();
-                    path.drain(0..cycle_start);
-                    return true;
+                    if let Some(cycle_start) = path.iter().position(|n| *n == *neighbor) {
+                        path.drain(0..cycle_start);
+                        return true;
+                    }
                 }
                 if !visited.contains(neighbor) && Self::dfs_find_cycle(neighbor, graph, visited, path, path_set) {
                     return true;
