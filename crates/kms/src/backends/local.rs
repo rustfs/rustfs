@@ -524,9 +524,10 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Active;
 
-        // For simplicity, we'll regenerate key material
-        // In a real implementation, we'd preserve the original key material
-        let key_material = generate_key_material(&master_key.algorithm)?;
+        // Preserve the existing key material. Regenerating it on a pure status change would
+        // destroy the original master key and make every DEK ever wrapped by it permanently
+        // undecryptable (silent data loss).
+        let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -543,7 +544,9 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Disabled;
 
-        let key_material = generate_key_material(&master_key.algorithm)?;
+        // Preserve the existing key material (see enable_key): a status change must never
+        // regenerate the master key, or every DEK wrapped by it becomes undecryptable.
+        let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -565,7 +568,10 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::PendingDeletion;
 
-        let key_material = generate_key_material(&master_key.algorithm)?;
+        // Preserve the existing key material (see enable_key): scheduling deletion must not
+        // regenerate the master key, or cancelling the deletion later would recover a key that
+        // can no longer decrypt existing data.
+        let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -582,7 +588,9 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Active;
 
-        let key_material = generate_key_material(&master_key.algorithm)?;
+        // Preserve the existing key material (see enable_key): cancelling deletion must recover
+        // the ORIGINAL key, not mint a new one that cannot decrypt existing data.
+        let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -1018,6 +1026,41 @@ mod tests {
 
         let decrypted = client.decrypt(&decrypt_request, None).await.expect("Failed to decrypt");
         assert_eq!(decrypted, data_key.plaintext.clone().expect("No plaintext"));
+    }
+
+    #[tokio::test]
+    async fn key_state_transitions_preserve_master_key_material() {
+        // Regression: enable/disable/schedule_deletion/cancel_deletion previously regenerated the
+        // master key material on a pure status change, permanently destroying the ability to
+        // decrypt any DEK wrapped by that key. A status cycle must preserve the material.
+        let (client, _temp_dir) = create_test_client().await;
+
+        let key_id = "state-cycle-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create");
+
+        let request = GenerateKeyRequest::new(key_id.to_string(), "AES_256".to_string())
+            .with_context("bucket".to_string(), "b".to_string());
+        let data_key = client.generate_data_key(&request, None).await.expect("generate data key");
+        let ciphertext = data_key.ciphertext.clone();
+        let plaintext = data_key.plaintext.clone().expect("no plaintext");
+
+        // Cycle through every status-changing method the fix touches.
+        client.disable_key(key_id, None).await.expect("disable");
+        client.enable_key(key_id, None).await.expect("enable");
+        client
+            .schedule_key_deletion(key_id, 7, None)
+            .await
+            .expect("schedule deletion");
+        client.cancel_key_deletion(key_id, None).await.expect("cancel deletion");
+
+        // Pre-fix, each of those regenerated the master key, so this unwrap fails with an AEAD
+        // error. Post-fix, the original material is preserved and the DEK still decrypts.
+        let decrypt_request = DecryptRequest::new(ciphertext).with_context("bucket".to_string(), "b".to_string());
+        let decrypted = client
+            .decrypt(&decrypt_request, None)
+            .await
+            .expect("DEK must still decrypt after status transitions");
+        assert_eq!(decrypted, plaintext, "master key material must survive status transitions");
     }
 
     #[tokio::test]

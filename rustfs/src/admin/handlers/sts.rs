@@ -54,6 +54,27 @@ const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "AssumeRoleWithWebIdentity";
 const ASSUME_ROLE_VERSION: &str = "2011-06-15";
 
+/// Default STS temporary credential lifetime (seconds) when the client omits DurationSeconds.
+const STS_DEFAULT_DURATION_SECS: usize = 3600;
+/// Minimum STS temporary credential lifetime (seconds), matching AWS/MinIO (15 minutes).
+const STS_MIN_DURATION_SECS: usize = 900;
+/// Maximum STS temporary credential lifetime (seconds), matching AWS/MinIO AssumeRole (12 hours).
+const STS_MAX_DURATION_SECS: usize = 43200;
+
+/// Clamp the client-supplied DurationSeconds into the allowed STS window.
+///
+/// A value of 0 (unset) falls back to the default; any other value is clamped into
+/// `[STS_MIN_DURATION_SECS, STS_MAX_DURATION_SECS]`. This prevents callers from minting
+/// near-permanent temporary credentials and keeps the standard AssumeRole path consistent
+/// with the AssumeRoleWithWebIdentity path.
+fn clamp_assume_role_duration(duration_seconds: usize) -> usize {
+    if duration_seconds == 0 {
+        STS_DEFAULT_DURATION_SECS
+    } else {
+        duration_seconds.clamp(STS_MIN_DURATION_SECS, STS_MAX_DURATION_SECS)
+    }
+}
+
 fn has_identity_authorization_context(policies: &[String], groups: &[String]) -> bool {
     !policies.is_empty() || !groups.is_empty()
 }
@@ -216,17 +237,13 @@ async fn handle_assume_role(
 
     populate_session_policy(&mut claims, &body.policy)?;
 
-    let exp = {
-        if body.duration_seconds > 0 {
-            body.duration_seconds
-        } else {
-            3600
-        }
-    };
+    let exp = clamp_assume_role_duration(body.duration_seconds);
 
     claims.insert(
         "exp".to_string(),
-        Value::Number(serde_json::Number::from(OffsetDateTime::now_utc().unix_timestamp() + exp as i64)),
+        Value::Number(serde_json::Number::from(
+            OffsetDateTime::now_utc().unix_timestamp().saturating_add(exp as i64),
+        )),
     );
 
     claims.insert("parent".to_string(), Value::String(cred.access_key.clone()));
@@ -541,6 +558,24 @@ mod tests {
         assert_eq!(clamp(3600), 3600); // normal
         assert_eq!(clamp(43200), 43200); // exact max
         assert_eq!(clamp(999999), 43200); // clamped to max
+    }
+
+    #[test]
+    fn test_assume_role_duration_is_clamped_to_max() {
+        // Regression: the standard AssumeRole path previously used the raw client-supplied
+        // DurationSeconds with no upper bound, allowing near-permanent temporary credentials.
+        let ten_years_secs: usize = 315_360_000;
+        assert_eq!(clamp_assume_role_duration(ten_years_secs), STS_MAX_DURATION_SECS);
+        assert_eq!(STS_MAX_DURATION_SECS, 43200);
+        assert_eq!(clamp_assume_role_duration(0), STS_DEFAULT_DURATION_SECS);
+        assert_eq!(clamp_assume_role_duration(60), STS_MIN_DURATION_SECS);
+        assert_eq!(clamp_assume_role_duration(3600), 3600);
+        assert_eq!(clamp_assume_role_duration(43200), 43200);
+
+        // The exp timestamp derived from a huge duration must not exceed now + 12h.
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let exp = now.saturating_add(clamp_assume_role_duration(ten_years_secs) as i64);
+        assert!(exp - now <= STS_MAX_DURATION_SECS as i64);
     }
 
     #[test]

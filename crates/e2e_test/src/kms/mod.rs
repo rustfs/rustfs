@@ -47,3 +47,6 @@ mod bucket_default_encryption_test;
 
 #[cfg(test)]
 mod encryption_metadata_test;
+
+#[cfg(test)]
+mod copy_object_version_restore_sse_test;
