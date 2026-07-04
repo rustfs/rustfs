@@ -255,13 +255,13 @@ assert_extra_volumes_absent "$distributed_default_output" "distributed StatefulS
 
 # clusterDomain (issue #3857): a custom Kubernetes cluster domain must flow into
 # the RUSTFS_VOLUMES FQDN and mTLS server cert SANs, defaulting to cluster.local.
-volumes_default=$(render_distributed_configmap | grep 'RUSTFS_VOLUMES:')
+volumes_default=$(render_distributed_configmap | grep 'RUSTFS_VOLUMES:' || true)
 if ! grep -q 'svc\.cluster\.local' <<<"$volumes_default"; then
   echo "Default RUSTFS_VOLUMES must use svc.cluster.local" >&2
   exit 1
 fi
 
-volumes_custom=$(render_distributed_configmap --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:')
+volumes_custom=$(render_distributed_configmap --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:' || true)
 if ! grep -q 'svc\.cluster\.internal' <<<"$volumes_custom"; then
   echo "Custom clusterDomain must appear in the RUSTFS_VOLUMES FQDN" >&2
   exit 1
@@ -274,9 +274,16 @@ fi
 # An explicit config.rustfs.volumes stays authoritative regardless of clusterDomain.
 volumes_explicit=$(render_distributed_configmap \
   --set config.rustfs.volumes=http://example.test/data \
-  --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:')
+  --set clusterDomain=cluster.internal | grep 'RUSTFS_VOLUMES:' || true)
 if ! grep -q 'RUSTFS_VOLUMES: "http://example.test/data"' <<<"$volumes_explicit"; then
   echo "Explicit config.rustfs.volumes must remain authoritative regardless of clusterDomain" >&2
+  exit 1
+fi
+
+# A dot-only clusterDomain must fall back to cluster.local instead of an empty domain.
+volumes_dots=$(render_distributed_configmap --set clusterDomain=. | grep 'RUSTFS_VOLUMES:' || true)
+if ! grep -q 'svc\.cluster\.local' <<<"$volumes_dots"; then
+  echo "Dot-only clusterDomain must fall back to cluster.local in RUSTFS_VOLUMES" >&2
   exit 1
 fi
 

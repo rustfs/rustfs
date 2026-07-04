@@ -161,10 +161,11 @@ Merges (in order of increasing precedence):
 
 {{/*
 Resolve the Kubernetes cluster DNS domain (defaults to cluster.local).
-Trims any leading/trailing dots so callers can safely append it after `svc.`.
+Trims any leading/trailing dots so callers can safely append it after `svc.`,
+falling back to cluster.local when the value is empty or only dots.
 */}}
 {{- define "rustfs.clusterDomain" -}}
-{{- .Values.clusterDomain | default "cluster.local" | trimPrefix "." | trimSuffix "." -}}
+{{- .Values.clusterDomain | default "cluster.local" | trimAll "." | default "cluster.local" -}}
 {{- end -}}
 
 {{/*
