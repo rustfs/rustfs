@@ -1031,11 +1031,12 @@ mod tests {
 
         // len = 8 -> payload_len = 4 (< 16). Provide exactly 4 payload bytes.
         let len: usize = 8;
-        let mut input = Vec::new();
-        input.push(0x00); // typ (regular block)
-        input.push((len & 0xFF) as u8);
-        input.push(((len >> 8) & 0xFF) as u8);
-        input.push(((len >> 16) & 0xFF) as u8);
+        let mut input = vec![
+            0x00u8, // typ (regular block)
+            (len & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            ((len >> 16) & 0xFF) as u8,
+        ];
         input.extend_from_slice(&[0u8; 4]); // crc (unused before the panic site)
         input.extend_from_slice(&[0x01u8, 0x02, 0x03, 0x04]); // 4-byte payload
 

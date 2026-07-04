@@ -500,11 +500,12 @@ mod tests {
     #[tokio::test]
     async fn test_decompress_reader_short_block_no_panic() {
         let len: usize = 3;
-        let mut input = Vec::new();
-        input.push(COMPRESS_TYPE_COMPRESSED);
-        input.push((len & 0xFF) as u8);
-        input.push(((len >> 8) & 0xFF) as u8);
-        input.push(((len >> 16) & 0xFF) as u8);
+        let mut input = vec![
+            COMPRESS_TYPE_COMPRESSED,
+            (len & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            ((len >> 16) & 0xFF) as u8,
+        ];
         input.extend_from_slice(&[0u8; 4]); // bogus CRC
         // Body: a uvarint claiming uncompressed length = 127, followed by 2 bytes that are not
         // a valid compressed stream — post-fix this must surface as a clean InvalidData error.
@@ -522,11 +523,12 @@ mod tests {
     #[tokio::test]
     async fn test_decompress_reader_unterminated_length_prefix_is_rejected() {
         let len: usize = 3;
-        let mut input = Vec::new();
-        input.push(COMPRESS_TYPE_COMPRESSED);
-        input.push((len & 0xFF) as u8);
-        input.push(((len >> 8) & 0xFF) as u8);
-        input.push(((len >> 16) & 0xFF) as u8);
+        let mut input = vec![
+            COMPRESS_TYPE_COMPRESSED,
+            (len & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            ((len >> 16) & 0xFF) as u8,
+        ];
         input.extend_from_slice(&[0u8; 4]); // bogus CRC
         input.extend_from_slice(&[0x80, 0x80, 0x80]); // 3 continuation bytes, no terminator
 
