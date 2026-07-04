@@ -154,17 +154,11 @@ fn ensure_rpc_decommission_local_leader(store: &ECStore, idx: usize) -> StorageR
     Ok(())
 }
 
-#[path = "bucket.rs"]
 mod bucket;
-#[path = "disk.rs"]
 mod disk;
-#[path = "event.rs"]
 mod event;
-#[path = "health.rs"]
 mod health;
-#[path = "lock.rs"]
 mod lock;
-#[path = "metrics.rs"]
 mod metrics;
 
 pub struct NodeService {

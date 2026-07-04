@@ -18,13 +18,11 @@ use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-#[path = "endpoint_index_test/storage_api.rs"]
 mod storage_api;
 
 use storage_api::endpoint_index::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks};
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_endpoint_index_settings() -> anyhow::Result<()> {
+async fn test_endpoint_index_settings() -> rustfs_heal::Result<()> {
     let temp_dir = TempDir::new()?;
 
     // create test disk paths

@@ -967,7 +967,7 @@ async fn test_namespace_lock_distributed_write_lock_fails_with_two_nodes_one_off
 }
 
 #[tokio::test]
-async fn test_namespace_lock_distributed_remote_rpc_failures_are_hard_quorum_failures() {
+async fn test_namespace_lock_distributed_remote_rpc_failures_retry_before_final_quorum_failure() {
     let manager = Arc::new(GlobalLockManager::new());
     let client_ok: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
     let client_rpc_failed: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
@@ -987,16 +987,16 @@ async fn test_namespace_lock_distributed_remote_rpc_failures_are_hard_quorum_fai
     let err = lock
         .get_write_lock(resource, "owner-a", Duration::from_secs(1))
         .await
-        .expect_err("write lock should fail as soon as remote RPC failures make quorum impossible");
+        .expect_err("persistent remote RPC failures should end as quorum failure");
 
     assert!(
-        started.elapsed() < Duration::from_millis(150),
-        "remote RPC failures should not retry until the full acquire timeout"
+        started.elapsed() >= Duration::from_millis(250),
+        "remote RPC failures should be retried before final quorum failure"
     );
     let err_str = err.to_string().to_lowercase();
     assert!(
         err_str.contains("quorum") || err_str.contains("not reached"),
-        "expected hard quorum failure, got: {err}"
+        "expected final quorum failure, got: {err}"
     );
 }
 
@@ -1191,7 +1191,7 @@ async fn test_namespace_lock_distributed_read_lock_returns_after_quorum_without_
 }
 
 #[tokio::test]
-async fn test_namespace_lock_distributed_failure_returns_early_and_cleans_up_late_successes() {
+async fn test_namespace_lock_distributed_failure_retries_and_cleans_up_late_successes() {
     let manager_fast = Arc::new(GlobalLockManager::new());
     let manager_slow = Arc::new(GlobalLockManager::new());
 
@@ -1216,8 +1216,8 @@ async fn test_namespace_lock_distributed_failure_returns_early_and_cleans_up_lat
         .expect_err("write lock should fail when quorum becomes impossible");
 
     assert!(
-        started.elapsed() < Duration::from_millis(150),
-        "write lock should fail as soon as quorum becomes impossible"
+        started.elapsed() >= Duration::from_millis(250),
+        "write lock should retry before final quorum failure"
     );
     let err_str = err.to_string().to_lowercase();
     assert!(

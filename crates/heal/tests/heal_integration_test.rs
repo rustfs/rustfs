@@ -30,7 +30,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use walkdir::WalkDir;
 
-#[path = "heal_integration_test/storage_api.rs"]
 mod storage_api;
 
 use storage_api::integration::{
