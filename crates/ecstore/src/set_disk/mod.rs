@@ -968,6 +968,65 @@ struct GetCodecStreamingGate {
     prefer_data_blocks_first_reader_setup: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetDirectMemoryDecision {
+    Use,
+    Fallback(GetDirectMemoryFallbackReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetDirectMemoryFallbackReason {
+    Disabled,
+    ThresholdZero,
+    Range,
+    PartNumber,
+    VersionId,
+    Versioned,
+    VersionSuspended,
+    InclFreeVersions,
+    SkipFreeVersion,
+    DataMovement,
+    RawDataMovementRead,
+    DeleteMarker,
+    MetadataOnly,
+    VersionOnly,
+    Encrypted,
+    Compressed,
+    Remote,
+    ObjectInfoMultipart,
+    FileInfoMultipart,
+    InvalidSize,
+    AboveThreshold,
+}
+
+impl GetDirectMemoryFallbackReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::ThresholdZero => "threshold_zero",
+            Self::Range => "range",
+            Self::PartNumber => "part_number",
+            Self::VersionId => "version_id",
+            Self::Versioned => "versioned",
+            Self::VersionSuspended => "version_suspended",
+            Self::InclFreeVersions => "incl_free_versions",
+            Self::SkipFreeVersion => "skip_free_version",
+            Self::DataMovement => "data_movement",
+            Self::RawDataMovementRead => "raw_data_movement_read",
+            Self::DeleteMarker => "delete_marker",
+            Self::MetadataOnly => "metadata_only",
+            Self::VersionOnly => "version_only",
+            Self::Encrypted => "encrypted",
+            Self::Compressed => "compressed",
+            Self::Remote => "remote",
+            Self::ObjectInfoMultipart => "object_info_multipart",
+            Self::FileInfoMultipart => "file_info_multipart",
+            Self::InvalidSize => "invalid_size",
+            Self::AboveThreshold => "above_threshold",
+        }
+    }
+}
+
 fn record_get_codec_streaming_gate_decision(
     object_class: GetCodecStreamingObjectClass,
     decision: GetCodecStreamingDecision,
@@ -985,6 +1044,23 @@ fn record_get_codec_streaming_gate_decision(
     let object_class = object_class.as_str();
     rustfs_io_metrics::record_get_object_codec_streaming_decision(outcome, object_class, reason);
     rustfs_io_metrics::record_get_object_codec_streaming_decision_by_size(outcome, object_class, reason, size_bucket);
+}
+
+fn record_get_direct_memory_decision(
+    object_class: GetCodecStreamingObjectClass,
+    decision: GetDirectMemoryDecision,
+    size_bucket: &'static str,
+) {
+    let (outcome, reason) = match decision {
+        GetDirectMemoryDecision::Use => (
+            crate::diagnostics::get::GET_DIRECT_MEMORY_DECISION_USE,
+            crate::diagnostics::get::GET_DIRECT_MEMORY_REASON_NONE,
+        ),
+        GetDirectMemoryDecision::Fallback(reason) => {
+            (crate::diagnostics::get::GET_DIRECT_MEMORY_DECISION_FALLBACK, reason.as_str())
+        }
+    };
+    rustfs_io_metrics::record_get_object_direct_memory_decision(outcome, object_class.as_str(), reason, size_bucket);
 }
 
 fn record_get_object_reader_path_observation(
@@ -1026,50 +1102,105 @@ fn is_get_small_object_direct_memory_eligible_with_threshold(
     opts: &ObjectOptions,
     threshold: usize,
 ) -> bool {
-    if threshold == 0
-        || range.is_some()
-        || opts.part_number.is_some()
-        || opts.version_id.is_some()
-        || opts.versioned
-        || opts.version_suspended
-        || opts.incl_free_versions
-        || opts.skip_free_version
-        || opts.data_movement
-        || opts.raw_data_movement_read
-        || object_info.delete_marker
-        || object_info.metadata_only
-        || object_info.version_only
-        || object_info.is_encrypted()
-        || object_info.is_compressed()
-        || object_info.is_remote()
-        || object_info.parts.len() != 1
-        || fi.parts.len() != 1
-        || fi.size <= 0
-    {
-        return false;
-    }
-
-    let Ok(object_size) = usize::try_from(fi.size) else {
-        return false;
-    };
-
-    object_size <= threshold
+    matches!(
+        get_small_object_direct_memory_decision_with_threshold(range, object_info, fi, opts, true, threshold),
+        GetDirectMemoryDecision::Use
+    )
 }
 
-fn is_get_small_object_direct_memory_eligible(
+fn get_small_object_direct_memory_decision_with_threshold(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     opts: &ObjectOptions,
-) -> bool {
-    is_get_small_object_direct_memory_enabled()
-        && is_get_small_object_direct_memory_eligible_with_threshold(
-            range,
-            object_info,
-            fi,
-            opts,
-            get_small_object_direct_memory_threshold(),
-        )
+    enabled: bool,
+    threshold: usize,
+) -> GetDirectMemoryDecision {
+    if !enabled {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Disabled);
+    }
+    if threshold == 0 {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::ThresholdZero);
+    }
+    if range.is_some() {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Range);
+    }
+    if opts.part_number.is_some() {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::PartNumber);
+    }
+    if opts.version_id.is_some() {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionId);
+    }
+    if opts.versioned {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Versioned);
+    }
+    if opts.version_suspended {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionSuspended);
+    }
+    if opts.incl_free_versions {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InclFreeVersions);
+    }
+    if opts.skip_free_version {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::SkipFreeVersion);
+    }
+    if opts.data_movement {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::DataMovement);
+    }
+    if opts.raw_data_movement_read {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::RawDataMovementRead);
+    }
+    if object_info.delete_marker {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::DeleteMarker);
+    }
+    if object_info.metadata_only {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::MetadataOnly);
+    }
+    if object_info.version_only {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::VersionOnly);
+    }
+    if object_info.is_encrypted() {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Encrypted);
+    }
+    if object_info.is_compressed() {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Compressed);
+    }
+    if object_info.is_remote() {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Remote);
+    }
+    if object_info.parts.len() != 1 {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::ObjectInfoMultipart);
+    }
+    if fi.parts.len() != 1 {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::FileInfoMultipart);
+    }
+
+    let Ok(object_size) = usize::try_from(fi.size) else {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InvalidSize);
+    };
+    if object_size == 0 {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InvalidSize);
+    }
+    if object_size > threshold {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::AboveThreshold);
+    }
+
+    GetDirectMemoryDecision::Use
+}
+
+fn get_small_object_direct_memory_decision(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+) -> GetDirectMemoryDecision {
+    get_small_object_direct_memory_decision_with_threshold(
+        range,
+        object_info,
+        fi,
+        opts,
+        is_get_small_object_direct_memory_enabled(),
+        get_small_object_direct_memory_threshold(),
+    )
 }
 
 fn should_prefer_codec_streaming_data_blocks_first_reader_setup(
@@ -1779,6 +1910,15 @@ fn should_use_single_block_non_inline_fast_path(is_inline_buffer: bool, object_s
     !is_inline_buffer && object_fits_single_block(object_size, block_size)
 }
 
+fn should_use_inline_fast_path(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+) -> bool {
+    object_info.is_inline_fast_path_eligible() && fi.data.is_some() && range.is_none() && opts.part_number.is_none()
+}
+
 enum SmallWritePath {
     Inline,
     SingleBlockNonInline,
@@ -2156,8 +2296,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         // Inline data fast path: skip duplex pipe for small inline objects.
         // Uses the shared predicate from ObjectInfo; additionally checks that
-        // inline data is actually present and no range request is in flight.
-        if object_info.is_inline_fast_path_eligible() && fi.data.is_some() && range.is_none() {
+        // inline data is actually present and neither range nor partNumber is
+        // in flight.
+        if should_use_inline_fast_path(&range, &object_info, &fi, opts) {
             let mut inline_prepare_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let data_shards = fi.erasure.data_blocks;
 
@@ -2372,7 +2513,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
-        if is_get_small_object_direct_memory_eligible(&range, &object_info, &fi, opts) {
+        let direct_memory_decision = get_small_object_direct_memory_decision(&range, &object_info, &fi, opts);
+        record_get_direct_memory_decision(object_class, direct_memory_decision, size_bucket);
+        if matches!(direct_memory_decision, GetDirectMemoryDecision::Use) {
             let object_size = usize::try_from(object_info.size)
                 .map_err(|_| to_object_err(Error::other("direct-memory GET object size is invalid"), vec![bucket, object]))?;
             if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo(
@@ -9592,6 +9735,110 @@ mod tests {
             &opts,
             128 * 1024
         ));
+    }
+
+    #[test]
+    fn inline_fast_path_rejects_part_number_requests() {
+        let (mut object_info, mut fi, opts) = direct_memory_test_metadata(1024);
+        object_info.inlined = true;
+        fi.data = Some(Bytes::from(vec![0; 1024]));
+
+        assert!(should_use_inline_fast_path(&None, &object_info, &fi, &opts));
+
+        let mut part_opts = opts;
+        part_opts.part_number = Some(1);
+        assert!(!should_use_inline_fast_path(&None, &object_info, &fi, &part_opts));
+    }
+
+    #[test]
+    fn small_object_direct_memory_decision_reports_bounded_reasons() {
+        let (object_info, fi, opts) = direct_memory_test_metadata(1024);
+
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, false, 128 * 1024),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Disabled)
+        );
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 0),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::ThresholdZero)
+        );
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(
+                &Some(HTTPRangeSpec {
+                    start: 0,
+                    end: 10,
+                    is_suffix_length: false,
+                }),
+                &object_info,
+                &fi,
+                &opts,
+                true,
+                128 * 1024
+            ),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Range)
+        );
+
+        let mut versioned_opts = opts.clone();
+        versioned_opts.versioned = true;
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &versioned_opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Versioned)
+        );
+
+        let mut encrypted = object_info.clone();
+        Arc::make_mut(&mut encrypted.user_defined).insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &encrypted, &fi, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Encrypted)
+        );
+
+        let mut remote = object_info.clone();
+        remote.transitioned_object.status = TRANSITION_COMPLETE.to_string();
+        remote.transitioned_object.tier = "remote-tier".to_string();
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &remote, &fi, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Remote)
+        );
+
+        let mut multipart = object_info.clone();
+        multipart.parts = Arc::new(vec![ObjectPartInfo::default(), ObjectPartInfo::default()]);
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &multipart, &fi, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::ObjectInfoMultipart)
+        );
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 512),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::AboveThreshold)
+        );
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Use
+        );
+    }
+
+    #[test]
+    fn direct_memory_fallback_metric_labels_are_stable() {
+        assert_eq!(GetDirectMemoryFallbackReason::Disabled.as_str(), "disabled");
+        assert_eq!(GetDirectMemoryFallbackReason::ThresholdZero.as_str(), "threshold_zero");
+        assert_eq!(GetDirectMemoryFallbackReason::Range.as_str(), "range");
+        assert_eq!(GetDirectMemoryFallbackReason::PartNumber.as_str(), "part_number");
+        assert_eq!(GetDirectMemoryFallbackReason::VersionId.as_str(), "version_id");
+        assert_eq!(GetDirectMemoryFallbackReason::Versioned.as_str(), "versioned");
+        assert_eq!(GetDirectMemoryFallbackReason::VersionSuspended.as_str(), "version_suspended");
+        assert_eq!(GetDirectMemoryFallbackReason::InclFreeVersions.as_str(), "incl_free_versions");
+        assert_eq!(GetDirectMemoryFallbackReason::SkipFreeVersion.as_str(), "skip_free_version");
+        assert_eq!(GetDirectMemoryFallbackReason::DataMovement.as_str(), "data_movement");
+        assert_eq!(GetDirectMemoryFallbackReason::RawDataMovementRead.as_str(), "raw_data_movement_read");
+        assert_eq!(GetDirectMemoryFallbackReason::DeleteMarker.as_str(), "delete_marker");
+        assert_eq!(GetDirectMemoryFallbackReason::MetadataOnly.as_str(), "metadata_only");
+        assert_eq!(GetDirectMemoryFallbackReason::VersionOnly.as_str(), "version_only");
+        assert_eq!(GetDirectMemoryFallbackReason::Encrypted.as_str(), "encrypted");
+        assert_eq!(GetDirectMemoryFallbackReason::Compressed.as_str(), "compressed");
+        assert_eq!(GetDirectMemoryFallbackReason::Remote.as_str(), "remote");
+        assert_eq!(GetDirectMemoryFallbackReason::ObjectInfoMultipart.as_str(), "object_info_multipart");
+        assert_eq!(GetDirectMemoryFallbackReason::FileInfoMultipart.as_str(), "file_info_multipart");
+        assert_eq!(GetDirectMemoryFallbackReason::InvalidSize.as_str(), "invalid_size");
+        assert_eq!(GetDirectMemoryFallbackReason::AboveThreshold.as_str(), "above_threshold");
     }
 
     #[test]

@@ -724,6 +724,34 @@ pub fn record_get_object_direct_memory_subpath(subpath: &'static str, object_cla
     .increment(1);
 }
 
+/// Record the direct-memory GetObject path decision and bounded fallback reason.
+#[inline(always)]
+pub fn record_get_object_direct_memory_decision(
+    outcome: &'static str,
+    object_class: &'static str,
+    reason: &'static str,
+    size_bucket: &'static str,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_direct_memory_decision_total",
+        "outcome" => outcome,
+        "object_class" => object_class,
+        "reason" => reason
+    )
+    .increment(1);
+    counter!(
+        "rustfs_io_get_object_direct_memory_decision_by_size_total",
+        "outcome" => outcome,
+        "object_class" => object_class,
+        "reason" => reason,
+        "size_bucket" => size_bucket
+    )
+    .increment(1);
+}
+
 /// Record why the codec streaming reader was not selected.
 #[inline(always)]
 pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {

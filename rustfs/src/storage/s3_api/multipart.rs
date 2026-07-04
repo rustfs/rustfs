@@ -19,7 +19,7 @@ use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, Multip
 use s3s::{S3Error, S3ErrorCode};
 
 const MAX_MULTIPART_UPLOADS_LIST: i32 = 1000;
-const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
+pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ListPartsParams {
