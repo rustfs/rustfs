@@ -131,6 +131,10 @@ Current coupling:
   `rustfs-replication`; ECStore converts storage-api delete DTOs at the
   replication storage boundary instead of `rustfs-replication` importing
   `rustfs-storage-api`;
+- `ReplicationCrateUtilsIndependence`: HTTP metadata keys, S3 header labels,
+  ETag trimming, and case-insensitive prefix matching used by replication wire
+  contracts are owned inside `rustfs-replication` instead of importing
+  `rustfs-utils`;
 - direct ECStore replication imports from `rustfs-replication` are limited to
   `*_boundary.rs` modules;
 - storage-api delete replication status/state helpers use the local
@@ -188,6 +192,10 @@ Required contracts before crate movement:
   replication delete/queue/operation helpers are owned in
   `crates/replication/src/storage_api.rs`, and `rustfs-replication` must not
   import or depend on `rustfs-storage-api`.
+- `ReplicationCrateUtilsIndependence`: replication-specific HTTP metadata,
+  header, ETag, and prefix helper contracts are owned in
+  `crates/replication/src/http.rs`, and `rustfs-replication` must not import or
+  depend on `rustfs-utils`.
 - `EcstoreReplicationBoundaryImports`: ECStore-side imports from
   `rustfs-replication` are concentrated in replication `*_boundary.rs` modules.
 - `RuntimeReplicationFacadeConsumers`: scanner, admin, storage-owner, and app

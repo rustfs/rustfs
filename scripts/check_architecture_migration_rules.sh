@@ -88,6 +88,7 @@ require_source_contains "docs/architecture/ecstore-module-split-plan.md" "Ecstor
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "RuntimeReplicationFacadeConsumers" "ECStore split plan runtime replication facade consumer section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaIndependence" "ECStore split plan replication crate filemeta independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateStorageApiIndependence" "ECStore split plan replication crate storage-api independence section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateUtilsIndependence" "ECStore split plan replication crate utils independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "StorageApiReplicationContracts" "ECStore split plan storage-api replication contract section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Facade Group Inventory" "ECStore facade inventory group section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## External Consumer Boundaries" "ECStore facade inventory consumer boundary section"
@@ -213,6 +214,7 @@ RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_replication_facade
 RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE="${TMP_DIR}/runtime_replication_dependency_bypass_hits.txt"
 REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_filemeta_bypass_hits.txt"
 REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_storage_api_bypass_hits.txt"
+REPLICATION_CRATE_UTILS_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_utils_bypass_hits.txt"
 REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_config_rule_contract_backslide_hits.txt"
 REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_delete_worker_contract_backslide_hits.txt"
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
@@ -2685,6 +2687,18 @@ fi
 
 if [[ -s "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE" ]]; then
   report_failure "replication crate delete DTO contracts must not import or depend on rustfs-storage-api: $(paste -sd '; ' "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_utils::|use\s+rustfs_utils\b|^rustfs-utils\b' \
+    crates/replication/src \
+    --glob '*.rs' \
+    crates/replication/Cargo.toml || true
+) >"$REPLICATION_CRATE_UTILS_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_CRATE_UTILS_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication crate HTTP/helper contracts must not import or depend on rustfs-utils: $(paste -sd '; ' "$REPLICATION_CRATE_UTILS_BYPASS_HITS_FILE")"
 fi
 
 (

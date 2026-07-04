@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use rustfs_utils::http::{SUFFIX_ACTUAL_SIZE, get_str};
+use crate::http::{SUFFIX_ACTUAL_SIZE, get_internal_metadata};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationMultipartPartInput {
@@ -106,7 +106,7 @@ pub fn replication_multipart_part_plan(
 }
 
 pub fn replication_multipart_complete_actual_size(user_defined: &HashMap<String, String>) -> String {
-    get_str(user_defined, SUFFIX_ACTUAL_SIZE).unwrap_or_default()
+    get_internal_metadata(user_defined, SUFFIX_ACTUAL_SIZE).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -115,7 +115,7 @@ mod tests {
         ReplicationMultipartPartInput, ReplicationMultipartPartPlan, ReplicationMultipartPlanError, ReplicationMultipartRange,
         replication_multipart_complete_actual_size, replication_multipart_part_plan,
     };
-    use rustfs_utils::http::{SUFFIX_ACTUAL_SIZE, insert_str};
+    use crate::http::{SUFFIX_ACTUAL_SIZE, insert_internal_metadata};
     use std::collections::HashMap;
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn multipart_complete_actual_size_reads_compatible_metadata() {
         let mut user_defined = HashMap::new();
-        insert_str(&mut user_defined, SUFFIX_ACTUAL_SIZE, "123".to_string());
+        insert_internal_metadata(&mut user_defined, SUFFIX_ACTUAL_SIZE, "123".to_string());
 
         assert_eq!(replication_multipart_complete_actual_size(&user_defined), "123");
         assert!(replication_multipart_complete_actual_size(&HashMap::new()).is_empty());
