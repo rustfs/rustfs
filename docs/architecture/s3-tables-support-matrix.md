@@ -86,14 +86,15 @@ catalog extension.
 | Snapshot expiration planning | Supported | Produces expiration plans with retained and candidate snapshots. |
 | Snapshot expiration commit | Preview / controlled | Can manually commit safe snapshot expiration through the catalog. Stale plans fail closed. |
 | Manifest/data/delete reachability cleanup | Supported | Reads manifest-list and manifest Avro references, reports reachable objects, and deletes only unreferenced table objects that pass the safety window. |
-| Maintenance worker run endpoint | Preview / controlled | Supports run-once execution, current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates. |
-| Maintenance scheduler guardrails | Preview / controlled | Exposes disabled, paused, ready, active-job backpressure, retry deferral, quarantine boundary, recommended actions, and recent maintenance job audit timeline state for external schedulers and operators. |
+| Maintenance scheduler run endpoint | Preview / controlled | Lets an external scheduler durably queue one maintenance job per table, reuse an active queued job, and recover expired queued leases before requeuing. |
+| Maintenance worker run endpoint | Preview / controlled | Supports queued-job claim, run-once execution, current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates. |
+| Maintenance scheduler guardrails | Preview / controlled | Exposes disabled, paused, ready, queued-job handoff, active-job backpressure, retry deferral, quarantine boundary, recommended actions, and recent maintenance job audit timeline state for external schedulers and operators. |
 | Maintenance audit events | Preview / controlled | Job reports and scheduler job summaries include structured audit events for planning, worker transitions, heartbeats, lease expiry recovery, and mutating quarantine operations. |
 | Maintenance quarantine operations | Preview / controlled | Lets operators inspect, release, retry, or abandon the current quarantined maintenance job without moving the table pointer. |
 | Compaction planning | Preview / controlled | Plans partition-local and sort-order-local binpack candidates for Parquet files and does not mix data files from different partition directories or sort orders in one rewrite group. |
 | Delete-file or row-level compaction planning | Preview / controlled | Manifests with position or equality delete files produce machine-readable row-level planning and force the compaction report into manual review before any rewrite can run. |
 | Compaction commit | Preview / controlled | Can commit a safe partition-local Parquet rewrite through the catalog while preserving Iceberg data file sort order IDs in the rewritten manifest. |
-| Built-in periodic scheduler | Not claimed | Operators can trigger worker runs, but continuous in-process scheduling is not claimed. |
+| Built-in periodic scheduler | Not claimed | Operators can trigger scheduler and worker ticks, but continuous in-process scheduling is not claimed. |
 | Delete-file or row-level compaction execution | Not claimed | RustFS does not rewrite delete files or execute row-level compaction; those cases remain manual-review maintenance items. |
 
 ## Recovery And Strong Backing Matrix
@@ -162,7 +163,7 @@ RustFS does not currently claim:
 - full MinIO AIStor Tables private extension parity
 - full Cloudflare R2 Data Catalog interoperability
 - full Alibaba OSS Tables interoperability
-- built-in periodic maintenance scheduling; external schedulers can inspect scheduler guardrails, but RustFS does not claim a continuous in-process scheduler
+- built-in periodic maintenance scheduling; external schedulers can queue maintenance jobs and workers can claim them, but RustFS does not claim a continuous in-process scheduler
 - active-active multi-region table writes
 - multi-table transactions
 - no-long-term-data-credential table bootstrap

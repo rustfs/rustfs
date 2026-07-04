@@ -7814,7 +7814,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e50c72c21c738f5c5f350cc33640aee30bf7cd20f9d9da20ed41bce2671d532"
 dependencies = [
  "bytes",
- "snafu 0.6.10",
+ "snafu",
 ]
 
 [[package]]
@@ -9147,7 +9147,6 @@ dependencies = [
 name = "rustfs-heal"
 version = "1.0.0-beta.8"
 dependencies = [
- "anyhow",
  "async-trait",
  "futures",
  "http 1.4.2",
@@ -9718,7 +9717,7 @@ dependencies = [
  "rustfs-storage-api",
  "s3s",
  "serde_json",
- "snafu 0.9.1",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -9738,7 +9737,6 @@ dependencies = [
  "parking_lot",
  "rustfs-s3select-api",
  "s3s",
- "snafu 0.9.1",
  "tokio",
  "tracing",
 ]
@@ -10806,16 +10804,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eab12d3c261b2308b0d80c26fffb58d17eba81a4be97890101f416b478c79ca7"
 dependencies = [
  "doc-comment",
- "snafu-derive 0.6.10",
-]
-
-[[package]]
-name = "snafu"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1a012328be2e3f5d5f6f3218147ca02588cea4cb865e876849ab6debcf36522"
-dependencies = [
- "snafu-derive 0.9.1",
+ "snafu-derive",
 ]
 
 [[package]]
@@ -10827,18 +10816,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "snafu-derive"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f103c50866b8743da9429b8a581d81a27c2d3a9c4ac7df8f8571c1dd7896eda"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]

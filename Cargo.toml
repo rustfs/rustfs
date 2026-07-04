@@ -289,7 +289,6 @@ shadow-rs = { version = "2.0.0", default-features = false }
 siphasher = "1.0.3"
 smallvec = { version = "1.15.2", features = ["serde"] }
 smartstring = "1.0.1"
-snafu = "0.9.1"
 snap = "1.1.1"
 starshard = { version = "2.2.1", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }

@@ -426,6 +426,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         ),
         table_route_sample(
             Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
+            "/analytics/namespaces/sales/tables/orders/maintenance/scheduler/run",
+        ),
+        table_route_sample(
+            Method::POST,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
             "/analytics/namespaces/sales/tables/orders/maintenance/worker/run",
         ),
@@ -607,6 +612,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
             "/analytics/namespaces/sales/tables/orders/maintenance/scheduler",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
+            "/analytics/namespaces/sales/tables/orders/maintenance/scheduler/run",
         ),
         compat_table_route_sample(
             Method::POST,
@@ -867,6 +877,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(
         &router,
         Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/scheduler/run"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
         &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/worker/run"),
     );
     assert_route(
@@ -1020,6 +1035,11 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::GET,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/scheduler"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/scheduler/run"),
     );
     assert_route(
         &router,
