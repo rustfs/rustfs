@@ -74,6 +74,7 @@ const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_VIEW_RESOURCE_ROOT: &str = "views";
 const TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
+const DEFAULT_TABLE_MAINTENANCE_SCHEDULER_ID: &str = "rustfs-maintenance-scheduler";
 const DEFAULT_TABLE_MAINTENANCE_WORKER_ID: &str = "rustfs-maintenance-worker";
 const EXTERNAL_CATALOG_BRIDGE_STATUS_UNCONFIGURED: &str = "bridge-unconfigured";
 const EXTERNAL_CATALOG_BRIDGE_STATUS_CONFIGURED: &str = "bridge-configured";
@@ -136,6 +137,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
@@ -182,6 +184,7 @@ static GET_TABLE_MAINTENANCE_CONFIG_HANDLER: GetTableMaintenanceConfigHandler = 
 static PUT_TABLE_MAINTENANCE_CONFIG_HANDLER: PutTableMaintenanceConfigHandler = PutTableMaintenanceConfigHandler {};
 static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTableMaintenanceJobHandler {};
 static GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER: GetTableMaintenanceSchedulerHandler = GetTableMaintenanceSchedulerHandler {};
+static RUN_TABLE_MAINTENANCE_SCHEDULER_HANDLER: RunTableMaintenanceSchedulerHandler = RunTableMaintenanceSchedulerHandler {};
 static RUN_TABLE_MAINTENANCE_WORKER_HANDLER: RunTableMaintenanceWorkerHandler = RunTableMaintenanceWorkerHandler {};
 static HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER: HeartbeatTableMaintenanceJobHandler = HeartbeatTableMaintenanceJobHandler {};
 static TABLE_MAINTENANCE_QUARANTINE_HANDLER: TableMaintenanceQuarantineHandler = TableMaintenanceQuarantineHandler {};
@@ -355,6 +358,19 @@ struct TableMetadataMaintenanceRequest {
     compaction: Option<crate::table_catalog::TableCompactionPlanningConfig>,
     #[serde(default, rename = "commit-compaction")]
     commit_compaction: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableMaintenanceSchedulerRunRequest {
+    #[serde(default, rename = "scheduler-id")]
+    scheduler_id: Option<String>,
+}
+
+impl TableMaintenanceSchedulerRunRequest {
+    fn scheduler_id(&self) -> &str {
+        self.scheduler_id.as_deref().unwrap_or(DEFAULT_TABLE_MAINTENANCE_SCHEDULER_ID)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -950,6 +966,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/scheduler").as_str(),
         AdminOperation(&GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/scheduler/run").as_str(),
+        AdminOperation(&RUN_TABLE_MAINTENANCE_SCHEDULER_HANDLER),
     )?;
     r.insert(
         Method::POST,
@@ -5238,6 +5259,32 @@ impl Operation for GetTableMaintenanceSchedulerHandler {
 pub struct RunTableMaintenanceWorkerHandler {}
 
 #[async_trait::async_trait]
+impl Operation for RunTableMaintenanceSchedulerHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let request = read_json_body::<TableMaintenanceSchedulerRunRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .run_table_maintenance_scheduler_once(
+                &warehouse,
+                &namespace.public_name(),
+                &table,
+                request.scheduler_id().to_string(),
+            )
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RunTableMaintenanceSchedulerHandler {}
+
+#[async_trait::async_trait]
 impl Operation for RunTableMaintenanceWorkerHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
@@ -5698,6 +5745,7 @@ mod tests {
             ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
             ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
+            ("RunTableMaintenanceSchedulerHandler", "AdminAction::RunTableMaintenanceAction"),
             ("TableMaintenanceQuarantineHandler", "AdminAction::RunTableMaintenanceAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
@@ -5753,6 +5801,7 @@ mod tests {
             ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
             ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
+            ("RunTableMaintenanceSchedulerHandler", "AdminAction::RunTableMaintenanceAction"),
             ("TableMaintenanceQuarantineHandler", "AdminAction::RunTableMaintenanceAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
@@ -5810,6 +5859,7 @@ mod tests {
             "PutTableMaintenanceConfigHandler",
             "GetTableMaintenanceJobHandler",
             "GetTableMaintenanceSchedulerHandler",
+            "RunTableMaintenanceSchedulerHandler",
             "RunTableMaintenanceWorkerHandler",
             "HeartbeatTableMaintenanceJobHandler",
             "TableMaintenanceQuarantineHandler",
@@ -5920,6 +5970,7 @@ mod tests {
         let _: &PutTableMaintenanceConfigHandler = &PUT_TABLE_MAINTENANCE_CONFIG_HANDLER;
         let _: &GetTableMaintenanceJobHandler = &GET_TABLE_MAINTENANCE_JOB_HANDLER;
         let _: &GetTableMaintenanceSchedulerHandler = &GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER;
+        let _: &RunTableMaintenanceSchedulerHandler = &RUN_TABLE_MAINTENANCE_SCHEDULER_HANDLER;
         let _: &TableMaintenanceQuarantineHandler = &TABLE_MAINTENANCE_QUARANTINE_HANDLER;
         let _: &ExportTableCatalogHandler = &EXPORT_TABLE_CATALOG_HANDLER;
         let _: &ImportTableCatalogHandler = &IMPORT_TABLE_CATALOG_HANDLER;
@@ -5959,6 +6010,7 @@ mod tests {
         assert_operation::<PutTableMaintenanceConfigHandler>();
         assert_operation::<GetTableMaintenanceJobHandler>();
         assert_operation::<GetTableMaintenanceSchedulerHandler>();
+        assert_operation::<RunTableMaintenanceSchedulerHandler>();
         assert_operation::<RunTableMaintenanceWorkerHandler>();
         assert_operation::<HeartbeatTableMaintenanceJobHandler>();
         assert_operation::<TableMaintenanceQuarantineHandler>();
@@ -6031,6 +6083,24 @@ mod tests {
         assert_eq!(compaction.small_file_threshold_bytes, 67_108_864);
         assert_eq!(compaction.min_input_files, 5);
         assert_eq!(compaction.max_rewrite_bytes_per_job, 10_737_418_240);
+    }
+
+    #[test]
+    fn table_maintenance_scheduler_run_request_uses_stable_default_scheduler_id() {
+        let request: TableMaintenanceSchedulerRunRequest =
+            serde_json::from_value(serde_json::json!({})).expect("scheduler run request should parse");
+
+        assert_eq!(request.scheduler_id(), "rustfs-maintenance-scheduler");
+    }
+
+    #[test]
+    fn table_maintenance_scheduler_run_request_accepts_scheduler_id() {
+        let request: TableMaintenanceSchedulerRunRequest = serde_json::from_value(serde_json::json!({
+            "scheduler-id": "scheduler-a"
+        }))
+        .expect("scheduler run request should parse scheduler id");
+
+        assert_eq!(request.scheduler_id(), "scheduler-a");
     }
 
     #[test]
