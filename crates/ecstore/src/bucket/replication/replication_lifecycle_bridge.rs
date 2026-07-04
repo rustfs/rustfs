@@ -14,13 +14,15 @@
 
 use s3s::dto::ReplicationConfiguration;
 
-use super::config::ReplicationConfigurationExt as _;
+use super::replication_config_boundary::ReplicationConfigurationExt as _;
 use super::replication_filemeta_boundary::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, version_purge_statuses_map,
 };
 use super::replication_object_config::{ReplicationConfig, check_replicate_delete};
 use super::replication_queue_boundary::DeletedObjectReplicationInfo;
-use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete};
+use super::replication_storage_boundary::{
+    DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, deleted_object_for_replication,
+};
 
 pub(crate) type ReplicationLifecycleConfig = ReplicationConfig;
 
@@ -64,7 +66,7 @@ impl ReplicationLifecycleBridge {
 
     pub(crate) async fn schedule_delete(bucket: String, delete_object: DeletedObject) {
         super::replication_pool::schedule_replication_delete(DeletedObjectReplicationInfo {
-            delete_object,
+            delete_object: deleted_object_for_replication(delete_object),
             bucket,
             event_type: REPLICATE_INCOMING_DELETE.to_string(),
             ..Default::default()

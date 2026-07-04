@@ -445,7 +445,7 @@ impl ObjectInfo {
             .map(|v| v.replicate_decision_str.clone())
             .unwrap_or_default();
 
-        let mut replication_status = fi.replication_status();
+        let mut replication_status = replication_status_from_filemeta(fi.replication_status());
         if replication_status.is_empty()
             && let Some(status) = fi.metadata.get(AMZ_BUCKET_REPLICATION_STATUS).cloned()
             && status == ReplicationStatusType::Replica.as_str()
@@ -453,7 +453,7 @@ impl ObjectInfo {
             replication_status = ReplicationStatusType::Replica;
         }
 
-        let version_purge_status = fi.version_purge_status();
+        let version_purge_status = version_purge_status_from_filemeta(fi.version_purge_status());
 
         let transitioned_object = TransitionedObject {
             name: fi.transitioned_objname.clone(),
@@ -1052,10 +1052,10 @@ mod tests {
     #[test]
     fn from_file_info_preserves_replication_decision() {
         let fi = FileInfo {
-            replication_state_internal: Some(ReplicationState {
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
                 replicate_decision_str: "arn=true;false;arn:replication::1:dest;rule-id".to_string(),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
 

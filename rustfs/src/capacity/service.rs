@@ -33,8 +33,14 @@ pub fn capacity_disk_ref(endpoint: impl Into<String>, drive_path: impl Into<Stri
 }
 
 fn capacity_disk_refs(disks: &[rustfs_madmin::Disk]) -> Vec<CapacityDiskRef> {
+    // Admin callers pass cluster-wide `storage_info` disks. The scan walks
+    // `drive_path` on the local filesystem, so remote disks must be excluded:
+    // scanning them either double-counts local bytes (same mount layout on every
+    // node) or fails with NotFound (per-node layouts), and both poison the
+    // per-disk cache that the scheduled local-only refresh relies on.
     disks
         .iter()
+        .filter(|disk| disk.local)
         .map(|disk| capacity_disk_ref(disk.endpoint.clone(), disk.drive_path.clone()))
         .collect()
 }
@@ -325,5 +331,32 @@ fn capacity_source_label(source: capacity_manager::DataSource) -> &'static str {
         capacity_manager::DataSource::Scheduled => "scheduled",
         capacity_manager::DataSource::WriteTriggered => "write-triggered",
         capacity_manager::DataSource::Fallback => "fallback",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_disk_refs_excludes_remote_disks() {
+        let disks = vec![
+            rustfs_madmin::Disk {
+                endpoint: "http://node1:9000/data/rustfs0".to_string(),
+                drive_path: "/data/rustfs0".to_string(),
+                local: true,
+                ..Default::default()
+            },
+            rustfs_madmin::Disk {
+                endpoint: "http://node2:9000/data/rustfs0".to_string(),
+                drive_path: "/data/rustfs0".to_string(),
+                local: false,
+                ..Default::default()
+            },
+        ];
+
+        let refs = capacity_disk_refs(&disks);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].endpoint, "http://node1:9000/data/rustfs0");
     }
 }

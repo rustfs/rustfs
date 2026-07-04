@@ -16,7 +16,7 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use crate::{Error, Result};
 
-pub use rustfs_filemeta::{MrfOpKind, MrfReplicateEntry};
+pub use crate::filemeta::{MrfOpKind, MrfReplicateEntry};
 
 pub const MRF_META_FORMAT: u16 = 1;
 pub const MRF_META_VERSION: u16 = 1;

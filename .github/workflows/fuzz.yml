@@ -59,7 +59,7 @@ jobs:
       github.event_name == 'pull_request' ||
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch'
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 45
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -113,7 +113,7 @@ jobs:
       github.event_name == 'pull_request' ||
       (github.event_name == 'workflow_dispatch' &&
         (github.event.inputs.profile == 'smoke' || github.event.inputs.profile == 'both'))
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -164,7 +164,7 @@ jobs:
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' &&
         (github.event.inputs.profile == 'nightly' || github.event.inputs.profile == 'both'))
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 60
     strategy:
       fail-fast: false

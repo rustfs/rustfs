@@ -19,7 +19,7 @@ use s3s::dto::ReplicationConfiguration;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-use super::config::{ObjectOpts, ReplicationConfigurationExt as _};
+use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt as _};
 use super::replication_error_boundary::Result;
 use super::replication_filemeta_boundary::{
     ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, ReplicationType, ResyncDecision,
@@ -30,7 +30,7 @@ use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationDeleteSource, ReplicationResyncTargetObject, delete_replication_missing_source_decision,
     delete_replication_object_opts, resync_target_for_object,
 };
-use super::replication_storage_boundary::{ObjectInfo, ObjectOptions, ObjectToDelete};
+use super::replication_storage_boundary::{ObjectInfo, ObjectOptions, ObjectToDelete, object_to_delete_for_replication};
 use super::replication_target_boundary::{BucketTargets, ReplicationTargetStore};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -194,8 +194,9 @@ pub(crate) async fn check_replicate_delete(
         return ReplicateDecision::default();
     }
 
+    let replication_delete = object_to_delete_for_replication(dobj);
     let opts = delete_replication_object_opts(
-        dobj,
+        &replication_delete,
         &ReplicationDeleteSource {
             user_defined: oi.user_defined.as_ref(),
             user_tags: oi.user_tags.as_str(),

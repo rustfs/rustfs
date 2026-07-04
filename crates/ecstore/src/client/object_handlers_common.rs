@@ -21,7 +21,7 @@ const EVENT_LIFECYCLE_CLEANUP_SKIPPED: &str = "lifecycle_cleanup_skipped";
 const EVENT_LIFECYCLE_CLEANUP_FAILED: &str = "lifecycle_cleanup_failed";
 
 use crate::bucket::lifecycle::lifecycle;
-use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationState};
+use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationState, replication_state_to_filemeta};
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::object_api::ObjectOptions;
@@ -106,7 +106,7 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
             let Some(replication_state) = replication_candidates.get(i).and_then(|c| c.clone()) else {
                 continue;
             };
-            deleted_obj.replication_state = Some(replication_state);
+            deleted_obj.replication_state = Some(replication_state_to_filemeta(&replication_state));
             ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;
         }
 

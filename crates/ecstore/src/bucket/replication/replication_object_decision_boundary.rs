@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use rustfs_replication::MustReplicateOptions;
+pub use rustfs_replication::{
+    MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, delete_replication_state_from_config,
+    delete_replication_version_id, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+    should_use_existing_delete_replication_source,
+};
 pub(crate) use rustfs_replication::{
     ReplicationDeleteSource, ReplicationMultipartPartInput, ReplicationResyncTargetObject,
     delete_replication_missing_source_decision, delete_replication_object_opts, heal_uses_delete_replication_path,

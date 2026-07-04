@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::datatypes::ResyncStatusType;
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::Error as EcstoreError;
 use super::replication_filemeta_boundary::{
@@ -30,6 +29,7 @@ use super::replication_queue_boundary::{
     initial_worker_counts, large_worker_backpressure_resize, mrf_worker_size_to_count, replication_backpressure_recommendation,
     replication_heal_queue_action, resized_worker_counts, should_queue_large_object, worker_queue_for_replication_type,
 };
+use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file,
     encode_mrf_file, should_auto_resume_resync,
@@ -38,7 +38,9 @@ use super::replication_resyncer::{
     ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_object, save_resync_status,
 };
 use super::replication_state::ReplicationStats;
-use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
+use super::replication_storage_boundary::{
+    ObjectInfo, ObjectOptions, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
+};
 use super::replication_target_boundary::ReplicationTargetStore;
 use super::runtime_boundary as runtime_sources;
 use lazy_static::lazy_static;
@@ -616,7 +618,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         // get_object_info here because the delete-marker or version may
                         // already be absent from the local store — that is expected.
                         let dv = DeletedObjectReplicationInfo {
-                            delete_object: DeletedObject {
+                            delete_object: ReplicationDeletedObject {
                                 object_name: entry.object.clone(),
                                 version_id: entry.version_id,
                                 delete_marker_version_id: entry.delete_marker_version_id,

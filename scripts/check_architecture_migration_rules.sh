@@ -84,6 +84,11 @@ require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" 
 require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "crates/obs/src/metrics/storage_api.rs" "observability ECStore storage_api boundary"
 require_source_contains "docs/architecture/overview.md" "ecstore-api-facade-inventory.md" "architecture overview ECStore facade inventory link"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ecstore-api-facade-inventory.md" "ECStore split plan facade inventory link"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "EcstoreReplicationBoundaryImports" "ECStore split plan replication boundary imports section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "RuntimeReplicationFacadeConsumers" "ECStore split plan runtime replication facade consumer section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaIndependence" "ECStore split plan replication crate filemeta independence section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateStorageApiIndependence" "ECStore split plan replication crate storage-api independence section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateUtilsIndependence" "ECStore split plan replication crate utils independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "StorageApiReplicationContracts" "ECStore split plan storage-api replication contract section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Facade Group Inventory" "ECStore facade inventory group section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## External Consumer Boundaries" "ECStore facade inventory consumer boundary section"
@@ -203,6 +208,13 @@ FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
+ECSTORE_REPLICATION_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_replication_boundary_bypass_hits.txt"
+SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/scanner_replication_facade_bypass_hits.txt"
+RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_replication_facade_bypass_hits.txt"
+RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE="${TMP_DIR}/runtime_replication_dependency_bypass_hits.txt"
+REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_filemeta_bypass_hits.txt"
+REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_storage_api_bypass_hits.txt"
+REPLICATION_CRATE_UTILS_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_utils_bypass_hits.txt"
 REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_config_rule_contract_backslide_hits.txt"
 REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_delete_worker_contract_backslide_hits.txt"
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
@@ -966,7 +978,8 @@ fi
       rg -v '^crates/ecstore/src/bucket/replication/' || true
     rg -n -U --with-filename 'use\s+rustfs_filemeta::\{[^}]*\b(ReplicateDecision|ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|use\s+rustfs_filemeta::(ReplicateDecision|ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|rustfs_filemeta::(Replicate|Replication|VersionPurge|replication_statuses_map|version_purge_statuses_map)' \
       crates/ecstore/src \
-      --glob '*.rs' || true
+      --glob '*.rs' |
+      rg -v '^crates/ecstore/src/bucket/replication/' || true
   }
 ) >"$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE"
 
@@ -2605,6 +2618,87 @@ fi
 
 if [[ -s "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE" ]]; then
   report_failure "replication facade must use explicit compatibility exports instead of wildcard re-exports: $(paste -sd '; ' "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/[^:]*_boundary\.rs:' || true
+) >"$ECSTORE_REPLICATION_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_REPLICATION_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "ECStore replication rustfs-replication imports must stay behind *_boundary.rs modules: $(paste -sd '; ' "$ECSTORE_REPLICATION_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    crates/scanner/src \
+    --glob '*.rs' || true
+) >"$SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE"
+
+if [[ -s "$SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner replication contracts must come through the ECStore replication facade: $(paste -sd '; ' "$SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    rustfs/src \
+    --glob '*.rs' || true
+) >"$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS runtime replication contracts must come through storage API / ECStore replication facades: $(paste -sd '; ' "$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^rustfs-replication\b' \
+    rustfs/Cargo.toml \
+    crates/scanner/Cargo.toml || true
+) >"$RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE"
+
+if [[ -s "$RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS runtime and scanner crates must not depend on rustfs-replication directly: $(paste -sd '; ' "$RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'rustfs_filemeta::|use\s+rustfs_filemeta\b' crates/replication/src --glob '*.rs'
+    rg -n --with-filename '^rustfs-filemeta\b' crates/replication/Cargo.toml
+  } || true
+) >"$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE" ]]; then
+  report_failure "rustfs-replication must not import or depend on rustfs-filemeta: $(paste -sd '; ' "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_storage_api::|use\s+rustfs_storage_api\b|^rustfs-storage-api\b' \
+    crates/replication/src \
+    --glob '*.rs' \
+    crates/replication/Cargo.toml || true
+) >"$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication crate delete DTO contracts must not import or depend on rustfs-storage-api: $(paste -sd '; ' "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_utils::|use\s+rustfs_utils\b|^rustfs-utils\b' \
+    crates/replication/src \
+    --glob '*.rs' \
+    crates/replication/Cargo.toml || true
+) >"$REPLICATION_CRATE_UTILS_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_CRATE_UTILS_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication crate HTTP/helper contracts must not import or depend on rustfs-utils: $(paste -sd '; ' "$REPLICATION_CRATE_UTILS_BYPASS_HITS_FILE")"
 fi
 
 (

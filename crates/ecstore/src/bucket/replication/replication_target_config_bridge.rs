@@ -14,7 +14,7 @@
 
 use s3s::dto::ReplicationConfiguration;
 
-use super::config::{ObjectOpts, ReplicationConfigurationExt};
+use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt};
 use super::replication_filemeta_boundary::ReplicationType;
 
 pub(crate) struct ReplicationTargetConfigBridge;

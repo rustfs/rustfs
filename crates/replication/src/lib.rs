@@ -14,6 +14,8 @@
 
 pub mod config;
 pub mod delete;
+mod filemeta;
+mod http;
 pub mod mrf;
 pub mod multipart;
 pub mod object;
@@ -23,6 +25,7 @@ pub mod resync;
 pub mod rule;
 pub mod runtime;
 pub mod stats;
+mod storage_api;
 pub mod tagging;
 
 pub use config::{
@@ -32,6 +35,14 @@ pub use config::{
 pub use delete::{
     DeletedObjectReplicationInfo, is_retryable_delete_replication_head_error, is_version_delete_replication,
     should_retry_delete_marker_purge,
+};
+pub use filemeta::{
+    REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, REPLICATE_INCOMING,
+    REPLICATE_INCOMING_DELETE, REPLICATE_MRF, REPLICATE_QUEUED, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision,
+    ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState,
+    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision,
+    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
+    version_purge_statuses_map,
 };
 pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
 pub use multipart::{
@@ -68,16 +79,10 @@ pub use runtime::{
     next_mrf_worker_count, next_regular_worker_count, replication_backpressure_recommendation, resized_worker_counts,
     should_grow_large_workers, should_queue_large_object, worker_counts_for_priority,
 };
-pub use rustfs_filemeta::{
-    REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, REPLICATE_INCOMING_DELETE,
-    ReplicateDecision, ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
-    ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision,
-    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
-    version_purge_statuses_map,
-};
 pub use stats::{
     ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, BucketStats, ExponentialMovingAverage, FailStats,
     FailedMetric, InQueueMetric, InQueueStats, LatencyStats, ProxyMetric, ProxyStatsCache, QueueCache, QueueNode, QueueStats,
     SRMetricsSummary, XferStats,
 };
+pub use storage_api::{DeletedObject, ObjectToDelete};
 pub use tagging::{ReplicationTagFilter, decode_tags_to_map};

@@ -845,9 +845,68 @@ pub(crate) struct TableCompactionPlanningReport {
     pub manual_review_count: usize,
     #[serde(default, rename = "committed-metadata-location")]
     pub committed_metadata_location: Option<String>,
+    #[serde(default, rename = "row-level-planning")]
+    pub row_level_planning: TableRowLevelMaintenancePlanningReport,
     #[serde(default, rename = "rewrite-groups")]
     pub rewrite_groups: Vec<TableCompactionRewriteGroup>,
     pub snapshot_reports: Vec<TableCompactionSnapshotReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableRowLevelMaintenancePlanningReport {
+    pub status: TableRowLevelMaintenancePlanningStatus,
+    #[serde(rename = "delete-file-count")]
+    pub delete_file_count: usize,
+    #[serde(rename = "position-delete-file-count")]
+    pub position_delete_file_count: usize,
+    #[serde(rename = "equality-delete-file-count")]
+    pub equality_delete_file_count: usize,
+    #[serde(rename = "manual-review-count")]
+    pub manual_review_count: usize,
+    pub reasons: Vec<TableRowLevelMaintenancePlanningReason>,
+    #[serde(rename = "delete-files")]
+    pub delete_files: Vec<TableRowLevelDeleteFilePlanningReport>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableRowLevelMaintenancePlanningStatus {
+    #[default]
+    NoDeleteFiles,
+    ManualReviewRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableRowLevelMaintenancePlanningReason {
+    PositionDeleteFile,
+    EqualityDeleteFile,
+    DeleteFileRewriteUnsupported,
+    MissingDeleteFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableRowLevelDeleteFilePlanningReport {
+    #[serde(rename = "file-location")]
+    pub file_location: String,
+    pub content: TableRowLevelDeleteFileContent,
+    #[serde(rename = "object-exists")]
+    pub object_exists: bool,
+    #[serde(default, rename = "record-count", skip_serializing_if = "Option::is_none")]
+    pub record_count: Option<u64>,
+    #[serde(default, rename = "file-size-bytes", skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<u64>,
+    #[serde(default, rename = "sequence-number", skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<i64>,
+    #[serde(default, rename = "file-sequence-number", skip_serializing_if = "Option::is_none")]
+    pub file_sequence_number: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableRowLevelDeleteFileContent {
+    PositionDelete,
+    EqualityDelete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -896,6 +955,10 @@ pub(crate) enum TableCompactionPlanningReason {
     MissingCurrentSnapshot,
     MissingManifestList,
     MissingDataFile,
+    DeleteFile,
+    PositionDeleteFile,
+    EqualityDeleteFile,
+    RowLevelRewriteUnsupported,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -7407,13 +7470,15 @@ pub(crate) fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatal
         let content = avro_record_field(data_file, "content")
             .and_then(avro_i32_value)
             .ok_or_else(|| TableCatalogStoreError::Invalid("manifest data file missing content".to_string()))?;
-        let object_kind = match content {
-            0 => TableMetadataMaintenanceObjectKind::DataFile,
-            1 | 2 => TableMetadataMaintenanceObjectKind::DeleteFile,
+        let (content, object_kind) = match content {
+            0 => (ManifestDataFileContent::Data, TableMetadataMaintenanceObjectKind::DataFile),
+            1 => (ManifestDataFileContent::PositionDelete, TableMetadataMaintenanceObjectKind::DeleteFile),
+            2 => (ManifestDataFileContent::EqualityDelete, TableMetadataMaintenanceObjectKind::DeleteFile),
             _ => continue,
         };
         files.push(ManifestDataFileReference {
             location: file_path.to_string(),
+            content,
             object_kind,
             entry_status: avro_record_field(&value, "status").and_then(avro_i32_value),
             snapshot_id: avro_record_field(&value, "snapshot_id").and_then(avro_i64_value),
@@ -8041,6 +8106,12 @@ struct TableCompactionDataFileCandidate {
     sort_order_id: Option<i32>,
 }
 
+#[derive(Debug, Default)]
+struct CompactionManifestPlanning {
+    candidates: Vec<TableCompactionDataFileCandidate>,
+    row_level_planning: TableRowLevelMaintenancePlanningReport,
+}
+
 struct CompactedParquetFile {
     data: Vec<u8>,
     record_count: u64,
@@ -8064,6 +8135,7 @@ struct CompactedDataFile {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ManifestDataFileReference {
     pub location: String,
+    pub content: ManifestDataFileContent,
     pub object_kind: TableMetadataMaintenanceObjectKind,
     pub entry_status: Option<i32>,
     pub snapshot_id: Option<i64>,
@@ -8073,6 +8145,13 @@ pub(crate) struct ManifestDataFileReference {
     pub file_size_bytes: Option<u64>,
     pub partition: Vec<(String, apache_avro::types::Value)>,
     pub sort_order_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestDataFileContent {
+    Data,
+    PositionDelete,
+    EqualityDelete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8114,6 +8193,7 @@ where
     let mut snapshot_reports = Vec::new();
     let mut candidates = Vec::new();
     let mut rewrite_groups = Vec::new();
+    let mut row_level_planning = TableRowLevelMaintenancePlanningReport::default();
 
     if let Some(current_snapshot_id) = current_snapshot_id {
         let current_snapshot = current_metadata
@@ -8135,7 +8215,7 @@ where
                     .map(ToString::to_string);
                 match manifest_list.as_deref() {
                     Some(manifest_list) => {
-                        candidates = match compaction_data_file_candidates(
+                        let planning = match compaction_data_file_candidates(
                             backend,
                             table_bucket,
                             namespace,
@@ -8146,7 +8226,7 @@ where
                         )
                         .await
                         {
-                            Ok(candidates) => candidates,
+                            Ok(planning) => planning,
                             Err(_) => {
                                 snapshot_reports.push(TableCompactionSnapshotReport {
                                     snapshot_id: Some(current_snapshot_id),
@@ -8157,10 +8237,21 @@ where
                                         TableCompactionPlanningReason::ManifestAvroReaderUnavailable,
                                     ],
                                 });
-                                Vec::new()
+                                CompactionManifestPlanning::default()
                             }
                         };
-                        if !candidates.is_empty() && snapshot_reports.is_empty() {
+                        row_level_planning = planning.row_level_planning;
+                        candidates = planning.candidates;
+                        if row_level_planning.status == TableRowLevelMaintenancePlanningStatus::ManualReviewRequired
+                            && snapshot_reports.is_empty()
+                        {
+                            snapshot_reports.push(TableCompactionSnapshotReport {
+                                snapshot_id: Some(current_snapshot_id),
+                                manifest_list: Some(manifest_list.to_string()),
+                                status: TableCompactionPlanningStatus::ManualReviewRequired,
+                                reasons: compaction_row_level_planning_reasons(&row_level_planning),
+                            });
+                        } else if !candidates.is_empty() && snapshot_reports.is_empty() {
                             rewrite_groups = compaction_rewrite_groups(&candidates, &config);
                             let (status, reasons) = if rewrite_groups.is_empty() {
                                 (
@@ -8231,6 +8322,7 @@ where
         rewrite_group_count: rewrite_groups.len(),
         manual_review_count,
         committed_metadata_location: None,
+        row_level_planning,
         rewrite_groups,
         snapshot_reports,
     })
@@ -8244,7 +8336,7 @@ async fn compaction_data_file_candidates<B>(
     warehouse_object_prefix: Option<&str>,
     manifest_list: &str,
     config: &TableCompactionPlanningConfig,
-) -> TableCatalogStoreResult<Vec<TableCompactionDataFileCandidate>>
+) -> TableCatalogStoreResult<CompactionManifestPlanning>
 where
     B: TableCatalogObjectBackend,
 {
@@ -8264,7 +8356,7 @@ where
         return Err(TableCatalogStoreError::NotFound(format!("compaction manifest list {manifest_list_key}")));
     };
     let manifest_paths = manifest_paths_from_manifest_list_avro(&manifest_list_object.data)?;
-    let mut candidates = Vec::new();
+    let mut planning = CompactionManifestPlanning::default();
     for manifest_location in manifest_paths {
         let Some(manifest_key) = table_catalog_object_key_from_location(table_bucket, &manifest_location) else {
             return Err(TableCatalogStoreError::Invalid(
@@ -8283,9 +8375,17 @@ where
         };
         for reference in data_file_references_from_manifest_avro(&manifest_object.data)? {
             if reference.object_kind != TableMetadataMaintenanceObjectKind::DataFile {
-                return Err(TableCatalogStoreError::Invalid(
-                    "compaction currently does not support delete files".to_string(),
-                ));
+                record_compaction_row_level_delete_file(
+                    backend,
+                    table_bucket,
+                    namespace,
+                    table,
+                    warehouse_object_prefix,
+                    &mut planning.row_level_planning,
+                    &reference,
+                )
+                .await?;
+                continue;
             }
             validate_compaction_manifest_entry_status(reference.entry_status)?;
             let Some(data_key) = table_catalog_object_key_from_location(table_bucket, &reference.location) else {
@@ -8305,7 +8405,7 @@ where
             };
             let size_bytes = u64::try_from(data_object.data.len()).unwrap_or(u64::MAX);
             if size_bytes <= config.small_file_threshold_bytes {
-                candidates.push(TableCompactionDataFileCandidate {
+                planning.candidates.push(TableCompactionDataFileCandidate {
                     rewrite_prefix: compaction_data_file_rewrite_prefix(namespace, table, warehouse_object_prefix, &data_key)
                         .unwrap_or_else(|| data_key.clone()),
                     location: data_key,
@@ -8315,7 +8415,100 @@ where
             }
         }
     }
-    Ok(candidates)
+    Ok(planning)
+}
+
+async fn record_compaction_row_level_delete_file<B>(
+    backend: &B,
+    table_bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+    planning: &mut TableRowLevelMaintenancePlanningReport,
+    reference: &ManifestDataFileReference,
+) -> TableCatalogStoreResult<()>
+where
+    B: TableCatalogObjectBackend,
+{
+    let Some(content) = row_level_delete_file_content(reference.content) else {
+        return Ok(());
+    };
+    let Some(delete_key) = table_catalog_object_key_from_location(table_bucket, &reference.location) else {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction delete file must be inside the table bucket".to_string(),
+        ));
+    };
+    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &delete_key)
+        != Some(TableMetadataMaintenanceObjectKind::DeleteFile)
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction delete file must be inside the table delete directory".to_string(),
+        ));
+    }
+
+    let object_exists = backend.read_object(table_bucket, &delete_key).await?.is_some();
+    planning.status = TableRowLevelMaintenancePlanningStatus::ManualReviewRequired;
+    planning.delete_file_count = planning.delete_file_count.saturating_add(1);
+    planning.manual_review_count = planning.manual_review_count.saturating_add(1);
+    push_row_level_planning_reason(planning, TableRowLevelMaintenancePlanningReason::DeleteFileRewriteUnsupported);
+    match content {
+        TableRowLevelDeleteFileContent::PositionDelete => {
+            planning.position_delete_file_count = planning.position_delete_file_count.saturating_add(1);
+            push_row_level_planning_reason(planning, TableRowLevelMaintenancePlanningReason::PositionDeleteFile);
+        }
+        TableRowLevelDeleteFileContent::EqualityDelete => {
+            planning.equality_delete_file_count = planning.equality_delete_file_count.saturating_add(1);
+            push_row_level_planning_reason(planning, TableRowLevelMaintenancePlanningReason::EqualityDeleteFile);
+        }
+    }
+    if !object_exists {
+        push_row_level_planning_reason(planning, TableRowLevelMaintenancePlanningReason::MissingDeleteFile);
+    }
+    planning.delete_files.push(TableRowLevelDeleteFilePlanningReport {
+        file_location: delete_key,
+        content,
+        object_exists,
+        record_count: reference.record_count,
+        file_size_bytes: reference.file_size_bytes,
+        sequence_number: reference.sequence_number,
+        file_sequence_number: reference.file_sequence_number,
+    });
+    Ok(())
+}
+
+fn row_level_delete_file_content(content: ManifestDataFileContent) -> Option<TableRowLevelDeleteFileContent> {
+    match content {
+        ManifestDataFileContent::Data => None,
+        ManifestDataFileContent::PositionDelete => Some(TableRowLevelDeleteFileContent::PositionDelete),
+        ManifestDataFileContent::EqualityDelete => Some(TableRowLevelDeleteFileContent::EqualityDelete),
+    }
+}
+
+fn push_row_level_planning_reason(
+    planning: &mut TableRowLevelMaintenancePlanningReport,
+    reason: TableRowLevelMaintenancePlanningReason,
+) {
+    if !planning.reasons.contains(&reason) {
+        planning.reasons.push(reason);
+    }
+}
+
+fn compaction_row_level_planning_reasons(
+    planning: &TableRowLevelMaintenancePlanningReport,
+) -> Vec<TableCompactionPlanningReason> {
+    let mut reasons = vec![
+        TableCompactionPlanningReason::ManifestList,
+        TableCompactionPlanningReason::ManifestFile,
+        TableCompactionPlanningReason::DeleteFile,
+        TableCompactionPlanningReason::RowLevelRewriteUnsupported,
+    ];
+    if planning.position_delete_file_count > 0 {
+        reasons.push(TableCompactionPlanningReason::PositionDeleteFile);
+    }
+    if planning.equality_delete_file_count > 0 {
+        reasons.push(TableCompactionPlanningReason::EqualityDeleteFile);
+    }
+    reasons
 }
 
 async fn compaction_current_data_files<B>(
@@ -14552,6 +14745,131 @@ mod tests {
             snapshot
                 .reasons
                 .contains(&TableCompactionPlanningReason::ManifestAvroReaderUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_plan_reports_row_level_delete_files_without_rewrite_candidates() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let data_dir = default_table_data_dir_path(&namespace, &table);
+        let delete_dir = default_table_delete_dir_path(&namespace, &table);
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+        let manifest_list = format!("{metadata_dir}/snap-20.avro");
+        let manifest = format!("{metadata_dir}/manifest-20.avro");
+        let data_file = format!("{data_dir}/part-left.parquet");
+        let position_delete_file = format!("{delete_dir}/pos-left.parquet");
+        let equality_delete_file = format!("{delete_dir}/eq-left.parquet");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &manifest,
+                manifest_avro_bytes(&[(&data_file, 0), (&position_delete_file, 1), (&equality_delete_file, 2)]),
+            )
+            .await;
+        backend.seed_object(bucket, &data_file, parquet_i32_bytes(&[1, 2])).await;
+        backend
+            .seed_object(bucket, &position_delete_file, b"position-delete".to_vec())
+            .await;
+        backend
+            .seed_object(bucket, &equality_delete_file, b"equality-delete".to_vec())
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "current-snapshot-id": 20,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 20,
+                            "timestamp-ms": 2000,
+                            "manifest-list": manifest_list
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .expect("current metadata should serialize"),
+            )
+            .await;
+
+        let config = TableCompactionPlanningConfig {
+            target_file_size_bytes: 512 * 1024 * 1024,
+            small_file_threshold_bytes: 64 * 1024 * 1024,
+            min_input_files: 2,
+            max_rewrite_bytes_per_job: 1024 * 1024 * 1024,
+        };
+        let report = store
+            .plan_table_compaction(bucket, "sales", "orders", config.clone())
+            .await
+            .expect("compaction planning should succeed");
+
+        assert_eq!(report.status, TableCompactionPlanningStatus::ManualReviewRequired);
+        assert_eq!(report.candidate_file_count, 1);
+        assert_eq!(report.rewrite_group_count, 0);
+        assert_eq!(report.manual_review_count, 1);
+        assert_eq!(
+            report.row_level_planning.status,
+            TableRowLevelMaintenancePlanningStatus::ManualReviewRequired
+        );
+        assert_eq!(report.row_level_planning.delete_file_count, 2);
+        assert_eq!(report.row_level_planning.position_delete_file_count, 1);
+        assert_eq!(report.row_level_planning.equality_delete_file_count, 1);
+        assert!(
+            report
+                .row_level_planning
+                .reasons
+                .contains(&TableRowLevelMaintenancePlanningReason::DeleteFileRewriteUnsupported)
+        );
+        assert!(
+            report
+                .row_level_planning
+                .delete_files
+                .iter()
+                .any(|delete_file| delete_file.file_location == position_delete_file
+                    && delete_file.content == TableRowLevelDeleteFileContent::PositionDelete
+                    && delete_file.object_exists)
+        );
+        assert!(
+            report
+                .row_level_planning
+                .delete_files
+                .iter()
+                .any(|delete_file| delete_file.file_location == equality_delete_file
+                    && delete_file.content == TableRowLevelDeleteFileContent::EqualityDelete
+                    && delete_file.object_exists)
+        );
+        let snapshot = compaction_snapshot_report(&report, 20);
+        assert_eq!(snapshot.status, TableCompactionPlanningStatus::ManualReviewRequired);
+        assert!(snapshot.reasons.contains(&TableCompactionPlanningReason::DeleteFile));
+        assert!(
+            snapshot
+                .reasons
+                .contains(&TableCompactionPlanningReason::RowLevelRewriteUnsupported)
+        );
+
+        let err = store
+            .commit_table_compaction(bucket, "sales", "orders", config)
+            .await
+            .expect_err("delete-file compaction should fail closed");
+        assert!(
+            err.to_string().contains("compaction has no safe rewrite candidates"),
+            "unexpected error: {err}"
         );
     }
 

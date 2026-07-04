@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::config::{ObjectOpts, ReplicationConfigurationExt as _};
-use super::datatypes::ResyncStatusType;
 use super::replication_bandwidth_boundary;
+use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt as _};
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
@@ -35,6 +34,7 @@ use super::replication_object_decision_boundary::{
     replication_multipart_complete_actual_size, replication_multipart_part_plan, should_retry_delete_marker_purge,
 };
 use super::replication_queue_boundary::DeletedObjectReplicationInfo;
+use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
     resync_state_accepts_update, should_count_head_proxy_failure,
@@ -42,8 +42,8 @@ use super::replication_resync_boundary::{
 #[cfg(test)]
 use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX, decode_resync_file};
 use super::replication_storage_boundary::{
-    AdvancedGetOptions, DeletedObject, EcstoreObjectOperations, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
-    ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
+    AdvancedGetOptions, EcstoreObjectOperations, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
+    ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
 };
 use super::replication_target_boundary::{
     PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_action_for_target_head,
@@ -671,7 +671,7 @@ impl ReplicationResyncer {
                         };
 
                         let doi = DeletedObjectReplicationInfo {
-                            delete_object: DeletedObject {
+                            delete_object: ReplicationDeletedObject {
                                 object_name: roi.name.clone(),
                                 delete_marker_version_id: dm_version_id,
                                 version_id,
@@ -3131,7 +3131,7 @@ mod tests {
 
     #[test]
     fn test_is_version_delete_replication_for_delete_marker_version_purge() {
-        let dobj = DeletedObject {
+        let dobj = ReplicationDeletedObject {
             delete_marker: false,
             delete_marker_version_id: Some(Uuid::new_v4()),
             ..Default::default()
@@ -3145,7 +3145,7 @@ mod tests {
 
     #[test]
     fn test_is_version_delete_replication_for_delete_marker_creation() {
-        let dobj = DeletedObject {
+        let dobj = ReplicationDeletedObject {
             delete_marker: true,
             delete_marker_version_id: Some(Uuid::new_v4()),
             ..Default::default()
@@ -3159,7 +3159,7 @@ mod tests {
 
     #[test]
     fn test_should_retry_delete_marker_purge_for_version_purge() {
-        let dobj = DeletedObject {
+        let dobj = ReplicationDeletedObject {
             delete_marker: false,
             delete_marker_version_id: Some(Uuid::new_v4()),
             ..Default::default()
@@ -3173,7 +3173,7 @@ mod tests {
 
     #[test]
     fn test_should_retry_delete_marker_purge_for_delete_marker_creation() {
-        let dobj = DeletedObject {
+        let dobj = ReplicationDeletedObject {
             delete_marker: true,
             delete_marker_version_id: Some(Uuid::new_v4()),
             ..Default::default()
