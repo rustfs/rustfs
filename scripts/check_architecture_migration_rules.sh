@@ -571,6 +571,44 @@ require_source_line \
   "crates/ecstore/src/api/mod.rs" \
   "pub mod cluster {" \
   "ECStore cluster control-plane public facade"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod bucket_target_sys {" \
+  "ECStore bucket target public facade explicit module"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod metadata_sys {" \
+  "ECStore bucket metadata public facade explicit module"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod admin_handler_utils {" \
+  "ECStore client admin handler public facade explicit module"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod com {" \
+  "ECStore config common public facade explicit module"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod endpoint {" \
+  "ECStore disk endpoint public facade explicit module"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod tier_config {" \
+  "ECStore tier config public facade explicit module"
+for ecstore_explicit_facade in bucket client; do
+  if grep -qF "pub use crate::${ecstore_explicit_facade}::{" "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
+    report_failure "ECStore ${ecstore_explicit_facade} public facade must expose explicit submodules instead of whole owner module passthroughs"
+  fi
+done
+if perl -0ne 'exit(!/pub use crate::config::\{[^}]*\b(?:com|storageclass)\b/s)' "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
+  report_failure "ECStore config public facade must expose explicit submodules instead of whole owner module passthroughs"
+fi
+if perl -0ne 'exit(!/pub use crate::disk::\{[^}]*\b(?:endpoint|error|error_reduce)\b/s)' "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
+  report_failure "ECStore disk public facade must expose explicit submodules instead of whole owner module passthroughs"
+fi
+if grep -qF "pub use crate::services::tier::{" "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
+  report_failure "ECStore tier public facade must expose explicit submodules instead of whole owner module passthroughs"
+fi
 for ecstore_private_module in \
   bucket \
   cache_value \
@@ -3098,7 +3136,7 @@ fi
       crates/ecstore/src \
       --glob '*.rs'
   } |
-    rg -v '^crates/ecstore/src/bucket/replication/' || true
+    rg -v '^crates/ecstore/src/(api/mod\.rs|bucket/replication/)' || true
 ) >"$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE" ]]; then
