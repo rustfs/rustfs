@@ -58,6 +58,7 @@ use super::resolve_swift_object_store_handle;
 use super::storage_api::versioning::{ListOperations as _, ObjectOperations as _};
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};
 
@@ -66,6 +67,11 @@ const LOG_SUBSYSTEM_SWIFT_VERSIONING: &str = "swift_versioning";
 const EVENT_SWIFT_VERSIONING_ARCHIVE_STATE: &str = "swift_versioning_archive_state";
 const EVENT_SWIFT_VERSIONING_RESTORE_STATE: &str = "swift_versioning_restore_state";
 const EVENT_SWIFT_VERSIONING_LIST_STATE: &str = "swift_versioning_list_state";
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+const VERSION_TIMESTAMP_MAX_SECONDS: u64 = 9_999_999_999;
+const VERSION_TIMESTAMP_MAX_NANOS: u64 = VERSION_TIMESTAMP_MAX_SECONDS * NANOS_PER_SECOND + (NANOS_PER_SECOND - 1);
+
+static LAST_VERSION_UNIX_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a version name for an archived object
 ///
@@ -91,22 +97,37 @@ const EVENT_SWIFT_VERSIONING_LIST_STATE: &str = "swift_versioning_list_state";
 /// # Returns
 /// Versioned object name with inverted timestamp prefix
 pub fn generate_version_name(container: &str, object: &str) -> String {
-    // Get current timestamp
+    let unix_nanos = next_version_unix_nanos();
+    let inverted_nanos = VERSION_TIMESTAMP_MAX_NANOS.saturating_sub(unix_nanos);
+    let inverted_seconds = inverted_nanos / NANOS_PER_SECOND;
+    let inverted_subsec_nanos = inverted_nanos % NANOS_PER_SECOND;
+
+    // Format: {inverted_timestamp}/{container}/{object}
+    // 9 decimal places = nanosecond precision (prevents collisions up to 1B ops/sec)
+    format!("{inverted_seconds:010}.{inverted_subsec_nanos:09}/{container}/{object}")
+}
+
+fn current_unix_nanos() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0));
 
-    let timestamp = now.as_secs_f64();
+    now.as_secs()
+        .saturating_mul(NANOS_PER_SECOND)
+        .saturating_add(u64::from(now.subsec_nanos()))
+}
 
-    // Invert timestamp so newer versions sort first
-    // Max reasonable timestamp: 9999999999 (year 2286)
-    // Using 9 decimal places (nanosecond precision) to prevent collisions
-    // in high-throughput scenarios where objects are uploaded rapidly
-    let inverted = 9999999999.999999999 - timestamp;
+fn next_version_unix_nanos() -> u64 {
+    let now = current_unix_nanos();
+    let mut observed = LAST_VERSION_UNIX_NANOS.load(Ordering::Acquire);
 
-    // Format: {inverted_timestamp}/{container}/{object}
-    // 9 decimal places = nanosecond precision (prevents collisions up to 1B ops/sec)
-    format!("{:.9}/{}/{}", inverted, container, object)
+    loop {
+        let candidate = now.max(observed.saturating_add(1)).min(VERSION_TIMESTAMP_MAX_NANOS);
+        match LAST_VERSION_UNIX_NANOS.compare_exchange_weak(observed, candidate, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return candidate,
+            Err(actual) => observed = actual,
+        }
+    }
 }
 
 /// Archive the current version of an object before overwriting
@@ -677,8 +698,6 @@ mod tests {
             timestamps.insert(ts);
         }
 
-        // Should have at least some unique timestamps
-        // (May not be 100 due to system clock granularity)
-        assert!(timestamps.len() > 1, "Timestamps should be mostly unique");
+        assert_eq!(timestamps.len(), 100, "Version timestamps should be unique");
     }
 }
