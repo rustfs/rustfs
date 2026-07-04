@@ -1366,7 +1366,8 @@ mod tests {
     use super::*;
     use crate::bucket::lifecycle::core::TRANSITION_COMPLETE;
     use crate::bucket::replication::{
-        ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+        ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta, replication_statuses_map,
+        version_purge_statuses_map,
     };
     use crate::layout::{
         endpoints::{Endpoints, PoolEndpoints},
@@ -1532,13 +1533,13 @@ mod tests {
             transitioned_objname: "remote/object".to_string(),
             transition_tier: "WARM".to_string(),
             transition_version_id: Some(transition_version_id),
-            replication_state_internal: Some(ReplicationState {
+            replication_state_internal: Some(replication_state_to_filemeta(&ReplicationState {
                 replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
                 targets: replication_statuses_map("arn:minio:replication:target=COMPLETED;"),
                 version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
                 purge_targets: version_purge_statuses_map("arn:minio:replication:target=PENDING;"),
                 ..Default::default()
-            }),
+            })),
             metadata: HashMap::from([
                 ("etag".to_string(), "etag-value".to_string()),
                 ("x-amz-meta-key".to_string(), "metadata-value".to_string()),

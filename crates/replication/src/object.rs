@@ -13,13 +13,12 @@
 // limitations under the License.
 
 use crate::filemeta::{ReplicationAction, ReplicationType};
-use crate::tagging::ReplicationTagFilter;
-use rustfs_utils::http::{
+use crate::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_TAGGING,
     AMZ_WEBSITE_REDIRECT_LOCATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, EXPIRES,
+    has_prefix_fold, trim_etag,
 };
-use rustfs_utils::path::trim_etag;
-use rustfs_utils::string::strings_has_prefix_fold;
+use crate::tagging::ReplicationTagFilter;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
@@ -150,7 +149,7 @@ fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<St
     for (key, value) in metadata.into_iter().flatten() {
         if REPLICATION_METADATA_COMPARE_KEYS
             .iter()
-            .any(|prefix| strings_has_prefix_fold(key, prefix))
+            .any(|prefix| has_prefix_fold(key, prefix))
         {
             comparable.insert(key.to_lowercase(), value.clone());
         }

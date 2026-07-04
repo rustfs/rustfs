@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::replication::replication_state_from_filemeta;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
@@ -2132,7 +2133,10 @@ fn decommission_delete_marker_opts(
         data_movement: true,
         delete_marker: true,
         skip_decommissioned: true,
-        delete_replication: version.replication_state_internal.clone(),
+        delete_replication: version
+            .replication_state_internal
+            .as_ref()
+            .map(replication_state_from_filemeta),
         ..Default::default()
     }
 }
@@ -4236,12 +4240,12 @@ mod tests {
         let mod_time = OffsetDateTime::now_utc();
         let version = rustfs_filemeta::FileInfo {
             mod_time: Some(mod_time),
-            replication_state_internal: Some(ReplicationState {
+            replication_state_internal: Some(crate::bucket::replication::replication_state_to_filemeta(&ReplicationState {
                 replica_status: ReplicationStatusType::Replica,
                 delete_marker: true,
                 replicate_decision_str: "existing".to_string(),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
 

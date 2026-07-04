@@ -43,18 +43,30 @@ mod replication_versioning_boundary;
 mod runtime_boundary;
 
 pub use datatypes::ResyncStatusType;
-pub use replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt};
+pub use replication_config_boundary::{
+    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, replication_target_arns,
+    should_remove_replication_target, validate_replication_config_target_arns,
+};
 #[cfg(test)]
 pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
-pub(crate) use replication_filemeta_boundary::{
-    ReplicateDecision, ReplicationState, replication_statuses_map, version_purge_statuses_map,
+pub(crate) use replication_filemeta_boundary::version_purge_statuses_map;
+pub use replication_filemeta_boundary::{
+    REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState, ReplicationStatusType, ReplicationType,
+    VersionPurgeStatusType, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
+    version_purge_status_to_filemeta,
 };
-pub use replication_filemeta_boundary::{ReplicateObjectInfo, ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
+pub(crate) use replication_filemeta_boundary::{
+    replication_state_from_filemeta, replication_status_from_filemeta, version_purge_status_from_filemeta,
+};
 pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
 pub use replication_object_config::ReplicationConfig;
-pub use replication_object_decision_boundary::MustReplicateOptions;
+pub use replication_object_decision_boundary::{
+    MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, delete_replication_state_from_config,
+    delete_replication_version_id, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+    should_use_existing_delete_replication_source,
+};
 pub use replication_pool::{
     DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
     init_background_replication,

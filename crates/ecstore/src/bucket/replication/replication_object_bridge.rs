@@ -19,7 +19,9 @@ use super::replication_object_config::{check_replicate_delete, get_must_replicat
 use super::replication_object_decision_boundary::MustReplicateOptions;
 use super::replication_pool::{schedule_replication, schedule_replication_delete};
 use super::replication_queue_boundary::DeletedObjectReplicationInfo;
-use super::replication_storage_boundary::{ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationStorage};
+use super::replication_storage_boundary::{
+    DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationStorage, deleted_object_for_replication,
+};
 
 pub struct ReplicationObjectBridge;
 
@@ -59,6 +61,16 @@ impl ReplicationObjectBridge {
 
     pub async fn schedule_delete(delete_object: DeletedObjectReplicationInfo) {
         schedule_replication_delete(delete_object).await;
+    }
+
+    pub async fn schedule_storage_delete(delete_object: DeletedObject, bucket: String, event_type: String) {
+        Self::schedule_delete(DeletedObjectReplicationInfo {
+            delete_object: deleted_object_for_replication(delete_object),
+            bucket,
+            event_type,
+            ..Default::default()
+        })
+        .await;
     }
 }
 

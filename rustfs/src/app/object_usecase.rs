@@ -40,9 +40,10 @@ use super::storage_api::object_usecase::bucket::{
     predict_lifecycle_expiration,
     quota::QuotaOperation,
     replication::{
-        DeletedObjectReplicationInfo, REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType,
-        check_replicate_delete, delete_replication_state_from_config, delete_replication_version_id, must_replicate_object,
-        schedule_object_replication, schedule_replication_delete, should_schedule_delete_replication,
+        REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType, check_replicate_delete,
+        delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
+        must_replicate_object, schedule_object_replication, schedule_replication_delete, set_deleted_object_replication_state,
+        set_object_to_delete_version_purge_status, should_schedule_delete_replication,
         should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
     },
     tagging::decode_tags,
@@ -1528,7 +1529,7 @@ async fn enrich_delete_replication_state_if_needed(
         version_id,
         obj_info.replication_status == ReplicationStatusType::Replica,
     ) {
-        delete_object.replication_state = Some(local_state);
+        set_deleted_object_replication_state(delete_object, &local_state);
     }
 }
 
@@ -4719,7 +4720,7 @@ impl DefaultObjectUsecase {
                 .await;
                 if dsc.replicate_any() {
                     if object.version_id.is_some() {
-                        object.version_purge_status = Some(VersionPurgeStatusType::Pending);
+                        set_object_to_delete_version_purge_status(&mut object, VersionPurgeStatusType::Pending);
                         object.version_purge_statuses = dsc.pending_status();
                     } else {
                         object.delete_marker_replication_status = dsc.pending_status();
@@ -4861,8 +4862,7 @@ impl DefaultObjectUsecase {
         for dobjs in &delete_results {
             if let Some(dobj) = &dobjs.delete_object
                 && replicate_deletes
-                && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
-                    || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
+                && deleted_object_has_pending_replication_delete(dobj)
             {
                 let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
                 let mut dobj = dobj.clone();
@@ -4870,13 +4870,7 @@ impl DefaultObjectUsecase {
                     dobj.version_id = Some(Uuid::nil());
                 }
 
-                let deleted_object = DeletedObjectReplicationInfo {
-                    delete_object: dobj,
-                    bucket: bucket.clone(),
-                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
-                    ..Default::default()
-                };
-                schedule_replication_delete(deleted_object).await;
+                schedule_replication_delete(dobj, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
             }
         }
 
@@ -5061,16 +5055,15 @@ impl DefaultObjectUsecase {
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
-                schedule_replication_delete(DeletedObjectReplicationInfo {
-                    delete_object: StorageDeletedObject {
+                schedule_replication_delete(
+                    StorageDeletedObject {
                         object_name: key.clone(),
                         force_delete: true,
                         ..Default::default()
                     },
-                    bucket: bucket.clone(),
-                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
-                    ..Default::default()
-                })
+                    bucket.clone(),
+                    REPLICATE_INCOMING_DELETE.to_string(),
+                )
                 .await;
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
@@ -5109,30 +5102,26 @@ impl DefaultObjectUsecase {
 
         if schedule_delete_replication {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
-            let mut deleted_object = DeletedObjectReplicationInfo {
-                delete_object: StorageDeletedObject {
-                    delete_marker: deleted_object_source.delete_marker && !deleted_delete_marker_version,
-                    delete_marker_version_id: if deleted_object_source.delete_marker {
-                        deleted_object_source.version_id
-                    } else {
-                        None
-                    },
-                    object_name: key.clone(),
-                    version_id: if deleted_object_source.delete_marker {
-                        None
-                    } else {
-                        deleted_object_source.version_id
-                    },
-                    delete_marker_mtime: deleted_object_source.mod_time,
-                    replication_state: Some(replication_state_source.replication_state()),
-                    ..Default::default()
+            let mut deleted_object = StorageDeletedObject {
+                delete_marker: deleted_object_source.delete_marker && !deleted_delete_marker_version,
+                delete_marker_version_id: if deleted_object_source.delete_marker {
+                    deleted_object_source.version_id
+                } else {
+                    None
                 },
-                bucket: bucket.clone(),
-                event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                object_name: key.clone(),
+                version_id: if deleted_object_source.delete_marker {
+                    None
+                } else {
+                    deleted_object_source.version_id
+                },
+                delete_marker_mtime: deleted_object_source.mod_time,
+                replication_state: None,
                 ..Default::default()
             };
-            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object.delete_object, replication_state_source).await;
-            schedule_replication_delete(deleted_object).await;
+            set_deleted_object_replication_state(&mut deleted_object, &replication_state_source.replication_state());
+            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object, replication_state_source).await;
+            schedule_replication_delete(deleted_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
         }
 
         let delete_marker = obj_info.delete_marker;
@@ -8558,15 +8547,14 @@ mod tests {
 
     #[test]
     fn replica_delete_enrichment_must_not_reuse_upstream_targets() {
-        let delete_object = StorageDeletedObject {
-            replication_state: Some(ReplicationState {
-                replicate_decision_str: "arn:aws:s3:::upstream=true;false;arn:aws:s3:::upstream;".to_string(),
-                replication_status_internal: Some("arn:aws:s3:::upstream=COMPLETED;".to_string()),
-                targets: replication_statuses_map("arn:aws:s3:::upstream=COMPLETED;"),
-                ..Default::default()
-            }),
+        let upstream_state = ReplicationState {
+            replicate_decision_str: "arn:aws:s3:::upstream=true;false;arn:aws:s3:::upstream;".to_string(),
+            replication_status_internal: Some("arn:aws:s3:::upstream=COMPLETED;".to_string()),
+            targets: replication_statuses_map("arn:aws:s3:::upstream=COMPLETED;"),
             ..Default::default()
         };
+        let mut delete_object = StorageDeletedObject::default();
+        set_deleted_object_replication_state(&mut delete_object, &upstream_state);
         let obj_info = ObjectInfo {
             replication_status: ReplicationStatusType::Replica,
             ..Default::default()
