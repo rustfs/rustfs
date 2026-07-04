@@ -16510,7 +16510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strong_catalog_backing_rolls_back_cache_when_persist_and_reload_fail() {
+    async fn strong_catalog_backing_does_not_publish_draft_when_persist_and_reload_fail() {
         let backend = TestCatalogObjectBackend::default();
         let store = StrongTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
