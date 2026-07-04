@@ -350,6 +350,10 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
         return None;
     }
 
+    if let Some(marker) = decoded_next_continuation_marker(v2) {
+        return Some(encode_list_output_value(marker, v2.encoding_type.as_ref()));
+    }
+
     let last_key = v2
         .contents
         .as_ref()
@@ -386,6 +390,12 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
         (None, Some(p)) => Some(p),
         (None, None) => None,
     }
+}
+
+fn decoded_next_continuation_marker(v2: &ListObjectsV2Output) -> Option<String> {
+    let token = v2.next_continuation_token.as_ref()?;
+    let bytes = base64_simd::STANDARD.decode_to_vec(token.as_bytes()).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -474,6 +484,44 @@ mod tests {
 
         let output = build_list_objects_output(v2, None);
         assert_eq!(output.next_marker, Some("zebra/".to_string()));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_preserves_internal_continuation_marker() {
+        let marker = "key-998[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            contents: Some(vec![Object {
+                key: Some("key-998".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let output = build_list_objects_output(v2, None);
+        assert_eq!(output.next_marker.as_deref(), Some(marker));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_encodes_internal_marker_when_url_encoded() {
+        let marker = "dir a/key[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            contents: Some(vec![Object {
+                key: Some("dir%20a/key".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let output = build_list_objects_output(v2, None);
+        assert_eq!(
+            output.next_marker.as_deref(),
+            Some("dir%20a/key%5Brustfs_cache%3Av2%2Cid%3Alist-cache-id%2Cp%3A0%2Cs%3A0%5D")
+        );
     }
 
     #[test]
