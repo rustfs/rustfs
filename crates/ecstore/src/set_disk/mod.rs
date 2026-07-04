@@ -443,6 +443,7 @@ const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
+mod ctx;
 mod heal;
 mod list;
 mod lock;
