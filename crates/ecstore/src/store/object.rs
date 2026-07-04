@@ -778,6 +778,25 @@ impl ECStore {
             }
 
             if dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
+                // Restoring a specific historical version onto the current key creates a NEW
+                // version. When the caller supplies a reader (S3 CopyObject), write the fetched
+                // bytes through put_object so any re-encryption/compression applied to the reader
+                // stays consistent with the new version's metadata. Sharing the source data_dir via
+                // a metadata-only version copy would corrupt SSE/compressed objects (issue #4238).
+                if let Some(reader) = src_info.put_object_reader.as_mut() {
+                    let put_opts = ObjectOptions {
+                        user_defined: (*src_info.user_defined).clone(),
+                        versioned: dst_opts.versioned,
+                        version_id: dst_opts.version_id.clone(),
+                        no_lock: dst_opts.no_lock,
+                        mod_time: dst_opts.mod_time,
+                        http_preconditions: dst_opts.http_preconditions.clone(),
+                        ..Default::default()
+                    };
+                    return self.pools[pool_idx]
+                        .put_object(dst_bucket, &dst_object, reader, &put_opts)
+                        .await;
+                }
                 src_info.version_only = true;
                 return self.pools[pool_idx]
                     .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, &dst_opts)

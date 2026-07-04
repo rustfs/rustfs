@@ -141,6 +141,9 @@ mod heal_erasure_disk_rebuild_test;
 #[cfg(test)]
 mod copy_object_metadata_test;
 
+#[cfg(test)]
+mod copy_object_version_restore_test;
+
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;
