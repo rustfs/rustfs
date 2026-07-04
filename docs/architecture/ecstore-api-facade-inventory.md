@@ -9,10 +9,11 @@ replication, or `SetDisks` runtime behavior.
 
 | Facade group | Current role | Shrink posture |
 |---|---|---|
-| `storage`, `disk`, `layout`, `error`, `runtime`, `cluster`, `rpc` | Compatibility spine for storage, disk topology, runtime handles, cluster control, and internode calls. | Keep until replacement contracts compile in downstream boundary files. |
+| `storage`, `layout`, `error`, `runtime`, `cluster`, `rpc` | Compatibility spine for storage, topology, runtime handles, cluster control, and internode calls. | Keep until replacement contracts compile in downstream boundary files. |
 | `bucket` | Domain facade consumed through owner-local `storage_api` boundaries. The public API keeps compatibility paths but exposes explicit submodules and symbol lists instead of whole bucket owner modules. | Keep explicit lists aligned with owner-boundary consumers; do not restore whole-module passthroughs. |
-| `config`, `tier`, `data_usage`, `capacity`, `notification`, `metrics`, `rebalance` | Domain and service facades still consumed through owner-local `storage_api` boundaries. | Narrow one group at a time after explicit aliases or wrappers exist. |
-| `set_disk`, `object`, `rio`, `bitrot`, `erasure`, `compression`, `cache`, `client`, `store_list` | Low-level object IO, reader, erasure, cache, and migration helper compatibility. | Keep stable while `SetDisks` remains the shared state carrier. |
+| `client`, `config`, `disk`, `tier` | Compatibility paths consumed through owner-local `storage_api` boundaries. The public API keeps existing path names but exposes explicit nested submodules and symbol lists instead of whole owner modules. | Keep explicit lists aligned with owner-boundary consumers; do not restore whole-module passthroughs. |
+| `data_usage`, `capacity`, `notification`, `metrics`, `rebalance` | Domain and service facades still consumed through owner-local `storage_api` boundaries. | Narrow one group at a time after explicit aliases or wrappers exist. |
+| `set_disk`, `object`, `rio`, `bitrot`, `erasure`, `compression`, `cache`, `store_list` | Low-level object IO, reader, erasure, cache, and migration helper compatibility. | Keep stable while `SetDisks` remains the shared state carrier. |
 | `admin`, `event`, `global` | Admin, event hook, and legacy global compatibility. | Keep `global` limited to bootstrap writes and lifecycle controls; read-only runtime access must use runtime-source contracts. |
 
 ## External Consumer Boundaries
@@ -61,8 +62,9 @@ any facade shrink or operation-family movement.
 5. Remove or narrow one facade group per PR so rollback preserves object IO,
    quorum, lifecycle/replication queues, scanner repair, notification/audit
    events, and metadata compatibility.
-6. Keep `api::bucket` on explicit submodules and symbol lists; do not restore
-   `pub use crate::bucket::{...}` whole-module passthroughs.
+6. Keep `api::bucket`, `api::client`, `api::config`, `api::disk`, and
+   `api::tier` on explicit submodules and symbol lists; do not restore
+   `pub use crate::<owner>::{...}` whole-module passthroughs for those groups.
 
 ## First PR Checklist
 

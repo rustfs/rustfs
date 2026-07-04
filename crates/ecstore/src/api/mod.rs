@@ -189,7 +189,25 @@ pub mod capacity {
 }
 
 pub mod client {
-    pub use crate::client::{admin_handler_utils, api_put_object, object_api_utils, transition_api};
+    pub mod admin_handler_utils {
+        pub use crate::client::admin_handler_utils::AdminError;
+    }
+
+    pub mod api_put_object {
+        pub use crate::client::api_put_object::{AdvancedPutOptions, PutObjectOptions};
+    }
+
+    pub mod object_api_utils {
+        pub use crate::client::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
+    }
+
+    pub mod transition_api {
+        pub use crate::client::transition_api::{
+            BucketLookupType, CreateBucketConfiguration, LocationConstraint, ObjectInfo, ObjectMultipartInfo, Options,
+            PutObjectPartOptions, ReadCloser, ReaderImpl, RequestMetadata, RestoreInfo, SendRequest, TransitionClient,
+            TransitionCore, UploadInfo, to_object_info,
+        };
+    }
 }
 
 pub mod cluster {
@@ -208,9 +226,26 @@ pub mod compression {
 }
 
 pub mod config {
+    pub mod com {
+        pub use crate::config::com::{
+            COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
+            ServerConfigCorruptError, delete_config, is_server_config_corrupt_error, lookup_configs, read_config,
+            read_config_no_lock, read_config_with_metadata, read_config_without_migrate, save_config, save_config_with_opts,
+            save_server_config, try_migrate_server_config,
+        };
+    }
+
+    pub mod storageclass {
+        pub use crate::config::storageclass::{
+            CLASS_RRS, CLASS_STANDARD, Config, DEEP_ARCHIVE, DEFAULT_INLINE_BLOCK, DEFAULT_KVS, DEFAULT_RRS_PARITY,
+            EXPRESS_ONEZONE, GLACIER, GLACIER_IR, INLINE_BLOCK, INLINE_BLOCK_ENV, INTELLIGENT_TIERING, MIN_PARITY_DRIVES,
+            ONEZONE_IA, OPTIMIZE, OPTIMIZE_ENV, OUTPOSTS, RRS, RRS_ENV, SCHEME_PREFIX, SNOW, STANDARD, STANDARD_ENV, STANDARD_IA,
+            StorageClass, default_parity_count, lookup_config, parse_storage_class, validate_parity, validate_parity_inner,
+        };
+    }
+
     pub use crate::config::{
-        RUSTFS_CONFIG_PREFIX, com, init, init_global_config_sys, set_global_storage_class, storageclass,
-        try_migrate_server_config,
+        RUSTFS_CONFIG_PREFIX, init, init_global_config_sys, set_global_storage_class, try_migrate_server_config,
     };
 }
 
@@ -226,9 +261,6 @@ pub mod data_usage {
 
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
-    pub use crate::disk::endpoint::Endpoint;
-    pub use crate::disk::error::DiskError;
-    pub use crate::disk::error_reduce::is_all_buckets_not_found;
     pub use crate::disk::local::ScanGuard;
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
@@ -237,8 +269,26 @@ pub mod disk {
         ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
         validate_batch_read_version_item_count,
     };
-    pub use crate::disk::{endpoint, error, error_reduce};
     pub use bytes::Bytes;
+    pub use endpoint::Endpoint;
+    pub use error::DiskError;
+    pub use error_reduce::is_all_buckets_not_found;
+
+    pub mod endpoint {
+        pub use crate::layout::endpoint::{Endpoint, EndpointType};
+    }
+
+    pub mod error {
+        pub use crate::disk::error::{BitrotErrorType, DiskError, Error, FileAccessDeniedWithContext, Result};
+    }
+
+    pub mod error_reduce {
+        pub use crate::disk::error_reduce::{
+            BASE_IGNORED_ERRS, BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, WriteQuorumFailureSummary,
+            build_write_quorum_failure_summary, count_errs, count_retryable_failures, is_all_buckets_not_found, is_ignored_err,
+            reduce_errs, reduce_quorum_errs, reduce_read_quorum_errs, reduce_write_quorum_errs,
+        };
+    }
 }
 
 pub mod error {
@@ -336,5 +386,36 @@ pub mod storage {
 }
 
 pub mod tier {
-    pub use crate::services::tier::{tier, tier_admin, tier_config, tier_handlers, warm_backend};
+    #[allow(clippy::module_inception)]
+    pub mod tier {
+        pub use crate::services::tier::tier::{
+            ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_INVALID_CONFIG, ERR_TIER_MISSING_CREDENTIALS,
+            ERR_TIER_TYPE_UNSUPPORTED, TIER_CONFIG_FILE, TIER_CONFIG_FORMAT, TIER_CONFIG_V1, TIER_CONFIG_VERSION, TierConfigMgr,
+            is_err_config_not_found, try_migrate_tiering_config,
+        };
+    }
+
+    pub mod tier_admin {
+        pub use crate::services::tier::tier_admin::TierCreds;
+    }
+
+    pub mod tier_config {
+        pub use crate::services::tier::tier_config::{
+            ServicePrincipalAuth, TierAliyun, TierAzure, TierConfig, TierGCS, TierHuaweicloud, TierMinIO, TierR2, TierRustFS,
+            TierS3, TierTencent, TierType,
+        };
+    }
+
+    pub mod tier_handlers {
+        pub use crate::services::tier::tier_handlers::{
+            ERR_TIER_ALREADY_EXISTS, ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS,
+            ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR, ERR_TIER_RESERVED_NAME,
+        };
+    }
+
+    pub mod warm_backend {
+        pub use crate::services::tier::warm_backend::{
+            WarmBackend, WarmBackendGetOpts, WarmBackendImpl, build_transition_put_options, check_warm_backend, new_warm_backend,
+        };
+    }
 }

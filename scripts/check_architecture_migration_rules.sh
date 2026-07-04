@@ -579,8 +579,35 @@ require_source_line \
   "crates/ecstore/src/api/mod.rs" \
   "    pub mod metadata_sys {" \
   "ECStore bucket metadata public facade explicit module"
-if grep -qF "pub use crate::bucket::{" "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
-  report_failure "ECStore bucket public facade must expose explicit submodules instead of whole bucket module passthroughs"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod admin_handler_utils {" \
+  "ECStore client admin handler public facade explicit module"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod com {" \
+  "ECStore config common public facade explicit module"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod endpoint {" \
+  "ECStore disk endpoint public facade explicit module"
+require_source_line \
+  "crates/ecstore/src/api/mod.rs" \
+  "    pub mod tier_config {" \
+  "ECStore tier config public facade explicit module"
+for ecstore_explicit_facade in bucket client; do
+  if grep -qF "pub use crate::${ecstore_explicit_facade}::{" "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
+    report_failure "ECStore ${ecstore_explicit_facade} public facade must expose explicit submodules instead of whole owner module passthroughs"
+  fi
+done
+if perl -0ne 'exit(!/pub use crate::config::\{[^}]*\b(?:com|storageclass)\b/s)' "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
+  report_failure "ECStore config public facade must expose explicit submodules instead of whole owner module passthroughs"
+fi
+if perl -0ne 'exit(!/pub use crate::disk::\{[^}]*\b(?:endpoint|error|error_reduce)\b/s)' "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
+  report_failure "ECStore disk public facade must expose explicit submodules instead of whole owner module passthroughs"
+fi
+if grep -qF "pub use crate::services::tier::{" "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
+  report_failure "ECStore tier public facade must expose explicit submodules instead of whole owner module passthroughs"
 fi
 for ecstore_private_module in \
   bucket \
