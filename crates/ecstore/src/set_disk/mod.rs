@@ -970,7 +970,7 @@ struct GetCodecStreamingGate {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GetDirectMemoryDecision {
-    Use,
+    Use { object_size: usize },
     Fallback(GetDirectMemoryFallbackReason),
 }
 
@@ -996,6 +996,7 @@ enum GetDirectMemoryFallbackReason {
     ObjectInfoMultipart,
     FileInfoMultipart,
     InvalidSize,
+    SizeMismatch,
     AboveThreshold,
 }
 
@@ -1022,6 +1023,7 @@ impl GetDirectMemoryFallbackReason {
             Self::ObjectInfoMultipart => "object_info_multipart",
             Self::FileInfoMultipart => "file_info_multipart",
             Self::InvalidSize => "invalid_size",
+            Self::SizeMismatch => "size_mismatch",
             Self::AboveThreshold => "above_threshold",
         }
     }
@@ -1052,7 +1054,7 @@ fn record_get_direct_memory_decision(
     size_bucket: &'static str,
 ) {
     let (outcome, reason) = match decision {
-        GetDirectMemoryDecision::Use => (
+        GetDirectMemoryDecision::Use { .. } => (
             crate::diagnostics::get::GET_DIRECT_MEMORY_DECISION_USE,
             crate::diagnostics::get::GET_DIRECT_MEMORY_REASON_NONE,
         ),
@@ -1104,7 +1106,7 @@ fn is_get_small_object_direct_memory_eligible_with_threshold(
 ) -> bool {
     matches!(
         get_small_object_direct_memory_decision_with_threshold(range, object_info, fi, opts, true, threshold),
-        GetDirectMemoryDecision::Use
+        GetDirectMemoryDecision::Use { .. }
     )
 }
 
@@ -1180,11 +1182,14 @@ fn get_small_object_direct_memory_decision_with_threshold(
     if object_size == 0 {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InvalidSize);
     }
+    if object_info.size != fi.size {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::SizeMismatch);
+    }
     if object_size > threshold {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::AboveThreshold);
     }
 
-    GetDirectMemoryDecision::Use
+    GetDirectMemoryDecision::Use { object_size }
 }
 
 fn get_small_object_direct_memory_decision(
@@ -2515,9 +2520,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         let direct_memory_decision = get_small_object_direct_memory_decision(&range, &object_info, &fi, opts);
         record_get_direct_memory_decision(object_class, direct_memory_decision, size_bucket);
-        if matches!(direct_memory_decision, GetDirectMemoryDecision::Use) {
-            let object_size = usize::try_from(object_info.size)
-                .map_err(|_| to_object_err(Error::other("direct-memory GET object size is invalid"), vec![bucket, object]))?;
+        if let GetDirectMemoryDecision::Use { object_size } = direct_memory_decision {
             if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo(
                 bucket,
                 object,
@@ -9810,9 +9813,16 @@ mod tests {
             get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 512),
             GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::AboveThreshold)
         );
+
+        let mut size_mismatch = object_info.clone();
+        size_mismatch.size += 1;
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &size_mismatch, &fi, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::SizeMismatch)
+        );
         assert_eq!(
             get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 128 * 1024),
-            GetDirectMemoryDecision::Use
+            GetDirectMemoryDecision::Use { object_size: 1024 }
         );
     }
 
@@ -9838,6 +9848,7 @@ mod tests {
         assert_eq!(GetDirectMemoryFallbackReason::ObjectInfoMultipart.as_str(), "object_info_multipart");
         assert_eq!(GetDirectMemoryFallbackReason::FileInfoMultipart.as_str(), "file_info_multipart");
         assert_eq!(GetDirectMemoryFallbackReason::InvalidSize.as_str(), "invalid_size");
+        assert_eq!(GetDirectMemoryFallbackReason::SizeMismatch.as_str(), "size_mismatch");
         assert_eq!(GetDirectMemoryFallbackReason::AboveThreshold.as_str(), "above_threshold");
     }
 

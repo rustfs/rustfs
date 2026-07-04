@@ -2187,7 +2187,6 @@ impl DefaultObjectUsecase {
     fn build_memory_bytes_blob(
         bytes: Bytes,
         response_content_length: i64,
-        _optimal_buffer_size: usize,
         source: &'static str,
         lifecycle: GetObjectBodyLifecycle,
     ) -> StreamingBlob {
@@ -2217,11 +2216,10 @@ impl DefaultObjectUsecase {
     fn build_memory_blob(
         buf: Vec<u8>,
         response_content_length: i64,
-        optimal_buffer_size: usize,
         source: &'static str,
         lifecycle: GetObjectBodyLifecycle,
     ) -> StreamingBlob {
-        Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, optimal_buffer_size, source, lifecycle)
+        Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, source, lifecycle)
     }
 
     fn select_stream_buffer_strategy(
@@ -2843,7 +2841,6 @@ impl DefaultObjectUsecase {
                 return Ok(Self::build_memory_blob(
                     buf,
                     response_content_length,
-                    optimal_buffer_size,
                     GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
                     lifecycle.take(),
                 ));
@@ -2877,7 +2874,6 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_memory_bytes_blob(
                 buffered_body,
                 response_content_length,
-                optimal_buffer_size,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
                 lifecycle.take(),
             ));
@@ -2904,7 +2900,6 @@ impl DefaultObjectUsecase {
                     return Ok(Self::build_memory_blob(
                         buf,
                         response_content_length,
-                        optimal_buffer_size,
                         GET_MEMORY_BODY_SOURCE_SEEK_BUFFER,
                         lifecycle.take(),
                     ));
@@ -2966,7 +2961,6 @@ impl DefaultObjectUsecase {
                 return Ok(Self::build_memory_bytes_blob(
                     bytes,
                     response_content_length,
-                    optimal_buffer_size,
                     GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
                     lifecycle.take(),
                 ));
@@ -2980,7 +2974,6 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_memory_bytes_blob(
                 buffered_body,
                 response_content_length,
-                optimal_buffer_size,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
                 lifecycle.take(),
             ));
@@ -3041,7 +3034,6 @@ impl DefaultObjectUsecase {
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,
                         response_content_length,
-                        optimal_buffer_size,
                         GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED,
                         lifecycle.take(),
                     ));
