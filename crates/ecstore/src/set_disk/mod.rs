@@ -444,12 +444,12 @@ const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod ctx;
-mod heal;
 mod list;
 mod lock;
 #[path = "../metadata/set_disk.rs"]
 mod metadata;
 mod multipart;
+mod ops;
 mod read;
 mod replication;
 pub(crate) mod shard_source;
@@ -6079,177 +6079,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
-    type Error = Error;
-    type HealResultItem = HealResultItem;
-    type HealOptions = HealOpts;
-
-    #[tracing::instrument(skip(self))]
-    async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-        let disks = self.disks.read().await.clone();
-        let (formats, errs) = load_format_erasure_all(&disks, true).await;
-        let ref_format = match get_format_erasure_in_quorum(&formats) {
-            Ok(format) => format,
-            Err(err) => {
-                let can_use_cached_layout = count_errs(&errs, &DiskError::UnformattedDisk) > 0
-                    && formats.iter().flatten().all(|format| self.format.check_other(format).is_ok())
-                    && errs
-                        .iter()
-                        .all(|err| err.is_none() || matches!(err, Some(DiskError::UnformattedDisk)));
-                if can_use_cached_layout {
-                    self.format.clone()
-                } else {
-                    return Ok((HealResultItem::default(), Some(err)));
-                }
-            }
-        };
-
-        let endpoints = crate::layout::endpoints::Endpoints::from(self.set_endpoints.clone());
-        let before_drives = crate::layout::set_heal::formats_to_drives_info(&endpoints, &formats, &errs);
-        let mut result = HealResultItem {
-            heal_item_type: HealItemType::Metadata.to_string(),
-            detail: "disk-format".to_string(),
-            disk_count: self.set_drive_count,
-            set_count: 1,
-            before: Infos {
-                drives: before_drives.clone(),
-            },
-            after: Infos { drives: before_drives },
-            ..Default::default()
-        };
-
-        if count_errs(&errs, &DiskError::UnformattedDisk) == 0 {
-            info!("set disk formats success, NoHealRequired, errs: {:?}", errs);
-            return Ok((result, Some(StorageError::NoHealRequired)));
-        }
-
-        if !dry_run {
-            for (disk_idx, err) in errs.iter().enumerate() {
-                if !matches!(err, Some(DiskError::UnformattedDisk)) {
-                    continue;
-                }
-
-                let mut new_format = ref_format.clone();
-                new_format.erasure.this = ref_format.erasure.sets[self.set_index][disk_idx];
-                if save_format_file(&disks[disk_idx], &Some(new_format.clone())).await.is_ok() {
-                    result.after.drives[disk_idx].uuid = new_format.erasure.this.to_string();
-                    result.after.drives[disk_idx].state = DriveState::Ok.to_string();
-                }
-            }
-        }
-
-        Ok((result, None))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
-        let mut result = heal_bucket_local_on_disks(bucket, opts, self.disk_inventory().await).await?;
-        result.set_count = 1;
-        Ok(result)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn heal_object(
-        &self,
-        bucket: &str,
-        object: &str,
-        version_id: &str,
-        opts: &HealOpts,
-    ) -> Result<(HealResultItem, Option<Error>)> {
-        let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(
-                ns_lock
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-            )
-        } else {
-            None
-        };
-
-        if has_suffix(object, SLASH_SEPARATOR) {
-            let (result, err) = self.heal_object_dir_locked(bucket, object, opts.dry_run, opts.remove).await?;
-            return Ok((result, err.map(|e| e.into())));
-        }
-
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
-        let (_, errs) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false)
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-        if DiskError::is_all_not_found(&errs) {
-            debug!(
-                event = EVENT_SET_DISK_HEAL,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                bucket,
-                object,
-                version_id,
-                state = "missing_object_skipped",
-                "Set disk heal skipped missing object"
-            );
-            let err = if !version_id.is_empty() {
-                Error::FileVersionNotFound
-            } else {
-                Error::FileNotFound
-            };
-            return Ok((
-                self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
-                    .await,
-                Some(err),
-            ));
-        }
-
-        // Heal the object.
-        // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
-        let mut inner_opts = *opts;
-        inner_opts.no_lock = true;
-        let (result, err) = self
-            .heal_object(bucket, object, version_id, &inner_opts)
-            .await
-            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-        if let Some(err) = err.as_ref() {
-            match err {
-                &DiskError::FileCorrupt if opts.scan_mode != HealScanMode::Deep => {
-                    // Instead of returning an error when a bitrot error is detected
-                    // during a normal heal scan, heal again with bitrot flag enabled.
-                    inner_opts.scan_mode = HealScanMode::Deep;
-                    let (result, err) = self
-                        .heal_object(bucket, object, version_id, &inner_opts)
-                        .await
-                        .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
-                    return Ok((result, err.map(|e| e.into())));
-                }
-                _ => {}
-            }
-        }
-        Ok((result, err.map(|e| e.into())))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
-        for (set_idx, set) in self.format.erasure.sets.iter().enumerate() {
-            for (disk_idx, disk_id) in set.iter().enumerate() {
-                if disk_id.to_string() == id {
-                    return Ok((Some(self.pool_index), Some(set_idx), Some(disk_idx)));
-                }
-            }
-        }
-
-        Err(Error::DiskNotFound)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
-        // Multipart orphan reconciliation is intentionally retained above the set layer
-        // until there is a concrete caller and a stable lower-level contract to implement.
-        Err(StorageError::NotImplemented)
     }
 }
 
