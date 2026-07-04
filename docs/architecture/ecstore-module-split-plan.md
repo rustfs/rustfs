@@ -1,15 +1,15 @@
 # ECStore Module Split Plan
 
 This plan records the remaining ECStore split work after the final audit
-remediation pass. It is intentionally design-only: no crate movement should
-start until each candidate boundary has explicit contracts, compatibility
-coverage, dependency evidence, and rollback steps.
+remediation pass. Runtime movement must still wait until each candidate
+boundary has explicit contracts, compatibility coverage, dependency evidence,
+and rollback steps.
 
 ## Current Shape
 
 | Area | Current owner | Size | Split status |
 |---|---|---:|---|
-| Bucket lifecycle | `crates/ecstore/src/bucket/lifecycle/` | 8,657 lines | Proposal only |
+| Bucket lifecycle | `crates/lifecycle/` + `crates/ecstore/src/bucket/lifecycle/` | core contracts + ECStore runtime | Core contract extracted |
 | Bucket replication | `crates/ecstore/src/bucket/replication/` | 8,730 lines | Proposal only |
 | Set disks | `crates/ecstore/src/set_disk/` | state carrier plus operation modules | Keep in ECStore |
 | Public ECStore facade | `crates/ecstore/src/api/mod.rs` | broad compatibility surface | Shrink only through guarded PRs |
@@ -50,7 +50,10 @@ not a runtime split PR.
 
 ## Lifecycle Candidate
 
-`bucket/lifecycle` is not ready for a standalone crate yet.
+`rustfs-lifecycle` now owns the pure lifecycle rule, event, evaluator, tag
+filtering, object-lock metadata check, and expiry-time contracts. ECStore keeps
+the object-store runtime, queues, tiering, audit/notification, metadata, and
+replication scheduling adapters.
 
 Current coupling:
 
@@ -61,9 +64,20 @@ Current coupling:
   through the lifecycle metadata boundary;
 - lifecycle expiry schedules bucket replication delete work through the
   replication lifecycle bridge contract;
-- lifecycle evaluation shares S3 DTOs, object metadata, object lock, replication
-  config reads through lifecycle-local boundaries, scanner metrics,
-  notification/audit side effects, and tier services.
+- lifecycle evaluation uses S3 DTOs and replication status contracts from the
+  independent `rustfs-lifecycle`/`rustfs-replication` crates, while ECStore maps
+  `ObjectInfo` into lifecycle object options at the compatibility boundary;
+- lifecycle runtime still coordinates scanner metrics, notification/audit side
+  effects, metadata access, replication delete scheduling, and tier services.
+
+Current extracted contracts:
+
+- `LifecycleCrateCoreIndependence`: lifecycle rule validation, filtering,
+  event evaluation, transition/expiration options, tag decoding, object-lock
+  metadata checks, and ILM expiry-time rounding live in `rustfs-lifecycle`.
+  `rustfs-lifecycle` must not import ECStore internals, file metadata, or
+  `rustfs-utils`; ECStore owns the `ObjectInfo` adapter in
+  `crates/ecstore/src/bucket/lifecycle/core.rs`.
 
 Required contracts before crate movement:
 
@@ -79,12 +93,13 @@ Required contracts before crate movement:
   without depending on the replication implementation module.
 - `LifecycleAuditSink`: lifecycle audit and notification emission boundary.
 
-First safe PR:
+Next safe PR:
 
-- add a lifecycle extraction inventory section or module-level README;
-- list current ECStore/runtime dependencies and the target contract owner for
-  each dependency;
-- add no code movement and no behavior changes.
+- move one runtime-facing dependency behind a trait or adapter owned by
+  `rustfs-lifecycle` without changing queue, transition, or delete behavior;
+- keep ECStore compatibility shims until scanner and RustFS app consumers stop
+  depending on `rustfs_ecstore::api::bucket::lifecycle` paths;
+- add focused tests for the moved contract and keep architecture guard coverage.
 
 The module-level inventory lives in
 `crates/ecstore/src/bucket/lifecycle/README.md`.

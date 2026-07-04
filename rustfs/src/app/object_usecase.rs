@@ -2017,7 +2017,7 @@ async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> O
         return None;
     };
 
-    let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
+    let obj_opts = lifecycle::object_opts_from_object_info(obj_info);
     let event = predict_lifecycle_expiration(&lifecycle_config, &obj_opts).await;
     debug!(
         bucket,
