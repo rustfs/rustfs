@@ -352,7 +352,7 @@ fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustf
             },
             namespace: None,
             mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
-            tls: None,
+            ..rustfs_kms::config::VaultTransitConfig::default()
         })),
         allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
         default_key_id: cfg.kms_default_key_id.clone(),
