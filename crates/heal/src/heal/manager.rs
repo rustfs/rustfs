@@ -588,7 +588,7 @@ fn is_recoverable_heal_error(err: &Error, error: &str) -> bool {
         Error::TaskTimeout | Error::TransientSkip { .. } => true,
         Error::Storage(err) => is_recoverable_storage_heal_error(err) || is_recoverable_heal_error_message(error),
         Error::Disk(err) => is_recoverable_disk_heal_error(err) || is_recoverable_heal_error_message(error),
-        Error::TaskExecutionFailed { .. } | Error::Io(_) | Error::IO(_) | Error::Anyhow(_) | Error::Other(_) => {
+        Error::TaskExecutionFailed { .. } | Error::Io(_) | Error::IO(_) | Error::Other(_) => {
             is_recoverable_heal_error_message(error)
         }
         _ => false,
