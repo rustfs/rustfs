@@ -446,7 +446,6 @@ static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 mod ctx;
 mod list;
 mod lock;
-#[path = "../metadata/set_disk.rs"]
 mod metadata;
 mod multipart;
 mod ops;
