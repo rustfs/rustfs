@@ -20,7 +20,7 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabl
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
-use crate::storage::s3_api::multipart::MAX_MULTIPART_PART_NUMBER;
+use crate::storage::storage_api::ecfs_extend_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
 use crate::storage::storage_api::ecfs_extend_consumer::contract::{
     bucket::{BucketOperations, BucketOptions},
     object::ObjectToDelete,
