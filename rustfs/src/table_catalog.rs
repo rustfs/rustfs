@@ -572,6 +572,7 @@ pub(crate) enum TableMaintenanceAuditActor {
 pub(crate) enum TableMaintenanceAuditAction {
     Planned,
     WorkerControl,
+    SchedulerControl,
     SchedulerQueued,
     SchedulerLeaseExpired,
     WorkerStarted,
@@ -5014,7 +5015,7 @@ where
             &mut report,
             control.now,
             TableMaintenanceAuditActor::Scheduler,
-            TableMaintenanceAuditAction::WorkerControl,
+            TableMaintenanceAuditAction::SchedulerControl,
             Some(control.reason.to_string()),
             None,
             None,
@@ -13672,7 +13673,7 @@ mod tests {
         assert_eq!(stored.job.status, TableMetadataMaintenanceJobStatus::Disabled);
         assert_eq!(
             stored.audit_events.last().map(|event| event.action.clone()),
-            Some(TableMaintenanceAuditAction::WorkerControl)
+            Some(TableMaintenanceAuditAction::SchedulerControl)
         );
         let scheduler = store
             .get_table_maintenance_scheduler_report_at(bucket, "sales", "orders", now)

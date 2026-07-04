@@ -360,7 +360,7 @@ struct TableMetadataMaintenanceRequest {
     commit_compaction: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TableMaintenanceSchedulerRunRequest {
     #[serde(default, rename = "scheduler-id")]
@@ -5267,7 +5267,7 @@ impl Operation for RunTableMaintenanceSchedulerHandler {
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
         ensure_table_bucket_enabled(&warehouse).await?;
-        let request = read_json_body::<TableMaintenanceSchedulerRunRequest>(req.input).await?;
+        let request = read_json_body_or_default::<TableMaintenanceSchedulerRunRequest>(req.input).await?;
         let store = table_catalog_store()?;
         let response = store
             .run_table_maintenance_scheduler_once(
@@ -6089,6 +6089,15 @@ mod tests {
     fn table_maintenance_scheduler_run_request_uses_stable_default_scheduler_id() {
         let request: TableMaintenanceSchedulerRunRequest =
             serde_json::from_value(serde_json::json!({})).expect("scheduler run request should parse");
+
+        assert_eq!(request.scheduler_id(), "rustfs-maintenance-scheduler");
+    }
+
+    #[tokio::test]
+    async fn table_maintenance_scheduler_run_request_empty_body_uses_default_scheduler_id() {
+        let request: TableMaintenanceSchedulerRunRequest = read_json_body_or_default(Body::empty())
+            .await
+            .expect("bodyless scheduler run should use the default scheduler id");
 
         assert_eq!(request.scheduler_id(), "rustfs-maintenance-scheduler");
     }
