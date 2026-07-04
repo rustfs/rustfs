@@ -23,10 +23,157 @@ pub mod bitrot {
 }
 
 pub mod bucket {
-    pub use crate::bucket::{
-        bandwidth, bucket_target_sys, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys, quota, replication,
-        tagging, target, utils, versioning, versioning_sys,
-    };
+    pub mod bandwidth {
+        pub mod monitor {
+            pub use crate::bucket::bandwidth::monitor::{BandwidthDetails, Monitor};
+        }
+    }
+
+    pub mod bucket_target_sys {
+        pub use crate::bucket::bucket_target_sys::{
+            AdvancedPutOptions, BucketTargetError, BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError,
+            TargetClient,
+        };
+    }
+
+    pub mod lifecycle {
+        pub mod bucket_lifecycle_audit {
+            pub use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+        }
+
+        pub mod bucket_lifecycle_ops {
+            pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
+                ExpiryState, LifecycleOps, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
+                apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
+                enqueue_transition_immediate, get_global_expiry_state, get_global_transition_state, init_background_expiry,
+                post_restore_opts, run_stale_multipart_upload_cleanup_once, validate_transition_tier,
+            };
+        }
+
+        pub mod evaluator {
+            pub use crate::bucket::lifecycle::evaluator::Evaluator;
+        }
+
+        #[allow(clippy::module_inception)]
+        pub mod lifecycle {
+            pub use crate::bucket::lifecycle::lifecycle::{
+                Event, ExpirationOptions, IlmAction, Lifecycle, LifecycleCalculate, ObjectOpts, RuleValidate,
+                TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time, object_opts_from_object_info,
+            };
+        }
+
+        pub mod rule {
+            pub use crate::bucket::lifecycle::rule::{Filter, NoncurrentVersionTransitionOps, TransitionOps};
+        }
+
+        pub mod tier_delete_journal {
+            pub use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
+        }
+
+        pub mod tier_last_day_stats {
+            pub use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
+        }
+
+        pub mod tier_sweeper {
+            pub use crate::bucket::lifecycle::tier_sweeper::{
+                Jentry, transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
+            };
+        }
+    }
+
+    pub mod metadata {
+        pub use crate::bucket::metadata::{
+            BUCKET_ACCELERATE_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_LOGGING_CONFIG,
+            BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
+            BUCKET_REPLICATION_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_SSECONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,
+            BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG, BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG,
+            BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata, OBJECT_LOCK_CONFIG,
+            load_bucket_metadata, table_catalog_path_hash,
+        };
+    }
+
+    pub mod metadata_sys {
+        pub use crate::bucket::metadata_sys::{
+            BucketMetadataSys, delete, get, get_accelerate_config, get_bucket_policy, get_bucket_policy_raw,
+            get_bucket_targets_config, get_config_from_disk, get_cors_config, get_global_bucket_metadata_sys,
+            get_lifecycle_config, get_logging_config, get_notification_config, get_object_lock_config,
+            get_public_access_block_config, get_quota_config, get_replication_config, get_request_payment_config, get_sse_config,
+            get_tagging_config, get_versioning_config, get_website_config, init_bucket_metadata_sys, list_bucket_targets,
+            set_bucket_metadata, update,
+        };
+    }
+
+    pub mod migration {
+        pub use crate::bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config};
+    }
+
+    pub mod object_lock {
+        pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
+
+        pub mod objectlock {
+            pub use crate::bucket::object_lock::objectlock::{get_object_legalhold_meta, get_object_retention_meta};
+        }
+
+        pub mod objectlock_sys {
+            pub use crate::bucket::object_lock::objectlock_sys::{
+                BucketObjectLockSys, ObjectLockBlockReason, add_years, check_object_lock_for_deletion,
+                check_retention_for_modification, is_retention_active,
+            };
+        }
+    }
+
+    pub mod policy_sys {
+        pub use crate::bucket::policy_sys::PolicySys;
+    }
+
+    pub mod quota {
+        pub use crate::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
+
+        pub mod checker {
+            pub use crate::bucket::quota::checker::QuotaChecker;
+        }
+    }
+
+    pub mod replication {
+        pub use crate::bucket::replication::{
+            BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, MustReplicateOptions,
+            ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationConfig,
+            ReplicationConfigurationExt, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource,
+            ReplicationHealQueueResult, ReplicationObjectBridge, ReplicationObjectIO, ReplicationOperation, ReplicationPoolTrait,
+            ReplicationPriority, ReplicationQueueAdmission, ReplicationScannerBridge, ReplicationState, ReplicationStats,
+            ReplicationStatusType, ReplicationStorage, ReplicationTargetValidationError, ReplicationType, ResyncOpts,
+            ResyncStatusType, TargetReplicationResyncStatus, VersionPurgeStatusType, delete_replication_state_from_config,
+            delete_replication_version_id, get_global_replication_pool, get_global_replication_stats,
+            init_background_replication, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
+            replication_target_arns, should_remove_replication_target, should_schedule_delete_replication,
+            should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+            validate_replication_config_target_arns, version_purge_status_to_filemeta,
+        };
+    }
+
+    pub mod tagging {
+        pub use crate::bucket::tagging::{decode_tags, decode_tags_to_map, encode_tags};
+    }
+
+    pub mod target {
+        pub use crate::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials, LatencyStat};
+    }
+
+    pub mod utils {
+        pub use crate::bucket::utils::{
+            check_bucket_and_object_names, check_list_objs_args, check_object_name_for_length_and_slash,
+            check_valid_bucket_name_strict, deserialize, has_bad_path_component, is_meta_bucketname, is_valid_object_prefix,
+            serialize,
+        };
+    }
+
+    pub mod versioning {
+        pub use crate::bucket::versioning::VersioningApi;
+    }
+
+    pub mod versioning_sys {
+        pub use crate::bucket::versioning_sys::BucketVersioningSys;
+    }
 }
 
 pub mod cache {
@@ -42,7 +189,25 @@ pub mod capacity {
 }
 
 pub mod client {
-    pub use crate::client::{admin_handler_utils, api_put_object, object_api_utils, transition_api};
+    pub mod admin_handler_utils {
+        pub use crate::client::admin_handler_utils::AdminError;
+    }
+
+    pub mod api_put_object {
+        pub use crate::client::api_put_object::{AdvancedPutOptions, PutObjectOptions};
+    }
+
+    pub mod object_api_utils {
+        pub use crate::client::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
+    }
+
+    pub mod transition_api {
+        pub use crate::client::transition_api::{
+            BucketLookupType, CreateBucketConfiguration, LocationConstraint, ObjectInfo, ObjectMultipartInfo, Options,
+            PutObjectPartOptions, ReadCloser, ReaderImpl, RequestMetadata, RestoreInfo, SendRequest, TransitionClient,
+            TransitionCore, UploadInfo, to_object_info,
+        };
+    }
 }
 
 pub mod cluster {
@@ -61,9 +226,26 @@ pub mod compression {
 }
 
 pub mod config {
+    pub mod com {
+        pub use crate::config::com::{
+            COMMA_SEPARATED_LISTS, CONFIG_PREFIX, ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS,
+            ServerConfigCorruptError, delete_config, is_server_config_corrupt_error, lookup_configs, read_config,
+            read_config_no_lock, read_config_with_metadata, read_config_without_migrate, save_config, save_config_with_opts,
+            save_server_config, try_migrate_server_config,
+        };
+    }
+
+    pub mod storageclass {
+        pub use crate::config::storageclass::{
+            CLASS_RRS, CLASS_STANDARD, Config, DEEP_ARCHIVE, DEFAULT_INLINE_BLOCK, DEFAULT_KVS, DEFAULT_RRS_PARITY,
+            EXPRESS_ONEZONE, GLACIER, GLACIER_IR, INLINE_BLOCK, INLINE_BLOCK_ENV, INTELLIGENT_TIERING, MIN_PARITY_DRIVES,
+            ONEZONE_IA, OPTIMIZE, OPTIMIZE_ENV, OUTPOSTS, RRS, RRS_ENV, SCHEME_PREFIX, SNOW, STANDARD, STANDARD_ENV, STANDARD_IA,
+            StorageClass, default_parity_count, lookup_config, parse_storage_class, validate_parity, validate_parity_inner,
+        };
+    }
+
     pub use crate::config::{
-        RUSTFS_CONFIG_PREFIX, com, init, init_global_config_sys, set_global_storage_class, storageclass,
-        try_migrate_server_config,
+        RUSTFS_CONFIG_PREFIX, init, init_global_config_sys, set_global_storage_class, try_migrate_server_config,
     };
 }
 
@@ -79,9 +261,6 @@ pub mod data_usage {
 
 pub mod disk {
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
-    pub use crate::disk::endpoint::Endpoint;
-    pub use crate::disk::error::DiskError;
-    pub use crate::disk::error_reduce::is_all_buckets_not_found;
     pub use crate::disk::local::ScanGuard;
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
@@ -90,8 +269,26 @@ pub mod disk {
         ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
         validate_batch_read_version_item_count,
     };
-    pub use crate::disk::{endpoint, error, error_reduce};
     pub use bytes::Bytes;
+    pub use endpoint::Endpoint;
+    pub use error::DiskError;
+    pub use error_reduce::is_all_buckets_not_found;
+
+    pub mod endpoint {
+        pub use crate::layout::endpoint::{Endpoint, EndpointType};
+    }
+
+    pub mod error {
+        pub use crate::disk::error::{BitrotErrorType, DiskError, Error, FileAccessDeniedWithContext, Result};
+    }
+
+    pub mod error_reduce {
+        pub use crate::disk::error_reduce::{
+            BASE_IGNORED_ERRS, BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, WriteQuorumFailureSummary,
+            build_write_quorum_failure_summary, count_errs, count_retryable_failures, is_all_buckets_not_found, is_ignored_err,
+            reduce_errs, reduce_quorum_errs, reduce_read_quorum_errs, reduce_write_quorum_errs,
+        };
+    }
 }
 
 pub mod error {
@@ -189,5 +386,36 @@ pub mod storage {
 }
 
 pub mod tier {
-    pub use crate::services::tier::{tier, tier_admin, tier_config, tier_handlers, warm_backend};
+    #[allow(clippy::module_inception)]
+    pub mod tier {
+        pub use crate::services::tier::tier::{
+            ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_INVALID_CONFIG, ERR_TIER_MISSING_CREDENTIALS,
+            ERR_TIER_TYPE_UNSUPPORTED, TIER_CONFIG_FILE, TIER_CONFIG_FORMAT, TIER_CONFIG_V1, TIER_CONFIG_VERSION, TierConfigMgr,
+            is_err_config_not_found, try_migrate_tiering_config,
+        };
+    }
+
+    pub mod tier_admin {
+        pub use crate::services::tier::tier_admin::TierCreds;
+    }
+
+    pub mod tier_config {
+        pub use crate::services::tier::tier_config::{
+            ServicePrincipalAuth, TierAliyun, TierAzure, TierConfig, TierGCS, TierHuaweicloud, TierMinIO, TierR2, TierRustFS,
+            TierS3, TierTencent, TierType,
+        };
+    }
+
+    pub mod tier_handlers {
+        pub use crate::services::tier::tier_handlers::{
+            ERR_TIER_ALREADY_EXISTS, ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS,
+            ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR, ERR_TIER_RESERVED_NAME,
+        };
+    }
+
+    pub mod warm_backend {
+        pub use crate::services::tier::warm_backend::{
+            WarmBackend, WarmBackendGetOpts, WarmBackendImpl, build_transition_put_options, check_warm_backend, new_warm_backend,
+        };
+    }
 }

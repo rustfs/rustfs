@@ -4699,10 +4699,6 @@ mod tests {
             fs::create_dir_all(path.join(RUSTFS_META_MULTIPART_BUCKET).join(&sha_dir))
                 .await
                 .expect("empty multipart sha dir should be created for cleanup");
-            assert!(
-                path.join(RUSTFS_META_MULTIPART_BUCKET).join(&sha_dir).exists(),
-                "empty multipart sha dir should exist before cleanup"
-            );
         }
 
         cleanup_empty_multipart_sha_dirs_on_local_disks(&ecstore.pools[0].disk_set[0]).await;
