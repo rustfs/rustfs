@@ -529,22 +529,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
 
         let access_key = config.access_key.clone();
         let secret_key = config.secret_key.clone();
-
-        b.set_auth(IAMAuth::new(access_key, secret_key));
-        b.set_access(store);
-        b.set_route(admin::make_admin_route(config.console_enable)?);
-
-        // Normalize leading/duplicate forward slashes in object keys (MinIO parity).
-        // AWS S3 accepts keys such as "/foo/bar"; without this, requests like
-        // `PUT /bucket//foo/bar` are rejected downstream with InvalidArgument
-        // (ObjectNamePrefixAsSlash, issue #2427). MinIO collapses these slashes instead of preserving them,
-        // so `//foo/bar` is stored and served as `foo/bar`.
-        let mut s3_config = S3Config::default();
-        s3_config.normalize_forward_slash_path = true;
-        b.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
-
-        // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
-        if !config.server_domains.is_empty() && !config.console_enable {
+        let host_domain_sets = if !config.server_domains.is_empty() && !config.console_enable {
             MultiDomain::new(&config.server_domains).map_err(Error::other)?; // validate domains
 
             // add the default port number to the given server domains
@@ -558,6 +543,34 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                 }
             }
 
+            Some(domain_sets)
+        } else {
+            None
+        };
+        let metadata_route_host = host_domain_sets
+            .as_ref()
+            .map(MultiDomain::new)
+            .transpose()
+            .map_err(Error::other)?;
+
+        b.set_auth(IAMAuth::new(access_key, secret_key));
+        b.set_access(store);
+        b.set_route(storage::metadata_route::with_metadata_route(
+            admin::make_admin_route(config.console_enable)?,
+            metadata_route_host,
+        ));
+
+        // Normalize leading/duplicate forward slashes in object keys (MinIO parity).
+        // AWS S3 accepts keys such as "/foo/bar"; without this, requests like
+        // `PUT /bucket//foo/bar` are rejected downstream with InvalidArgument
+        // (ObjectNamePrefixAsSlash, issue #2427). MinIO collapses these slashes instead of preserving them,
+        // so `//foo/bar` is stored and served as `foo/bar`.
+        let mut s3_config = S3Config::default();
+        s3_config.normalize_forward_slash_path = true;
+        b.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
+
+        // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
+        if let Some(domain_sets) = host_domain_sets {
             info!(
                 event = EVENT_HTTP_HOST_ROUTING,
                 component = LOG_COMPONENT_SERVER,
@@ -567,7 +580,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
                 domains = ?domain_sets,
                 "Virtual-hosted-style routing configured"
             );
-            b.set_host(MultiDomain::new(domain_sets).map_err(Error::other)?);
+            b.set_host(MultiDomain::new(&domain_sets).map_err(Error::other)?);
         }
 
         b.build()

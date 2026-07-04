@@ -99,6 +99,15 @@ pub(crate) mod server {
             pub(crate) type FS = crate::storage::storage_api::FS;
         }
 
+        pub(crate) mod metadata_route {
+            pub(crate) fn with_metadata_route<A>(admin: A, host: Option<s3s::host::MultiDomain>) -> impl s3s::route::S3Route
+            where
+                A: s3s::route::S3Route,
+            {
+                crate::app::metadata_route::with_metadata_route(admin, host)
+            }
+        }
+
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::{
                 RequestContext, extract_request_id_from_headers,
