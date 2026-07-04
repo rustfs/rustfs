@@ -12,12 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::ctx::SetDisksCtx;
 use super::*;
 
 impl SetDisks {
     #[tracing::instrument(skip(self))]
     pub async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
-        let disks = self.disks.read().await;
+        ListOperations::new(self.ctx()).delete_all(bucket, prefix).await
+    }
+}
+
+/// List/prefix maintenance operations, borrowing the `SetDisks` core state
+/// through [`SetDisksCtx`].
+///
+/// First validation of the borrow pattern for the SetDisks split (#816). The
+/// behavior here is byte-for-byte identical to the previous inherent
+/// `SetDisks::delete_all`; only state access moves from `self` to the borrow
+/// handle.
+pub(crate) struct ListOperations<'a> {
+    ctx: SetDisksCtx<'a>,
+}
+
+impl<'a> ListOperations<'a> {
+    pub(crate) fn new(ctx: SetDisksCtx<'a>) -> Self {
+        Self { ctx }
+    }
+
+    pub(crate) async fn delete_all(&self, bucket: &str, prefix: &str) -> Result<()> {
+        let disks = self.ctx.disks().read().await;
 
         let disks = disks.clone();
 

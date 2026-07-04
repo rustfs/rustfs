@@ -515,6 +515,7 @@ pub(crate) struct TableMaintenanceEffectiveConfig {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableMaintenanceSchedulerStatus {
     Ready,
+    Queued,
     Disabled,
     Paused,
     Backpressured,
@@ -544,6 +545,12 @@ pub(crate) struct TableMaintenanceSchedulerReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMaintenanceSchedulerRunResult {
+    pub report: TableMetadataMaintenanceReport,
+    pub scheduler: TableMaintenanceSchedulerReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableMaintenanceSchedulerQuarantineBoundary {
     pub enabled: bool,
     pub active: bool,
@@ -565,6 +572,9 @@ pub(crate) enum TableMaintenanceAuditActor {
 pub(crate) enum TableMaintenanceAuditAction {
     Planned,
     WorkerControl,
+    SchedulerControl,
+    SchedulerQueued,
+    SchedulerLeaseExpired,
     WorkerStarted,
     WorkerHeartbeat,
     WorkerLeaseExpired,
@@ -623,6 +633,10 @@ pub(crate) struct TableMaintenanceSchedulerJobSummary {
     pub job_id: String,
     pub operation: TableMetadataMaintenanceOperation,
     pub status: TableMetadataMaintenanceJobStatus,
+    #[serde(default, rename = "scheduler-id")]
+    pub scheduler_id: Option<String>,
+    #[serde(default, rename = "scheduled-at")]
+    pub scheduled_at: Option<String>,
     pub worker_id: Option<String>,
     pub attempt: u16,
     pub started_at: Option<String>,
@@ -651,6 +665,12 @@ pub(crate) struct TableMetadataMaintenanceJob {
     pub recommended_actions: Vec<TableMaintenanceRecommendedAction>,
     #[serde(default)]
     pub config_source: TableMaintenanceConfigSource,
+    #[serde(default, rename = "scheduler-id")]
+    pub scheduler_id: Option<String>,
+    #[serde(default, rename = "scheduler-lease-id")]
+    pub scheduler_lease_id: String,
+    #[serde(default, rename = "scheduled-at")]
+    pub scheduled_at: Option<String>,
     #[serde(default)]
     pub worker_id: Option<String>,
     #[serde(default)]
@@ -973,6 +993,7 @@ pub(crate) enum TableMetadataMaintenanceOperation {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableMetadataMaintenanceJobStatus {
     NotYetRun,
+    Queued,
     Running,
     #[default]
     Successful,
@@ -985,6 +1006,7 @@ pub(crate) enum TableMetadataMaintenanceJobStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableMaintenanceRecommendedAction {
     NoActionRequired,
+    RunMaintenanceWorker,
     ReviewAndRunDelete,
     ReviewQuarantine,
     EnableDelete,
@@ -1079,7 +1101,26 @@ struct TableMaintenanceWorkerControlReport<'a> {
     now: OffsetDateTime,
 }
 
+struct TableMaintenanceSchedulerControlReport<'a> {
+    table_bucket: &'a str,
+    namespace: &'a str,
+    table: &'a str,
+    scheduler_id: String,
+    effective: &'a TableMaintenanceEffectiveConfig,
+    status: TableMetadataMaintenanceJobStatus,
+    reason: &'a str,
+    now: OffsetDateTime,
+}
+
 enum TableMaintenanceWorkerPreflight {
+    Ready {
+        effective: TableMaintenanceEffectiveConfig,
+        queued: Option<Box<TableMetadataMaintenanceReport>>,
+    },
+    Complete(Box<TableMetadataMaintenanceReport>),
+}
+
+enum TableMaintenanceSchedulerPreflight {
     Ready(TableMaintenanceEffectiveConfig),
     Complete(Box<TableMetadataMaintenanceReport>),
 }
@@ -4213,6 +4254,12 @@ where
             push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::WaitForActiveWorker);
             TableMaintenanceSchedulerStatus::Backpressured
         } else if let Some(current) = current.as_ref()
+            && matches!(current.job.status, TableMetadataMaintenanceJobStatus::Queued)
+            && table_maintenance_scheduler_lease_is_active(&current.job, effective.config.worker_lease_timeout_seconds, now)
+        {
+            push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::RunMaintenanceWorker);
+            TableMaintenanceSchedulerStatus::Queued
+        } else if let Some(current) = current.as_ref()
             && table_maintenance_job_retry_is_pending(&current.job, now)
         {
             push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::WaitForRetryBackoff);
@@ -4245,6 +4292,130 @@ where
             quarantine,
             audit_timeline: reports.iter().map(table_maintenance_scheduler_job_summary).collect(),
         })
+    }
+
+    pub(crate) async fn run_table_maintenance_scheduler_once(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        scheduler_id: String,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
+        self.run_table_maintenance_scheduler_once_at(table_bucket, namespace, table, scheduler_id, OffsetDateTime::now_utc())
+            .await
+    }
+
+    async fn run_table_maintenance_scheduler_once_at(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        scheduler_id: String,
+        now: OffsetDateTime,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let namespace_name = namespace.public_name();
+        let table_name = table.as_str().to_string();
+
+        let effective = {
+            let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+            match self
+                .table_metadata_maintenance_scheduler_preflight(table_bucket, &namespace_name, &table_name, &scheduler_id, now)
+                .await?
+            {
+                TableMaintenanceSchedulerPreflight::Ready(effective) => effective,
+                TableMaintenanceSchedulerPreflight::Complete(report) => {
+                    let scheduler = self
+                        .get_table_maintenance_scheduler_report_at(table_bucket, &namespace_name, &table_name, now)
+                        .await?;
+                    return Ok(TableMaintenanceSchedulerRunResult {
+                        report: *report,
+                        scheduler,
+                    });
+                }
+            }
+        };
+
+        let mut report = self
+            .plan_table_metadata_maintenance(
+                table_bucket,
+                &namespace_name,
+                &table_name,
+                effective.config.retain_recent_metadata_files,
+            )
+            .await?;
+
+        let report = {
+            let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+            match self
+                .table_metadata_maintenance_scheduler_preflight(table_bucket, &namespace_name, &table_name, &scheduler_id, now)
+                .await?
+            {
+                TableMaintenanceSchedulerPreflight::Ready(effective) => {
+                    if report.job.retain_recent_metadata_files != effective.config.retain_recent_metadata_files {
+                        return Err(TableCatalogStoreError::Conflict(
+                            "maintenance config changed before scheduler claim".to_string(),
+                        ));
+                    }
+                    let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
+                        return Err(TableCatalogStoreError::NotFound(format!(
+                            "table {}/{}/{}",
+                            table_bucket, namespace_name, table_name
+                        )));
+                    };
+                    if entry.metadata_location != report.current_metadata_location {
+                        return Err(TableCatalogStoreError::Conflict(
+                            "current metadata location changed before maintenance scheduler claim".to_string(),
+                        ));
+                    }
+
+                    let before_status = Some(report.job.status.clone());
+                    let before_quarantined_object_count = Some(report.job.quarantined_object_count);
+                    let scheduled_at = maintenance_timestamp(now);
+                    report.job.operation = if effective.config.delete_enabled {
+                        TableMetadataMaintenanceOperation::Delete
+                    } else {
+                        TableMetadataMaintenanceOperation::DryRun
+                    };
+                    report.job.status = TableMetadataMaintenanceJobStatus::Queued;
+                    report.job.failure_reason = None;
+                    report.job.config_source = effective.source;
+                    report.job.scheduler_id = Some(scheduler_id);
+                    report.job.scheduler_lease_id = Uuid::new_v4().to_string();
+                    report.job.scheduled_at = Some(scheduled_at);
+                    report.job.worker_id = None;
+                    report.job.lease_id = String::new();
+                    report.job.attempt = 0;
+                    report.job.max_retry_attempts = effective.config.max_retry_attempts;
+                    report.job.next_retry_after = None;
+                    report.job.quarantine_enabled = effective.config.quarantine_enabled;
+                    report.job.quarantine_retention_seconds = effective.config.quarantine_retention_seconds;
+                    report.job.heartbeat_at = None;
+                    report.job.started_at = None;
+                    report.job.finished_at = None;
+                    refresh_table_maintenance_report_recommended_actions(&mut report);
+                    push_table_maintenance_audit_event(
+                        &mut report,
+                        now,
+                        TableMaintenanceAuditActor::Scheduler,
+                        TableMaintenanceAuditAction::SchedulerQueued,
+                        None,
+                        before_status,
+                        before_quarantined_object_count,
+                    );
+                    self.put_table_metadata_maintenance_report(&report).await?;
+                    report
+                }
+                TableMaintenanceSchedulerPreflight::Complete(report) => *report,
+            }
+        };
+
+        let scheduler = self
+            .get_table_maintenance_scheduler_report_at(table_bucket, &namespace_name, &table_name, now)
+            .await?;
+        Ok(TableMaintenanceSchedulerRunResult { report, scheduler })
     }
 
     pub(crate) async fn apply_table_maintenance_quarantine_operation(
@@ -4379,6 +4550,82 @@ where
         Ok(reports)
     }
 
+    async fn table_metadata_maintenance_scheduler_preflight(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        scheduler_id: &str,
+        now: OffsetDateTime,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerPreflight> {
+        let effective = self
+            .get_effective_table_maintenance_config(table_bucket, namespace, table)
+            .await?;
+        if !effective.config.background_enabled {
+            let report = self
+                .put_table_metadata_maintenance_scheduler_control_report(TableMaintenanceSchedulerControlReport {
+                    table_bucket,
+                    namespace,
+                    table,
+                    scheduler_id: scheduler_id.to_string(),
+                    effective: &effective,
+                    status: TableMetadataMaintenanceJobStatus::Disabled,
+                    reason: "background maintenance is disabled",
+                    now,
+                })
+                .await?;
+            return Ok(TableMaintenanceSchedulerPreflight::Complete(Box::new(report)));
+        }
+        if effective.config.worker_paused {
+            let report = self
+                .put_table_metadata_maintenance_scheduler_control_report(TableMaintenanceSchedulerControlReport {
+                    table_bucket,
+                    namespace,
+                    table,
+                    scheduler_id: scheduler_id.to_string(),
+                    effective: &effective,
+                    status: TableMetadataMaintenanceJobStatus::Paused,
+                    reason: "background maintenance worker is paused",
+                    now,
+                })
+                .await?;
+            return Ok(TableMaintenanceSchedulerPreflight::Complete(Box::new(report)));
+        }
+
+        if let Some(current) = self
+            .get_table_metadata_maintenance_report(table_bucket, namespace, table, MAINTENANCE_JOB_ALIAS_CURRENT)
+            .await?
+        {
+            if matches!(current.job.status, TableMetadataMaintenanceJobStatus::Running) {
+                if table_maintenance_job_lease_is_active(&current.job, effective.config.worker_lease_timeout_seconds, now) {
+                    return Ok(TableMaintenanceSchedulerPreflight::Complete(Box::new(current)));
+                }
+                self.expire_table_maintenance_job(
+                    current,
+                    now,
+                    "maintenance worker lease expired",
+                    TableMaintenanceAuditAction::WorkerLeaseExpired,
+                )
+                .await?;
+            } else if matches!(current.job.status, TableMetadataMaintenanceJobStatus::Queued) {
+                if table_maintenance_scheduler_lease_is_active(&current.job, effective.config.worker_lease_timeout_seconds, now) {
+                    return Ok(TableMaintenanceSchedulerPreflight::Complete(Box::new(current)));
+                }
+                self.expire_table_maintenance_job(
+                    current,
+                    now,
+                    "maintenance scheduler lease expired",
+                    TableMaintenanceAuditAction::SchedulerLeaseExpired,
+                )
+                .await?;
+            } else if table_maintenance_job_retry_is_pending(&current.job, now) {
+                return Ok(TableMaintenanceSchedulerPreflight::Complete(Box::new(current)));
+            }
+        }
+
+        Ok(TableMaintenanceSchedulerPreflight::Ready(effective))
+    }
+
     pub(crate) async fn run_table_metadata_maintenance_worker_once(
         &self,
         table_bucket: &str,
@@ -4404,35 +4651,46 @@ where
         let namespace_name = namespace.public_name();
         let table_name = table.as_str().to_string();
 
-        let effective = {
+        let (effective, queued) = {
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
             match self
                 .table_metadata_maintenance_worker_preflight(table_bucket, &namespace_name, &table_name, &worker_id, now)
                 .await?
             {
-                TableMaintenanceWorkerPreflight::Ready(effective) => effective,
+                TableMaintenanceWorkerPreflight::Ready { effective, queued } => (effective, queued),
                 TableMaintenanceWorkerPreflight::Complete(report) => return Ok(*report),
             }
         };
 
-        let mut report = self
-            .plan_table_metadata_maintenance(
+        let mut report = if let Some(queued) = queued {
+            *queued
+        } else {
+            self.plan_table_metadata_maintenance(
                 table_bucket,
                 &namespace_name,
                 &table_name,
                 effective.config.retain_recent_metadata_files,
             )
-            .await?;
+            .await?
+        };
 
         let (report, effective, delete) = {
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
-            let effective = match self
+            let (effective, queued) = match self
                 .table_metadata_maintenance_worker_preflight(table_bucket, &namespace_name, &table_name, &worker_id, now)
                 .await?
             {
-                TableMaintenanceWorkerPreflight::Ready(effective) => effective,
+                TableMaintenanceWorkerPreflight::Ready { effective, queued } => (effective, queued),
                 TableMaintenanceWorkerPreflight::Complete(report) => return Ok(*report),
             };
+            if let Some(queued) = queued {
+                if queued.job.job_id != report.job.job_id {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "queued maintenance job changed before worker claim".to_string(),
+                    ));
+                }
+                report = *queued;
+            }
 
             if report.job.retain_recent_metadata_files != effective.config.retain_recent_metadata_files {
                 return Err(TableCatalogStoreError::Conflict(
@@ -4451,12 +4709,17 @@ where
                 ));
             }
 
+            let was_queued_claim = matches!(report.job.status, TableMetadataMaintenanceJobStatus::Queued);
+            let before_status = Some(report.job.status.clone());
+            let before_quarantined_object_count = Some(report.job.quarantined_object_count);
             let started_at = maintenance_timestamp(now);
-            report.job.operation = if effective.config.delete_enabled {
-                TableMetadataMaintenanceOperation::Delete
-            } else {
-                TableMetadataMaintenanceOperation::DryRun
-            };
+            if !was_queued_claim {
+                report.job.operation = if effective.config.delete_enabled {
+                    TableMetadataMaintenanceOperation::Delete
+                } else {
+                    TableMetadataMaintenanceOperation::DryRun
+                };
+            }
             report.job.status = TableMetadataMaintenanceJobStatus::Running;
             report.job.failure_reason = None;
             report.job.config_source = effective.source;
@@ -4477,12 +4740,12 @@ where
                 TableMaintenanceAuditActor::Worker,
                 TableMaintenanceAuditAction::WorkerStarted,
                 None,
-                Some(TableMetadataMaintenanceJobStatus::Successful),
-                Some(0),
+                before_status,
+                before_quarantined_object_count,
             );
             self.put_table_metadata_maintenance_report(&report).await?;
 
-            let delete = effective.config.delete_enabled;
+            let delete = matches!(report.job.operation, TableMetadataMaintenanceOperation::Delete);
             (report, effective, delete)
         };
 
@@ -4540,29 +4803,33 @@ where
                 if table_maintenance_job_lease_is_active(&current.job, effective.config.worker_lease_timeout_seconds, now) {
                     return Ok(TableMaintenanceWorkerPreflight::Complete(Box::new(current)));
                 }
-                let mut expired = current;
-                let before_status = Some(expired.job.status.clone());
-                let before_quarantined_object_count = Some(expired.job.quarantined_object_count);
-                expired.job.status = TableMetadataMaintenanceJobStatus::Failed;
-                expired.job.failure_reason = Some("maintenance worker lease expired".to_string());
-                expired.job.finished_at = Some(maintenance_timestamp(now));
-                refresh_table_maintenance_report_recommended_actions(&mut expired);
-                push_table_maintenance_audit_event(
-                    &mut expired,
+                self.expire_table_maintenance_job(
+                    current,
                     now,
-                    TableMaintenanceAuditActor::Scheduler,
+                    "maintenance worker lease expired",
                     TableMaintenanceAuditAction::WorkerLeaseExpired,
-                    Some("maintenance worker lease expired".to_string()),
-                    before_status,
-                    before_quarantined_object_count,
-                );
-                self.put_table_metadata_maintenance_report(&expired).await?;
+                )
+                .await?;
+            } else if matches!(current.job.status, TableMetadataMaintenanceJobStatus::Queued) {
+                if table_maintenance_scheduler_lease_is_active(&current.job, effective.config.worker_lease_timeout_seconds, now) {
+                    return Ok(TableMaintenanceWorkerPreflight::Ready {
+                        effective,
+                        queued: Some(Box::new(current)),
+                    });
+                }
+                self.expire_table_maintenance_job(
+                    current,
+                    now,
+                    "maintenance scheduler lease expired",
+                    TableMaintenanceAuditAction::SchedulerLeaseExpired,
+                )
+                .await?;
             } else if table_maintenance_job_retry_is_pending(&current.job, now) {
                 return Ok(TableMaintenanceWorkerPreflight::Complete(Box::new(current)));
             }
         }
 
-        Ok(TableMaintenanceWorkerPreflight::Ready(effective))
+        Ok(TableMaintenanceWorkerPreflight::Ready { effective, queued: None })
     }
 
     pub(crate) async fn heartbeat_table_metadata_maintenance_job(
@@ -4643,6 +4910,120 @@ where
         Ok(report)
     }
 
+    async fn expire_table_maintenance_job(
+        &self,
+        mut report: TableMetadataMaintenanceReport,
+        now: OffsetDateTime,
+        reason: &str,
+        action: TableMaintenanceAuditAction,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let before_status = Some(report.job.status.clone());
+        let before_quarantined_object_count = Some(report.job.quarantined_object_count);
+        report.job.status = TableMetadataMaintenanceJobStatus::Failed;
+        report.job.failure_reason = Some(reason.to_string());
+        report.job.finished_at = Some(maintenance_timestamp(now));
+        refresh_table_maintenance_report_recommended_actions(&mut report);
+        push_table_maintenance_audit_event(
+            &mut report,
+            now,
+            TableMaintenanceAuditActor::Scheduler,
+            action,
+            Some(reason.to_string()),
+            before_status,
+            before_quarantined_object_count,
+        );
+        self.put_table_metadata_maintenance_report(&report).await?;
+        Ok(report)
+    }
+
+    async fn put_table_metadata_maintenance_scheduler_control_report(
+        &self,
+        control: TableMaintenanceSchedulerControlReport<'_>,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let namespace = parse_namespace_for_store(control.namespace)?;
+        let table = parse_table_for_store(control.table)?;
+        let table_path = self.paths.table_entry_path(control.table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                control.table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        let timestamp = maintenance_timestamp(control.now);
+        let cleanup_watermark_unix_seconds =
+            (control.now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS)).unix_timestamp();
+        let current_metadata_location = entry.metadata_location.clone();
+        let report = TableMetadataMaintenanceReport {
+            job: TableMetadataMaintenanceJob {
+                job_id: Uuid::new_v4().to_string(),
+                table_bucket: control.table_bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                table_id: entry.table_id,
+                operation: TableMetadataMaintenanceOperation::DryRun,
+                status: control.status,
+                failure_reason: Some(control.reason.to_string()),
+                recommended_actions: Vec::new(),
+                config_source: control.effective.source,
+                scheduler_id: Some(control.scheduler_id),
+                scheduler_lease_id: String::new(),
+                scheduled_at: Some(timestamp.clone()),
+                worker_id: None,
+                lease_id: String::new(),
+                attempt: 0,
+                max_retry_attempts: control.effective.config.max_retry_attempts,
+                next_retry_after: None,
+                quarantine_enabled: control.effective.config.quarantine_enabled,
+                quarantine_retention_seconds: control.effective.config.quarantine_retention_seconds,
+                heartbeat_at: None,
+                started_at: None,
+                finished_at: Some(timestamp),
+                current_metadata_location: current_metadata_location.clone(),
+                current_generation: entry.generation,
+                retain_recent_metadata_files: control.effective.config.retain_recent_metadata_files,
+                safety_window_seconds: TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS,
+                cleanup_watermark_unix_seconds,
+                planned_metadata_file_count: 0,
+                retained_metadata_file_count: 0,
+                cleanup_candidate_count: 0,
+                deletable_metadata_file_count: 0,
+                deleted_metadata_file_count: 0,
+                planned_object_file_count: 0,
+                cleanup_candidate_object_count: 0,
+                deletable_object_count: 0,
+                deleted_object_count: 0,
+                quarantined_object_count: 0,
+            },
+            current_metadata_location,
+            retained_metadata_locations: Vec::new(),
+            cleanup_candidate_locations: Vec::new(),
+            deletable_metadata_locations: Vec::new(),
+            cleanup_object_candidate_locations: Vec::new(),
+            deletable_object_locations: Vec::new(),
+            object_reports: Vec::new(),
+            object_cleanup_reports: Vec::new(),
+            referenced_object_reports: Vec::new(),
+            reachability_graph: TableMaintenanceReachabilityGraphReport::default(),
+            snapshot_expiration: None,
+            compaction: None,
+            audit_events: Vec::new(),
+        };
+        let mut report = table_maintenance_report_with_recommended_actions(report);
+        push_table_maintenance_audit_event(
+            &mut report,
+            control.now,
+            TableMaintenanceAuditActor::Scheduler,
+            TableMaintenanceAuditAction::SchedulerControl,
+            Some(control.reason.to_string()),
+            None,
+            None,
+        );
+        self.put_table_metadata_maintenance_report(&report).await?;
+        Ok(report)
+    }
+
     async fn put_table_metadata_maintenance_worker_control_report(
         &self,
         control: TableMaintenanceWorkerControlReport<'_>,
@@ -4674,6 +5055,9 @@ where
                 failure_reason: Some(control.reason.to_string()),
                 recommended_actions: Vec::new(),
                 config_source: control.effective.source,
+                scheduler_id: None,
+                scheduler_lease_id: String::new(),
+                scheduled_at: None,
                 worker_id: Some(control.worker_id),
                 lease_id: String::new(),
                 attempt: 0,
@@ -5430,6 +5814,9 @@ where
                 failure_reason: None,
                 recommended_actions: Vec::new(),
                 config_source: TableMaintenanceConfigSource::Default,
+                scheduler_id: None,
+                scheduler_lease_id: String::new(),
+                scheduled_at: None,
                 worker_id: None,
                 lease_id: String::new(),
                 attempt: 0,
@@ -6711,6 +7098,23 @@ where
             Self::ObjectBacked(store) => {
                 store
                     .get_table_maintenance_scheduler_report(table_bucket, namespace, table)
+                    .await
+            }
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance scheduler")),
+        }
+    }
+
+    pub(crate) async fn run_table_maintenance_scheduler_once(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        scheduler_id: String,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .run_table_maintenance_scheduler_once(table_bucket, namespace, table, scheduler_id)
                     .await
             }
             Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance scheduler")),
@@ -9471,6 +9875,9 @@ fn table_maintenance_recommended_actions(job: &TableMetadataMaintenanceJob) -> V
     let mut actions = Vec::new();
     match job.status {
         TableMetadataMaintenanceJobStatus::NotYetRun => {}
+        TableMetadataMaintenanceJobStatus::Queued => {
+            actions.push(TableMaintenanceRecommendedAction::RunMaintenanceWorker);
+        }
         TableMetadataMaintenanceJobStatus::Running => {
             actions.push(TableMaintenanceRecommendedAction::WaitForActiveWorker);
         }
@@ -9527,6 +9934,7 @@ fn table_maintenance_report_order_timestamp(report: &TableMetadataMaintenanceRep
         .clone()
         .or_else(|| report.job.heartbeat_at.clone())
         .or_else(|| report.job.started_at.clone())
+        .or_else(|| report.job.scheduled_at.clone())
         .unwrap_or_default()
 }
 
@@ -9535,6 +9943,8 @@ fn table_maintenance_scheduler_job_summary(report: &TableMetadataMaintenanceRepo
         job_id: report.job.job_id.clone(),
         operation: report.job.operation.clone(),
         status: report.job.status.clone(),
+        scheduler_id: report.job.scheduler_id.clone(),
+        scheduled_at: report.job.scheduled_at.clone(),
         worker_id: report.job.worker_id.clone(),
         attempt: report.job.attempt,
         started_at: report.job.started_at.clone(),
@@ -9571,6 +9981,18 @@ fn table_maintenance_report_with_recommended_actions(
 ) -> TableMetadataMaintenanceReport {
     refresh_table_maintenance_report_recommended_actions(&mut report);
     report
+}
+
+fn table_maintenance_scheduler_lease_is_active(
+    job: &TableMetadataMaintenanceJob,
+    scheduler_lease_timeout_seconds: u64,
+    now: OffsetDateTime,
+) -> bool {
+    let Some(scheduled_at) = job.scheduled_at.as_deref().and_then(parse_maintenance_timestamp) else {
+        return false;
+    };
+    let timeout_seconds = i64::try_from(scheduler_lease_timeout_seconds).unwrap_or(i64::MAX);
+    scheduled_at.saturating_add(Duration::seconds(timeout_seconds)) > now
 }
 
 fn table_maintenance_job_lease_is_active(
@@ -13172,6 +13594,376 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_scheduler_run_queues_one_durable_job() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    retain_recent_metadata_files: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+
+        let result = store
+            .run_table_maintenance_scheduler_once_at(bucket, "sales", "orders", "scheduler-a".to_string(), now)
+            .await
+            .expect("scheduler tick should queue maintenance");
+
+        assert_eq!(result.report.job.status, TableMetadataMaintenanceJobStatus::Queued);
+        assert_eq!(result.report.job.scheduler_id.as_deref(), Some("scheduler-a"));
+        assert!(!result.report.job.scheduler_lease_id.is_empty());
+        assert_eq!(result.report.job.retain_recent_metadata_files, 2);
+        assert_eq!(result.scheduler.status, TableMaintenanceSchedulerStatus::Queued);
+        assert_eq!(
+            result.scheduler.current_job.as_ref().map(|job| job.job_id.as_str()),
+            Some(result.report.job.job_id.as_str())
+        );
+        assert_eq!(
+            result.report.audit_events.last().map(|event| event.action.clone()),
+            Some(TableMaintenanceAuditAction::SchedulerQueued)
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_scheduler_run_persists_disabled_control_report() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+
+        let result = store
+            .run_table_maintenance_scheduler_once_at(bucket, "sales", "orders", "scheduler-a".to_string(), now)
+            .await
+            .expect("disabled scheduler tick should persist a control report");
+
+        assert_eq!(result.report.job.status, TableMetadataMaintenanceJobStatus::Disabled);
+        assert_eq!(result.report.job.scheduler_id.as_deref(), Some("scheduler-a"));
+        let stored = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", &result.report.job.job_id)
+            .await
+            .expect("scheduler control report lookup should succeed")
+            .expect("scheduler control report should be durable");
+        assert_eq!(stored.job.job_id, result.report.job.job_id);
+        assert_eq!(stored.job.status, TableMetadataMaintenanceJobStatus::Disabled);
+        assert_eq!(
+            stored.audit_events.last().map(|event| event.action.clone()),
+            Some(TableMaintenanceAuditAction::SchedulerControl)
+        );
+        let scheduler = store
+            .get_table_maintenance_scheduler_report_at(bucket, "sales", "orders", now)
+            .await
+            .expect("scheduler report should load");
+        assert_eq!(scheduler.audit_timeline.len(), 1);
+        assert_eq!(scheduler.audit_timeline[0].job_id, result.report.job.job_id);
+    }
+
+    #[tokio::test]
+    async fn maintenance_scheduler_run_reuses_active_queued_job() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    worker_lease_timeout_seconds: 300,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+
+        let first = store
+            .run_table_maintenance_scheduler_once_at(bucket, "sales", "orders", "scheduler-a".to_string(), now)
+            .await
+            .expect("first scheduler tick should queue maintenance");
+        let second = store
+            .run_table_maintenance_scheduler_once_at(
+                bucket,
+                "sales",
+                "orders",
+                "scheduler-b".to_string(),
+                now + Duration::seconds(30),
+            )
+            .await
+            .expect("second scheduler tick should reuse the queued job");
+
+        assert_eq!(second.report.job.job_id, first.report.job.job_id);
+        assert_eq!(second.report.job.scheduler_id.as_deref(), Some("scheduler-a"));
+        assert_eq!(second.report.job.status, TableMetadataMaintenanceJobStatus::Queued);
+        assert_eq!(second.scheduler.audit_timeline.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_claims_queued_job_before_running_it() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        let queued = store
+            .run_table_maintenance_scheduler_once_at(bucket, "sales", "orders", "scheduler-a".to_string(), now)
+            .await
+            .expect("scheduler tick should queue maintenance");
+
+        let finished = store
+            .run_table_metadata_maintenance_worker_once_at(
+                bucket,
+                "sales",
+                "orders",
+                "worker-a".to_string(),
+                now + Duration::seconds(10),
+            )
+            .await
+            .expect("worker tick should claim and finish the queued job");
+
+        assert_eq!(finished.job.job_id, queued.report.job.job_id);
+        assert_eq!(finished.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(finished.job.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(finished.job.attempt, 1);
+        assert_eq!(finished.job.scheduler_id.as_deref(), Some("scheduler-a"));
+        let actions = finished
+            .audit_events
+            .iter()
+            .map(|event| event.action.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                TableMaintenanceAuditAction::Planned,
+                TableMaintenanceAuditAction::SchedulerQueued,
+                TableMaintenanceAuditAction::WorkerStarted,
+                TableMaintenanceAuditAction::WorkerSucceeded,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_preserves_queued_dry_run_after_delete_is_enabled() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let table_root = format!("{}{}/", default_table_root_prefix(&namespace), table.as_str());
+        let manifest_list = format!("{metadata_dir}/snap-10.avro");
+        let manifest = format!("{metadata_dir}/manifest-10.avro");
+        let data_file = format!("{table_root}data/part-00001.parquet");
+        let orphan_data = format!("{table_root}data/orphan.parquet");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(bucket, &manifest, manifest_avro_bytes(&[(&data_file, 0)]))
+            .await;
+        backend.seed_object(bucket, &data_file, b"data".to_vec()).await;
+        backend.seed_object(bucket, &orphan_data, b"orphan-data".to_vec()).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 10,
+                            "manifest-list": manifest_list
+                        }
+                    ],
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 10,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    delete_enabled: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dry-run background maintenance config should persist");
+        let queued = store
+            .run_table_maintenance_scheduler_once_at(bucket, "sales", "orders", "scheduler-a".to_string(), now)
+            .await
+            .expect("scheduler tick should queue dry-run maintenance");
+        assert_eq!(queued.report.job.operation, TableMetadataMaintenanceOperation::DryRun);
+        assert_eq!(queued.report.job.deletable_object_count, 1);
+
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    delete_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete-enabled background maintenance config should persist");
+        let finished = store
+            .run_table_metadata_maintenance_worker_once_at(
+                bucket,
+                "sales",
+                "orders",
+                "worker-a".to_string(),
+                now + Duration::seconds(10),
+            )
+            .await
+            .expect("worker tick should preserve the queued dry-run operation");
+
+        assert_eq!(finished.job.job_id, queued.report.job.job_id);
+        assert_eq!(finished.job.operation, TableMetadataMaintenanceOperation::DryRun);
+        assert_eq!(finished.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(finished.job.deleted_object_count, 0);
+        assert!(backend.object_exists(bucket, &orphan_data).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maintenance_scheduler_run_recovers_expired_queued_job() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1000);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    worker_lease_timeout_seconds: 60,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        let first = store
+            .run_table_maintenance_scheduler_once_at(bucket, "sales", "orders", "scheduler-a".to_string(), now)
+            .await
+            .expect("first scheduler tick should queue maintenance");
+
+        let second = store
+            .run_table_maintenance_scheduler_once_at(
+                bucket,
+                "sales",
+                "orders",
+                "scheduler-b".to_string(),
+                now + Duration::seconds(120),
+            )
+            .await
+            .expect("scheduler tick should recover expired queued maintenance");
+
+        assert_ne!(second.report.job.job_id, first.report.job.job_id);
+        let expired = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", &first.report.job.job_id)
+            .await
+            .expect("expired queued job lookup should succeed")
+            .expect("expired queued job should remain addressable");
+        assert_eq!(expired.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert!(
+            expired
+                .job
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("scheduler lease expired"))
+        );
+        assert_eq!(
+            expired.audit_events.last().map(|event| event.action.clone()),
+            Some(TableMaintenanceAuditAction::SchedulerLeaseExpired)
+        );
+        assert_eq!(second.report.job.status, TableMetadataMaintenanceJobStatus::Queued);
+        assert_eq!(second.report.job.scheduler_id.as_deref(), Some("scheduler-b"));
+    }
+
+    #[tokio::test]
     async fn maintenance_scheduler_report_surfaces_active_backpressure_and_audit_timeline() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
@@ -16510,7 +17302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strong_catalog_backing_rolls_back_cache_when_persist_and_reload_fail() {
+    async fn strong_catalog_backing_does_not_publish_draft_when_persist_and_reload_fail() {
         let backend = TestCatalogObjectBackend::default();
         let store = StrongTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
