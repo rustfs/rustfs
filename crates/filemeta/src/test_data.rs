@@ -357,6 +357,70 @@ pub fn create_complex_xlmeta() -> Result<Vec<u8>> {
     fm.marshal_msg()
 }
 
+/// Create a realistic single-object xl.meta with a populated `meta_sys` (internal keys) and
+/// `meta_user` (user metadata), mirroring what a typical PUT produces. Unlike the other
+/// fixtures (which leave `meta_sys` empty), this exercises the internal-key classification and
+/// lookup hot path in `into_fileinfo`.
+pub fn create_realistic_object_xlmeta() -> Result<Vec<u8>> {
+    use rustfs_utils::http::{
+        SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_CRC, SUFFIX_INLINE_DATA, insert_bytes,
+    };
+
+    let mut fm = FileMeta::new();
+
+    let version_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef")?;
+    let data_dir = Uuid::parse_str("fedcba98-7654-3210-fedc-ba9876543210")?;
+
+    let mut meta_user = HashMap::new();
+    meta_user.insert("content-type".to_string(), "application/octet-stream".to_string());
+    meta_user.insert("X-Amz-Meta-Author".to_string(), "test-user".to_string());
+    meta_user.insert("X-Amz-Meta-Project".to_string(), "rustfs".to_string());
+    meta_user.insert("X-Amz-Meta-Env".to_string(), "production".to_string());
+
+    // Dual-writes x-rustfs-internal-* and x-minio-internal-* keys, matching real objects.
+    let mut meta_sys = HashMap::new();
+    insert_bytes(&mut meta_sys, SUFFIX_COMPRESSION, b"klauspost/compress/s2".to_vec());
+    insert_bytes(&mut meta_sys, SUFFIX_COMPRESSION_SIZE, b"1048576".to_vec());
+    insert_bytes(&mut meta_sys, SUFFIX_ACTUAL_SIZE, b"2097152".to_vec());
+    insert_bytes(&mut meta_sys, SUFFIX_CRC, b"crc32c:abcdef01".to_vec());
+    insert_bytes(&mut meta_sys, SUFFIX_INLINE_DATA, b"true".to_vec());
+
+    let object_version = MetaObject {
+        version_id: Some(version_id),
+        data_dir: Some(data_dir),
+        erasure_algorithm: crate::fileinfo::ErasureAlgo::ReedSolomon,
+        erasure_m: 4,
+        erasure_n: 2,
+        erasure_block_size: 1024 * 1024,
+        erasure_index: 1,
+        erasure_dist: vec![0, 1, 2, 3, 4, 5],
+        bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+        part_numbers: vec![1],
+        part_etags: vec!["d41d8cd98f00b204e9800998ecf8427e".to_string()],
+        part_sizes: vec![2097152],
+        part_actual_sizes: vec![2097152],
+        part_indices: Vec::new(),
+        size: 2097152,
+        mod_time: Some(OffsetDateTime::from_unix_timestamp(1705312200)?),
+        meta_sys,
+        meta_user,
+    };
+
+    let file_version = FileMetaVersion {
+        version_type: VersionType::Object,
+        legacy_object: None,
+        object: Some(object_version),
+        delete_marker: None,
+        write_version: 1,
+        uses_legacy_checksum: false,
+    };
+
+    let shallow_version = FileMetaShallowVersion::try_from(file_version)?;
+    fm.versions.push(shallow_version);
+
+    fm.marshal_msg()
+}
+
 /// Create a corrupted xl.meta file for error handling tests
 pub fn create_corrupted_xlmeta() -> Vec<u8> {
     let mut data = vec![
