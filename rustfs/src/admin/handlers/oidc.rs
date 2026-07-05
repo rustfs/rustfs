@@ -575,6 +575,8 @@ impl Operation for OidcCallbackHandler {
             provider_id = %actual_provider_id,
             policy_count = policies.len(),
             group_count = groups.len(),
+            policies = ?policies,
+            groups = ?groups,
             state = "claims_mapped",
             "admin oidc state"
         );

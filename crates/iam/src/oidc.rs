@@ -1111,6 +1111,28 @@ impl OidcSys {
         groups.sort();
         groups.dedup();
 
+        let mut raw_claim_keys: Vec<&str> = claims.raw.keys().map(String::as_str).collect();
+        raw_claim_keys.sort_unstable();
+
+        info!(
+            event = EVENT_OIDC_DIAGNOSTICS,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            result = "claims_policy_mapped",
+            provider_id = %provider_id,
+            claim_name = %config.claim_name,
+            claim_prefix = %config.claim_prefix,
+            groups_claim = %config.groups_claim,
+            roles_claim = %config.roles_claim,
+            role_policy = %config.role_policy,
+            policy_count = policies.len(),
+            group_count = groups.len(),
+            policies = ?policies,
+            groups = ?groups,
+            raw_claim_keys = ?raw_claim_keys,
+            "oidc claims mapped to policies"
+        );
+
         (policies, groups)
     }
 

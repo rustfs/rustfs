@@ -347,12 +347,25 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     let (policies, groups) = oidc_sys.map_claims_to_policies(&provider_id, &claims);
 
     if !has_identity_authorization_context(&policies, &groups) {
+        warn!(
+            provider_id = %provider_id,
+            username = %claims.username,
+            sub = %claims.sub,
+            policy_count = policies.len(),
+            group_count = groups.len(),
+            "AssumeRoleWithWebIdentity has no mapped policies or groups"
+        );
         return Err(s3_error!(InvalidArgument, "no policies are available for this OIDC token"));
     }
 
     info!(
-        "AssumeRoleWithWebIdentity: user='{}', provider='{}', policies={:?}, groups={:?}",
-        claims.username, provider_id, policies, groups
+        provider_id = %provider_id,
+        username = %claims.username,
+        policy_count = policies.len(),
+        group_count = groups.len(),
+        policies = ?policies,
+        groups = ?groups,
+        "AssumeRoleWithWebIdentity mapped OIDC policies and groups"
     );
 
     let mut duration = if body.duration_seconds > 0 {
@@ -430,8 +443,18 @@ pub async fn create_oidc_sts_credentials(
     // Set the parent user: prefer username, then email, then sub
     let parent_user = resolve_oidc_session_identity(claims);
     info!(
-        "OIDC STS credential: parent_user='{}' (email='{}', username='{}', sub='{}')",
-        parent_user, claims.email, claims.username, claims.sub
+        provider_id = %provider_id,
+        parent_user = %parent_user,
+        email = %claims.email,
+        username = %claims.username,
+        sub = %claims.sub,
+        policy_count = policies.len(),
+        group_count = groups.len(),
+        policies = ?policies,
+        groups = ?groups,
+        roles_claim_key = ?roles_claim_key,
+        has_session_policy = session_policy.is_some(),
+        "OIDC STS credential claims prepared"
     );
     token_claims.insert("parent".to_string(), Value::String(parent_user.clone()));
 
