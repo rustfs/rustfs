@@ -73,6 +73,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - Match protocol commands to the same S3 actions as HTTP, such as `RETR` to `GetObject`, `SIZE`/`MDTM` to `HeadObject`, `MKD` to `CreateBucket`, and bucket probes to `ListBucket` or `HeadBucket`.
 - Review every handler in a protocol driver, not only the changed handler, because RustFS advisories show mixed guarded and unguarded siblings in the same driver.
 - Regression tests for protocol frontends should deny the shared authorization hook and prove the backend is not reached for the denied command.
+- Compare protocol secrets in constant time, normalize invalid-user and invalid-secret failures where practical, and add rate limiting before exposing password-style protocol endpoints.
 
 ### Paths, object keys, and filesystem access
 - Never join untrusted bucket/object/RPC path strings onto filesystem roots without normalization and boundary checks.
@@ -82,7 +83,8 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 
 ### Secrets, default credentials, and crypto
 - Do not ship hard-coded shared tokens, HMAC secrets, private keys, or production test keys.
-- Defaults for internode/RPC auth must fail closed for network-reachable deployments or require explicit opt-in with loud warnings.
+- Defaults for root credentials and internode/RPC auth must fail closed for network-reachable deployments or generate per-install random secrets; warnings alone are not a security boundary.
+- Keep cryptographic roles separated: root S3 credentials, RPC HMAC keys, and STS/JWT signing keys must not be reused or deterministically derived from each other.
 - License or token validation must use signatures with embedded public/verifying keys only; do not use private-key decryption as authenticity.
 - Plan key rotation and key IDs when removing exposed keys.
 
