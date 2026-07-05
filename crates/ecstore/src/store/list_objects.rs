@@ -371,6 +371,35 @@ fn list_objects_index_provider_metric_label(provider: Option<ListObjectsIndexPro
     provider.map(ListObjectsIndexProviderKind::metric_label).unwrap_or("none")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListObjectsIndexProviderState {
+    kind: ListObjectsIndexProviderKind,
+    lifecycle: ListIndexLifecycle,
+}
+
+impl ListObjectsIndexProviderState {
+    fn walker_key_only() -> Self {
+        let mut lifecycle = ListIndexLifecycle::disabled(0);
+        lifecycle.begin_rebuild(LIST_CURSOR_GENERATION_LIVE, 0);
+        lifecycle.checkpoint_rebuild(0);
+        let _ = lifecycle.publish_rebuild();
+        Self {
+            kind: ListObjectsIndexProviderKind::WalkerKeyOnly,
+            lifecycle,
+        }
+    }
+
+    fn from_kind(kind: ListObjectsIndexProviderKind) -> Self {
+        match kind {
+            ListObjectsIndexProviderKind::WalkerKeyOnly => Self::walker_key_only(),
+        }
+    }
+
+    fn health_snapshot(&self) -> ListIndexHealthSnapshot {
+        self.lifecycle.health_snapshot()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListIndexSourceDecision {
     UseIndex(ListSourceMode),
@@ -749,14 +778,15 @@ fn list_objects_index_provider_from_env() -> Option<ListObjectsIndexProviderKind
     }
 }
 
+fn list_objects_index_provider_state_from_env() -> Option<ListObjectsIndexProviderState> {
+    list_objects_index_provider_from_env().map(ListObjectsIndexProviderState::from_kind)
+}
+
 fn list_objects_key_only_provider_health(provider: Option<ListObjectsIndexProviderKind>) -> ListIndexHealthSnapshot {
-    let mut lifecycle = ListIndexLifecycle::disabled(0);
-    if matches!(provider, Some(ListObjectsIndexProviderKind::WalkerKeyOnly)) {
-        lifecycle.begin_rebuild(LIST_CURSOR_GENERATION_LIVE, 0);
-        lifecycle.checkpoint_rebuild(0);
-        let _ = lifecycle.publish_rebuild();
-    }
-    lifecycle.health_snapshot()
+    provider
+        .map(ListObjectsIndexProviderState::from_kind)
+        .map(|state| state.health_snapshot())
+        .unwrap_or_else(|| ListIndexLifecycle::disabled(0).health_snapshot())
 }
 
 fn record_list_objects_index_fallback(mode: ListSourceMode, reason: ListIndexFallbackReason) {
@@ -1733,7 +1763,8 @@ impl ECStore {
         incl_deleted: bool,
     ) -> Result<Option<ListObjectsInfo>> {
         let list_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
-        let provider = list_objects_index_provider_from_env();
+        let provider_state = list_objects_index_provider_state_from_env();
+        let provider = provider_state.as_ref().map(|state| state.kind);
         let provider_label = if list_metrics_enabled {
             list_objects_index_provider_metric_label(provider)
         } else {
@@ -1754,7 +1785,10 @@ impl ECStore {
             return Ok(None);
         }
 
-        let health = list_objects_key_only_provider_health(provider);
+        let health = provider_state
+            .as_ref()
+            .map(ListObjectsIndexProviderState::health_snapshot)
+            .unwrap_or_else(|| ListIndexLifecycle::disabled(0).health_snapshot());
         match select_list_index_provider_source_mode(opts, mode, &health) {
             ListIndexSourceDecision::FallbackToWalker(reason) => {
                 record_list_objects_index_fallback(mode, reason);
@@ -1770,10 +1804,13 @@ impl ECStore {
             ListIndexSourceDecision::UseIndex(_) => {}
         }
 
-        let Some(ListObjectsIndexProviderKind::WalkerKeyOnly) = provider else {
+        let Some(provider_state) = provider_state else {
             record_list_objects_index_fallback(mode, ListIndexFallbackReason::Disabled);
             return Ok(None);
         };
+        match provider_state.kind {
+            ListObjectsIndexProviderKind::WalkerKeyOnly => {}
+        }
 
         let mut provider_opts = opts.clone();
         provider_opts.parse_marker();
@@ -4684,11 +4721,11 @@ mod test {
         LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
         ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
         ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
-        ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions,
-        MAX_OBJECT_LIST, VerifiedIndexCandidateStats, VersionMarker, enforce_latest_listing_write_quorum,
-        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
-        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum,
-        list_metadata_resolution_params, list_objects_from_verified_index_candidates,
+        ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
+        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, VerifiedIndexCandidateStats, VersionMarker,
+        enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
+        latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
+        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_verified_index_candidates,
         list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
         list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_key_only_provider_health,
         list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
@@ -5406,6 +5443,21 @@ mod test {
                 assert_eq!(health.active_generation.as_deref(), Some(LIST_CURSOR_GENERATION_LIVE));
                 assert_eq!(health.fallback_reason, None);
             },
+        );
+    }
+
+    #[test]
+    fn list_objects_index_provider_state_uses_lifecycle_active_generation() {
+        let provider = ListObjectsIndexProviderState::from_kind(ListObjectsIndexProviderKind::WalkerKeyOnly);
+        let health = provider.health_snapshot();
+
+        assert_eq!(provider.kind, ListObjectsIndexProviderKind::WalkerKeyOnly);
+        assert_eq!(health.state, ListIndexLifecycleState::Healthy);
+        assert_eq!(health.staging_generation, None);
+        assert_eq!(health.active_generation.as_deref(), Some(LIST_CURSOR_GENERATION_LIVE));
+        assert_eq!(
+            select_list_index_source_mode(Some(ListSourceMode::IndexKeyOnly), health.active_generation.as_deref(), &health),
+            ListIndexSourceDecision::UseIndex(ListSourceMode::IndexKeyOnly)
         );
     }
 
