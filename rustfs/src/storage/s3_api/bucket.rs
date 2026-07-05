@@ -351,7 +351,10 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
     }
 
     if let Some(marker) = decoded_next_continuation_marker(v2) {
-        return Some(encode_list_output_value(marker, v2.encoding_type.as_ref()));
+        return Some(encode_list_output_value(
+            public_list_marker(&marker).to_owned(),
+            v2.encoding_type.as_ref(),
+        ));
     }
 
     let last_key = v2
@@ -389,6 +392,31 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
         (Some(k), None) => Some(k),
         (None, Some(p)) => Some(p),
         (None, None) => None,
+    }
+}
+
+fn public_list_marker(marker: &str) -> &str {
+    let Some(start_idx) = marker.rfind("[rustfs_cache:") else {
+        return marker;
+    };
+    let Some(tag_body) = marker[start_idx + 1..].strip_suffix(']') else {
+        return marker;
+    };
+
+    let mut has_supported_version = false;
+    let mut has_continuation_field = false;
+    for tag in tag_body.split(',') {
+        match tag.split_once(':') {
+            Some(("rustfs_cache", "v1" | "v2")) => has_supported_version = true,
+            Some(("id" | "return", _)) => has_continuation_field = true,
+            _ => {}
+        }
+    }
+
+    if has_supported_version && has_continuation_field {
+        &marker[..start_idx]
+    } else {
+        marker
     }
 }
 
@@ -487,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_objects_next_marker_preserves_internal_continuation_marker() {
+    fn test_list_objects_next_marker_removes_internal_continuation_marker() {
         let marker = "key-998[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
         let v2 = ListObjectsV2Output {
             is_truncated: Some(true),
@@ -500,11 +528,11 @@ mod tests {
         };
 
         let output = build_list_objects_output(v2, None);
-        assert_eq!(output.next_marker.as_deref(), Some(marker));
+        assert_eq!(output.next_marker.as_deref(), Some("key-998"));
     }
 
     #[test]
-    fn test_list_objects_next_marker_encodes_internal_marker_when_url_encoded() {
+    fn test_list_objects_next_marker_strips_internal_marker_when_url_encoded() {
         let marker = "dir a/key[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
         let v2 = ListObjectsV2Output {
             is_truncated: Some(true),
@@ -518,10 +546,7 @@ mod tests {
         };
 
         let output = build_list_objects_output(v2, None);
-        assert_eq!(
-            output.next_marker.as_deref(),
-            Some("dir%20a/key%5Brustfs_cache%3Av2%2Cid%3Alist-cache-id%2Cp%3A0%2Cs%3A0%5D")
-        );
+        assert_eq!(output.next_marker.as_deref(), Some("dir%20a/key"));
     }
 
     #[test]
