@@ -18,3 +18,4 @@
 //! contract impls stay `for SetDisks`, so contract bounds are unchanged.
 
 pub(crate) mod heal;
+pub(crate) mod multipart;
