@@ -1701,6 +1701,646 @@ where
 }
 
 // ===========================================================================
+// Shared metadata/erasure read primitives (relocated verbatim from
+// set_disk/read.rs, P5 step 3, tracking backlog#815, issue backlog#820).
+// The object-read operation itself (get_object_*, read_version_optimized, the
+// metadata cache) stays in read.rs and reaches these through the SetDisks core.
+// ===========================================================================
+
+pub(in crate::set_disk) fn should_allow_metadata_early_stop(
+    read_data: bool,
+    version_id: &str,
+    healing: bool,
+    incl_free_versions: bool,
+) -> bool {
+    if read_data {
+        return false;
+    }
+
+    (is_get_metadata_early_stop_enabled() && version_id.is_empty() && !healing && !incl_free_versions)
+        || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing)
+}
+
+impl SetDisks {
+    pub(in crate::set_disk) async fn read_parts(
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        part_meta_paths: &[String],
+        part_numbers: &[usize],
+        read_quorum: usize,
+    ) -> disk::error::Result<Vec<ObjectPartInfo>> {
+        let bucket = bucket.to_string();
+        let part_meta_paths = part_meta_paths.to_vec();
+
+        let tasks: Vec<_> = disks
+            .iter()
+            .map(|disk| {
+                let disk = disk.clone();
+                let bucket = bucket.clone();
+                let part_meta_paths = part_meta_paths.clone();
+
+                async move {
+                    if let Some(disk) = disk {
+                        disk.read_parts(&bucket, &part_meta_paths).await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    }
+                }
+            })
+            .collect();
+
+        let (responses, collected_errors) = match collect_read_parts_results(tasks, read_quorum).await {
+            Ok(collected) => collected,
+            Err(()) => return Err(DiskError::ErasureReadQuorum),
+        };
+
+        if let Some(err) = reduce_read_quorum_errs(&collected_errors, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            return Err(err);
+        }
+
+        let mut ret = vec![ObjectPartInfo::default(); part_meta_paths.len()];
+
+        for (part_idx, part_info) in part_meta_paths.iter().enumerate() {
+            ret[part_idx] = resolve_read_part_from_responses(
+                &bucket,
+                part_info,
+                part_numbers[part_idx],
+                part_idx,
+                part_meta_paths.len(),
+                &responses,
+                read_quorum,
+            )?;
+        }
+
+        Ok(ret)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(level = "debug", skip(disks))]
+    pub(in crate::set_disk) async fn read_all_fileinfo(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>)> {
+        let (ress, errors, _) = Self::read_all_fileinfo_inner(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            healing,
+            incl_free_versions,
+            false,
+            0,
+        )
+        .await?;
+        Ok((ress, errors))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::set_disk) async fn read_all_fileinfo_observed(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        default_parity_count: usize,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        Self::read_all_fileinfo_inner(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            healing,
+            incl_free_versions,
+            true,
+            default_parity_count,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_inner(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        observe: bool,
+        default_parity_count: usize,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        let early_stop_enabled = observe && (is_get_metadata_early_stop_enabled() || is_version_early_stop_enabled());
+        let allow_early_stop = observe && should_allow_metadata_early_stop(read_data, version_id, healing, incl_free_versions);
+        if allow_early_stop {
+            return Self::read_all_fileinfo_early_stop(
+                disks,
+                org_bucket,
+                bucket,
+                object,
+                version_id,
+                read_data,
+                healing,
+                incl_free_versions,
+                default_parity_count,
+            )
+            .await;
+        }
+        if early_stop_enabled {
+            rustfs_io_metrics::record_get_object_metadata_early_stop_miss(
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
+            );
+            rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(GET_OBJECT_PATH_LEGACY_DUPLEX, 0);
+        }
+
+        Self::read_all_fileinfo_full_wait(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            healing,
+            incl_free_versions,
+            observe,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_full_wait(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        observe: bool,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        let fanout_start = observe.then(Instant::now);
+        let mut ress = Vec::with_capacity(disks.len());
+        let mut errors = Vec::with_capacity(disks.len());
+        let mut observations = observe.then(|| Vec::with_capacity(disks.len()));
+        let opts = Arc::new(ReadOptions {
+            incl_free_versions,
+            read_data,
+            healing,
+        });
+        let org_bucket = Arc::new(org_bucket.to_string());
+        let bucket = Arc::new(bucket.to_string());
+        let object = Arc::new(object.to_string());
+        let version_id = Arc::new(version_id.to_string());
+        let futures = disks.iter().map(|disk| {
+            let disk = disk.clone();
+            let opts = opts.clone();
+            let org_bucket = org_bucket.clone();
+            let bucket = bucket.clone();
+            let object = object.clone();
+            let version_id = version_id.clone();
+            tokio::spawn(async move {
+                let response_start = observe.then(Instant::now);
+                let result = if let Some(disk) = disk {
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                };
+                let elapsed = response_start.map(|start| start.elapsed());
+                (result, elapsed)
+            })
+        });
+
+        // Wait for all futures to complete
+        let results = join_all(futures).await;
+
+        for join_result in results {
+            match join_result {
+                Ok((res, elapsed)) => match res {
+                    Ok(file_info) => {
+                        if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
+                            observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
+                        }
+                        ress.push(file_info);
+                        errors.push(None);
+                    }
+                    Err(e) => {
+                        if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
+                            observations.push(MetadataFanoutObservation::from_error(&e, elapsed));
+                        }
+                        ress.push(FileInfo::default());
+                        errors.push(Some(e));
+                    }
+                },
+                Err(_join_err) => {
+                    // A spawned task panicked — treat as unexpected disk error
+                    if let Some(observations) = &mut observations {
+                        observations.push(MetadataFanoutObservation::from_error(&DiskError::Unexpected, Duration::ZERO));
+                    }
+                    ress.push(FileInfo::default());
+                    errors.push(Some(DiskError::Unexpected));
+                }
+            }
+        }
+        let diagnostics = match (fanout_start, observations) {
+            (Some(fanout_start), Some(observations)) => MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations),
+            _ => MetadataFanoutDiagnostics::default(),
+        };
+        Ok((ress, errors, diagnostics))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_early_stop(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        default_parity_count: usize,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        let fanout_start = Instant::now();
+        let mut ress = vec![FileInfo::default(); disks.len()];
+        let mut errors = vec![None; disks.len()];
+        let mut observations = Vec::with_capacity(disks.len());
+        let mut accumulator =
+            MetadataQuorumAccumulator::new(disks.len(), default_parity_count, true).with_requested_version_id(version_id);
+        let opts = Arc::new(ReadOptions {
+            incl_free_versions,
+            read_data,
+            healing,
+        });
+        let org_bucket = Arc::new(org_bucket.to_string());
+        let bucket = Arc::new(bucket.to_string());
+        let object = Arc::new(object.to_string());
+        let version_id = Arc::new(version_id.to_string());
+        let mut join_set = JoinSet::new();
+
+        for (index, disk) in disks.iter().cloned().enumerate() {
+            let opts = opts.clone();
+            let org_bucket = org_bucket.clone();
+            let bucket = bucket.clone();
+            let object = object.clone();
+            let version_id = version_id.clone();
+            join_set.spawn(async move {
+                let response_start = Instant::now();
+                let result = if let Some(disk) = disk {
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                };
+                (index, result, response_start.elapsed())
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((index, res, elapsed)) => match res {
+                    Ok(file_info) => {
+                        observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
+                        accumulator.observe_file_info(&file_info);
+                        if let Some(slot) = ress.get_mut(index) {
+                            *slot = file_info;
+                        }
+                    }
+                    Err(err) => {
+                        observations.push(MetadataFanoutObservation::from_error(&err, elapsed));
+                        accumulator.observe_error(&err);
+                        if let Some(slot) = errors.get_mut(index) {
+                            *slot = Some(err);
+                        }
+                    }
+                },
+                Err(_) => {
+                    let err = DiskError::Unexpected;
+                    observations.push(MetadataFanoutObservation::from_error(&err, fanout_start.elapsed()));
+                    accumulator.observe_error(&err);
+                }
+            }
+
+            if let Some(decision) = accumulator
+                .early_stop_decision()
+                .or_else(|| accumulator.version_early_stop_decision())
+            {
+                let saved_responses = join_set.len();
+                join_set.abort_all();
+                rustfs_io_metrics::record_get_object_metadata_early_stop_hit(GET_OBJECT_PATH_LEGACY_DUPLEX, decision.reason);
+                rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(
+                    GET_OBJECT_PATH_LEGACY_DUPLEX,
+                    saved_responses,
+                );
+                while join_set.join_next().await.is_some() {}
+                let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
+                return Ok((ress, errors, diagnostics));
+            }
+        }
+
+        rustfs_io_metrics::record_get_object_metadata_early_stop_miss(
+            GET_OBJECT_PATH_LEGACY_DUPLEX,
+            accumulator.final_miss_reason(),
+        );
+        rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(GET_OBJECT_PATH_LEGACY_DUPLEX, 0);
+        let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
+        Ok((ress, errors, diagnostics))
+    }
+
+    pub(in crate::set_disk) async fn read_all_xl(
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        read_data: bool,
+        incl_free_vers: bool,
+    ) -> (Vec<FileInfo>, Vec<Option<DiskError>>) {
+        let (fileinfos, errs) = Self::read_all_raw_file_info(disks, bucket, object, read_data).await;
+
+        Self::pick_latest_quorum_files_info(fileinfos, errs, bucket, object, read_data, incl_free_vers).await
+    }
+
+    pub(crate) async fn load_file_info_versions_exact(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Option<rustfs_filemeta::FileInfoVersions>> {
+        let disks = self.get_disks_internal().await;
+        if disks.is_empty() {
+            return Err(to_object_err(StorageError::ErasureReadQuorum, vec![bucket, object]));
+        }
+
+        let read_quorum = disks.len().div_ceil(2).max(1);
+        let (raw_fileinfos, errs) = Self::read_all_raw_file_info(&disks, bucket, object, false).await;
+
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            let object_err = to_object_err(err.into(), vec![bucket, object]);
+            if is_err_object_not_found(&object_err) || is_err_version_not_found(&object_err) {
+                return Ok(None);
+            }
+            return Err(object_err);
+        }
+
+        let mut shallow_versions = Vec::with_capacity(raw_fileinfos.len());
+        for raw_fileinfo in raw_fileinfos.into_iter().flatten() {
+            let meta = FileMeta::load(&raw_fileinfo.buf)
+                .map_err(|err| Error::other(format!("exact object metadata decode failed for {bucket}/{object}: {err}")))?;
+            shallow_versions.push(meta.versions);
+        }
+
+        if shallow_versions.len() < read_quorum {
+            return Err(to_object_err(StorageError::ErasureReadQuorum, vec![bucket, object]));
+        }
+
+        let versions = merge_file_meta_versions(read_quorum, true, 0, &shallow_versions);
+        if versions.is_empty() {
+            return Err(Error::other(format!(
+                "exact object metadata read returned no quorum versions for {bucket}/{object}"
+            )));
+        }
+
+        FileMeta {
+            versions,
+            ..Default::default()
+        }
+        .get_all_file_info_versions(bucket, object, true)
+        .map(Some)
+        .map_err(|err| Error::other(format!("exact object versions decode failed for {bucket}/{object}: {err}")))
+    }
+
+    pub(in crate::set_disk) async fn read_all_raw_file_info(
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        read_data: bool,
+    ) -> (Vec<Option<RawFileInfo>>, Vec<Option<DiskError>>) {
+        let mut ress = Vec::with_capacity(disks.len());
+        let mut errors = Vec::with_capacity(disks.len());
+
+        let mut futures = Vec::with_capacity(disks.len());
+
+        for disk in disks.iter() {
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.read_xl(bucket, object, read_data).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        let results = join_all(futures).await;
+        for result in results {
+            match result {
+                Ok(res) => {
+                    ress.push(Some(res));
+                    errors.push(None);
+                }
+                Err(e) => {
+                    ress.push(None);
+                    errors.push(Some(e));
+                }
+            }
+        }
+
+        (ress, errors)
+    }
+
+    pub(in crate::set_disk) async fn pick_latest_quorum_files_info(
+        fileinfos: Vec<Option<RawFileInfo>>,
+        errs: Vec<Option<DiskError>>,
+        bucket: &str,
+        object: &str,
+        read_data: bool,
+        incl_free_vers: bool,
+    ) -> (Vec<FileInfo>, Vec<Option<DiskError>>) {
+        let mut metadata_array = vec![None; fileinfos.len()];
+        let mut meta_file_infos = vec![FileInfo::default(); fileinfos.len()];
+        let mut metadata_shallow_versions = vec![None; fileinfos.len()];
+
+        let mut v2_bufs = {
+            if !read_data {
+                vec![Vec::new(); fileinfos.len()]
+            } else {
+                Vec::new()
+            }
+        };
+
+        let mut errs = errs;
+
+        for (idx, info_op) in fileinfos.iter().enumerate() {
+            if let Some(info) = info_op {
+                if !read_data {
+                    v2_bufs[idx] = info.buf.clone();
+                }
+
+                let xlmeta = match FileMeta::load(&info.buf) {
+                    Ok(res) => res,
+                    Err(err) => {
+                        errs[idx] = Some(err.into());
+                        continue;
+                    }
+                };
+
+                metadata_array[idx] = Some(xlmeta);
+                meta_file_infos[idx] = FileInfo::default();
+            }
+        }
+
+        for (idx, info_op) in metadata_array.iter().enumerate() {
+            if let Some(info) = info_op {
+                metadata_shallow_versions[idx] = Some(info.versions.clone());
+            }
+        }
+
+        let shallow_versions: Vec<Vec<FileMetaShallowVersion>> = metadata_shallow_versions.iter().flatten().cloned().collect();
+
+        let read_quorum = fileinfos.len().div_ceil(2);
+        let versions = merge_file_meta_versions(read_quorum, false, 1, &shallow_versions);
+        let meta = FileMeta {
+            versions,
+            ..Default::default()
+        };
+
+        let finfo = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
+            Ok(res) => res,
+            Err(err) => {
+                for item in errs.iter_mut() {
+                    if item.is_none() {
+                        *item = Some(err.clone().into());
+                    }
+                }
+
+                return (meta_file_infos, errs);
+            }
+        };
+
+        if !finfo.is_valid() {
+            for item in errs.iter_mut() {
+                if item.is_none() {
+                    *item = Some(DiskError::FileCorrupt);
+                }
+            }
+
+            return (meta_file_infos, errs);
+        }
+
+        let vid = finfo.version_id.unwrap_or(Uuid::nil());
+
+        for (idx, meta_op) in metadata_array.iter().enumerate() {
+            if let Some(meta) = meta_op {
+                match meta.into_fileinfo(bucket, object, vid.to_string().as_str(), read_data, incl_free_vers, true) {
+                    Ok(res) => meta_file_infos[idx] = res,
+                    Err(err) => errs[idx] = Some(err.into()),
+                }
+            }
+        }
+
+        (meta_file_infos, errs)
+    }
+
+    pub(in crate::set_disk) async fn read_multiple_files(
+        disks: &[Option<DiskStore>],
+        req: ReadMultipleReq,
+        read_quorum: usize,
+    ) -> Vec<ReadMultipleResp> {
+        let mut futures = Vec::with_capacity(disks.len());
+        let empty_quorum_result = || {
+            req.files
+                .iter()
+                .map(|want| ReadMultipleResp {
+                    bucket: req.bucket.clone(),
+                    prefix: req.prefix.clone(),
+                    file: want.clone(),
+                    exists: false,
+                    error: Error::ErasureReadQuorum.to_string(),
+                    data: Vec::new(),
+                    mod_time: None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for disk in disks.iter() {
+            let disk = disk.clone();
+            let req = req.clone();
+            futures.push(async move {
+                if let Some(disk) = disk {
+                    disk.read_multiple(req).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                }
+            });
+        }
+
+        let (ress, errors) = match collect_read_multiple_results(futures, read_quorum).await {
+            Ok(collected) => collected,
+            Err(()) => return empty_quorum_result(),
+        };
+
+        // debug!("ReadMultipleResp ress {:?}", ress);
+        // debug!("ReadMultipleResp errors {:?}", errors);
+
+        let mut ret = Vec::with_capacity(req.files.len());
+
+        for want in req.files.iter() {
+            let mut quorum = 0;
+
+            let mut get_res = ReadMultipleResp::default();
+
+            for res in ress.iter() {
+                if res.is_none() {
+                    continue;
+                }
+
+                let disk_res = res.as_ref().unwrap();
+
+                for resp in disk_res.iter() {
+                    if !resp.error.is_empty() || !resp.exists {
+                        continue;
+                    }
+
+                    if &resp.file != want || resp.bucket != req.bucket || resp.prefix != req.prefix {
+                        continue;
+                    }
+                    quorum += 1;
+
+                    if get_res.mod_time > resp.mod_time || get_res.data.len() > resp.data.len() {
+                        continue;
+                    }
+
+                    get_res = resp.clone();
+                }
+            }
+
+            if quorum < read_quorum {
+                // debug!("quorum < read_quorum: {} < {}", quorum, read_quorum);
+                get_res.exists = false;
+                get_res.error = Error::ErasureReadQuorum.to_string();
+                get_res.data = Vec::new();
+            }
+
+            ret.push(get_res);
+        }
+
+        // log err
+
+        ret
+    }
+}
+
+// ===========================================================================
 // Write / rename / delete primitives (relocated verbatim from set_disk/write.rs,
 // P5 step 2, tracking backlog#815, issue backlog#820).
 // ===========================================================================
