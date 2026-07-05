@@ -30,6 +30,7 @@ SKIP_BUILD="${SKIP_BUILD:-false}"
 INDEX_PROVIDER="${INDEX_PROVIDER:-persistent_key_only}"
 INDEX_GENERATION="${INDEX_GENERATION:-bench-$(date +%Y%m%d%H%M%S)}"
 KEY_INDEX_PATH="${KEY_INDEX_PATH:-${OUT_DIR}/persistent-key-only.index}"
+PREBUILD_KEY_INDEX="${PREBUILD_KEY_INDEX:-false}"
 PROMETHEUS_QUERY_URL="${PROMETHEUS_QUERY_URL:-http://localhost:9090/api/v1/query}"
 PROMETHEUS_JOB="${PROMETHEUS_JOB:-rustfs-app-metrics}"
 
@@ -62,6 +63,7 @@ Options:
   --skip-build           Use existing RustFS binary.
   --index-provider <v>   Opt-in provider (default: persistent_key_only).
   --key-index-path <p>   Persistent key-only index path.
+  --prebuild-key-index   Build persistent key-only index from the bench script.
   --prometheus-query-url <url>
                          Prometheus API query URL or UI /query URL.
   -h, --help             Show this help.
@@ -71,7 +73,7 @@ Environment:
   REGION, OBJECTS, OBJECT_SIZE, CONCURRENCY, MAX_KEYS, DURATION,
   WARMUP_DURATION, METER_INTERVAL, RESOURCE_SAMPLE_INTERVAL, SKIP_BUILD,
   BUILD_PROFILE, INDEX_PROVIDER, INDEX_GENERATION, KEY_INDEX_PATH,
-  PROMETHEUS_QUERY_URL, PROMETHEUS_JOB.
+  PREBUILD_KEY_INDEX, PROMETHEUS_QUERY_URL, PROMETHEUS_JOB.
 USAGE
 }
 
@@ -104,6 +106,7 @@ parse_args() {
       --skip-build) SKIP_BUILD="true"; shift ;;
       --index-provider) INDEX_PROVIDER="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --key-index-path) KEY_INDEX_PATH="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --prebuild-key-index) PREBUILD_KEY_INDEX="true"; shift ;;
       --prometheus-query-url) PROMETHEUS_QUERY_URL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown arg: $1" ;;
@@ -259,9 +262,10 @@ prepare_bucket() {
 write_key_index() {
   local bucket="$1"
   local index_path="$2"
-  local index_dir tmp_keys tmp_index token page response_file next_token
+  local index_dir tmp_keys sorted_keys tmp_index token page response_file next_token key_count
   index_dir="$(dirname "$index_path")"
   tmp_keys="${index_path}.keys.tmp"
+  sorted_keys="${index_path}.keys.sorted.tmp"
   tmp_index="${index_path}.tmp"
   mkdir -p "$index_dir"
   : >"$tmp_keys"
@@ -293,13 +297,17 @@ write_key_index() {
     page=$((page + 1))
   done
 
+  LC_ALL=C sort -u "$tmp_keys" >"$sorted_keys"
+  key_count="$(awk 'END{print NR + 0}' "$sorted_keys")"
   {
     echo "# rustfs-listobjects-key-only-v1"
+    echo "# bucket=${bucket}"
     echo "# generation=${INDEX_GENERATION}"
-    LC_ALL=C sort -u "$tmp_keys"
+    echo "# checkpoint_high_water_mark=${key_count}"
+    cat "$sorted_keys"
   } >"$tmp_index"
   mv "$tmp_index" "$index_path"
-  rm -f "$tmp_keys"
+  rm -f "$tmp_keys" "$sorted_keys"
 }
 
 extract_xml_keys() {
@@ -308,6 +316,18 @@ extract_xml_keys() {
 
 extract_next_token() {
   grep -o '<NextContinuationToken>[^<]*</NextContinuationToken>' | sed 's:<NextContinuationToken>::g; s:</NextContinuationToken>::g' | head -n 1
+}
+
+signed_list_once() {
+  local bucket="$1"
+  local response_file="$2"
+  local max_keys="${3:-1}"
+  curl -fsS \
+    --user "${ACCESS_KEY}:${SECRET_KEY}" \
+    --aws-sigv4 "aws:amz:${REGION}:s3" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    -o "$response_file" \
+    "${ENDPOINT}/${bucket}?list-type=2&max-keys=${max_keys}"
 }
 
 urlencode() {
@@ -533,6 +553,13 @@ write_prometheus_snapshot() {
   query_prometheus_expr "sum(rustfs_s3_list_objects_index_verification_io_amplification_sum) / sum(rustfs_s3_list_objects_index_verification_io_amplification_count)" "$prom_dir/verification_io_amplification_avg.json" || true
   query_prometheus_expr "rate(process_cpu_seconds_total{job=\"${PROMETHEUS_JOB}\"}[1m])" "$prom_dir/process_cpu_rate_1m.json" || true
   query_prometheus_expr "process_resident_memory_bytes{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/process_resident_memory_bytes.json" || true
+  query_prometheus_expr "rustfs_memory_allocator_reserved_bytes{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/allocator_reserved_bytes.json" || true
+  query_prometheus_expr "rustfs_memory_allocator_committed_bytes{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/allocator_committed_bytes.json" || true
+  query_prometheus_expr "rustfs_memory_allocator_page_committed_bytes{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/allocator_page_committed_bytes.json" || true
+  query_prometheus_expr "rustfs_memory_allocator_malloc_requested_bytes{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/allocator_malloc_requested_bytes.json" || true
+  query_prometheus_expr "rustfs_memory_allocator_malloc_requested_peak_bytes{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/allocator_malloc_requested_peak_bytes.json" || true
+  query_prometheus_expr "rustfs_memory_allocator_malloc_requested_total_bytes{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/allocator_malloc_requested_total_bytes.json" || true
+  query_prometheus_expr "rustfs_memory_allocator_heap_count{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/allocator_heap_count.json" || true
 }
 
 write_resource_summary() {
@@ -569,6 +596,12 @@ run_mode() {
   start_server "$mode" "$mode_dir/rustfs.log" "$reset_data"
   start_resource_sampler "$mode_dir/resource-samples.csv"
 
+  if [[ "$mode" == "opt_in_verified" && "$PREBUILD_KEY_INDEX" != "true" ]] \
+    && [[ "$INDEX_PROVIDER" == "persistent_key_only" || "$INDEX_PROVIDER" == "persisted_key_only" ]]; then
+    log_info "Warming persistent key-only provider through production rebuild path"
+    signed_list_once "$bucket" "$mode_dir/provider-warmup.xml" 1
+  fi
+
   log_info "Signed ListObjectsV2 bench for mode=$mode duration=$DURATION"
   run_signed_list_bench "$mode" "$bucket" "$DURATION" "$mode_dir"
   stop_resource_sampler
@@ -599,6 +632,7 @@ write_manifest() {
     echo "index_provider=$INDEX_PROVIDER"
     echo "index_generation=$INDEX_GENERATION"
     echo "key_index_path=$KEY_INDEX_PATH"
+    echo "prebuild_key_index=$PREBUILD_KEY_INDEX"
     echo "prometheus_query_url=$PROMETHEUS_QUERY_URL"
     echo "prometheus_job=$PROMETHEUS_JOB"
   } >"$OUT_DIR/manifest.env"
@@ -663,8 +697,12 @@ main() {
     tail -n 80 "$prep_dir/warp-prepare.log" >&2 || true
     return 1
   }
-  log_info "Writing persistent key-only index: $KEY_INDEX_PATH"
-  write_key_index "$bucket" "$KEY_INDEX_PATH"
+  if [[ "$PREBUILD_KEY_INDEX" == "true" ]]; then
+    log_info "Writing persistent key-only index from bench script: $KEY_INDEX_PATH"
+    write_key_index "$bucket" "$KEY_INDEX_PATH"
+  else
+    log_info "Skipping bench-side key index generation; opt-in mode will rebuild through RustFS lifecycle"
+  fi
   stop_server
 
   run_mode walker "$bucket" false

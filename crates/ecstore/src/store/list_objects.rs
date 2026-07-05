@@ -48,7 +48,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -266,6 +266,10 @@ const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECT
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
+const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v1";
+const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
+const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
+const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
 
 /// Identifies the source that produced a ListObjects page.
 ///
@@ -384,6 +388,7 @@ struct ListObjectsIndexProviderState {
     kind: ListObjectsIndexProviderKind,
     lifecycle: ListIndexLifecycle,
     persistent_path: Option<PathBuf>,
+    persistent_generation: Option<String>,
 }
 
 impl ListObjectsIndexProviderState {
@@ -396,17 +401,19 @@ impl ListObjectsIndexProviderState {
             kind: ListObjectsIndexProviderKind::WalkerKeyOnly,
             lifecycle,
             persistent_path: None,
+            persistent_generation: None,
         }
     }
 
     fn persistent_key_only(path: Option<PathBuf>, generation: Option<String>) -> Self {
         let mut lifecycle = ListIndexLifecycle::disabled(0);
         if path.as_ref().is_some_and(|path| !path.as_os_str().is_empty()) {
-            let generation =
-                generation.unwrap_or_else(|| LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION.to_owned());
-            lifecycle.begin_rebuild(generation, 0);
-            lifecycle.checkpoint_rebuild(0);
-            let _ = lifecycle.publish_rebuild();
+            lifecycle.begin_rebuild(
+                generation
+                    .as_deref()
+                    .unwrap_or(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION),
+                0,
+            );
         } else {
             lifecycle.mark_degraded();
         }
@@ -415,6 +422,7 @@ impl ListObjectsIndexProviderState {
             kind: ListObjectsIndexProviderKind::PersistentKeyOnly,
             lifecycle,
             persistent_path: path,
+            persistent_generation: generation,
         }
     }
 
@@ -435,6 +443,14 @@ struct PersistentKeyOnlyIndexCache {
     path: PathBuf,
     len: u64,
     modified: Option<SystemTime>,
+    index: Arc<PersistentKeyOnlyIndex>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistentKeyOnlyIndex {
+    bucket: Option<String>,
+    generation: String,
+    checkpoint_high_water_mark: u64,
     keys: Arc<Vec<String>>,
 }
 
@@ -446,21 +462,125 @@ async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentK
         .await
 }
 
-fn parse_persistent_key_only_index(contents: &str) -> Vec<String> {
+fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
+    let mut bucket = None;
+    let mut generation = None;
+    let mut checkpoint_high_water_mark = None;
     let mut keys = Vec::new();
+
     for line in contents.lines() {
-        let key = line.trim_end_matches('\r');
-        if key.is_empty() || key.starts_with('#') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
             continue;
         }
-        keys.push(key.to_owned());
+        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER) {
+            if !value.is_empty() {
+                bucket = Some(value.to_owned());
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER) {
+            if is_valid_list_objects_index_generation(value) {
+                generation = Some(value.to_owned());
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER) {
+            checkpoint_high_water_mark = value.parse::<u64>().ok();
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        keys.push(line.to_owned());
     }
+
     keys.sort_unstable();
     keys.dedup();
-    keys
+    let checkpoint_high_water_mark = checkpoint_high_water_mark.unwrap_or_else(|| match u64::try_from(keys.len()) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    });
+
+    PersistentKeyOnlyIndex {
+        bucket,
+        generation: generation.unwrap_or_else(|| LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION.to_owned()),
+        checkpoint_high_water_mark,
+        keys: Arc::new(keys),
+    }
 }
 
-async fn load_persistent_key_only_index(path: &Path) -> Result<Arc<Vec<String>>> {
+fn persistent_key_only_index_health(index: &PersistentKeyOnlyIndex) -> ListIndexHealthSnapshot {
+    let mut lifecycle = ListIndexLifecycle::disabled(0);
+    lifecycle.begin_rebuild(&index.generation, index.checkpoint_high_water_mark);
+    lifecycle.checkpoint_rebuild(index.checkpoint_high_water_mark);
+    let _ = lifecycle.publish_rebuild();
+    lifecycle.health_snapshot()
+}
+
+fn generated_persistent_key_only_generation(configured: Option<&str>) -> String {
+    if let Some(configured) = configured
+        && is_valid_list_objects_index_generation(configured)
+    {
+        return configured.to_owned();
+    }
+
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("{LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION}-{millis}")
+}
+
+async fn write_persistent_key_only_index(
+    path: &Path,
+    bucket: &str,
+    generation: &str,
+    keys: &[String],
+) -> Result<PersistentKeyOnlyIndex> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
+    }
+
+    let mut keys = keys.to_vec();
+    keys.sort_unstable();
+    keys.dedup();
+    let checkpoint_high_water_mark = match u64::try_from(keys.len()) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    };
+    let mut contents = String::new();
+    contents.push_str(PERSISTENT_KEY_ONLY_INDEX_HEADER);
+    contents.push('\n');
+    contents.push_str(PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER);
+    contents.push_str(bucket);
+    contents.push('\n');
+    contents.push_str(PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER);
+    contents.push_str(generation);
+    contents.push('\n');
+    contents.push_str(PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER);
+    contents.push_str(&checkpoint_high_water_mark.to_string());
+    contents.push('\n');
+    for key in &keys {
+        contents.push_str(key);
+        contents.push('\n');
+    }
+
+    let tmp_path = path.with_extension("tmp");
+    tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
+    tokio::fs::rename(&tmp_path, path).await.map_err(Error::Io)?;
+
+    Ok(PersistentKeyOnlyIndex {
+        bucket: Some(bucket.to_owned()),
+        generation: generation.to_owned(),
+        checkpoint_high_water_mark,
+        keys: Arc::new(keys),
+    })
+}
+
+async fn load_persistent_key_only_index(path: &Path) -> Result<Arc<PersistentKeyOnlyIndex>> {
     let metadata = tokio::fs::metadata(path).await.map_err(Error::Io)?;
     let len = metadata.len();
     let modified = metadata.modified().ok();
@@ -473,20 +593,20 @@ async fn load_persistent_key_only_index(path: &Path) -> Result<Arc<Vec<String>>>
             && cached.len == len
             && cached.modified == modified
         {
-            return Ok(cached.keys.clone());
+            return Ok(cached.index.clone());
         }
     }
 
     let contents = tokio::fs::read_to_string(path).await.map_err(Error::Io)?;
-    let keys = Arc::new(parse_persistent_key_only_index(&contents));
+    let index = Arc::new(parse_persistent_key_only_index(&contents));
     let mut cached = cache.write().await;
     *cached = Some(PersistentKeyOnlyIndexCache {
         path: path.to_path_buf(),
         len,
         modified,
-        keys: keys.clone(),
+        index: index.clone(),
     });
-    Ok(keys)
+    Ok(index)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -877,14 +997,15 @@ fn list_objects_index_provider_path_from_env() -> Option<PathBuf> {
     if value.is_empty() { None } else { Some(PathBuf::from(value)) }
 }
 
+fn is_valid_list_objects_index_generation(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.contains([',', ':', '[', ']'])
+}
+
 fn list_objects_index_provider_generation_from_env() -> Option<String> {
     let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, "");
     let value = value.trim();
-    if value.is_empty() || value.contains([',', ':', '[', ']']) {
-        None
-    } else {
-        Some(value.to_owned())
-    }
+    is_valid_list_objects_index_generation(value).then(|| value.to_owned())
 }
 
 fn list_objects_index_provider_state_from_env() -> Option<ListObjectsIndexProviderState> {
@@ -909,6 +1030,10 @@ fn record_list_objects_index_fallback(mode: ListSourceMode, reason: ListIndexFal
 }
 
 fn record_list_objects_index_opt_in_fallback(opts: &ListPathOptions, mode: ListSourceMode) {
+    if !rustfs_io_metrics::get_stage_metrics_enabled() {
+        return;
+    }
+
     let health = list_objects_key_only_provider_health(None);
     let reason = match select_list_index_provider_source_mode(opts, mode, &health) {
         ListIndexSourceDecision::FallbackToWalker(reason) => reason,
@@ -1870,6 +1995,102 @@ impl ListPathOptions {
 }
 
 impl ECStore {
+    async fn rebuild_persistent_key_only_index(
+        self: Arc<Self>,
+        opts: &ListPathOptions,
+        path: &Path,
+        configured_generation: Option<&str>,
+    ) -> Result<Arc<PersistentKeyOnlyIndex>> {
+        let mut marker = None;
+        let mut keys = Vec::new();
+        let generation = generated_persistent_key_only_generation(configured_generation);
+
+        loop {
+            let previous_marker = marker.clone();
+            let page_opts = ListPathOptions {
+                bucket: opts.bucket.clone(),
+                prefix: String::new(),
+                marker: marker.clone(),
+                separator: None,
+                limit: max_keys_plus_one(MAX_OBJECT_LIST, true),
+                ask_disks: list_objects_quorum_from_env(),
+                incl_deleted: false,
+                cursor_source: Some(ListSourceMode::Walker),
+                cursor_generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
+                ..Default::default()
+            };
+            let mut list_result = self
+                .clone()
+                .list_path(&page_opts)
+                .await
+                .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                    err: Some(err.into()),
+                    ..Default::default()
+                });
+            let reached_end = match list_result.err.take() {
+                Some(err) if err == rustfs_filemeta::Error::Unexpected => true,
+                Some(err) => return Err(Error::from(err)),
+                None => false,
+            };
+
+            if let Some(result) = list_result.entries.as_mut() {
+                result.forward_past(marker.clone());
+            }
+
+            let page_keys = list_result
+                .entries
+                .as_ref()
+                .map(|entries| {
+                    entries
+                        .entries()
+                        .into_iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            if page_keys.is_empty() {
+                break;
+            }
+
+            marker = page_keys.last().cloned();
+            if marker == previous_marker {
+                return Err(Error::other("persistent key-only index rebuild marker did not advance"));
+            }
+            keys.extend(page_keys);
+
+            if reached_end {
+                break;
+            }
+        }
+
+        write_persistent_key_only_index(path, &opts.bucket, &generation, &keys).await?;
+        load_persistent_key_only_index(path).await
+    }
+
+    async fn prepare_persistent_key_only_index(
+        self: Arc<Self>,
+        opts: &ListPathOptions,
+        provider_state: &ListObjectsIndexProviderState,
+    ) -> Result<Arc<PersistentKeyOnlyIndex>> {
+        let Some(path) = provider_state.persistent_path.as_ref() else {
+            return Err(Error::other("persistent key-only provider path is not configured"));
+        };
+
+        match load_persistent_key_only_index(path).await {
+            Ok(index) if index.bucket.as_deref().is_none_or(|bucket| bucket == opts.bucket) => Ok(index),
+            Ok(_) => {
+                self.rebuild_persistent_key_only_index(opts, path, provider_state.persistent_generation.as_deref())
+                    .await
+            }
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.rebuild_persistent_key_only_index(opts, path, provider_state.persistent_generation.as_deref())
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn list_objects_from_opt_in_key_only_provider(
         self: Arc<Self>,
         opts: &ListPathOptions,
@@ -1896,41 +2117,44 @@ impl ECStore {
         }
 
         if incl_deleted || !mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification() {
-            record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
+            if list_metrics_enabled {
+                record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
+            }
             return Ok(None);
         }
 
-        let health = provider_state
-            .as_ref()
-            .map(ListObjectsIndexProviderState::health_snapshot)
-            .unwrap_or_else(|| ListIndexLifecycle::disabled(0).health_snapshot());
-        match select_list_index_provider_source_mode(opts, mode, &health) {
-            ListIndexSourceDecision::FallbackToWalker(reason) => {
-                record_list_objects_index_fallback(mode, reason);
-                debug!(
-                    bucket = %opts.bucket,
-                    prefix = %opts.prefix,
-                    source = mode.cursor_value(),
-                    reason = reason.metric_label(),
-                    "list_objects opt-in index path fell back to walker"
-                );
-                return Ok(None);
-            }
-            ListIndexSourceDecision::UseIndex(_) => {}
-        }
-
         let Some(provider_state) = provider_state else {
-            record_list_objects_index_fallback(mode, ListIndexFallbackReason::Disabled);
+            if list_metrics_enabled {
+                record_list_objects_index_fallback(mode, ListIndexFallbackReason::Disabled);
+            }
             return Ok(None);
         };
 
         let mut provider_opts = opts.clone();
         provider_opts.parse_marker();
-        provider_opts.cursor_source = Some(mode);
-        provider_opts.cursor_generation = health.active_generation.clone();
 
-        let candidate_keys = match provider_state.kind {
+        let (candidate_keys, health) = match provider_state.kind {
             ListObjectsIndexProviderKind::WalkerKeyOnly => {
+                let health = provider_state.health_snapshot();
+                match select_list_index_provider_source_mode(&provider_opts, mode, &health) {
+                    ListIndexSourceDecision::FallbackToWalker(reason) => {
+                        if list_metrics_enabled {
+                            record_list_objects_index_fallback(mode, reason);
+                        }
+                        debug!(
+                            bucket = %opts.bucket,
+                            prefix = %opts.prefix,
+                            source = mode.cursor_value(),
+                            reason = reason.metric_label(),
+                            "list_objects opt-in index path fell back to walker"
+                        );
+                        return Ok(None);
+                    }
+                    ListIndexSourceDecision::UseIndex(_) => {}
+                }
+                provider_opts.cursor_source = Some(mode);
+                provider_opts.cursor_generation = health.active_generation.clone();
+
                 let mut list_result =
                     self.clone()
                         .list_path(&provider_opts)
@@ -1943,7 +2167,9 @@ impl ECStore {
                 if let Some(err) = list_result.err.take()
                     && err != rustfs_filemeta::Error::Unexpected
                 {
-                    record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
+                    if list_metrics_enabled {
+                        record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
+                    }
                     return Ok(None);
                 }
 
@@ -1951,7 +2177,7 @@ impl ECStore {
                     result.forward_past(provider_opts.marker.clone());
                 }
 
-                Arc::new(
+                let candidate_keys = Arc::new(
                     list_result
                         .entries
                         .as_ref()
@@ -1963,22 +2189,54 @@ impl ECStore {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default(),
-                )
+                );
+                (candidate_keys, health)
             }
             ListObjectsIndexProviderKind::PersistentKeyOnly => {
                 let Some(path) = provider_state.persistent_path.as_ref() else {
-                    record_list_objects_index_fallback(mode, ListIndexFallbackReason::Degraded);
+                    if list_metrics_enabled {
+                        record_list_objects_index_fallback(mode, ListIndexFallbackReason::Degraded);
+                    }
                     return Ok(None);
                 };
-                match load_persistent_key_only_index(path).await {
-                    Ok(keys) => keys,
+                match self
+                    .clone()
+                    .prepare_persistent_key_only_index(&provider_opts, &provider_state)
+                    .await
+                {
+                    Ok(index) => {
+                        let health = persistent_key_only_index_health(&index);
+                        match select_list_index_provider_source_mode(&provider_opts, mode, &health) {
+                            ListIndexSourceDecision::FallbackToWalker(reason) => {
+                                if list_metrics_enabled {
+                                    record_list_objects_index_fallback(mode, reason);
+                                }
+                                debug!(
+                                    bucket = %opts.bucket,
+                                    prefix = %opts.prefix,
+                                    source = mode.cursor_value(),
+                                    provider = provider_state.kind.metric_label(),
+                                    reason = reason.metric_label(),
+                                    "list_objects persistent key-only provider fell back to walker"
+                                );
+                                return Ok(None);
+                            }
+                            ListIndexSourceDecision::UseIndex(_) => {}
+                        }
+                        provider_opts.cursor_source = Some(mode);
+                        provider_opts.cursor_generation = health.active_generation.clone();
+                        (index.keys.clone(), health)
+                    }
                     Err(err) => {
-                        record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
+                        if list_metrics_enabled {
+                            record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
+                        }
                         debug!(
                             bucket = %opts.bucket,
                             prefix = %opts.prefix,
                             source = mode.cursor_value(),
                             provider = provider_state.kind.metric_label(),
+                            path = %path.display(),
                             error = %err,
                             "list_objects persistent key-only provider failed to load candidates"
                         );
@@ -4862,17 +5120,17 @@ mod test {
         ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
         ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
         ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
-        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, VerifiedIndexCandidateStats, VersionMarker,
-        enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
-        latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
+        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, PersistentKeyOnlyIndex, VerifiedIndexCandidateStats,
+        VersionMarker, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object,
+        gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
         latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_verified_index_candidates,
         list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
         list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
         list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
         merge_entry_channels, normalize_list_quorum, parse_persistent_key_only_index, parse_version_marker,
-        record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry, resolve_listing_entries,
-        select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel, version_marker_for_entries,
-        walk_result_from_set_errors,
+        persistent_key_only_index_health, record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry,
+        resolve_listing_entries, select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel,
+        version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
@@ -5624,7 +5882,7 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn list_objects_index_provider_state_publishes_persistent_generation() {
+    fn list_objects_index_provider_state_rebuilds_persistent_until_index_is_loaded() {
         let index_path = "/tmp/rustfs-listobjects-key-only.index";
         temp_env::with_var(
             ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
@@ -5638,9 +5896,10 @@ mod test {
 
                         assert_eq!(provider.kind, ListObjectsIndexProviderKind::PersistentKeyOnly);
                         assert_eq!(provider.persistent_path.as_deref(), Some(std::path::Path::new(index_path)));
-                        assert_eq!(health.state, ListIndexLifecycleState::Healthy);
-                        assert_eq!(health.active_generation.as_deref(), Some("bench-20260706"));
-                        assert_eq!(health.fallback_reason, None);
+                        assert_eq!(provider.persistent_generation.as_deref(), Some("bench-20260706"));
+                        assert_eq!(health.state, ListIndexLifecycleState::Rebuilding);
+                        assert_eq!(health.staging_generation.as_deref(), Some("bench-20260706"));
+                        assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Rebuilding));
                     });
                 });
             },
@@ -5649,8 +5908,11 @@ mod test {
 
     #[test]
     fn parse_persistent_key_only_index_sorts_and_deduplicates_keys() {
-        let keys = parse_persistent_key_only_index(
+        let index = parse_persistent_key_only_index(
             "# rustfs-listobjects-key-only-v1\n\
+             # bucket=photos\n\
+             # generation=bench-20260706\n\
+             # checkpoint_high_water_mark=99\n\
              photos/c.jpg\n\
              photos/a.jpg\r\n\
              \n\
@@ -5658,14 +5920,35 @@ mod test {
              photos/a.jpg\n",
         );
 
+        assert_eq!(index.bucket.as_deref(), Some("photos"));
+        assert_eq!(index.generation, "bench-20260706");
+        assert_eq!(index.checkpoint_high_water_mark, 99);
         assert_eq!(
-            keys,
+            index.keys.as_slice(),
             vec![
                 "photos/a.jpg".to_string(),
                 "photos/b.jpg".to_string(),
                 "photos/c.jpg".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn persistent_key_only_index_health_uses_snapshot_generation_and_checkpoint() {
+        let index = PersistentKeyOnlyIndex {
+            bucket: Some("bucket".to_string()),
+            generation: "generation-42".to_string(),
+            checkpoint_high_water_mark: 42,
+            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
+        };
+
+        let health = persistent_key_only_index_health(&index);
+
+        assert_eq!(health.state, ListIndexLifecycleState::Healthy);
+        assert_eq!(health.active_generation.as_deref(), Some("generation-42"));
+        assert_eq!(health.checkpoint_high_water_mark, 42);
+        assert_eq!(health.mutation_high_water_mark, 42);
+        assert_eq!(health.fallback_reason, None);
     }
 
     #[test]
