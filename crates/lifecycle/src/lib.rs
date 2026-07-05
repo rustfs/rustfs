@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::api::disk::{DiskStore, endpoint::Endpoint};
-use rustfs_storage_api as storage_contracts;
+pub mod core;
+pub mod evaluator;
+pub mod object_lock;
+pub mod rule;
+mod tagging;
 
-pub(crate) mod bug_fixes {
-    pub(crate) use super::storage_contracts::BucketInfo;
-    pub(crate) use super::{DiskStore, Endpoint};
-}
+pub use core::*;
+pub use evaluator::Evaluator;
+pub use rustfs_common::metrics::IlmAction;
+pub use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};

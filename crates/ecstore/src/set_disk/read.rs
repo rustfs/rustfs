@@ -371,6 +371,9 @@ impl MetadataQuorumAccumulator {
     /// Check if a versioned request can early-stop because the requested
     /// version_id has reached quorum across disks.
     fn version_early_stop_decision(&self) -> Option<MetadataEarlyStopDecision> {
+        if !self.allow_early_stop {
+            return None;
+        }
         if self.requested_version_id.is_empty() {
             return None;
         }
@@ -4386,6 +4389,18 @@ mod tests {
 
     fn version_early_stop_accumulator(requested_version_id: &str) -> MetadataQuorumAccumulator {
         MetadataQuorumAccumulator::new(4, 2, true).with_requested_version_id(requested_version_id)
+    }
+
+    #[test]
+    fn version_early_stop_respects_disabled_accumulator() {
+        let vid = Uuid::new_v4();
+        let mut accumulator = MetadataQuorumAccumulator::new(4, 2, false).with_requested_version_id(&vid.to_string());
+
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 1, vid));
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 2, vid));
+
+        assert!(accumulator.version_early_stop_decision().is_none());
+        assert_eq!(accumulator.matching_version_votes, 2);
     }
 
     #[test]

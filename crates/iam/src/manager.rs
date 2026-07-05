@@ -514,12 +514,16 @@ where
             }
 
             if let Err(err) = self.api.delete_policy_doc(name).await {
+                // A real backend failure (disk IO, insufficient quorum, etc.) means the on-disk
+                // policy was NOT removed: propagate the error so callers do not report a phantom
+                // success and evict a policy that is still persisted (it would reappear on the
+                // next full IAM reload).
                 if !is_err_no_such_policy(&err) {
-                    self.cache.delete_policy_doc(name, OffsetDateTime::now_utc());
-                    return Ok(());
+                    return Err(err);
                 }
 
-                return Err(err);
+                // NoSuchPolicy means the doc is already gone on the backend; treat the delete as
+                // idempotently successful and fall through to evict any stale cache entry below.
             }
         }
 
@@ -2925,5 +2929,40 @@ mod tests {
         assert_eq!(desc.policy, "readonly");
         assert_eq!(desc.members, vec!["alice".to_string()]);
         assert!(desc.updated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_policy_propagates_backend_error_and_keeps_cache() {
+        // Regression: on the admin delete path (is_from_notify = true), a real backend delete
+        // failure (here Error::InvalidArgument, standing in for disk IO / insufficient quorum)
+        // must propagate — NOT be swallowed as Ok(()) while evicting the still-persisted policy.
+        let cache = build_test_iam_cache(FailingInitialLoadStore);
+
+        let policy = Policy {
+            id: Default::default(),
+            version: "2012-10-17".to_string(),
+            statements: vec![],
+        };
+        let policy_doc = PolicyDoc {
+            version: 1,
+            policy,
+            create_date: Some(OffsetDateTime::now_utc()),
+            update_date: Some(OffsetDateTime::now_utc()),
+        };
+        cache
+            .cache
+            .add_or_update_policy_doc("permissive-policy", &policy_doc, OffsetDateTime::now_utc());
+
+        let result = cache.delete_policy("permissive-policy", true).await;
+
+        // Pre-fix this returned Ok(()) (phantom success) and evicted the cache entry.
+        assert!(
+            result.is_err(),
+            "delete_policy must surface a real backend delete failure instead of reporting success"
+        );
+        assert!(
+            cache.cache.snapshot().policy_docs.contains_key("permissive-policy"),
+            "cache must not evict a policy whose backend delete failed"
+        );
     }
 }

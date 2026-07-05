@@ -93,30 +93,31 @@ use s3s::dto::{
     DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
     DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
     DeleteBucketPolicyOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput,
-    DeleteBucketTaggingOutput, DeleteMarkerM, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
+    DeleteBucketTaggingOutput, DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
     ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
     GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
     GetBucketNotificationConfigurationInput, GetBucketNotificationConfigurationOutput, GetBucketPolicyInput,
     GetBucketPolicyOutput, GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput,
     GetBucketReplicationOutput, GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput,
     GetBucketVersioningOutput, GetPublicAccessBlockInput, GetPublicAccessBlockOutput, HeadBucketInput, HeadBucketOutput,
-    LifecycleRule, ListBucketsInput, ListBucketsOutput, ListObjectVersionMEntry, ListObjectVersionsInput,
-    ListObjectVersionsMOutput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
-    ListObjectsV2MOutput, ListObjectsV2Output, NotificationConfiguration, NotificationConfigurationFilter, ObjectInternalInfo,
-    ObjectLockConfiguration, ObjectM, ObjectStorageClass, ObjectVersionM, ObjectVersionStorageClass, PolicyStatus,
-    PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
-    PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput, PutBucketNotificationConfigurationInput,
-    PutBucketNotificationConfigurationOutput, PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput,
-    PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput, PutBucketVersioningInput,
-    PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput, ReplicationConfiguration,
-    ServerSideEncryption, Tagging, Timestamp, UserMetadataCollection, UserMetadataEntry, VersioningConfiguration,
+    LifecycleRule, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput,
+    ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration,
+    NotificationConfigurationFilter, Object, ObjectLockConfiguration, ObjectStorageClass, ObjectVersion,
+    ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput,
+    PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
+    PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput, PutBucketPolicyInput,
+    PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
+    PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput,
+    ReplicationConfiguration, ServerSideEncryption, Tagging, Timestamp, UserMetadata, VersioningConfiguration,
 };
 use s3s::region::Region;
 use s3s::xml;
+use s3s::xml::{SerResult, SerializeContent};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    io::Write,
     sync::Arc,
 };
 use tracing::{debug, error, info, instrument, warn};
@@ -127,6 +128,208 @@ use urlencoding::encode;
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+
+const XMLNS_S3: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ObjectInternalInfo {
+    pub k: i32,
+    pub m: i32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ObjectMetadataExtension {
+    pub user_metadata: Option<UserMetadata>,
+    pub user_tags: Option<String>,
+    pub internal: Option<ObjectInternalInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ListObjectVersionMetadataEntry {
+    DeleteMarker(DeleteMarkerEntry, ObjectMetadataExtension),
+    Version(ObjectVersion, ObjectMetadataExtension),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ListObjectVersionsMetadataOutput {
+    pub output: ListObjectVersionsOutput,
+    pub entries: Vec<ListObjectVersionMetadataEntry>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ObjectMetadataEntry {
+    pub object: Object,
+    pub extension: ObjectMetadataExtension,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ListObjectsV2MetadataOutput {
+    pub output: ListObjectsV2Output,
+    pub contents: Vec<ObjectMetadataEntry>,
+}
+
+impl xml::Serialize for ListObjectVersionsMetadataOutput {
+    fn serialize<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        s.content_with_ns("ListVersionsResult", XMLNS_S3, self)
+    }
+}
+
+impl SerializeContent for ListObjectVersionsMetadataOutput {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        if let Some(iter) = &self.output.common_prefixes {
+            s.flattened_list("CommonPrefixes", iter)?;
+        }
+        if let Some(ref val) = self.output.delimiter {
+            s.content("Delimiter", val)?;
+        }
+        if let Some(ref val) = self.output.encoding_type {
+            s.content("EncodingType", val)?;
+        }
+        if let Some(ref val) = self.output.is_truncated {
+            s.content("IsTruncated", val)?;
+        }
+        if let Some(ref val) = self.output.key_marker {
+            s.content("KeyMarker", val)?;
+        }
+        if let Some(ref val) = self.output.max_keys {
+            s.content("MaxKeys", val)?;
+        }
+        if let Some(ref val) = self.output.name {
+            s.content("Name", val)?;
+        }
+        if let Some(ref val) = self.output.next_key_marker {
+            s.content("NextKeyMarker", val)?;
+        }
+        if let Some(ref val) = self.output.next_version_id_marker {
+            s.content("NextVersionIdMarker", val)?;
+        }
+        if let Some(ref val) = self.output.prefix {
+            s.content("Prefix", val)?;
+        }
+        if let Some(ref val) = self.output.version_id_marker {
+            s.content("VersionIdMarker", val)?;
+        }
+        for entry in &self.entries {
+            match entry {
+                ListObjectVersionMetadataEntry::DeleteMarker(marker, extension) => {
+                    s.content(
+                        "DeleteMarker",
+                        &VersionMetadataContent {
+                            value: marker,
+                            extension,
+                        },
+                    )?;
+                }
+                ListObjectVersionMetadataEntry::Version(version, extension) => {
+                    s.content(
+                        "Version",
+                        &VersionMetadataContent {
+                            value: version,
+                            extension,
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl xml::Serialize for ListObjectsV2MetadataOutput {
+    fn serialize<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        s.content_with_ns("ListBucketResult", XMLNS_S3, self)
+    }
+}
+
+impl SerializeContent for ListObjectsV2MetadataOutput {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        if let Some(ref val) = self.output.name {
+            s.content("Name", val)?;
+        }
+        if let Some(ref val) = self.output.prefix {
+            s.content("Prefix", val)?;
+        }
+        if let Some(ref val) = self.output.max_keys {
+            s.content("MaxKeys", val)?;
+        }
+        if let Some(ref val) = self.output.key_count {
+            s.content("KeyCount", val)?;
+        }
+        if let Some(ref val) = self.output.continuation_token {
+            s.content("ContinuationToken", val)?;
+        }
+        if let Some(ref val) = self.output.is_truncated {
+            s.content("IsTruncated", val)?;
+        }
+        if let Some(ref val) = self.output.next_continuation_token {
+            s.content("NextContinuationToken", val)?;
+        }
+        for entry in &self.contents {
+            s.content("Contents", entry)?;
+        }
+        if let Some(iter) = &self.output.common_prefixes {
+            s.flattened_list("CommonPrefixes", iter)?;
+        }
+        if let Some(ref val) = self.output.delimiter {
+            s.content("Delimiter", val)?;
+        }
+        if let Some(ref val) = self.output.encoding_type {
+            s.content("EncodingType", val)?;
+        }
+        if let Some(ref val) = self.output.start_after {
+            s.content("StartAfter", val)?;
+        }
+        Ok(())
+    }
+}
+
+struct VersionMetadataContent<'a, T> {
+    value: &'a T,
+    extension: &'a ObjectMetadataExtension,
+}
+
+impl<T: SerializeContent> SerializeContent for VersionMetadataContent<'_, T> {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        self.value.serialize_content(s)?;
+        self.extension.serialize_content(s)
+    }
+}
+
+impl SerializeContent for ObjectMetadataEntry {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        self.object.serialize_content(s)?;
+        self.extension.serialize_content(s)
+    }
+}
+
+impl SerializeContent for ObjectMetadataExtension {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        if let Some(metadata) = &self.user_metadata {
+            s.element("UserMetadata", |s| {
+                for entry in metadata {
+                    if let (Some(name), Some(value)) = (&entry.name, &entry.value) {
+                        s.content(name, value)?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(tags) = &self.user_tags {
+            s.content("UserTags", tags)?;
+        }
+        if let Some(internal) = &self.internal {
+            s.content("Internal", internal)?;
+        }
+        Ok(())
+    }
+}
+
+impl SerializeContent for ObjectInternalInfo {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        s.content("K", &self.k)?;
+        s.content("M", &self.m)
+    }
+}
 
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
@@ -421,19 +624,22 @@ fn encode_list_objects_v2_value(value: &str, encoding_type: Option<&EncodingType
     }
 }
 
-fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<UserMetadataCollection> {
+fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<UserMetadata> {
     let mut items = extract_user_defined_metadata(user_defined)
         .into_iter()
         .filter(|(key, _)| !key.is_empty())
-        .map(|(key, value)| UserMetadataEntry { key, value })
+        .map(|(key, value)| MetadataEntry {
+            name: Some(key),
+            value: Some(value),
+        })
         .collect::<Vec<_>>();
-    items.sort_by(|left, right| left.key.cmp(&right.key));
+    items.sort_by(|left, right| left.name.cmp(&right.name));
 
-    if items.is_empty() {
-        None
-    } else {
-        Some(UserMetadataCollection { items })
-    }
+    if items.is_empty() { None } else { Some(items) }
+}
+
+fn metadata_count_to_i32(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 async fn is_list_objects_metadata_action_allowed<T>(
@@ -496,13 +702,13 @@ async fn collect_list_objects_metadata_permissions<T>(
     Ok(permissions)
 }
 
-fn build_list_object_versions_m_output(
+fn build_list_object_versions_metadata_output(
     object_infos: ListObjectVersionsInfo,
     bucket: &str,
     params: &ListObjectVersionsParams,
     encoding_type: Option<&EncodingType>,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
-) -> ListObjectVersionsMOutput {
+) -> ListObjectVersionsMetadataOutput {
     let owner = rustfs_owner();
     let common_prefixes = object_infos
         .prefixes
@@ -535,42 +741,49 @@ fn build_list_object_versions_m_output(
             };
             let internal = if permission.metadata_allowed && (object.data_blocks > 0 || object.parity_blocks > 0) {
                 Some(ObjectInternalInfo {
-                    k: object.data_blocks as i32,
-                    m: object.parity_blocks as i32,
+                    k: metadata_count_to_i32(object.data_blocks),
+                    m: metadata_count_to_i32(object.parity_blocks),
                 })
             } else {
                 None
             };
 
+            let extension = ObjectMetadataExtension {
+                user_metadata,
+                user_tags,
+                internal,
+            };
+
             if object.delete_marker {
-                ListObjectVersionMEntry::DeleteMarker(DeleteMarkerM {
-                    key: Some(object_name),
-                    last_modified: object.mod_time.map(Timestamp::from),
-                    owner: Some(owner.clone()),
-                    version_id: Some(version_id),
-                    is_latest: Some(object.is_latest),
-                    user_metadata,
-                    user_tags,
-                    internal,
-                })
+                ListObjectVersionMetadataEntry::DeleteMarker(
+                    DeleteMarkerEntry {
+                        key: Some(object_name),
+                        last_modified: object.mod_time.map(Timestamp::from),
+                        owner: Some(owner.clone()),
+                        version_id: Some(version_id),
+                        is_latest: Some(object.is_latest),
+                    },
+                    extension,
+                )
             } else {
-                ListObjectVersionMEntry::Version(ObjectVersionM {
-                    key: Some(object_name),
-                    last_modified: object.mod_time.map(Timestamp::from),
-                    size: Some(object.size),
-                    version_id: Some(version_id),
-                    is_latest: Some(object.is_latest),
-                    e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                    storage_class: Some(ObjectVersionStorageClass::from(
-                        object
-                            .storage_class
-                            .unwrap_or_else(|| ObjectVersionStorageClass::STANDARD.to_string()),
-                    )),
-                    owner: Some(owner.clone()),
-                    user_metadata,
-                    user_tags,
-                    internal,
-                })
+                ListObjectVersionMetadataEntry::Version(
+                    ObjectVersion {
+                        key: Some(object_name),
+                        last_modified: object.mod_time.map(Timestamp::from),
+                        size: Some(object.size),
+                        version_id: Some(version_id),
+                        is_latest: Some(object.is_latest),
+                        e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                        storage_class: Some(ObjectVersionStorageClass::from(
+                            object
+                                .storage_class
+                                .unwrap_or_else(|| ObjectVersionStorageClass::STANDARD.to_string()),
+                        )),
+                        owner: Some(owner.clone()),
+                        ..Default::default()
+                    },
+                    extension,
+                )
             }
         })
         .collect::<Vec<_>>();
@@ -581,37 +794,40 @@ fn build_list_object_versions_m_output(
         .map(|marker| encode_list_versions_value(&marker, encoding_type));
     let next_version_id_marker = object_infos.next_version_idmarker.filter(|marker| !marker.is_empty());
 
-    ListObjectVersionsMOutput {
-        common_prefixes: Some(common_prefixes),
-        delimiter: params
-            .delimiter
-            .clone()
-            .map(|value| encode_list_versions_value(&value, encoding_type)),
-        encoding_type: encoding_type.cloned(),
-        is_truncated: Some(object_infos.is_truncated),
-        key_marker: Some(encode_list_versions_value(
-            params.key_marker.as_deref().unwrap_or_default(),
-            encoding_type,
-        )),
-        max_keys: Some(params.max_keys),
-        name: Some(bucket.to_owned()),
-        next_key_marker,
-        next_version_id_marker,
-        prefix: Some(encode_list_versions_value(&params.prefix, encoding_type)),
-        request_charged: None,
-        version_id_marker: Some(params.version_id_marker.clone().unwrap_or_default()),
+    ListObjectVersionsMetadataOutput {
+        output: ListObjectVersionsOutput {
+            common_prefixes: Some(common_prefixes),
+            delimiter: params
+                .delimiter
+                .clone()
+                .map(|value| encode_list_versions_value(&value, encoding_type)),
+            encoding_type: encoding_type.cloned(),
+            is_truncated: Some(object_infos.is_truncated),
+            key_marker: Some(encode_list_versions_value(
+                params.key_marker.as_deref().unwrap_or_default(),
+                encoding_type,
+            )),
+            max_keys: Some(params.max_keys),
+            name: Some(bucket.to_owned()),
+            next_key_marker,
+            next_version_id_marker,
+            prefix: Some(encode_list_versions_value(&params.prefix, encoding_type)),
+            request_charged: None,
+            version_id_marker: Some(params.version_id_marker.clone().unwrap_or_default()),
+            ..Default::default()
+        },
         entries,
     }
 }
 
-fn build_list_objects_v2m_output(
+fn build_list_objects_v2_metadata_output(
     object_infos: ListObjectsV2Info,
     bucket: &str,
     params: &ListObjectsV2Params,
     encoding_type: Option<&EncodingType>,
     fetch_owner: bool,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
-) -> ListObjectsV2MOutput {
+) -> ListObjectsV2MetadataOutput {
     let owner = rustfs_owner();
 
     let contents = object_infos
@@ -632,28 +848,33 @@ fn build_list_objects_v2m_output(
             };
             let internal = if permission.metadata_allowed && (object.data_blocks > 0 || object.parity_blocks > 0) {
                 Some(ObjectInternalInfo {
-                    k: object.data_blocks as i32,
-                    m: object.parity_blocks as i32,
+                    k: metadata_count_to_i32(object.data_blocks),
+                    m: metadata_count_to_i32(object.parity_blocks),
                 })
             } else {
                 None
             };
 
-            ObjectM {
-                key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
-                last_modified: object.mod_time.map(Timestamp::from),
-                size: Some(object.get_actual_size().unwrap_or_default()),
-                e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                storage_class: Some(ObjectStorageClass::from(
-                    object
-                        .storage_class
-                        .clone()
-                        .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
-                )),
-                owner: fetch_owner.then_some(owner.clone()),
-                user_metadata,
-                user_tags,
-                internal,
+            ObjectMetadataEntry {
+                object: Object {
+                    key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
+                    last_modified: object.mod_time.map(Timestamp::from),
+                    size: Some(object.get_actual_size().unwrap_or_default()),
+                    e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: Some(ObjectStorageClass::from(
+                        object
+                            .storage_class
+                            .clone()
+                            .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
+                    )),
+                    owner: fetch_owner.then_some(owner.clone()),
+                    ..Default::default()
+                },
+                extension: ObjectMetadataExtension {
+                    user_metadata,
+                    user_tags,
+                    internal,
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -666,25 +887,27 @@ fn build_list_objects_v2m_output(
         })
         .collect::<Vec<_>>();
 
-    let key_count = (contents.len() + common_prefixes.len()) as i32;
+    let key_count = metadata_count_to_i32(contents.len() + common_prefixes.len());
     let next_continuation_token = object_infos
         .next_continuation_token
         .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
 
-    ListObjectsV2MOutput {
-        name: Some(bucket.to_owned()),
-        prefix: Some(params.prefix.clone()),
-        max_keys: Some(params.max_keys),
-        key_count: Some(key_count),
-        continuation_token: params.response_continuation_token.clone(),
-        is_truncated: Some(object_infos.is_truncated),
-        next_continuation_token,
-        contents: Some(contents),
-        common_prefixes: Some(common_prefixes),
-        delimiter: params.delimiter.clone(),
-        encoding_type: encoding_type.cloned(),
-        start_after: params.response_start_after.clone(),
-        ..Default::default()
+    ListObjectsV2MetadataOutput {
+        output: ListObjectsV2Output {
+            name: Some(bucket.to_owned()),
+            prefix: Some(params.prefix.clone()),
+            max_keys: Some(params.max_keys),
+            key_count: Some(key_count),
+            continuation_token: params.response_continuation_token.clone(),
+            is_truncated: Some(object_infos.is_truncated),
+            next_continuation_token,
+            common_prefixes: Some(common_prefixes),
+            delimiter: params.delimiter.clone(),
+            encoding_type: encoding_type.cloned(),
+            start_after: params.response_start_after.clone(),
+            ..Default::default()
+        },
+        contents,
     }
 }
 
@@ -2156,10 +2379,10 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
-    pub async fn execute_list_objects_v2m(
+    pub(crate) async fn execute_list_objects_v2m(
         &self,
         req: S3Request<ListObjectsV2Input>,
-    ) -> S3Result<S3Response<ListObjectsV2MOutput>> {
+    ) -> S3Result<S3Response<ListObjectsV2MetadataOutput>> {
         let input = req.input.clone();
         let ListObjectsV2Input {
             bucket,
@@ -2197,7 +2420,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let output = build_list_objects_v2m_output(
+        let output = build_list_objects_v2_metadata_output(
             object_infos,
             &bucket,
             &params,
@@ -2245,10 +2468,10 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
-    pub async fn execute_list_object_versions_m(
+    pub(crate) async fn execute_list_object_versions_m(
         &self,
         req: S3Request<ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
+    ) -> S3Result<S3Response<ListObjectVersionsMetadataOutput>> {
         let input = req.input.clone();
         let ListObjectVersionsInput {
             bucket,
@@ -2277,7 +2500,8 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let output = build_list_object_versions_m_output(object_infos, &bucket, &params, encoding_type.as_ref(), &permissions);
+        let output =
+            build_list_object_versions_metadata_output(object_infos, &bucket, &params, encoding_type.as_ref(), &permissions);
 
         Ok(S3Response::new(output))
     }
@@ -3009,7 +3233,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_object_versions_m_output_maps_metadata_and_preserves_entry_order() {
+    fn build_list_object_versions_metadata_output_maps_metadata_and_preserves_entry_order() {
         use time::macros::datetime;
         use uuid::Uuid;
 
@@ -3069,7 +3293,7 @@ mod tests {
             version_id_marker: Some("vid-1".to_string()),
             max_keys: 1000,
         };
-        let output = build_list_object_versions_m_output(
+        let output = build_list_object_versions_metadata_output(
             object_infos,
             "demo-bucket",
             &params,
@@ -3077,24 +3301,24 @@ mod tests {
             &permissions,
         );
 
-        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("pre"));
-        assert_eq!(output.key_marker.as_deref(), Some("start%20marker"));
-        assert_eq!(output.next_key_marker.as_deref(), Some("obj-z"));
-        assert_eq!(output.next_version_id_marker.as_deref(), Some("null"));
+        assert_eq!(output.output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.output.prefix.as_deref(), Some("pre"));
+        assert_eq!(output.output.key_marker.as_deref(), Some("start%20marker"));
+        assert_eq!(output.output.next_key_marker.as_deref(), Some("obj-z"));
+        assert_eq!(output.output.next_version_id_marker.as_deref(), Some("null"));
         assert_eq!(output.entries.len(), 2);
 
         match &output.entries[0] {
-            ListObjectVersionMEntry::Version(version) => {
+            ListObjectVersionMetadataEntry::Version(version, extension) => {
                 assert_eq!(version.key.as_deref(), Some("obj-a"));
                 assert_eq!(version.version_id.as_deref(), Some(Uuid::nil().to_string().as_str()));
-                assert_eq!(version.user_tags.as_deref(), Some("env=prod"));
-                assert_eq!(version.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
+                assert_eq!(extension.user_tags.as_deref(), Some("env=prod"));
+                assert_eq!(extension.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
                 assert_eq!(
-                    version.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-                    Some(vec![UserMetadataEntry {
-                        key: "project".to_string(),
-                        value: "alpha".to_string(),
+                    extension.user_metadata.clone(),
+                    Some(vec![MetadataEntry {
+                        name: Some("project".to_string()),
+                        value: Some("alpha".to_string()),
                     }])
                 );
             }
@@ -3102,15 +3326,15 @@ mod tests {
         }
 
         match &output.entries[1] {
-            ListObjectVersionMEntry::DeleteMarker(marker) => {
+            ListObjectVersionMetadataEntry::DeleteMarker(marker, extension) => {
                 assert_eq!(marker.key.as_deref(), Some("obj-b"));
                 assert_eq!(marker.version_id.as_deref(), Some("null"));
-                assert!(marker.user_tags.is_none());
+                assert!(extension.user_tags.is_none());
                 assert_eq!(
-                    marker.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-                    Some(vec![UserMetadataEntry {
-                        key: "marker".to_string(),
-                        value: "true".to_string(),
+                    extension.user_metadata.clone(),
+                    Some(vec![MetadataEntry {
+                        name: Some("marker".to_string()),
+                        value: Some("true".to_string()),
                     }])
                 );
             }
@@ -3119,7 +3343,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_object_versions_m_output_uses_params_and_hides_metadata_without_permissions() {
+    fn build_list_object_versions_metadata_output_uses_params_and_hides_metadata_without_permissions() {
         use time::macros::datetime;
 
         let object_infos = ListObjectVersionsInfo {
@@ -3148,7 +3372,7 @@ mod tests {
             max_keys: 25,
         };
 
-        let output = build_list_object_versions_m_output(
+        let output = build_list_object_versions_metadata_output(
             object_infos,
             "demo-bucket",
             &params,
@@ -3156,20 +3380,20 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("logs%20and%20more%2F"));
-        assert_eq!(output.delimiter.as_deref(), Some("%20"));
-        assert_eq!(output.key_marker.as_deref(), Some("marker%20value"));
-        assert_eq!(output.version_id_marker.as_deref(), Some(""));
-        assert_eq!(output.next_key_marker, None);
-        assert_eq!(output.next_version_id_marker, None);
+        assert_eq!(output.output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.output.prefix.as_deref(), Some("logs%20and%20more%2F"));
+        assert_eq!(output.output.delimiter.as_deref(), Some("%20"));
+        assert_eq!(output.output.key_marker.as_deref(), Some("marker%20value"));
+        assert_eq!(output.output.version_id_marker.as_deref(), Some(""));
+        assert_eq!(output.output.next_key_marker, None);
+        assert_eq!(output.output.next_version_id_marker, None);
 
         match &output.entries[0] {
-            ListObjectVersionMEntry::Version(version) => {
+            ListObjectVersionMetadataEntry::Version(version, extension) => {
                 assert_eq!(version.key.as_deref(), Some("logs%20and%20more%2Fobject%20one.txt"));
-                assert!(version.user_metadata.is_none());
-                assert!(version.user_tags.is_none());
-                assert!(version.internal.is_none());
+                assert!(extension.user_metadata.is_none());
+                assert!(extension.user_tags.is_none());
+                assert!(extension.internal.is_none());
             }
             other => panic!("expected version entry, got {other:?}"),
         }
@@ -3201,7 +3425,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_objects_v2m_output_maps_metadata_and_key_count() {
+    fn build_list_objects_v2_metadata_output_maps_metadata_and_key_count() {
         use time::macros::datetime;
 
         let object_infos = ListObjectsV2Info {
@@ -3241,7 +3465,7 @@ mod tests {
             decoded_continuation_token: None,
         };
 
-        let output = build_list_objects_v2m_output(
+        let output = build_list_objects_v2_metadata_output(
             object_infos,
             "demo-bucket",
             &params,
@@ -3250,34 +3474,82 @@ mod tests {
             &permissions,
         );
 
-        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("logs/"));
-        assert_eq!(output.continuation_token.as_deref(), Some("start token"));
-        assert_eq!(output.start_after.as_deref(), Some("logs/start after"));
-        assert_eq!(output.next_continuation_token.as_deref(), Some("bmV4dC10b2tlbg=="));
-        assert_eq!(output.key_count, Some(2));
-        assert_eq!(output.contents.as_ref().map(Vec::len), Some(1));
-        assert_eq!(output.common_prefixes.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.output.prefix.as_deref(), Some("logs/"));
+        assert_eq!(output.output.continuation_token.as_deref(), Some("start token"));
+        assert_eq!(output.output.start_after.as_deref(), Some("logs/start after"));
+        assert_eq!(output.output.next_continuation_token.as_deref(), Some("bmV4dC10b2tlbg=="));
+        assert_eq!(output.output.key_count, Some(2));
+        assert_eq!(output.contents.len(), 1);
+        assert_eq!(output.output.common_prefixes.as_ref().map(Vec::len), Some(1));
 
-        let object = output.contents.as_ref().unwrap().first().unwrap();
-        assert_eq!(object.key.as_deref(), Some("logs/obj%20a.txt"));
-        assert_eq!(object.user_tags.as_deref(), Some("env=prod"));
-        assert_eq!(object.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
-        assert!(object.owner.is_some());
+        let entry = output.contents.first().unwrap();
+        assert_eq!(entry.object.key.as_deref(), Some("logs/obj%20a.txt"));
+        assert_eq!(entry.extension.user_tags.as_deref(), Some("env=prod"));
+        assert_eq!(entry.extension.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
+        assert!(entry.object.owner.is_some());
         assert_eq!(
-            object.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-            Some(vec![UserMetadataEntry {
-                key: "project".to_string(),
-                value: "alpha".to_string(),
+            entry.extension.user_metadata.clone(),
+            Some(vec![MetadataEntry {
+                name: Some("project".to_string()),
+                value: Some("alpha".to_string()),
             }])
         );
 
-        let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
+        let prefix = output.output.common_prefixes.as_ref().unwrap().first().unwrap();
         assert_eq!(prefix.prefix.as_deref(), Some("logs/archive/"));
     }
 
     #[test]
-    fn build_list_objects_v2m_output_uses_params_and_hides_owner_without_fetch_owner() {
+    fn list_objects_v2_metadata_output_serializes_minio_extension_xml() {
+        use time::macros::datetime;
+
+        let object_infos = ListObjectsV2Info {
+            is_truncated: false,
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs/obj-a.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-03 00:00 UTC)),
+                size: 11,
+                user_defined: Arc::new(HashMap::from([("project".to_string(), "alpha".to_string())])),
+                parity_blocks: 2,
+                data_blocks: 4,
+                user_tags: Arc::new("env=prod&project=alpha".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let permissions = HashMap::from([(
+            "logs/obj-a.txt".to_string(),
+            ObjectMetadataPermissions {
+                metadata_allowed: true,
+                tags_allowed: true,
+            },
+        )]);
+        let params = ListObjectsV2Params {
+            prefix: "logs/".to_string(),
+            max_keys: 1000,
+            delimiter: None,
+            response_start_after: None,
+            start_after_for_query: None,
+            response_continuation_token: None,
+            decoded_continuation_token: None,
+        };
+
+        let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
+        let xml = String::from_utf8(serialize_config(&output).expect("metadata output should serialize"))
+            .expect("metadata output should be UTF-8");
+
+        assert!(xml.contains("<ListBucketResult"));
+        assert!(xml.contains("<Contents>"));
+        assert!(xml.contains("<UserMetadata><project>alpha</project></UserMetadata>"));
+        assert!(xml.contains("<UserTags>env=prod&amp;project=alpha</UserTags>"));
+        assert!(xml.contains("<Internal><K>4</K><M>2</M></Internal>"));
+        assert!(!xml.contains("<MetadataEntry>"));
+    }
+
+    #[test]
+    fn build_list_objects_v2_metadata_output_uses_params_and_hides_owner_without_fetch_owner() {
         use time::macros::datetime;
 
         let object_infos = ListObjectsV2Info {
@@ -3308,7 +3580,7 @@ mod tests {
             decoded_continuation_token: Some("decoded token".to_string()),
         };
 
-        let output = build_list_objects_v2m_output(
+        let output = build_list_objects_v2_metadata_output(
             object_infos,
             "demo-bucket",
             &params,
@@ -3317,22 +3589,22 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("logs and more/"));
-        assert_eq!(output.delimiter.as_deref(), Some("/"));
-        assert_eq!(output.continuation_token.as_deref(), Some("opaque token"));
-        assert_eq!(output.start_after.as_deref(), Some("logs and more/start after"));
-        assert_eq!(output.key_count, Some(2));
-        assert_eq!(output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
+        assert_eq!(output.output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.output.prefix.as_deref(), Some("logs and more/"));
+        assert_eq!(output.output.delimiter.as_deref(), Some("/"));
+        assert_eq!(output.output.continuation_token.as_deref(), Some("opaque token"));
+        assert_eq!(output.output.start_after.as_deref(), Some("logs and more/start after"));
+        assert_eq!(output.output.key_count, Some(2));
+        assert_eq!(output.output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
 
-        let object = output.contents.as_ref().unwrap().first().unwrap();
-        assert_eq!(object.key.as_deref(), Some("logs%20and%20more/object%20one.txt"));
-        assert!(object.owner.is_none());
-        assert!(object.user_metadata.is_none());
-        assert!(object.user_tags.is_none());
-        assert!(object.internal.is_none());
+        let entry = output.contents.first().unwrap();
+        assert_eq!(entry.object.key.as_deref(), Some("logs%20and%20more/object%20one.txt"));
+        assert!(entry.object.owner.is_none());
+        assert!(entry.extension.user_metadata.is_none());
+        assert!(entry.extension.user_tags.is_none());
+        assert!(entry.extension.internal.is_none());
 
-        let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
+        let prefix = output.output.common_prefixes.as_ref().unwrap().first().unwrap();
         assert_eq!(prefix.prefix.as_deref(), Some("logs%20and%20more/archive/"));
     }
 

@@ -25,6 +25,18 @@ use url::Url;
 
 pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS";
 pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
+pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT";
+pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
+pub const DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "secret";
+pub const DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX: &str = "rustfs/kms/transit-metadata";
+
+fn default_vault_transit_metadata_kv_mount() -> String {
+    DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string()
+}
+
+fn default_vault_transit_metadata_key_prefix() -> String {
+    DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string()
+}
 
 pub const KMS_CONFIG_REDACTION_RULES: &[RedactionRule] = &[
     RedactionRule::new("kms.local.master_key", RedactionLevel::Secret, "local backend key encryption material"),
@@ -244,6 +256,12 @@ pub struct VaultTransitConfig {
     pub namespace: Option<String>,
     /// Transit engine mount path
     pub mount_path: String,
+    /// KV v2 mount path for persisting transit key metadata
+    #[serde(default = "default_vault_transit_metadata_kv_mount")]
+    pub metadata_kv_mount: String,
+    /// Key path prefix under metadata_kv_mount for transit key metadata storage
+    #[serde(default = "default_vault_transit_metadata_key_prefix")]
+    pub metadata_key_prefix: String,
     /// TLS configuration
     pub tls: Option<TlsConfig>,
 }
@@ -255,6 +273,8 @@ impl fmt::Debug for VaultTransitConfig {
             .field("auth_method", &self.auth_method)
             .field("namespace", &self.namespace)
             .field("mount_path", &self.mount_path)
+            .field("metadata_kv_mount", &self.metadata_kv_mount)
+            .field("metadata_key_prefix", &self.metadata_key_prefix)
             .field("tls", &self.tls)
             .finish()
     }
@@ -269,6 +289,8 @@ impl Default for VaultTransitConfig {
             },
             namespace: None,
             mount_path: "transit".to_string(),
+            metadata_kv_mount: default_vault_transit_metadata_kv_mount(),
+            metadata_key_prefix: default_vault_transit_metadata_key_prefix(),
             tls: None,
         }
     }
@@ -505,6 +527,14 @@ impl KmsConfig {
                     return Err(KmsError::configuration_error("Vault Transit mount path cannot be empty"));
                 }
 
+                if config.metadata_kv_mount.is_empty() {
+                    return Err(KmsError::configuration_error("Vault Transit metadata KV mount cannot be empty"));
+                }
+
+                if config.metadata_key_prefix.is_empty() {
+                    return Err(KmsError::configuration_error("Vault Transit metadata key prefix cannot be empty"));
+                }
+
                 if config.address.starts_with("https://")
                     && let Some(ref tls) = config.tls
                     && !tls.skip_verify
@@ -600,6 +630,14 @@ impl KmsConfig {
                     auth_method: VaultAuthMethod::Token { token },
                     namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
                     mount_path: get_env_str("RUSTFS_KMS_VAULT_MOUNT_PATH", "transit"),
+                    metadata_kv_mount: get_env_str(
+                        ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT,
+                        DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT,
+                    ),
+                    metadata_key_prefix: get_env_str(
+                        ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX,
+                        DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX,
+                    ),
                     tls: vault_tls_config(skip_tls_verify),
                 }));
             }
@@ -749,6 +787,8 @@ mod tests {
                 },
                 namespace: None,
                 mount_path: "transit".to_string(),
+                metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
+                metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
                 tls: Some(TlsConfig {
                     ca_cert_path: None,
                     client_cert_path: None,
@@ -799,6 +839,39 @@ mod tests {
         let config: KmsConfig = serde_json::from_str(raw).expect("legacy persisted kms config");
         assert_eq!(config.backend, KmsBackend::VaultKv2);
         assert!(config.vault_config().is_some());
+    }
+
+    #[test]
+    fn test_legacy_persisted_vault_transit_config_uses_metadata_defaults() {
+        let raw = r#"{
+            "backend": "VaultTransit",
+            "backend_config": {
+                "VaultTransit": {
+                    "address": "http://127.0.0.1:8200",
+                    "auth_method": { "Token": { "token": "t" } },
+                    "namespace": null,
+                    "mount_path": "transit",
+                    "tls": null
+                }
+            },
+            "default_key_id": null,
+            "timeout": {"secs": 30, "nanos": 0},
+            "retry_attempts": 3,
+            "enable_cache": true,
+            "cache_config": {
+                "max_keys": 1000,
+                "ttl": {"secs": 3600, "nanos": 0},
+                "enable_metrics": true
+            }
+        }"#;
+        let config: KmsConfig = serde_json::from_str(raw).expect("legacy persisted vault-transit config");
+        assert_eq!(config.backend, KmsBackend::VaultTransit);
+
+        let vault = config
+            .vault_transit_config()
+            .expect("vault transit config should deserialize");
+        assert_eq!(vault.metadata_kv_mount, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT);
+        assert_eq!(vault.metadata_key_prefix, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX);
     }
 
     #[test]

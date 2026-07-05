@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint;
-pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
-pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
+//! Home for the `SetDisks` operation families extracted during the
+//! God-Object split (tracking #815). Each family owns its module here and
+//! borrows shared state through [`super::ctx::SetDisksCtx`]; the storage-api
+//! contract impls stay `for SetDisks`, so contract bounds are unchanged.
 
-pub(crate) mod endpoint_index {
-    pub(crate) use super::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks};
-}
+pub(crate) mod bucket;
+pub(crate) mod heal;
+pub(crate) mod list;
+pub(crate) mod multipart;

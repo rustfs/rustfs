@@ -970,15 +970,6 @@ impl S3 for FS {
         usecase.execute_list_object_versions(req).await
     }
 
-    async fn list_object_versions_m(
-        &self,
-        req: S3Request<ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
-        record_s3_op(S3Operation::ListObjectVersions, &req.input.bucket);
-        let usecase = s3_api::default_bucket_usecase();
-        usecase.execute_list_object_versions_m(req).await
-    }
-
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         record_s3_op(S3Operation::ListObjects, &req.input.bucket);
@@ -991,13 +982,6 @@ impl S3 for FS {
         record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
         let usecase = s3_api::default_bucket_usecase();
         usecase.execute_list_objects_v2(req).await
-    }
-
-    #[instrument(level = "debug", skip(self, req))]
-    async fn list_objects_v2m(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2MOutput>> {
-        record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
-        let usecase = s3_api::default_bucket_usecase();
-        usecase.execute_list_objects_v2m(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]

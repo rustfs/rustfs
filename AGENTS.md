@@ -31,6 +31,9 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 
 - Prefer direct, local code over extracting one-off helpers.
 - Extract a helper only when logic is reused or the extraction materially clarifies a non-trivial flow.
+- Use Rust's default module file layout (`mod foo;` with `foo.rs` or `foo/mod.rs`/`foo/*.rs`).
+  Avoid `#[path = "..."]` for module inclusion; move files into the canonical module tree instead.
+  If an unavoidable generated-code, FFI, or test-fixture exception remains, keep it local and document why the canonical layout cannot work.
 - Solve only the requested problem; do not add speculative features, configurability, or adjacent improvements.
 - Prefer editing existing code over rewriting files or reshaping unrelated logic.
 - Modify only what is required and remove only artifacts introduced by your own changes.

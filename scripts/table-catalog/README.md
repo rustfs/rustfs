@@ -191,6 +191,7 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-sql --cleanup
 python3 scripts/table-catalog/engine_compatibility.py --print-live-conformance --cleanup
+python3 scripts/table-catalog/engine_compatibility.py --print-operations-guide
 ```
 
 The production failure helper records the negative coverage required before
@@ -230,9 +231,9 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   `main` cannot be deleted
 - Iceberg views support basic create, list, load, replace, existence check, and
   drop routes with persisted view metadata and view-scoped authorization
-- metadata maintenance supports safe dry-run planning, controlled worker
-  execution checks, and a scheduler status report with disabled, paused,
-  backpressure, retry, quarantine, and audit-timeline state; job reports expose
+- metadata maintenance supports safe dry-run planning, controlled scheduler
+  queueing, worker execution checks, and a scheduler status report with disabled,
+  paused, queued, backpressure, retry, quarantine, and audit-timeline state; job reports expose
   structured audit events for planning, worker transitions, heartbeat updates,
   lease expiry, and mutating quarantine operations; quarantined jobs can be
   inspected, released, retried, or abandoned through an operator endpoint
@@ -320,6 +321,27 @@ manual-review diagnostics, stale rollback/import conflicts, and data-plane
 policy failures as fail-closed results that require operator investigation
 before cutover or release claims.
 
+## Production Operations Guide
+
+The engine helper can print a machine-readable operations guide that ties client
+conformance, durable backing cutover, maintenance, recovery, permissions, and
+unsupported-claim governance to the exact evidence operators must record:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --endpoint http://127.0.0.1:9000 \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --print-operations-guide
+```
+
+Use this output as the release checklist when expanding compatibility language.
+Each section records commands, required evidence, pass criteria, and fail-closed
+signals. A client or vendor claim should only be promoted when the corresponding
+live evidence records the RustFS build, catalog backing mode, client version,
+expected status, observed status, and metadata location.
+
 ## Vendor Profile References
 
 | Profile | Catalog shape | Warehouse shape | Signing name | RustFS claim |
@@ -338,10 +360,10 @@ Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
 - credential vending: automated after table bootstrap with exact-prefix validation and a data-plane scope probe; full no-long-term-data-credential bootstrap is not claimed
-- background maintenance worker: controlled run-once, heartbeat, quarantine operation, and scheduler status endpoints are registered; disabled/paused/backpressure/retry/quarantine/audit-timeline state and per-job audit events are machine-readable; continuous in-process scheduling is not claimed
+- background maintenance worker: controlled scheduler run, worker run-once, heartbeat, quarantine operation, and scheduler status endpoints are registered; disabled/paused/queued/backpressure/retry/quarantine/audit-timeline state and per-job audit events are machine-readable; continuous in-process scheduling is not claimed
 - manifest/data reachability cleanup: metadata maintenance reads manifest-list and manifest Avro references, reports manifest/data/delete reachability, and deletes only unreferenced table objects that pass the safety window
 - snapshot expiration dry-run planning and manual catalog commit: supported through metadata maintenance reports
-- automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint and scheduler status report; built-in periodic scheduling is not claimed
+- automatic maintenance scheduling: external scheduler hook supported through the scheduler run endpoint, worker run endpoint, and scheduler status report; built-in periodic scheduling is not claimed
 - compaction rewrite: controlled run-once support for partition-local and sort-order-preserving Parquet binpack through metadata maintenance; manifests with position or equality delete files produce machine-readable row-level planning and fail closed before rewrite; built-in periodic scheduling, delete-file rewrite, and row-level compaction execution are not claimed
 - row-level delete/update/merge commits: standard catalog commit validates append, overwrite, delete, and replace snapshot manifests for table-warehouse scope, referenced object existence, current-live-file deletes, and stale add/delete conflicts; end-to-end SQL DML client coverage remains a compatibility validation item
 - external catalog bridges: metadata import/register and operator-supplied metadata pointer sync are supported for Polaris/Glue/DLF/Hive identity boundaries; online vendor SDK polling and policy mirroring are not claimed
@@ -410,6 +432,9 @@ The output includes:
 - generated Spark SQL
 - a `spark-sql` command using the generated properties
 - expected `row_count=2` before optional cleanup
+- an evidence template for recording RustFS build, catalog backing mode, client
+  version, expected status, observed status, metadata location, and claim
+  promotion boundary
 
 Generate the configuration properties:
 

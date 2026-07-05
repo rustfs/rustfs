@@ -54,29 +54,55 @@ pub const SUFFIX_TIER_FV_ID: &str = "tier-free-versionID";
 pub const SUFFIX_TIER_FV_MARKER: &str = "tier-free-marker";
 pub const SUFFIX_TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 
+/// Case-insensitive (ASCII) check that `s` begins with `prefix`. Equivalent to
+/// `s.to_lowercase().starts_with(prefix)` when `prefix` is ASCII (as both internal prefixes are),
+/// but without allocating.
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// Allocation-free equivalent of `key.to_lowercase() == format!("{prefix}{suffix}")`.
+/// The common ASCII path matches the prefix case-insensitively and ASCII-lowercases the suffix
+/// region byte-for-byte. Non-ASCII keys fall back to full Unicode lowercasing so the result is
+/// identical to the original for every input (e.g. U+212A KELVIN SIGN lowercases to ASCII `k`).
+fn internal_key_eq(key: &str, prefix: &str, suffix: &str) -> bool {
+    if !key.is_ascii() {
+        return key.to_lowercase() == format!("{prefix}{suffix}");
+    }
+    let key = key.as_bytes();
+    if key.len() != prefix.len() + suffix.len() {
+        return false;
+    }
+    let (key_prefix, key_suffix) = key.split_at(prefix.len());
+    key_prefix.eq_ignore_ascii_case(prefix.as_bytes())
+        && key_suffix
+            .iter()
+            .zip(suffix.as_bytes())
+            .all(|(k, s)| k.to_ascii_lowercase() == *s)
+}
+
 /// Returns true if the key is an internal metadata key (x-rustfs-internal-* or x-minio-internal-*)
 /// for xl.meta compatibility. Case-insensitive.
 pub fn is_internal_key(key: &str) -> bool {
-    let lower = key.to_lowercase();
-    lower.starts_with(RUSTFS_INTERNAL_PREFIX) || lower.starts_with(MINIO_INTERNAL_PREFIX)
+    starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX) || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX)
 }
 
 /// Returns true if the key matches the given suffix for either x-rustfs-internal-* or x-minio-internal-*.
 pub fn has_internal_suffix(key: &str, suffix: &str) -> bool {
-    let lower = key.to_lowercase();
-    let rustfs_key = format!("{RUSTFS_INTERNAL_PREFIX}{suffix}");
-    let minio_key = format!("{MINIO_INTERNAL_PREFIX}{suffix}");
-    lower == rustfs_key || lower == minio_key
+    internal_key_eq(key, RUSTFS_INTERNAL_PREFIX, suffix) || internal_key_eq(key, MINIO_INTERNAL_PREFIX, suffix)
 }
 
 /// Strips x-rustfs-internal- or x-minio-internal- prefix from key. Returns the suffix part.
 /// Case-insensitive. Returns None if key is not an internal key.
 pub fn strip_internal_prefix(key: &str) -> Option<String> {
-    let lower = key.to_lowercase();
-    lower
-        .strip_prefix(RUSTFS_INTERNAL_PREFIX)
-        .or_else(|| lower.strip_prefix(MINIO_INTERNAL_PREFIX))
-        .map(|s| s.to_string())
+    let rest = if starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX) {
+        &key[RUSTFS_INTERNAL_PREFIX.len()..]
+    } else if starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX) {
+        &key[MINIO_INTERNAL_PREFIX.len()..]
+    } else {
+        return None;
+    };
+    Some(rest.to_lowercase())
 }
 
 /// Returns true if key is internal and its suffix part starts with the given suffix_prefix.
@@ -96,6 +122,29 @@ fn both_keys(suffix: &str) -> (String, String) {
     (format!("{RUSTFS_INTERNAL_PREFIX}{suffix}"), format!("{MINIO_INTERNAL_PREFIX}{suffix}"))
 }
 
+/// Longest known suffix ("objectlock-retention-timestamp", 30 bytes) plus the 18-byte prefix fits
+/// well under this; the cap leaves ample headroom so lookups never touch the heap in practice.
+const INTERNAL_KEY_STACK_CAP: usize = 96;
+
+/// Builds the internal key `{prefix}{suffix}` in a stack buffer and invokes `f` with it, avoiding
+/// the per-lookup heap allocation that `format!` incurs. Falls back to an owned `String` only for
+/// unusually long suffixes that do not fit the stack buffer.
+fn with_internal_key<R>(prefix: &str, suffix: &str, f: impl FnOnce(&str) -> R) -> R {
+    let total = prefix.len() + suffix.len();
+    if total <= INTERNAL_KEY_STACK_CAP {
+        let mut buf = [0u8; INTERNAL_KEY_STACK_CAP];
+        buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        buf[prefix.len()..total].copy_from_slice(suffix.as_bytes());
+        // `prefix` and `suffix` are both `&str`, so their concatenation is valid UTF-8.
+        match std::str::from_utf8(&buf[..total]) {
+            Ok(key) => f(key),
+            Err(_) => f(&format!("{prefix}{suffix}")),
+        }
+    } else {
+        f(&format!("{prefix}{suffix}"))
+    }
+}
+
 /// Builds the RustFS internal key for the given suffix. Use when a single key is needed (e.g. for
 /// backward compat). Prefer insert_str/get_str when both keys should be written/read.
 pub fn internal_key_rustfs(suffix: &str) -> String {
@@ -111,27 +160,35 @@ pub fn insert_str(map: &mut HashMap<String, String>, suffix: &str, value: String
 }
 
 pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
+    if let Some(v) = with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.get(k1).cloned()) {
+        return Some(v);
+    }
+    if let Some(v) = with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.get(k2).cloned()) {
+        return Some(v);
+    }
+    // Rare fallback: case-insensitive scan for non-canonical key casing.
     let (k1, k2) = both_keys(suffix);
-    map.get(&k1).cloned().or_else(|| map.get(&k2).cloned()).or_else(|| {
-        map.iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
-            .map(|(_, value)| value.clone())
-    })
+    map.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+        .map(|(_, value)| value.clone())
 }
 
 pub fn contains_key_str(map: &HashMap<String, String>, suffix: &str) -> bool {
+    if with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.contains_key(k1)) {
+        return true;
+    }
+    if with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.contains_key(k2)) {
+        return true;
+    }
     let (k1, k2) = both_keys(suffix);
-    map.contains_key(&k1)
-        || map.contains_key(&k2)
-        || map
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+    map.keys()
+        .any(|key| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
 }
 
 pub fn remove_str(map: &mut HashMap<String, String>, suffix: &str) {
+    with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
+    with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
     let (k1, k2) = both_keys(suffix);
-    map.remove(&k1);
-    map.remove(&k2);
     map.retain(|key, _| !key.eq_ignore_ascii_case(&k1) && !key.eq_ignore_ascii_case(&k2));
 }
 
@@ -145,19 +202,18 @@ pub fn insert_bytes(map: &mut HashMap<String, Vec<u8>>, suffix: &str, value: Vec
 }
 
 pub fn get_bytes(map: &HashMap<String, Vec<u8>>, suffix: &str) -> Option<Vec<u8>> {
-    let (k1, k2) = both_keys(suffix);
-    map.get(&k1).cloned().or_else(|| map.get(&k2).cloned())
+    with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.get(k1).cloned())
+        .or_else(|| with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.get(k2).cloned()))
 }
 
 pub fn contains_key_bytes(map: &HashMap<String, Vec<u8>>, suffix: &str) -> bool {
-    let (k1, k2) = both_keys(suffix);
-    map.contains_key(&k1) || map.contains_key(&k2)
+    with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.contains_key(k1))
+        || with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.contains_key(k2))
 }
 
 pub fn remove_bytes(map: &mut HashMap<String, Vec<u8>>, suffix: &str) {
-    let (k1, k2) = both_keys(suffix);
-    map.remove(&k1);
-    map.remove(&k2);
+    with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
+    with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
 }
 
 #[cfg(test)]
@@ -238,5 +294,120 @@ mod tests {
         ]);
 
         assert_eq!(get_bytes(&meta_sys, SUFFIX_TRANSITIONED_VERSION_ID), Some(b"rustfs-version".to_vec()));
+    }
+
+    // Reference implementations mirroring the original allocation-heavy logic, used to prove the
+    // optimized helpers are behavior-preserving across a battery of inputs.
+    fn is_internal_key_ref(key: &str) -> bool {
+        let lower = key.to_lowercase();
+        lower.starts_with(RUSTFS_INTERNAL_PREFIX) || lower.starts_with(MINIO_INTERNAL_PREFIX)
+    }
+
+    fn has_internal_suffix_ref(key: &str, suffix: &str) -> bool {
+        let lower = key.to_lowercase();
+        lower == format!("{RUSTFS_INTERNAL_PREFIX}{suffix}") || lower == format!("{MINIO_INTERNAL_PREFIX}{suffix}")
+    }
+
+    fn strip_internal_prefix_ref(key: &str) -> Option<String> {
+        let lower = key.to_lowercase();
+        lower
+            .strip_prefix(RUSTFS_INTERNAL_PREFIX)
+            .or_else(|| lower.strip_prefix(MINIO_INTERNAL_PREFIX))
+            .map(|s| s.to_string())
+    }
+
+    #[test]
+    fn test_classifiers_match_reference_impl() {
+        let keys = [
+            "x-rustfs-internal-inline-data",
+            "X-RustFS-Internal-Inline-Data",
+            "x-minio-internal-compression",
+            "X-MINIO-INTERNAL-actual-size",
+            "x-rustfs-internal-",
+            "x-rustfs-internal-replication-reset-arn:aws:s3:::bucket",
+            "x-rustfs-internal-Actual-Object-Size",
+            "x-amz-meta-custom",
+            "content-type",
+            "not-internal",
+            "",
+            "X",
+            "x-rustfs-interna",                          // one char short of the prefix
+            "x-rustfs-internal-tier-free-mar\u{212A}er", // U+212A KELVIN SIGN lowercases to ASCII 'k'
+        ];
+        let suffixes = [
+            SUFFIX_INLINE_DATA,
+            SUFFIX_COMPRESSION,
+            SUFFIX_ACTUAL_SIZE,
+            SUFFIX_ACTUAL_OBJECT_SIZE_CAP,
+            SUFFIX_PURGESTATUS,
+            SUFFIX_TIER_FV_MARKER,
+            "inline-data",
+            "nonexistent",
+            "",
+        ];
+
+        for key in keys {
+            assert_eq!(is_internal_key(key), is_internal_key_ref(key), "is_internal_key mismatch for {key:?}");
+            assert_eq!(
+                strip_internal_prefix(key),
+                strip_internal_prefix_ref(key),
+                "strip_internal_prefix mismatch for {key:?}"
+            );
+            for suffix in suffixes {
+                assert_eq!(
+                    has_internal_suffix(key, suffix),
+                    has_internal_suffix_ref(key, suffix),
+                    "has_internal_suffix mismatch for key {key:?} suffix {suffix:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_has_internal_suffix_kelvin_sign_equivalence() {
+        // U+212A KELVIN SIGN Unicode-lowercases to ASCII 'k'. The optimized ASCII fast path must
+        // fall back to full Unicode lowercasing for non-ASCII keys so it stays byte-for-byte
+        // equivalent to the original `key.to_lowercase()` implementation.
+        let key = "x-rustfs-internal-tier-free-mar\u{212A}er";
+        assert!(has_internal_suffix(key, SUFFIX_TIER_FV_MARKER));
+        assert_eq!(
+            has_internal_suffix(key, SUFFIX_TIER_FV_MARKER),
+            has_internal_suffix_ref(key, SUFFIX_TIER_FV_MARKER)
+        );
+        // A plain ASCII 'k' key still matches, and a non-matching suffix still fails.
+        assert!(has_internal_suffix("x-rustfs-internal-tier-free-marker", SUFFIX_TIER_FV_MARKER));
+        assert!(!has_internal_suffix(key, SUFFIX_COMPRESSION));
+    }
+
+    #[test]
+    fn test_get_str_case_insensitive_fallback() {
+        // Non-canonical mixed-case key must still be found via the case-insensitive scan.
+        let metadata = HashMap::from([("X-RustFS-Internal-Compression".to_string(), "s2".to_string())]);
+        assert_eq!(get_str(&metadata, SUFFIX_COMPRESSION).as_deref(), Some("s2"));
+        assert!(contains_key_str(&metadata, SUFFIX_COMPRESSION));
+    }
+
+    #[test]
+    fn test_get_bytes_no_case_insensitive_fallback() {
+        // get_bytes only checks the two canonical keys (matching the original behavior): a
+        // mixed-case key is not matched.
+        let meta_sys = HashMap::from([("X-RustFS-Internal-Crc".to_string(), b"z".to_vec())]);
+        assert_eq!(get_bytes(&meta_sys, SUFFIX_CRC), None);
+
+        let meta_sys = HashMap::from([(internal_key_rustfs(SUFFIX_CRC), b"z".to_vec())]);
+        assert_eq!(get_bytes(&meta_sys, SUFFIX_CRC), Some(b"z".to_vec()));
+    }
+
+    #[test]
+    fn test_long_suffix_falls_back_to_heap_key() {
+        // A suffix longer than the stack buffer must still round-trip via the heap fallback.
+        let long_suffix = "x".repeat(INTERNAL_KEY_STACK_CAP);
+        let mut meta_sys = HashMap::new();
+        insert_bytes(&mut meta_sys, &long_suffix, b"payload".to_vec());
+
+        assert!(contains_key_bytes(&meta_sys, &long_suffix));
+        assert_eq!(get_bytes(&meta_sys, &long_suffix), Some(b"payload".to_vec()));
+        remove_bytes(&mut meta_sys, &long_suffix);
+        assert!(!contains_key_bytes(&meta_sys, &long_suffix));
     }
 }

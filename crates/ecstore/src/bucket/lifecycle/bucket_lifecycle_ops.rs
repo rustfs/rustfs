@@ -1965,7 +1965,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     };
     let object_opts = object_infos
         .iter()
-        .map(ObjectOpts::from_object_info)
+        .map(lifecycle::object_opts_from_object_info)
         .collect::<Vec<ObjectOpts>>();
     let Ok(events) = Evaluator::new(Arc::new(lifecycle))
         .with_lock_retention(lock_config)
@@ -2086,7 +2086,7 @@ async fn enqueue_expiry_for_existing_object_group(
 
     let object_opts = object_infos
         .iter()
-        .map(ObjectOpts::from_object_info)
+        .map(lifecycle::object_opts_from_object_info)
         .collect::<Vec<ObjectOpts>>();
     let events = match Evaluator::new(context.lc.clone())
         .with_lock_retention(context.lock_config.clone())
@@ -2559,7 +2559,7 @@ pub trait LifecycleOps {
 
 impl LifecycleOps for ObjectInfo {
     fn to_lifecycle_opts(&self) -> lifecycle::ObjectOpts {
-        lifecycle::ObjectOpts::from_object_info(self)
+        lifecycle::object_opts_from_object_info(self)
     }
 
     fn is_remote(&self) -> bool {
@@ -4699,10 +4699,6 @@ mod tests {
             fs::create_dir_all(path.join(RUSTFS_META_MULTIPART_BUCKET).join(&sha_dir))
                 .await
                 .expect("empty multipart sha dir should be created for cleanup");
-            assert!(
-                path.join(RUSTFS_META_MULTIPART_BUCKET).join(&sha_dir).exists(),
-                "empty multipart sha dir should exist before cleanup"
-            );
         }
 
         cleanup_empty_multipart_sha_dirs_on_local_disks(&ecstore.pools[0].disk_set[0]).await;

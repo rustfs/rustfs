@@ -46,13 +46,34 @@ use s3s::{
 use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, error, info, warn};
 
 const ASSUME_ROLE_ACTION: &str = "AssumeRole";
 const ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION: &str = "AssumeRoleWithWebIdentity";
 const ASSUME_ROLE_VERSION: &str = "2011-06-15";
+
+/// Default STS temporary credential lifetime (seconds) when the client omits DurationSeconds.
+const STS_DEFAULT_DURATION_SECS: usize = 3600;
+/// Minimum STS temporary credential lifetime (seconds), matching AWS/MinIO (15 minutes).
+const STS_MIN_DURATION_SECS: usize = 900;
+/// Maximum STS temporary credential lifetime (seconds), matching AWS/MinIO AssumeRole (12 hours).
+const STS_MAX_DURATION_SECS: usize = 43200;
+
+/// Clamp the client-supplied DurationSeconds into the allowed STS window.
+///
+/// A value of 0 (unset) falls back to the default; any other value is clamped into
+/// `[STS_MIN_DURATION_SECS, STS_MAX_DURATION_SECS]`. This prevents callers from minting
+/// near-permanent temporary credentials and keeps the standard AssumeRole path consistent
+/// with the AssumeRoleWithWebIdentity path.
+fn clamp_assume_role_duration(duration_seconds: usize) -> usize {
+    if duration_seconds == 0 {
+        STS_DEFAULT_DURATION_SECS
+    } else {
+        duration_seconds.clamp(STS_MIN_DURATION_SECS, STS_MAX_DURATION_SECS)
+    }
+}
 
 fn has_identity_authorization_context(policies: &[String], groups: &[String]) -> bool {
     !policies.is_empty() || !groups.is_empty()
@@ -107,6 +128,85 @@ fn resolve_oidc_session_identity(claims: &OidcClaims) -> String {
         claims.sub.clone()
     } else {
         "oidc-user-unknown".to_string()
+    }
+}
+
+async fn log_oidc_policy_diagnostics(
+    iam_store: &rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>,
+    provider_id: &str,
+    parent_user: &str,
+    policies: &[String],
+    groups: &[String],
+) {
+    if policies.is_empty() {
+        let policy_documents = BTreeMap::<String, Value>::new();
+        let missing_policies = Vec::<String>::new();
+        let combined_policy = Value::Null;
+        debug!(
+            provider_id = %provider_id,
+            parent_user = %parent_user,
+            policy_count = 0,
+            group_count = groups.len(),
+            policies = ?policies,
+            groups = ?groups,
+            policy_documents = ?policy_documents,
+            missing_policies = ?missing_policies,
+            combined_policy = ?combined_policy,
+            "OIDC STS policy diagnostics"
+        );
+        return;
+    }
+
+    match iam_store.list_policy_docs("").await {
+        Ok(policy_docs) => {
+            let mut policy_documents = BTreeMap::new();
+            let mut missing_policies = Vec::new();
+            for policy_name in policies {
+                match policy_docs.get(policy_name) {
+                    Some(policy_doc) => {
+                        let policy_doc_json = serde_json::to_value(policy_doc).unwrap_or_else(|err| {
+                            serde_json::json!({
+                                "serialization_error": err.to_string(),
+                            })
+                        });
+                        policy_documents.insert(policy_name.clone(), policy_doc_json);
+                    }
+                    None => missing_policies.push(policy_name.clone()),
+                }
+            }
+
+            let combined_policy = iam_store.get_combined_policy(policies).await;
+            let combined_policy_json = serde_json::to_value(&combined_policy).unwrap_or_else(|err| {
+                serde_json::json!({
+                    "serialization_error": err.to_string(),
+                })
+            });
+
+            debug!(
+                provider_id = %provider_id,
+                parent_user = %parent_user,
+                policy_count = policies.len(),
+                group_count = groups.len(),
+                policies = ?policies,
+                groups = ?groups,
+                missing_policies = ?missing_policies,
+                policy_documents = ?policy_documents,
+                combined_policy = ?combined_policy_json,
+                "OIDC STS policy diagnostics"
+            );
+        }
+        Err(err) => {
+            warn!(
+                provider_id = %provider_id,
+                parent_user = %parent_user,
+                policy_count = policies.len(),
+                group_count = groups.len(),
+                policies = ?policies,
+                groups = ?groups,
+                error = %err,
+                "OIDC STS policy diagnostics failed"
+            );
+        }
     }
 }
 
@@ -216,17 +316,13 @@ async fn handle_assume_role(
 
     populate_session_policy(&mut claims, &body.policy)?;
 
-    let exp = {
-        if body.duration_seconds > 0 {
-            body.duration_seconds
-        } else {
-            3600
-        }
-    };
+    let exp = clamp_assume_role_duration(body.duration_seconds);
 
     claims.insert(
         "exp".to_string(),
-        Value::Number(serde_json::Number::from(OffsetDateTime::now_utc().unix_timestamp() + exp as i64)),
+        Value::Number(serde_json::Number::from(
+            OffsetDateTime::now_utc().unix_timestamp().saturating_add(exp as i64),
+        )),
     );
 
     claims.insert("parent".to_string(), Value::String(cred.access_key.clone()));
@@ -330,12 +426,25 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     let (policies, groups) = oidc_sys.map_claims_to_policies(&provider_id, &claims);
 
     if !has_identity_authorization_context(&policies, &groups) {
+        warn!(
+            provider_id = %provider_id,
+            username = %claims.username,
+            sub = %claims.sub,
+            policy_count = policies.len(),
+            group_count = groups.len(),
+            "AssumeRoleWithWebIdentity has no mapped policies or groups"
+        );
         return Err(s3_error!(InvalidArgument, "no policies are available for this OIDC token"));
     }
 
-    info!(
-        "AssumeRoleWithWebIdentity: user='{}', provider='{}', policies={:?}, groups={:?}",
-        claims.username, provider_id, policies, groups
+    debug!(
+        provider_id = %provider_id,
+        username = %claims.username,
+        policy_count = policies.len(),
+        group_count = groups.len(),
+        policies = ?policies,
+        groups = ?groups,
+        "AssumeRoleWithWebIdentity mapped OIDC policies and groups"
     );
 
     let mut duration = if body.duration_seconds > 0 {
@@ -412,9 +521,19 @@ pub async fn create_oidc_sts_credentials(
 
     // Set the parent user: prefer username, then email, then sub
     let parent_user = resolve_oidc_session_identity(claims);
-    info!(
-        "OIDC STS credential: parent_user='{}' (email='{}', username='{}', sub='{}')",
-        parent_user, claims.email, claims.username, claims.sub
+    debug!(
+        provider_id = %provider_id,
+        parent_user = %parent_user,
+        email = %claims.email,
+        username = %claims.username,
+        sub = %claims.sub,
+        policy_count = policies.len(),
+        group_count = groups.len(),
+        policies = ?policies,
+        groups = ?groups,
+        roles_claim_key = ?roles_claim_key,
+        has_session_policy = session_policy.is_some(),
+        "OIDC STS credential claims prepared"
     );
     token_claims.insert("parent".to_string(), Value::String(parent_user.clone()));
 
@@ -440,6 +559,9 @@ pub async fn create_oidc_sts_credentials(
     // Store temp user in IAM
     let iam_store =
         crate::admin::runtime_sources::current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        log_oidc_policy_diagnostics(&iam_store, provider_id, &new_cred.parent_user, policies, groups).await;
+    }
 
     let updated_at = iam_store
         .set_temp_user(&new_cred.access_key, &new_cred, None)
@@ -541,6 +663,24 @@ mod tests {
         assert_eq!(clamp(3600), 3600); // normal
         assert_eq!(clamp(43200), 43200); // exact max
         assert_eq!(clamp(999999), 43200); // clamped to max
+    }
+
+    #[test]
+    fn test_assume_role_duration_is_clamped_to_max() {
+        // Regression: the standard AssumeRole path previously used the raw client-supplied
+        // DurationSeconds with no upper bound, allowing near-permanent temporary credentials.
+        let ten_years_secs: usize = 315_360_000;
+        assert_eq!(clamp_assume_role_duration(ten_years_secs), STS_MAX_DURATION_SECS);
+        assert_eq!(STS_MAX_DURATION_SECS, 43200);
+        assert_eq!(clamp_assume_role_duration(0), STS_DEFAULT_DURATION_SECS);
+        assert_eq!(clamp_assume_role_duration(60), STS_MIN_DURATION_SECS);
+        assert_eq!(clamp_assume_role_duration(3600), 3600);
+        assert_eq!(clamp_assume_role_duration(43200), 43200);
+
+        // The exp timestamp derived from a huge duration must not exceed now + 12h.
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let exp = now.saturating_add(clamp_assume_role_duration(ten_years_secs) as i64);
+        assert!(exp - now <= STS_MAX_DURATION_SECS as i64);
     }
 
     #[test]

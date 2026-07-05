@@ -20,6 +20,7 @@ use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabl
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
+use crate::storage::storage_api::ecfs_extend_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
 use crate::storage::storage_api::ecfs_extend_consumer::contract::{
     bucket::{BucketOperations, BucketOptions},
     object::ObjectToDelete,
@@ -1106,9 +1107,9 @@ pub(crate) async fn wrap_response_with_cors<T>(
 pub(crate) fn parse_part_number_i32_to_usize(part_number: Option<i32>, op: &'static str) -> S3Result<Option<usize>> {
     match part_number {
         None => Ok(None),
-        Some(n) if n <= 0 => Err(S3Error::with_message(
+        Some(n) if !(1..=MAX_MULTIPART_PART_NUMBER).contains(&n) => Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
-            format!("{op}: invalid partNumber {n}, must be a positive integer"),
+            format!("{op}: partNumber must be between 1 and {MAX_MULTIPART_PART_NUMBER}"),
         )),
         Some(n) => Ok(Some(n as usize)),
     }

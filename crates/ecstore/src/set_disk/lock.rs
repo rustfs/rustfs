@@ -654,4 +654,67 @@ mod tests {
 
         drop(temp_dirs);
     }
+
+    // SetDisks split P0 (#816): the borrow handle must mirror the core state and
+    // the List operation family must run identically through it.
+    #[tokio::test]
+    async fn set_disks_ctx_mirrors_core_and_drives_list_operations() {
+        use crate::set_disk::ops::list::ListOperations;
+
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints.clone(),
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        // The handle reads through to the same core state, not a copy.
+        let ctx = set_disks.ctx();
+        assert_eq!(ctx.locker_owner(), "test-owner");
+        assert_eq!(ctx.set_drive_count(), disk_count);
+        assert_eq!(ctx.default_parity_count(), disk_count / 2);
+        assert_eq!(ctx.set_index(), 0);
+        assert_eq!(ctx.pool_index(), 0);
+        assert_eq!(ctx.set_endpoints().len(), endpoints.len());
+        assert!(ctx.lockers().is_empty());
+        assert!(
+            Arc::ptr_eq(ctx.disks(), &set_disks.disks),
+            "ctx must borrow the core disks, not clone them"
+        );
+        assert!(std::ptr::eq(ctx.core(), &*set_disks), "ctx must borrow the core, not clone it");
+        assert!(std::ptr::eq(ctx.format(), &set_disks.format), "ctx must borrow the core format");
+
+        // The List family runs through the borrow handle with unchanged
+        // behavior: delete_all reports success even when the prefix is absent.
+        ListOperations::new(set_disks.ctx())
+            .delete_all("nonexistent-bucket", "nonexistent-prefix")
+            .await
+            .expect("delete_all via borrow handle should succeed");
+        set_disks
+            .delete_all("nonexistent-bucket", "nonexistent-prefix")
+            .await
+            .expect("delete_all public entry should stay in sync");
+
+        drop(temp_dirs);
+    }
 }

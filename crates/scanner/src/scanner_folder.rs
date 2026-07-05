@@ -795,7 +795,7 @@ impl ScannerItem {
 
         let object_opts = object_infos
             .iter()
-            .map(ObjectOpts::from_object_info)
+            .map(crate::ecstore_object_opts_from_object_info)
             .collect::<Vec<ObjectOpts>>();
 
         let events = match Evaluator::new(lifecycle.clone())

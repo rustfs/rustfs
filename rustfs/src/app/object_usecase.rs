@@ -343,8 +343,6 @@ struct GetObjectReadSetup {
     sse_customer_key_md5: Option<SSECustomerKeyMD5>,
     ssekms_key_id: Option<SSEKMSKeyId>,
     encryption_applied: bool,
-    /// `true` when the object was read via the inline data fast path (no disk I/O).
-    is_inline_fast_path: bool,
 }
 
 struct GetObjectPreparedRead {
@@ -505,13 +503,48 @@ pin_project! {
     }
 }
 
-pin_project! {
-    struct MemoryTrackedBytesStream {
-        bytes: Bytes,
-        emitted: bool,
-        started: std::time::Instant,
-        source: &'static str,
-        _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+struct MemoryTrackedBytesStream {
+    bytes: Bytes,
+    emitted: bool,
+    completed: bool,
+    expected: usize,
+    started: std::time::Instant,
+    source: &'static str,
+    _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    lifecycle: GetObjectBodyLifecycle,
+}
+
+#[derive(Default)]
+struct GetObjectBodyLifecycle {
+    request_guard: Option<GetObjectGuard>,
+}
+
+impl GetObjectBodyLifecycle {
+    fn tracked(request_guard: GetObjectGuard) -> Self {
+        Self {
+            request_guard: Some(request_guard),
+        }
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self { request_guard: None }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.request_guard.is_none()
+    }
+
+    fn finish_ok(&mut self) {
+        if let Some(mut request_guard) = self.request_guard.take() {
+            request_guard.finish_ok();
+        }
+    }
+
+    fn finish_err(&mut self) {
+        if let Some(mut request_guard) = self.request_guard.take() {
+            request_guard.finish_err();
+        }
     }
 }
 
@@ -566,14 +599,32 @@ pin_project! {
 }
 
 impl MemoryTrackedBytesStream {
-    fn new(bytes: Bytes, source: &'static str, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
+    fn new(
+        bytes: Bytes,
+        expected: usize,
+        source: &'static str,
+        guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+        lifecycle: GetObjectBodyLifecycle,
+    ) -> Self {
         Self {
             bytes,
             emitted: false,
+            completed: expected == 0,
+            expected,
             started: std::time::Instant::now(),
             source,
             _guard: guard,
+            lifecycle,
         }
+    }
+
+    fn finish_ok(&mut self) {
+        self.completed = true;
+        self.lifecycle.finish_ok();
+    }
+
+    fn finish_err(&mut self) {
+        self.lifecycle.finish_err();
     }
 }
 
@@ -600,9 +651,9 @@ impl futures::Stream for MemoryTrackedBytesStream {
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
+        let this = self.get_mut();
         let poll_start = is_get_output_handoff_attribution_enabled().then(std::time::Instant::now);
-        if *this.emitted {
+        if this.emitted {
             if let Some(poll_start) = poll_start {
                 rustfs_io_metrics::record_get_object_memory_body_stream_poll(
                     this.source,
@@ -615,9 +666,12 @@ impl futures::Stream for MemoryTrackedBytesStream {
         }
 
         let first_byte_elapsed = (!this.bytes.is_empty()).then(|| this.started.elapsed());
-        *this.emitted = true;
+        this.emitted = true;
         if let Some(elapsed) = first_byte_elapsed {
             rustfs_io_metrics::record_get_object_first_byte_latency(GET_OBJECT_STAGE_PATH_S3_HANDLER, elapsed.as_secs_f64());
+        }
+        if this.bytes.len() >= this.expected {
+            this.finish_ok();
         }
         if let Some(poll_start) = poll_start {
             rustfs_io_metrics::record_get_object_memory_body_stream_poll(
@@ -628,6 +682,20 @@ impl futures::Stream for MemoryTrackedBytesStream {
             );
         }
         Poll::Ready(Some(Ok(this.bytes.clone())))
+    }
+}
+
+impl Drop for MemoryTrackedBytesStream {
+    fn drop(&mut self) {
+        if self.lifecycle.is_finished() {
+            return;
+        }
+
+        if self.completed {
+            self.finish_ok();
+        } else {
+            self.finish_err();
+        }
     }
 }
 
@@ -730,11 +798,12 @@ struct GetObjectStreamingReader<R> {
     started: std::time::Instant,
     first_byte_reported: bool,
     completed: bool,
+    lifecycle: GetObjectBodyLifecycle,
     _foreground_read_guard: rustfs_scanner::ForegroundReadGuard,
 }
 
 impl<R> GetObjectStreamingReader<R> {
-    fn new(inner: R, bucket: &str, key: &str, expected: usize, timeout: Duration) -> Self {
+    fn new(inner: R, bucket: &str, key: &str, expected: usize, timeout: Duration, lifecycle: GetObjectBodyLifecycle) -> Self {
         Self {
             inner,
             bucket: bucket.to_string(),
@@ -746,12 +815,22 @@ impl<R> GetObjectStreamingReader<R> {
             started: std::time::Instant::now(),
             first_byte_reported: false,
             completed: expected == 0,
+            lifecycle,
             _foreground_read_guard: rustfs_scanner::ForegroundReadGuard::new(),
         }
     }
 
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    fn finish_ok(&mut self) {
+        self.completed = true;
+        self.lifecycle.finish_ok();
+    }
+
+    fn finish_err(&mut self) {
+        self.lifecycle.finish_err();
     }
 }
 
@@ -789,6 +868,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     }
                     if self.emitted >= self.expected {
                         self.completed = true;
+                        self.finish_ok();
                     }
                 } else if self.emitted < self.expected {
                     warn!(
@@ -803,14 +883,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         state = "short_eof",
                         "GetObject streaming body ended before expected length"
                     );
+                    self.finish_err();
                 } else {
                     self.completed = true;
+                    self.finish_ok();
                 }
 
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {
                 self.timer = None;
+                self.finish_err();
                 warn!(
                     event = EVENT_GET_OBJECT_STREAM_BODY,
                     component = LOG_COMPONENT_APP,
@@ -852,6 +935,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         state = "stall_timeout",
                         "GetObject streaming body stalled"
                     );
+                    self.finish_err();
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "get object streaming body stall timeout",
@@ -866,10 +950,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
 
 impl<R> Drop for GetObjectStreamingReader<R> {
     fn drop(&mut self) {
-        if self.expected == 0 || self.completed || self.emitted >= self.expected {
+        if self.lifecycle.is_finished() {
             return;
         }
 
+        if self.expected == 0 || self.completed || self.emitted >= self.expected {
+            self.finish_ok();
+            return;
+        }
+
+        self.finish_err();
         warn!(
             event = EVENT_GET_OBJECT_STREAM_BODY,
             component = LOG_COMPONENT_APP,
@@ -2017,7 +2107,7 @@ async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> O
         return None;
     };
 
-    let obj_opts = lifecycle::ObjectOpts::from_object_info(obj_info);
+    let obj_opts = lifecycle::object_opts_from_object_info(obj_info);
     let event = predict_lifecycle_expiration(&lifecycle_config, &obj_opts).await;
     debug!(
         bucket,
@@ -2095,16 +2185,19 @@ impl DefaultObjectUsecase {
     fn build_memory_bytes_blob(
         bytes: Bytes,
         response_content_length: i64,
-        _optimal_buffer_size: usize,
         source: &'static str,
-    ) -> Option<StreamingBlob> {
+        lifecycle: GetObjectBodyLifecycle,
+    ) -> StreamingBlob {
         let get_stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let memory_blob_start = get_stage_metrics_enabled.then(std::time::Instant::now);
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
-        let blob = StreamingBlob::wrap(bytes_stream(MemoryTrackedBytesStream::new(bytes, source, guard), remaining));
+        let blob = StreamingBlob::wrap(bytes_stream(
+            MemoryTrackedBytesStream::new(bytes, remaining, source, guard, lifecycle),
+            remaining,
+        ));
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 "single_chunk",
@@ -2115,16 +2208,16 @@ impl DefaultObjectUsecase {
             );
         }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_MEMORY_BLOB, memory_blob_start);
-        Some(blob)
+        blob
     }
 
     fn build_memory_blob(
         buf: Vec<u8>,
         response_content_length: i64,
-        optimal_buffer_size: usize,
         source: &'static str,
-    ) -> Option<StreamingBlob> {
-        Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, optimal_buffer_size, source)
+        lifecycle: GetObjectBodyLifecycle,
+    ) -> StreamingBlob {
+        Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, source, lifecycle)
     }
 
     fn select_stream_buffer_strategy(
@@ -2151,7 +2244,8 @@ impl DefaultObjectUsecase {
         stream_strategy: GetObjectStreamStrategy,
         bucket: &str,
         key: &str,
-    ) -> Option<StreamingBlob>
+        lifecycle: GetObjectBodyLifecycle,
+    ) -> StreamingBlob
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
@@ -2170,7 +2264,7 @@ impl DefaultObjectUsecase {
             );
         }
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
-        let reader = GetObjectStreamingReader::new(reader, bucket, key, expected, get_object_disk_read_timeout());
+        let reader = GetObjectStreamingReader::new(reader, bucket, key, expected, get_object_disk_read_timeout(), lifecycle);
         let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source);
         let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
@@ -2183,7 +2277,7 @@ impl DefaultObjectUsecase {
             );
         }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAMING_BLOB, streaming_blob_start);
-        Some(blob)
+        blob
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
@@ -2200,8 +2294,6 @@ impl DefaultObjectUsecase {
 
         Self::ensure_get_object_not_timed_out(&wrapper, &timeout_config, bucket, key, GetObjectTimeoutStage::BeforeProcessing)?;
 
-        rustfs_io_metrics::record_get_object_request_start(concurrent_requests);
-
         debug!(
             "GetObject request started with {} concurrent requests, timeout={:?}",
             concurrent_requests, timeout_config.get_object_timeout
@@ -2215,6 +2307,16 @@ impl DefaultObjectUsecase {
             _deadlock_request_guard: deadlock_request_guard,
             concurrent_requests,
         })
+    }
+
+    fn validate_get_object_part_number(part_number: Option<usize>, info: &ObjectInfo) -> S3Result<()> {
+        if let Some(part_number) = part_number
+            && part_number > 1
+            && !info.parts.iter().any(|part| part.number == part_number)
+        {
+            return Err(s3_error!(InvalidPart));
+        }
+        Ok(())
     }
 
     /// How long a GET waits for a disk read permit before degrading to a
@@ -2313,13 +2415,7 @@ impl DefaultObjectUsecase {
 
         validate_object_key(&key, "GET")?;
 
-        let part_number = part_number.map(|v| v as usize);
-
-        if let Some(part_num) = part_number
-            && part_num == 0
-        {
-            return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
-        }
+        let part_number = parse_part_number_i32_to_usize(part_number, "GET")?;
 
         let rs = range.map(|v| match v {
             Range::Int { first, last } => HTTPRangeSpec {
@@ -2376,8 +2472,14 @@ impl DefaultObjectUsecase {
             );
         }
 
-        // SF05: Read object metadata/data BEFORE acquiring disk I/O semaphore.
-        // ECStore's get_object_reader acquires its own RwLock — safe without the semaphore.
+        // Acquire the GET disk permit before ECStore reader setup. Reader setup
+        // may perform metadata fanout, materialize direct-memory bodies, or
+        // start legacy duplex background reads; all of that work belongs inside
+        // the admission boundary. Fully materialized bodies release the permit
+        // when the unused wrapped reader is dropped during body construction,
+        // while streaming bodies keep it until EOF or client drop.
+        let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
+
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
         let read_setup = Self::prepare_get_object_read(
@@ -2394,18 +2496,6 @@ impl DefaultObjectUsecase {
             read_stage_start,
         )
         .await?;
-
-        // SF05: Skip disk I/O semaphore for inline fast path — data is already in memory.
-        let io_planning = if read_setup.is_inline_fast_path {
-            GetObjectIoPlanning {
-                disk_permit: None,
-                permit_wait_duration: Duration::ZERO,
-                queue_status: concurrency::IoQueueStatus::default(),
-                queue_utilization: 0.0,
-            }
-        } else {
-            Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?
-        };
 
         Ok(GetObjectPreparedRead { io_planning, read_setup })
     }
@@ -2450,6 +2540,7 @@ impl DefaultObjectUsecase {
         }
 
         check_preconditions(&req.headers, &info)?;
+        Self::validate_get_object_part_number(part_number, &info)?;
 
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in info.parts.iter() {
@@ -2544,10 +2635,6 @@ impl DefaultObjectUsecase {
             None => (None, None, None, None, false, wrap_reader(stream), buffered_body),
         };
 
-        // Detect inline fast path: data is in memory, no disk I/O semaphore needed.
-        // Uses the shared predicate from ObjectInfo; additionally checks no range request.
-        let is_inline_fast_path = info.is_inline_fast_path_eligible() && rs.is_none();
-
         Ok(GetObjectReadSetup {
             info,
             final_stream,
@@ -2562,7 +2649,6 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5,
             ssekms_key_id,
             encryption_applied,
-            is_inline_fast_path,
         })
     }
     #[allow(clippy::too_many_arguments)]
@@ -2722,7 +2808,8 @@ impl DefaultObjectUsecase {
         buffered_body: Option<Bytes>,
         bucket: &str,
         key: &str,
-    ) -> S3Result<Option<StreamingBlob>>
+        mut lifecycle: GetObjectBodyLifecycle,
+    ) -> S3Result<StreamingBlob>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
@@ -2736,6 +2823,7 @@ impl DefaultObjectUsecase {
                 let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
                 record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ, buffer_read_start);
                 if let Err(e) = read_result {
+                    lifecycle.finish_err();
                     error!(error = %e, "GetObject decrypted object buffering failed");
                     return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
                 }
@@ -2751,8 +2839,8 @@ impl DefaultObjectUsecase {
                 return Ok(Self::build_memory_blob(
                     buf,
                     response_content_length,
-                    optimal_buffer_size,
                     GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
+                    lifecycle,
                 ));
             }
 
@@ -2768,6 +2856,7 @@ impl DefaultObjectUsecase {
                 stream_strategy,
                 bucket,
                 key,
+                lifecycle,
             ));
         }
 
@@ -2783,8 +2872,8 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_memory_bytes_blob(
                 buffered_body,
                 response_content_length,
-                optimal_buffer_size,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                lifecycle,
             ));
         }
 
@@ -2809,8 +2898,8 @@ impl DefaultObjectUsecase {
                     return Ok(Self::build_memory_blob(
                         buf,
                         response_content_length,
-                        optimal_buffer_size,
                         GET_MEMORY_BODY_SOURCE_SEEK_BUFFER,
+                        lifecycle,
                     ));
                 }
                 Err(e) => {
@@ -2830,6 +2919,7 @@ impl DefaultObjectUsecase {
             stream_strategy,
             bucket,
             key,
+            lifecycle,
         ))
     }
 
@@ -2848,7 +2938,8 @@ impl DefaultObjectUsecase {
         buffered_body: Option<Bytes>,
         bucket: &str,
         key: &str,
-    ) -> S3Result<Option<StreamingBlob>>
+        mut lifecycle: GetObjectBodyLifecycle,
+    ) -> S3Result<StreamingBlob>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
@@ -2868,8 +2959,8 @@ impl DefaultObjectUsecase {
                 return Ok(Self::build_memory_bytes_blob(
                     bytes,
                     response_content_length,
-                    optimal_buffer_size,
                     GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
+                    lifecycle,
                 ));
             }
             GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
@@ -2881,8 +2972,8 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_memory_bytes_blob(
                 buffered_body,
                 response_content_length,
-                optimal_buffer_size,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+                lifecycle,
             ));
         }
 
@@ -2915,6 +3006,7 @@ impl DefaultObjectUsecase {
                     None,
                     bucket,
                     key,
+                    lifecycle,
                 )
                 .await;
             };
@@ -2940,11 +3032,12 @@ impl DefaultObjectUsecase {
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,
                         response_content_length,
-                        optimal_buffer_size,
                         GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED,
+                        lifecycle,
                     ));
                 }
                 Err(e) => {
+                    lifecycle.finish_err();
                     error!(error = %e, "GetObject materialize-fill buffering failed");
                     // The stream is partially consumed; falling back to the
                     // streaming path would send a body missing its prefix, so
@@ -2970,6 +3063,7 @@ impl DefaultObjectUsecase {
             None,
             bucket,
             key,
+            lifecycle,
         )
         .await
     }
@@ -3687,6 +3781,7 @@ impl DefaultObjectUsecase {
         concurrent_requests: usize,
         part_number: Option<usize>,
         versioned: bool,
+        lifecycle: GetObjectBodyLifecycle,
     ) -> S3Result<GetObjectOutputContext> {
         let strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let strategy = self.finalize_get_object_strategy(
@@ -3724,6 +3819,7 @@ impl DefaultObjectUsecase {
             buffered_body,
             bucket,
             key,
+            lifecycle,
         )
         .await?;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_BUILD, body_build_start);
@@ -3762,7 +3858,7 @@ impl DefaultObjectUsecase {
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
 
         let output = GetObjectOutput {
-            body,
+            body: Some(body),
             content_length: Some(response_content_length),
             last_modified,
             content_type,
@@ -3825,13 +3921,19 @@ impl DefaultObjectUsecase {
         let wrapper = bootstrap.wrapper;
         let request_start = bootstrap.request_start;
         let concurrent_requests = bootstrap.concurrent_requests;
-        let mut request_guard = bootstrap.request_guard;
+        let mut lifecycle = GetObjectBodyLifecycle::tracked(bootstrap.request_guard);
 
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
         let request_context_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let request_context = Self::prepare_get_object_request_context(&req).await?;
+        let request_context = match Self::prepare_get_object_request_context(&req).await {
+            Ok(request_context) => request_context,
+            Err(err) => {
+                lifecycle.finish_err();
+                return Err(err);
+            }
+        };
         if let Some(request_context_start) = request_context_start {
             rustfs_io_metrics::record_get_object_stage_duration(
                 "s3_handler",
@@ -3850,7 +3952,7 @@ impl DefaultObjectUsecase {
 
         let manager = get_concurrency_manager();
 
-        let prepared_read = Self::prepare_get_object_read_execution(
+        let prepared_read = match Self::prepare_get_object_read_execution(
             &req,
             manager,
             &wrapper,
@@ -3861,7 +3963,14 @@ impl DefaultObjectUsecase {
             &opts,
             part_number,
         )
-        .await?;
+        .await
+        {
+            Ok(prepared_read) => prepared_read,
+            Err(err) => {
+                lifecycle.finish_err();
+                return Err(err);
+            }
+        };
         let GetObjectPreparedRead { io_planning, read_setup } = prepared_read;
         let GetObjectIoPlanning {
             disk_permit,
@@ -3884,7 +3993,6 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5,
             ssekms_key_id,
             encryption_applied,
-            is_inline_fast_path: _,
         } = read_setup;
         let final_stream = if let Some(disk_permit) = disk_permit {
             wrap_reader(DiskReadPermitReader::new(final_stream, disk_permit))
@@ -3923,8 +4031,13 @@ impl DefaultObjectUsecase {
                 concurrent_requests,
                 part_number,
                 opts.versioned,
+                lifecycle,
             )
-            .await?;
+            .await;
+        let output_context = match output_context {
+            Ok(output_context) => output_context,
+            Err(err) => return Err(err),
+        };
         if let Some(output_build_start) = output_build_start {
             rustfs_io_metrics::record_get_object_stage_duration(
                 "s3_handler",
@@ -3948,22 +4061,8 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
         );
 
-        let result = Self::finalize_get_object_response(
-            helper,
-            &bucket,
-            &req.method,
-            &req.headers,
-            event_info,
-            version_id_for_event,
-            output,
-        )
-        .await;
-        if result.is_ok() {
-            request_guard.finish_ok();
-        } else {
-            request_guard.finish_err();
-        }
-        result
+        Self::finalize_get_object_response(helper, &bucket, &req.method, &req.headers, event_info, version_id_for_event, output)
+            .await
     }
 
     pub async fn execute_get_object_attributes(
@@ -6624,7 +6723,14 @@ mod tests {
 
     #[tokio::test]
     async fn get_object_streaming_reader_times_out_when_body_stalls() {
-        let reader = GetObjectStreamingReader::new(PendingReader, "test-bucket", "stalled-object", 1, Duration::from_millis(1));
+        let reader = GetObjectStreamingReader::new(
+            PendingReader,
+            "test-bucket",
+            "stalled-object",
+            1,
+            Duration::from_millis(1),
+            GetObjectBodyLifecycle::disabled(),
+        );
         let mut stream = ReaderStream::with_capacity(reader, 1024);
 
         let err = stream
@@ -6634,6 +6740,97 @@ mod tests {
             .expect_err("stalled reader should return an error");
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_streaming_reader_holds_request_guard_until_eof() {
+        use tokio::io::AsyncReadExt;
+
+        let initial = GetObjectGuard::concurrent_count();
+        let guard = GetObjectGuard::new();
+        assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+        let mut reader = GetObjectStreamingReader::new(
+            std::io::Cursor::new(b"hello".to_vec()),
+            "test-bucket",
+            "complete-object",
+            5,
+            Duration::ZERO,
+            GetObjectBodyLifecycle::tracked(guard),
+        );
+        let mut out = Vec::new();
+
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect("complete streaming body should read successfully");
+
+        assert_eq!(out, b"hello");
+        assert_eq!(GetObjectGuard::concurrent_count(), initial);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn get_object_streaming_reader_releases_request_guard_when_dropped_incomplete() {
+        let initial = GetObjectGuard::concurrent_count();
+        let guard = GetObjectGuard::new();
+        assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+        let reader = GetObjectStreamingReader::new(
+            std::io::Cursor::new(b"short".to_vec()),
+            "test-bucket",
+            "dropped-object",
+            10,
+            Duration::ZERO,
+            GetObjectBodyLifecycle::tracked(guard),
+        );
+        drop(reader);
+
+        assert_eq!(GetObjectGuard::concurrent_count(), initial);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn memory_tracked_bytes_stream_releases_request_guard_after_emit() {
+        let initial = GetObjectGuard::concurrent_count();
+        let guard = GetObjectGuard::new();
+        assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+        let mut stream = MemoryTrackedBytesStream::new(
+            Bytes::from_static(b"hello"),
+            5,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            None,
+            GetObjectBodyLifecycle::tracked(guard),
+        );
+        let chunk = stream
+            .next()
+            .await
+            .expect("memory body should emit one chunk")
+            .expect("memory body chunk should be readable");
+
+        assert_eq!(chunk.as_ref(), b"hello");
+        assert_eq!(GetObjectGuard::concurrent_count(), initial);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_tracked_bytes_stream_releases_request_guard_for_zero_length_without_poll() {
+        let initial = GetObjectGuard::concurrent_count();
+        let guard = GetObjectGuard::new();
+        assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+        let stream = MemoryTrackedBytesStream::new(
+            Bytes::new(),
+            0,
+            GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            None,
+            GetObjectBodyLifecycle::tracked(guard),
+        );
+        drop(stream);
+
+        assert_eq!(GetObjectGuard::concurrent_count(), initial);
     }
 
     #[tokio::test]
@@ -6663,7 +6860,7 @@ mod tests {
             ..Default::default()
         };
 
-        let body = DefaultObjectUsecase::build_get_object_body(
+        let _body = DefaultObjectUsecase::build_get_object_body(
             reader,
             &info,
             18_i64 * 1024 * 1024 * 1024,
@@ -6676,11 +6873,11 @@ mod tests {
             None,
             "test-bucket",
             "large-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("build_get_object_body should succeed for streaming path");
 
-        assert!(body.is_some());
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
             0,
@@ -6699,7 +6896,7 @@ mod tests {
             ..Default::default()
         };
 
-        let body = DefaultObjectUsecase::build_get_object_body(
+        let _body = DefaultObjectUsecase::build_get_object_body(
             reader,
             &info,
             18_i64 * 1024 * 1024 * 1024,
@@ -6712,11 +6909,11 @@ mod tests {
             None,
             "test-bucket",
             "large-encrypted-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("build_get_object_body should succeed for encrypted streaming path");
 
-        assert!(body.is_some());
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
             0,
@@ -6735,7 +6932,7 @@ mod tests {
             ..Default::default()
         };
 
-        let body = DefaultObjectUsecase::build_get_object_body(
+        let _body = DefaultObjectUsecase::build_get_object_body(
             reader,
             &info,
             4,
@@ -6748,11 +6945,11 @@ mod tests {
             Some(Bytes::from_static(b"test")),
             "test-bucket",
             "direct-memory-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("build_get_object_body should consume buffered body");
 
-        assert!(body.is_some());
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
             0,
@@ -6790,7 +6987,7 @@ mod tests {
 
         assert_eq!(fill, rustfs_object_data_cache::ObjectDataCacheFillResult::Inserted);
 
-        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+        let _body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             reader,
             &info,
@@ -6804,11 +7001,11 @@ mod tests {
             None,
             "test-bucket",
             "cached-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("cache hit body handoff should succeed");
 
-        assert!(body.is_some());
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
             0,
@@ -6844,7 +7041,7 @@ mod tests {
         });
         let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"oops")).await;
 
-        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+        let _body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             reader,
             &info,
@@ -6858,13 +7055,13 @@ mod tests {
             None,
             "test-bucket",
             "cached-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("size-mismatched direct fill should not create a cache hit");
         let lookup_after_mismatch = adapter.lookup_body(&plan).await;
 
         assert_eq!(fill, rustfs_object_data_cache::ObjectDataCacheFillResult::SkippedSizeMismatch);
-        assert!(body.is_some());
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
             0,
@@ -6899,7 +7096,7 @@ mod tests {
             })
             .expect("fill-enabled cache adapter should initialize");
 
-        let first_body = DefaultObjectUsecase::build_get_object_body_with_cache(
+        let _first_body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             first_reader,
             &info,
@@ -6913,11 +7110,12 @@ mod tests {
             Some(Bytes::from_static(b"hello")),
             "test-bucket",
             "cached-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("buffered-body handoff should succeed");
 
-        let second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
+        let _second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             second_reader,
             &info,
@@ -6931,12 +7129,11 @@ mod tests {
             None,
             "test-bucket",
             "cached-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("follow-up cache hit should succeed");
 
-        assert!(first_body.is_some());
-        assert!(second_body.is_some());
         assert_eq!(
             first_reads.load(AtomicOrdering::Relaxed),
             0,
@@ -6976,7 +7173,7 @@ mod tests {
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
 
-        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+        let _body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             reader,
             &info,
@@ -6990,12 +7187,12 @@ mod tests {
             Some(Bytes::from_static(b"oops")),
             "test-bucket",
             "cached-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("size-mismatched buffered-body handoff should still return a response body");
         let lookup = adapter.lookup_body(&plan).await;
 
-        assert!(body.is_some());
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
             0,
@@ -7031,7 +7228,7 @@ mod tests {
             })
             .expect("materialize-fill cache adapter should initialize");
 
-        let first_body = DefaultObjectUsecase::build_get_object_body_with_cache(
+        let _first_body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             first_reader,
             &info,
@@ -7045,11 +7242,12 @@ mod tests {
             None,
             "test-bucket",
             "materialized-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("materialize-fill handoff should succeed");
 
-        let second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
+        let _second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             second_reader,
             &info,
@@ -7063,12 +7261,11 @@ mod tests {
             None,
             "test-bucket",
             "materialized-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("follow-up cache hit should succeed");
 
-        assert!(first_body.is_some());
-        assert!(second_body.is_some());
         assert_eq!(
             first_reads.load(AtomicOrdering::Relaxed),
             2,
@@ -7102,7 +7299,7 @@ mod tests {
             })
             .expect("materialize-fill cache adapter should initialize");
 
-        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+        let _body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             reader,
             &info,
@@ -7116,11 +7313,11 @@ mod tests {
             None,
             "test-bucket",
             "too-large-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("too-large cache candidate should use streaming fallback");
 
-        assert!(body.is_some());
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
             0,
@@ -7139,7 +7336,7 @@ mod tests {
             ..Default::default()
         };
 
-        let body = DefaultObjectUsecase::build_get_object_body(
+        let _body = DefaultObjectUsecase::build_get_object_body(
             reader,
             &info,
             4,
@@ -7152,11 +7349,11 @@ mod tests {
             None,
             "test-bucket",
             "small-plain-object",
+            GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("build_get_object_body should keep small plain object on streaming path");
 
-        assert!(body.is_some());
         assert_eq!(
             reads.load(AtomicOrdering::Relaxed),
             0,
@@ -7877,6 +8074,7 @@ mod tests {
                 1,
                 None,
                 false,
+                GetObjectBodyLifecycle::disabled(),
             )
             .await
             .expect("get object output context");
@@ -7905,6 +8103,31 @@ mod tests {
 
         let err = Box::pin(usecase.execute_get_object(req)).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_get_object_part_number_rejects_above_s3_max() {
+        let err = parse_part_number_i32_to_usize(Some(10001), "GET").expect_err("partNumber above S3 max must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("GET: partNumber must be between 1 and 10000"));
+    }
+
+    #[test]
+    fn validate_get_object_part_number_rejects_missing_part() {
+        let info = ObjectInfo {
+            parts: Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+                number: 1,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let err =
+            DefaultObjectUsecase::validate_get_object_part_number(Some(2), &info).expect_err("missing requested part must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidPart);
+        assert!(DefaultObjectUsecase::validate_get_object_part_number(Some(1), &info).is_ok());
     }
 
     #[tokio::test]

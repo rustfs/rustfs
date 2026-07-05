@@ -48,6 +48,14 @@ catalog extension.
 | Databend | Manual/live harness | RustFS can generate an S3 stage read probe for table data files. RustFS does not claim Databend Iceberg REST Catalog integration yet. |
 | Snowflake Open Catalog / Iceberg integrations | Generated harness | RustFS can generate an operator-adapted external volume/catalog SQL template. Live RustFS interoperability is not claimed. |
 
+## Live Evidence And Operations Matrix
+
+| Area | Status | Current RustFS claim |
+|---|---|---|
+| Live conformance evidence template | Generated harness | `engine_compatibility.py --print-live-conformance` records required run metadata, per-client result rows, and claim promotion rules before a manual/live result can expand compatibility wording. |
+| Production operations guide | Generated harness | `engine_compatibility.py --print-operations-guide` records command, evidence, pass criteria, and fail-closed signals for live conformance, durable backing cutover, maintenance, recovery, permissions, credential vending, and unsupported-claim governance. |
+| Client claim promotion | Documented, not automated | PyIceberg remains the automated claim. Spark can be promoted only with recorded manual/live evidence; Trino and DuckDB read probes do not promote write compatibility; Snowflake and vendor profiles remain reference-only without repeatable live evidence. |
+
 ## Catalog API Matrix
 
 | Area | Status | Covered behavior |
@@ -86,14 +94,15 @@ catalog extension.
 | Snapshot expiration planning | Supported | Produces expiration plans with retained and candidate snapshots. |
 | Snapshot expiration commit | Preview / controlled | Can manually commit safe snapshot expiration through the catalog. Stale plans fail closed. |
 | Manifest/data/delete reachability cleanup | Supported | Reads manifest-list and manifest Avro references, reports reachable objects, and deletes only unreferenced table objects that pass the safety window. |
-| Maintenance worker run endpoint | Preview / controlled | Supports run-once execution, current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates. |
-| Maintenance scheduler guardrails | Preview / controlled | Exposes disabled, paused, ready, active-job backpressure, retry deferral, quarantine boundary, recommended actions, and recent maintenance job audit timeline state for external schedulers and operators. |
+| Maintenance scheduler run endpoint | Preview / controlled | Lets an external scheduler durably queue one maintenance job per table, reuse an active queued job, and recover expired queued leases before requeuing. |
+| Maintenance worker run endpoint | Preview / controlled | Supports queued-job claim, run-once execution, current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates. |
+| Maintenance scheduler guardrails | Preview / controlled | Exposes disabled, paused, ready, queued-job handoff, active-job backpressure, retry deferral, quarantine boundary, recommended actions, and recent maintenance job audit timeline state for external schedulers and operators. |
 | Maintenance audit events | Preview / controlled | Job reports and scheduler job summaries include structured audit events for planning, worker transitions, heartbeats, lease expiry recovery, and mutating quarantine operations. |
 | Maintenance quarantine operations | Preview / controlled | Lets operators inspect, release, retry, or abandon the current quarantined maintenance job without moving the table pointer. |
 | Compaction planning | Preview / controlled | Plans partition-local and sort-order-local binpack candidates for Parquet files and does not mix data files from different partition directories or sort orders in one rewrite group. |
 | Delete-file or row-level compaction planning | Preview / controlled | Manifests with position or equality delete files produce machine-readable row-level planning and force the compaction report into manual review before any rewrite can run. |
 | Compaction commit | Preview / controlled | Can commit a safe partition-local Parquet rewrite through the catalog while preserving Iceberg data file sort order IDs in the rewritten manifest. |
-| Built-in periodic scheduler | Not claimed | Operators can trigger worker runs, but continuous in-process scheduling is not claimed. |
+| Built-in periodic scheduler | Not claimed | Operators can trigger scheduler and worker ticks, but continuous in-process scheduling is not claimed. |
 | Delete-file or row-level compaction execution | Not claimed | RustFS does not rewrite delete files or execute row-level compaction; those cases remain manual-review maintenance items. |
 
 ## Recovery And Strong Backing Matrix
@@ -162,7 +171,7 @@ RustFS does not currently claim:
 - full MinIO AIStor Tables private extension parity
 - full Cloudflare R2 Data Catalog interoperability
 - full Alibaba OSS Tables interoperability
-- built-in periodic maintenance scheduling; external schedulers can inspect scheduler guardrails, but RustFS does not claim a continuous in-process scheduler
+- built-in periodic maintenance scheduling; external schedulers can queue maintenance jobs and workers can claim them, but RustFS does not claim a continuous in-process scheduler
 - active-active multi-region table writes
 - multi-table transactions
 - no-long-term-data-credential table bootstrap
@@ -198,6 +207,11 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --metadata-location s3://rustfs-s3table-smoke/tables/table-id/metadata/v1.metadata.json \
   --print-live-conformance \
   --cleanup
+python3 scripts/table-catalog/engine_compatibility.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --print-operations-guide
 python3 scripts/table-catalog/failure_coverage.py \
   --warehouse rustfs-s3table-smoke \
   --namespace smoke \
@@ -221,7 +235,8 @@ Acceptable wording:
 > with PyIceberg smoke coverage, table-aware S3 data-plane policy checks,
 > controlled maintenance, catalog recovery diagnostics, manual conformance
 > input for Spark, Trino, DuckDB, Databend, and Snowflake, production-failure
-> probe harnesses, and disaster-recovery rehearsal probes.
+> probe harnesses, disaster-recovery rehearsal probes, and a machine-readable
+> production operations evidence guide.
 
 Do not claim:
 

@@ -290,7 +290,12 @@ impl PriorityHealQueue {
         });
 
         if displaced.is_some() {
-            debug_assert_eq!(self.push(request), QueuePushOutcome::Accepted);
+            // The enqueue side effect must run in ALL builds. Do NOT fold `self.push(request)`
+            // into `debug_assert_eq!` — in release builds (`debug_assertions` off) the whole
+            // macro, including its argument expression, is compiled out, which would silently
+            // drop the new high-priority request after having already evicted a queued item.
+            let outcome = self.push(request);
+            debug_assert_eq!(outcome, QueuePushOutcome::Accepted);
         }
 
         displaced
@@ -583,7 +588,7 @@ fn is_recoverable_heal_error(err: &Error, error: &str) -> bool {
         Error::TaskTimeout | Error::TransientSkip { .. } => true,
         Error::Storage(err) => is_recoverable_storage_heal_error(err) || is_recoverable_heal_error_message(error),
         Error::Disk(err) => is_recoverable_disk_heal_error(err) || is_recoverable_heal_error_message(error),
-        Error::TaskExecutionFailed { .. } | Error::Io(_) | Error::IO(_) | Error::Anyhow(_) | Error::Other(_) => {
+        Error::TaskExecutionFailed { .. } | Error::Io(_) | Error::IO(_) | Error::Other(_) => {
             is_recoverable_heal_error_message(error)
         }
         _ => false,
@@ -3062,6 +3067,38 @@ mod tests {
         );
         request.source = source;
         request
+    }
+
+    #[test]
+    fn test_push_displacing_lower_priority_actually_enqueues_new_request() {
+        // Regression for the release-build defect where the enqueue side effect lived inside
+        // `debug_assert_eq!(self.push(request), ...)` and was compiled out under
+        // `cargo test --release` (debug_assertions off), silently dropping the displacing
+        // high-priority request while still having evicted a queued item.
+        //
+        // Must run with --release to expose the original bug.
+        let mut queue = PriorityHealQueue::new();
+
+        let low = bucket_request("victim-bucket", HealPriority::Low, HealRequestSource::Scanner);
+        assert_eq!(queue.push(low), QueuePushOutcome::Accepted);
+        assert_eq!(queue.len(), 1);
+
+        let high = bucket_request("admin-bucket", HealPriority::High, HealRequestSource::Admin);
+        let high_id = high.id.clone();
+        assert!(queue.can_displace_lower_priority(high.priority));
+
+        let displaced = queue
+            .push_displacing_lower_priority(high)
+            .expect("a lower-priority item should have been displaced");
+        assert_eq!(displaced.priority, HealPriority::Low);
+
+        // The displacing high-priority request must actually be enqueued (pre-fix under
+        // --release, len() is 0 because self.push(request) was elided with debug_assert_eq!).
+        assert_eq!(queue.len(), 1, "displacing request must remain enqueued");
+        let admitted = queue.pop_next().expect("displacing high-priority request must be enqueued");
+        assert_eq!(admitted.priority, HealPriority::High);
+        assert_eq!(admitted.id, high_id);
+        assert_eq!(queue.len(), 0);
     }
 
     #[test]
