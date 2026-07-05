@@ -324,7 +324,11 @@ enum ListMetadataAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListIndexFallbackReason {
     Disabled,
+    Rebuilding,
     Unhealthy,
+    Lagging,
+    Degraded,
+    Corrupt,
     MissingGeneration,
     UnsupportedRequest,
 }
@@ -391,6 +395,135 @@ fn select_list_index_source_mode(
     }
 
     ListIndexSourceDecision::UseIndex(mode)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListIndexLifecycleState {
+    Disabled,
+    Rebuilding,
+    Healthy,
+    Lagging,
+    Degraded,
+    Corrupt,
+}
+
+impl ListIndexLifecycleState {
+    fn fallback_reason(self) -> Option<ListIndexFallbackReason> {
+        match self {
+            Self::Disabled => Some(ListIndexFallbackReason::Disabled),
+            Self::Rebuilding => Some(ListIndexFallbackReason::Rebuilding),
+            Self::Healthy => None,
+            Self::Lagging => Some(ListIndexFallbackReason::Lagging),
+            Self::Degraded => Some(ListIndexFallbackReason::Degraded),
+            Self::Corrupt => Some(ListIndexFallbackReason::Corrupt),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListIndexHealthSnapshot {
+    state: ListIndexLifecycleState,
+    active_generation: Option<String>,
+    staging_generation: Option<String>,
+    checkpoint_high_water_mark: u64,
+    mutation_high_water_mark: u64,
+    mutation_lag: u64,
+    fallback_reason: Option<ListIndexFallbackReason>,
+}
+
+impl ListMetadataIndexHealth for ListIndexHealthSnapshot {
+    fn fallback_reason(&self) -> Option<ListIndexFallbackReason> {
+        self.fallback_reason
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListIndexLifecycle {
+    state: ListIndexLifecycleState,
+    active_generation: Option<String>,
+    staging_generation: Option<String>,
+    checkpoint_high_water_mark: u64,
+    mutation_high_water_mark: u64,
+    max_allowed_lag: u64,
+}
+
+impl ListIndexLifecycle {
+    fn disabled(max_allowed_lag: u64) -> Self {
+        Self {
+            state: ListIndexLifecycleState::Disabled,
+            active_generation: None,
+            staging_generation: None,
+            checkpoint_high_water_mark: 0,
+            mutation_high_water_mark: 0,
+            max_allowed_lag,
+        }
+    }
+
+    fn begin_rebuild(&mut self, generation: impl Into<String>, current_high_water_mark: u64) {
+        self.state = ListIndexLifecycleState::Rebuilding;
+        self.staging_generation = Some(generation.into());
+        self.mutation_high_water_mark = current_high_water_mark;
+    }
+
+    fn checkpoint_rebuild(&mut self, checkpoint_high_water_mark: u64) {
+        if self.state == ListIndexLifecycleState::Rebuilding && self.staging_generation.is_some() {
+            self.checkpoint_high_water_mark = checkpoint_high_water_mark;
+        }
+    }
+
+    fn publish_rebuild(&mut self) -> bool {
+        let Some(generation) = self.staging_generation.take() else {
+            return false;
+        };
+
+        self.active_generation = Some(generation);
+        self.state = ListIndexLifecycleState::Healthy;
+        self.mutation_high_water_mark = self.checkpoint_high_water_mark;
+        true
+    }
+
+    fn recover_after_restart(mut self) -> Self {
+        self.staging_generation = None;
+        self.state = if self.active_generation.is_some() {
+            ListIndexLifecycleState::Healthy
+        } else {
+            ListIndexLifecycleState::Disabled
+        };
+        self
+    }
+
+    fn observe_mutation_high_water_mark(&mut self, mutation_high_water_mark: u64) {
+        self.mutation_high_water_mark = self.mutation_high_water_mark.max(mutation_high_water_mark);
+        if matches!(self.state, ListIndexLifecycleState::Healthy | ListIndexLifecycleState::Lagging)
+            && self.mutation_lag() > self.max_allowed_lag
+        {
+            self.state = ListIndexLifecycleState::Lagging;
+        }
+    }
+
+    fn mark_degraded(&mut self) {
+        self.state = ListIndexLifecycleState::Degraded;
+    }
+
+    fn mark_corrupt(&mut self) {
+        self.state = ListIndexLifecycleState::Corrupt;
+    }
+
+    fn mutation_lag(&self) -> u64 {
+        self.mutation_high_water_mark.saturating_sub(self.checkpoint_high_water_mark)
+    }
+
+    fn health_snapshot(&self) -> ListIndexHealthSnapshot {
+        ListIndexHealthSnapshot {
+            state: self.state,
+            active_generation: self.active_generation.clone(),
+            staging_generation: self.staging_generation.clone(),
+            checkpoint_high_water_mark: self.checkpoint_high_water_mark,
+            mutation_high_water_mark: self.mutation_high_water_mark,
+            mutation_lag: self.mutation_lag(),
+            fallback_reason: self.state.fallback_reason(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4066,15 +4199,15 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState,
-        ListIndexFallbackReason, ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration,
-        ListMetadataIndexHealth, ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator,
-        ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions,
-        MAX_OBJECT_LIST, VersionMarker, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
-        fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
-        latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_metadata_resolution_params,
-        list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
-        parse_version_marker, resolve_agreed_listing_entry, resolve_listing_entries, select_list_index_source_mode,
-        send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
+        ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState, ListIndexSourceDecision, ListMetadataAuthority,
+        ListMetadataIndexGeneration, ListMetadataIndexHealth, ListMetadataIndexKeyLookup, ListMetadataIndexPage,
+        ListMetadataIndexPageIterator, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
+        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, VersionMarker, enforce_latest_listing_write_quorum,
+        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
+        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum,
+        list_metadata_resolution_params, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
+        merge_entry_channels, normalize_list_quorum, parse_version_marker, resolve_agreed_listing_entry, resolve_listing_entries,
+        select_list_index_source_mode, send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
@@ -5197,6 +5330,98 @@ mod test {
             lookup.lookup_page(&ListPathOptions::default()),
             ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::UnsupportedRequest)
         );
+    }
+
+    #[test]
+    fn list_index_lifecycle_rebuild_requires_publish_before_health() {
+        let mut lifecycle = ListIndexLifecycle::disabled(10);
+
+        lifecycle.begin_rebuild("generation-1", 100);
+        lifecycle.checkpoint_rebuild(80);
+
+        let snapshot = lifecycle.health_snapshot();
+        assert_eq!(snapshot.state, ListIndexLifecycleState::Rebuilding);
+        assert_eq!(snapshot.active_generation, None);
+        assert_eq!(snapshot.staging_generation.as_deref(), Some("generation-1"));
+        assert_eq!(snapshot.checkpoint_high_water_mark, 80);
+        assert_eq!(snapshot.fallback_reason, Some(ListIndexFallbackReason::Rebuilding));
+
+        assert!(lifecycle.publish_rebuild());
+        let snapshot = lifecycle.health_snapshot();
+        assert_eq!(snapshot.state, ListIndexLifecycleState::Healthy);
+        assert_eq!(snapshot.active_generation.as_deref(), Some("generation-1"));
+        assert_eq!(snapshot.staging_generation, None);
+        assert_eq!(snapshot.fallback_reason, None);
+    }
+
+    #[test]
+    fn list_index_lifecycle_restart_never_trusts_unpublished_staging_generation() {
+        let mut lifecycle = ListIndexLifecycle::disabled(10);
+        lifecycle.begin_rebuild("generation-1", 100);
+        lifecycle.checkpoint_rebuild(90);
+
+        let recovered = lifecycle.recover_after_restart();
+        let snapshot = recovered.health_snapshot();
+
+        assert_eq!(snapshot.state, ListIndexLifecycleState::Disabled);
+        assert_eq!(snapshot.active_generation, None);
+        assert_eq!(snapshot.staging_generation, None);
+        assert_eq!(snapshot.fallback_reason, Some(ListIndexFallbackReason::Disabled));
+    }
+
+    #[test]
+    fn list_index_lifecycle_restart_keeps_only_last_published_generation() {
+        let mut lifecycle = ListIndexLifecycle::disabled(10);
+        lifecycle.begin_rebuild("generation-1", 100);
+        lifecycle.checkpoint_rebuild(100);
+        assert!(lifecycle.publish_rebuild());
+
+        lifecycle.begin_rebuild("generation-2", 125);
+        lifecycle.checkpoint_rebuild(120);
+
+        let recovered = lifecycle.recover_after_restart();
+        let snapshot = recovered.health_snapshot();
+
+        assert_eq!(snapshot.state, ListIndexLifecycleState::Healthy);
+        assert_eq!(snapshot.active_generation.as_deref(), Some("generation-1"));
+        assert_eq!(snapshot.staging_generation, None);
+        assert_eq!(snapshot.fallback_reason, None);
+    }
+
+    #[test]
+    fn list_index_lifecycle_reports_lagging_and_fallback_reason() {
+        let mut lifecycle = ListIndexLifecycle::disabled(10);
+        lifecycle.begin_rebuild("generation-1", 100);
+        lifecycle.checkpoint_rebuild(100);
+        assert!(lifecycle.publish_rebuild());
+
+        lifecycle.observe_mutation_high_water_mark(115);
+        let snapshot = lifecycle.health_snapshot();
+
+        assert_eq!(snapshot.state, ListIndexLifecycleState::Lagging);
+        assert_eq!(snapshot.mutation_lag, 15);
+        assert_eq!(snapshot.fallback_reason, Some(ListIndexFallbackReason::Lagging));
+        assert!(!snapshot.is_healthy());
+    }
+
+    #[test]
+    fn list_index_lifecycle_reports_degraded_and_corrupt_as_unhealthy() {
+        let mut lifecycle = ListIndexLifecycle::disabled(10);
+        lifecycle.begin_rebuild("generation-1", 100);
+        lifecycle.checkpoint_rebuild(100);
+        assert!(lifecycle.publish_rebuild());
+
+        lifecycle.mark_degraded();
+        let degraded = lifecycle.health_snapshot();
+        assert_eq!(degraded.state, ListIndexLifecycleState::Degraded);
+        assert_eq!(degraded.fallback_reason, Some(ListIndexFallbackReason::Degraded));
+        assert!(!degraded.is_healthy());
+
+        lifecycle.mark_corrupt();
+        let corrupt = lifecycle.health_snapshot();
+        assert_eq!(corrupt.state, ListIndexLifecycleState::Corrupt);
+        assert_eq!(corrupt.fallback_reason, Some(ListIndexFallbackReason::Corrupt));
+        assert!(!corrupt.is_healthy());
     }
 
     #[test]
