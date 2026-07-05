@@ -12,8 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::ctx::SetDisksCtx;
-use super::*;
+//! `ListOperations` for `SetDisks` and the borrow-based prefix-maintenance
+//! service unit.
+//!
+//! P3 of the SetDisks God-Object split (tracking backlog#815, issue #819).
+//! Consolidates the `ListOperations` storage-api contract impl (relocated from
+//! `set_disk/mod.rs`) with the `SetDisks::delete_all` borrow service unit
+//! (relocated from `set_disk/list.rs`). Method bodies are moved verbatim and
+//! runtime behavior is unchanged.
+
+use super::super::ctx::SetDisksCtx;
+use super::super::*;
 
 impl SetDisks {
     #[tracing::instrument(skip(self))]
@@ -89,5 +98,66 @@ impl<'a> ListOperations<'a> {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::list::ListOperations for SetDisks {
+    type Error = Error;
+    type ListObjectsV2Info = ListObjectsV2Info;
+    type ListObjectVersionsInfo = ListObjectVersionsInfo;
+    type ObjectInfoOrErr = ObjectInfoOrErr;
+    type WalkOptions = WalkOptions;
+    type WalkCancellation = CancellationToken;
+    type WalkResultSender = Sender<ObjectInfoOrErr>;
+
+    #[tracing::instrument(skip(self))]
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: Option<String>,
+        incl_deleted: bool,
+    ) -> Result<ListObjectsV2Info> {
+        self.inner_list_objects_v2(
+            bucket,
+            prefix,
+            continuation_token,
+            delimiter,
+            max_keys,
+            fetch_owner,
+            start_after,
+            incl_deleted,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_versions(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+            .await
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        self.walk_internal(rx, bucket, prefix, result, opts).await
     }
 }
