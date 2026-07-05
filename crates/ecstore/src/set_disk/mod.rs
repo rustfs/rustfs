@@ -443,6 +443,7 @@ const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
+mod core;
 mod ctx;
 mod lock;
 mod metadata;
@@ -2609,7 +2610,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 )
                 .await?
                 {
-                    read::GetCodecStreamingReaderBuildOutcome::Reader(stream) => {
+                    core::io_primitives::GetCodecStreamingReaderBuildOutcome::Reader(stream) => {
                         record_get_codec_streaming_gate_decision(
                             codec_streaming_gate.object_class,
                             GetCodecStreamingDecision::Use,
@@ -2625,7 +2626,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                             object,
                         ));
                     }
-                    read::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
+                    core::io_primitives::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
                         record_get_codec_streaming_gate_decision(
                             codec_streaming_gate.object_class,
                             GetCodecStreamingDecision::Fallback(reason),
