@@ -174,6 +174,12 @@ pub const ENV_RUSTFS_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
 /// Environment variable for console server address.
 pub const ENV_RUSTFS_CONSOLE_ADDRESS: &str = "RUSTFS_CONSOLE_ADDRESS";
 
+/// Public browser entrypoint used to build OIDC callback and console redirects.
+///
+/// This should be the externally reachable scheme and authority, without a path.
+/// Example: `RUSTFS_BROWSER_REDIRECT_URL=https://console.example.com`.
+pub const ENV_RUSTFS_BROWSER_REDIRECT_URL: &str = "RUSTFS_BROWSER_REDIRECT_URL";
+
 /// Environment variable for server tls path.
 pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
 
@@ -348,6 +354,7 @@ mod tests {
             RUSTFS_TLS_CERT,
             DEFAULT_ADDRESS,
             DEFAULT_CONSOLE_ADDRESS,
+            ENV_RUSTFS_BROWSER_REDIRECT_URL,
         ];
 
         for constant in &string_constants {
