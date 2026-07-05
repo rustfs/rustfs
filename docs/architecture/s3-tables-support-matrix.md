@@ -48,6 +48,14 @@ catalog extension.
 | Databend | Manual/live harness | RustFS can generate an S3 stage read probe for table data files. RustFS does not claim Databend Iceberg REST Catalog integration yet. |
 | Snowflake Open Catalog / Iceberg integrations | Generated harness | RustFS can generate an operator-adapted external volume/catalog SQL template. Live RustFS interoperability is not claimed. |
 
+## Live Evidence And Operations Matrix
+
+| Area | Status | Current RustFS claim |
+|---|---|---|
+| Live conformance evidence template | Generated harness | `engine_compatibility.py --print-live-conformance` records required run metadata, per-client result rows, and claim promotion rules before a manual/live result can expand compatibility wording. |
+| Production operations guide | Generated harness | `engine_compatibility.py --print-operations-guide` records command, evidence, pass criteria, and fail-closed signals for live conformance, durable backing cutover, maintenance, recovery, permissions, credential vending, and unsupported-claim governance. |
+| Client claim promotion | Documented, not automated | PyIceberg remains the automated claim. Spark can be promoted only with recorded manual/live evidence; Trino and DuckDB read probes do not promote write compatibility; Snowflake and vendor profiles remain reference-only without repeatable live evidence. |
+
 ## Catalog API Matrix
 
 | Area | Status | Covered behavior |
@@ -199,6 +207,11 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --metadata-location s3://rustfs-s3table-smoke/tables/table-id/metadata/v1.metadata.json \
   --print-live-conformance \
   --cleanup
+python3 scripts/table-catalog/engine_compatibility.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --print-operations-guide
 python3 scripts/table-catalog/failure_coverage.py \
   --warehouse rustfs-s3table-smoke \
   --namespace smoke \
@@ -222,7 +235,8 @@ Acceptable wording:
 > with PyIceberg smoke coverage, table-aware S3 data-plane policy checks,
 > controlled maintenance, catalog recovery diagnostics, manual conformance
 > input for Spark, Trino, DuckDB, Databend, and Snowflake, production-failure
-> probe harnesses, and disaster-recovery rehearsal probes.
+> probe harnesses, disaster-recovery rehearsal probes, and a machine-readable
+> production operations evidence guide.
 
 Do not claim:
 
