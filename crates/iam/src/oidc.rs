@@ -1113,6 +1113,12 @@ impl OidcSys {
 
         let mut raw_claim_keys: Vec<&str> = claims.raw.keys().map(String::as_str).collect();
         raw_claim_keys.sort_unstable();
+        let (claim_name_lookup, claim_name_raw_value) = claim_lookup_for_log(&claims.raw, &config.claim_name);
+        let (groups_claim_lookup, groups_claim_raw_value) = claim_lookup_for_log(&claims.raw, &config.groups_claim);
+        let (roles_claim_lookup, roles_claim_raw_value) = claim_lookup_for_log(&claims.raw, &config.roles_claim);
+        let claim_name_values = extract_groups_claim(&claims.raw, &config.claim_name);
+        let groups_claim_values = extract_groups_claim(&claims.raw, &config.groups_claim);
+        let roles_claim_values = extract_groups_claim(&claims.raw, &config.roles_claim);
 
         info!(
             event = EVENT_OIDC_DIAGNOSTICS,
@@ -1130,6 +1136,19 @@ impl OidcSys {
             policies = ?policies,
             groups = ?groups,
             raw_claim_keys = ?raw_claim_keys,
+            raw_claims = ?claims.raw,
+            claim_name_lookup = %claim_name_lookup,
+            claim_name_type = claim_value_type_for_log(claim_name_raw_value),
+            claim_name_value = ?claim_name_raw_value,
+            claim_name_values = ?claim_name_values,
+            groups_claim_lookup = %groups_claim_lookup,
+            groups_claim_type = claim_value_type_for_log(groups_claim_raw_value),
+            groups_claim_value = ?groups_claim_raw_value,
+            groups_claim_values = ?groups_claim_values,
+            roles_claim_lookup = %roles_claim_lookup,
+            roles_claim_type = claim_value_type_for_log(roles_claim_raw_value),
+            roles_claim_value = ?roles_claim_raw_value,
+            roles_claim_values = ?roles_claim_values,
             "oidc claims mapped to policies"
         );
 
@@ -1788,6 +1807,29 @@ fn extract_canonical_group_values(
     groups.sort();
     groups.dedup();
     groups
+}
+
+fn claim_lookup_for_log<'a>(
+    claims: &'a HashMap<String, serde_json::Value>,
+    key: &str,
+) -> (&'static str, Option<&'a serde_json::Value>) {
+    match get_claim_case_insensitive(claims, key) {
+        ClaimLookup::Found(value) => ("found", Some(value)),
+        ClaimLookup::Missing => ("missing", None),
+        ClaimLookup::Ambiguous => ("ambiguous", None),
+    }
+}
+
+fn claim_value_type_for_log(value: Option<&serde_json::Value>) -> &'static str {
+    match value {
+        Some(serde_json::Value::Null) => "null",
+        Some(serde_json::Value::Bool(_)) => "bool",
+        Some(serde_json::Value::Number(_)) => "number",
+        Some(serde_json::Value::String(_)) => "string",
+        Some(serde_json::Value::Array(_)) => "array",
+        Some(serde_json::Value::Object(_)) => "object",
+        None => "none",
+    }
 }
 
 #[cfg(test)]

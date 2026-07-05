@@ -46,7 +46,7 @@ use s3s::{
 use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, error, info, warn};
 
@@ -128,6 +128,85 @@ fn resolve_oidc_session_identity(claims: &OidcClaims) -> String {
         claims.sub.clone()
     } else {
         "oidc-user-unknown".to_string()
+    }
+}
+
+async fn log_oidc_policy_diagnostics(
+    iam_store: &rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>,
+    provider_id: &str,
+    parent_user: &str,
+    policies: &[String],
+    groups: &[String],
+) {
+    if policies.is_empty() {
+        let policy_documents = BTreeMap::<String, Value>::new();
+        let missing_policies = Vec::<String>::new();
+        let combined_policy = Value::Null;
+        info!(
+            provider_id = %provider_id,
+            parent_user = %parent_user,
+            policy_count = 0,
+            group_count = groups.len(),
+            policies = ?policies,
+            groups = ?groups,
+            policy_documents = ?policy_documents,
+            missing_policies = ?missing_policies,
+            combined_policy = ?combined_policy,
+            "OIDC STS policy diagnostics"
+        );
+        return;
+    }
+
+    match iam_store.list_policy_docs("").await {
+        Ok(policy_docs) => {
+            let mut policy_documents = BTreeMap::new();
+            let mut missing_policies = Vec::new();
+            for policy_name in policies {
+                match policy_docs.get(policy_name) {
+                    Some(policy_doc) => {
+                        let policy_doc_json = serde_json::to_value(policy_doc).unwrap_or_else(|err| {
+                            serde_json::json!({
+                                "serialization_error": err.to_string(),
+                            })
+                        });
+                        policy_documents.insert(policy_name.clone(), policy_doc_json);
+                    }
+                    None => missing_policies.push(policy_name.clone()),
+                }
+            }
+
+            let combined_policy = iam_store.get_combined_policy(policies).await;
+            let combined_policy_json = serde_json::to_value(&combined_policy).unwrap_or_else(|err| {
+                serde_json::json!({
+                    "serialization_error": err.to_string(),
+                })
+            });
+
+            info!(
+                provider_id = %provider_id,
+                parent_user = %parent_user,
+                policy_count = policies.len(),
+                group_count = groups.len(),
+                policies = ?policies,
+                groups = ?groups,
+                missing_policies = ?missing_policies,
+                policy_documents = ?policy_documents,
+                combined_policy = ?combined_policy_json,
+                "OIDC STS policy diagnostics"
+            );
+        }
+        Err(err) => {
+            warn!(
+                provider_id = %provider_id,
+                parent_user = %parent_user,
+                policy_count = policies.len(),
+                group_count = groups.len(),
+                policies = ?policies,
+                groups = ?groups,
+                error = %err,
+                "OIDC STS policy diagnostics failed"
+            );
+        }
     }
 }
 
@@ -480,6 +559,7 @@ pub async fn create_oidc_sts_credentials(
     // Store temp user in IAM
     let iam_store =
         crate::admin::runtime_sources::current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
+    log_oidc_policy_diagnostics(&iam_store, provider_id, &new_cred.parent_user, policies, groups).await;
 
     let updated_at = iam_store
         .set_temp_user(&new_cred.access_key, &new_cred, None)
