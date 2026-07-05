@@ -1001,6 +1001,7 @@ else
 fi
 
 # Run tests from s3tests/functional
+set +e
 S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     tox -- \
     -vv -ra --showlocals --tb=long \
@@ -1012,6 +1013,7 @@ S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     2>&1 | tee "${ARTIFACTS_DIR}/pytest.log"
 
 TEST_EXIT_CODE=${PIPESTATUS[0]}
+set -e
 
 # Step 10: Collect RustFS logs
 log_info "Collecting RustFS logs..."

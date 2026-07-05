@@ -3703,10 +3703,18 @@ impl SetDisks {
                         let resolver = agreed_resolver.clone();
                         let supplement = agreed_supplement.clone();
                         async move {
+                            if cancel_token.is_cancelled() {
+                                return;
+                            }
+
                             let entry =
                                 match resolve_agreed_listing_entry(entry, reader_disks, resolver.clone(), enforce_write_quorum) {
                                     ListingEntryResolution::Resolved(entry) => entry,
                                     ListingEntryResolution::NeedsSupplement(entry, fallback) => {
+                                        if cancel_token.is_cancelled() {
+                                            return;
+                                        }
+
                                         let Some(entry) = resolve_agreed_listing_entry_with_supplement(
                                             entry,
                                             reader_disks,
@@ -3738,6 +3746,10 @@ impl SetDisks {
                         let cancel_token = cancel_for_send2.clone();
                         let supplement = partial_supplement.clone();
                         async move {
+                            if cancel_token.is_cancelled() {
+                                return;
+                            }
+
                             if let Some(entry) =
                                 resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement).await
                                 && let Err(err) = send_or_cancel(&cancel_token, &value, entry).await

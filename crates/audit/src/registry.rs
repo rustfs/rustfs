@@ -112,7 +112,7 @@ impl AuditRegistry {
     /// * `id` - The identifier for the target to be removed.
     ///
     /// # Returns
-/// * `Option<SharedTarget<AuditEntry>>` - The removed target if it existed.
+    /// * `Option<SharedTarget<AuditEntry>>` - The removed target if it existed.
     pub async fn remove_target(&mut self, id: &str) -> Option<SharedTarget<AuditEntry>> {
         self.targets.remove_and_close(id).await
     }
@@ -123,7 +123,7 @@ impl AuditRegistry {
     /// * `id` - The identifier for the target to be retrieved.
     ///
     /// # Returns
-    /// * `Option<&(dyn Target<AuditEntry> + Send + Sync)>` - The target if it exists.
+    /// * `Option<SharedTarget<AuditEntry>>` - The target if it exists.
     pub fn get_target(&self, id: &str) -> Option<SharedTarget<AuditEntry>> {
         self.targets.get(id)
     }
