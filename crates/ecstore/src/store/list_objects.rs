@@ -44,7 +44,8 @@ use rustfs_io_metrics::{
     ListObjectsGatherObservation,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use tokio::io::duplex;
 use tokio::sync::OnceCell;
@@ -257,6 +258,8 @@ const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
 const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
 const ENV_API_LIST_OBJECTS_INDEX_MODE: &str = "RUSTFS_LIST_OBJECTS_INDEX_MODE";
+const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER";
+const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 
 /// Identifies the source that produced a ListObjects page.
 ///
@@ -331,6 +334,7 @@ enum ListIndexFallbackReason {
     Degraded,
     Corrupt,
     MissingGeneration,
+    GenerationMismatch,
     UnsupportedRequest,
 }
 
@@ -344,9 +348,15 @@ impl ListIndexFallbackReason {
             Self::Degraded => "degraded",
             Self::Corrupt => "corrupt",
             Self::MissingGeneration => "missing_generation",
+            Self::GenerationMismatch => "generation_mismatch",
             Self::UnsupportedRequest => "unsupported_request",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListObjectsIndexProviderKind {
+    WalkerKeyOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +397,33 @@ trait ListMetadataIndexKeyLookup {
     type Page: ListMetadataIndexPage;
 
     fn lookup_page(&self, opts: &ListPathOptions) -> ListIndexSourceDecision;
+}
+
+fn select_list_index_provider_source_mode(
+    opts: &ListPathOptions,
+    requested: ListSourceMode,
+    health: &ListIndexHealthSnapshot,
+) -> ListIndexSourceDecision {
+    let mut parsed_opts = opts.clone();
+    parsed_opts.parse_marker();
+
+    if parsed_opts
+        .cursor_source
+        .is_some_and(|source| source != requested && source != ListSourceMode::Walker)
+    {
+        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::UnsupportedRequest);
+    }
+
+    if let Some(cursor_generation) = parsed_opts.cursor_generation.as_deref()
+        && health
+            .active_generation
+            .as_deref()
+            .is_some_and(|active_generation| cursor_generation != active_generation)
+    {
+        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::GenerationMismatch);
+    }
+
+    select_list_index_source_mode(Some(requested), health.active_generation.as_deref(), health)
 }
 
 fn select_list_index_source_mode(
@@ -690,24 +727,38 @@ fn list_objects_index_mode_from_env() -> Option<ListSourceMode> {
     }
 }
 
-fn record_list_objects_index_opt_in_fallback(opts: &ListPathOptions, mode: ListSourceMode) {
-    let mut parsed_opts = opts.clone();
-    parsed_opts.parse_marker();
-
-    let reason = if parsed_opts
-        .cursor_source
-        .is_some_and(|source| source != mode && source != ListSourceMode::Walker)
-    {
-        ListIndexFallbackReason::UnsupportedRequest
+fn list_objects_index_provider_from_env() -> Option<ListObjectsIndexProviderKind> {
+    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_PROVIDER, "");
+    let value = value.trim();
+    if value.eq_ignore_ascii_case(LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY) {
+        Some(ListObjectsIndexProviderKind::WalkerKeyOnly)
     } else {
-        let health = ListIndexLifecycle::disabled(0).health_snapshot();
-        match select_list_index_source_mode(Some(mode), Some("provider-not-attached"), &health) {
-            ListIndexSourceDecision::FallbackToWalker(reason) => reason,
-            ListIndexSourceDecision::UseIndex(_) => ListIndexFallbackReason::UnsupportedRequest,
-        }
+        None
+    }
+}
+
+fn list_objects_key_only_provider_health(provider: Option<ListObjectsIndexProviderKind>) -> ListIndexHealthSnapshot {
+    let mut lifecycle = ListIndexLifecycle::disabled(0);
+    if matches!(provider, Some(ListObjectsIndexProviderKind::WalkerKeyOnly)) {
+        lifecycle.begin_rebuild(LIST_CURSOR_GENERATION_LIVE, 0);
+        lifecycle.checkpoint_rebuild(0);
+        let _ = lifecycle.publish_rebuild();
+    }
+    lifecycle.health_snapshot()
+}
+
+fn record_list_objects_index_fallback(mode: ListSourceMode, reason: ListIndexFallbackReason) {
+    rustfs_io_metrics::record_list_objects_index_fallback(mode.cursor_value(), reason.metric_label());
+}
+
+fn record_list_objects_index_opt_in_fallback(opts: &ListPathOptions, mode: ListSourceMode) {
+    let health = list_objects_key_only_provider_health(None);
+    let reason = match select_list_index_provider_source_mode(opts, mode, &health) {
+        ListIndexSourceDecision::FallbackToWalker(reason) => reason,
+        ListIndexSourceDecision::UseIndex(_) => ListIndexFallbackReason::UnsupportedRequest,
     };
 
-    rustfs_io_metrics::record_list_objects_index_fallback(mode.cursor_value(), reason.metric_label());
+    record_list_objects_index_fallback(mode, reason);
     debug!(
         bucket = %opts.bucket,
         prefix = %opts.prefix,
@@ -825,7 +876,21 @@ fn list_objects_paginate(
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
 }
 
-fn list_objects_from_verified_index_candidates<F>(
+enum VerifiedIndexVisibleEntry {
+    Object(ObjectInfo),
+    Prefix(String),
+}
+
+impl VerifiedIndexVisibleEntry {
+    fn marker(&self) -> &str {
+        match self {
+            Self::Object(object) => &object.name,
+            Self::Prefix(prefix) => prefix,
+        }
+    }
+}
+
+async fn list_objects_from_verified_index_candidates<F, Fut>(
     prefix: &str,
     marker: Option<&str>,
     delimiter: &Option<String>,
@@ -834,17 +899,17 @@ fn list_objects_from_verified_index_candidates<F>(
     mut live_verify: F,
 ) -> Result<ListObjectsInfo>
 where
-    F: FnMut(&str) -> Result<Option<ObjectInfo>>,
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Option<ObjectInfo>>>,
 {
     let max_keys = normalize_max_keys(max_keys);
-    let page_limit = if max_keys <= 0 {
-        0
-    } else {
-        usize::try_from(max_keys_plus_one(max_keys, true)).unwrap_or(usize::MAX)
-    };
-    let mut objects = Vec::new();
-    let mut prefixes = BTreeSet::new();
-    let mut visible_candidates = 0usize;
+    if max_keys <= 0 {
+        return Ok(ListObjectsInfo::default());
+    }
+
+    let page_limit = usize::try_from(max_keys_plus_one(max_keys, true)).unwrap_or(usize::MAX);
+    let mut visible_entries = Vec::new();
+    let mut prefix_set = HashSet::new();
 
     for key in candidate_keys {
         if marker.is_some_and(|marker| key.as_str() <= marker) || !key.starts_with(prefix) {
@@ -856,41 +921,44 @@ where
         {
             let suffix = key.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
-                prefixes.insert(format!("{prefix}{common_prefix}{separator}"));
-                visible_candidates += 1;
-                if page_limit > 0 && visible_candidates >= page_limit {
+                let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if prefix_set.insert(common_prefix.clone()) {
+                    visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
+                }
+                if visible_entries.len() >= page_limit {
                     break;
                 }
                 continue;
             }
         }
 
-        if let Some(object) = live_verify(key)? {
-            objects.push(object);
-            visible_candidates += 1;
-            if page_limit > 0 && visible_candidates >= page_limit {
+        if let Some(object) = live_verify(key.clone()).await? {
+            visible_entries.push(VerifiedIndexVisibleEntry::Object(object));
+            if visible_entries.len() >= page_limit {
                 break;
             }
         }
     }
 
-    let prefixes = prefixes
-        .into_iter()
-        .map(|prefix| ObjectInfo {
-            name: prefix,
-            is_dir: true,
-            ..ObjectInfo::from_file_info(&rustfs_filemeta::FileInfo::default(), "", "", false)
-        })
-        .collect::<Vec<_>>();
-    let disk_has_more = page_limit > 0 && visible_candidates >= page_limit;
-    let (objects, prefixes, is_truncated, next_marker, _) = list_objects_paginate(
-        objects.into_iter().chain(prefixes).collect(),
-        delimiter,
-        max_keys,
-        disk_has_more,
-        None,
-        false,
-    );
+    let is_truncated = visible_entries.len() > max_keys as usize;
+    if is_truncated {
+        visible_entries.truncate(max_keys as usize);
+    }
+
+    let next_marker = if is_truncated {
+        visible_entries.last().map(|entry| entry.marker().to_owned())
+    } else {
+        None
+    };
+
+    let mut objects = Vec::new();
+    let mut prefixes = Vec::new();
+    for entry in visible_entries {
+        match entry {
+            VerifiedIndexVisibleEntry::Object(object) => objects.push(object),
+            VerifiedIndexVisibleEntry::Prefix(prefix) => prefixes.push(prefix),
+        }
+    }
 
     Ok(ListObjectsInfo {
         is_truncated,
@@ -1547,6 +1615,125 @@ impl ListPathOptions {
 }
 
 impl ECStore {
+    async fn list_objects_from_opt_in_key_only_provider(
+        self: Arc<Self>,
+        opts: &ListPathOptions,
+        mode: ListSourceMode,
+        max_keys: i32,
+        incl_deleted: bool,
+    ) -> Result<Option<ListObjectsInfo>> {
+        if incl_deleted || !mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification() {
+            record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
+            return Ok(None);
+        }
+
+        let provider = list_objects_index_provider_from_env();
+        let health = list_objects_key_only_provider_health(provider);
+        match select_list_index_provider_source_mode(opts, mode, &health) {
+            ListIndexSourceDecision::FallbackToWalker(reason) => {
+                record_list_objects_index_fallback(mode, reason);
+                debug!(
+                    bucket = %opts.bucket,
+                    prefix = %opts.prefix,
+                    source = mode.cursor_value(),
+                    reason = reason.metric_label(),
+                    "list_objects opt-in index path fell back to walker"
+                );
+                return Ok(None);
+            }
+            ListIndexSourceDecision::UseIndex(_) => {}
+        }
+
+        let Some(ListObjectsIndexProviderKind::WalkerKeyOnly) = provider else {
+            record_list_objects_index_fallback(mode, ListIndexFallbackReason::Disabled);
+            return Ok(None);
+        };
+
+        let mut provider_opts = opts.clone();
+        provider_opts.parse_marker();
+        provider_opts.cursor_source = Some(mode);
+        provider_opts.cursor_generation = health.active_generation.clone();
+
+        let mut list_result = self
+            .clone()
+            .list_path(&provider_opts)
+            .await
+            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                err: Some(err.into()),
+                ..Default::default()
+            });
+
+        if let Some(err) = list_result.err.take()
+            && err != rustfs_filemeta::Error::Unexpected
+        {
+            record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
+            return Ok(None);
+        }
+
+        if let Some(result) = list_result.entries.as_mut() {
+            result.forward_past(provider_opts.marker.clone());
+        }
+
+        let candidate_keys = list_result
+            .entries
+            .as_ref()
+            .map(|entries| {
+                entries
+                    .entries()
+                    .into_iter()
+                    .map(|entry| entry.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let bucket = provider_opts.bucket.clone();
+        let mut result = list_objects_from_verified_index_candidates(
+            &provider_opts.prefix,
+            provider_opts.marker.as_deref(),
+            &provider_opts.separator,
+            max_keys,
+            &candidate_keys,
+            |key| {
+                let store = self.clone();
+                let bucket = bucket.clone();
+                async move {
+                    match store
+                        .get_object_info(
+                            &bucket,
+                            &key,
+                            &ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        Ok(object) => Ok(Some(object)),
+                        Err(err) if err.is_not_found() => Ok(None),
+                        Err(err) => Err(err),
+                    }
+                }
+            },
+        )
+        .await?;
+
+        if let Some(next_marker) = result.next_marker.take() {
+            result.next_marker = Some(
+                ListContinuationV2 {
+                    version: MARKER_TAG_VERSION,
+                    id: None,
+                    pool_idx: None,
+                    set_idx: None,
+                    source: Some(mode),
+                    generation: health.active_generation,
+                }
+                .encode_marker(&next_marker),
+            );
+        }
+
+        Ok(Some(result))
+    }
+
     #[allow(clippy::too_many_arguments)]
     // @continuation_token marker
     // @start_after as marker when continuation_token empty
@@ -1606,7 +1793,13 @@ impl ECStore {
             ..Default::default()
         };
         if let Some(mode) = list_objects_index_mode_from_env() {
-            record_list_objects_index_opt_in_fallback(&opts, mode);
+            if let Some(result) = self
+                .clone()
+                .list_objects_from_opt_in_key_only_provider(&opts, mode, max_keys, incl_deleted)
+                .await?
+            {
+                return Ok(result);
+            }
         }
 
         // Optimization: use get for single object lookup with exact prefix
@@ -4331,18 +4524,20 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries,
-        FallbackListingEntry, GatherResultsState, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
+        ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM,
+        FallbackListingEntries, FallbackListingEntry, GatherResultsState, LIST_CURSOR_GENERATION_LIVE,
+        LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
         ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
-        ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListPathOptions, ListPathRawOptions,
-        ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, VersionMarker,
-        enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
-        latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
-        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_verified_index_candidates,
-        list_objects_index_mode_from_env, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
+        ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
+        ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions,
+        MAX_OBJECT_LIST, VersionMarker, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
+        fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
+        latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_metadata_resolution_params,
+        list_objects_from_verified_index_candidates, list_objects_index_mode_from_env, list_objects_index_provider_from_env,
+        list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
         merge_entry_channels, normalize_list_quorum, parse_version_marker, record_list_objects_index_opt_in_fallback,
-        resolve_agreed_listing_entry, resolve_listing_entries, select_list_index_source_mode, send_or_cancel,
-        version_marker_for_entries, walk_result_from_set_errors,
+        resolve_agreed_listing_entry, resolve_listing_entries, select_list_index_provider_source_mode,
+        select_list_index_source_mode, send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
@@ -5031,6 +5226,33 @@ mod test {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn list_objects_index_provider_from_env_is_default_off() {
+        temp_env::with_var_unset(ENV_API_LIST_OBJECTS_INDEX_PROVIDER, || {
+            assert_eq!(list_objects_index_provider_from_env(), None);
+            let health = list_objects_key_only_provider_health(list_objects_index_provider_from_env());
+            assert_eq!(health.state, ListIndexLifecycleState::Disabled);
+            assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Disabled));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_provider_from_env_publishes_live_generation_when_enabled() {
+        temp_env::with_var(
+            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
+            Some(LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY),
+            || {
+                assert_eq!(list_objects_index_provider_from_env(), Some(ListObjectsIndexProviderKind::WalkerKeyOnly));
+                let health = list_objects_key_only_provider_health(list_objects_index_provider_from_env());
+                assert_eq!(health.state, ListIndexLifecycleState::Healthy);
+                assert_eq!(health.active_generation.as_deref(), Some(LIST_CURSOR_GENERATION_LIVE));
+                assert_eq!(health.fallback_reason, None);
+            },
+        );
+    }
+
+    #[test]
     fn list_objects_index_opt_in_fallback_accepts_incompatible_cursor_without_panicking() {
         record_list_objects_index_opt_in_fallback(
             &ListPathOptions {
@@ -5045,18 +5267,20 @@ mod test {
         );
     }
 
-    #[test]
-    fn list_objects_verified_index_candidates_use_live_metadata_only() {
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_use_live_metadata_only() {
         let candidates = vec![
             "photos/2026/a.jpg".to_string(),
             "photos/2026/b.jpg".to_string(),
             "photos/2026/c.jpg".to_string(),
         ];
 
-        let result = list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| {
-            Ok(Some(test_live_object_info(key, "live-etag")))
-        })
-        .expect("verified candidate listing should succeed");
+        let result =
+            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
+                Ok(Some(test_live_object_info(&key, "live-etag")))
+            })
+            .await
+            .expect("verified candidate listing should succeed");
 
         assert_eq!(result.objects.len(), 3);
         assert!(
@@ -5069,8 +5293,8 @@ mod test {
         assert!(!result.is_truncated);
     }
 
-    #[test]
-    fn list_objects_verified_index_candidates_apply_marker_and_delimiter_boundaries() {
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_apply_marker_and_delimiter_boundaries() {
         let candidates = vec![
             "photos/2025/old.jpg".to_string(),
             "photos/2026/a.jpg".to_string(),
@@ -5085,8 +5309,9 @@ mod test {
             &Some("/".to_string()),
             100,
             &candidates,
-            |key| Ok(Some(test_live_object_info(key, "live-etag"))),
+            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
         )
+        .await
         .expect("verified candidate listing should succeed");
 
         assert_eq!(
@@ -5097,21 +5322,137 @@ mod test {
         assert!(!result.is_truncated);
     }
 
-    #[test]
-    fn list_objects_verified_index_candidates_drop_deleted_or_failed_live_verifications() {
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_use_common_prefix_as_page_marker() {
+        let candidates = vec![
+            "photos/2026/archive/b.jpg".to_string(),
+            "photos/2026/archive/c.jpg".to_string(),
+            "photos/2026/d.jpg".to_string(),
+        ];
+
+        let result = list_objects_from_verified_index_candidates(
+            "photos/2026/",
+            None,
+            &Some("/".to_string()),
+            1,
+            &candidates,
+            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
+        )
+        .await
+        .expect("verified candidate listing should succeed");
+
+        assert!(result.objects.is_empty());
+        assert_eq!(result.prefixes, vec!["photos/2026/archive/".to_string()]);
+        assert!(result.is_truncated);
+        assert_eq!(result.next_marker.as_deref(), Some("photos/2026/archive/"));
+    }
+
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_drop_deleted_or_failed_live_verifications() {
         let candidates = vec!["photos/2026/a.jpg".to_string(), "photos/2026/deleted.jpg".to_string()];
 
-        let result = list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| {
-            if key.ends_with("deleted.jpg") {
-                Ok(None)
-            } else {
-                Ok(Some(test_live_object_info(key, "live-etag")))
-            }
-        })
-        .expect("verified candidate listing should succeed");
+        let result =
+            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
+                if key.ends_with("deleted.jpg") {
+                    Ok(None)
+                } else {
+                    Ok(Some(test_live_object_info(&key, "live-etag")))
+                }
+            })
+            .await
+            .expect("verified candidate listing should succeed");
 
         assert_eq!(result.objects.len(), 1);
         assert_eq!(result.objects[0].name, "photos/2026/a.jpg");
+    }
+
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_ignore_stale_delete_markers() {
+        let candidates = vec![
+            "photos/2026/live.jpg".to_string(),
+            "photos/2026/stale-delete-marker.jpg".to_string(),
+        ];
+
+        let result =
+            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
+                if key.ends_with("stale-delete-marker.jpg") {
+                    Ok(None)
+                } else {
+                    Ok(Some(test_live_object_info(&key, "live-etag")))
+                }
+            })
+            .await
+            .expect("verified candidate listing should succeed");
+
+        assert_eq!(
+            result.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
+            vec!["photos/2026/live.jpg"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_return_overwritten_live_metadata() {
+        let candidates = vec!["photos/2026/overwritten.jpg".to_string()];
+
+        let result =
+            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
+                Ok(Some(test_live_object_info(&key, "new-live-etag")))
+            })
+            .await
+            .expect("verified candidate listing should succeed");
+
+        assert_eq!(result.objects.len(), 1);
+        assert_eq!(result.objects[0].etag.as_deref(), Some("new-live-etag"));
+    }
+
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_include_completed_multipart_after_live_verify() {
+        let candidates = vec!["photos/2026/multipart-complete.bin".to_string()];
+
+        let result =
+            list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| async move {
+                Ok(Some(test_live_object_info(&key, "completed-multipart-etag")))
+            })
+            .await
+            .expect("verified candidate listing should succeed");
+
+        assert_eq!(result.objects.len(), 1);
+        assert_eq!(result.objects[0].name, "photos/2026/multipart-complete.bin");
+        assert_eq!(result.objects[0].etag.as_deref(), Some("completed-multipart-etag"));
+    }
+
+    #[test]
+    fn list_index_provider_selection_rejects_generation_mismatch() {
+        let mut lifecycle = ListIndexLifecycle::disabled(10);
+        lifecycle.begin_rebuild("generation-2", 100);
+        lifecycle.checkpoint_rebuild(100);
+        assert!(lifecycle.publish_rebuild());
+        let health = lifecycle.health_snapshot();
+
+        let opts = ListPathOptions {
+            marker: Some("photos/2026/a.jpg[rustfs_cache:v2,id:list-cache-id,src:index_key_only,gen:generation-1]".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_list_index_provider_source_mode(&opts, ListSourceMode::IndexKeyOnly, &health),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::GenerationMismatch)
+        );
+    }
+
+    #[test]
+    fn list_index_provider_selection_falls_back_when_degraded() {
+        let mut lifecycle = ListIndexLifecycle::disabled(10);
+        lifecycle.begin_rebuild("generation-1", 100);
+        lifecycle.checkpoint_rebuild(100);
+        assert!(lifecycle.publish_rebuild());
+        lifecycle.mark_degraded();
+        let health = lifecycle.health_snapshot();
+
+        assert_eq!(
+            select_list_index_provider_source_mode(&ListPathOptions::default(), ListSourceMode::IndexKeyOnly, &health),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Degraded)
+        );
     }
 
     #[test]
