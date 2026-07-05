@@ -2800,8 +2800,9 @@ mod tests {
     // ── Corrupted server config recovery (issue #4156) ─────────────────
 
     use super::{
-        STORAGE_CLASS_SUB_SYS, ServerConfigCorruptError, config_read_failure_is_retryable, decode_persisted_server_config,
-        fallback_server_config_after_corruption, is_server_config_corrupt_error, read_config_without_migrate_with_recovery,
+        ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS, ServerConfigCorruptError, config_read_failure_is_retryable,
+        decode_persisted_server_config, fallback_server_config_after_corruption, is_server_config_corrupt_error,
+        read_config_without_migrate_with_recovery,
     };
     use rustfs_common::heal_channel::HealOpts;
     use std::sync::Mutex;
@@ -3037,6 +3038,22 @@ mod tests {
             configs_semantically_equal(&cfg, &Config::new()),
             "fallback config should be the default server config"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_recovery_respects_disabled_corruption_fallback_env() {
+        temp_env::async_with_vars([(ENV_CONFIG_RECOVER_ON_CORRUPTION, Some("off"))], async {
+            let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(corrupt_config_blob()), None));
+
+            let err = read_config_without_migrate_with_recovery(store.clone())
+                .await
+                .expect_err("disabled fallback must propagate persistent config corruption");
+
+            assert!(is_server_config_corrupt_error(&err), "expected corrupt config error, got {err:?}");
+            assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should run before failing");
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -10618,7 +10618,15 @@ mod tests {
 
         let mut reader = PutObjReader::from_vec(b"hello".to_vec());
         set_disks
-            .put_object(bucket, "object", &mut reader, &ObjectOptions::default())
+            .put_object(
+                bucket,
+                "object",
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..ObjectOptions::default()
+                },
+            )
             .await
             .expect("object should be written");
 
