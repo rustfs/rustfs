@@ -113,7 +113,7 @@ impl AuditRegistry {
     ///
     /// # Returns
     /// * `Option<Box<dyn Target<AuditEntry> + Send + Sync>>` - The removed target if it existed.
-    pub async fn remove_target(&mut self, id: &str) -> Option<rustfs_targets::SharedTarget<AuditEntry>> {
+    pub async fn remove_target(&mut self, id: &str) -> Option<SharedTarget<AuditEntry>> {
         self.targets.remove_and_close(id).await
     }
 
@@ -124,12 +124,12 @@ impl AuditRegistry {
     ///
     /// # Returns
     /// * `Option<&(dyn Target<AuditEntry> + Send + Sync)>` - The target if it exists.
-    pub fn get_target(&self, id: &str) -> Option<rustfs_targets::SharedTarget<AuditEntry>> {
+    pub fn get_target(&self, id: &str) -> Option<SharedTarget<AuditEntry>> {
         self.targets.get(id)
     }
 
     /// Lists cloned target values for runtime inspection without exposing mutable registry access.
-    pub fn list_target_values(&self) -> Vec<rustfs_targets::SharedTarget<AuditEntry>> {
+    pub fn list_target_values(&self) -> Vec<SharedTarget<AuditEntry>> {
         self.targets.values()
     }
 

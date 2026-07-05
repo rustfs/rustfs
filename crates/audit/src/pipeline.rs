@@ -247,7 +247,7 @@ impl AuditRuntimeView {
         registry.list_targets()
     }
 
-    pub async fn get_target_values(&self) -> Vec<rustfs_targets::SharedTarget<AuditEntry>> {
+    pub async fn get_target_values(&self) -> Vec<SharedTarget<AuditEntry>> {
         let registry = self.registry.lock().await;
         registry.list_target_values()
     }

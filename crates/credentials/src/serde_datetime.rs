@@ -19,9 +19,9 @@ use time::OffsetDateTime;
 use time::format_description;
 use time::format_description::well_known::Rfc3339;
 
-static LEGACY_FORMAT: std::sync::OnceLock<time::format_description::OwnedFormatItem> = std::sync::OnceLock::new();
+static LEGACY_FORMAT: std::sync::OnceLock<format_description::OwnedFormatItem> = std::sync::OnceLock::new();
 
-fn legacy_format() -> &'static time::format_description::OwnedFormatItem {
+fn legacy_format() -> &'static format_description::OwnedFormatItem {
     LEGACY_FORMAT.get_or_init(|| {
         format_description::parse_owned::<2>(
             "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond] [offset_hour sign:mandatory]:[offset_minute]:[offset_second]",
