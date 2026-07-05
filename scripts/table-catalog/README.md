@@ -191,6 +191,7 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-sql --cleanup
 python3 scripts/table-catalog/engine_compatibility.py --print-live-conformance --cleanup
+python3 scripts/table-catalog/engine_compatibility.py --print-operations-guide
 ```
 
 The production failure helper records the negative coverage required before
@@ -320,6 +321,27 @@ manual-review diagnostics, stale rollback/import conflicts, and data-plane
 policy failures as fail-closed results that require operator investigation
 before cutover or release claims.
 
+## Production Operations Guide
+
+The engine helper can print a machine-readable operations guide that ties client
+conformance, durable backing cutover, maintenance, recovery, permissions, and
+unsupported-claim governance to the exact evidence operators must record:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --endpoint http://127.0.0.1:9000 \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --print-operations-guide
+```
+
+Use this output as the release checklist when expanding compatibility language.
+Each section records commands, required evidence, pass criteria, and fail-closed
+signals. A client or vendor claim should only be promoted when the corresponding
+live evidence records the RustFS build, catalog backing mode, client version,
+expected status, observed status, and metadata location.
+
 ## Vendor Profile References
 
 | Profile | Catalog shape | Warehouse shape | Signing name | RustFS claim |
@@ -410,6 +432,9 @@ The output includes:
 - generated Spark SQL
 - a `spark-sql` command using the generated properties
 - expected `row_count=2` before optional cleanup
+- an evidence template for recording RustFS build, catalog backing mode, client
+  version, expected status, observed status, metadata location, and claim
+  promotion boundary
 
 Generate the configuration properties:
 
