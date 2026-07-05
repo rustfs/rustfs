@@ -61,7 +61,17 @@ Current implemented metrics:
 | `rustfs_s3_list_objects_gather_limit` | histogram | `source` | Internal gather limit |
 | `rustfs_s3_list_objects_merge_fan_in` | histogram | `source`, `outcome` | Merge input stream count |
 | `rustfs_s3_list_objects_merge_read_quorum` | histogram | `source`, `outcome` | Merge read quorum |
+| `rustfs_s3_list_objects_index_attempt_total` | counter | `source`, `provider`, `has_prefix`, `has_delimiter`, `has_marker` | Opt-in index serving attempts; denominator for fallback ratio |
 | `rustfs_s3_list_objects_index_fallback_total` | counter | `source`, `reason` | Opt-in index attempts that fell back to walker |
+| `rustfs_s3_list_objects_index_served_total` | counter | `source`, `provider`, `is_truncated` | Pages actually served by an opt-in index provider |
+| `rustfs_s3_list_objects_index_candidate_keys` | histogram | `source`, `provider` | Candidate keys proposed by the opt-in provider per page |
+| `rustfs_s3_list_objects_index_live_verify_attempts` | histogram | `source`, `provider` | Live xl.meta verification attempts per opt-in page |
+| `rustfs_s3_list_objects_index_live_verify_hits` | histogram | `source`, `provider` | Candidates accepted by live verification per opt-in page |
+| `rustfs_s3_list_objects_index_live_verify_misses` | histogram | `source`, `provider` | Stale/missing candidates rejected by live verification per opt-in page |
+| `rustfs_s3_list_objects_index_live_verify_failure_total` | counter | `source`, `reason` | Live verification failures that surface as errors |
+| `rustfs_s3_list_objects_index_returned_objects` | histogram | `source`, `provider` | Objects returned per opt-in page |
+| `rustfs_s3_list_objects_index_returned_prefixes` | histogram | `source`, `provider` | Common prefixes returned per opt-in page |
+| `rustfs_s3_list_objects_index_verification_io_amplification` | histogram | `source`, `provider` | Live verification attempts divided by returned objects |
 
 Future index manager metrics must add:
 
@@ -71,9 +81,9 @@ Future index manager metrics must add:
 - active generation and staging generation
 - checkpoint high-water mark and mutation high-water mark
 - mutation lag and lag threshold
-- candidate keys proposed
-- live verification attempts, successes, misses, and failures
-- fallback ratio by source mode and reason
+- persistent index lifecycle state by bucket or shard
+- generation checkpoint publish/lag gauges
+- CPU and allocator attribution for walker vs opt-in verified serving
 
 ## Alert Guidelines
 

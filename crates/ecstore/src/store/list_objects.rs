@@ -41,7 +41,7 @@ use rustfs_filemeta::{
 };
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
-    ListObjectsGatherObservation,
+    ListObjectsGatherObservation, ListObjectsIndexPageObservation,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
@@ -357,6 +357,18 @@ impl ListIndexFallbackReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListObjectsIndexProviderKind {
     WalkerKeyOnly,
+}
+
+impl ListObjectsIndexProviderKind {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::WalkerKeyOnly => LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY,
+        }
+    }
+}
+
+fn list_objects_index_provider_metric_label(provider: Option<ListObjectsIndexProviderKind>) -> &'static str {
+    provider.map(ListObjectsIndexProviderKind::metric_label).unwrap_or("none")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -890,21 +902,62 @@ impl VerifiedIndexVisibleEntry {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct VerifiedIndexCandidateStats {
+    candidate_keys: usize,
+    skipped_keys: usize,
+    common_prefixes: usize,
+    live_verify_attempts: usize,
+    live_verify_hits: usize,
+    live_verify_misses: usize,
+}
+
+struct VerifiedIndexCandidateResult {
+    info: ListObjectsInfo,
+    stats: VerifiedIndexCandidateStats,
+}
+
 async fn list_objects_from_verified_index_candidates<F, Fut>(
     prefix: &str,
     marker: Option<&str>,
     delimiter: &Option<String>,
     max_keys: i32,
     candidate_keys: &[String],
-    mut live_verify: F,
+    live_verify: F,
 ) -> Result<ListObjectsInfo>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<Option<ObjectInfo>>>,
 {
+    Ok(
+        list_objects_from_verified_index_candidates_with_stats(prefix, marker, delimiter, max_keys, candidate_keys, live_verify)
+            .await?
+            .info,
+    )
+}
+
+async fn list_objects_from_verified_index_candidates_with_stats<F, Fut>(
+    prefix: &str,
+    marker: Option<&str>,
+    delimiter: &Option<String>,
+    max_keys: i32,
+    candidate_keys: &[String],
+    mut live_verify: F,
+) -> Result<VerifiedIndexCandidateResult>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Option<ObjectInfo>>>,
+{
     let max_keys = normalize_max_keys(max_keys);
+    let mut stats = VerifiedIndexCandidateStats {
+        candidate_keys: candidate_keys.len(),
+        ..Default::default()
+    };
     if max_keys <= 0 {
-        return Ok(ListObjectsInfo::default());
+        return Ok(VerifiedIndexCandidateResult {
+            info: ListObjectsInfo::default(),
+            stats,
+        });
     }
 
     let page_limit = usize::try_from(max_keys_plus_one(max_keys, true)).unwrap_or(usize::MAX);
@@ -913,6 +966,7 @@ where
 
     for key in candidate_keys {
         if marker.is_some_and(|marker| key.as_str() <= marker) || !key.starts_with(prefix) {
+            stats.skipped_keys += 1;
             continue;
         }
 
@@ -923,6 +977,7 @@ where
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
                 if prefix_set.insert(common_prefix.clone()) {
+                    stats.common_prefixes += 1;
                     visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
                 }
                 if visible_entries.len() >= page_limit {
@@ -932,10 +987,17 @@ where
             }
         }
 
-        if let Some(object) = live_verify(key.clone()).await? {
-            visible_entries.push(VerifiedIndexVisibleEntry::Object(object));
-            if visible_entries.len() >= page_limit {
-                break;
+        stats.live_verify_attempts += 1;
+        match live_verify(key.clone()).await? {
+            Some(object) => {
+                stats.live_verify_hits += 1;
+                visible_entries.push(VerifiedIndexVisibleEntry::Object(object));
+                if visible_entries.len() >= page_limit {
+                    break;
+                }
+            }
+            None => {
+                stats.live_verify_misses += 1;
             }
         }
     }
@@ -960,11 +1022,14 @@ where
         }
     }
 
-    Ok(ListObjectsInfo {
-        is_truncated,
-        next_marker,
-        objects,
-        prefixes,
+    Ok(VerifiedIndexCandidateResult {
+        info: ListObjectsInfo {
+            is_truncated,
+            next_marker,
+            objects,
+            prefixes,
+        },
+        stats,
     })
 }
 
@@ -1622,12 +1687,21 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<Option<ListObjectsInfo>> {
+        let provider = list_objects_index_provider_from_env();
+        let provider_label = list_objects_index_provider_metric_label(provider);
+        rustfs_io_metrics::record_list_objects_index_attempt(
+            mode.cursor_value(),
+            provider_label,
+            !opts.prefix.is_empty(),
+            opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
+            opts.marker.is_some(),
+        );
+
         if incl_deleted || !mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification() {
             record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
             return Ok(None);
         }
 
-        let provider = list_objects_index_provider_from_env();
         let health = list_objects_key_only_provider_health(provider);
         match select_list_index_provider_source_mode(opts, mode, &health) {
             ListIndexSourceDecision::FallbackToWalker(reason) => {
@@ -1687,7 +1761,7 @@ impl ECStore {
             .unwrap_or_default();
 
         let bucket = provider_opts.bucket.clone();
-        let mut result = list_objects_from_verified_index_candidates(
+        let verified = list_objects_from_verified_index_candidates_with_stats(
             &provider_opts.prefix,
             provider_opts.marker.as_deref(),
             &provider_opts.separator,
@@ -1710,12 +1784,29 @@ impl ECStore {
                     {
                         Ok(object) => Ok(Some(object)),
                         Err(err) if err.is_not_found() => Ok(None),
-                        Err(err) => Err(err),
+                        Err(err) => {
+                            rustfs_io_metrics::record_list_objects_index_live_verify_failure(mode.cursor_value(), "read_error");
+                            Err(err)
+                        }
                     }
                 }
             },
         )
         .await?;
+        let stats = verified.stats;
+        let mut result = verified.info;
+
+        rustfs_io_metrics::record_list_objects_index_served(ListObjectsIndexPageObservation {
+            source: mode.cursor_value(),
+            provider: provider_label,
+            candidate_keys: stats.candidate_keys,
+            live_verify_attempts: stats.live_verify_attempts,
+            live_verify_hits: stats.live_verify_hits,
+            live_verify_misses: stats.live_verify_misses,
+            returned_objects: result.objects.len(),
+            returned_prefixes: result.prefixes.len(),
+            is_truncated: result.is_truncated,
+        });
 
         if let Some(next_marker) = result.next_marker.take() {
             result.next_marker = Some(
@@ -4533,11 +4624,12 @@ mod test {
         MAX_OBJECT_LIST, VersionMarker, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
         fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
         latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_metadata_resolution_params,
-        list_objects_from_verified_index_candidates, list_objects_index_mode_from_env, list_objects_index_provider_from_env,
-        list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
-        merge_entry_channels, normalize_list_quorum, parse_version_marker, record_list_objects_index_opt_in_fallback,
-        resolve_agreed_listing_entry, resolve_listing_entries, select_list_index_provider_source_mode,
-        select_list_index_source_mode, send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
+        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_stats,
+        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_key_only_provider_health,
+        list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
+        parse_version_marker, record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry, resolve_listing_entries,
+        select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel, version_marker_for_entries,
+        walk_result_from_set_errors,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
@@ -5419,6 +5511,42 @@ mod test {
         assert_eq!(result.objects.len(), 1);
         assert_eq!(result.objects[0].name, "photos/2026/multipart-complete.bin");
         assert_eq!(result.objects[0].etag.as_deref(), Some("completed-multipart-etag"));
+    }
+
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_report_verification_stats() {
+        let candidates = vec![
+            "photos/2025/old.jpg".to_string(),
+            "photos/2026/a.jpg".to_string(),
+            "photos/2026/archive/b.jpg".to_string(),
+            "photos/2026/deleted.jpg".to_string(),
+        ];
+
+        let result = list_objects_from_verified_index_candidates_with_stats(
+            "photos/2026/",
+            Some("photos/2026/a.jpg"),
+            &Some("/".to_string()),
+            100,
+            &candidates,
+            |key| async move {
+                if key.ends_with("deleted.jpg") {
+                    Ok(None)
+                } else {
+                    Ok(Some(test_live_object_info(&key, "live-etag")))
+                }
+            },
+        )
+        .await
+        .expect("verified candidate listing should succeed");
+
+        assert!(result.info.objects.is_empty());
+        assert_eq!(result.info.prefixes, vec!["photos/2026/archive/".to_string()]);
+        assert_eq!(result.stats.candidate_keys, 4);
+        assert_eq!(result.stats.skipped_keys, 2);
+        assert_eq!(result.stats.common_prefixes, 1);
+        assert_eq!(result.stats.live_verify_attempts, 1);
+        assert_eq!(result.stats.live_verify_hits, 0);
+        assert_eq!(result.stats.live_verify_misses, 1);
     }
 
     #[test]
