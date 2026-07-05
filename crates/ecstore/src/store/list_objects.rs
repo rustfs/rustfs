@@ -117,6 +117,65 @@ enum GatherResultsState {
     InputClosed,
 }
 
+#[derive(Clone)]
+struct ListPathLogContext {
+    bucket: String,
+    base_dir: String,
+    prefix: String,
+    marker: String,
+    limit: i32,
+}
+
+impl ListPathLogContext {
+    fn from_options(opts: &ListPathOptions) -> Self {
+        Self {
+            bucket: opts.bucket.clone(),
+            base_dir: opts.base_dir.clone(),
+            prefix: opts.prefix.clone(),
+            marker: opts.marker.clone().unwrap_or_default(),
+            limit: opts.limit,
+        }
+    }
+}
+
+fn log_list_path_worker_error<E>(component: &'static str, stage: &'static str, context: &ListPathLogContext, err: &E)
+where
+    E: std::fmt::Display + ?Sized,
+{
+    error!(
+        component,
+        stage,
+        bucket = %context.bucket,
+        prefix = %context.prefix,
+        base_dir = %context.base_dir,
+        limit = context.limit,
+        marker = %context.marker,
+        error = %err,
+        "list_path worker failed"
+    );
+}
+
+fn log_list_path_finished(
+    component: &'static str,
+    context: &ListPathLogContext,
+    elapsed_ms: f64,
+    candidate_count: usize,
+    has_error: bool,
+) {
+    debug!(
+        component,
+        bucket = %context.bucket,
+        prefix = %context.prefix,
+        base_dir = %context.base_dir,
+        limit = context.limit,
+        marker = %context.marker,
+        candidate_count,
+        has_error,
+        elapsed_ms,
+        "list_path finished"
+    );
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
     pub id: Option<String>,
@@ -1316,6 +1375,7 @@ impl ECStore {
         if o.transient {
             o.create = false;
         }
+        let log_context = ListPathLogContext::from_options(&o);
 
         // cancel channel
         let cancel = CancellationToken::new();
@@ -1329,6 +1389,7 @@ impl ECStore {
         let cancel_rx1 = cancel.clone();
         let cancel_rx1_for_err = cancel_rx1.clone();
         let err_tx1 = err_tx.clone();
+        let job1_context = log_context.clone();
         let job1 = tokio::spawn(
             async move {
                 let mut opts = opts;
@@ -1336,7 +1397,7 @@ impl ECStore {
                 if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await
                     && !cancel_rx1_for_err.is_cancelled()
                 {
-                    error!("list_merged err {:?}", err);
+                    log_list_path_worker_error("store", "list_merged", &job1_context, &err);
                     let _ = err_tx1.send(Arc::new(err));
                 }
             }
@@ -1348,13 +1409,14 @@ impl ECStore {
         let (result_tx, mut result_rx) = mpsc::channel(1);
         let err_tx2 = err_tx.clone();
         let opts = o.clone();
+        let job2_context = log_context.clone();
         let job2 = tokio::spawn(
             async move {
                 match gather_results(cancel_rx2, opts, recv, result_tx).await {
                     Ok(GatherResultsState::LimitReached) => cancel.cancel(),
                     Ok(GatherResultsState::InputClosed) => {}
                     Err(err) => {
-                        error!("gather_results err {:?}", err);
+                        log_list_path_worker_error("store", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
                         cancel.cancel();
                     }
@@ -1369,12 +1431,12 @@ impl ECStore {
                res = err_rx.recv() =>{
 
                 match res{
-                    Ok(o) => {
-                        error!("list_path err_rx.recv() ok {:?}", &o);
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(o.as_ref().clone().into()) }
+                    Ok(err) => {
+                        log_list_path_worker_error("store", "worker_error", &log_context, err.as_ref());
+                        MetaCacheEntriesSortedResult{ entries: None, err: Some(err.as_ref().clone().into()) }
                     },
                     Err(err) => {
-                        error!("list_path err_rx.recv() err {:?}", &err);
+                        log_list_path_worker_error("store", "error_channel_closed", &log_context, &err);
 
                         MetaCacheEntriesSortedResult{ entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
                     },
@@ -1390,11 +1452,12 @@ impl ECStore {
         join_all(vec![job1, job2]).await;
 
         if let Ok(err) = err_rx.try_recv() {
-            error!("list_path err_rx.try_recv() ok {:?}", &err);
+            log_list_path_worker_error("store", "trailing_worker_error", &log_context, err.as_ref());
             result.err = Some(err.as_ref().clone().into());
         }
 
         if result.err.is_some() {
+            log_list_path_finished("store", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
             return Ok(result);
         }
 
@@ -1420,14 +1483,16 @@ impl ECStore {
             list_path_started.elapsed().as_secs_f64() * 1000.0,
         );
 
-        debug!(
-            bucket = %o.bucket,
-            prefix = %o.base_dir,
-            limit = o.limit,
-            marker = %o.marker.as_deref().unwrap_or(""),
-            candidate_count = result.entries.as_ref().map(|entries| entries.entries().len()).unwrap_or_default(),
-            has_error = result.err.is_some(),
-            "store list_path finished"
+        log_list_path_finished(
+            "store",
+            &log_context,
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+            result
+                .entries
+                .as_ref()
+                .map(|entries| entries.entries().len())
+                .unwrap_or_default(),
+            result.err.is_some(),
         );
 
         Ok(result)
@@ -1997,7 +2062,7 @@ async fn gather_results(
             results_tx
                 .send(MetaCacheEntriesSortedResult {
                     entries: Some(MetaCacheEntriesSorted {
-                        o: MetaCacheEntries(entries.clone()),
+                        o: MetaCacheEntries(entries),
                         ..Default::default()
                     }),
                     err: None,
@@ -2024,7 +2089,7 @@ async fn gather_results(
     results_tx
         .send(MetaCacheEntriesSortedResult {
             entries: Some(MetaCacheEntriesSorted {
-                o: MetaCacheEntries(entries.clone()),
+                o: MetaCacheEntries(entries),
                 ..Default::default()
             }),
             err: Some(Error::Unexpected.into()),
@@ -2448,6 +2513,7 @@ impl Sets {
 
     pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
+        let list_path_started = std::time::Instant::now();
 
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
@@ -2488,6 +2554,7 @@ impl Sets {
         if o.transient {
             o.create = false;
         }
+        let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
@@ -2498,6 +2565,7 @@ impl Sets {
         let cancel_rx1 = cancel.clone();
         let cancel_rx1_for_err = cancel_rx1.clone();
         let err_tx1 = err_tx.clone();
+        let job1_context = log_context.clone();
         let job1 = tokio::spawn(
             async move {
                 let mut opts = opts;
@@ -2505,7 +2573,7 @@ impl Sets {
                 if let Err(err) = sets.list_merged(cancel_rx1, opts, sender).await
                     && !cancel_rx1_for_err.is_cancelled()
                 {
-                    error!("list_merged err {:?}", err);
+                    log_list_path_worker_error("sets", "list_merged", &job1_context, &err);
                     let _ = err_tx1.send(Arc::new(err));
                 }
             }
@@ -2516,13 +2584,14 @@ impl Sets {
         let (result_tx, mut result_rx) = mpsc::channel(1);
         let err_tx2 = err_tx.clone();
         let opts = o.clone();
+        let job2_context = log_context.clone();
         let job2 = tokio::spawn(
             async move {
                 match gather_results(cancel_rx2, opts, recv, result_tx).await {
                     Ok(GatherResultsState::LimitReached) => cancel.cancel(),
                     Ok(GatherResultsState::InputClosed) => {}
                     Err(err) => {
-                        error!("gather_results err {:?}", err);
+                        log_list_path_worker_error("sets", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
                         cancel.cancel();
                     }
@@ -2534,8 +2603,14 @@ impl Sets {
         let mut result = tokio::select! {
             res = err_rx.recv() => {
                 match res {
-                    Ok(err) => MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) },
-                    Err(err) => MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) },
+                    Ok(err) => {
+                        log_list_path_worker_error("sets", "worker_error", &log_context, err.as_ref());
+                        MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) }
+                    },
+                    Err(err) => {
+                        log_list_path_worker_error("sets", "error_channel_closed", &log_context, &err);
+                        MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
+                    },
                 }
             }
             Some(result) = result_rx.recv() => result,
@@ -2544,10 +2619,12 @@ impl Sets {
         join_all(vec![job1, job2]).await;
 
         if let Ok(err) = err_rx.try_recv() {
+            log_list_path_worker_error("sets", "trailing_worker_error", &log_context, err.as_ref());
             result.err = Some(err.as_ref().clone().into());
         }
 
         if result.err.is_some() {
+            log_list_path_finished("sets", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
             return Ok(result);
         }
 
@@ -2567,6 +2644,18 @@ impl Sets {
                 result.err = Some(Error::Unexpected.into());
             }
         }
+
+        log_list_path_finished(
+            "sets",
+            &log_context,
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+            result
+                .entries
+                .as_ref()
+                .map(|entries| entries.entries().len())
+                .unwrap_or_default(),
+            result.err.is_some(),
+        );
 
         Ok(result)
     }
@@ -3385,6 +3474,7 @@ impl SetDisks {
         if o.transient {
             o.create = false;
         }
+        let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
@@ -3395,6 +3485,7 @@ impl SetDisks {
         let cancel_rx1 = cancel.clone();
         let cancel_rx1_for_err = cancel_rx1.clone();
         let err_tx1 = err_tx.clone();
+        let job1_context = log_context.clone();
         let job1 = tokio::spawn(
             async move {
                 let mut opts = opts;
@@ -3402,7 +3493,7 @@ impl SetDisks {
                 if let Err(err) = set.list_path(cancel_rx1, opts, sender).await
                     && !cancel_rx1_for_err.is_cancelled()
                 {
-                    error!("list_path err {:?}", err);
+                    log_list_path_worker_error("set_disks", "list_path", &job1_context, &err);
                     let _ = err_tx1.send(Arc::new(err));
                 }
             }
@@ -3413,13 +3504,14 @@ impl SetDisks {
         let (result_tx, mut result_rx) = mpsc::channel(1);
         let err_tx2 = err_tx.clone();
         let opts = o.clone();
+        let job2_context = log_context.clone();
         let job2 = tokio::spawn(
             async move {
                 match gather_results(cancel_rx2, opts, recv, result_tx).await {
                     Ok(GatherResultsState::LimitReached) => cancel.cancel(),
                     Ok(GatherResultsState::InputClosed) => {}
                     Err(err) => {
-                        error!("gather_results err {:?}", err);
+                        log_list_path_worker_error("set_disks", "gather_results", &job2_context, &err);
                         let _ = err_tx2.send(Arc::new(err));
                         cancel.cancel();
                     }
@@ -3431,8 +3523,14 @@ impl SetDisks {
         let mut result = tokio::select! {
             res = err_rx.recv() => {
                 match res {
-                    Ok(err) => MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) },
-                    Err(err) => MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) },
+                    Ok(err) => {
+                        log_list_path_worker_error("set_disks", "worker_error", &log_context, err.as_ref());
+                        MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) }
+                    },
+                    Err(err) => {
+                        log_list_path_worker_error("set_disks", "error_channel_closed", &log_context, &err);
+                        MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
+                    },
                 }
             }
             Some(result) = result_rx.recv() => result,
@@ -3441,10 +3539,12 @@ impl SetDisks {
         join_all(vec![job1, job2]).await;
 
         if let Ok(err) = err_rx.try_recv() {
+            log_list_path_worker_error("set_disks", "trailing_worker_error", &log_context, err.as_ref());
             result.err = Some(err.as_ref().clone().into());
         }
 
         if result.err.is_some() {
+            log_list_path_finished("set_disks", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
             return Ok(result);
         }
 
@@ -3470,14 +3570,16 @@ impl SetDisks {
             list_path_started.elapsed().as_secs_f64() * 1000.0,
         );
 
-        debug!(
-            bucket = %o.bucket,
-            prefix = %o.base_dir,
-            limit = o.limit,
-            marker = %o.marker.as_deref().unwrap_or(""),
-            candidate_count = result.entries.as_ref().map(|entries| entries.entries().len()).unwrap_or_default(),
-            has_error = result.err.is_some(),
-            "sets list_path finished"
+        log_list_path_finished(
+            "set_disks",
+            &log_context,
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+            result
+                .entries
+                .as_ref()
+                .map(|entries| entries.entries().len())
+                .unwrap_or_default(),
+            result.err.is_some(),
         );
 
         Ok(result)
@@ -3621,7 +3723,7 @@ impl SetDisks {
                                     ListingEntryResolution::Rejected => return,
                                 };
 
-                            if let Err(err) = value.send(entry).await
+                            if let Err(err) = send_or_cancel(&cancel_token, &value, entry).await
                                 && !cancel_token.is_cancelled()
                             {
                                 error!("list_path send fail {:?}", err);
@@ -3638,7 +3740,7 @@ impl SetDisks {
                         async move {
                             if let Some(entry) =
                                 resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement).await
-                                && let Err(err) = value.send(entry).await
+                                && let Err(err) = send_or_cancel(&cancel_token, &value, entry).await
                                 && !cancel_token.is_cancelled()
                             {
                                 error!("list_path send fail {:?}", err);
@@ -3667,6 +3769,9 @@ impl SetDisks {
                 asked_disks = ask_disks,
                 listing_quorum = listing_quorum,
                 stop_disk_at_limit = opts.stop_disk_at_limit,
+                limit = opts.limit,
+                per_disk_limit = limit,
+                elapsed_ms = list_path_started.elapsed().as_secs_f64() * 1000.0,
                 list_error = %err,
                 "set_disks list_path finished with error"
             );
@@ -3679,6 +3784,9 @@ impl SetDisks {
                 asked_disks = ask_disks,
                 listing_quorum = listing_quorum,
                 stop_disk_at_limit = opts.stop_disk_at_limit,
+                limit = opts.limit,
+                per_disk_limit = limit,
+                elapsed_ms = list_path_started.elapsed().as_secs_f64() * 1000.0,
                 "set_disks list_path finished"
             );
         }
@@ -3755,7 +3863,7 @@ mod test {
         fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
         latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_metadata_resolution_params,
         list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
-        parse_version_marker, resolve_agreed_listing_entry, resolve_listing_entries, version_marker_for_entries,
+        parse_version_marker, resolve_agreed_listing_entry, resolve_listing_entries, send_or_cancel, version_marker_for_entries,
         walk_result_from_set_errors,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
@@ -5187,5 +5295,27 @@ mod test {
 
         drop(tx_a);
         drop(tx_b);
+    }
+
+    #[tokio::test]
+    async fn send_or_cancel_returns_false_when_cancelled_while_output_is_full() {
+        let (out_tx, _out_rx) = mpsc::channel::<MetaCacheEntry>(1);
+        out_tx
+            .send(test_meta_entry("already-buffered"))
+            .await
+            .expect("output channel should accept initial entry");
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        let handle = tokio::spawn(async move { send_or_cancel(&cancel_clone, &out_tx, test_meta_entry("next")).await });
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("send_or_cancel should not hang when cancellation wins over backpressure")
+            .expect("task should not panic")
+            .expect("send_or_cancel should succeed");
+        assert!(!result, "send_or_cancel should report cancellation instead of a successful send");
     }
 }

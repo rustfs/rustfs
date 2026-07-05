@@ -8334,6 +8334,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_delete_objects_rejects_more_than_one_thousand_objects_before_store_lookup() {
+        let objects = (0..1001)
+            .map(|idx| ObjectIdentifier {
+                key: format!("test-key-{idx}"),
+                version_id: None,
+                ..Default::default()
+            })
+            .collect();
+        let input = DeleteObjectsInput::builder()
+            .bucket("test-bucket".to_string())
+            .delete(Delete { objects, quiet: None })
+            .build()
+            .expect("delete objects input should build");
+
+        let req = build_request(input, Method::POST);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_delete_objects(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn execute_delete_objects_returns_internal_error_when_store_uninitialized() {
         let input = DeleteObjectsInput::builder()
             .bucket("test-bucket".to_string())
