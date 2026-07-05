@@ -156,6 +156,13 @@ Tables, Cloudflare R2 Data Catalog, and OSS Tables reference profiles leave
 provider object I/O endpoint and credential selection to the provider-specific
 Spark/Iceberg runtime configuration instead of inheriting RustFS local defaults.
 
+The standalone engine helper also prints a vendor compatibility audit. This
+records the public reference source, catalog path, warehouse shape, signing
+name, auth model, required validation categories, and explicit not-claimed
+boundaries for AWS S3 Tables, MinIO AIStor Tables, Cloudflare R2 Data Catalog,
+and Alibaba OSS Tables. Use it to plan compatibility work; do not treat it as
+live interoperability evidence.
+
 Generate an AWS S3 Tables-style reference profile:
 
 ```bash
@@ -177,11 +184,24 @@ python3 scripts/table-catalog/pyiceberg_smoke.py \
   --print-vendor-profiles
 ```
 
+Generate an Alibaba OSS Tables-style reference profile:
+
+```bash
+python3 scripts/table-catalog/pyiceberg_smoke.py \
+  --profile oss-tables \
+  --endpoint https://cn-hangzhou.oss-tables.aliyuncs.com \
+  --region cn-hangzhou \
+  --account-id 123456789012 \
+  --table-bucket analytics \
+  --print-vendor-profiles
+```
+
 The standalone engine helper prints the same compatibility matrix and can also
 generate Spark REST catalog input without importing PyIceberg:
 
 ```bash
 python3 scripts/table-catalog/engine_compatibility.py --print-engine-matrix
+python3 scripts/table-catalog/engine_compatibility.py --print-vendor-audit
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py \
   --profile aws-s3tables \
@@ -352,7 +372,7 @@ expected status, observed status, and metadata location.
 | `aws-s3tables` | `https://s3tables.{region}.amazonaws.com/iceberg` | `arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}` | `s3tables` | profile generator only; full AWS S3 Tables API parity is not claimed |
 | `minio-aistor` | `{endpoint}/_iceberg` | `{warehouse}` | `s3tables` | profile generator plus RustFS alias smoke; full AIStor extension parity is not claimed |
 | `cloudflare-r2-data-catalog` | catalog URI returned by R2 | `{warehouse_name}` | `s3` | profile generator only; live RustFS interoperability is not claimed |
-| `oss-tables` | provider REST endpoint | `{warehouse}` | `s3` | profile generator only; live RustFS interoperability is not claimed |
+| `oss-tables` | provider REST endpoint | `acs:osstables:{region}:{account_id}:bucket/{table_bucket}` | `osstables` | profile generator only; live RustFS interoperability is not claimed |
 
 ## Unsupported Inventory
 

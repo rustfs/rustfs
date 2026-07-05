@@ -34,7 +34,7 @@ catalog extension.
 | AWS S3 Tables endpoint shape | Profile generator | Generates the AWS catalog URI and S3 Tables warehouse ARN shape for migration docs. Full AWS S3 Tables API parity is not claimed. |
 | MinIO AIStor Tables profile | Profile generator plus RustFS alias smoke | RustFS exposes the alias shape, but does not claim all AIStor private extensions. |
 | Cloudflare R2 Data Catalog profile | Profile generator | Generates the catalog URI and warehouse-name shape for migration docs. Live RustFS interoperability is not claimed. |
-| Alibaba OSS Tables profile | Profile generator | Generates provider endpoint and warehouse shapes for migration docs. Live RustFS interoperability is not claimed. |
+| Alibaba OSS Tables profile | Profile generator | Generates provider endpoint, `acs:osstables` warehouse ARN, and `osstables` signing-name shapes for migration docs. Live RustFS interoperability is not claimed. |
 
 ## Client And Engine Matrix
 
@@ -54,6 +54,7 @@ catalog extension.
 |---|---|---|
 | Live conformance evidence template | Generated harness | `engine_compatibility.py --print-live-conformance` records required run metadata, per-client result rows, and claim promotion rules before a manual/live result can expand compatibility wording. |
 | Production operations guide | Generated harness | `engine_compatibility.py --print-operations-guide` records command, evidence, pass criteria, and fail-closed signals for live conformance, durable backing cutover, maintenance, recovery, permissions, credential vending, and unsupported-claim governance. |
+| Vendor compatibility gap audit | Generated harness | `engine_compatibility.py --print-vendor-audit` records provider source URLs, catalog path and warehouse shapes, signing/auth models, error/permission/maintenance validation categories, and not-claimed boundaries for AWS S3 Tables, MinIO AIStor Tables, Cloudflare R2 Data Catalog, and Alibaba OSS Tables. |
 | Client claim promotion | Documented, not automated | PyIceberg remains the automated claim. Spark can be promoted only with recorded manual/live evidence; Trino and DuckDB read probes do not promote write compatibility; Snowflake and vendor profiles remain reference-only without repeatable live evidence. |
 
 ## Catalog API Matrix
@@ -196,6 +197,7 @@ python3 scripts/table-catalog/pyiceberg_smoke.py --print-engine-compatibility
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-failure-coverage
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-vendor-profiles
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
+python3 scripts/table-catalog/engine_compatibility.py --print-vendor-audit
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py \
   --profile aws-s3tables \

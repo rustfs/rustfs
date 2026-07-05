@@ -164,6 +164,73 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertIn("engine_compatibility", document)
         self.assertTrue(document["engine_compatibility"])
 
+    def test_vendor_compatibility_audit_records_provider_gaps(self) -> None:
+        audit = engine_compatibility.vendor_compatibility_audit()
+        by_profile = {entry["profile"]: entry for entry in audit["providers"]}
+
+        self.assertEqual(audit["claim_boundary"], "reference profiles and gap audit")
+        self.assertEqual(audit["promotion_policy"], "live evidence required before compatibility claims expand")
+        self.assertIn("aws-s3tables", by_profile)
+        self.assertIn("minio-aistor", by_profile)
+        self.assertIn("cloudflare-r2-data-catalog", by_profile)
+        self.assertIn("oss-tables", by_profile)
+
+        aws = by_profile["aws-s3tables"]
+        self.assertEqual(aws["signing_name"], "s3tables")
+        self.assertEqual(aws["warehouse_shape"], "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}")
+        self.assertIn("iceberg-rest-routes", aws["audit_categories"])
+        self.assertIn("error-shapes", aws["audit_categories"])
+        self.assertIn("permission-actions", aws["audit_categories"])
+        self.assertIn("maintenance-semantics", aws["audit_categories"])
+        self.assertIn("credential-vending", aws["audit_categories"])
+        self.assertEqual(aws["rustfs_claim"], "profile-generator-only")
+
+        minio = by_profile["minio-aistor"]
+        self.assertEqual(minio["catalog_base_path"], "/_iceberg")
+        self.assertEqual(minio["signing_name"], "s3tables")
+        self.assertEqual(minio["rustfs_claim"], "alias-smoke-plus-profile-generator")
+        self.assertIn("private-extension-parity", minio["not_claimed"])
+
+        cloudflare = by_profile["cloudflare-r2-data-catalog"]
+        self.assertEqual(cloudflare["auth_model"], "api-token")
+        self.assertIn("managed-maintenance-parity", cloudflare["not_claimed"])
+        self.assertEqual(cloudflare["rustfs_claim"], "profile-generator-only")
+
+        oss = by_profile["oss-tables"]
+        self.assertEqual(oss["signing_name"], "osstables")
+        self.assertEqual(oss["warehouse_shape"], "acs:osstables:{region}:{account_id}:bucket/{table_bucket}")
+        self.assertIn("provider-error-code-parity", oss["not_claimed"])
+
+        self.assertIn("full AWS S3 Tables compatibility", audit["global_not_claimed"])
+        self.assertIn("full Cloudflare R2 Data Catalog interoperability", audit["global_not_claimed"])
+
+    def test_vendor_compatibility_audit_has_stable_validation_steps(self) -> None:
+        audit = engine_compatibility.vendor_compatibility_audit()
+        step_names = {step["name"] for step in audit["required_validation_steps"]}
+
+        self.assertIn("route-and-field-shape", step_names)
+        self.assertIn("error-response-shape", step_names)
+        self.assertIn("permission-action-mapping", step_names)
+        self.assertIn("maintenance-behavior", step_names)
+        self.assertIn("credential-model", step_names)
+        self.assertIn("client-live-run", step_names)
+
+        route_step = next(step for step in audit["required_validation_steps"] if step["name"] == "route-and-field-shape")
+        self.assertIn("request path", route_step["evidence"])
+        self.assertIn("response fields", route_step["evidence"])
+        self.assertEqual(route_step["status"], "manual-audit-required")
+
+    def test_cli_prints_vendor_compatibility_audit(self) -> None:
+        payload = engine_compatibility.cli_json(["--print-vendor-audit"])
+        document = json.loads(payload)
+
+        self.assertIn("vendor_compatibility_audit", document)
+        profiles = {entry["profile"] for entry in document["vendor_compatibility_audit"]["providers"]}
+        self.assertIn("aws-s3tables", profiles)
+        self.assertIn("minio-aistor", profiles)
+        self.assertIn("cloudflare-r2-data-catalog", profiles)
+        self.assertIn("oss-tables", profiles)
+
     def test_cli_prints_vendor_spark_config(self) -> None:
         payload = engine_compatibility.cli_json(
             [
@@ -191,6 +258,32 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertNotIn("spark.sql.catalog.rustfs.s3.path-style-access", config)
         self.assertNotIn("spark.sql.catalog.rustfs.s3.access-key-id", config)
         self.assertNotIn("spark.sql.catalog.rustfs.s3.secret-access-key", config)
+
+    def test_cli_prints_oss_tables_spark_config(self) -> None:
+        payload = engine_compatibility.cli_json(
+            [
+                "--print-spark-config",
+                "--profile",
+                "oss-tables",
+                "--endpoint",
+                "https://cn-hangzhou.oss-tables.aliyuncs.com",
+                "--region",
+                "cn-hangzhou",
+                "--account-id",
+                "123456789012",
+                "--table-bucket",
+                "analytics",
+            ]
+        )
+        document = json.loads(payload)
+        config = document["spark_config"]
+
+        self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "https://cn-hangzhou.oss-tables.aliyuncs.com/iceberg")
+        self.assertEqual(
+            config["spark.sql.catalog.rustfs.warehouse"],
+            "acs:osstables:cn-hangzhou:123456789012:bucket/analytics",
+        )
+        self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "osstables")
 
     def test_cli_spark_config_keeps_explicit_rest_overrides(self) -> None:
         payload = engine_compatibility.cli_json(
