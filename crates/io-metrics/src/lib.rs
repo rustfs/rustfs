@@ -95,6 +95,7 @@ pub mod config;
 pub mod deadlock_metrics;
 pub mod internode_metrics;
 pub mod io_metrics;
+pub mod list_objects_metrics;
 pub mod lock_metrics;
 pub mod performance;
 pub mod process_lock_metrics;
@@ -128,6 +129,10 @@ pub use capacity_metrics::{
 pub use io_metrics::{
     IoSchedulerStats, record_bandwidth_observation, record_buffer_size_adjustment, record_io_priority_decision,
     record_io_scheduler_decision, record_load_level_change, record_queue_operation, record_starvation_event,
+};
+pub use list_objects_metrics::{
+    LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
+    ListObjectsGatherObservation, init_list_objects_metrics, record_list_objects_gather, record_list_objects_merge,
 };
 
 // Backpressure metrics exports

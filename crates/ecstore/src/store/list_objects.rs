@@ -39,6 +39,10 @@ use rustfs_filemeta::{
     FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
     MetacacheReader, MetadataResolutionParams, is_io_eof, merge_file_meta_versions,
 };
+use rustfs_io_metrics::{
+    LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
+    ListObjectsGatherObservation,
+};
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -2044,6 +2048,17 @@ async fn gather_results(
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
             rx.cancel();
             let filtered = scanned_entries.saturating_sub(candidate_entries);
+            rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
+                source: LIST_OBJECTS_SOURCE_WALKER,
+                outcome: LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED,
+                limit: opts.limit,
+                scanned_entries,
+                returned_entries: candidate_entries,
+                duration_ms: gather_started.elapsed().as_secs_f64() * 1000.0,
+                has_prefix: !opts.prefix.is_empty(),
+                has_delimiter: opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
+                has_marker: opts.marker.is_some(),
+            });
             debug!(
                 bucket = %opts.bucket,
                 prefix = %opts.prefix,
@@ -2075,6 +2090,17 @@ async fn gather_results(
 
     // finish not full, return eof
     let filtered = scanned_entries.saturating_sub(candidate_entries);
+    rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
+        source: LIST_OBJECTS_SOURCE_WALKER,
+        outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
+        limit: opts.limit,
+        scanned_entries,
+        returned_entries: candidate_entries,
+        duration_ms: gather_started.elapsed().as_secs_f64() * 1000.0,
+        has_prefix: !opts.prefix.is_empty(),
+        has_delimiter: opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
+        has_marker: opts.marker.is_some(),
+    });
     debug!(
         bucket = %opts.bucket,
         prefix = %opts.prefix,
@@ -2143,6 +2169,8 @@ async fn merge_entry_channels(
     if in_channels.is_empty() {
         return Ok(());
     }
+
+    rustfs_io_metrics::record_list_objects_merge(LIST_OBJECTS_SOURCE_WALKER, in_channels.len(), read_quorum);
 
     let mut in_channels = in_channels;
     if in_channels.len() == 1 {
