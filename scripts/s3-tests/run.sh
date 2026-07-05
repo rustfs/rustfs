@@ -39,6 +39,13 @@ S3_REGION="${S3_REGION:-us-east-1}"
 S3_HOST="${S3_HOST:-127.0.0.1}"
 S3_PORT="${S3_PORT:-9000}"
 
+# Keep the compatibility harness focused on foreground S3 API behavior.
+# The background scanner can race short-lived test buckets and add avoidable
+# metacache/listing pressure on small CI runners.
+export RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED:-false}"
+export RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS:-3600}"
+export RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE:-3600}"
+
 # Test parameters
 TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
@@ -87,6 +94,55 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $*"
+}
+
+summarize_junit_failures() {
+    local junit_path="$1"
+
+    if [ ! -f "${junit_path}" ]; then
+        log_warn "JUnit report not found: ${junit_path}"
+        return 0
+    fi
+
+    python3 - "${junit_path}" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+junit_path = sys.argv[1]
+try:
+    root = ET.parse(junit_path).getroot()
+except Exception as exc:
+    print(f"[WARN] Failed to parse JUnit report {junit_path}: {exc}")
+    raise SystemExit(0)
+
+failures = []
+for case in root.iter("testcase"):
+    failure = case.find("failure")
+    error = case.find("error")
+    node = failure if failure is not None else error
+    if node is None:
+        continue
+
+    classname = case.attrib.get("classname", "")
+    name = case.attrib.get("name", "")
+    duration = case.attrib.get("time", "0")
+    message = node.attrib.get("message") or (node.text or "").strip().splitlines()[0:1]
+    if isinstance(message, list):
+        message = message[0] if message else ""
+    failures.append((classname, name, duration, message))
+
+if not failures:
+    print("[INFO] No failed testcases found in JUnit report")
+    raise SystemExit(0)
+
+print("[ERROR] s3-tests failed testcase summary:")
+for classname, name, duration, message in failures[:20]:
+    nodeid = f"{classname}::{name}" if classname else name
+    print(f"[ERROR] - {nodeid} ({duration}s): {message}")
+
+if len(failures) > 20:
+    print(f"[ERROR] - ... {len(failures) - 20} additional failed testcases omitted")
+PY
 }
 
 # =============================================================================
@@ -259,6 +315,7 @@ Environment Variables:
   S3_ALT_ACCESS_KEY      - Alt user access key (default: rustfsalt)
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   RUSTFS_SSE_S3_MASTER_KEY - Optional base64 32-byte key for local managed SSE fallback
+  RUSTFS_SCANNER_ENABLED - Enable background scanner for harness service (default: false)
   MAXFAIL                - Stop after N failures, 0 = never stop (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
   TEST_SCOPE             - "implemented" (whitelist, default) or "all" (entire upstream suite)
@@ -479,6 +536,9 @@ elif [ "${DEPLOY_MODE}" = "docker" ]; then
         -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
         -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
         -e RUSTFS_SSE_S3_MASTER_KEY="${RUSTFS_SSE_S3_MASTER_KEY}" \
+        -e RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED}" \
+        -e RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS}" \
+        -e RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE}" \
         -e RUSTFS_VOLUMES="/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3" \
         -v "/tmp/${CONTAINER_NAME}:/data" \
         rustfs-ci || {
@@ -887,6 +947,18 @@ git -C "${PROJECT_ROOT}/s3-tests" checkout -qf --detach "${S3TESTS_REV}" || {
     exit 1
 }
 
+S3TESTS_PATCH_DIR="${SCRIPT_DIR}/patches"
+if [ -d "${S3TESTS_PATCH_DIR}" ]; then
+    for patch_file in "${S3TESTS_PATCH_DIR}"/*.patch; do
+        [ -e "${patch_file}" ] || continue
+        log_info "Applying s3-tests patch: ${patch_file##*/}"
+        git -C "${PROJECT_ROOT}/s3-tests" apply "${patch_file}" || {
+            log_error "Failed to apply s3-tests patch: ${patch_file}"
+            exit 1
+        }
+    done
+fi
+
 cd "${PROJECT_ROOT}/s3-tests"
 
 # Install tox if not available
@@ -929,6 +1001,7 @@ else
 fi
 
 # Run tests from s3tests/functional
+set +e
 S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     tox -- \
     -vv -ra --showlocals --tb=long \
@@ -940,6 +1013,7 @@ S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     2>&1 | tee "${ARTIFACTS_DIR}/pytest.log"
 
 TEST_EXIT_CODE=${PIPESTATUS[0]}
+set -e
 
 # Step 10: Collect RustFS logs
 log_info "Collecting RustFS logs..."
@@ -964,6 +1038,10 @@ if [ -f "${REPORT_SCRIPT}" ] && [ -f "${ARTIFACTS_DIR}/junit.xml" ]; then
         --lists-dir "${SCRIPT_DIR}" \
         --output "${ARTIFACTS_DIR}/compat-report.md" \
         || log_warn "Compatibility report generation failed"
+fi
+
+if [ ${TEST_EXIT_CODE} -ne 0 ]; then
+    summarize_junit_failures "${ARTIFACTS_DIR}/junit.xml"
 fi
 
 # Summary

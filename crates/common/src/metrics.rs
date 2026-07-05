@@ -1913,7 +1913,7 @@ impl Metrics {
         let duration_millis = duration_millis_saturated(duration);
         let _ = self
             .scanner_yield_duration_millis
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(duration_millis))
             });
     }
@@ -1927,7 +1927,7 @@ impl Metrics {
         let duration_millis = duration_millis_saturated(duration);
         let _ = self
             .scanner_throttle_sleep_duration_millis
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(duration_millis))
             });
     }
@@ -2239,10 +2239,10 @@ impl Metrics {
         active: Option<usize>,
     ) {
         let key = format!("{pool}/{set}");
-        let mut states = match self.scanner_disk_bucket_scan_states.lock() {
-            Ok(states) => states,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut states = self
+            .scanner_disk_bucket_scan_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = states.entry(key).or_default();
         if let Some(concurrency_limit) = concurrency_limit {
             state.concurrency_limit = concurrency_limit as u64;

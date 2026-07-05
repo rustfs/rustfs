@@ -43,6 +43,10 @@ use tokio::time::sleep;
 use tracing::{debug, error, warn};
 use url::Url;
 
+const LOG_COMPONENT_IAM: &str = "iam";
+const LOG_SUBSYSTEM_OIDC: &str = "oidc";
+const EVENT_OIDC_DIAGNOSTICS: &str = "oidc_diagnostics";
+const EVENT_OIDC_HTTP: &str = "oidc_http";
 const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
 const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
@@ -168,6 +172,79 @@ pub fn oidc_plugin_authn_metrics_snapshot() -> OidcPluginAuthnMetricsSnapshot {
     OIDC_PLUGIN_AUTHN_METRICS.snapshot()
 }
 
+fn format_http_headers(headers: &http::HeaderMap) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = value.to_str().unwrap_or("<non-utf8>");
+            format!("{}={}", name.as_str(), value)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn format_http_body(body: &[u8]) -> String {
+    String::from_utf8_lossy(body).into_owned()
+}
+
+#[derive(Debug, Default)]
+struct TokenResponseBodyShape {
+    json_object: bool,
+    json_keys: String,
+    has_access_token: bool,
+    has_id_token: bool,
+    has_token_type: bool,
+    has_expires_in: bool,
+    has_error: bool,
+    has_error_description: bool,
+    looks_like_html: bool,
+}
+
+fn inspect_token_response_body(body: &[u8]) -> TokenResponseBodyShape {
+    let mut shape = TokenResponseBodyShape {
+        looks_like_html: body
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| byte == b'<'),
+        ..Default::default()
+    };
+
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return shape;
+    };
+    let Some(object) = value.as_object() else {
+        return shape;
+    };
+
+    shape.json_object = true;
+    shape.has_access_token = object.contains_key("access_token");
+    shape.has_id_token = object.contains_key("id_token");
+    shape.has_token_type = object.contains_key("token_type");
+    shape.has_expires_in = object.contains_key("expires_in");
+    shape.has_error = object.contains_key("error");
+    shape.has_error_description = object.contains_key("error_description");
+
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.truncate(16);
+    shape.json_keys = keys.join(",");
+
+    shape
+}
+
+fn oidc_http_error_diagnostics(error: &OidcHttpError) -> (&'static str, String) {
+    match error {
+        OidcHttpError::Reqwest(err) if err.is_timeout() => ("timeout", String::new()),
+        OidcHttpError::Reqwest(err) if err.is_connect() => ("connect", String::new()),
+        OidcHttpError::Reqwest(err) if err.status().is_some() => {
+            ("http_status", err.status().map(|status| status.as_u16().to_string()).unwrap_or_default())
+        }
+        OidcHttpError::Reqwest(_) => ("request", String::new()),
+        OidcHttpError::Http(_) => ("http_build", String::new()),
+    }
+}
+
 // ---- HTTP Client Adapter ----
 
 /// Error type for the OIDC HTTP client adapter.
@@ -245,10 +322,28 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
         Box::pin(async move {
             let started_at = Instant::now();
             let (parts, body) = request.into_parts();
+            let method = parts.method.clone();
             let uri = parts.uri.to_string();
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let request_headers = format_http_headers(&parts.headers);
+                let request_body = format_http_body(&body);
+                debug!(
+                    event = EVENT_OIDC_HTTP,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "request",
+                    method = %method,
+                    uri = %uri,
+                    request_headers = %request_headers,
+                    request_body_len = body.len(),
+                    request_body = %request_body,
+                    "oidc outbound http"
+                );
+            }
+
             let client = self.client_for_uri(&uri);
             let response = client
-                .request(parts.method, uri)
+                .request(parts.method, uri.clone())
                 .headers(parts.headers)
                 .body(body)
                 .send()
@@ -258,11 +353,57 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             let succeeded = response.as_ref().is_ok_and(|resp| resp.status().is_success());
             OIDC_PLUGIN_AUTHN_METRICS.record(elapsed_ms, succeeded);
 
-            let response = response.map_err(OidcHttpError::Reqwest)?;
+            let response = response.map_err(|err| {
+                error!(
+                    event = EVENT_OIDC_HTTP,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "request_failed",
+                    method = %method,
+                    uri = %uri,
+                    elapsed_ms,
+                    error = %err,
+                    "oidc outbound http"
+                );
+                OidcHttpError::Reqwest(err)
+            })?;
 
             let status = response.status();
             let headers = response.headers().clone();
-            let body_bytes = response.bytes().await.map_err(OidcHttpError::Reqwest)?;
+            let body_bytes = response.bytes().await.map_err(|err| {
+                error!(
+                    event = EVENT_OIDC_HTTP,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "response_body_failed",
+                    method = %method,
+                    uri = %uri,
+                    status = status.as_u16(),
+                    elapsed_ms,
+                    error = %err,
+                    "oidc outbound http"
+                );
+                OidcHttpError::Reqwest(err)
+            })?;
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let response_headers = format_http_headers(&headers);
+                let response_body = format_http_body(&body_bytes);
+                debug!(
+                    event = EVENT_OIDC_HTTP,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "response",
+                    method = %method,
+                    uri = %uri,
+                    status = status.as_u16(),
+                    status_success = status.is_success(),
+                    elapsed_ms,
+                    response_headers = %response_headers,
+                    response_body_len = body_bytes.len(),
+                    response_body = %response_body,
+                    "oidc outbound http"
+                );
+            }
 
             let mut http_response = http::Response::builder()
                 .status(status)
@@ -429,7 +570,20 @@ impl OidcSys {
                     configs.insert(config.id.clone(), config);
                 }
                 Err(e) => {
-                    error!(provider = %config.id, error = %e, "OIDC provider discovery failed");
+                    error!(
+                        event = EVENT_OIDC_DIAGNOSTICS,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "provider_discovery_failed",
+                        provider_id = %config.id,
+                        config_url = %config.config_url,
+                        client_id = %config.client_id,
+                        scopes = ?config.scopes,
+                        redirect_uri = %config.redirect_uri.as_deref().unwrap_or(""),
+                        redirect_uri_dynamic = config.redirect_uri_dynamic,
+                        error = %e,
+                        "oidc provider discovery failed"
+                    );
                 }
             }
         }
@@ -551,6 +705,12 @@ impl OidcSys {
             .get(&session.provider_id)
             .ok_or_else(|| format!("unknown provider: {}", session.provider_id))?;
         let provider_state = self.get_provider_state(&session.provider_id)?;
+        let issuer = provider_state.metadata.issuer().to_string();
+        let token_endpoint = provider_state
+            .metadata
+            .token_endpoint()
+            .map(ToString::to_string)
+            .unwrap_or_default();
 
         // Construct CoreClient on-the-fly with JWKS from discovery
         let client = CoreClient::from_provider_metadata(
@@ -565,41 +725,230 @@ impl OidcSys {
         // Exchange code for tokens
         let token_response = client
             .exchange_code(AuthorizationCode::new(code.to_string()))
-            .map_err(|e| format!("token endpoint not configured: {e}"))?
+            .map_err(|e| {
+                error!(
+                    event = EVENT_OIDC_DIAGNOSTICS,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "token_endpoint_missing",
+                    provider_id = %session.provider_id,
+                    config_url = %config.config_url,
+                    issuer = %issuer,
+                    client_id = %config.client_id,
+                    redirect_uri = %redirect_uri,
+                    scopes = ?config.scopes,
+                    error = %e,
+                    "oidc token exchange failed"
+                );
+                format!(
+                    "token endpoint not configured: {e}: provider_id={}, config_url={}, issuer={}, redirect_uri={}, client_id={}",
+                    session.provider_id, config.config_url, issuer, redirect_uri, config.client_id
+                )
+            })?
             .set_pkce_verifier(PkceCodeVerifier::new(session.pkce_verifier.clone()))
             .set_redirect_uri(Cow::Owned(redirect))
             .request_async(&self.http_client)
             .await
             .map_err(|e| match &e {
-                RequestTokenError::Parse(parse_err, body) => format!(
-                    "token exchange failed: {e}: parse_error_path={}, response_body_len={}",
-                    parse_err.path(),
-                    body.len()
-                ),
-                _ => format!("token exchange failed: {e}"),
+                RequestTokenError::ServerResponse(response) => {
+                    error!(
+                        event = EVENT_OIDC_DIAGNOSTICS,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "token_server_response",
+                        provider_id = %session.provider_id,
+                        config_url = %config.config_url,
+                        issuer = %issuer,
+                        token_endpoint = %token_endpoint,
+                        client_id = %config.client_id,
+                        client_secret_configured = config.client_secret.as_deref().is_some_and(|secret| !secret.is_empty()),
+                        redirect_uri = %redirect_uri,
+                        scopes = ?config.scopes,
+                        oauth_error = %response.error(),
+                        oauth_error_description = %response.error_description().map(String::as_str).unwrap_or(""),
+                        oauth_error_uri = %response.error_uri().map(String::as_str).unwrap_or(""),
+                        error = %e,
+                        "oidc token exchange failed"
+                    );
+                    format!(
+                        "token exchange failed: {e}: stage=token_server_response, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, oauth_error={}, oauth_error_description={}",
+                        session.provider_id,
+                        config.config_url,
+                        issuer,
+                        token_endpoint,
+                        redirect_uri,
+                        config.client_id,
+                        response.error(),
+                        response.error_description().map(String::as_str).unwrap_or("")
+                    )
+                }
+                RequestTokenError::Request(err) => {
+                    let (request_error_kind, request_error_status) = oidc_http_error_diagnostics(err);
+                    error!(
+                        event = EVENT_OIDC_DIAGNOSTICS,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "token_request_failed",
+                        provider_id = %session.provider_id,
+                        config_url = %config.config_url,
+                        issuer = %issuer,
+                        token_endpoint = %token_endpoint,
+                        client_id = %config.client_id,
+                        redirect_uri = %redirect_uri,
+                        request_error_kind = %request_error_kind,
+                        request_error_status = %request_error_status,
+                        error = %e,
+                        "oidc token exchange failed"
+                    );
+                    format!(
+                        "token exchange failed: {e}: stage=token_request_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, request_error_kind={}, request_error_status={}",
+                        session.provider_id,
+                        config.config_url,
+                        issuer,
+                        token_endpoint,
+                        redirect_uri,
+                        config.client_id,
+                        request_error_kind,
+                        request_error_status
+                    )
+                }
+                RequestTokenError::Parse(parse_err, body) => {
+                    let shape = inspect_token_response_body(body);
+                    let response_body = format_http_body(body);
+                    error!(
+                        event = EVENT_OIDC_DIAGNOSTICS,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "token_response_parse_failed",
+                        provider_id = %session.provider_id,
+                        config_url = %config.config_url,
+                        issuer = %issuer,
+                        token_endpoint = %token_endpoint,
+                        client_id = %config.client_id,
+                        redirect_uri = %redirect_uri,
+                        parse_error_path = %parse_err.path(),
+                        response_body_len = body.len(),
+                        response_json_object = shape.json_object,
+                        response_json_keys = %shape.json_keys,
+                        response_has_access_token = shape.has_access_token,
+                        response_has_id_token = shape.has_id_token,
+                        response_has_token_type = shape.has_token_type,
+                        response_has_expires_in = shape.has_expires_in,
+                        response_has_error = shape.has_error,
+                        response_has_error_description = shape.has_error_description,
+                        response_looks_like_html = shape.looks_like_html,
+                        response_body = %response_body,
+                        error = %e,
+                        "oidc token exchange failed"
+                    );
+                    format!(
+                        "token exchange failed: {e}: stage=token_response_parse_failed, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, parse_error_path={}, response_body_len={}, response_json_keys={}, response_has_id_token={}, response_has_error={}, response_looks_like_html={}, response_body={}",
+                        session.provider_id,
+                        config.config_url,
+                        issuer,
+                        token_endpoint,
+                        redirect_uri,
+                        config.client_id,
+                        parse_err.path(),
+                        body.len(),
+                        shape.json_keys,
+                        shape.has_id_token,
+                        shape.has_error,
+                        shape.looks_like_html,
+                        response_body
+                    )
+                }
+                RequestTokenError::Other(message) => {
+                    error!(
+                        event = EVENT_OIDC_DIAGNOSTICS,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "token_exchange_other_error",
+                        provider_id = %session.provider_id,
+                        config_url = %config.config_url,
+                        issuer = %issuer,
+                        token_endpoint = %token_endpoint,
+                        client_id = %config.client_id,
+                        redirect_uri = %redirect_uri,
+                        error = %message,
+                        "oidc token exchange failed"
+                    );
+                    format!(
+                        "token exchange failed: {e}: stage=token_exchange_other_error, provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}",
+                        session.provider_id, config.config_url, issuer, token_endpoint, redirect_uri, config.client_id
+                    )
+                }
             })?;
 
         // Verify the ID token (signature, issuer, audience, expiry, nonce)
         let id_token = token_response
             .extra_fields()
             .id_token()
-            .ok_or_else(|| "no id_token in token response".to_string())?;
+            .ok_or_else(|| {
+                error!(
+                    event = EVENT_OIDC_DIAGNOSTICS,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "token_response_missing_id_token",
+                    provider_id = %session.provider_id,
+                    config_url = %config.config_url,
+                    issuer = %issuer,
+                    token_endpoint = %token_endpoint,
+                    client_id = %config.client_id,
+                    redirect_uri = %redirect_uri,
+                    scopes = ?config.scopes,
+                    "oidc token exchange failed"
+                );
+                format!(
+                    "no id_token in token response: provider_id={}, config_url={}, issuer={}, token_endpoint={}, redirect_uri={}, client_id={}, scopes={}",
+                    session.provider_id,
+                    config.config_url,
+                    issuer,
+                    token_endpoint,
+                    redirect_uri,
+                    config.client_id,
+                    config.scopes.join(",")
+                )
+            })?;
 
         let verifier = client
             .id_token_verifier()
             .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         let verified = id_token.claims(&verifier, &Nonce::new(session.nonce.clone()));
         if let Err(e) = verified {
+            let verification_error = e.to_string();
+            warn!(
+                event = EVENT_OIDC_DIAGNOSTICS,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "id_token_verification_retry",
+                provider_id = %session.provider_id,
+                config_url = %config.config_url,
+                issuer = %issuer,
+                token_endpoint = %token_endpoint,
+                client_id = %config.client_id,
+                other_audiences = ?config.other_audiences,
+                error = %verification_error,
+                "oidc id token verification failed"
+            );
             let refreshed_state = self
                 .refresh_provider_state(&session.provider_id, config)
                 .await
                 .map_err(|refresh_err| {
-                    format!("ID token verification failed: {e}; failed to refresh provider metadata: {refresh_err}")
+                    format!(
+                        "ID token verification failed: {verification_error}; failed to refresh provider metadata: {refresh_err}"
+                    )
                 })?;
 
             warn!(
-                "OIDC provider '{}' JWKS metadata refreshed and verification retried after failure",
-                session.provider_id
+                event = EVENT_OIDC_DIAGNOSTICS,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "jwks_metadata_refreshed",
+                provider_id = %session.provider_id,
+                config_url = %config.config_url,
+                issuer = %issuer,
+                "oidc provider metadata refreshed"
             );
 
             let client = CoreClient::from_provider_metadata(
@@ -614,7 +963,32 @@ impl OidcSys {
                 .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
             id_token
                 .claims(&verifier, &Nonce::new(session.nonce.clone()))
-                .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
+                .map_err(|retry_err| {
+                    error!(
+                        event = EVENT_OIDC_DIAGNOSTICS,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "id_token_verification_failed",
+                        provider_id = %session.provider_id,
+                        config_url = %config.config_url,
+                        issuer = %issuer,
+                        token_endpoint = %token_endpoint,
+                        client_id = %config.client_id,
+                        other_audiences = ?config.other_audiences,
+                        original_error = %verification_error,
+                        retry_error = %retry_err,
+                        "oidc id token verification failed"
+                    );
+                    format!(
+                        "ID token verification failed after JWKS refresh: {retry_err}; original_error={verification_error}; provider_id={}, config_url={}, issuer={}, token_endpoint={}, client_id={}, other_audiences={}",
+                        session.provider_id,
+                        config.config_url,
+                        issuer,
+                        token_endpoint,
+                        config.client_id,
+                        config.other_audiences.join(",")
+                    )
+                })?;
         }
 
         // Extract raw claims from the verified JWT for custom claim support
@@ -738,6 +1112,47 @@ impl OidcSys {
         policies.dedup();
         groups.sort();
         groups.dedup();
+
+        let mut raw_claim_keys: Vec<&str> = claims.raw.keys().map(String::as_str).collect();
+        raw_claim_keys.sort_unstable();
+        let (claim_name_lookup, claim_name_raw_value) = claim_lookup_for_log(&claims.raw, &config.claim_name);
+        let (groups_claim_lookup, groups_claim_raw_value) = claim_lookup_for_log(&claims.raw, &config.groups_claim);
+        let (roles_claim_lookup, roles_claim_raw_value) = claim_lookup_for_log(&claims.raw, &config.roles_claim);
+        let claim_name_values = extract_groups_claim(&claims.raw, &config.claim_name);
+        let groups_claim_values = extract_groups_claim(&claims.raw, &config.groups_claim);
+        let roles_claim_values = extract_groups_claim(&claims.raw, &config.roles_claim);
+
+        debug!(
+            event = EVENT_OIDC_DIAGNOSTICS,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            result = "claims_policy_mapped",
+            provider_id = %provider_id,
+            claim_name = %config.claim_name,
+            claim_prefix = %config.claim_prefix,
+            groups_claim = %config.groups_claim,
+            roles_claim = %config.roles_claim,
+            role_policy = %config.role_policy,
+            policy_count = policies.len(),
+            group_count = groups.len(),
+            policies = ?policies,
+            groups = ?groups,
+            raw_claim_keys = ?raw_claim_keys,
+            raw_claims = ?claims.raw,
+            claim_name_lookup = %claim_name_lookup,
+            claim_name_type = claim_value_type_for_log(claim_name_raw_value),
+            claim_name_value = ?claim_name_raw_value,
+            claim_name_values = ?claim_name_values,
+            groups_claim_lookup = %groups_claim_lookup,
+            groups_claim_type = claim_value_type_for_log(groups_claim_raw_value),
+            groups_claim_value = ?groups_claim_raw_value,
+            groups_claim_values = ?groups_claim_values,
+            roles_claim_lookup = %roles_claim_lookup,
+            roles_claim_type = claim_value_type_for_log(roles_claim_raw_value),
+            roles_claim_value = ?roles_claim_raw_value,
+            roles_claim_values = ?roles_claim_values,
+            "oidc claims mapped to policies"
+        );
 
         (policies, groups)
     }
@@ -1181,12 +1596,17 @@ impl OidcSys {
                         let should_retry = is_transient_transport && attempt + 1 < OIDC_DISCOVERY_TRANSPORT_RETRIES;
                         if should_retry {
                             warn!(
-                                "OIDC provider '{}' discovery transport attempt {}/{} failed for issuer '{}': {}",
-                                config.id,
-                                attempt + 1,
-                                OIDC_DISCOVERY_TRANSPORT_RETRIES,
-                                candidate_issuer,
-                                error
+                                event = EVENT_OIDC_DIAGNOSTICS,
+                                component = LOG_COMPONENT_IAM,
+                                subsystem = LOG_SUBSYSTEM_OIDC,
+                                result = "provider_discovery_transport_retry",
+                                provider_id = %config.id,
+                                config_url = %config.config_url,
+                                issuer_candidate = %candidate_issuer,
+                                attempt = attempt + 1,
+                                max_attempts = OIDC_DISCOVERY_TRANSPORT_RETRIES,
+                                error = %error,
+                                "oidc provider discovery failed"
                             );
                             sleep(OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY).await;
                             continue;
@@ -1194,8 +1614,17 @@ impl OidcSys {
 
                         last_errors.push(format!("issuer '{candidate_issuer}': {error}"));
                         warn!(
-                            "OIDC provider '{}' discovery attempt failed for issuer '{}': {}",
-                            config.id, candidate_issuer, error
+                            event = EVENT_OIDC_DIAGNOSTICS,
+                            component = LOG_COMPONENT_IAM,
+                            subsystem = LOG_SUBSYSTEM_OIDC,
+                            result = "provider_discovery_candidate_failed",
+                            provider_id = %config.id,
+                            config_url = %config.config_url,
+                            issuer_candidate = %candidate_issuer,
+                            attempt = attempt + 1,
+                            max_attempts = OIDC_DISCOVERY_TRANSPORT_RETRIES,
+                            error = %error,
+                            "oidc provider discovery failed"
                         );
                         break;
                     }
@@ -1380,6 +1809,29 @@ fn extract_canonical_group_values(
     groups.sort();
     groups.dedup();
     groups
+}
+
+fn claim_lookup_for_log<'a>(
+    claims: &'a HashMap<String, serde_json::Value>,
+    key: &str,
+) -> (&'static str, Option<&'a serde_json::Value>) {
+    match get_claim_case_insensitive(claims, key) {
+        ClaimLookup::Found(value) => ("found", Some(value)),
+        ClaimLookup::Missing => ("missing", None),
+        ClaimLookup::Ambiguous => ("ambiguous", None),
+    }
+}
+
+fn claim_value_type_for_log(value: Option<&serde_json::Value>) -> &'static str {
+    match value {
+        Some(serde_json::Value::Null) => "null",
+        Some(serde_json::Value::Bool(_)) => "bool",
+        Some(serde_json::Value::Number(_)) => "number",
+        Some(serde_json::Value::String(_)) => "string",
+        Some(serde_json::Value::Array(_)) => "array",
+        Some(serde_json::Value::Object(_)) => "object",
+        None => "none",
+    }
 }
 
 #[cfg(test)]
@@ -1823,6 +2275,25 @@ mod tests {
     fn test_decode_jwt_payload_invalid() {
         assert!(decode_jwt_payload("not-a-jwt").is_empty());
         assert!(decode_jwt_payload("").is_empty());
+    }
+
+    #[test]
+    fn test_core_token_response_accepts_rfc3339_updated_at() {
+        // Signature verification happens later; this test covers token response deserialization.
+        let id_token = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20vb2lkYyIsInN1YiI6InVzZXItMSIsImF1ZCI6InJ1c3RmcyIsImV4cCI6MTc4NDQzMjc2OSwiaWF0IjoxNzgzMjIzMTY5LCJ1cGRhdGVkX2F0IjoiMjAyNi0wNy0wM1QwNDo1MDo1MC44MTFaIn0.c2ln";
+        let body = serde_json::json!({
+            "scope": "openid roles profile email",
+            "token_type": "Bearer",
+            "access_token": "access-token",
+            "expires_in": 1209600,
+            "id_token": id_token,
+        })
+        .to_string();
+
+        let response: openidconnect::core::CoreTokenResponse =
+            serde_json::from_str(&body).expect("RFC3339 updated_at should parse in token response");
+
+        assert!(response.extra_fields().id_token().is_some());
     }
 
     #[test]

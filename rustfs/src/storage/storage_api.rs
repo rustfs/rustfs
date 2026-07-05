@@ -35,6 +35,7 @@ pub(crate) mod contract {
     }
 
     pub(crate) mod multipart {
+        pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
         pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
         #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{MultipartInfo, PartInfo};
@@ -127,6 +128,10 @@ pub(crate) mod ecfs_extend_consumer {
 
         pub(crate) mod object {
             pub(crate) use super::super::super::contract::object::ObjectToDelete;
+        }
+
+        pub(crate) mod multipart {
+            pub(crate) use super::super::super::contract::multipart::MAX_MULTIPART_PART_NUMBER;
         }
     }
 
@@ -254,7 +259,9 @@ pub(crate) mod s3_api_consumer {
 
         pub(crate) mod contract {
             pub(crate) mod multipart {
-                pub(crate) use super::super::super::super::contract::multipart::{ListMultipartsInfo, ListPartsInfo};
+                pub(crate) use super::super::super::super::contract::multipart::{
+                    ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
+                };
 
                 #[cfg(test)]
                 pub(crate) use super::super::super::super::contract::multipart::{MultipartInfo, PartInfo};

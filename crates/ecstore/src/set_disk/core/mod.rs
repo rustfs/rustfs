@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Home for the `SetDisks` operation families extracted during the
-//! God-Object split (tracking #815). Each family owns its module here and
-//! borrows shared state through [`super::ctx::SetDisksCtx`]; the storage-api
-//! contract impls stay `for SetDisks`, so contract bounds are unchanged.
+//! Shared low-level IO/erasure primitives for the `SetDisks` core, extracted
+//! during the God-Object split (P5, tracking backlog#815, issue backlog#820).
+//! Operation families reach these through the `SetDisks` core rather than
+//! duplicating read/write/erasure logic.
 
-pub(crate) mod bucket;
-pub(crate) mod heal;
-pub(crate) mod list;
-pub(crate) mod multipart;
+pub(crate) mod io_primitives;

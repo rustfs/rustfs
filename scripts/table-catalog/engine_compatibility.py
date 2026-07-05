@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import shlex
+import urllib.parse
 from collections import OrderedDict
 from io import StringIO
 from typing import Any
@@ -488,6 +489,463 @@ def databend_command(*, dsn: str) -> str:
     return shell_join(["databend-sql", "--dsn", dsn, "-f", "/tmp/rustfs-s3tables-databend-stage.sql"])
 
 
+def rest_api_prefix(rest_path: str) -> str:
+    prefix = normalized_rest_path(rest_path)
+    if not prefix.endswith("/v1"):
+        prefix = f"{prefix}/v1"
+    return prefix
+
+
+def rest_path_segment(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
+
+
+def warehouse_catalog_path(*, warehouse: str, rest_path: str, suffix: str = "") -> str:
+    return f"{rest_api_prefix(rest_path)}/{rest_path_segment(warehouse)}{suffix}"
+
+
+def table_catalog_path(*, warehouse: str, namespace: str, table: str, rest_path: str, suffix: str = "") -> str:
+    return (
+        f"{rest_api_prefix(rest_path)}/{rest_path_segment(warehouse)}"
+        f"/namespaces/{rest_path_segment(namespace)}/tables/{rest_path_segment(table)}{suffix}"
+    )
+
+
+def live_conformance_evidence(
+    *,
+    warehouse: str,
+    namespace: str,
+    table: str,
+    rest_path: str,
+    metadata_location: str,
+    cleanup: bool,
+) -> OrderedDict[str, Any]:
+    return OrderedDict(
+        [
+            ("result", "operator-recorded"),
+            (
+                "required_run_metadata",
+                [
+                    "rustfs_build",
+                    "git_sha",
+                    "catalog_backing",
+                    "endpoint",
+                    "warehouse",
+                    "rest_path",
+                    "namespace",
+                    "table",
+                    "metadata_location",
+                    "client_name",
+                    "client_version",
+                    "run_timestamp_utc",
+                    "operator",
+                    "expected_status",
+                    "observed_status",
+                    "row_count",
+                    "cleanup_result",
+                ],
+            ),
+            (
+                "result_table_template",
+                [
+                    OrderedDict(
+                        [
+                            ("client", "PyIceberg"),
+                            ("scenario", "create-append-reload-scan-direct-rest-probes"),
+                            ("expected_status", "pass"),
+                            ("expected_row_count", 2),
+                            ("claim_after_pass", "automated-smoke"),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("client", "Spark Iceberg REST catalog"),
+                            ("scenario", "create-namespace-create-table-append-refresh-count-cleanup"),
+                            ("expected_status", "pass"),
+                            ("expected_row_count", 2),
+                            ("claim_after_pass", "manual-live-verified"),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("client", "Trino Iceberg REST catalog"),
+                            ("scenario", "read-count-existing-table"),
+                            ("expected_status", "pass"),
+                            ("expected_row_count", 2),
+                            ("claim_after_pass", "manual-live-read-verified"),
+                            ("write_claim_after_pass", "not-claimed"),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("client", "DuckDB Iceberg"),
+                            ("scenario", "iceberg-scan-current-metadata-location"),
+                            ("expected_status", "pass"),
+                            ("expected_row_count", 2),
+                            ("claim_after_pass", "manual-live-read-verified"),
+                            ("write_claim_after_pass", "not-claimed"),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("client", "Databend"),
+                            ("scenario", "s3-stage-read-table-data-files"),
+                            ("expected_status", "pass"),
+                            ("claim_after_pass", "manual-live-s3-stage-verified"),
+                            ("iceberg_rest_catalog_claim_after_pass", "not-claimed"),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("client", "Snowflake Open Catalog / Iceberg integrations"),
+                            ("scenario", "operator-adapted-external-volume-reference"),
+                            ("expected_status", "operator-recorded"),
+                            ("claim_after_pass", "reference-only"),
+                            ("live_rustfs_interoperability_after_pass", "not-claimed"),
+                        ]
+                    ),
+                ],
+            ),
+            (
+                "promotion_rules",
+                [
+                    "Keep PyIceberg as the only automated claim unless the run is executed by CI or a repeatable operator job.",
+                    "Promote Spark only to manual-live-verified when the exact RustFS build, Spark version, Iceberg version, SQL output, and row_count are recorded.",
+                    "Do not promote Trino or DuckDB write compatibility from read probes; write compatibility remains not-claimed.",
+                    "Do not promote Snowflake or vendor catalog interoperability from a generated template without a repeatable live run.",
+                    "Treat manual-live failures as compatibility findings and keep the previous public claim boundary.",
+                ],
+            ),
+            (
+                "target",
+                OrderedDict(
+                    [
+                        ("warehouse", warehouse),
+                        ("namespace", namespace),
+                        ("table", table),
+                        ("rest_path", rest_path),
+                        ("metadata_location", metadata_location),
+                        ("cleanup", cleanup),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+
+def production_operations_guide(
+    *,
+    endpoint: str,
+    warehouse: str,
+    namespace: str,
+    table: str,
+    rest_path: str,
+) -> OrderedDict[str, Any]:
+    endpoint = normalized_endpoint(endpoint)
+    table_base = table_catalog_path(warehouse=warehouse, namespace=namespace, table=table, rest_path=rest_path)
+    pyiceberg_smoke_command = shell_join(
+        [
+            "python3",
+            "scripts/table-catalog/pyiceberg_smoke.py",
+            "--profile",
+            "rustfs",
+            "--endpoint",
+            endpoint,
+            "--bucket",
+            warehouse,
+            "--namespace",
+            namespace,
+            "--table",
+            table,
+            "--rest-path",
+            rest_path,
+            "--replace",
+            "--cleanup",
+        ]
+    )
+    live_conformance_command = shell_join(
+        [
+            "python3",
+            "scripts/table-catalog/engine_compatibility.py",
+            "--endpoint",
+            endpoint,
+            "--warehouse",
+            warehouse,
+            "--namespace",
+            namespace,
+            "--table",
+            table,
+            "--rest-path",
+            rest_path,
+            "--print-live-conformance",
+            "--cleanup",
+        ]
+    )
+    return OrderedDict(
+        [
+            ("claim_boundary", "Iceberg REST Catalog S3 Tables implementation"),
+            (
+                "target",
+                OrderedDict(
+                    [
+                        ("endpoint", endpoint),
+                        ("warehouse", warehouse),
+                        ("namespace", namespace),
+                        ("table", table),
+                        ("rest_path", rest_path),
+                    ]
+                ),
+            ),
+            (
+                "sections",
+                [
+                    OrderedDict(
+                        [
+                            ("name", "live-client-conformance"),
+                            ("objective", "Record repeatable client evidence before expanding engine compatibility claims."),
+                            (
+                                "commands",
+                                [
+                                    pyiceberg_smoke_command,
+                                    live_conformance_command,
+                                ],
+                            ),
+                            (
+                                "required_evidence",
+                                [
+                                    "RustFS build and git SHA",
+                                    "catalog backing mode",
+                                    "client name and version",
+                                    "generated command or SQL",
+                                    "expected and observed status",
+                                    "row_count or response status",
+                                    "current metadata location",
+                                ],
+                            ),
+                            (
+                                "pass_criteria",
+                                [
+                                    "PyIceberg append/reload/scan returns row_count=2",
+                                    "Spark manual/live run returns row_count=2 before cleanup",
+                                    "read-only engines do not claim write compatibility",
+                                ],
+                            ),
+                            (
+                                "fail_closed_signals",
+                                [
+                                    "missing run metadata",
+                                    "manual-live run fails",
+                                    "client writes are attempted through a read-only probe",
+                                ],
+                            ),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("name", "catalog-backing-cutover"),
+                            ("objective", "Verify durable backing readiness before selecting a non-object-backed catalog mode."),
+                            ("commands", [f"GET {warehouse_catalog_path(warehouse=warehouse, rest_path=rest_path, suffix='/catalog/migration')}"]),
+                            (
+                                "required_evidence",
+                                [
+                                    "migration dry-run response",
+                                    "commit recovery blockers",
+                                    "idempotency index readiness",
+                                    "warehouse prefix index readiness",
+                                    "rollback configuration",
+                                ],
+                            ),
+                            (
+                                "pass_criteria",
+                                [
+                                    "blockers is empty",
+                                    "recommended actions are completed",
+                                    "object-backed catalog backup exists before cutover",
+                                ],
+                            ),
+                            (
+                                "fail_closed_signals",
+                                [
+                                    "non-empty blockers",
+                                    "recoverable commit gaps require repair",
+                                    "warehouse prefix index is missing or stale",
+                                ],
+                            ),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("name", "maintenance-operations"),
+                            ("objective", "Validate controlled maintenance without claiming a continuous in-process scheduler."),
+                            (
+                                "commands",
+                                [
+                                    f"POST {table_base}/maintenance/metadata",
+                                    f"GET {table_base}/maintenance/jobs/{{job}}",
+                                ],
+                            ),
+                            (
+                                "required_evidence",
+                                [
+                                    "dry-run report before delete or rewrite",
+                                    "current pointer re-read",
+                                    "audit-events for planning and worker transitions",
+                                    "quarantine status for failed jobs",
+                                    "safe-window configuration",
+                                ],
+                            ),
+                            (
+                                "pass_criteria",
+                                [
+                                    "unreachable object deletion candidates pass safety-window checks",
+                                    "rewrite groups stay partition-local and sort-order-local",
+                                    "delete-file or row-level maintenance remains manual review",
+                                ],
+                            ),
+                            (
+                                "fail_closed_signals",
+                                [
+                                    "stale maintenance plan",
+                                    "quarantine required",
+                                    "row-level delete file rewrite requested",
+                                    "missing referenced object",
+                                ],
+                            ),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("name", "recovery-and-disaster-rehearsal"),
+                            ("objective", "Exercise operator recovery paths without moving the table pointer unexpectedly."),
+                            (
+                                "commands",
+                                [
+                                    f"GET {table_base}/catalog/diagnostics",
+                                    f"POST {table_base}/catalog/recovery",
+                                    "python3 scripts/table-catalog/failure_coverage.py --print-disaster-recovery-rehearsal",
+                                ],
+                            ),
+                            (
+                                "required_evidence",
+                                [
+                                    "catalog export baseline",
+                                    "diagnostics recovery status",
+                                    "safe repair result",
+                                    "rollback or import response when used",
+                                    "post-recovery loadTable result",
+                                ],
+                            ),
+                            (
+                                "pass_criteria",
+                                [
+                                    "safe repair does not move the current pointer",
+                                    "rollback/import uses normal catalog validation",
+                                    "post-recovery loadTable returns the expected metadata location",
+                                ],
+                            ),
+                            (
+                                "fail_closed_signals",
+                                [
+                                    "manual-review diagnostics",
+                                    "stale rollback or import conflict",
+                                    "post-recovery data-plane policy failure",
+                                ],
+                            ),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("name", "permissions-and-credentials"),
+                            ("objective", "Verify table policy and credential vending cannot bypass table warehouse scope."),
+                            (
+                                "commands",
+                                [
+                                    "python3 scripts/table-catalog/pyiceberg_smoke.py --profile rustfs-vended-credentials --replace --cleanup",
+                                    f"GET {table_base}/credentials",
+                                ],
+                            ),
+                            (
+                                "required_evidence",
+                                [
+                                    "catalog principal permissions",
+                                    "vended credential expiration",
+                                    "warehouse prefix scope",
+                                    "inside-prefix S3 put/head/get/delete result",
+                                    "outside-prefix deny result",
+                                ],
+                            ),
+                            (
+                                "pass_criteria",
+                                [
+                                    "default credentials response is empty unless vending is enabled",
+                                    "vended credentials work inside the exact table prefix",
+                                    "vended credentials are denied outside the exact table prefix",
+                                ],
+                            ),
+                            (
+                                "fail_closed_signals",
+                                [
+                                    "long-lived storage secret returned by catalog",
+                                    "prefix mismatch",
+                                    "outside-prefix object access succeeds",
+                                ],
+                            ),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("name", "unsupported-claim-governance"),
+                            ("objective", "Keep release language aligned with verified RustFS behavior."),
+                            (
+                                "commands",
+                                [
+                                    "python3 scripts/table-catalog/pyiceberg_smoke.py --print-unsupported-inventory",
+                                    "python3 scripts/table-catalog/engine_compatibility.py --print-engine-matrix",
+                                ],
+                            ),
+                            (
+                                "not_claimed",
+                                [
+                                    "full AWS S3 Tables control-plane API parity",
+                                    "full MinIO AIStor private extension parity",
+                                    "full Cloudflare R2 Data Catalog interoperability",
+                                    "active-active multi-region table writes",
+                                    "multi-table transactions",
+                                    "built-in SQL query execution",
+                                    "Delta Lake or Hudi table format support",
+                                    "end-to-end SQL row-level DML validation",
+                                ],
+                            ),
+                            (
+                                "required_evidence",
+                                [
+                                    "support matrix status label",
+                                    "unsupported inventory entry",
+                                    "live evidence before any promotion",
+                                ],
+                            ),
+                            (
+                                "pass_criteria",
+                                [
+                                    "public claim wording matches support matrix status",
+                                    "reference profiles stay reference-only without live evidence",
+                                ],
+                            ),
+                            (
+                                "fail_closed_signals",
+                                [
+                                    "vendor parity wording without recorded live evidence",
+                                    "manual probe documented as automated support",
+                                ],
+                            ),
+                        ]
+                    ),
+                ],
+            ),
+        ]
+    )
+
+
 def live_conformance_harness(
     *,
     endpoint: str,
@@ -598,6 +1056,17 @@ def live_conformance_harness(
                         ("row_count", 2),
                         ("cleanup", cleanup),
                     ]
+                ),
+            ),
+            (
+                "evidence",
+                live_conformance_evidence(
+                    warehouse=warehouse,
+                    namespace=namespace,
+                    table=table,
+                    rest_path=rest_path,
+                    metadata_location=metadata_location,
+                    cleanup=cleanup,
                 ),
             ),
             (
@@ -731,6 +1200,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--print-engine-matrix", action="store_true")
     parser.add_argument("--print-live-conformance", action="store_true")
+    parser.add_argument("--print-operations-guide", action="store_true")
     parser.add_argument("--print-spark-config", action="store_true")
     parser.add_argument("--print-spark-sql", action="store_true")
     return parser.parse_args(argv)
@@ -803,6 +1273,20 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
                     databend_dsn=args.databend_dsn,
                     metadata_location=args.metadata_location,
                     cleanup=args.cleanup,
+                )
+            },
+            output,
+        )
+        printed = True
+    if args.print_operations_guide:
+        print_json(
+            {
+                "production_operations_guide": production_operations_guide(
+                    endpoint=args.endpoint,
+                    warehouse=args.warehouse,
+                    namespace=args.namespace,
+                    table=args.table,
+                    rest_path=args.rest_path or "/iceberg",
                 )
             },
             output,
