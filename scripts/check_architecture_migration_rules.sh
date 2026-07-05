@@ -3869,7 +3869,7 @@ fi
   rg -n --with-filename '\bREAD_REPAIR_HEAL_CACHE\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
-    rg -v '^crates/ecstore/src/set_disk/read\.rs:' || true
+    rg -v '^crates/ecstore/src/set_disk/(read|core/io_primitives)\.rs:' || true
 ) >"$ECSTORE_READ_REPAIR_CACHE_BYPASS_HITS_FILE"
 
 if [[ -s "$ECSTORE_READ_REPAIR_CACHE_BYPASS_HITS_FILE" ]]; then
