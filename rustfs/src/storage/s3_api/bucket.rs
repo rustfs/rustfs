@@ -563,6 +563,22 @@ mod tests {
     }
 
     #[test]
+    fn test_list_objects_next_marker_uses_visible_common_prefix_with_internal_token() {
+        let marker = "asdf[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            common_prefixes: Some(vec![CommonPrefix {
+                prefix: Some("asdf".to_string()),
+            }]),
+            ..Default::default()
+        };
+
+        let output = build_list_objects_output(v2, None);
+        assert_eq!(output.next_marker.as_deref(), Some("asdf"));
+    }
+
+    #[test]
     fn test_list_objects_next_marker_preserves_cache_like_key_suffix() {
         let marker = "key[rustfs_cache:v2]";
         let v2 = ListObjectsV2Output {

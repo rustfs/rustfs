@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{ListMultipartsInfo, ListPartsInfo};
+use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
+    ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
+};
 use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_etag;
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
 const MAX_MULTIPART_UPLOADS_LIST: i32 = 1000;
-const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ListPartsParams {

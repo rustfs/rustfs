@@ -39,6 +39,13 @@ S3_REGION="${S3_REGION:-us-east-1}"
 S3_HOST="${S3_HOST:-127.0.0.1}"
 S3_PORT="${S3_PORT:-9000}"
 
+# Keep the compatibility harness focused on foreground S3 API behavior.
+# The background scanner can race short-lived test buckets and add avoidable
+# metacache/listing pressure on small CI runners.
+export RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED:-false}"
+export RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS:-3600}"
+export RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE:-3600}"
+
 # Test parameters
 TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
@@ -259,6 +266,7 @@ Environment Variables:
   S3_ALT_ACCESS_KEY      - Alt user access key (default: rustfsalt)
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   RUSTFS_SSE_S3_MASTER_KEY - Optional base64 32-byte key for local managed SSE fallback
+  RUSTFS_SCANNER_ENABLED - Enable background scanner for harness service (default: false)
   MAXFAIL                - Stop after N failures, 0 = never stop (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
   TEST_SCOPE             - "implemented" (whitelist, default) or "all" (entire upstream suite)
@@ -479,6 +487,9 @@ elif [ "${DEPLOY_MODE}" = "docker" ]; then
         -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
         -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
         -e RUSTFS_SSE_S3_MASTER_KEY="${RUSTFS_SSE_S3_MASTER_KEY}" \
+        -e RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED}" \
+        -e RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS}" \
+        -e RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE}" \
         -e RUSTFS_VOLUMES="/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3" \
         -v "/tmp/${CONTAINER_NAME}:/data" \
         rustfs-ci || {
