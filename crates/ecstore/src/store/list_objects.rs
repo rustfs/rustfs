@@ -241,7 +241,7 @@ pub struct ListPathOptions {
 
     pub pool_idx: Option<usize>,
     pub set_idx: Option<usize>,
-    pub cursor_source: Option<String>,
+    pub cursor_source: Option<ListSourceMode>,
     pub cursor_generation: Option<String>,
 }
 
@@ -257,13 +257,149 @@ const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
 const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
 
+/// Identifies the source that produced a ListObjects page.
+///
+/// `Walker` is the current live xl.meta-backed path. Index modes are future
+/// integration points only: key-only and verified-page modes still require live
+/// metadata validation before they can satisfy a strong listing, while
+/// metadata-fast is explicitly eventually consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListSourceMode {
+    Walker,
+    IndexKeyOnly,
+    IndexVerifiedPage,
+    IndexMetadataFast,
+}
+
+impl ListSourceMode {
+    fn cursor_value(self) -> &'static str {
+        match self {
+            Self::Walker => LIST_CURSOR_SOURCE_WALKER,
+            Self::IndexKeyOnly => LIST_CURSOR_SOURCE_INDEX_KEY_ONLY,
+            Self::IndexVerifiedPage => LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE,
+            Self::IndexMetadataFast => LIST_CURSOR_SOURCE_INDEX_METADATA_FAST,
+        }
+    }
+
+    fn from_cursor_value(source: &str) -> Option<Self> {
+        match source {
+            LIST_CURSOR_SOURCE_WALKER => Some(Self::Walker),
+            LIST_CURSOR_SOURCE_INDEX_KEY_ONLY => Some(Self::IndexKeyOnly),
+            LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE => Some(Self::IndexVerifiedPage),
+            LIST_CURSOR_SOURCE_INDEX_METADATA_FAST => Some(Self::IndexMetadataFast),
+            _ => None,
+        }
+    }
+
+    fn metadata_authority(self) -> ListMetadataAuthority {
+        match self {
+            Self::Walker => ListMetadataAuthority::LiveXlMeta,
+            Self::IndexKeyOnly | Self::IndexVerifiedPage => ListMetadataAuthority::LiveVerifiedIndexCandidate,
+            Self::IndexMetadataFast => ListMetadataAuthority::IndexSnapshotEventuallyConsistent,
+        }
+    }
+
+    fn requires_live_metadata_verification(self) -> bool {
+        matches!(self, Self::IndexKeyOnly | Self::IndexVerifiedPage)
+    }
+
+    fn can_satisfy_strong_listing(self) -> bool {
+        !matches!(self.metadata_authority(), ListMetadataAuthority::IndexSnapshotEventuallyConsistent)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListMetadataAuthority {
+    /// Object metadata was read from live xl.meta and can be authoritative for
+    /// strong ListObjects results.
+    LiveXlMeta,
+    /// The index provided candidate keys/pages; live xl.meta validation still
+    /// owns authoritative object metadata.
+    LiveVerifiedIndexCandidate,
+    /// Metadata came from an index snapshot and must not be treated as strong
+    /// consistency-equivalent to live xl.meta.
+    IndexSnapshotEventuallyConsistent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListIndexFallbackReason {
+    Disabled,
+    Unhealthy,
+    MissingGeneration,
+    UnsupportedRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListIndexSourceDecision {
+    UseIndex(ListSourceMode),
+    FallbackToWalker(ListIndexFallbackReason),
+}
+
+trait ListMetadataIndexGeneration {
+    fn generation_id(&self) -> &str;
+}
+
+trait ListMetadataIndexHealth {
+    fn fallback_reason(&self) -> Option<ListIndexFallbackReason>;
+
+    fn is_healthy(&self) -> bool {
+        self.fallback_reason().is_none()
+    }
+}
+
+trait ListMetadataIndexPage {
+    fn source_mode(&self) -> ListSourceMode;
+    fn generation(&self) -> &dyn ListMetadataIndexGeneration;
+    fn keys(&self) -> &[String];
+
+    fn metadata_authority(&self) -> ListMetadataAuthority {
+        self.source_mode().metadata_authority()
+    }
+}
+
+trait ListMetadataIndexPageIterator {
+    type Page: ListMetadataIndexPage;
+
+    fn next_page(&mut self) -> Option<Self::Page>;
+}
+
+trait ListMetadataIndexKeyLookup {
+    type Page: ListMetadataIndexPage;
+
+    fn lookup_page(&self, opts: &ListPathOptions) -> ListIndexSourceDecision;
+}
+
+fn select_list_index_source_mode(
+    requested: Option<ListSourceMode>,
+    generation: Option<&str>,
+    health: &dyn ListMetadataIndexHealth,
+) -> ListIndexSourceDecision {
+    let Some(mode) = requested else {
+        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Disabled);
+    };
+
+    if mode == ListSourceMode::Walker {
+        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Disabled);
+    }
+
+    if generation.is_none_or(str::is_empty) {
+        return ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::MissingGeneration);
+    }
+
+    if let Some(reason) = health.fallback_reason() {
+        return ListIndexSourceDecision::FallbackToWalker(reason);
+    }
+
+    ListIndexSourceDecision::UseIndex(mode)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListContinuationV2 {
     version: &'static str,
     id: Option<String>,
     pool_idx: Option<usize>,
     set_idx: Option<usize>,
-    source: Option<String>,
+    source: Option<ListSourceMode>,
     generation: Option<String>,
 }
 
@@ -290,7 +426,7 @@ impl ListContinuationV2 {
         }
         if let Some(source) = &self.source {
             marker_tag.push_str(",src:");
-            marker_tag.push_str(source);
+            marker_tag.push_str(source.cursor_value());
         }
         if let Some(generation) = &self.generation {
             marker_tag.push_str(",gen:");
@@ -348,7 +484,7 @@ impl ListContinuationV2 {
                     }
                 },
                 "src" => {
-                    parsed.source = Some(normalize_cursor_source(value)?.to_owned());
+                    parsed.source = Some(ListSourceMode::from_cursor_value(value)?);
                 }
                 "gen" => {
                     if value.is_empty() {
@@ -365,16 +501,6 @@ impl ListContinuationV2 {
         } else {
             None
         }
-    }
-}
-
-fn normalize_cursor_source(source: &str) -> Option<&'static str> {
-    match source {
-        LIST_CURSOR_SOURCE_WALKER => Some(LIST_CURSOR_SOURCE_WALKER),
-        LIST_CURSOR_SOURCE_INDEX_KEY_ONLY => Some(LIST_CURSOR_SOURCE_INDEX_KEY_ONLY),
-        LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE => Some(LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE),
-        LIST_CURSOR_SOURCE_INDEX_METADATA_FAST => Some(LIST_CURSOR_SOURCE_INDEX_METADATA_FAST),
-        _ => None,
     }
 }
 
@@ -413,7 +539,7 @@ fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> Str
         id: Some(id.to_owned()),
         pool_idx: None,
         set_idx: None,
-        source: Some(LIST_CURSOR_SOURCE_WALKER.to_owned()),
+        source: Some(ListSourceMode::Walker),
         generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
     }
     .encode_marker(&marker)
@@ -1150,7 +1276,7 @@ impl ListPathOptions {
             id: self.id.clone(),
             pool_idx: self.pool_idx,
             set_idx: self.set_idx,
-            source: Some(LIST_CURSOR_SOURCE_WALKER.to_owned()),
+            source: Some(ListSourceMode::Walker),
             generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
         }
         .encode_marker(marker)
@@ -3940,13 +4066,15 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState,
-        ListPathOptions, ListPathRawOptions, ListingEntryResolution, ListingSupplement, ListingSupplementOptions,
+        ListIndexFallbackReason, ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration,
+        ListMetadataIndexHealth, ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator,
+        ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions,
         MAX_OBJECT_LIST, VersionMarker, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
         fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
         latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_metadata_resolution_params,
         list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
-        parse_version_marker, resolve_agreed_listing_entry, resolve_listing_entries, send_or_cancel, version_marker_for_entries,
-        walk_result_from_set_errors,
+        parse_version_marker, resolve_agreed_listing_entry, resolve_listing_entries, select_list_index_source_mode,
+        send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
@@ -3962,6 +4090,70 @@ mod test {
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    struct TestIndexGeneration {
+        id: String,
+    }
+
+    impl ListMetadataIndexGeneration for TestIndexGeneration {
+        fn generation_id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    struct TestIndexHealth {
+        reason: Option<ListIndexFallbackReason>,
+    }
+
+    impl ListMetadataIndexHealth for TestIndexHealth {
+        fn fallback_reason(&self) -> Option<ListIndexFallbackReason> {
+            self.reason
+        }
+    }
+
+    struct TestIndexPage {
+        mode: ListSourceMode,
+        generation: TestIndexGeneration,
+        keys: Vec<String>,
+    }
+
+    impl ListMetadataIndexPage for TestIndexPage {
+        fn source_mode(&self) -> ListSourceMode {
+            self.mode
+        }
+
+        fn generation(&self) -> &dyn ListMetadataIndexGeneration {
+            &self.generation
+        }
+
+        fn keys(&self) -> &[String] {
+            &self.keys
+        }
+    }
+
+    struct TestIndexIterator {
+        pages: std::vec::IntoIter<TestIndexPage>,
+    }
+
+    impl ListMetadataIndexPageIterator for TestIndexIterator {
+        type Page = TestIndexPage;
+
+        fn next_page(&mut self) -> Option<Self::Page> {
+            self.pages.next()
+        }
+    }
+
+    struct TestIndexLookup {
+        decision: ListIndexSourceDecision,
+    }
+
+    impl ListMetadataIndexKeyLookup for TestIndexLookup {
+        type Page = TestIndexPage;
+
+        fn lookup_page(&self, _opts: &ListPathOptions) -> ListIndexSourceDecision {
+            self.decision
+        }
+    }
 
     fn test_meta_entry(name: &str) -> MetaCacheEntry {
         MetaCacheEntry {
@@ -4894,7 +5086,7 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
-        assert_eq!(parsed.cursor_source.as_deref(), Some("walker"));
+        assert_eq!(parsed.cursor_source, Some(ListSourceMode::Walker));
         assert_eq!(parsed.cursor_generation.as_deref(), Some("live"));
         assert!(!parsed.create);
     }
@@ -4915,9 +5107,96 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
-        assert_eq!(parsed.cursor_source.as_deref(), Some("index_key_only"));
+        assert_eq!(parsed.cursor_source, Some(ListSourceMode::IndexKeyOnly));
         assert_eq!(parsed.cursor_generation.as_deref(), Some("generation-42"));
         assert!(!parsed.create);
+    }
+
+    #[test]
+    fn list_source_modes_expose_metadata_authority_boundaries() {
+        assert_eq!(ListSourceMode::Walker.metadata_authority(), ListMetadataAuthority::LiveXlMeta);
+        assert_eq!(
+            ListSourceMode::IndexKeyOnly.metadata_authority(),
+            ListMetadataAuthority::LiveVerifiedIndexCandidate
+        );
+        assert_eq!(
+            ListSourceMode::IndexVerifiedPage.metadata_authority(),
+            ListMetadataAuthority::LiveVerifiedIndexCandidate
+        );
+        assert_eq!(
+            ListSourceMode::IndexMetadataFast.metadata_authority(),
+            ListMetadataAuthority::IndexSnapshotEventuallyConsistent
+        );
+
+        assert!(ListSourceMode::IndexKeyOnly.requires_live_metadata_verification());
+        assert!(ListSourceMode::IndexVerifiedPage.requires_live_metadata_verification());
+        assert!(!ListSourceMode::IndexMetadataFast.requires_live_metadata_verification());
+        assert!(!ListSourceMode::IndexMetadataFast.can_satisfy_strong_listing());
+    }
+
+    #[test]
+    fn list_index_source_selection_falls_back_until_request_is_healthy_and_versioned() {
+        let healthy = TestIndexHealth { reason: None };
+        let unhealthy = TestIndexHealth {
+            reason: Some(ListIndexFallbackReason::Unhealthy),
+        };
+
+        assert_eq!(
+            select_list_index_source_mode(None, Some("generation-1"), &healthy),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Disabled)
+        );
+        assert_eq!(
+            select_list_index_source_mode(Some(ListSourceMode::Walker), Some("generation-1"), &healthy),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Disabled)
+        );
+        assert_eq!(
+            select_list_index_source_mode(Some(ListSourceMode::IndexKeyOnly), None, &healthy),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::MissingGeneration)
+        );
+        assert_eq!(
+            select_list_index_source_mode(Some(ListSourceMode::IndexKeyOnly), Some(""), &healthy),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::MissingGeneration)
+        );
+        assert_eq!(
+            select_list_index_source_mode(Some(ListSourceMode::IndexKeyOnly), Some("generation-1"), &unhealthy),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Unhealthy)
+        );
+        assert_eq!(
+            select_list_index_source_mode(Some(ListSourceMode::IndexVerifiedPage), Some("generation-1"), &healthy),
+            ListIndexSourceDecision::UseIndex(ListSourceMode::IndexVerifiedPage)
+        );
+    }
+
+    #[test]
+    fn list_index_traits_keep_page_iteration_and_metadata_authority_explicit() {
+        let page = TestIndexPage {
+            mode: ListSourceMode::IndexMetadataFast,
+            generation: TestIndexGeneration {
+                id: "snapshot-7".to_string(),
+            },
+            keys: vec!["photos/2026/image.jpg".to_string()],
+        };
+        let mut iterator = TestIndexIterator {
+            pages: vec![page].into_iter(),
+        };
+        let page = iterator.next_page().expect("test iterator should produce one page");
+
+        assert_eq!(page.keys(), &["photos/2026/image.jpg".to_string()]);
+        assert_eq!(page.generation().generation_id(), "snapshot-7");
+        assert_eq!(page.metadata_authority(), ListMetadataAuthority::IndexSnapshotEventuallyConsistent);
+        assert!(!page.source_mode().can_satisfy_strong_listing());
+    }
+
+    #[test]
+    fn list_index_key_lookup_trait_returns_explicit_fallback_decision() {
+        let lookup = TestIndexLookup {
+            decision: ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::UnsupportedRequest),
+        };
+
+        assert_eq!(
+            lookup.lookup_page(&ListPathOptions::default()),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::UnsupportedRequest)
+        );
     }
 
     #[test]
