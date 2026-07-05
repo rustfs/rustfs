@@ -4061,17 +4061,8 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
         );
 
-        let result = Self::finalize_get_object_response(
-            helper,
-            &bucket,
-            &req.method,
-            &req.headers,
-            event_info,
-            version_id_for_event,
-            output,
-        )
-        .await;
-        result
+        Self::finalize_get_object_response(helper, &bucket, &req.method, &req.headers, event_info, version_id_for_event, output)
+            .await
     }
 
     pub async fn execute_get_object_attributes(
