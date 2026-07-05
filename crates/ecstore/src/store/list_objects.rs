@@ -241,10 +241,17 @@ pub struct ListPathOptions {
 
     pub pool_idx: Option<usize>,
     pub set_idx: Option<usize>,
+    pub cursor_source: Option<String>,
+    pub cursor_generation: Option<String>,
 }
 
 const MARKER_TAG_VERSION: &str = "v2";
 const LEGACY_MARKER_TAG_VERSIONS: &[&str] = &["v1", MARKER_TAG_VERSION];
+const LIST_CURSOR_SOURCE_WALKER: &str = "walker";
+const LIST_CURSOR_SOURCE_INDEX_KEY_ONLY: &str = "index_key_only";
+const LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE: &str = "index_verified_page";
+const LIST_CURSOR_SOURCE_INDEX_METADATA_FAST: &str = "index_metadata_fast";
+const LIST_CURSOR_GENERATION_LIVE: &str = "live";
 const ENV_API_LIST_QUORUM: &str = "RUSTFS_API_LIST_QUORUM";
 const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
@@ -256,6 +263,8 @@ struct ListContinuationV2 {
     id: Option<String>,
     pool_idx: Option<usize>,
     set_idx: Option<usize>,
+    source: Option<String>,
+    generation: Option<String>,
 }
 
 impl ListContinuationV2 {
@@ -279,6 +288,14 @@ impl ListContinuationV2 {
             marker_tag.push_str(",s:");
             marker_tag.push_str(&set_idx.to_string());
         }
+        if let Some(source) = &self.source {
+            marker_tag.push_str(",src:");
+            marker_tag.push_str(source);
+        }
+        if let Some(generation) = &self.generation {
+            marker_tag.push_str(",gen:");
+            marker_tag.push_str(generation);
+        }
         marker_tag.push(']');
         marker_tag
     }
@@ -289,6 +306,8 @@ impl ListContinuationV2 {
             id: None,
             pool_idx: None,
             set_idx: None,
+            source: None,
+            generation: None,
         };
         let mut has_list_cache = false;
         let mut should_create = false;
@@ -328,6 +347,15 @@ impl ListContinuationV2 {
                         should_create = true;
                     }
                 },
+                "src" => {
+                    parsed.source = Some(normalize_cursor_source(value)?.to_owned());
+                }
+                "gen" => {
+                    if value.is_empty() {
+                        return None;
+                    }
+                    parsed.generation = Some(value.to_owned());
+                }
                 _ => (),
             }
         }
@@ -337,6 +365,16 @@ impl ListContinuationV2 {
         } else {
             None
         }
+    }
+}
+
+fn normalize_cursor_source(source: &str) -> Option<&'static str> {
+    match source {
+        LIST_CURSOR_SOURCE_WALKER => Some(LIST_CURSOR_SOURCE_WALKER),
+        LIST_CURSOR_SOURCE_INDEX_KEY_ONLY => Some(LIST_CURSOR_SOURCE_INDEX_KEY_ONLY),
+        LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE => Some(LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE),
+        LIST_CURSOR_SOURCE_INDEX_METADATA_FAST => Some(LIST_CURSOR_SOURCE_INDEX_METADATA_FAST),
+        _ => None,
     }
 }
 
@@ -370,15 +408,15 @@ fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> Str
         return marker;
     };
 
-    let mut marker_tag = String::with_capacity(marker.len() + 24 + id.len());
-    marker_tag.push_str(&marker);
-    marker_tag.push_str("[rustfs_cache:");
-    marker_tag.push_str(MARKER_TAG_VERSION);
-    marker_tag.push_str(",id:");
-    marker_tag.push_str(id);
-    marker_tag.push(']');
-
-    marker_tag
+    ListContinuationV2 {
+        version: MARKER_TAG_VERSION,
+        id: Some(id.to_owned()),
+        pool_idx: None,
+        set_idx: None,
+        source: Some(LIST_CURSOR_SOURCE_WALKER.to_owned()),
+        generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
+    }
+    .encode_marker(&marker)
 }
 
 fn build_list_next_marker(objects: &[ObjectInfo], prefixes: &[String], cache_id: Option<&str>) -> Option<String> {
@@ -1099,6 +1137,8 @@ impl ListPathOptions {
         self.id = continuation.id;
         self.pool_idx = continuation.pool_idx;
         self.set_idx = continuation.set_idx;
+        self.cursor_source = continuation.source;
+        self.cursor_generation = continuation.generation;
         if should_create {
             self.create = true;
         }
@@ -1110,6 +1150,8 @@ impl ListPathOptions {
             id: self.id.clone(),
             pool_idx: self.pool_idx,
             set_idx: self.set_idx,
+            source: Some(LIST_CURSOR_SOURCE_WALKER.to_owned()),
+            generation: Some(LIST_CURSOR_GENERATION_LIVE.to_owned()),
         }
         .encode_marker(marker)
     }
@@ -4837,7 +4879,7 @@ mod test {
 
         let marker = opts.encode_marker("photos/2026/image.jpg");
         let expected_marker = format!(
-            "photos/2026/image.jpg[rustfs_cache:{},id:list-cache-id,p:3,s:7]",
+            "photos/2026/image.jpg[rustfs_cache:{},id:list-cache-id,p:3,s:7,src:walker,gen:live]",
             super::MARKER_TAG_VERSION
         );
         assert_eq!(marker, expected_marker);
@@ -4852,6 +4894,46 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
+        assert_eq!(parsed.cursor_source.as_deref(), Some("walker"));
+        assert_eq!(parsed.cursor_generation.as_deref(), Some("live"));
+        assert!(!parsed.create);
+    }
+
+    #[test]
+    fn list_path_marker_parser_preserves_source_aware_cursor_fields() {
+        let mut parsed = ListPathOptions {
+            marker: Some(
+                "photos/2026/image.jpg[rustfs_cache:v2,id:list-cache-id,p:3,s:7,src:index_key_only,gen:generation-42]"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+        assert_eq!(parsed.cursor_source.as_deref(), Some("index_key_only"));
+        assert_eq!(parsed.cursor_generation.as_deref(), Some("generation-42"));
+        assert!(!parsed.create);
+    }
+
+    #[test]
+    fn list_path_marker_parser_rejects_unknown_cursor_source() {
+        let original = "photos/2026/image.jpg[rustfs_cache:v2,id:list-cache-id,src:unknown,gen:generation-42]";
+        let mut parsed = ListPathOptions {
+            marker: Some(original.to_string()),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some(original));
+        assert!(parsed.id.is_none());
+        assert!(parsed.cursor_source.is_none());
+        assert!(parsed.cursor_generation.is_none());
         assert!(!parsed.create);
     }
 
@@ -4919,6 +5001,8 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("legacy-cache-id"));
         assert_eq!(parsed.pool_idx, Some(4));
         assert_eq!(parsed.set_idx, Some(1));
+        assert!(parsed.cursor_source.is_none());
+        assert!(parsed.cursor_generation.is_none());
         assert!(!parsed.create);
     }
 
