@@ -2212,6 +2212,25 @@ mod tests {
     }
 
     #[test]
+    fn test_core_token_response_accepts_rfc3339_updated_at() {
+        // Signature verification happens later; this test covers token response deserialization.
+        let id_token = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20vb2lkYyIsInN1YiI6InVzZXItMSIsImF1ZCI6InJ1c3RmcyIsImV4cCI6MTc4NDQzMjc2OSwiaWF0IjoxNzgzMjIzMTY5LCJ1cGRhdGVkX2F0IjoiMjAyNi0wNy0wM1QwNDo1MDo1MC44MTFaIn0.c2ln";
+        let body = serde_json::json!({
+            "scope": "openid roles profile email",
+            "token_type": "Bearer",
+            "access_token": "access-token",
+            "expires_in": 1209600,
+            "id_token": id_token,
+        })
+        .to_string();
+
+        let response: openidconnect::core::CoreTokenResponse =
+            serde_json::from_str(&body).expect("RFC3339 updated_at should parse in token response");
+
+        assert!(response.extra_fields().id_token().is_some());
+    }
+
+    #[test]
     fn test_map_claims_to_policies_no_provider() {
         let sys = OidcSys::empty().expect("failed to initialize empty OIDC system");
 
