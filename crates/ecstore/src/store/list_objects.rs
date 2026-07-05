@@ -46,11 +46,13 @@ use rustfs_io_metrics::{
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::io::duplex;
-use tokio::sync::OnceCell;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
@@ -259,7 +261,11 @@ const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
 const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
 const ENV_API_LIST_OBJECTS_INDEX_MODE: &str = "RUSTFS_LIST_OBJECTS_INDEX_MODE";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER";
+const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
+const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
+const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
+const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
 
 /// Identifies the source that produced a ListObjects page.
 ///
@@ -357,12 +363,14 @@ impl ListIndexFallbackReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListObjectsIndexProviderKind {
     WalkerKeyOnly,
+    PersistentKeyOnly,
 }
 
 impl ListObjectsIndexProviderKind {
     fn metric_label(self) -> &'static str {
         match self {
             Self::WalkerKeyOnly => LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY,
+            Self::PersistentKeyOnly => LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
         }
     }
 }
@@ -375,6 +383,7 @@ fn list_objects_index_provider_metric_label(provider: Option<ListObjectsIndexPro
 struct ListObjectsIndexProviderState {
     kind: ListObjectsIndexProviderKind,
     lifecycle: ListIndexLifecycle,
+    persistent_path: Option<PathBuf>,
 }
 
 impl ListObjectsIndexProviderState {
@@ -386,18 +395,98 @@ impl ListObjectsIndexProviderState {
         Self {
             kind: ListObjectsIndexProviderKind::WalkerKeyOnly,
             lifecycle,
+            persistent_path: None,
+        }
+    }
+
+    fn persistent_key_only(path: Option<PathBuf>, generation: Option<String>) -> Self {
+        let mut lifecycle = ListIndexLifecycle::disabled(0);
+        if path.as_ref().is_some_and(|path| !path.as_os_str().is_empty()) {
+            let generation =
+                generation.unwrap_or_else(|| LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION.to_owned());
+            lifecycle.begin_rebuild(generation, 0);
+            lifecycle.checkpoint_rebuild(0);
+            let _ = lifecycle.publish_rebuild();
+        } else {
+            lifecycle.mark_degraded();
+        }
+
+        Self {
+            kind: ListObjectsIndexProviderKind::PersistentKeyOnly,
+            lifecycle,
+            persistent_path: path,
         }
     }
 
     fn from_kind(kind: ListObjectsIndexProviderKind) -> Self {
         match kind {
             ListObjectsIndexProviderKind::WalkerKeyOnly => Self::walker_key_only(),
+            ListObjectsIndexProviderKind::PersistentKeyOnly => Self::persistent_key_only(None, None),
         }
     }
 
     fn health_snapshot(&self) -> ListIndexHealthSnapshot {
         self.lifecycle.health_snapshot()
     }
+}
+
+#[derive(Debug, Clone)]
+struct PersistentKeyOnlyIndexCache {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    keys: Arc<Vec<String>>,
+}
+
+static PERSISTENT_KEY_ONLY_INDEX_CACHE: OnceCell<RwLock<Option<PersistentKeyOnlyIndexCache>>> = OnceCell::const_new();
+
+async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentKeyOnlyIndexCache>> {
+    PERSISTENT_KEY_ONLY_INDEX_CACHE
+        .get_or_init(|| async { RwLock::new(None) })
+        .await
+}
+
+fn parse_persistent_key_only_index(contents: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in contents.lines() {
+        let key = line.trim_end_matches('\r');
+        if key.is_empty() || key.starts_with('#') {
+            continue;
+        }
+        keys.push(key.to_owned());
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+async fn load_persistent_key_only_index(path: &Path) -> Result<Arc<Vec<String>>> {
+    let metadata = tokio::fs::metadata(path).await.map_err(Error::Io)?;
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+    let cache = persistent_key_only_index_cache().await;
+
+    {
+        let cached = cache.read().await;
+        if let Some(cached) = cached.as_ref()
+            && cached.path == path
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return Ok(cached.keys.clone());
+        }
+    }
+
+    let contents = tokio::fs::read_to_string(path).await.map_err(Error::Io)?;
+    let keys = Arc::new(parse_persistent_key_only_index(&contents));
+    let mut cached = cache.write().await;
+    *cached = Some(PersistentKeyOnlyIndexCache {
+        path: path.to_path_buf(),
+        len,
+        modified,
+        keys: keys.clone(),
+    });
+    Ok(keys)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -773,13 +862,39 @@ fn list_objects_index_provider_from_env() -> Option<ListObjectsIndexProviderKind
     let value = value.trim();
     if value.eq_ignore_ascii_case(LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY) {
         Some(ListObjectsIndexProviderKind::WalkerKeyOnly)
+    } else if value.eq_ignore_ascii_case(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY)
+        || value.eq_ignore_ascii_case("persisted_key_only")
+    {
+        Some(ListObjectsIndexProviderKind::PersistentKeyOnly)
     } else {
         None
     }
 }
 
+fn list_objects_index_provider_path_from_env() -> Option<PathBuf> {
+    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, "");
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(PathBuf::from(value)) }
+}
+
+fn list_objects_index_provider_generation_from_env() -> Option<String> {
+    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, "");
+    let value = value.trim();
+    if value.is_empty() || value.contains([',', ':', '[', ']']) {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
 fn list_objects_index_provider_state_from_env() -> Option<ListObjectsIndexProviderState> {
-    list_objects_index_provider_from_env().map(ListObjectsIndexProviderState::from_kind)
+    list_objects_index_provider_from_env().map(|kind| match kind {
+        ListObjectsIndexProviderKind::WalkerKeyOnly => ListObjectsIndexProviderState::walker_key_only(),
+        ListObjectsIndexProviderKind::PersistentKeyOnly => ListObjectsIndexProviderState::persistent_key_only(
+            list_objects_index_provider_path_from_env(),
+            list_objects_index_provider_generation_from_env(),
+        ),
+    })
 }
 
 fn list_objects_key_only_provider_health(provider: Option<ListObjectsIndexProviderKind>) -> ListIndexHealthSnapshot {
@@ -1808,46 +1923,70 @@ impl ECStore {
             record_list_objects_index_fallback(mode, ListIndexFallbackReason::Disabled);
             return Ok(None);
         };
-        match provider_state.kind {
-            ListObjectsIndexProviderKind::WalkerKeyOnly => {}
-        }
 
         let mut provider_opts = opts.clone();
         provider_opts.parse_marker();
         provider_opts.cursor_source = Some(mode);
         provider_opts.cursor_generation = health.active_generation.clone();
 
-        let mut list_result = self
-            .clone()
-            .list_path(&provider_opts)
-            .await
-            .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
-                ..Default::default()
-            });
+        let candidate_keys = match provider_state.kind {
+            ListObjectsIndexProviderKind::WalkerKeyOnly => {
+                let mut list_result =
+                    self.clone()
+                        .list_path(&provider_opts)
+                        .await
+                        .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
+                            err: Some(err.into()),
+                            ..Default::default()
+                        });
 
-        if let Some(err) = list_result.err.take()
-            && err != rustfs_filemeta::Error::Unexpected
-        {
-            record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
-            return Ok(None);
-        }
+                if let Some(err) = list_result.err.take()
+                    && err != rustfs_filemeta::Error::Unexpected
+                {
+                    record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
+                    return Ok(None);
+                }
 
-        if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(provider_opts.marker.clone());
-        }
+                if let Some(result) = list_result.entries.as_mut() {
+                    result.forward_past(provider_opts.marker.clone());
+                }
 
-        let candidate_keys = list_result
-            .entries
-            .as_ref()
-            .map(|entries| {
-                entries
-                    .entries()
-                    .into_iter()
-                    .map(|entry| entry.name.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+                Arc::new(
+                    list_result
+                        .entries
+                        .as_ref()
+                        .map(|entries| {
+                            entries
+                                .entries()
+                                .into_iter()
+                                .map(|entry| entry.name.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                )
+            }
+            ListObjectsIndexProviderKind::PersistentKeyOnly => {
+                let Some(path) = provider_state.persistent_path.as_ref() else {
+                    record_list_objects_index_fallback(mode, ListIndexFallbackReason::Degraded);
+                    return Ok(None);
+                };
+                match load_persistent_key_only_index(path).await {
+                    Ok(keys) => keys,
+                    Err(err) => {
+                        record_list_objects_index_fallback(mode, ListIndexFallbackReason::Unhealthy);
+                        debug!(
+                            bucket = %opts.bucket,
+                            prefix = %opts.prefix,
+                            source = mode.cursor_value(),
+                            provider = provider_state.kind.metric_label(),
+                            error = %err,
+                            "list_objects persistent key-only provider failed to load candidates"
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+        };
 
         let bucket = provider_opts.bucket.clone();
         let verified = list_objects_from_verified_index_candidates_with_optional_stats(
@@ -1855,7 +1994,7 @@ impl ECStore {
             provider_opts.marker.as_deref(),
             &provider_opts.separator,
             max_keys,
-            &candidate_keys,
+            candidate_keys.as_slice(),
             list_metrics_enabled,
             |key| {
                 let store = self.clone();
@@ -4716,8 +4855,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM,
-        FallbackListingEntries, FallbackListingEntry, GatherResultsState, LIST_CURSOR_GENERATION_LIVE,
+        ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
+        ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries,
+        FallbackListingEntry, GatherResultsState, LIST_CURSOR_GENERATION_LIVE, LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
         LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
         ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
         ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
@@ -4727,9 +4867,10 @@ mod test {
         latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
         latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_verified_index_candidates,
         list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
-        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_key_only_provider_health,
-        list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
-        parse_version_marker, record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry, resolve_listing_entries,
+        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
+        list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
+        merge_entry_channels, normalize_list_quorum, parse_persistent_key_only_index, parse_version_marker,
+        record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry, resolve_listing_entries,
         select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel, version_marker_for_entries,
         walk_result_from_set_errors,
     };
@@ -5443,6 +5584,87 @@ mod test {
                 assert_eq!(health.active_generation.as_deref(), Some(LIST_CURSOR_GENERATION_LIVE));
                 assert_eq!(health.fallback_reason, None);
             },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_provider_from_env_accepts_persistent_key_only() {
+        temp_env::with_var(
+            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
+            Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY),
+            || {
+                assert_eq!(
+                    list_objects_index_provider_from_env(),
+                    Some(ListObjectsIndexProviderKind::PersistentKeyOnly)
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_provider_state_degrades_persistent_without_path() {
+        temp_env::with_var(
+            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
+            Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY),
+            || {
+                temp_env::with_var_unset(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, || {
+                    let provider = list_objects_index_provider_state_from_env().expect("persistent provider should be selected");
+                    let health = provider.health_snapshot();
+
+                    assert_eq!(provider.kind, ListObjectsIndexProviderKind::PersistentKeyOnly);
+                    assert_eq!(provider.persistent_path, None);
+                    assert_eq!(health.state, ListIndexLifecycleState::Degraded);
+                    assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Degraded));
+                });
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_provider_state_publishes_persistent_generation() {
+        let index_path = "/tmp/rustfs-listobjects-key-only.index";
+        temp_env::with_var(
+            ENV_API_LIST_OBJECTS_INDEX_PROVIDER,
+            Some(LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY),
+            || {
+                temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, Some(index_path), || {
+                    temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION, Some("bench-20260706"), || {
+                        let provider =
+                            list_objects_index_provider_state_from_env().expect("persistent provider should be selected");
+                        let health = provider.health_snapshot();
+
+                        assert_eq!(provider.kind, ListObjectsIndexProviderKind::PersistentKeyOnly);
+                        assert_eq!(provider.persistent_path.as_deref(), Some(std::path::Path::new(index_path)));
+                        assert_eq!(health.state, ListIndexLifecycleState::Healthy);
+                        assert_eq!(health.active_generation.as_deref(), Some("bench-20260706"));
+                        assert_eq!(health.fallback_reason, None);
+                    });
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn parse_persistent_key_only_index_sorts_and_deduplicates_keys() {
+        let keys = parse_persistent_key_only_index(
+            "# rustfs-listobjects-key-only-v1\n\
+             photos/c.jpg\n\
+             photos/a.jpg\r\n\
+             \n\
+             photos/b.jpg\n\
+             photos/a.jpg\n",
+        );
+
+        assert_eq!(
+            keys,
+            vec![
+                "photos/a.jpg".to_string(),
+                "photos/b.jpg".to_string(),
+                "photos/c.jpg".to_string()
+            ]
         );
     }
 

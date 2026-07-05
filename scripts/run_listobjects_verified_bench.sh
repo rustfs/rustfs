@@ -5,7 +5,13 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 OUT_DIR="${OUT_DIR:-${PROJECT_ROOT}/target/bench/listobjects-verified-$(date +%Y%m%d-%H%M%S)}"
 DATA_ROOT="${DATA_ROOT:-/private/tmp/listobjects-verified-$(date +%Y%m%d-%H%M%S)}"
-RUSTFS_BIN="${RUSTFS_BIN:-${PROJECT_ROOT}/target/debug/rustfs}"
+BUILD_PROFILE="${BUILD_PROFILE:-debug}"
+RUSTFS_BIN_USER_SET="false"
+if [[ -n "${RUSTFS_BIN:-}" ]]; then
+  RUSTFS_BIN_USER_SET="true"
+else
+  RUSTFS_BIN="${PROJECT_ROOT}/target/${BUILD_PROFILE}/rustfs"
+fi
 WARP_BIN="${WARP_BIN:-warp}"
 ADDRESS="${ADDRESS:-127.0.0.1:9000}"
 ENDPOINT="${ENDPOINT:-http://${ADDRESS}}"
@@ -19,9 +25,16 @@ MAX_KEYS="${MAX_KEYS:-1000}"
 DURATION="${DURATION:-20s}"
 WARMUP_DURATION="${WARMUP_DURATION:-5s}"
 METER_INTERVAL="${METER_INTERVAL:-1}"
+RESOURCE_SAMPLE_INTERVAL="${RESOURCE_SAMPLE_INTERVAL:-1}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
+INDEX_PROVIDER="${INDEX_PROVIDER:-persistent_key_only}"
+INDEX_GENERATION="${INDEX_GENERATION:-bench-$(date +%Y%m%d%H%M%S)}"
+KEY_INDEX_PATH="${KEY_INDEX_PATH:-${OUT_DIR}/persistent-key-only.index}"
+PROMETHEUS_QUERY_URL="${PROMETHEUS_QUERY_URL:-http://localhost:9090/api/v1/query}"
+PROMETHEUS_JOB="${PROMETHEUS_JOB:-rustfs-app-metrics}"
 
 SERVER_PID=""
+RESOURCE_SAMPLER_PID=""
 
 log_info() { printf '[INFO] %s\n' "$*"; }
 log_warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -45,13 +58,20 @@ Options:
   --warmup-duration <d>  Warmup duration before timed run (default: 5s).
   --concurrency <n>      warp --concurrent value (default: 16).
   --max-keys <n>         warp --max-keys value (default: 1000).
+  --release              Build and run target/release/rustfs.
   --skip-build           Use existing RustFS binary.
+  --index-provider <v>   Opt-in provider (default: persistent_key_only).
+  --key-index-path <p>   Persistent key-only index path.
+  --prometheus-query-url <url>
+                         Prometheus API query URL or UI /query URL.
   -h, --help             Show this help.
 
 Environment:
   OUT_DIR, DATA_ROOT, RUSTFS_BIN, WARP_BIN, ADDRESS, ACCESS_KEY, SECRET_KEY,
   REGION, OBJECTS, OBJECT_SIZE, CONCURRENCY, MAX_KEYS, DURATION,
-  WARMUP_DURATION, METER_INTERVAL, SKIP_BUILD.
+  WARMUP_DURATION, METER_INTERVAL, RESOURCE_SAMPLE_INTERVAL, SKIP_BUILD,
+  BUILD_PROFILE, INDEX_PROVIDER, INDEX_GENERATION, KEY_INDEX_PATH,
+  PROMETHEUS_QUERY_URL, PROMETHEUS_JOB.
 USAGE
 }
 
@@ -67,14 +87,24 @@ parse_args() {
     case "$1" in
       --out-dir) OUT_DIR="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --data-root) DATA_ROOT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
-      --rustfs-bin) RUSTFS_BIN="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --rustfs-bin) RUSTFS_BIN="$(arg_value "$1" "${2:-}")"; RUSTFS_BIN_USER_SET="true"; shift 2 ;;
       --warp-bin) WARP_BIN="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --objects) OBJECTS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --duration) DURATION="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --warmup-duration) WARMUP_DURATION="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --concurrency) CONCURRENCY="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --max-keys) MAX_KEYS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --release)
+        BUILD_PROFILE="release"
+        if [[ "$RUSTFS_BIN_USER_SET" == "false" ]]; then
+          RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
+        fi
+        shift
+        ;;
       --skip-build) SKIP_BUILD="true"; shift ;;
+      --index-provider) INDEX_PROVIDER="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --key-index-path) KEY_INDEX_PATH="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --prometheus-query-url) PROMETHEUS_QUERY_URL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown arg: $1" ;;
     esac
@@ -94,16 +124,42 @@ build_rustfs() {
     [[ -x "$RUSTFS_BIN" ]] || die "RustFS binary is not executable: $RUSTFS_BIN"
     return
   fi
-  (cd "$PROJECT_ROOT" && cargo build -p rustfs)
+  if [[ "$BUILD_PROFILE" == "release" ]]; then
+    (cd "$PROJECT_ROOT" && cargo build -p rustfs --release)
+  else
+    (cd "$PROJECT_ROOT" && cargo build -p rustfs)
+  fi
   [[ -x "$RUSTFS_BIN" ]] || die "RustFS binary is not executable after build: $RUSTFS_BIN"
 }
 
 stop_server() {
+  stop_resource_sampler
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
     wait "$SERVER_PID" >/dev/null 2>&1 || true
   fi
   SERVER_PID=""
+}
+
+stop_resource_sampler() {
+  if [[ -n "$RESOURCE_SAMPLER_PID" ]] && kill -0 "$RESOURCE_SAMPLER_PID" >/dev/null 2>&1; then
+    kill "$RESOURCE_SAMPLER_PID" >/dev/null 2>&1 || true
+    wait "$RESOURCE_SAMPLER_PID" >/dev/null 2>&1 || true
+  fi
+  RESOURCE_SAMPLER_PID=""
+}
+
+start_resource_sampler() {
+  local out_file="$1"
+  local pid="$SERVER_PID"
+  echo "unix_ts,pid,cpu_percent,rss_kib" >"$out_file"
+  (
+    while kill -0 "$pid" >/dev/null 2>&1; do
+      ps -p "$pid" -o pid=,%cpu=,rss= | awk -v ts="$(date +%s)" '{printf "%s,%s,%s,%s\n", ts, $1, $2, $3}'
+      sleep "$RESOURCE_SAMPLE_INTERVAL"
+    done
+  ) >>"$out_file" 2>/dev/null &
+  RESOURCE_SAMPLER_PID="$!"
 }
 
 wait_for_health() {
@@ -158,9 +214,15 @@ start_server() {
     export RUSTFS_REGION="$REGION"
     unset RUSTFS_LIST_OBJECTS_INDEX_MODE
     unset RUSTFS_LIST_OBJECTS_INDEX_PROVIDER
+    unset RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH
+    unset RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION
     if [[ "$mode" == "opt_in_verified" ]]; then
       export RUSTFS_LIST_OBJECTS_INDEX_MODE=index_key_only
-      export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER=walker_key_only
+      export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER="$INDEX_PROVIDER"
+      if [[ "$INDEX_PROVIDER" == "persistent_key_only" || "$INDEX_PROVIDER" == "persisted_key_only" ]]; then
+        export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH="$KEY_INDEX_PATH"
+        export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION="$INDEX_GENERATION"
+      fi
     fi
     exec "$RUSTFS_BIN" server \
       "${DATA_ROOT}/d1" \
@@ -192,6 +254,52 @@ prepare_bucket() {
     --noclear \
     --no-color \
     >"$log_file" 2>&1
+}
+
+write_key_index() {
+  local bucket="$1"
+  local index_path="$2"
+  local index_dir tmp_keys tmp_index token page response_file next_token
+  index_dir="$(dirname "$index_path")"
+  tmp_keys="${index_path}.keys.tmp"
+  tmp_index="${index_path}.tmp"
+  mkdir -p "$index_dir"
+  : >"$tmp_keys"
+
+  token=""
+  page=0
+  while true; do
+    local url="${ENDPOINT}/${bucket}?list-type=2&max-keys=${MAX_KEYS}"
+    if [[ -n "$token" ]]; then
+      local encoded_token
+      encoded_token="$(printf '%s' "$token" | urlencode)"
+      url="${url}&continuation-token=${encoded_token}"
+    fi
+
+    response_file="${index_path}.page-${page}.xml"
+    curl -fsS \
+      --user "${ACCESS_KEY}:${SECRET_KEY}" \
+      --aws-sigv4 "aws:amz:${REGION}:s3" \
+      -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+      -o "$response_file" \
+      "$url"
+    extract_xml_keys <"$response_file" >>"$tmp_keys" || true
+    next_token="$(extract_next_token <"$response_file" || true)"
+    rm -f "$response_file"
+    if [[ -z "$next_token" ]]; then
+      break
+    fi
+    token="$next_token"
+    page=$((page + 1))
+  done
+
+  {
+    echo "# rustfs-listobjects-key-only-v1"
+    echo "# generation=${INDEX_GENERATION}"
+    LC_ALL=C sort -u "$tmp_keys"
+  } >"$tmp_index"
+  mv "$tmp_index" "$index_path"
+  rm -f "$tmp_keys"
 }
 
 extract_xml_keys() {
@@ -388,6 +496,68 @@ write_ratio_summary() {
   } >"$csv_file"
 }
 
+prometheus_api_query_url() {
+  local url="$PROMETHEUS_QUERY_URL"
+  if [[ "$url" == */api/v1/query ]]; then
+    printf '%s\n' "$url"
+  elif [[ "$url" == */query ]]; then
+    printf '%s/api/v1/query\n' "${url%/query}"
+  else
+    printf '%s\n' "$url"
+  fi
+}
+
+query_prometheus_expr() {
+  local expr="$1"
+  local out_file="$2"
+  local api_url
+  api_url="$(prometheus_api_query_url)"
+  curl -fsS --get --data-urlencode "query=${expr}" "$api_url" -o "$out_file"
+}
+
+write_prometheus_snapshot() {
+  local mode="$1"
+  local out_dir="$2"
+  local prom_dir="$out_dir/prometheus"
+  mkdir -p "$prom_dir"
+
+  query_prometheus_expr "sum(rustfs_s3_list_objects_index_attempt_total)" "$prom_dir/index_attempt_total.json" || {
+    log_warn "Prometheus query failed; skipping Prometheus snapshot for mode=$mode"
+    return 0
+  }
+  query_prometheus_expr "sum(rustfs_s3_list_objects_index_fallback_total)" "$prom_dir/index_fallback_total.json" || true
+  query_prometheus_expr "sum(rustfs_s3_list_objects_index_served_total)" "$prom_dir/index_served_total.json" || true
+  query_prometheus_expr "sum(rustfs_s3_list_objects_index_live_verify_attempts_sum)" "$prom_dir/live_verify_attempts_sum.json" || true
+  query_prometheus_expr "sum(rustfs_s3_list_objects_index_live_verify_misses_sum)" "$prom_dir/live_verify_misses_sum.json" || true
+  query_prometheus_expr "sum(rustfs_s3_list_objects_index_returned_objects_sum)" "$prom_dir/returned_objects_sum.json" || true
+  query_prometheus_expr "sum(rustfs_s3_list_objects_index_verification_io_amplification_sum) / sum(rustfs_s3_list_objects_index_verification_io_amplification_count)" "$prom_dir/verification_io_amplification_avg.json" || true
+  query_prometheus_expr "rate(process_cpu_seconds_total{job=\"${PROMETHEUS_JOB}\"}[1m])" "$prom_dir/process_cpu_rate_1m.json" || true
+  query_prometheus_expr "process_resident_memory_bytes{job=\"${PROMETHEUS_JOB}\"}" "$prom_dir/process_resident_memory_bytes.json" || true
+}
+
+write_resource_summary() {
+  local samples_file="$1"
+  local summary_file="$2"
+  awk -F',' '
+    NR == 1 { next }
+    NF >= 4 {
+      cpu += $3
+      rss += $4
+      if ($3 > max_cpu) max_cpu = $3
+      if ($4 > max_rss) max_rss = $4
+      count += 1
+    }
+    END {
+      print "samples,avg_cpu_percent,max_cpu_percent,avg_rss_mib,max_rss_mib"
+      if (count == 0) {
+        print "0,N/A,N/A,N/A,N/A"
+      } else {
+        printf "%d,%.6f,%.6f,%.6f,%.6f\n", count, cpu / count, max_cpu, (rss / count) / 1024.0, max_rss / 1024.0
+      }
+    }
+  ' "$samples_file" >"$summary_file"
+}
+
 run_mode() {
   local mode="$1"
   local bucket="$2"
@@ -397,11 +567,15 @@ run_mode() {
 
   log_info "Starting RustFS for mode=$mode"
   start_server "$mode" "$mode_dir/rustfs.log" "$reset_data"
+  start_resource_sampler "$mode_dir/resource-samples.csv"
 
   log_info "Signed ListObjectsV2 bench for mode=$mode duration=$DURATION"
   run_signed_list_bench "$mode" "$bucket" "$DURATION" "$mode_dir"
+  stop_resource_sampler
   sleep "$((METER_INTERVAL + 2))"
   write_ratio_summary "$mode" "$mode_dir/rustfs.log" "$mode_dir/index-ratios.csv"
+  write_resource_summary "$mode_dir/resource-samples.csv" "$mode_dir/resource-summary.csv"
+  write_prometheus_snapshot "$mode" "$mode_dir"
   stop_server
 }
 
@@ -410,6 +584,7 @@ write_manifest() {
   {
     echo "out_dir=$OUT_DIR"
     echo "data_root=$DATA_ROOT"
+    echo "build_profile=$BUILD_PROFILE"
     echo "rustfs_bin=$RUSTFS_BIN"
     echo "warp_bin=$WARP_BIN"
     echo "address=$ADDRESS"
@@ -420,6 +595,12 @@ write_manifest() {
     echo "duration=$DURATION"
     echo "warmup_duration=$WARMUP_DURATION"
     echo "meter_interval=$METER_INTERVAL"
+    echo "resource_sample_interval=$RESOURCE_SAMPLE_INTERVAL"
+    echo "index_provider=$INDEX_PROVIDER"
+    echo "index_generation=$INDEX_GENERATION"
+    echo "key_index_path=$KEY_INDEX_PATH"
+    echo "prometheus_query_url=$PROMETHEUS_QUERY_URL"
+    echo "prometheus_job=$PROMETHEUS_JOB"
   } >"$OUT_DIR/manifest.env"
 }
 
@@ -451,6 +632,16 @@ write_combined_summary() {
     echo "### Opt-in verified"
     echo
     cat "$OUT_DIR/opt_in_verified/index-ratios.csv"
+    echo
+    echo "## Resource Samples"
+    echo
+    echo "### Walker"
+    echo
+    cat "$OUT_DIR/walker/resource-summary.csv"
+    echo
+    echo "### Opt-in verified"
+    echo
+    cat "$OUT_DIR/opt_in_verified/resource-summary.csv"
   } >"$summary"
 }
 
@@ -472,6 +663,8 @@ main() {
     tail -n 80 "$prep_dir/warp-prepare.log" >&2 || true
     return 1
   }
+  log_info "Writing persistent key-only index: $KEY_INDEX_PATH"
+  write_key_index "$bucket" "$KEY_INDEX_PATH"
   stop_server
 
   run_mode walker "$bucket" false
