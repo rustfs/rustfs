@@ -40,7 +40,7 @@ use std::pin::Pin;
 use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 const LOG_COMPONENT_IAM: &str = "iam";
@@ -327,7 +327,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             let request_headers = format_http_headers(&parts.headers);
             let request_body_len = body.len();
             let request_body = format_http_body(&body);
-            info!(
+            debug!(
                 event = EVENT_OIDC_HTTP,
                 component = LOG_COMPONENT_IAM,
                 subsystem = LOG_SUBSYSTEM_OIDC,
@@ -387,7 +387,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             let response_headers = format_http_headers(&headers);
             let response_body_len = body_bytes.len();
             let response_body = format_http_body(&body_bytes);
-            info!(
+            debug!(
                 event = EVENT_OIDC_HTTP,
                 component = LOG_COMPONENT_IAM,
                 subsystem = LOG_SUBSYSTEM_OIDC,
@@ -1120,7 +1120,7 @@ impl OidcSys {
         let groups_claim_values = extract_groups_claim(&claims.raw, &config.groups_claim);
         let roles_claim_values = extract_groups_claim(&claims.raw, &config.roles_claim);
 
-        info!(
+        debug!(
             event = EVENT_OIDC_DIAGNOSTICS,
             component = LOG_COMPONENT_IAM,
             subsystem = LOG_SUBSYSTEM_OIDC,

@@ -142,7 +142,7 @@ async fn log_oidc_policy_diagnostics(
         let policy_documents = BTreeMap::<String, Value>::new();
         let missing_policies = Vec::<String>::new();
         let combined_policy = Value::Null;
-        info!(
+        debug!(
             provider_id = %provider_id,
             parent_user = %parent_user,
             policy_count = 0,
@@ -182,7 +182,7 @@ async fn log_oidc_policy_diagnostics(
                 })
             });
 
-            info!(
+            debug!(
                 provider_id = %provider_id,
                 parent_user = %parent_user,
                 policy_count = policies.len(),
@@ -437,7 +437,7 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
         return Err(s3_error!(InvalidArgument, "no policies are available for this OIDC token"));
     }
 
-    info!(
+    debug!(
         provider_id = %provider_id,
         username = %claims.username,
         policy_count = policies.len(),
@@ -521,7 +521,7 @@ pub async fn create_oidc_sts_credentials(
 
     // Set the parent user: prefer username, then email, then sub
     let parent_user = resolve_oidc_session_identity(claims);
-    info!(
+    debug!(
         provider_id = %provider_id,
         parent_user = %parent_user,
         email = %claims.email,

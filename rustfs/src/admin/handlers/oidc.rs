@@ -38,7 +38,7 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error}
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
@@ -468,7 +468,7 @@ impl Operation for OidcAuthorizeHandler {
                 S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}"))
             })?;
 
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
@@ -556,7 +556,7 @@ impl Operation for OidcCallbackHandler {
                 S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
             })?;
 
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
@@ -568,7 +568,7 @@ impl Operation for OidcCallbackHandler {
         // Map claims to policies and groups
         let (policies, groups) = oidc_sys.map_claims_to_policies(&actual_provider_id, &claims);
 
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
