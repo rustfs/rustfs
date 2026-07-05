@@ -410,11 +410,17 @@ async fn build_http_client(
     tuning: InternodeHttpClientTuning,
     outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState,
 ) -> io::Result<Client> {
+    // Keep the data-plane HTTP/2 keepalive timeout consistent with the control-plane
+    // gRPC channel and env-configurable. A too-aggressive value (e.g. 3s) tears down a
+    // busy data connection when a PING ACK is delayed under load, aborting in-flight
+    // shard read streams and truncating large-object GETs mid-stream (backlog#832).
+    let http2_keepalive_timeout_secs = get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS)
+        .unwrap_or(rustfs_config::DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS);
     let mut builder = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .tcp_keepalive(std::time::Duration::from_secs(10))
         .http2_keep_alive_interval(std::time::Duration::from_secs(5))
-        .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(http2_keepalive_timeout_secs))
         .http2_keep_alive_while_idle(true);
     builder = apply_http_client_tuning(builder, tuning);
 

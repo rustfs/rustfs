@@ -25,12 +25,19 @@ pub const ENV_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS: &str = "RUSTFS_INTERNODE_
 pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 5;
 
 /// HTTP/2 keepalive timeout for internode gRPC channels.
+///
+/// This is the time a peer has to ACK a keepalive PING before the whole channel
+/// (and every RPC/stream multiplexed on it) is torn down. A very aggressive value
+/// misfires under load: on a saturated node the PING ACK is legitimately delayed,
+/// the channel is wrongly declared dead, in-flight peer reads fail, and large-object
+/// GETs truncate mid-stream (client "unexpected EOF"). See backlog#832. Keep this
+/// generous enough to tolerate transient load while still detecting truly dead peers.
 pub const ENV_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS";
-pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 3;
+pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
 
 /// Overall timeout for a single internode gRPC request.
 pub const ENV_INTERNODE_RPC_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS";
-pub const DEFAULT_INTERNODE_RPC_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_INTERNODE_RPC_TIMEOUT_SECS: u64 = 30;
 
 /// Profile selector for conservative internode HTTP data-plane client tuning.
 pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";
@@ -73,8 +80,8 @@ mod tests {
         assert_eq!(DEFAULT_INTERNODE_CONNECT_TIMEOUT_SECS, 3);
         assert_eq!(DEFAULT_INTERNODE_TCP_KEEPALIVE_SECS, 10);
         assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS, 5);
-        assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS, 3);
-        assert_eq!(DEFAULT_INTERNODE_RPC_TIMEOUT_SECS, 10);
+        assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS, 20);
+        assert_eq!(DEFAULT_INTERNODE_RPC_TIMEOUT_SECS, 30);
         assert_eq!(DEFAULT_INTERNODE_HTTP_TUNING_PROFILE, "legacy");
     }
 
