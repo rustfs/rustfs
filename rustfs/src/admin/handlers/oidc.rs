@@ -38,7 +38,7 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error}
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
@@ -448,17 +448,34 @@ impl Operation for OidcAuthorizeHandler {
 
         // Optional: redirect_after query parameter (must be a safe relative path)
         let redirect_after = extract_safe_redirect_after(&req.uri)?;
+        let redirect_after_log = redirect_after.clone();
 
         let auth_url = oidc_sys
             .authorize_url(provider_id, &redirect_uri, redirect_after)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}")))?;
+            .map_err(|e| {
+                error!(
+                    event = EVENT_ADMIN_OIDC_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "authorize_url_failed",
+                    provider_id = %provider_id,
+                    redirect_uri = %redirect_uri,
+                    redirect_after = ?redirect_after_log,
+                    error = %e,
+                    "admin oidc state"
+                );
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}"))
+            })?;
 
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %provider_id,
+            redirect_uri = %redirect_uri,
+            redirect_after = ?redirect_after_log,
+            auth_url = %auth_url,
             state = "authorize_redirect",
             "admin oidc state"
         );
@@ -490,20 +507,14 @@ impl Operation for OidcCallbackHandler {
             return Err(s3_error!(InvalidRequest, "invalid provider_id"));
         }
 
-        // Extract code and state from query parameters
-        let code =
-            extract_query_param(&req.uri, "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
-        let state =
-            extract_query_param(&req.uri, "state").ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
-
         // Check for error response from IdP
-        if let Some(error) = extract_query_param(&req.uri, "error") {
-            let desc = extract_query_param(&req.uri, "error_description").unwrap_or_default();
+        if let Some((error, desc)) = extract_idp_callback_error(&req.uri) {
             warn!(
                 event = EVENT_ADMIN_OIDC_STATE,
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_OIDC,
                 result = "idp_callback_error",
+                provider_id = %provider_id,
                 error_code = %error,
                 error_description = %desc,
                 "admin oidc state"
@@ -513,6 +524,12 @@ impl Operation for OidcCallbackHandler {
                 format!("OIDC authentication failed: {error} - {desc}"),
             ));
         }
+
+        // Extract code and state from query parameters
+        let code =
+            extract_query_param(&req.uri, "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
+        let state =
+            extract_query_param(&req.uri, "state").ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
 
         let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
@@ -526,13 +543,19 @@ impl Operation for OidcCallbackHandler {
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_OIDC,
                     result = "code_exchange_failed",
+                    requested_provider_id = %provider_id,
+                    redirect_uri = %redirect_uri,
+                    code = %code,
+                    state = %state,
+                    code_len = code.len(),
+                    state_len = state.len(),
                     error = %e,
                     "admin oidc state"
                 );
                 S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
             })?;
 
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
@@ -544,13 +567,15 @@ impl Operation for OidcCallbackHandler {
         // Map claims to policies and groups
         let (policies, groups) = oidc_sys.map_claims_to_policies(&actual_provider_id, &claims);
 
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %actual_provider_id,
             policy_count = policies.len(),
             group_count = groups.len(),
+            policies = ?policies,
+            groups = ?groups,
             state = "claims_mapped",
             "admin oidc state"
         );
@@ -672,6 +697,12 @@ fn extract_query_param(uri: &http::Uri, key: &str) -> Option<String> {
             })
             .next()
     })
+}
+
+fn extract_idp_callback_error(uri: &http::Uri) -> Option<(String, String)> {
+    let error = extract_query_param(uri, "error")?;
+    let desc = extract_query_param(uri, "error_description").unwrap_or_default();
+    Some((error, desc))
 }
 
 fn extract_safe_redirect_after(uri: &http::Uri) -> S3Result<Option<String>> {
@@ -1170,6 +1201,18 @@ mod tests {
     fn test_extract_query_param_encoded() {
         let uri: http::Uri = "http://localhost/callback?redirect_after=%2Fdashboard".parse().unwrap();
         assert_eq!(extract_query_param(&uri, "redirect_after"), Some("/dashboard".to_string()));
+    }
+
+    #[test]
+    fn test_extract_idp_callback_error_without_code() {
+        let uri: http::Uri = "http://localhost/callback?error=access_denied&error_description=Denied%20by%20IdP&state=xyz789"
+            .parse()
+            .expect("valid callback URI should parse");
+
+        let (error, desc) = extract_idp_callback_error(&uri).expect("IdP callback error should be detected");
+        assert_eq!(error, "access_denied");
+        assert_eq!(desc, "Denied by IdP");
+        assert_eq!(extract_query_param(&uri, "code"), None);
     }
 
     #[test]
