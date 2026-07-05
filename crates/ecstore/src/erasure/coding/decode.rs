@@ -1031,8 +1031,8 @@ where
         // before the retirement pass mutates `self.readers` below.
         {
             let mut sets = FuturesUnordered::new();
-            let mut reader_iter = ReaderLaunchIter::new(&mut self.readers, &read_costs, locality_preference_enabled);
-            while let Some((i, reader)) = reader_iter.next() {
+            let reader_iter = ReaderLaunchIter::new(&mut self.readers, &read_costs, locality_preference_enabled);
+            for (i, reader) in reader_iter {
                 if reader.is_none() {
                     continue;
                 }
