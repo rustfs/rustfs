@@ -559,7 +559,9 @@ pub async fn create_oidc_sts_credentials(
     // Store temp user in IAM
     let iam_store =
         crate::admin::runtime_sources::current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
-    log_oidc_policy_diagnostics(&iam_store, provider_id, &new_cred.parent_user, policies, groups).await;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        log_oidc_policy_diagnostics(&iam_store, provider_id, &new_cred.parent_user, policies, groups).await;
+    }
 
     let updated_at = iam_store
         .set_temp_user(&new_cred.access_key, &new_cred, None)

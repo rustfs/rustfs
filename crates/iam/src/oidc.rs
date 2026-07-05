@@ -324,21 +324,22 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
             let (parts, body) = request.into_parts();
             let method = parts.method.clone();
             let uri = parts.uri.to_string();
-            let request_headers = format_http_headers(&parts.headers);
-            let request_body_len = body.len();
-            let request_body = format_http_body(&body);
-            debug!(
-                event = EVENT_OIDC_HTTP,
-                component = LOG_COMPONENT_IAM,
-                subsystem = LOG_SUBSYSTEM_OIDC,
-                result = "request",
-                method = %method,
-                uri = %uri,
-                request_headers = %request_headers,
-                request_body_len,
-                request_body = %request_body,
-                "oidc outbound http"
-            );
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let request_headers = format_http_headers(&parts.headers);
+                let request_body = format_http_body(&body);
+                debug!(
+                    event = EVENT_OIDC_HTTP,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "request",
+                    method = %method,
+                    uri = %uri,
+                    request_headers = %request_headers,
+                    request_body_len = body.len(),
+                    request_body = %request_body,
+                    "oidc outbound http"
+                );
+            }
 
             let client = self.client_for_uri(&uri);
             let response = client
@@ -384,24 +385,25 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                 );
                 OidcHttpError::Reqwest(err)
             })?;
-            let response_headers = format_http_headers(&headers);
-            let response_body_len = body_bytes.len();
-            let response_body = format_http_body(&body_bytes);
-            debug!(
-                event = EVENT_OIDC_HTTP,
-                component = LOG_COMPONENT_IAM,
-                subsystem = LOG_SUBSYSTEM_OIDC,
-                result = "response",
-                method = %method,
-                uri = %uri,
-                status = status.as_u16(),
-                status_success = status.is_success(),
-                elapsed_ms,
-                response_headers = %response_headers,
-                response_body_len,
-                response_body = %response_body,
-                "oidc outbound http"
-            );
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let response_headers = format_http_headers(&headers);
+                let response_body = format_http_body(&body_bytes);
+                debug!(
+                    event = EVENT_OIDC_HTTP,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "response",
+                    method = %method,
+                    uri = %uri,
+                    status = status.as_u16(),
+                    status_success = status.is_success(),
+                    elapsed_ms,
+                    response_headers = %response_headers,
+                    response_body_len = body_bytes.len(),
+                    response_body = %response_body,
+                    "oidc outbound http"
+                );
+            }
 
             let mut http_response = http::Response::builder()
                 .status(status)

@@ -507,15 +507,8 @@ impl Operation for OidcCallbackHandler {
             return Err(s3_error!(InvalidRequest, "invalid provider_id"));
         }
 
-        // Extract code and state from query parameters
-        let code =
-            extract_query_param(&req.uri, "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
-        let state =
-            extract_query_param(&req.uri, "state").ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
-
         // Check for error response from IdP
-        if let Some(error) = extract_query_param(&req.uri, "error") {
-            let desc = extract_query_param(&req.uri, "error_description").unwrap_or_default();
+        if let Some((error, desc)) = extract_idp_callback_error(&req.uri) {
             warn!(
                 event = EVENT_ADMIN_OIDC_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -531,6 +524,12 @@ impl Operation for OidcCallbackHandler {
                 format!("OIDC authentication failed: {error} - {desc}"),
             ));
         }
+
+        // Extract code and state from query parameters
+        let code =
+            extract_query_param(&req.uri, "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
+        let state =
+            extract_query_param(&req.uri, "state").ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
 
         let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
@@ -698,6 +697,12 @@ fn extract_query_param(uri: &http::Uri, key: &str) -> Option<String> {
             })
             .next()
     })
+}
+
+fn extract_idp_callback_error(uri: &http::Uri) -> Option<(String, String)> {
+    let error = extract_query_param(uri, "error")?;
+    let desc = extract_query_param(uri, "error_description").unwrap_or_default();
+    Some((error, desc))
 }
 
 fn extract_safe_redirect_after(uri: &http::Uri) -> S3Result<Option<String>> {
@@ -1196,6 +1201,18 @@ mod tests {
     fn test_extract_query_param_encoded() {
         let uri: http::Uri = "http://localhost/callback?redirect_after=%2Fdashboard".parse().unwrap();
         assert_eq!(extract_query_param(&uri, "redirect_after"), Some("/dashboard".to_string()));
+    }
+
+    #[test]
+    fn test_extract_idp_callback_error_without_code() {
+        let uri: http::Uri = "http://localhost/callback?error=access_denied&error_description=Denied%20by%20IdP&state=xyz789"
+            .parse()
+            .expect("valid callback URI should parse");
+
+        let (error, desc) = extract_idp_callback_error(&uri).expect("IdP callback error should be detected");
+        assert_eq!(error, "access_denied");
+        assert_eq!(desc, "Denied by IdP");
+        assert_eq!(extract_query_param(&uri, "code"), None);
     }
 
     #[test]
