@@ -278,6 +278,115 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertIn("SELECT COUNT(*)", databend["sql"])
         self.assertEqual(databend["iceberg_rest_catalog"], "not-claimed")
 
+    def test_live_conformance_harness_records_evidence_contract(self) -> None:
+        harness = engine_compatibility.live_conformance_harness(
+            endpoint="http://127.0.0.1:9000",
+            warehouse="rustfs-s3table-smoke",
+            access_key="rustfsadmin",
+            secret_key="rustfsadmin",
+            region="us-east-1",
+            catalog_name="rustfs",
+            namespace="smoke",
+            table="events",
+            rest_path="/iceberg",
+            rest_signing_name="s3",
+            pyiceberg_version="0.10.0",
+            spark_version="3.5.4",
+            iceberg_version="1.7.1",
+            scala_version="2.12",
+        )
+
+        evidence = harness["evidence"]
+        self.assertEqual(evidence["result"], "operator-recorded")
+        self.assertIn("rustfs_build", evidence["required_run_metadata"])
+        self.assertIn("catalog_backing", evidence["required_run_metadata"])
+        self.assertIn("client_version", evidence["required_run_metadata"])
+        self.assertIn("metadata_location", evidence["required_run_metadata"])
+        self.assertIn("expected_status", evidence["required_run_metadata"])
+        self.assertIn("observed_status", evidence["required_run_metadata"])
+
+        table_by_client = {row["client"]: row for row in evidence["result_table_template"]}
+        self.assertEqual(table_by_client["PyIceberg"]["claim_after_pass"], "automated-smoke")
+        self.assertEqual(table_by_client["Spark Iceberg REST catalog"]["claim_after_pass"], "manual-live-verified")
+        self.assertEqual(table_by_client["Trino Iceberg REST catalog"]["write_claim_after_pass"], "not-claimed")
+        self.assertEqual(table_by_client["DuckDB Iceberg"]["write_claim_after_pass"], "not-claimed")
+        self.assertIn("manual-live", " ".join(evidence["promotion_rules"]))
+        self.assertIn("not-claimed", " ".join(evidence["promotion_rules"]))
+
+    def test_production_operations_guide_covers_release_boundaries(self) -> None:
+        guide = engine_compatibility.production_operations_guide(
+            endpoint="http://127.0.0.1:9000",
+            warehouse="rustfs-s3table-smoke",
+            namespace="smoke",
+            table="events",
+            rest_path="/iceberg",
+        )
+
+        self.assertEqual(guide["claim_boundary"], "Iceberg REST Catalog S3 Tables implementation")
+        section_by_name = {section["name"]: section for section in guide["sections"]}
+
+        self.assertIn("live-client-conformance", section_by_name)
+        self.assertIn("catalog-backing-cutover", section_by_name)
+        self.assertIn("maintenance-operations", section_by_name)
+        self.assertIn("recovery-and-disaster-rehearsal", section_by_name)
+        self.assertIn("permissions-and-credentials", section_by_name)
+        self.assertIn("unsupported-claim-governance", section_by_name)
+
+        cutover = section_by_name["catalog-backing-cutover"]
+        self.assertIn("GET /iceberg/v1/rustfs-s3table-smoke/catalog/migration", cutover["commands"])
+        self.assertIn("blockers is empty", " ".join(cutover["pass_criteria"]))
+
+        maintenance = section_by_name["maintenance-operations"]
+        self.assertIn("quarantine", " ".join(maintenance["fail_closed_signals"]))
+        self.assertIn("audit-events", " ".join(maintenance["required_evidence"]))
+
+        unsupported = section_by_name["unsupported-claim-governance"]
+        self.assertIn("full AWS S3 Tables control-plane API parity", unsupported["not_claimed"])
+        self.assertNotIn("fully compatible", json.dumps(guide).lower())
+
+    def test_production_operations_guide_threads_target_args_into_commands(self) -> None:
+        guide = engine_compatibility.production_operations_guide(
+            endpoint="https://rustfs.example.com",
+            warehouse="lakehouse-prod",
+            namespace="sales",
+            table="orders",
+            rest_path="/_iceberg",
+        )
+
+        live = {section["name"]: section for section in guide["sections"]}["live-client-conformance"]
+        commands = "\n".join(live["commands"])
+
+        self.assertIn("--endpoint https://rustfs.example.com", commands)
+        self.assertIn("--bucket lakehouse-prod", commands)
+        self.assertIn("--warehouse lakehouse-prod", commands)
+        self.assertIn("--namespace sales", commands)
+        self.assertIn("--table orders", commands)
+        self.assertIn("--rest-path /_iceberg", commands)
+        self.assertNotIn("rustfs-s3table-smoke", commands)
+
+    def test_production_operations_guide_encodes_catalog_path_segments(self) -> None:
+        guide = engine_compatibility.production_operations_guide(
+            endpoint="http://127.0.0.1:9000",
+            warehouse="lake bucket",
+            namespace="sales/prod",
+            table="orders table",
+            rest_path="/_iceberg",
+        )
+
+        section_by_name = {section["name"]: section for section in guide["sections"]}
+        cutover = section_by_name["catalog-backing-cutover"]
+        maintenance = section_by_name["maintenance-operations"]
+        recovery = section_by_name["recovery-and-disaster-rehearsal"]
+        credentials = section_by_name["permissions-and-credentials"]
+
+        self.assertIn("GET /_iceberg/v1/lake%20bucket/catalog/migration", cutover["commands"])
+        encoded_table_path = "/_iceberg/v1/lake%20bucket/namespaces/sales%2Fprod/tables/orders%20table"
+        for commands in [maintenance["commands"], recovery["commands"], credentials["commands"]]:
+            rendered = "\n".join(commands)
+            self.assertIn(encoded_table_path, rendered)
+            self.assertNotIn("orders table", rendered)
+            self.assertNotIn("/namespaces/sales/prod/", rendered)
+
     def test_cli_prints_live_conformance_harness(self) -> None:
         payload = engine_compatibility.cli_json(
             [
@@ -295,6 +404,29 @@ class EngineCompatibilityTest(unittest.TestCase):
 
         self.assertEqual(document["live_conformance"]["mode"], "manual-or-ci-optional")
         self.assertEqual(document["live_conformance"]["expected_results"]["row_count"], 2)
+        self.assertIn("evidence", document["live_conformance"])
+
+    def test_cli_prints_production_operations_guide(self) -> None:
+        payload = engine_compatibility.cli_json(
+            [
+                "--print-operations-guide",
+                "--warehouse",
+                "rustfs-s3table-smoke",
+                "--namespace",
+                "smoke",
+                "--table",
+                "events",
+            ]
+        )
+        document = json.loads(payload)
+
+        self.assertEqual(
+            document["production_operations_guide"]["claim_boundary"],
+            "Iceberg REST Catalog S3 Tables implementation",
+        )
+        sections = {section["name"] for section in document["production_operations_guide"]["sections"]}
+        self.assertIn("live-client-conformance", sections)
+        self.assertIn("unsupported-claim-governance", sections)
 
     def test_live_conformance_harness_sanitizes_sql_file_path(self) -> None:
         harness = engine_compatibility.live_conformance_harness(
