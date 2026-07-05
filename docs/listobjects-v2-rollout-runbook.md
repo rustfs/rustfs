@@ -1,0 +1,152 @@
+# ListObjectsV2 Optimization Rollout Runbook
+
+This runbook defines the operator and maintainer contract for ListObjectsV2
+source modes. The default RustFS ListObjectsV2 path remains walker-backed unless
+an explicit opt-in mode is configured.
+
+## Source Modes
+
+| Mode | Source label | Default | Metadata authority | Consistency contract | Serving status |
+| --- | --- | --- | --- | --- | --- |
+| Walker | `walker` | Yes | Live `xl.meta` | Strong default ListObjectsV2 path | Enabled |
+| Key-only index | `index_key_only` | No | Index proposes keys; live `xl.meta` verifies objects | Strong only after live verification | Prototype gate only |
+| Verified-page index | `index_verified_page` | No | Index proposes pages; live `xl.meta` verifies objects | Strong only after live verification | Prototype gate only |
+| Metadata-fast index | `index_metadata_fast` | No | Index snapshot metadata | Eventually consistent only | Not enabled |
+
+Never present `index_metadata_fast` as equivalent to the default S3-compatible
+walker path. It requires a separate staleness SLA, chaos evidence, and an
+immediate rollback path.
+
+## Feature Flags
+
+Current opt-in gate:
+
+```bash
+RUSTFS_LIST_OBJECTS_INDEX_MODE=index_key_only
+RUSTFS_LIST_OBJECTS_INDEX_MODE=key_only
+RUSTFS_LIST_OBJECTS_INDEX_MODE=index_verified_page
+RUSTFS_LIST_OBJECTS_INDEX_MODE=verified_page
+```
+
+Unset or unknown values keep the default walker path.
+
+`index_metadata_fast` is intentionally rejected by the current gate. It must not
+be enabled through the key-only or verified-page flag.
+
+## Immediate Rollback
+
+To return all ListObjectsV2 requests to the default walker path:
+
+1. Remove `RUSTFS_LIST_OBJECTS_INDEX_MODE`.
+2. Restart or reload the affected RustFS process according to the deployment
+   system.
+3. Confirm that ListObjectsV2 fallback/index counters stop increasing.
+4. Confirm normal walker gather/merge metrics continue to update.
+
+No data migration is required to roll back because index-backed modes are
+opt-in and the walker path remains authoritative.
+
+## Required Metrics
+
+Current implemented metrics:
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `rustfs_s3_list_objects_gather_total` | counter | `source`, `outcome`, `has_prefix`, `has_delimiter`, `has_marker` | Gather attempts and request shape |
+| `rustfs_s3_list_objects_gather_duration_ms` | histogram | `source`, `outcome` | Gather latency |
+| `rustfs_s3_list_objects_gather_scanned_entries` | histogram | `source` | Entries scanned before page output |
+| `rustfs_s3_list_objects_gather_returned_entries` | histogram | `source` | Entries returned before pagination trimming |
+| `rustfs_s3_list_objects_gather_filtered_entries` | histogram | `source` | Entries filtered before page output |
+| `rustfs_s3_list_objects_gather_scan_amplification` | histogram | `source` | Scanned-to-returned entry ratio |
+| `rustfs_s3_list_objects_gather_limit` | histogram | `source` | Internal gather limit |
+| `rustfs_s3_list_objects_merge_fan_in` | histogram | `source`, `outcome` | Merge input stream count |
+| `rustfs_s3_list_objects_merge_read_quorum` | histogram | `source`, `outcome` | Merge read quorum |
+| `rustfs_s3_list_objects_index_fallback_total` | counter | `source`, `reason` | Opt-in index attempts that fell back to walker |
+
+Future index manager metrics must add:
+
+- active source mode by bucket or cluster
+- index lifecycle state: disabled, rebuilding, healthy, lagging, degraded,
+  corrupt
+- active generation and staging generation
+- checkpoint high-water mark and mutation high-water mark
+- mutation lag and lag threshold
+- candidate keys proposed
+- live verification attempts, successes, misses, and failures
+- fallback ratio by source mode and reason
+
+## Alert Guidelines
+
+Recommended alerts before any index-backed serving rollout:
+
+| Condition | Severity | Action |
+| --- | --- | --- |
+| `index_fallback_total` increases after opt-in | Warning | Inspect `reason`; stay on walker if fallback dominates |
+| Lifecycle state is `rebuilding` longer than the rebuild SLO | Warning | Check rebuild worker progress and disk errors |
+| Lifecycle state is `lagging` | Warning or critical by lag | Roll back if lag exceeds the staleness budget |
+| Lifecycle state is `degraded` | Critical | Roll back to walker and inspect health reason |
+| Lifecycle state is `corrupt` | Critical | Roll back, discard generation, rebuild from walker/live metadata |
+| Metadata-fast enabled without SLA evidence | Critical | Disable immediately |
+
+## Compatibility Matrix
+
+| Workload / feature | Walker | Key-only live-verified | Verified-page live-verified | Metadata-fast eventually-consistent |
+| --- | --- | --- | --- | --- |
+| Unversioned bucket | Supported | Requires live verification | Requires live verification | Requires SLA |
+| Versioned bucket | Supported | Requires version-aware verifier | Requires version-aware verifier | Not allowed until chaos-proven |
+| Delete marker | Live authoritative | Live verifier must suppress stale objects | Live verifier must suppress stale objects | High risk; requires chaos evidence |
+| Overwrite | Live authoritative | Live verifier returns latest visible object | Live verifier returns latest visible object | Requires bounded staleness SLA |
+| Multipart complete | Live authoritative | Must verify completed object metadata | Must verify completed object metadata | Requires mutation journal proof |
+| Delimiter/common prefixes | Supported | Candidate page must preserve prefix boundary | Candidate page must preserve prefix boundary | Requires pagination SLA |
+| Continuation token | Walker cursor | Cursor must carry source/generation | Cursor must carry source/generation | Cursor must carry source/generation and staleness semantics |
+| Crash during rebuild | Walker unaffected | Must fall back if generation unpublished | Must fall back if generation unpublished | Must discard or reconcile staging generation |
+| Lagging index | Walker unaffected | Fall back walker | Fall back walker | Must expose stale-read contract and rollback |
+
+## Release Checklist
+
+Do not broaden rollout unless every item below has evidence attached to the PR
+or release tracker.
+
+- `cargo test -p rustfs-io-metrics list_objects_metrics`
+- `cargo test -p rustfs-ecstore list_index`
+- `cargo test -p rustfs-ecstore verified_index_candidates`
+- `cargo test -p rustfs-ecstore list_objects`
+- `cargo fmt --all --check`
+- Benchmark large bucket walker baseline.
+- Benchmark opt-in verified mode p50, p95, p99.
+- Record fallback ratio and fallback reasons.
+- Record live verification IO amplification.
+- Record CPU and allocation delta.
+- Run overwrite/delete/multipart-complete adversarial tests.
+- Run crash during rebuild and restart recovery tests.
+- Confirm rollback by unsetting `RUSTFS_LIST_OBJECTS_INDEX_MODE`.
+
+## Canary Gates
+
+Start with a bucket or cluster where stale listing risk is acceptable and
+operator coverage is active.
+
+Canary may proceed only if:
+
+- default walker correctness remains unchanged
+- fallback reasons are visible
+- fallback ratio is below the rollout threshold
+- p95 and p99 latency do not regress beyond the agreed SLO
+- live verification IO amplification is understood
+- no stale delete marker, stale overwrite, or multipart completion regression is
+  observed
+
+Canary must stop immediately if:
+
+- lifecycle state becomes degraded or corrupt
+- mutation lag exceeds the configured staleness budget
+- continuation tokens duplicate or skip objects
+- metadata-fast appears on a strong-consistency response path
+
+## Maintainer Notes
+
+The verified index path is allowed to accelerate candidate discovery only. It
+must not become a metadata authority. Any change that returns object metadata
+directly from an index snapshot belongs to metadata-fast and must use the
+eventually-consistent contract with separate feature flags, documentation,
+chaos tests, and rollback evidence.
