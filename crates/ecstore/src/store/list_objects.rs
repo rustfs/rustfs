@@ -44,7 +44,7 @@ use rustfs_io_metrics::{
     ListObjectsGatherObservation,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::duplex;
 use tokio::sync::OnceCell;
@@ -823,6 +823,81 @@ fn list_objects_paginate(
     }
 
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
+}
+
+fn list_objects_from_verified_index_candidates<F>(
+    prefix: &str,
+    marker: Option<&str>,
+    delimiter: &Option<String>,
+    max_keys: i32,
+    candidate_keys: &[String],
+    mut live_verify: F,
+) -> Result<ListObjectsInfo>
+where
+    F: FnMut(&str) -> Result<Option<ObjectInfo>>,
+{
+    let max_keys = normalize_max_keys(max_keys);
+    let page_limit = if max_keys <= 0 {
+        0
+    } else {
+        usize::try_from(max_keys_plus_one(max_keys, true)).unwrap_or(usize::MAX)
+    };
+    let mut objects = Vec::new();
+    let mut prefixes = BTreeSet::new();
+    let mut visible_candidates = 0usize;
+
+    for key in candidate_keys {
+        if marker.is_some_and(|marker| key.as_str() <= marker) || !key.starts_with(prefix) {
+            continue;
+        }
+
+        if let Some(separator) = delimiter
+            && !separator.is_empty()
+        {
+            let suffix = key.trim_start_matches(prefix);
+            if let Some((common_prefix, _)) = suffix.split_once(separator) {
+                prefixes.insert(format!("{prefix}{common_prefix}{separator}"));
+                visible_candidates += 1;
+                if page_limit > 0 && visible_candidates >= page_limit {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        if let Some(object) = live_verify(key)? {
+            objects.push(object);
+            visible_candidates += 1;
+            if page_limit > 0 && visible_candidates >= page_limit {
+                break;
+            }
+        }
+    }
+
+    let prefixes = prefixes
+        .into_iter()
+        .map(|prefix| ObjectInfo {
+            name: prefix,
+            is_dir: true,
+            ..ObjectInfo::from_file_info(&rustfs_filemeta::FileInfo::default(), "", "", false)
+        })
+        .collect::<Vec<_>>();
+    let disk_has_more = page_limit > 0 && visible_candidates >= page_limit;
+    let (objects, prefixes, is_truncated, next_marker, _) = list_objects_paginate(
+        objects.into_iter().chain(prefixes).collect(),
+        delimiter,
+        max_keys,
+        disk_has_more,
+        None,
+        false,
+    );
+
+    Ok(ListObjectsInfo {
+        is_truncated,
+        next_marker,
+        objects,
+        prefixes,
+    })
 }
 
 fn list_metadata_resolution_params(
@@ -4263,14 +4338,16 @@ mod test {
         ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, VersionMarker,
         enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
         latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
-        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_index_mode_from_env,
-        list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
-        parse_version_marker, record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry, resolve_listing_entries,
-        select_list_index_source_mode, send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
+        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_verified_index_candidates,
+        list_objects_index_mode_from_env, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
+        merge_entry_channels, normalize_list_quorum, parse_version_marker, record_list_objects_index_opt_in_fallback,
+        resolve_agreed_listing_entry, resolve_listing_entries, select_list_index_source_mode, send_or_cancel,
+        version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
     use crate::error::StorageError;
+    use crate::object_api::ObjectInfo;
     use rustfs_filemeta::{
         FileInfo, FileMeta, FileMetaVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetaDeleteMarker,
         VersionType,
@@ -4352,6 +4429,17 @@ mod test {
             name: name.to_owned(),
             ..Default::default()
         }
+    }
+
+    fn test_live_object_info(name: &str, etag: &str) -> ObjectInfo {
+        let mut fi = FileInfo {
+            name: name.to_owned(),
+            size: 1,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+            ..Default::default()
+        };
+        fi.metadata.insert("etag".to_string(), etag.to_string());
+        ObjectInfo::from_file_info(&fi, "bucket", name, false)
     }
 
     fn test_object_meta_entry(name: &str) -> MetaCacheEntry {
@@ -4955,6 +5043,75 @@ mod test {
             },
             ListSourceMode::IndexKeyOnly,
         );
+    }
+
+    #[test]
+    fn list_objects_verified_index_candidates_use_live_metadata_only() {
+        let candidates = vec![
+            "photos/2026/a.jpg".to_string(),
+            "photos/2026/b.jpg".to_string(),
+            "photos/2026/c.jpg".to_string(),
+        ];
+
+        let result = list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| {
+            Ok(Some(test_live_object_info(key, "live-etag")))
+        })
+        .expect("verified candidate listing should succeed");
+
+        assert_eq!(result.objects.len(), 3);
+        assert!(
+            result
+                .objects
+                .iter()
+                .all(|object| object.etag.as_deref() == Some("live-etag"))
+        );
+        assert!(result.prefixes.is_empty());
+        assert!(!result.is_truncated);
+    }
+
+    #[test]
+    fn list_objects_verified_index_candidates_apply_marker_and_delimiter_boundaries() {
+        let candidates = vec![
+            "photos/2025/old.jpg".to_string(),
+            "photos/2026/a.jpg".to_string(),
+            "photos/2026/archive/b.jpg".to_string(),
+            "photos/2026/archive/c.jpg".to_string(),
+            "photos/2026/d.jpg".to_string(),
+        ];
+
+        let result = list_objects_from_verified_index_candidates(
+            "photos/2026/",
+            Some("photos/2026/a.jpg"),
+            &Some("/".to_string()),
+            100,
+            &candidates,
+            |key| Ok(Some(test_live_object_info(key, "live-etag"))),
+        )
+        .expect("verified candidate listing should succeed");
+
+        assert_eq!(
+            result.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
+            vec!["photos/2026/d.jpg"]
+        );
+        assert_eq!(result.prefixes, vec!["photos/2026/archive/".to_string()]);
+        assert!(!result.is_truncated);
+    }
+
+    #[test]
+    fn list_objects_verified_index_candidates_drop_deleted_or_failed_live_verifications() {
+        let candidates = vec!["photos/2026/a.jpg".to_string(), "photos/2026/deleted.jpg".to_string()];
+
+        let result = list_objects_from_verified_index_candidates("photos/2026/", None, &None, 100, &candidates, |key| {
+            if key.ends_with("deleted.jpg") {
+                Ok(None)
+            } else {
+                Ok(Some(test_live_object_info(key, "live-etag")))
+            }
+        })
+        .expect("verified candidate listing should succeed");
+
+        assert_eq!(result.objects.len(), 1);
+        assert_eq!(result.objects[0].name, "photos/2026/a.jpg");
     }
 
     #[test]
