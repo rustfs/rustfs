@@ -15,8 +15,8 @@
 //! API types for KMS dynamic configuration
 
 use crate::config::{
-    BackendConfig, CacheConfig, KmsBackend, KmsConfig, LocalConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig,
-    redacted_secret_option,
+    BackendConfig, CacheConfig, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, KmsBackend,
+    KmsConfig, LocalConfig, TlsConfig, VaultAuthMethod, VaultConfig, VaultTransitConfig, redacted_secret_option,
 };
 use crate::service_manager::KmsServiceStatus;
 use crate::types::{KeyMetadata, KeyUsage};
@@ -448,6 +448,8 @@ impl ConfigureVaultTransitKmsRequest {
                 auth_method: self.auth_method.clone(),
                 namespace: self.namespace.clone(),
                 mount_path: self.mount_path.clone().unwrap_or_else(|| "transit".to_string()),
+                metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
+                metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
                 tls: if self.skip_tls_verify.unwrap_or(false) {
                     Some(TlsConfig {
                         ca_cert_path: None,
@@ -663,6 +665,8 @@ mod tests {
                 },
                 namespace: Some("tenant-a".to_string()),
                 mount_path: "transit".to_string(),
+                metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
+                metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
                 tls: None,
             })),
             allow_insecure_dev_defaults: true,
