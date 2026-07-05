@@ -71,11 +71,55 @@ use uuid::Uuid;
 const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
+const INLINE_METADATA_ROLLBACK_DIR_XOR: u128 = 0x7275737466735f696e6c696e655f7262;
 const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_COUNT";
 const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS";
 const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT: u64 = 2;
 const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: u64 = 100;
+
+fn inline_metadata_rollback_dir(version_id: Uuid) -> Uuid {
+    Uuid::from_u128(version_id.as_u128() ^ INLINE_METADATA_ROLLBACK_DIR_XOR)
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn rollback_committed_rename_std(
+    dst_file_path: &Path,
+    new_data_path: Option<&Path>,
+    rollback_data_dir: Option<Uuid>,
+) -> std::io::Result<()> {
+    if let Some(old_data_dir) = rollback_data_dir {
+        let Some(dst_parent) = dst_file_path.parent() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing object metadata parent"));
+        };
+        let backup_path = dst_parent.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        std::fs::rename(backup_path, dst_file_path)?;
+    } else {
+        remove_file_if_exists(dst_file_path)?;
+    }
+
+    if let Some(new_data_path) = new_data_path {
+        remove_dir_all_if_exists(new_data_path)?;
+    }
+
+    Ok(())
+}
+
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DISK_LOCAL: &str = "disk_local";
 const EVENT_DISK_LOCAL_STARTUP_CLEANUP: &str = "disk_local_startup_cleanup";
@@ -1120,6 +1164,8 @@ fn mmap_page_size() -> Result<u64> {
 
 #[cfg(test)]
 static RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static RENAME_DATA_FAIL_AFTER_METADATA_COMMIT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 fn set_rename_data_fail_before_old_metadata_backup(dst_path: &str) {
@@ -1129,8 +1175,28 @@ fn set_rename_data_fail_before_old_metadata_backup(dst_path: &str) {
 }
 
 #[cfg(test)]
+fn set_rename_data_fail_after_metadata_commit(dst_path: &str) {
+    *RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
+        .lock()
+        .expect("test failpoint lock should not be poisoned") = Some(dst_path.to_string());
+}
+
+#[cfg(test)]
 fn should_fail_before_old_metadata_backup(dst_path: &str) -> bool {
     let mut target = RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
+        .lock()
+        .expect("test failpoint lock should not be poisoned");
+    if target.as_deref() == Some(dst_path) {
+        target.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn should_fail_after_metadata_commit(dst_path: &str) -> bool {
+    let mut target = RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
         .lock()
         .expect("test failpoint lock should not be poisoned");
     if target.as_deref() == Some(dst_path) {
@@ -1204,6 +1270,11 @@ fn should_crash_rename_data_at(point: RenameDataCrashPoint, dst_path: &str) -> b
 #[cfg(not(test))]
 #[inline(always)]
 fn should_crash_rename_data_at(_point: RenameDataCrashPoint, _dst_path: &str) -> bool {
+    false
+}
+
+#[cfg(not(test))]
+fn should_fail_after_metadata_commit(_dst_path: &str) -> bool {
     false
 }
 
@@ -5182,6 +5253,14 @@ impl DiskAPI for LocalDisk {
 
             let version_id = fi.version_id.unwrap_or_default();
             let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+            let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
+            let rollback_data_dir = has_old_data_dir.or_else(|| {
+                if old_version_exists && has_dst_buf.is_some() {
+                    Some(inline_metadata_rollback_dir(version_id))
+                } else {
+                    None
+                }
+            });
             if let Some(old_data_dir) = has_old_data_dir.as_ref() {
                 let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
             }
@@ -5285,7 +5364,7 @@ impl DiskAPI for LocalDisk {
             } else {
                 SyncMode::None
             };
-            if let Some(old_data_dir) = has_old_data_dir
+            if let Some(old_data_dir) = rollback_data_dir
                 && let Some(dst_buf) = has_dst_buf.as_ref()
                 && let Err(err) = self
                     .write_all_private(
@@ -5336,6 +5415,13 @@ impl DiskAPI for LocalDisk {
                 return Err(err);
             }
 
+            let committed_new_data_path = has_data_dir_path.as_ref().map(|(_, dst_data_path)| dst_data_path.as_path());
+            if should_fail_after_metadata_commit(dst_path) {
+                rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
+                    .map_err(to_file_error)?;
+                return Err(DiskError::Unexpected);
+            }
+
             // Persist the directory entries for both the data dir and xl.meta renames;
             // without this the commit itself can vanish on power loss. Relaxed tiers
             // accept that window (documented in docs/operations/durability-modes.md).
@@ -5343,6 +5429,8 @@ impl DiskAPI for LocalDisk {
                 && let Some(parent) = dst_file_path.parent()
                 && let Err(err) = os::fsync_dir(parent).await
             {
+                rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
+                    .map_err(to_file_error)?;
                 return Err(to_file_error(err).into());
             }
 
@@ -5381,7 +5469,7 @@ impl DiskAPI for LocalDisk {
             }
 
             Ok(RenameDataResp {
-                old_data_dir: has_old_data_dir,
+                old_data_dir: rollback_data_dir,
                 sign: version_signature,
                 old_current_size,
             })
@@ -5397,6 +5485,7 @@ impl DiskAPI for LocalDisk {
                 None
             };
 
+            let dst_path_for_failpoint = dst_path.to_string();
             let (old_data_dir, version_signature, old_current_size) = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
@@ -5428,6 +5517,14 @@ impl DiskAPI for LocalDisk {
 
                 let version_id = fi.version_id.unwrap_or_default();
                 let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+                let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
+                let rollback_data_dir = old_data_dir.or_else(|| {
+                    if old_version_exists && has_dst_buf.is_some() {
+                        Some(inline_metadata_rollback_dir(version_id))
+                    } else {
+                        None
+                    }
+                });
                 if let Some(d) = old_data_dir.as_ref() {
                     let _ = xlmeta.data.remove_two(version_id, *d);
                 }
@@ -5453,7 +5550,7 @@ impl DiskAPI for LocalDisk {
                 if sync {
                     f.sync_data()?;
                 }
-                if let Some(old_dir) = old_data_dir.as_ref()
+                if let Some(old_dir) = rollback_data_dir.as_ref()
                     && let Some(ref buf) = has_dst_buf
                     && let Some(dst_parent) = dst.parent()
                 {
@@ -5496,9 +5593,18 @@ impl DiskAPI for LocalDisk {
                     Err(err) => Err(to_file_error(err)),
                 }?;
 
+                if should_fail_after_metadata_commit(&dst_path_for_failpoint) {
+                    rollback_committed_rename_std(&dst, None, rollback_data_dir)?;
+                    return Err(std::io::Error::other("test fail after metadata commit"));
+                }
+
                 // Persist the commit rename's directory entry across power loss.
-                if sync && let Some(dst_parent) = dst.parent() {
-                    os::fsync_dir_std(dst_parent)?;
+                if sync
+                    && let Some(dst_parent) = dst.parent()
+                    && let Err(err) = os::fsync_dir_std(dst_parent)
+                {
+                    rollback_committed_rename_std(&dst, None, rollback_data_dir)?;
+                    return Err(err);
                 }
 
                 // Same power-loss gap as the non-inline path (rustfs/backlog#922
@@ -5523,7 +5629,7 @@ impl DiskAPI for LocalDisk {
                 }
 
                 Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>, Option<OldCurrentSize>), std::io::Error>((
-                    old_data_dir,
+                    rollback_data_dir,
                     version_signature,
                     old_current_size,
                 ))
@@ -5858,6 +5964,30 @@ impl DiskAPI for LocalDisk {
 
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
+        if let Some(old_data_dir) = opts.old_data_dir
+            && opts.undo_write
+        {
+            let backup_path = path_join(&[
+                file_path.as_path(),
+                Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
+            ]);
+            let dst_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
+            rename_all(&backup_path, &dst_path, file_path.as_path()).await?;
+
+            if let Some(new_data_dir) = fi.data_dir {
+                let new_data_path = path_join(&[file_path.as_path(), Path::new(new_data_dir.to_string().as_str())]);
+                check_path_length(new_data_path.to_string_lossy().as_ref())?;
+                if let Err(err) = self.move_to_trash(&new_data_path, true, false).await
+                    && err != DiskError::FileNotFound
+                    && err != DiskError::VolumeNotFound
+                {
+                    return Err(err);
+                }
+            }
+
+            return Ok(());
+        }
+
         let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
         let buf = match self.read_all_data(volume, &volume_dir, &xl_path).await {
             Ok(res) => res,
@@ -5894,17 +6024,6 @@ impl DiskAPI for LocalDisk {
             {
                 return Err(err);
             }
-        }
-
-        if let Some(old_data_dir) = opts.old_data_dir
-            && opts.undo_write
-        {
-            let src_path = path_join(&[
-                file_path.as_path(),
-                Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
-            ]);
-            let dst_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
-            return rename_all(&src_path, &dst_path, file_path).await;
         }
 
         if !meta.versions.is_empty() {
@@ -8006,6 +8125,50 @@ mod test {
 
             assert_eq!(resp.old_current_size, None);
         }
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_inline_post_commit_error_restores_old_metadata() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "inline-post-commit-object";
+        let tmp_object = "tmp-inline-post-commit-write";
+        let version_id = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("version id should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-old")));
+        let old_meta = test_meta(old_fi);
+        let dst_object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&dst_object_dir)
+            .await
+            .expect("object dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), old_meta.clone())
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_object_dir = dir.path().join(RUSTFS_META_TMP_BUCKET).join(tmp_object);
+        fs::create_dir_all(&tmp_object_dir)
+            .await
+            .expect("tmp object dir should be created");
+
+        set_rename_data_fail_after_metadata_commit(object);
+        let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-new")));
+        let result = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await;
+
+        assert!(result.is_err());
+        let restored_meta = fs::read(dst_object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("old metadata should still be readable");
+        assert_eq!(restored_meta, old_meta);
     }
 
     #[tokio::test]
