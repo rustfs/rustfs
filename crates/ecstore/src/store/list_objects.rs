@@ -2012,13 +2012,6 @@ async fn gather_results(
 
         // TODO: rx.recv()
 
-        // TODO: isLatestDeletemarker
-        if !opts.include_directories
-            && (entry.is_dir() || (!opts.versioned && entry.is_object() && entry.is_latest_delete_marker()))
-        {
-            continue;
-        }
-
         if let Some(marker) = &opts.marker
             && ((!opts.include_marker && &entry.name <= marker) || (opts.include_marker && &entry.name < marker))
         {
@@ -2036,7 +2029,14 @@ async fn gather_results(
             continue;
         }
 
-        if !opts.incl_deleted && entry.is_object() && entry.is_latest_delete_marker() && !entry.is_object_dir() {
+        let is_object = entry.is_object();
+        let is_latest_delete_marker = is_object && entry.is_latest_delete_marker();
+
+        if !opts.include_directories && (entry.is_dir() || (!opts.versioned && is_latest_delete_marker)) {
+            continue;
+        }
+
+        if !opts.incl_deleted && is_latest_delete_marker && !entry.is_object_dir() {
             continue;
         }
 
