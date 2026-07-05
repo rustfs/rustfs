@@ -112,7 +112,7 @@ impl AuditRegistry {
     /// * `id` - The identifier for the target to be removed.
     ///
     /// # Returns
-    /// * `Option<Box<dyn Target<AuditEntry> + Send + Sync>>` - The removed target if it existed.
+/// * `Option<SharedTarget<AuditEntry>>` - The removed target if it existed.
     pub async fn remove_target(&mut self, id: &str) -> Option<SharedTarget<AuditEntry>> {
         self.targets.remove_and_close(id).await
     }
