@@ -659,7 +659,7 @@ mod tests {
     // the List operation family must run identically through it.
     #[tokio::test]
     async fn set_disks_ctx_mirrors_core_and_drives_list_operations() {
-        use crate::set_disk::list::ListOperations;
+        use crate::set_disk::ops::list::ListOperations;
 
         let disk_count = 4;
         let format = FormatV3::new(1, disk_count);

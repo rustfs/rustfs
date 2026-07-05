@@ -17,5 +17,7 @@
 //! borrows shared state through [`super::ctx::SetDisksCtx`]; the storage-api
 //! contract impls stay `for SetDisks`, so contract bounds are unchanged.
 
+pub(crate) mod bucket;
 pub(crate) mod heal;
+pub(crate) mod list;
 pub(crate) mod multipart;
