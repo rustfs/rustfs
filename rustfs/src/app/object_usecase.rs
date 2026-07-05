@@ -531,12 +531,6 @@ impl GetObjectBodyLifecycle {
         Self { request_guard: None }
     }
 
-    fn take(&mut self) -> Self {
-        Self {
-            request_guard: self.request_guard.take(),
-        }
-    }
-
     fn is_finished(&self) -> bool {
         self.request_guard.is_none()
     }
@@ -956,6 +950,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
 
 impl<R> Drop for GetObjectStreamingReader<R> {
     fn drop(&mut self) {
+        if self.lifecycle.is_finished() {
+            return;
+        }
+
         if self.expected == 0 || self.completed || self.emitted >= self.expected {
             self.finish_ok();
             return;
@@ -2842,7 +2840,7 @@ impl DefaultObjectUsecase {
                     buf,
                     response_content_length,
                     GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
-                    lifecycle.take(),
+                    lifecycle,
                 ));
             }
 
@@ -2858,7 +2856,7 @@ impl DefaultObjectUsecase {
                 stream_strategy,
                 bucket,
                 key,
-                lifecycle.take(),
+                lifecycle,
             ));
         }
 
@@ -2875,7 +2873,7 @@ impl DefaultObjectUsecase {
                 buffered_body,
                 response_content_length,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
-                lifecycle.take(),
+                lifecycle,
             ));
         }
 
@@ -2901,7 +2899,7 @@ impl DefaultObjectUsecase {
                         buf,
                         response_content_length,
                         GET_MEMORY_BODY_SOURCE_SEEK_BUFFER,
-                        lifecycle.take(),
+                        lifecycle,
                     ));
                 }
                 Err(e) => {
@@ -2921,7 +2919,7 @@ impl DefaultObjectUsecase {
             stream_strategy,
             bucket,
             key,
-            lifecycle.take(),
+            lifecycle,
         ))
     }
 
@@ -2962,7 +2960,7 @@ impl DefaultObjectUsecase {
                     bytes,
                     response_content_length,
                     GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
-                    lifecycle.take(),
+                    lifecycle,
                 ));
             }
             GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
@@ -2975,7 +2973,7 @@ impl DefaultObjectUsecase {
                 buffered_body,
                 response_content_length,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
-                lifecycle.take(),
+                lifecycle,
             ));
         }
 
@@ -3008,7 +3006,7 @@ impl DefaultObjectUsecase {
                     None,
                     bucket,
                     key,
-                    lifecycle.take(),
+                    lifecycle,
                 )
                 .await;
             };
@@ -3035,7 +3033,7 @@ impl DefaultObjectUsecase {
                         bytes,
                         response_content_length,
                         GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED,
-                        lifecycle.take(),
+                        lifecycle,
                     ));
                 }
                 Err(e) => {
@@ -3065,7 +3063,7 @@ impl DefaultObjectUsecase {
             None,
             bucket,
             key,
-            lifecycle.take(),
+            lifecycle,
         )
         .await
     }
@@ -4033,15 +4031,12 @@ impl DefaultObjectUsecase {
                 concurrent_requests,
                 part_number,
                 opts.versioned,
-                lifecycle.take(),
+                lifecycle,
             )
             .await;
         let output_context = match output_context {
             Ok(output_context) => output_context,
-            Err(err) => {
-                lifecycle.finish_err();
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
         if let Some(output_build_start) = output_build_start {
             rustfs_io_metrics::record_get_object_stage_duration(
@@ -4076,11 +4071,6 @@ impl DefaultObjectUsecase {
             output,
         )
         .await;
-        if result.is_err() {
-            lifecycle.finish_err();
-        } else {
-            lifecycle.finish_ok();
-        }
         result
     }
 
