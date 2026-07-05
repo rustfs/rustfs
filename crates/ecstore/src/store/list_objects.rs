@@ -929,11 +929,17 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<Option<ObjectInfo>>>,
 {
-    Ok(
-        list_objects_from_verified_index_candidates_with_stats(prefix, marker, delimiter, max_keys, candidate_keys, live_verify)
-            .await?
-            .info,
+    Ok(list_objects_from_verified_index_candidates_with_optional_stats(
+        prefix,
+        marker,
+        delimiter,
+        max_keys,
+        candidate_keys,
+        false,
+        live_verify,
     )
+    .await?
+    .info)
 }
 
 async fn list_objects_from_verified_index_candidates_with_stats<F, Fut>(
@@ -942,6 +948,31 @@ async fn list_objects_from_verified_index_candidates_with_stats<F, Fut>(
     delimiter: &Option<String>,
     max_keys: i32,
     candidate_keys: &[String],
+    live_verify: F,
+) -> Result<VerifiedIndexCandidateResult>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Option<ObjectInfo>>>,
+{
+    list_objects_from_verified_index_candidates_with_optional_stats(
+        prefix,
+        marker,
+        delimiter,
+        max_keys,
+        candidate_keys,
+        true,
+        live_verify,
+    )
+    .await
+}
+
+async fn list_objects_from_verified_index_candidates_with_optional_stats<F, Fut>(
+    prefix: &str,
+    marker: Option<&str>,
+    delimiter: &Option<String>,
+    max_keys: i32,
+    candidate_keys: &[String],
+    collect_stats: bool,
     mut live_verify: F,
 ) -> Result<VerifiedIndexCandidateResult>
 where
@@ -949,9 +980,13 @@ where
     Fut: Future<Output = Result<Option<ObjectInfo>>>,
 {
     let max_keys = normalize_max_keys(max_keys);
-    let mut stats = VerifiedIndexCandidateStats {
-        candidate_keys: candidate_keys.len(),
-        ..Default::default()
+    let mut stats = if collect_stats {
+        VerifiedIndexCandidateStats {
+            candidate_keys: candidate_keys.len(),
+            ..Default::default()
+        }
+    } else {
+        VerifiedIndexCandidateStats::default()
     };
     if max_keys <= 0 {
         return Ok(VerifiedIndexCandidateResult {
@@ -966,7 +1001,9 @@ where
 
     for key in candidate_keys {
         if marker.is_some_and(|marker| key.as_str() <= marker) || !key.starts_with(prefix) {
-            stats.skipped_keys += 1;
+            if collect_stats {
+                stats.skipped_keys += 1;
+            }
             continue;
         }
 
@@ -977,7 +1014,9 @@ where
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
                 if prefix_set.insert(common_prefix.clone()) {
-                    stats.common_prefixes += 1;
+                    if collect_stats {
+                        stats.common_prefixes += 1;
+                    }
                     visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
                 }
                 if visible_entries.len() >= page_limit {
@@ -987,17 +1026,23 @@ where
             }
         }
 
-        stats.live_verify_attempts += 1;
+        if collect_stats {
+            stats.live_verify_attempts += 1;
+        }
         match live_verify(key.clone()).await? {
             Some(object) => {
-                stats.live_verify_hits += 1;
+                if collect_stats {
+                    stats.live_verify_hits += 1;
+                }
                 visible_entries.push(VerifiedIndexVisibleEntry::Object(object));
                 if visible_entries.len() >= page_limit {
                     break;
                 }
             }
             None => {
-                stats.live_verify_misses += 1;
+                if collect_stats {
+                    stats.live_verify_misses += 1;
+                }
             }
         }
     }
@@ -1687,15 +1732,22 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<Option<ListObjectsInfo>> {
+        let list_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let provider = list_objects_index_provider_from_env();
-        let provider_label = list_objects_index_provider_metric_label(provider);
-        rustfs_io_metrics::record_list_objects_index_attempt(
-            mode.cursor_value(),
-            provider_label,
-            !opts.prefix.is_empty(),
-            opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
-            opts.marker.is_some(),
-        );
+        let provider_label = if list_metrics_enabled {
+            list_objects_index_provider_metric_label(provider)
+        } else {
+            "none"
+        };
+        if list_metrics_enabled {
+            rustfs_io_metrics::record_list_objects_index_attempt(
+                mode.cursor_value(),
+                provider_label,
+                !opts.prefix.is_empty(),
+                opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
+                opts.marker.is_some(),
+            );
+        }
 
         if incl_deleted || !mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification() {
             record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
@@ -1761,12 +1813,13 @@ impl ECStore {
             .unwrap_or_default();
 
         let bucket = provider_opts.bucket.clone();
-        let verified = list_objects_from_verified_index_candidates_with_stats(
+        let verified = list_objects_from_verified_index_candidates_with_optional_stats(
             &provider_opts.prefix,
             provider_opts.marker.as_deref(),
             &provider_opts.separator,
             max_keys,
             &candidate_keys,
+            list_metrics_enabled,
             |key| {
                 let store = self.clone();
                 let bucket = bucket.clone();
@@ -1785,7 +1838,12 @@ impl ECStore {
                         Ok(object) => Ok(Some(object)),
                         Err(err) if err.is_not_found() => Ok(None),
                         Err(err) => {
-                            rustfs_io_metrics::record_list_objects_index_live_verify_failure(mode.cursor_value(), "read_error");
+                            if list_metrics_enabled {
+                                rustfs_io_metrics::record_list_objects_index_live_verify_failure(
+                                    mode.cursor_value(),
+                                    "read_error",
+                                );
+                            }
                             Err(err)
                         }
                     }
@@ -1796,17 +1854,19 @@ impl ECStore {
         let stats = verified.stats;
         let mut result = verified.info;
 
-        rustfs_io_metrics::record_list_objects_index_served(ListObjectsIndexPageObservation {
-            source: mode.cursor_value(),
-            provider: provider_label,
-            candidate_keys: stats.candidate_keys,
-            live_verify_attempts: stats.live_verify_attempts,
-            live_verify_hits: stats.live_verify_hits,
-            live_verify_misses: stats.live_verify_misses,
-            returned_objects: result.objects.len(),
-            returned_prefixes: result.prefixes.len(),
-            is_truncated: result.is_truncated,
-        });
+        if list_metrics_enabled {
+            rustfs_io_metrics::record_list_objects_index_served(ListObjectsIndexPageObservation {
+                source: mode.cursor_value(),
+                provider: provider_label,
+                candidate_keys: stats.candidate_keys,
+                live_verify_attempts: stats.live_verify_attempts,
+                live_verify_hits: stats.live_verify_hits,
+                live_verify_misses: stats.live_verify_misses,
+                returned_objects: result.objects.len(),
+                returned_prefixes: result.prefixes.len(),
+                is_truncated: result.is_truncated,
+            });
+        }
 
         if let Some(next_marker) = result.next_marker.take() {
             result.next_marker = Some(
@@ -2716,7 +2776,8 @@ async fn gather_results(
 ) -> Result<GatherResultsState> {
     let mut recv = recv;
     let mut entries = Vec::new();
-    let gather_started = std::time::Instant::now();
+    let list_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+    let gather_started = list_metrics_enabled.then(std::time::Instant::now);
     let mut scanned_entries = 0usize;
     let mut candidate_entries = 0usize;
 
@@ -2766,17 +2827,21 @@ async fn gather_results(
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
             rx.cancel();
             let filtered = scanned_entries.saturating_sub(candidate_entries);
-            rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
-                source: LIST_OBJECTS_SOURCE_WALKER,
-                outcome: LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED,
-                limit: opts.limit,
-                scanned_entries,
-                returned_entries: candidate_entries,
-                duration_ms: gather_started.elapsed().as_secs_f64() * 1000.0,
-                has_prefix: !opts.prefix.is_empty(),
-                has_delimiter: opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
-                has_marker: opts.marker.is_some(),
-            });
+            if let Some(started) = gather_started {
+                let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+                rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
+                    source: LIST_OBJECTS_SOURCE_WALKER,
+                    outcome: LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED,
+                    limit: opts.limit,
+                    scanned_entries,
+                    returned_entries: candidate_entries,
+                    duration_ms,
+                    has_prefix: !opts.prefix.is_empty(),
+                    has_delimiter: opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
+                    has_marker: opts.marker.is_some(),
+                });
+                rustfs_io_metrics::record_stage_duration("store_list_objects_gather", duration_ms);
+            }
             debug!(
                 bucket = %opts.bucket,
                 prefix = %opts.prefix,
@@ -2786,10 +2851,6 @@ async fn gather_results(
                 filtered_entries = filtered,
                 marker = %opts.marker.as_deref().unwrap_or(""),
                 "list_objects gather_results reached page limit and cancelled upstream listing"
-            );
-            rustfs_io_metrics::record_stage_duration(
-                "store_list_objects_gather",
-                gather_started.elapsed().as_secs_f64() * 1000.0,
             );
 
             results_tx
@@ -2808,17 +2869,21 @@ async fn gather_results(
 
     // finish not full, return eof
     let filtered = scanned_entries.saturating_sub(candidate_entries);
-    rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
-        source: LIST_OBJECTS_SOURCE_WALKER,
-        outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
-        limit: opts.limit,
-        scanned_entries,
-        returned_entries: candidate_entries,
-        duration_ms: gather_started.elapsed().as_secs_f64() * 1000.0,
-        has_prefix: !opts.prefix.is_empty(),
-        has_delimiter: opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
-        has_marker: opts.marker.is_some(),
-    });
+    if let Some(started) = gather_started {
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
+            source: LIST_OBJECTS_SOURCE_WALKER,
+            outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
+            limit: opts.limit,
+            scanned_entries,
+            returned_entries: candidate_entries,
+            duration_ms,
+            has_prefix: !opts.prefix.is_empty(),
+            has_delimiter: opts.separator.as_ref().is_some_and(|separator| !separator.is_empty()),
+            has_marker: opts.marker.is_some(),
+        });
+        rustfs_io_metrics::record_stage_duration("store_list_objects_gather", duration_ms);
+    }
     debug!(
         bucket = %opts.bucket,
         prefix = %opts.prefix,
@@ -2828,7 +2893,6 @@ async fn gather_results(
         marker = %opts.marker.as_deref().unwrap_or(""),
         "list_objects gather_results drained all candidates without hitting limit"
     );
-    rustfs_io_metrics::record_stage_duration("store_list_objects_gather", gather_started.elapsed().as_secs_f64() * 1000.0);
 
     results_tx
         .send(MetaCacheEntriesSortedResult {
@@ -4621,10 +4685,11 @@ mod test {
         ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
         ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
         ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions,
-        MAX_OBJECT_LIST, VersionMarker, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
-        fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
-        latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_metadata_resolution_params,
-        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_stats,
+        MAX_OBJECT_LIST, VerifiedIndexCandidateStats, VersionMarker, enforce_latest_listing_write_quorum,
+        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
+        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum,
+        list_metadata_resolution_params, list_objects_from_verified_index_candidates,
+        list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
         list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_key_only_provider_health,
         list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
         parse_version_marker, record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry, resolve_listing_entries,
@@ -5547,6 +5612,32 @@ mod test {
         assert_eq!(result.stats.live_verify_attempts, 1);
         assert_eq!(result.stats.live_verify_hits, 0);
         assert_eq!(result.stats.live_verify_misses, 1);
+    }
+
+    #[tokio::test]
+    async fn list_objects_verified_index_candidates_skip_stats_when_disabled() {
+        let candidates = vec!["photos/2026/a.jpg".to_string(), "photos/2026/deleted.jpg".to_string()];
+
+        let result = list_objects_from_verified_index_candidates_with_optional_stats(
+            "photos/2026/",
+            None,
+            &None,
+            100,
+            &candidates,
+            false,
+            |key| async move {
+                if key.ends_with("deleted.jpg") {
+                    Ok(None)
+                } else {
+                    Ok(Some(test_live_object_info(&key, "live-etag")))
+                }
+            },
+        )
+        .await
+        .expect("verified candidate listing should succeed");
+
+        assert_eq!(result.info.objects.len(), 1);
+        assert_eq!(result.stats, VerifiedIndexCandidateStats::default());
     }
 
     #[test]

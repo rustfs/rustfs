@@ -15,6 +15,8 @@
 use metrics::{counter, describe_counter, describe_histogram, histogram};
 use std::sync::OnceLock;
 
+use crate::get_stage_metrics_enabled;
+
 pub const LIST_OBJECTS_SOURCE_WALKER: &str = "walker";
 pub const LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED: &str = "limit_reached";
 pub const LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED: &str = "input_closed";
@@ -157,6 +159,10 @@ pub fn init_list_objects_metrics() {
 }
 
 pub fn record_list_objects_gather(observation: ListObjectsGatherObservation) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
     let filtered_entries = observation.scanned_entries.saturating_sub(observation.returned_entries);
     let scan_amplification = if observation.returned_entries == 0 {
         count_as_f64(observation.scanned_entries)
@@ -189,6 +195,10 @@ pub fn record_list_objects_gather(observation: ListObjectsGatherObservation) {
 }
 
 pub fn record_list_objects_merge(source: &'static str, input_channels: usize, read_quorum: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
     histogram!(
         LIST_OBJECTS_MERGE_FAN_IN,
         "source" => source,
@@ -204,6 +214,10 @@ pub fn record_list_objects_merge(source: &'static str, input_channels: usize, re
 }
 
 pub fn record_list_objects_index_fallback(source: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
     counter!(
         LIST_OBJECTS_INDEX_FALLBACK_TOTAL,
         "source" => source,
@@ -219,6 +233,10 @@ pub fn record_list_objects_index_attempt(
     has_delimiter: bool,
     has_marker: bool,
 ) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
     counter!(
         LIST_OBJECTS_INDEX_ATTEMPT_TOTAL,
         "source" => source,
@@ -231,6 +249,10 @@ pub fn record_list_objects_index_attempt(
 }
 
 pub fn record_list_objects_index_live_verify_failure(source: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
     counter!(
         LIST_OBJECTS_INDEX_LIVE_VERIFY_FAILURE_TOTAL,
         "source" => source,
@@ -240,6 +262,10 @@ pub fn record_list_objects_index_live_verify_failure(source: &'static str, reaso
 }
 
 pub fn record_list_objects_index_served(observation: ListObjectsIndexPageObservation) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
     let returned_objects = count_as_f64(observation.returned_objects);
     let verification_io_amplification = if observation.returned_objects == 0 {
         count_as_f64(observation.live_verify_attempts)

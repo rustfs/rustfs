@@ -50,6 +50,8 @@ opt-in and the walker path remains authoritative.
 
 Current implemented metrics:
 
+These metrics are gated by `rustfs_io_metrics::get_stage_metrics_enabled()` to keep the default ListObjects hot path lightweight when detailed GET stage metrics are disabled.
+
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `rustfs_s3_list_objects_gather_total` | counter | `source`, `outcome`, `has_prefix`, `has_delimiter`, `has_marker` | Gather attempts and request shape |
