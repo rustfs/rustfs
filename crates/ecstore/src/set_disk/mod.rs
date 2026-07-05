@@ -451,7 +451,6 @@ mod ops;
 mod read;
 mod replication;
 pub(crate) mod shard_source;
-mod write;
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
