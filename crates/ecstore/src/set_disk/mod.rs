@@ -12,6 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! `SetDisks` — one erasure set's worth of disks and the object storage logic
+//! over them. Historically a single ~19.7k-line God-Object; split into a Core
+//! plus borrow-based operation families during backlog#815 (Epic #728).
+//!
+//! Module layout after the split:
+//!
+//! - `mod.rs` — the `SetDisks` core struct, its construction, and the shared
+//!   inherent state/helpers the operation families borrow.
+//! - `ctx` — `SetDisksCtx`, the borrow context that hands operation units
+//!   access to the core without cloning `Arc`s (P0, backlog#816).
+//! - `core::io_primitives` — the shared low-level read/write/erasure IO
+//!   primitives (metadata-fanout quorum, bitrot readers, rename/delete, quorum
+//!   helpers) that the operation families call through the core (P5,
+//!   backlog#820).
+//! - `ops/` — one module per storage-api contract family, each
+//!   `impl <Contract> for SetDisks`: `ops::object` (`ObjectIO` +
+//!   `ObjectOperations`, the object read/write hot path, P6/backlog#821),
+//!   `ops::heal` (`HealOperations`, P1/backlog#817), `ops::multipart`
+//!   (`MultipartOperations`, P2/backlog#818), `ops::list` (`ListOperations`)
+//!   and `ops::bucket` (`BucketOperations`, P3+P4/backlog#819), `ops::locking`
+//!   (`NamespaceLocking` + lock helpers, P7/backlog#822).
+//! - `read.rs` — the object-read operation pipeline (`get_object_*`,
+//!   `read_version_optimized`) and its metadata cache, kept separate from the
+//!   read primitives it drives.
+//! - `metadata.rs`, `replication.rs`, `shard_source.rs` — supporting helpers.
+
 // #730: SetDisks still hosts staged read/heal/write migration helpers.
 #![allow(dead_code)]
 #![allow(unused_imports)]
@@ -445,7 +471,6 @@ static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod core;
 mod ctx;
-mod lock;
 mod metadata;
 mod ops;
 mod read;
@@ -2484,39 +2509,6 @@ impl SetDisks {
 
     pub(crate) async fn disk_inventory(&self) -> Vec<Option<DiskStore>> {
         self.get_disks_internal().await
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
-    type Error = Error;
-    type NamespaceLock = NamespaceLockWrapper;
-
-    #[tracing::instrument(skip(self))]
-    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        let set_lock = if runtime_sources::setup_is_dist_erasure().await {
-            // Calculate quorum based on lockers count (majority)
-            let lockers_count = self.lockers.len();
-            let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
-            NamespaceLock::with_clients_and_quorum(
-                format!("set-{}-{}", self.pool_index, self.set_index),
-                self.lockers.clone(),
-                write_quorum,
-            )
-        } else {
-            NamespaceLock::Local(LocalLock::new(
-                format!("set-{}-{}", self.pool_index, self.set_index),
-                self.local_lock_manager.clone(),
-            ))
-        };
-
-        let resource = ObjectKey {
-            bucket: Arc::from(bucket),
-            object: Arc::from(object),
-            version: None,
-        };
-
-        Ok(NamespaceLockWrapper::new(set_lock, resource, self.locker_owner.clone()))
     }
 }
 
