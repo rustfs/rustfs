@@ -29,6 +29,7 @@ const LIST_OBJECTS_GATHER_SCAN_AMPLIFICATION: &str = "rustfs_s3_list_objects_gat
 const LIST_OBJECTS_GATHER_LIMIT: &str = "rustfs_s3_list_objects_gather_limit";
 const LIST_OBJECTS_MERGE_FAN_IN: &str = "rustfs_s3_list_objects_merge_fan_in";
 const LIST_OBJECTS_MERGE_READ_QUORUM: &str = "rustfs_s3_list_objects_merge_read_quorum";
+const LIST_OBJECTS_INDEX_FALLBACK_TOTAL: &str = "rustfs_s3_list_objects_index_fallback_total";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ListObjectsGatherObservation {
@@ -85,6 +86,10 @@ pub fn init_list_objects_metrics() {
         describe_histogram!(LIST_OBJECTS_GATHER_LIMIT, "Requested internal ListObjects gather page limit.");
         describe_histogram!(LIST_OBJECTS_MERGE_FAN_IN, "Number of input streams merged for ListObjects pages.");
         describe_histogram!(LIST_OBJECTS_MERGE_READ_QUORUM, "Read quorum used while merging ListObjects entries.");
+        describe_counter!(
+            LIST_OBJECTS_INDEX_FALLBACK_TOTAL,
+            "Total number of opt-in ListObjects index attempts that fell back to the live walker."
+        );
     });
 }
 
@@ -135,6 +140,15 @@ pub fn record_list_objects_merge(source: &'static str, input_channels: usize, re
     .record(count_as_f64(read_quorum));
 }
 
+pub fn record_list_objects_index_fallback(source: &'static str, reason: &'static str) {
+    counter!(
+        LIST_OBJECTS_INDEX_FALLBACK_TOTAL,
+        "source" => source,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +173,11 @@ mod tests {
     fn record_merge_observation_accepts_zero_quorum() {
         init_list_objects_metrics();
         record_list_objects_merge(LIST_OBJECTS_SOURCE_WALKER, 4, 0);
+    }
+
+    #[test]
+    fn record_index_fallback_observation_accepts_reason() {
+        init_list_objects_metrics();
+        record_list_objects_index_fallback("index_key_only", "unsupported_request");
     }
 }

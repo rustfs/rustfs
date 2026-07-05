@@ -132,7 +132,8 @@ pub use io_metrics::{
 };
 pub use list_objects_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
-    ListObjectsGatherObservation, init_list_objects_metrics, record_list_objects_gather, record_list_objects_merge,
+    ListObjectsGatherObservation, init_list_objects_metrics, record_list_objects_gather, record_list_objects_index_fallback,
+    record_list_objects_merge,
 };
 
 // Backpressure metrics exports

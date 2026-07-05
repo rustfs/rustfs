@@ -256,6 +256,7 @@ const ENV_API_LIST_QUORUM: &str = "RUSTFS_API_LIST_QUORUM";
 const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
 const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
+const ENV_API_LIST_OBJECTS_INDEX_MODE: &str = "RUSTFS_LIST_OBJECTS_INDEX_MODE";
 
 /// Identifies the source that produced a ListObjects page.
 ///
@@ -331,6 +332,21 @@ enum ListIndexFallbackReason {
     Corrupt,
     MissingGeneration,
     UnsupportedRequest,
+}
+
+impl ListIndexFallbackReason {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Rebuilding => "rebuilding",
+            Self::Unhealthy => "unhealthy",
+            Self::Lagging => "lagging",
+            Self::Degraded => "degraded",
+            Self::Corrupt => "corrupt",
+            Self::MissingGeneration => "missing_generation",
+            Self::UnsupportedRequest => "unsupported_request",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,6 +676,45 @@ fn list_quorum_from_env() -> String {
 fn list_objects_quorum_from_env() -> String {
     let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_QUORUM, DEFAULT_API_LIST_OBJECTS_QUORUM);
     normalize_list_quorum(&value).to_owned()
+}
+
+fn list_objects_index_mode_from_env() -> Option<ListSourceMode> {
+    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_INDEX_MODE, "");
+    let value = value.trim();
+    if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_KEY_ONLY) || value.eq_ignore_ascii_case("key_only") {
+        Some(ListSourceMode::IndexKeyOnly)
+    } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE) || value.eq_ignore_ascii_case("verified_page") {
+        Some(ListSourceMode::IndexVerifiedPage)
+    } else {
+        None
+    }
+}
+
+fn record_list_objects_index_opt_in_fallback(opts: &ListPathOptions, mode: ListSourceMode) {
+    let mut parsed_opts = opts.clone();
+    parsed_opts.parse_marker();
+
+    let reason = if parsed_opts
+        .cursor_source
+        .is_some_and(|source| source != mode && source != ListSourceMode::Walker)
+    {
+        ListIndexFallbackReason::UnsupportedRequest
+    } else {
+        let health = ListIndexLifecycle::disabled(0).health_snapshot();
+        match select_list_index_source_mode(Some(mode), Some("provider-not-attached"), &health) {
+            ListIndexSourceDecision::FallbackToWalker(reason) => reason,
+            ListIndexSourceDecision::UseIndex(_) => ListIndexFallbackReason::UnsupportedRequest,
+        }
+    };
+
+    rustfs_io_metrics::record_list_objects_index_fallback(mode.cursor_value(), reason.metric_label());
+    debug!(
+        bucket = %opts.bucket,
+        prefix = %opts.prefix,
+        source = mode.cursor_value(),
+        reason = reason.metric_label(),
+        "list_objects opt-in index path fell back to walker"
+    );
 }
 
 fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> String {
@@ -1475,6 +1530,9 @@ impl ECStore {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
+        if let Some(mode) = list_objects_index_mode_from_env() {
+            record_list_objects_index_opt_in_fallback(&opts, mode);
+        }
 
         // Optimization: use get for single object lookup with exact prefix
         if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
@@ -4198,15 +4256,16 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState,
-        ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState, ListIndexSourceDecision, ListMetadataAuthority,
-        ListMetadataIndexGeneration, ListMetadataIndexHealth, ListMetadataIndexKeyLookup, ListMetadataIndexPage,
-        ListMetadataIndexPageIterator, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
-        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, VersionMarker, enforce_latest_listing_write_quorum,
-        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
-        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum,
-        list_metadata_resolution_params, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
-        merge_entry_channels, normalize_list_quorum, parse_version_marker, resolve_agreed_listing_entry, resolve_listing_entries,
+        ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries,
+        FallbackListingEntry, GatherResultsState, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
+        ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
+        ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListPathOptions, ListPathRawOptions,
+        ListSourceMode, ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, VersionMarker,
+        enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
+        latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
+        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_index_mode_from_env,
+        list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
+        parse_version_marker, record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry, resolve_listing_entries,
         select_list_index_source_mode, send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
@@ -4843,6 +4902,59 @@ mod test {
         temp_env::with_var(ENV_API_LIST_OBJECTS_QUORUM, Some("strict"), || {
             assert_eq!(list_objects_quorum_from_env(), "strict");
         });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_defaults_to_walker() {
+        temp_env::with_var_unset(ENV_API_LIST_OBJECTS_INDEX_MODE, || {
+            assert_eq!(list_objects_index_mode_from_env(), None);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_accepts_key_only_aliases() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("key_only"), || {
+            assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexKeyOnly));
+        });
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_key_only"), || {
+            assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexKeyOnly));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_accepts_verified_page_aliases() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("verified_page"), || {
+            assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexVerifiedPage));
+        });
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_verified_page"), || {
+            assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexVerifiedPage));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_rejects_metadata_fast() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
+            assert_eq!(list_objects_index_mode_from_env(), None);
+        });
+    }
+
+    #[test]
+    fn list_objects_index_opt_in_fallback_accepts_incompatible_cursor_without_panicking() {
+        record_list_objects_index_opt_in_fallback(
+            &ListPathOptions {
+                bucket: "bucket".to_string(),
+                prefix: "photos/".to_string(),
+                marker: Some(
+                    "photos/2026/[rustfs_cache:v2,id:list-cache-id,src:index_verified_page,gen:generation-1]".to_string(),
+                ),
+                ..Default::default()
+            },
+            ListSourceMode::IndexKeyOnly,
+        );
     }
 
     #[test]
