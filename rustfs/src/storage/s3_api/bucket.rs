@@ -30,6 +30,8 @@ use urlencoding::encode;
 use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
 
 const S3_MAX_KEYS: i32 = 1000;
+const LIST_CACHE_MARKER_TAG_PREFIX: &str = "[rustfs_cache:";
+const LIST_CACHE_MARKER_TAG_VERSIONS: &[&str] = &["v1", "v2"];
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
@@ -396,28 +398,39 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
 }
 
 fn public_list_marker(marker: &str) -> &str {
-    let Some(start_idx) = marker.rfind("[rustfs_cache:") else {
+    let Some(start_idx) = marker.rfind(LIST_CACHE_MARKER_TAG_PREFIX) else {
         return marker;
     };
     let Some(tag_body) = marker[start_idx + 1..].strip_suffix(']') else {
         return marker;
     };
 
-    let mut has_supported_version = false;
-    let mut has_continuation_field = false;
-    for tag in tag_body.split(',') {
-        match tag.split_once(':') {
-            Some(("rustfs_cache", "v1" | "v2")) => has_supported_version = true,
-            Some(("id" | "return", _)) => has_continuation_field = true,
-            _ => {}
-        }
-    }
-
-    if has_supported_version && has_continuation_field {
+    if is_list_cache_marker_tag(tag_body) {
         &marker[..start_idx]
     } else {
         marker
     }
+}
+
+fn is_list_cache_marker_tag(tag_body: &str) -> bool {
+    let mut has_supported_version = false;
+    let mut has_continuation_field = false;
+
+    for tag in tag_body.split(',') {
+        let Some((key, value)) = tag.split_once(':') else {
+            continue;
+        };
+
+        match key {
+            "rustfs_cache" => has_supported_version = LIST_CACHE_MARKER_TAG_VERSIONS.contains(&value),
+            "id" if !value.is_empty() => has_continuation_field = true,
+            "return" => has_continuation_field = true,
+            "p" | "s" if value.parse::<usize>().is_err() => return false,
+            _ => {}
+        }
+    }
+
+    has_supported_version && has_continuation_field
 }
 
 fn decoded_next_continuation_marker(v2: &ListObjectsV2Output) -> Option<String> {
@@ -547,6 +560,23 @@ mod tests {
 
         let output = build_list_objects_output(v2, None);
         assert_eq!(output.next_marker.as_deref(), Some("dir%20a/key"));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_preserves_cache_like_key_suffix() {
+        let marker = "key[rustfs_cache:v2]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            contents: Some(vec![Object {
+                key: Some(marker.to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let output = build_list_objects_output(v2, None);
+        assert_eq!(output.next_marker.as_deref(), Some(marker));
     }
 
     #[test]
