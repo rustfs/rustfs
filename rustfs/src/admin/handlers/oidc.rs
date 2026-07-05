@@ -448,17 +448,34 @@ impl Operation for OidcAuthorizeHandler {
 
         // Optional: redirect_after query parameter (must be a safe relative path)
         let redirect_after = extract_safe_redirect_after(&req.uri)?;
+        let redirect_after_log = redirect_after.clone();
 
         let auth_url = oidc_sys
             .authorize_url(provider_id, &redirect_uri, redirect_after)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}")))?;
+            .map_err(|e| {
+                error!(
+                    event = EVENT_ADMIN_OIDC_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "authorize_url_failed",
+                    provider_id = %provider_id,
+                    redirect_uri = %redirect_uri,
+                    redirect_after = ?redirect_after_log,
+                    error = %e,
+                    "admin oidc state"
+                );
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}"))
+            })?;
 
         info!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %provider_id,
+            redirect_uri = %redirect_uri,
+            redirect_after = ?redirect_after_log,
+            auth_url = %auth_url,
             state = "authorize_redirect",
             "admin oidc state"
         );
@@ -504,6 +521,7 @@ impl Operation for OidcCallbackHandler {
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_OIDC,
                 result = "idp_callback_error",
+                provider_id = %provider_id,
                 error_code = %error,
                 error_description = %desc,
                 "admin oidc state"
@@ -526,6 +544,12 @@ impl Operation for OidcCallbackHandler {
                     component = LOG_COMPONENT_ADMIN,
                     subsystem = LOG_SUBSYSTEM_OIDC,
                     result = "code_exchange_failed",
+                    requested_provider_id = %provider_id,
+                    redirect_uri = %redirect_uri,
+                    code = %code,
+                    state = %state,
+                    code_len = code.len(),
+                    state_len = state.len(),
                     error = %e,
                     "admin oidc state"
                 );
