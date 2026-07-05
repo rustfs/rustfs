@@ -3909,7 +3909,10 @@ mod test {
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
     use crate::error::StorageError;
-    use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
+    use rustfs_filemeta::{
+        FileInfo, FileMeta, FileMetaVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry, MetaDeleteMarker,
+        VersionType,
+    };
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -4080,6 +4083,35 @@ mod test {
             meta.add_version(fi).expect("test metadata should accept object version");
         }
         let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn test_delete_marker_meta_entry(name: &str, mod_time: time::OffsetDateTime) -> MetaCacheEntry {
+        let mut meta = FileMeta::new();
+        let delete_marker = FileMetaVersion {
+            version_type: VersionType::Delete,
+            object: None,
+            delete_marker: Some(MetaDeleteMarker {
+                version_id: Some(Uuid::from_u128(0x44444444555566667777888888888888)),
+                mod_time: Some(mod_time),
+                meta_sys: HashMap::new(),
+            }),
+            legacy_object: None,
+            write_version: 1,
+            uses_legacy_checksum: false,
+        };
+        meta.versions.push(
+            delete_marker
+                .try_into()
+                .expect("test delete marker should convert to shallow version"),
+        );
+        let metadata = meta.marshal_msg().expect("test delete marker metadata should marshal");
 
         MetaCacheEntry {
             name: name.to_owned(),
@@ -4262,6 +4294,58 @@ mod test {
         assert!(!cancel.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn list_path_gather_results_filters_delete_marker_after_name_filters() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_500).expect("valid timestamp");
+
+        entry_tx
+            .send(test_delete_marker_meta_entry("obj-a", mod_time))
+            .await
+            .expect("delete marker should be queued");
+        entry_tx
+            .send(test_object_meta_entry("obj-b"))
+            .await
+            .expect("object should be queued");
+        drop(entry_tx);
+
+        let handle = tokio::spawn(gather_results(
+            cancel.clone(),
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                marker: Some("obj-a".to_owned()),
+                limit: 2,
+                incl_deleted: false,
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .expect("result should be sent promptly")
+            .expect("result should be present");
+        let entries = result.entries.unwrap();
+        let names = entries
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["obj-b"]);
+
+        let state = timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("gather_results should finish")
+            .expect("gather_results task should not panic")
+            .expect("gather_results should succeed");
+        assert_eq!(state, GatherResultsState::InputClosed);
+        assert!(!cancel.is_cancelled());
+    }
+
     #[test]
     fn list_path_forward_past_is_idempotent_for_same_marker() {
         let mut first_page = sorted_entries(&["obj-0001", "obj-0002", "obj-0003", "obj-0004"]);
@@ -4284,6 +4368,20 @@ mod test {
 
         assert_eq!(first_page_names, second_page_names);
         assert_eq!(first_page_names, vec!["obj-0003".to_string(), "obj-0004".to_string()]);
+    }
+
+    #[test]
+    fn list_path_forward_past_keeps_source_switch_page_boundary() {
+        let mut walker_page_after_index = sorted_entries(&["obj-0001", "obj-0002", "obj-0003", "obj-0004"]);
+        walker_page_after_index.forward_past(Some("obj-0002".to_string()));
+
+        let page_names = walker_page_after_index
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(page_names, vec!["obj-0003".to_string(), "obj-0004".to_string()]);
     }
 
     #[test]
@@ -5226,6 +5324,50 @@ mod test {
 
         // "obj-a" should appear only once despite being in both channels
         assert_eq!(results, vec!["obj-a", "obj-b", "obj-c"]);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_documents_candidate_metadata_authority_risk() {
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (tx_c, rx_c) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_500).expect("valid timestamp");
+        let stale_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let stale_object = test_object_meta_entry_with_erasure_versions("obj-a", &[(stale_mod_time, "stale-etag", 4, 2)]);
+
+        tx_a.send(test_delete_marker_meta_entry("obj-a", mod_time))
+            .await
+            .expect("first delete marker should queue");
+        tx_b.send(test_delete_marker_meta_entry("obj-a", mod_time))
+            .await
+            .expect("second delete marker should queue");
+        tx_c.send(stale_object).await.expect("stale object should queue");
+        drop(tx_a);
+        drop(tx_b);
+        drop(tx_c);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b, rx_c], out_tx, 2));
+
+        let mut merged = timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("merged entry should be emitted promptly")
+            .expect("merged entry should be present");
+        assert_eq!(merged.name, "obj-a");
+        assert!(
+            !merged.is_latest_delete_marker(),
+            "current merge consumes candidate metadata bytes; future index-backed strong modes must live-verify metadata instead"
+        );
+        assert!(
+            matches!(timeout(Duration::from_secs(1), out_rx.recv()).await, Ok(None)),
+            "merge should not emit a duplicate entry for the same key"
+        );
+
+        handle
+            .await
+            .expect("merge task should not panic")
+            .expect("merge task should succeed");
     }
 
     #[tokio::test]
