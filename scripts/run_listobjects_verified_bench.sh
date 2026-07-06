@@ -458,10 +458,22 @@ last_metric_field_sum() {
   awk -v metric="$metric" -v field="$field" '
     function finish_block() {
       if (found) {
-        value=sum
+        snapshot_total += sum
+        snapshot_seen = 1
         found=0
         sum=0
       }
+    }
+    function finish_snapshot() {
+      finish_block()
+      if (snapshot_seen) {
+        value=snapshot_total
+      }
+      snapshot_total=0
+      snapshot_seen=0
+    }
+    /^Metric #0$/ {
+      finish_snapshot()
     }
     /^Metric #[0-9]+/ {
       finish_block()
@@ -474,7 +486,7 @@ last_metric_field_sum() {
       sum += line + 0
     }
     END {
-      finish_block()
+      finish_snapshot()
       if (value == "") print "0"; else print value
     }
   ' "$log_file"
