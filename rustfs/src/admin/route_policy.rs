@@ -68,6 +68,7 @@ const LIST_USERS: AdminActionRef = AdminActionRef::new("ListUsersAdminAction");
 const PROFILING: AdminActionRef = AdminActionRef::new("ProfilingAdminAction");
 const REBALANCE: AdminActionRef = AdminActionRef::new("RebalanceAdminAction");
 const REGISTER_TABLE: AdminActionRef = AdminActionRef::new("RegisterTableAction");
+const REMOVE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("RemoveServiceAccountAdminAction");
 const REMOVE_USER_FROM_GROUP: AdminActionRef = AdminActionRef::new("RemoveUserFromGroupAdminAction");
 const RUN_TABLE_MAINTENANCE: AdminActionRef = AdminActionRef::new("RunTableMaintenanceAction");
 const SERVER_INFO: AdminActionRef = AdminActionRef::new("ServerInfoAdminAction");
@@ -176,6 +177,55 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/export-iam", EXPORT_IAM, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/import-iam", IMPORT_IAM, RouteRiskLevel::High),
+    admin(HttpMethod::Put, "/rustfs/admin/v3/import-iam-v2", IMPORT_IAM, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/revoke-tokens/{user_provider}",
+        REMOVE_SERVICE_ACCOUNT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp-config/{idp_type}",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/idp/ldap/add-service-account",
+        CREATE_SERVICE_ACCOUNT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/idp/ldap/policy/{operation}",
+        ATTACH_POLICY,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/list-canned-policies",
@@ -1295,6 +1345,26 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     deferred(
         HttpMethod::Get,
         "/rustfs/admin/v3/idp/builtin/policy-entities",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/policy-entities",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/list-access-keys",
+        DeferredRoutePolicyReason::ContextualAuthorization,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/list-access-keys-bulk",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/openid/list-access-keys-bulk",
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(HttpMethod::Post, "/rustfs/admin/v3/service", DeferredRoutePolicyReason::NotImplemented),
