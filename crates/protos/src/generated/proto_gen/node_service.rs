@@ -586,6 +586,10 @@ pub struct DeleteVersionRequest {
     pub force_del_marker: bool,
     #[prost(string, tag = "6")]
     pub opts: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub file_info_bin: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub opts_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteVersionResponse {
@@ -606,6 +610,10 @@ pub struct DeleteVersionsRequest {
     pub versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "4")]
     pub opts: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", repeated, tag = "5")]
+    pub versions_bin: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub opts_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteVersionsResponse {

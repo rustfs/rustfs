@@ -29,3 +29,14 @@ pub(crate) fn record_stale_grpc_channel_tls_generation() {
 pub(crate) fn record_grpc_dial_result(duration: Duration, success: bool) {
     global_internode_metrics().record_dial_result(duration, success);
 }
+
+/// Mark an internode peer reachable (online) after a successful dial (grpc-optimization P3).
+pub(crate) fn record_peer_reachable(addr: &str) {
+    rustfs_io_metrics::internode_metrics::record_peer_reachable(addr);
+}
+
+/// Record a peer failure (dial failure or RPC-triggered eviction); flips the peer offline once it
+/// crosses `failure_threshold` consecutive failures (grpc-optimization P3).
+pub(crate) fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
+    rustfs_io_metrics::internode_metrics::record_peer_unreachable(addr, failure_threshold);
+}

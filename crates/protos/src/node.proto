@@ -405,6 +405,10 @@ message DeleteVersionRequest {
   string file_info = 4;
   bool force_del_marker = 5;
   string opts = 6;
+  // msgpack payloads mirroring the JSON fields above (grpc-optimization P2). Senders dual-write
+  // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
+  bytes file_info_bin = 7;
+  bytes opts_bin = 8;
 }
 
 message DeleteVersionResponse {
@@ -418,6 +422,10 @@ message DeleteVersionsRequest {
   string volume = 2;
   repeated string versions = 3;
   string opts = 4;
+  // msgpack payloads mirroring the JSON fields above (grpc-optimization P2). Senders dual-write
+  // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
+  repeated bytes versions_bin = 5;
+  bytes opts_bin = 6;
 }
 
 message DeleteVersionsResponse {

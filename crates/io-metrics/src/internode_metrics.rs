@@ -13,20 +13,27 @@
 // limitations under the License.
 
 use metrics::{counter, gauge};
+use std::collections::HashMap;
 use std::sync::{
-    Arc, LazyLock,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INTERNODE_OPERATION_READ_FILE_STREAM: &str = "read_file_stream";
 pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
 pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
+pub const INTERNODE_OPERATION_GRPC_READ_MULTIPLE: &str = "grpc_read_multiple";
 pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
 pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
 pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
+
+/// Direction of a msgpack/JSON codec decode, for the JSON-fallback counter: a server decoding a
+/// peer's request vs a client decoding a peer's response (grpc-optimization P2).
+pub const INTERNODE_MSGPACK_DIRECTION_REQUEST: &str = "request";
+pub const INTERNODE_MSGPACK_DIRECTION_RESPONSE: &str = "response";
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
@@ -34,6 +41,8 @@ const CLASSIFICATION_LABEL: &str = "classification";
 const STAGE_LABEL: &str = "stage";
 const DOMINANT_ERROR_LABEL: &str = "dominant_error";
 const HTTP_VERSION_LABEL: &str = "http_version";
+const DIRECTION_LABEL: &str = "direction";
+const MESSAGE_LABEL: &str = "message";
 const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
 const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
@@ -47,6 +56,9 @@ const INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL: &str = "rustfs_system_network_int
 const INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL: &str = "rustfs_system_network_internode_operation_stall_timeouts_total";
 const INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL: &str =
     "rustfs_system_network_internode_operation_write_shutdown_errors_total";
+const INTERNODE_OPERATION_PAYLOAD_BYTES: &str = "rustfs_system_network_internode_operation_payload_bytes";
+const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_internode_operation_large_payloads_total";
+const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +124,14 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     InternodeOperationMetricDescriptor {
         name: ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
         labels: QUORUM_FAILURE_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_PAYLOAD_BYTES,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
     },
 ];
 
@@ -315,6 +335,31 @@ impl InternodeMetrics {
             .increment(1);
     }
 
+    /// Record the payload size (bytes) of a completed internode operation into a histogram
+    /// keyed by operation+backend. Used to size which unary `bytes`-carrying RPCs
+    /// (`ReadAll`/`ReadMultiple`/`WriteAll`) would benefit from being moved off the shared
+    /// control-plane channel (see docs/grpc-optimization P1).
+    pub fn record_operation_payload_bytes(&self, operation: &'static str, backend: &'static str, bytes: usize) {
+        metrics::histogram!(INTERNODE_OPERATION_PAYLOAD_BYTES, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
+            .record(bytes as f64);
+    }
+
+    /// Increment the large-payload counter for an operation+backend whose payload exceeded the
+    /// caller-configured warning threshold. Feeds alerting on large unary RPCs that contend with
+    /// latency-sensitive control-plane traffic on the shared connection.
+    pub fn record_large_operation_payload(&self, operation: &'static str, backend: &'static str) {
+        counter!(INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+    }
+
+    /// Count a decode that fell back to the JSON compatibility field because the msgpack `_bin`
+    /// payload was absent. Both internode RPC directions dual-encode msgpack + JSON today; this
+    /// counter must read zero across a release window before the redundant JSON fields can be
+    /// dropped (grpc-optimization P2). `direction` is [`INTERNODE_MSGPACK_DIRECTION_REQUEST`] or
+    /// [`INTERNODE_MSGPACK_DIRECTION_RESPONSE`]; `message` is the low-cardinality value name.
+    pub fn record_msgpack_json_fallback(&self, direction: &'static str, message: &'static str) {
+        counter!(INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL, DIRECTION_LABEL => direction, MESSAGE_LABEL => message).increment(1);
+    }
+
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
@@ -386,6 +431,107 @@ pub fn global_internode_metrics() -> &'static Arc<InternodeMetrics> {
     &GLOBAL_INTERNODE_METRICS
 }
 
+// ── Cluster peer online/offline health (grpc-optimization P3) ──
+// Tracks reachability of each internode peer and exposes the count of offline peers as a gauge,
+// for parity with MinIO's `minio_cluster_servers_offline_total`. This is pure observability: it
+// does not change peer selection or quorum. A peer flips offline after a configured number of
+// consecutive failures and back online on the next successful dial.
+
+/// Gauge: number of internode peers currently considered offline.
+const CLUSTER_SERVERS_OFFLINE_TOTAL: &str = "rustfs_cluster_servers_offline_total";
+
+#[derive(Debug)]
+struct PeerHealthState {
+    online: bool,
+    consecutive_failures: u32,
+    /// Last time a request was let through to re-probe an offline peer (grpc-optimization P3
+    /// offline bypass). `None` means "not yet re-probed since going offline".
+    last_reprobe: Option<Instant>,
+}
+
+impl Default for PeerHealthState {
+    fn default() -> Self {
+        // A newly observed peer is assumed online until it accrues failures.
+        Self {
+            online: true,
+            consecutive_failures: 0,
+            last_reprobe: None,
+        }
+    }
+}
+
+static CLUSTER_PEER_HEALTH: LazyLock<Mutex<HashMap<String, PeerHealthState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn publish_offline_gauge(peers: &HashMap<String, PeerHealthState>) {
+    let offline = peers.values().filter(|peer| !peer.online).count();
+    gauge!(CLUSTER_SERVERS_OFFLINE_TOTAL).set(offline as f64);
+}
+
+/// Record that a cluster peer is reachable: mark it online and reset its consecutive-failure
+/// counter. Called on a successful dial to `addr`.
+pub fn record_peer_reachable(addr: &str) {
+    // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
+    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = peers.entry(addr.to_string()).or_default();
+    entry.online = true;
+    entry.consecutive_failures = 0;
+    entry.last_reprobe = None;
+    publish_offline_gauge(&peers);
+}
+
+/// Record a failed interaction with a cluster peer (dial failure or RPC-triggered eviction). After
+/// `failure_threshold` (>= 1) consecutive failures the peer flips offline.
+pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
+    // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
+    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = peers.entry(addr.to_string()).or_default();
+    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+    if entry.consecutive_failures >= failure_threshold.max(1) {
+        entry.online = false;
+    }
+    publish_offline_gauge(&peers);
+}
+
+/// Whether a cluster peer is currently considered offline (known and marked offline).
+pub fn cluster_peer_is_offline(addr: &str) -> bool {
+    let peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    peers.get(addr).map(|peer| !peer.online).unwrap_or(false)
+}
+
+/// Decide whether to fast-fail (bypass) an offline peer instead of attempting to reach it
+/// (grpc-optimization P3 offline bypass). Returns `true` to bypass.
+///
+/// Self-healing: for an offline peer this returns `true` most of the time, but lets one request
+/// through every `reprobe_interval` (returning `false` and recording the re-probe time) so the peer
+/// can recover via a normal dial even if no background monitor is running. Online peers are never
+/// bypassed.
+pub fn cluster_peer_should_bypass(addr: &str, reprobe_interval: Duration) -> bool {
+    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = peers.get_mut(addr) else {
+        return false;
+    };
+    if entry.online {
+        return false;
+    }
+    let now = Instant::now();
+    let due = match entry.last_reprobe {
+        None => true,
+        Some(last) => now.duration_since(last) >= reprobe_interval,
+    };
+    if due {
+        // Let this request through to re-probe; do not bypass.
+        entry.last_reprobe = Some(now);
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+fn cluster_peer_online(addr: &str) -> Option<bool> {
+    CLUSTER_PEER_HEALTH.lock().ok()?.get(addr).map(|peer| peer.online)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,7 +596,7 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 13);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 15);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
         }
@@ -465,6 +611,9 @@ mod tests {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
         }
         assert_eq!(INTERNODE_OPERATION_METRICS[12].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        // Payload histogram + large-payload counter carry operation+backend labels.
+        assert_eq!(INTERNODE_OPERATION_METRICS[13].labels, &[OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[14].labels, &[OPERATION_LABEL, BACKEND_LABEL]);
     }
 
     #[test]
@@ -511,6 +660,98 @@ mod tests {
             INTERNODE_OPERATION_METRICS[12].name,
             "rustfs_system_storage_erasure_write_quorum_failures_total"
         );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[13].name,
+            "rustfs_system_network_internode_operation_payload_bytes"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[14].name,
+            "rustfs_system_network_internode_operation_large_payloads_total"
+        );
+        assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
+        assert_eq!(
+            INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL,
+            "rustfs_system_network_internode_msgpack_json_fallback_total"
+        );
+        assert_eq!(INTERNODE_MSGPACK_DIRECTION_REQUEST, "request");
+        assert_eq!(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "response");
+    }
+
+    #[test]
+    fn msgpack_json_fallback_counter_records_without_panicking() {
+        // Smoke test: the counter accepts both directions and a static message label.
+        let metrics = InternodeMetrics::default();
+        metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
+        metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+    }
+
+    #[test]
+    fn cluster_peer_flips_offline_after_threshold_and_back_online() {
+        // Unique addr keeps this independent of the process-global registry / other tests.
+        let addr = "http://cluster-peer-health-unit-test:9000";
+        assert_eq!(cluster_peer_online(addr), None);
+
+        record_peer_unreachable(addr, 3);
+        record_peer_unreachable(addr, 3);
+        assert_eq!(cluster_peer_online(addr), Some(true), "still online below threshold");
+
+        record_peer_unreachable(addr, 3);
+        assert_eq!(cluster_peer_online(addr), Some(false), "offline at threshold");
+
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_online(addr), Some(true), "back online after a reachable dial");
+    }
+
+    #[test]
+    fn cluster_peer_threshold_is_clamped_to_at_least_one() {
+        let addr = "http://cluster-peer-health-clamp-test:9000";
+        // A zero threshold must not mean "never offline"; one failure suffices.
+        record_peer_unreachable(addr, 0);
+        assert_eq!(cluster_peer_online(addr), Some(false));
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_online(addr), Some(true));
+    }
+
+    #[test]
+    fn cluster_servers_offline_total_name_is_stable() {
+        assert_eq!(CLUSTER_SERVERS_OFFLINE_TOTAL, "rustfs_cluster_servers_offline_total");
+    }
+
+    #[test]
+    fn cluster_peer_should_bypass_is_self_healing() {
+        let addr = "http://cluster-peer-bypass-selfheal-test:9000";
+        let interval = Duration::from_secs(30);
+
+        // Online peer: never bypassed.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, interval));
+
+        // Take it offline (threshold 1 for the test).
+        record_peer_unreachable(addr, 1);
+        assert!(cluster_peer_is_offline(addr));
+
+        // First decision after going offline is a re-probe (not bypassed)...
+        assert!(!cluster_peer_should_bypass(addr, interval));
+        // ...and subsequent ones within the interval are bypassed.
+        assert!(cluster_peer_should_bypass(addr, interval));
+        assert!(cluster_peer_should_bypass(addr, interval));
+
+        // A zero interval always allows a re-probe (never strands the peer).
+        assert!(!cluster_peer_should_bypass(addr, Duration::ZERO));
+
+        // Recovery clears bypass entirely.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, interval));
+    }
+
+    #[test]
+    fn cluster_peer_should_bypass_ignores_unknown_and_online_peers() {
+        let addr = "http://cluster-peer-bypass-unknown-test:9000";
+        // Unknown peer: not bypassed.
+        assert!(!cluster_peer_should_bypass(addr, Duration::from_secs(5)));
+        // Known-online peer: not bypassed.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, Duration::from_secs(5)));
     }
 
     #[test]

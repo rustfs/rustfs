@@ -1902,6 +1902,7 @@ mod tests {
             file_info: "{}".to_string(),
             force_del_marker: false,
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1923,6 +1924,7 @@ mod tests {
             file_info: "invalid json".to_string(),
             force_del_marker: false,
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1944,6 +1946,7 @@ mod tests {
             file_info: "{}".to_string(),
             force_del_marker: false,
             opts: "invalid json".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1963,6 +1966,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["{}".to_string()],
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
@@ -1982,6 +1986,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["invalid json".to_string()],
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
@@ -2001,6 +2006,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["{}".to_string()],
             opts: "invalid json".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
