@@ -4688,6 +4688,112 @@ mod tests {
         assert_eq!(completed.size, second_part.size as i64);
     }
 
+    // backlog#853: concurrently re-transmitting the same part must not mix two
+    // shard generations. The uploadId commit lock only wraps rename_part, so the
+    // slow streaming phase stays fully concurrent (regression guard: no
+    // ServiceUnavailable / lock-acquire timeout) while the cross-disk commit is
+    // serialized, leaving exactly one self-consistent generation visible.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn concurrent_resend_same_part_commits_one_generation() {
+        use crate::storage_api_contracts::object::ObjectIO as _;
+
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("multipart-resend-{}", Uuid::new_v4().simple());
+        let object = "resend/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        let upload = ecstore
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        // Distinct payloads with distinct sizes: a mixed-generation reassembly
+        // would produce bytes matching none of them (or fail the read outright).
+        let candidates: Vec<Vec<u8>> = (0..6)
+            .map(|g| {
+                let len = 4096 + g * 512;
+                vec![b'a' + g as u8; len]
+            })
+            .collect();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for payload in candidates.iter().cloned() {
+            let store = ecstore.clone();
+            let bucket = bucket.clone();
+            let upload_id = upload.upload_id.clone();
+            tasks.spawn(async move {
+                let mut data = PutObjReader::from_vec(payload.clone());
+                store
+                    .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
+                    .await
+                    .map(|info| (info, payload))
+            });
+        }
+
+        // Every concurrent resend must succeed; the fix must not serialize the
+        // streaming phase into lock-acquire timeouts.
+        let mut results = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let outcome = joined.expect("put_object_part task should not panic");
+            results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
+        }
+        assert_eq!(results.len(), candidates.len());
+
+        // Exactly one generation is visible after the serialized commits, and its
+        // recorded size/etag matches one of the payloads we actually wrote.
+        let parts = ecstore
+            .list_object_parts(
+                &bucket,
+                object,
+                &upload.upload_id,
+                None,
+                crate::set_disk::MAX_PARTS_COUNT,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("multipart parts should be readable after concurrent resends");
+        assert_eq!(parts.parts.len(), 1, "only one generation of part 1 should remain visible");
+        let visible = &parts.parts[0];
+        assert_eq!(visible.part_num, 1);
+
+        let winner = results
+            .iter()
+            .find(|(info, _)| info.etag == visible.etag && info.size == visible.size)
+            .map(|(_, payload)| payload.clone())
+            .expect("the visible part must match exactly one payload that was committed");
+
+        let completed = ecstore
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                object,
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: 1,
+                    etag: visible.etag.clone(),
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    checksum_crc64nvme: None,
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete multipart upload should succeed with the committed generation");
+        assert_eq!(completed.size, winner.len() as i64);
+
+        // The reassembled object bytes must equal the winning generation exactly
+        // — proof that no shard from a different generation leaked into the read.
+        let mut reader = ecstore
+            .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed object should be readable");
+        let bytes = reader.read_all().await.expect("object bytes should be readable");
+        assert_eq!(bytes, winner, "reassembled object must match one intact generation, not a mix of shards");
+    }
+
     #[tokio::test]
     #[serial]
     async fn cleanup_removes_empty_multipart_sha_dirs() {
