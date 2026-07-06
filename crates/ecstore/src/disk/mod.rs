@@ -187,10 +187,10 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         match self {
-            Disk::Local(local_disk) => local_disk.delete_volume(volume).await,
-            Disk::Remote(remote_disk) => remote_disk.delete_volume(volume).await,
+            Disk::Local(local_disk) => local_disk.delete_volume(volume, force_delete).await,
+            Disk::Remote(remote_disk) => remote_disk.delete_volume(volume, force_delete).await,
         }
     }
 
@@ -554,7 +554,12 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
-    async fn delete_volume(&self, volume: &str) -> Result<()>;
+    /// Delete a volume (bucket directory). When `force_delete` is false a
+    /// non-empty volume is refused with `VolumeNotEmpty` (non-recursive); when
+    /// true it is removed recursively. Callers on the heal/dangling path must
+    /// pass false so a mis-classified bucket that still holds data cannot be
+    /// wiped (backlog#799 B1).
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()>;
 
     // Concurrent read/write pipeline w <- MetaCacheEntry
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()>;

@@ -137,7 +137,7 @@ impl NodeService {
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk.delete_volume(&request.volume).await {
+            match disk.delete_volume(&request.volume, request.force).await {
                 Ok(_) => Ok(Response::new(DeleteVolumeResponse {
                     success: true,
                     error: None,
