@@ -2658,6 +2658,28 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo.size = size;
         rinfo.replication_action = replication_action;
 
+        if replication_action == ReplicationAction::None {
+            // The target already holds a matching object (reached here only via
+            // the version-id fallback ETag match above) — there is nothing to
+            // copy. Record it as synced and return, instead of falling into the
+            // metadata-unsupported failure branch below, which previously left
+            // AWS-style targets permanently FAILED and never converging
+            // (backlog#860 / #799 B11).
+            if self.op_type == ReplicationType::ExistingObject && !tgt_client.reset_id.is_empty() {
+                rinfo.resync_timestamp = format!(
+                    "{};{}",
+                    OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| "invalid-time".to_string()),
+                    tgt_client.reset_id
+                );
+                rinfo.replication_resynced = true;
+            }
+            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+            return rinfo;
+        }
+
+        // action == Metadata: metadata-only replication is not implemented.
         if replication_action != ReplicationAction::All {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(ERR_REPLICATION_METADATA_COPY_UNSUPPORTED.to_string());
