@@ -542,6 +542,55 @@ write_ratio_summary() {
   } >"$csv_file"
 }
 
+write_fallback_reason_summary() {
+  local mode="$1"
+  local log_file="$2"
+  local csv_file="$3"
+
+  awk -v mode="$mode" '
+    BEGIN {
+      print "mode,reason,index_fallback_total"
+    }
+    /Name[[:space:]]*: rustfs_s3_list_objects_index_fallback_total/ {
+      in_metric = 1
+      value = ""
+      next
+    }
+    in_metric && /Name[[:space:]]*:/ && $0 !~ /rustfs_s3_list_objects_index_fallback_total/ {
+      in_metric = 0
+      value = ""
+      next
+    }
+    in_metric && /Value[[:space:]]*:/ {
+      line = $0
+      sub(/^.*Value[[:space:]]*:[[:space:]]*/, "", line)
+      split(line, parts, /[[:space:]]+/)
+      value = parts[1]
+      next
+    }
+    in_metric && /->[[:space:]]*reason:/ {
+      line = $0
+      sub(/^.*->[[:space:]]*reason:[[:space:]]*/, "", line)
+      split(line, parts, /[[:space:]]+/)
+      reason = parts[1]
+      last[reason] = value + 0
+      seen[reason] = 1
+      value = ""
+      next
+    }
+    END {
+      count = 0
+      for (reason in seen) {
+        printf "%s,%s,%.0f\n", mode, reason, last[reason]
+        count += 1
+      }
+      if (count == 0) {
+        printf "%s,N/A,0\n", mode
+      }
+    }
+  ' "$log_file" >"$csv_file"
+}
+
 prometheus_api_query_url() {
   local url="$PROMETHEUS_QUERY_URL"
   if [[ "$url" == */api/v1/query ]]; then
@@ -633,6 +682,7 @@ run_mode() {
   stop_resource_sampler
   sleep "$((METER_INTERVAL + 2))"
   write_ratio_summary "$mode" "$mode_dir/rustfs.log" "$mode_dir/index-ratios.csv"
+  write_fallback_reason_summary "$mode" "$mode_dir/rustfs.log" "$mode_dir/index-fallback-reasons.csv"
   write_resource_summary "$mode_dir/resource-samples.csv" "$mode_dir/resource-summary.csv"
   write_prometheus_snapshot "$mode" "$mode_dir"
   stop_server
@@ -695,6 +745,16 @@ write_combined_summary() {
     echo "### Opt-in verified"
     echo
     cat "$OUT_DIR/opt_in_verified/index-ratios.csv"
+    echo
+    echo "## Fallback Reasons"
+    echo
+    echo "### Walker"
+    echo
+    cat "$OUT_DIR/walker/index-fallback-reasons.csv"
+    echo
+    echo "### Opt-in verified"
+    echo
+    cat "$OUT_DIR/opt_in_verified/index-fallback-reasons.csv"
     echo
     echo "## Resource Samples"
     echo
