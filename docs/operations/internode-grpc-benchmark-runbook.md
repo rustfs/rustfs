@@ -8,6 +8,25 @@ optimization stage (grpc-optimization P0–P3). Every stage is env-gated, so "be
 > (`warp` or `s3bench`), and a Prometheus scrape of `/metrics`. They are not runnable in a
 > single-process sandbox. Capture artifacts on a real cluster.
 
+## One-click driver
+
+`scripts/run_internode_grpc_ab_bench.sh --stage <p0|p1|p2|p3> --phase <before|after> [-- <bench args>]`
+wraps the env matrix below: it writes the stage/phase **server** env to
+`<out-dir>/server-env.sh`, then runs the right underlying bench into
+`target/bench/internode-transport/<stage>-<phase>/`.
+
+```bash
+# P1 A/B (restart the cluster with each phase's server-env.sh between the two runs):
+scripts/run_internode_grpc_ab_bench.sh --stage p1 --phase before -- --access-key AK --secret-key SK --metrics-url http://node1:9000/metrics
+scripts/run_internode_grpc_ab_bench.sh --stage p1 --phase after  -- --access-key AK --secret-key SK --metrics-url http://node1:9000/metrics
+# P3 failover A/B (docker four-node):
+scripts/run_internode_grpc_ab_bench.sh --stage p3 --phase after
+```
+
+`RUSTFS_INTERNODE_*` are **server** env: for the load-driven stages (p0/p1/p2) source the emitted
+`server-env.sh` on every node and restart rustfs *before* the run — the driver cannot mutate an
+already-running server. Use `--dry-run` to preview the env and command.
+
 ## Harness
 
 - Throughput / latency: `scripts/run_internode_transport_baseline.sh` (drives
