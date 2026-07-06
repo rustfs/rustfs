@@ -423,7 +423,7 @@ impl BucketMetadata {
     }
 
     pub fn object_locking(&self) -> bool {
-        self.lock_enabled || (self.versioning_config.as_ref().is_some_and(|v| v.enabled()))
+        self.lock_enabled || self.object_lock_config.as_ref().is_some_and(|v| v.enabled())
     }
 
     pub fn table_bucket_enabled(&self) -> bool {
@@ -1111,6 +1111,24 @@ mod test {
         let new = BucketMetadata::unmarshal(&buf).unwrap();
 
         assert_eq!(bm.name, new.name);
+    }
+
+    #[test]
+    fn object_locking_requires_lock_metadata_not_plain_versioning() {
+        use s3s::dto::ObjectLockEnabled;
+
+        let mut bm = BucketMetadata::new("test-bucket");
+        bm.versioning_config = Some(VersioningConfiguration {
+            status: Some(s3s::dto::BucketVersioningStatus::from_static("Enabled")),
+            ..Default::default()
+        });
+        assert!(!bm.object_locking());
+
+        bm.object_lock_config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            ..Default::default()
+        });
+        assert!(bm.object_locking());
     }
 
     #[test]

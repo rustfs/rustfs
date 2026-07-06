@@ -17,6 +17,8 @@
 // Performance metrics recording (with zero-copy-metrics integration)
 use rustfs_io_metrics::buffered_write;
 
+use crate::storage_api::table::get_bucket_metadata;
+
 use super::storage_api::object_usecase::ECStore;
 use super::storage_api::object_usecase::access::{
     PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
@@ -35,7 +37,7 @@ use super::storage_api::object_usecase::bucket::{
     metadata_sys,
     object_lock::{
         objectlock::{get_object_legalhold_meta, get_object_retention_meta},
-        objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, is_retention_active},
+        objectlock_sys::{check_object_lock_for_deletion, is_retention_active},
     },
     predict_lifecycle_expiration,
     quota::QuotaOperation,
@@ -5053,8 +5055,7 @@ impl DefaultObjectUsecase {
         });
         let force_delete = opts.delete_prefix;
 
-        let lock_cfg = BucketObjectLockSys::get(&bucket).await;
-        if lock_cfg.is_some() && opts.delete_prefix {
+        if opts.delete_prefix && bucket_object_locking_enabled(&bucket).await {
             return Err(S3Error::with_message(
                 S3ErrorCode::Custom("force-delete is forbidden on Object Locking enabled buckets".into()),
                 "force-delete is forbidden on Object Locking enabled buckets",
@@ -6263,6 +6264,12 @@ fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'s
                 .eq_ignore_ascii_case(name)
         })
     })
+}
+
+async fn bucket_object_locking_enabled(bucket: &str) -> bool {
+    get_bucket_metadata(bucket)
+        .await
+        .is_ok_and(|metadata| metadata.object_locking())
 }
 
 #[cfg(test)]
