@@ -1312,6 +1312,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
         let disks = self.disk_inventory().await;
         let write_quorum = disks.len() / 2 + 1;
+        let rollback_dir = Uuid::new_v4();
 
         let mut futures = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
@@ -1320,7 +1321,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             futures.push(async move {
                 if let Some(disk) = disk {
                     match disk
-                        .delete_version(bucket, object, fi.clone(), force_del_marker, DeleteOptions::default())
+                        .delete_version(
+                            bucket,
+                            object,
+                            fi.clone(),
+                            force_del_marker,
+                            DeleteOptions {
+                                old_data_dir: Some(rollback_dir),
+                                ..Default::default()
+                            },
+                        )
                         .await
                     {
                         Ok(r) => Ok(r),
@@ -1344,7 +1354,77 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+        let quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+        let should_rollback = quorum_result.is_err();
+        let mut rollback_futures = Vec::new();
+        for (index, err) in errs.iter().enumerate() {
+            if err.is_some() {
+                continue;
+            }
+
+            let Some(disk) = disks[index].as_ref() else {
+                continue;
+            };
+
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            let fi = fi.clone();
+            rollback_futures.push(async move {
+                if should_rollback {
+                    if let Err(err) = disk
+                        .delete_version(
+                            &bucket,
+                            &object,
+                            fi,
+                            force_del_marker,
+                            DeleteOptions {
+                                undo_write: true,
+                                undo_delete: true,
+                                old_data_dir: Some(rollback_dir),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %object,
+                            rollback_dir = %rollback_dir,
+                            error = ?err,
+                            "failed to roll back delete after write quorum failure"
+                        );
+                    }
+                } else {
+                    let rollback_path = format!("{object}/{rollback_dir}");
+                    if let Err(err) = disk
+                        .delete(
+                            &bucket,
+                            &rollback_path,
+                            DeleteOptions {
+                                recursive: true,
+                                immediate: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        && err != DiskError::FileNotFound
+                        && err != DiskError::VolumeNotFound
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %object,
+                            rollback_dir = %rollback_dir,
+                            error = ?err,
+                            "failed to clean delete rollback state after quorum success"
+                        );
+                    }
+                }
+            });
+        }
+
+        join_all(rollback_futures).await;
+        quorum_result
     }
 
     #[tracing::instrument(skip(self))]
@@ -1542,6 +1622,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             vers.push(fi_vers);
         }
 
+        let rollback_dir = Uuid::new_v4();
+        let mut rollback_versions_by_index = vec![None; objects.len()];
+        for fi_vers in &vers {
+            for fi in &fi_vers.versions {
+                rollback_versions_by_index[fi.idx] = Some(fi_vers.clone());
+            }
+        }
+
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
@@ -1554,7 +1642,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let vers = vers.clone();
             futures.push(async move {
                 if let Some(disk) = disk {
-                    disk.delete_versions(bucket, vers, DeleteOptions::default()).await
+                    disk.delete_versions(
+                        bucket,
+                        vers,
+                        DeleteOptions {
+                            old_data_dir: Some(rollback_dir),
+                            ..Default::default()
+                        },
+                    )
+                    .await
                 } else {
                     let mut errs = Vec::with_capacity(vers.len());
                     for _ in 0..vers.len() {
@@ -1617,6 +1713,85 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+
+        let mut rollback_futures = Vec::new();
+        let mut handled_rollback_paths = HashSet::new();
+        for obj_idx in 0..objects.len() {
+            let Some(fi_vers) = rollback_versions_by_index[obj_idx].clone() else {
+                continue;
+            };
+
+            let should_rollback = del_errs[obj_idx].is_some();
+            for (disk_idx, disk) in disks.iter().enumerate() {
+                if del_obj_errs[disk_idx][obj_idx].is_some() {
+                    continue;
+                }
+
+                let Some(disk) = disk.as_ref() else {
+                    continue;
+                };
+
+                if !handled_rollback_paths.insert((disk_idx, fi_vers.name.clone(), should_rollback)) {
+                    continue;
+                }
+
+                let disk = disk.clone();
+                let bucket = bucket.to_string();
+                let object = fi_vers.name.clone();
+                let versions = fi_vers.clone();
+                rollback_futures.push(async move {
+                    if should_rollback {
+                        let errs = disk
+                            .delete_versions(
+                                &bucket,
+                                vec![versions],
+                                DeleteOptions {
+                                    undo_write: true,
+                                    undo_delete: true,
+                                    old_data_dir: Some(rollback_dir),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        if let Some(err) = errs.into_iter().flatten().next() {
+                            warn!(
+                                bucket = %bucket,
+                                object = %object,
+                                rollback_dir = %rollback_dir,
+                                error = ?err,
+                                "failed to roll back batch delete after write quorum failure"
+                            );
+                        }
+                    } else {
+                        let rollback_path = format!("{object}/{rollback_dir}");
+                        if let Err(err) = disk
+                            .delete(
+                                &bucket,
+                                &rollback_path,
+                                DeleteOptions {
+                                    recursive: true,
+                                    immediate: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            && err != DiskError::FileNotFound
+                            && err != DiskError::VolumeNotFound
+                        {
+                            warn!(
+                                bucket = %bucket,
+                                object = %object,
+                                rollback_dir = %rollback_dir,
+                                error = ?err,
+                                "failed to clean batch delete rollback state after quorum success"
+                            );
+                        }
+                    }
+                });
+            }
+        }
+
+        join_all(rollback_futures).await;
 
         // TODO: add_partial
 

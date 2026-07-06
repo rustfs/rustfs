@@ -812,6 +812,7 @@ impl LocalDiskWrapper {
                     recursive: false,
                     immediate: false,
                     undo_write: false,
+                    undo_delete: false,
                     old_data_dir: None,
                 },
             )
