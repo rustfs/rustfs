@@ -937,7 +937,10 @@ async fn handle_builtin_policy_entities(req: S3Request<Body>) -> S3Result<S3Resp
     Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
 }
 
-async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool) -> S3Result<S3Response<(StatusCode, Body)>> {
+pub(crate) async fn handle_builtin_policy_association(
+    req: S3Request<Body>,
+    is_attach: bool,
+) -> S3Result<S3Response<(StatusCode, Body)>> {
     let Some(input_cred) = req.credentials else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
     };

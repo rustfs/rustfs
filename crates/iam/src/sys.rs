@@ -330,6 +330,27 @@ impl<T: Store> IamSys<T> {
         Ok(())
     }
 
+    /// Delete a single temporary/STS account by its access key.
+    ///
+    /// Unlike [`Self::delete_user`], which operates on regular (`UserType::Reg`)
+    /// identities, this removes an STS credential (`UserType::Sts`) from both the
+    /// in-memory cache and the backing store, immediately invalidating the
+    /// associated session token. This is the primitive used by the admin
+    /// `revoke-tokens` endpoint to revoke STS credentials for a parent user.
+    pub async fn delete_temp_account(&self, access_key: &str, notify: bool) -> Result<()> {
+        self.store.delete_user(access_key, UserType::Sts).await?;
+
+        if notify && !self.has_watcher() {
+            for r in notify_iam_delete_user(access_key).await {
+                if let Some(err) = r.err {
+                    warn!("notify delete_temp_account failed: {}", err);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn notify_for_user(&self, name: &str, is_temp: bool) {
         if self.has_watcher() {
             return;
