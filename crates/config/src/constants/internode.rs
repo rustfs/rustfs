@@ -148,6 +148,15 @@ pub const DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS: u64 = 5;
 const _: () = assert!(!DEFAULT_INTERNODE_PREWARM);
 const _: () = assert!(!DEFAULT_INTERNODE_OFFLINE_BYPASS);
 
+/// Extra attempts for idempotent, read-only/reentrant control-plane RPCs (e.g. `DiskInfo`) on
+/// transient network failures, with exponential backoff (grpc-optimization P3-3).
+///
+/// Defaults to `0` (disabled) — retries change latency-on-failure behavior and are opt-in. **Only**
+/// idempotent reads use this; write/lock RPCs (`WriteAll`/`RenameData`/`Delete*`/`Lock`/`UnLock`)
+/// must never auto-retry, to preserve quorum and idempotency semantics (see `CLAUDE.md`).
+pub const ENV_INTERNODE_IDEMPOTENT_READ_RETRIES: &str = "RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES";
+pub const DEFAULT_INTERNODE_IDEMPOTENT_READ_RETRIES: usize = 0;
+
 // ── Control/bulk channel isolation (P1) ──
 // Large `bytes`-carrying unary RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion) otherwise
 // share the control-plane HTTP/2 connection with latency-sensitive lock/health RPCs; a large
@@ -268,9 +277,11 @@ mod tests {
     fn internode_p3_lifecycle_defaults_are_opt_in() {
         // The opt-in (default-off) invariants are asserted at compile time next to the definitions.
         assert_eq!(DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS, 5);
+        assert_eq!(DEFAULT_INTERNODE_IDEMPOTENT_READ_RETRIES, 0);
         assert_eq!(ENV_INTERNODE_PREWARM, "RUSTFS_INTERNODE_PREWARM");
         assert_eq!(ENV_INTERNODE_OFFLINE_BYPASS, "RUSTFS_INTERNODE_OFFLINE_BYPASS");
         assert_eq!(ENV_INTERNODE_OFFLINE_REPROBE_SECS, "RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS");
+        assert_eq!(ENV_INTERNODE_IDEMPOTENT_READ_RETRIES, "RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES");
     }
 
     #[test]

@@ -79,6 +79,8 @@ enum FailureHealthAction {
 
 const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+/// Base backoff for idempotent read-only RPC retries (grpc-optimization P3-3); doubles per attempt.
+const REMOTE_DISK_READ_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
 const ENV_RUSTFS_METADATA_BATCH_READ: &str = "RUSTFS_METADATA_BATCH_READ";
 const LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC: &str = "RUSTFS_BATCH_METADATA_RPC";
 const BATCH_METADATA_RPC_OFF: &str = "off";
@@ -209,6 +211,28 @@ fn internode_offline_reprobe_interval() -> Duration {
             rustfs_config::DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS,
         )
         .max(1),
+    )
+}
+
+/// If the offline bypass is enabled and `addr` is marked offline, return a reason string to
+/// fast-fail with instead of paying the connect timeout (grpc-optimization P3-2). Self-healing:
+/// one request per re-probe interval is let through so the peer can recover. Shared by the data
+/// path (`remote_disk`) and the lock path (`remote_locker`).
+pub(crate) fn internode_offline_bypass_reason(addr: &str) -> Option<String> {
+    if internode_offline_bypass_enabled()
+        && rustfs_io_metrics::internode_metrics::cluster_peer_should_bypass(addr, internode_offline_reprobe_interval())
+    {
+        return Some(format!("internode peer {addr} offline; fast-fail bypass (P3)"));
+    }
+    None
+}
+
+/// Number of extra attempts for idempotent read-only control-plane RPCs on transient network
+/// failures (grpc-optimization P3-3). `0` (default) disables retries. Write/lock RPCs never retry.
+fn internode_idempotent_read_retries() -> usize {
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_INTERNODE_IDEMPOTENT_READ_RETRIES,
+        rustfs_config::DEFAULT_INTERNODE_IDEMPOTENT_READ_RETRIES,
     )
 }
 
@@ -671,6 +695,38 @@ impl RemoteDisk {
         self.execute_with_timeout_for_op("unknown", operation, timeout_duration).await
     }
 
+    /// Execute an **idempotent, read-only/reentrant** RPC with a bounded number of retries on
+    /// transient network failures, with exponential backoff (grpc-optimization P3-3). Retries
+    /// default to 0 (disabled). MUST NOT be used for write/lock RPCs — those must never auto-retry
+    /// (quorum/idempotency safety). The `operation` closure is re-invoked per attempt, so it must be
+    /// `Fn` (rebuild the request from borrowed inputs, do not move captured state out).
+    async fn execute_read_with_retry<T, F, Fut>(&self, op: &'static str, operation: F, timeout_duration: Duration) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let max_retries = internode_idempotent_read_retries();
+        let mut attempt = 0usize;
+        loop {
+            match self.execute_with_timeout_for_op(op, &operation, timeout_duration).await {
+                Err(err) if attempt < max_retries && is_network_like_disk_error(&err) => {
+                    attempt += 1;
+                    let backoff = REMOTE_DISK_READ_RETRY_BASE_BACKOFF
+                        .saturating_mul(1u32 << u32::try_from(attempt - 1).unwrap_or(4).min(4));
+                    debug!(
+                        endpoint = %self.endpoint,
+                        addr = %self.addr,
+                        op,
+                        attempt,
+                        "retrying idempotent read-only RPC after transient network error"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     async fn execute_with_timeout_for_op<T, F, Fut>(
         &self,
         op: &'static str,
@@ -868,12 +924,7 @@ impl RemoteDisk {
     /// recovers even without a background monitor. The recovery monitor's own probe path calls the
     /// client directly and is unaffected.
     fn offline_bypass_error(&self) -> Option<Error> {
-        if internode_offline_bypass_enabled()
-            && rustfs_io_metrics::internode_metrics::cluster_peer_should_bypass(&self.addr, internode_offline_reprobe_interval())
-        {
-            return Some(Error::other(format!("internode peer {} offline; fast-fail bypass (P3)", self.addr)));
-        }
-        None
+        internode_offline_bypass_reason(&self.addr).map(Error::other)
     }
 
     async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
@@ -2541,7 +2592,8 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
-        self.execute_with_timeout_for_op(
+        // disk_info is idempotent/read-only, so it is eligible for the P3-3 bounded retry.
+        self.execute_read_with_retry(
             "disk_info",
             || async {
                 let opts = serde_json::to_string(&opts)?;

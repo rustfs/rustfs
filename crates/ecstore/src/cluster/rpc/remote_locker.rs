@@ -77,6 +77,12 @@ impl RemoteClient {
     }
 
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        // P3-2 offline bypass (now covering the lock path too): fast-fail a peer already marked
+        // offline instead of paying the connect timeout, so dsync reaches quorum sooner. Does not
+        // change quorum; the self-healing re-probe keeps the peer recoverable.
+        if let Some(reason) = crate::cluster::rpc::remote_disk::internode_offline_bypass_reason(&self.addr) {
+            return Err(LockError::internal(reason));
+        }
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| LockError::internal(format!("can not get client, err: {err}")))
