@@ -708,17 +708,59 @@ impl ReplicationResyncer {
                         roi.version_id.map(|v| v.to_string()),
                     )
                     .await;
-                    let (size, err) = if let Err(err) = head_result {
-                        if roi.delete_marker {
+                    let (size, err) = match head_result {
+                        Ok(_) => {
                             st.replicated_count += 1;
-                        } else {
-                            st.failed_count += 1;
+                            st.replicated_size += roi.size;
+                            (roi.size, None)
                         }
-                        (0, Some(err))
-                    } else {
-                        st.replicated_count += 1;
-                        st.replicated_size += roi.size;
-                        (roi.size, None)
+                        Err(err) if roi.delete_marker => {
+                            // Verifying a replicated delete marker: only a
+                            // definitive 404/NoSuchKey or 405/MethodNotAllowed
+                            // confirms the marker propagated. Any other
+                            // (retryable/ambiguous) HEAD error leaves the outcome
+                            // unverified, so it must count as failed — not as a
+                            // blanket success (backlog#862 / #799 B13).
+                            let retryable = {
+                                let (is_not_found, code) = err
+                                    .as_service_error()
+                                    .map(|se| (se.is_not_found(), se.code()))
+                                    .unwrap_or((false, None));
+                                is_retryable_delete_replication_head_error(is_not_found, code)
+                            };
+                            if retryable {
+                                st.failed_count += 1;
+                                (0, Some(err))
+                            } else {
+                                st.replicated_count += 1;
+                                (0, None)
+                            }
+                        }
+                        Err(err) if is_version_id_format_mismatch(&err) => {
+                            // AWS-style target rejects the RustFS UUID versionId
+                            // (400). Re-verify without the versionId before
+                            // concluding the object failed to replicate, instead
+                            // of counting a well-replicated object as failed.
+                            match head_object_fallback(&bucket_name, target_client.as_ref(), &roi.name).await {
+                                Ok(Some(_)) => {
+                                    st.replicated_count += 1;
+                                    st.replicated_size += roi.size;
+                                    (roi.size, None)
+                                }
+                                Ok(None) => {
+                                    st.failed_count += 1;
+                                    (0, Some(err))
+                                }
+                                Err(e2) => {
+                                    st.failed_count += 1;
+                                    (0, Some(e2))
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            st.failed_count += 1;
+                            (0, Some(err))
+                        }
                     };
 
                     if err.is_some() {
