@@ -459,7 +459,12 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
+// Enabled by default (backlog#872): the early-stop path only engages for
+// requests `should_allow_metadata_early_stop` classifies as safe (metadata-only
+// reads without version_id / healing / free-version needs) and still requires
+// a full read-quorum agreement before stopping. Set the env var to `false` to
+// fall back to full-wait metadata fanout.
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;

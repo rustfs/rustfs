@@ -221,7 +221,9 @@ impl SetDisks {
 
         let disks = disks.clone();
 
-        // TODO: optimize concurrency and break once enough slots are available
+        // Early-stop for safe metadata reads is handled inside
+        // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
+        // core/io_primitives.rs); unsafe requests fall back to full-wait.
         let (parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
             &disks,
             "",
@@ -2145,9 +2147,19 @@ mod tests {
     }
 
     #[test]
-    fn metadata_early_stop_gate_defaults_to_disabled() {
+    fn metadata_early_stop_gate_defaults_to_enabled() {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, None::<&str>, || {
+            assert!(is_get_metadata_early_stop_enabled());
+        });
+    }
+
+    #[test]
+    fn metadata_early_stop_gate_honors_explicit_opt_out() {
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("false"), || {
             assert!(!is_get_metadata_early_stop_enabled());
+            // With the gate off, even safe metadata-only requests must fall
+            // back to the full-wait fanout.
+            assert!(!should_allow_metadata_early_stop(false, "", false, false));
         });
     }
 
