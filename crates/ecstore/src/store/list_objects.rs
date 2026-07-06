@@ -33,6 +33,7 @@ use crate::storage_api_contracts::{
 };
 use crate::store::ECStore;
 use crate::store::utils::is_reserved_or_invalid_bucket;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
@@ -268,6 +269,9 @@ const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PRO
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH";
+const ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED";
+const ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS";
+const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
@@ -275,6 +279,7 @@ const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v1
 const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
 const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
 const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
+const PERSISTENT_KEY_ONLY_INDEX_OBJECT_PREFIX: &str = "# object\t";
 const LIST_OBJECTS_NAMESPACE_JOURNAL_HEADER: &str = "# rustfs-listobjects-namespace-journal-v1";
 const LIST_OBJECTS_NAMESPACE_JOURNAL_BUCKET_HEADER: &str = "# bucket=";
 const LIST_OBJECTS_NAMESPACE_JOURNAL_HIGH_WATER_MARK_HEADER: &str = "# high_water_mark=";
@@ -359,6 +364,7 @@ enum ListIndexFallbackReason {
     MissingGeneration,
     GenerationMismatch,
     UnsupportedRequest,
+    MetadataFastUnavailable,
 }
 
 impl ListIndexFallbackReason {
@@ -373,6 +379,7 @@ impl ListIndexFallbackReason {
             Self::MissingGeneration => "missing_generation",
             Self::GenerationMismatch => "generation_mismatch",
             Self::UnsupportedRequest => "unsupported_request",
+            Self::MetadataFastUnavailable => "metadata_fast_unavailable",
         }
     }
 }
@@ -465,6 +472,41 @@ struct PersistentKeyOnlyIndex {
     generation: String,
     checkpoint_high_water_mark: u64,
     keys: Arc<Vec<String>>,
+    objects: Arc<Vec<PersistentListMetadataObject>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistentListMetadataObject {
+    name: String,
+    size: i64,
+    mod_time: Option<time::OffsetDateTime>,
+    etag: Option<String>,
+    storage_class: Option<String>,
+}
+
+impl PersistentListMetadataObject {
+    fn from_object_info(object: &ObjectInfo) -> Self {
+        Self {
+            name: object.name.clone(),
+            size: object.size,
+            mod_time: object.mod_time,
+            etag: object.etag.clone(),
+            storage_class: object.storage_class.clone(),
+        }
+    }
+
+    fn to_object_info(&self, bucket: &str) -> ObjectInfo {
+        ObjectInfo {
+            bucket: bucket.to_owned(),
+            name: self.name.clone(),
+            size: self.size,
+            mod_time: self.mod_time,
+            etag: self.etag.clone(),
+            storage_class: self.storage_class.clone(),
+            is_latest: true,
+            ..Default::default()
+        }
+    }
 }
 
 static PERSISTENT_KEY_ONLY_INDEX_CACHE: OnceCell<RwLock<Option<PersistentKeyOnlyIndexCache>>> = OnceCell::const_new();
@@ -1095,15 +1137,88 @@ async fn persist_observed_list_objects_mutation(store: Option<&ECStore>, bucket:
     }
 }
 
+fn encode_persistent_list_metadata_string(value: &str) -> String {
+    BASE64_STANDARD.encode(value.as_bytes())
+}
+
+fn decode_persistent_list_metadata_string(value: &str) -> Option<String> {
+    let bytes = BASE64_STANDARD.decode(value).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn encode_optional_persistent_list_metadata_string(value: Option<&str>) -> String {
+    value
+        .map(encode_persistent_list_metadata_string)
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn decode_optional_persistent_list_metadata_string(value: &str) -> Option<Option<String>> {
+    if value == "-" {
+        Some(None)
+    } else {
+        decode_persistent_list_metadata_string(value).map(Some)
+    }
+}
+
+fn encode_persistent_list_metadata_object(object: &PersistentListMetadataObject) -> String {
+    let mut line = String::new();
+    line.push_str(PERSISTENT_KEY_ONLY_INDEX_OBJECT_PREFIX);
+    line.push_str(&encode_persistent_list_metadata_string(&object.name));
+    line.push('\t');
+    line.push_str(&object.size.to_string());
+    line.push('\t');
+    line.push_str(
+        &object
+            .mod_time
+            .map(|mod_time| mod_time.unix_timestamp_nanos().to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+    );
+    line.push('\t');
+    line.push_str(&encode_optional_persistent_list_metadata_string(object.etag.as_deref()));
+    line.push('\t');
+    line.push_str(&encode_optional_persistent_list_metadata_string(object.storage_class.as_deref()));
+    line
+}
+
+fn parse_persistent_list_metadata_object(line: &str) -> Option<PersistentListMetadataObject> {
+    let value = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_OBJECT_PREFIX)?;
+    let mut fields = value.split('\t');
+    let name = decode_persistent_list_metadata_string(fields.next()?)?;
+    let size = fields.next()?.parse::<i64>().ok()?;
+    let mod_time = match fields.next()? {
+        "-" => None,
+        value => Some(time::OffsetDateTime::from_unix_timestamp_nanos(value.parse::<i128>().ok()?).ok()?),
+    };
+    let etag = decode_optional_persistent_list_metadata_string(fields.next()?)?;
+    let storage_class = decode_optional_persistent_list_metadata_string(fields.next()?)?;
+    if fields.next().is_some() {
+        return None;
+    }
+
+    Some(PersistentListMetadataObject {
+        name,
+        size,
+        mod_time,
+        etag,
+        storage_class,
+    })
+}
+
 fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
     let mut bucket = None;
     let mut generation = None;
     let mut checkpoint_high_water_mark = None;
     let mut keys = Vec::new();
+    let mut objects = Vec::new();
 
     for line in contents.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
+            continue;
+        }
+        if let Some(object) = parse_persistent_list_metadata_object(line) {
+            keys.push(object.name.clone());
+            objects.push(object);
             continue;
         }
         if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER) {
@@ -1130,6 +1245,8 @@ fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
 
     keys.sort_unstable();
     keys.dedup();
+    objects.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    objects.dedup_by(|left, right| left.name == right.name);
     let checkpoint_high_water_mark = checkpoint_high_water_mark.unwrap_or_else(|| match u64::try_from(keys.len()) {
         Ok(value) => value,
         Err(_) => u64::MAX,
@@ -1140,6 +1257,7 @@ fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
         generation: generation.unwrap_or_else(|| LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION.to_owned()),
         checkpoint_high_water_mark,
         keys: Arc::new(keys),
+        objects: Arc::new(objects),
     }
 }
 
@@ -1174,6 +1292,15 @@ fn persistent_key_only_index_matches_provider(
         .is_none_or(|generation| index.generation == generation)
 }
 
+fn persistent_key_only_index_has_complete_metadata_snapshot(index: &PersistentKeyOnlyIndex) -> bool {
+    index.keys.len() == index.objects.len()
+        && index
+            .keys
+            .iter()
+            .zip(index.objects.iter())
+            .all(|(key, object)| key == &object.name)
+}
+
 fn generated_persistent_key_only_generation(configured: Option<&str>) -> String {
     if let Some(configured) = configured
         && is_valid_list_objects_index_generation(configured)
@@ -1196,6 +1323,18 @@ async fn write_persistent_key_only_index(
     checkpoint_high_water_mark: u64,
     keys: &[String],
 ) -> Result<PersistentKeyOnlyIndex> {
+    write_persistent_key_only_index_with_metadata(store, path, bucket, generation, checkpoint_high_water_mark, keys, &[]).await
+}
+
+async fn write_persistent_key_only_index_with_metadata(
+    store: Option<&ECStore>,
+    path: &Path,
+    bucket: &str,
+    generation: &str,
+    checkpoint_high_water_mark: u64,
+    keys: &[String],
+    objects: &[PersistentListMetadataObject],
+) -> Result<PersistentKeyOnlyIndex> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1205,6 +1344,9 @@ async fn write_persistent_key_only_index(
     let mut keys = keys.to_vec();
     keys.sort_unstable();
     keys.dedup();
+    let mut objects = objects.to_vec();
+    objects.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    objects.dedup_by(|left, right| left.name == right.name);
     let mut contents = String::new();
     contents.push_str(PERSISTENT_KEY_ONLY_INDEX_HEADER);
     contents.push('\n');
@@ -1221,6 +1363,10 @@ async fn write_persistent_key_only_index(
         contents.push_str(key);
         contents.push('\n');
     }
+    for object in &objects {
+        contents.push_str(&encode_persistent_list_metadata_object(object));
+        contents.push('\n');
+    }
 
     let Some(journal_backend) = list_objects_namespace_journal_backend(store, Some(path)) else {
         return Err(Error::other("list objects namespace mutation journal path is not configured"));
@@ -1235,6 +1381,7 @@ async fn write_persistent_key_only_index(
         generation: generation.to_owned(),
         checkpoint_high_water_mark,
         keys: Arc::new(keys),
+        objects: Arc::new(objects),
     })
 }
 
@@ -1641,9 +1788,29 @@ fn list_objects_index_mode_from_env() -> Option<ListSourceMode> {
         Some(ListSourceMode::IndexKeyOnly)
     } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE) || value.eq_ignore_ascii_case("verified_page") {
         Some(ListSourceMode::IndexVerifiedPage)
+    } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_METADATA_FAST) || value.eq_ignore_ascii_case("metadata_fast") {
+        list_objects_metadata_fast_guardrails_from_env().map(|_| ListSourceMode::IndexMetadataFast)
     } else {
         None
     }
+}
+
+fn list_objects_metadata_fast_guardrails_from_env() -> Option<u64> {
+    let enabled = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, "");
+    let enabled = enabled.trim();
+    if !(enabled == "1"
+        || enabled.eq_ignore_ascii_case("true")
+        || enabled.eq_ignore_ascii_case("yes")
+        || enabled.eq_ignore_ascii_case("on"))
+    {
+        return None;
+    }
+
+    let staleness = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, "");
+    let staleness_ms = staleness.trim().parse::<u64>().ok()?;
+    (1..=MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS)
+        .contains(&staleness_ms)
+        .then_some(staleness_ms)
 }
 
 fn list_objects_index_provider_from_env() -> Option<ListObjectsIndexProviderKind> {
@@ -1986,9 +2153,10 @@ where
         }
     }
 
-    let is_truncated = visible_entries.len() > max_keys as usize;
+    let max_keys_len = usize::try_from(max_keys).unwrap_or(usize::MAX);
+    let is_truncated = visible_entries.len() > max_keys_len;
     if is_truncated {
-        visible_entries.truncate(max_keys as usize);
+        visible_entries.truncate(max_keys_len);
     }
 
     let next_marker = if is_truncated {
@@ -2015,6 +2183,91 @@ where
         },
         stats,
     })
+}
+
+fn list_objects_from_metadata_snapshot_candidates(
+    bucket: &str,
+    prefix: &str,
+    marker: Option<&str>,
+    delimiter: &Option<String>,
+    max_keys: i32,
+    candidate_objects: &[PersistentListMetadataObject],
+) -> VerifiedIndexCandidateResult {
+    let max_keys = normalize_max_keys(max_keys);
+    let mut stats = VerifiedIndexCandidateStats {
+        candidate_keys: candidate_objects.len(),
+        ..Default::default()
+    };
+    if max_keys <= 0 {
+        return VerifiedIndexCandidateResult {
+            info: ListObjectsInfo::default(),
+            stats,
+        };
+    }
+
+    let page_limit = usize::try_from(max_keys_plus_one(max_keys, true)).unwrap_or(usize::MAX);
+    let mut visible_entries = Vec::new();
+    let mut prefix_set = HashSet::new();
+
+    for object in candidate_objects {
+        if marker.is_some_and(|marker| object.name.as_str() <= marker) || !object.name.starts_with(prefix) {
+            stats.skipped_keys += 1;
+            continue;
+        }
+
+        if let Some(separator) = delimiter
+            && !separator.is_empty()
+        {
+            let suffix = object.name.trim_start_matches(prefix);
+            if let Some((common_prefix, _)) = suffix.split_once(separator) {
+                let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if prefix_set.insert(common_prefix.clone()) {
+                    stats.common_prefixes += 1;
+                    visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
+                }
+                if visible_entries.len() >= page_limit {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        visible_entries.push(VerifiedIndexVisibleEntry::Object(object.to_object_info(bucket)));
+        if visible_entries.len() >= page_limit {
+            break;
+        }
+    }
+
+    let max_keys_len = usize::try_from(max_keys).unwrap_or(usize::MAX);
+    let is_truncated = visible_entries.len() > max_keys_len;
+    if is_truncated {
+        visible_entries.truncate(max_keys_len);
+    }
+
+    let next_marker = if is_truncated {
+        visible_entries.last().map(|entry| entry.marker().to_owned())
+    } else {
+        None
+    };
+
+    let mut objects = Vec::new();
+    let mut prefixes = Vec::new();
+    for entry in visible_entries {
+        match entry {
+            VerifiedIndexVisibleEntry::Object(object) => objects.push(object),
+            VerifiedIndexVisibleEntry::Prefix(prefix) => prefixes.push(prefix),
+        }
+    }
+
+    VerifiedIndexCandidateResult {
+        info: ListObjectsInfo {
+            is_truncated,
+            next_marker,
+            objects,
+            prefixes,
+        },
+        stats,
+    }
 }
 
 fn list_metadata_resolution_params(
@@ -2664,9 +2917,12 @@ impl ListPathOptions {
 }
 
 impl ECStore {
-    async fn collect_persistent_key_only_index_keys(self: Arc<Self>, opts: &ListPathOptions) -> Result<Vec<String>> {
+    async fn collect_persistent_key_only_index_objects(
+        self: Arc<Self>,
+        opts: &ListPathOptions,
+    ) -> Result<Vec<PersistentListMetadataObject>> {
         let mut marker = None;
-        let mut keys = Vec::new();
+        let mut objects = Vec::new();
 
         loop {
             let previous_marker = marker.clone();
@@ -2715,19 +2971,22 @@ impl ECStore {
             if page_keys.is_empty() {
                 break;
             }
+            if let Some(entries) = list_result.entries.as_ref() {
+                let page_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(entries, &opts.bucket, "", None).await;
+                objects.extend(page_objects.iter().map(PersistentListMetadataObject::from_object_info));
+            }
 
             marker = page_keys.last().cloned();
             if marker == previous_marker {
                 return Err(Error::other("persistent key-only index rebuild marker did not advance"));
             }
-            keys.extend(page_keys);
 
             if reached_end {
                 break;
             }
         }
 
-        Ok(keys)
+        Ok(objects)
     }
 
     async fn rebuild_persistent_key_only_index(
@@ -2744,19 +3003,21 @@ impl ECStore {
             if start_sequence.degraded {
                 return Err(Error::other("list objects namespace mutation journal is degraded"));
             }
-            let keys = self.clone().collect_persistent_key_only_index_keys(opts).await?;
+            let objects = self.clone().collect_persistent_key_only_index_objects(opts).await?;
+            let keys = objects.iter().map(|object| object.name.clone()).collect::<Vec<_>>();
             let end_sequence = current_list_objects_mutation_snapshot(Some(self.as_ref()), &opts.bucket).await;
             if end_sequence.degraded {
                 return Err(Error::other("list objects namespace mutation journal is degraded"));
             }
             if start_sequence.high_water_mark == end_sequence.high_water_mark {
-                write_persistent_key_only_index(
+                write_persistent_key_only_index_with_metadata(
                     Some(self.as_ref()),
                     path,
                     &opts.bucket,
                     &generation,
                     end_sequence.high_water_mark,
                     &keys,
+                    &objects,
                 )
                 .await?;
                 return load_persistent_key_only_index(Some(self.as_ref()), path).await;
@@ -2807,6 +3068,173 @@ impl ECStore {
         }
     }
 
+    async fn list_objects_from_metadata_fast_provider(
+        self: Arc<Self>,
+        provider_opts: &ListPathOptions,
+        provider_state: &ListObjectsIndexProviderState,
+        provider_label: &'static str,
+        max_keys: i32,
+        list_metrics_enabled: bool,
+    ) -> Result<Option<ListObjectsInfo>> {
+        let staleness_ms = match list_objects_metadata_fast_guardrails_from_env() {
+            Some(staleness_ms) => staleness_ms,
+            None => {
+                if list_metrics_enabled {
+                    record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Disabled);
+                }
+                return Ok(None);
+            }
+        };
+
+        if provider_state.kind != ListObjectsIndexProviderKind::PersistentKeyOnly {
+            if list_metrics_enabled {
+                record_list_objects_index_fallback(
+                    ListSourceMode::IndexMetadataFast,
+                    ListIndexFallbackReason::UnsupportedRequest,
+                );
+            }
+            return Ok(None);
+        }
+
+        let Some(path) = provider_state.persistent_path.as_ref() else {
+            if list_metrics_enabled {
+                record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Degraded);
+            }
+            return Ok(None);
+        };
+
+        let index = match load_persistent_key_only_index(Some(self.as_ref()), path).await {
+            Ok(index) if persistent_key_only_index_matches_provider(&index, &provider_opts.bucket, provider_state) => index,
+            Ok(_) => {
+                if list_metrics_enabled {
+                    record_list_objects_index_fallback(
+                        ListSourceMode::IndexMetadataFast,
+                        ListIndexFallbackReason::GenerationMismatch,
+                    );
+                }
+                debug!(
+                    bucket = %provider_opts.bucket,
+                    prefix = %provider_opts.prefix,
+                    source = ListSourceMode::IndexMetadataFast.cursor_value(),
+                    provider = provider_state.kind.metric_label(),
+                    path = %path.display(),
+                    "list_objects metadata-fast provider generation or bucket did not match"
+                );
+                return Ok(None);
+            }
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                if list_metrics_enabled {
+                    record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Rebuilding);
+                }
+                debug!(
+                    bucket = %provider_opts.bucket,
+                    prefix = %provider_opts.prefix,
+                    source = ListSourceMode::IndexMetadataFast.cursor_value(),
+                    provider = provider_state.kind.metric_label(),
+                    path = %path.display(),
+                    "list_objects metadata-fast provider has no published snapshot"
+                );
+                return Ok(None);
+            }
+            Err(err) => {
+                if list_metrics_enabled {
+                    record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Unhealthy);
+                }
+                debug!(
+                    bucket = %provider_opts.bucket,
+                    prefix = %provider_opts.prefix,
+                    source = ListSourceMode::IndexMetadataFast.cursor_value(),
+                    provider = provider_state.kind.metric_label(),
+                    path = %path.display(),
+                    error = %err,
+                    "list_objects metadata-fast provider failed to load published snapshot"
+                );
+                return Ok(None);
+            }
+        };
+
+        if !persistent_key_only_index_has_complete_metadata_snapshot(&index) {
+            if list_metrics_enabled {
+                record_list_objects_index_fallback(
+                    ListSourceMode::IndexMetadataFast,
+                    ListIndexFallbackReason::MetadataFastUnavailable,
+                );
+            }
+            debug!(
+                bucket = %provider_opts.bucket,
+                prefix = %provider_opts.prefix,
+                source = ListSourceMode::IndexMetadataFast.cursor_value(),
+                provider = provider_state.kind.metric_label(),
+                indexed_keys = index.keys.len(),
+                snapshot_objects = index.objects.len(),
+                "list_objects metadata-fast provider has no complete metadata snapshot"
+            );
+            return Ok(None);
+        }
+
+        let current_sequence = current_list_objects_mutation_snapshot(Some(self.as_ref()), &provider_opts.bucket).await;
+        let health = persistent_key_only_index_health(&index, current_sequence);
+        match select_list_index_provider_source_mode(provider_opts, ListSourceMode::IndexMetadataFast, &health) {
+            ListIndexSourceDecision::FallbackToWalker(reason) => {
+                if list_metrics_enabled {
+                    record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, reason);
+                }
+                debug!(
+                    bucket = %provider_opts.bucket,
+                    prefix = %provider_opts.prefix,
+                    source = ListSourceMode::IndexMetadataFast.cursor_value(),
+                    provider = provider_state.kind.metric_label(),
+                    staleness_ms,
+                    reason = reason.metric_label(),
+                    "list_objects metadata-fast provider fell back to walker"
+                );
+                return Ok(None);
+            }
+            ListIndexSourceDecision::UseIndex(_) => {}
+        }
+
+        let verified = list_objects_from_metadata_snapshot_candidates(
+            &provider_opts.bucket,
+            &provider_opts.prefix,
+            provider_opts.marker.as_deref(),
+            &provider_opts.separator,
+            max_keys,
+            index.objects.as_slice(),
+        );
+        let stats = verified.stats;
+        let mut result = verified.info;
+
+        if list_metrics_enabled {
+            rustfs_io_metrics::record_list_objects_index_served(ListObjectsIndexPageObservation {
+                source: ListSourceMode::IndexMetadataFast.cursor_value(),
+                provider: provider_label,
+                candidate_keys: stats.candidate_keys,
+                live_verify_attempts: 0,
+                live_verify_hits: 0,
+                live_verify_misses: 0,
+                returned_objects: result.objects.len(),
+                returned_prefixes: result.prefixes.len(),
+                is_truncated: result.is_truncated,
+            });
+        }
+
+        if let Some(next_marker) = result.next_marker.take() {
+            result.next_marker = Some(
+                ListContinuationV2 {
+                    version: MARKER_TAG_VERSION,
+                    id: None,
+                    pool_idx: None,
+                    set_idx: None,
+                    source: Some(ListSourceMode::IndexMetadataFast),
+                    generation: health.active_generation,
+                }
+                .encode_marker(&next_marker),
+            );
+        }
+
+        Ok(Some(result))
+    }
+
     async fn list_objects_from_opt_in_key_only_provider(
         self: Arc<Self>,
         opts: &ListPathOptions,
@@ -2832,7 +3260,10 @@ impl ECStore {
             );
         }
 
-        if incl_deleted || !mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification() {
+        if incl_deleted
+            || (mode != ListSourceMode::IndexMetadataFast
+                && (!mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification()))
+        {
             if list_metrics_enabled {
                 record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
             }
@@ -2855,6 +3286,18 @@ impl ECStore {
 
         let mut provider_opts = opts.clone();
         provider_opts.parse_marker();
+
+        if mode == ListSourceMode::IndexMetadataFast {
+            return self
+                .list_objects_from_metadata_fast_provider(
+                    &provider_opts,
+                    &provider_state,
+                    provider_label,
+                    max_keys,
+                    list_metrics_enabled,
+                )
+                .await;
+        }
 
         let (candidate_keys, health) = match provider_state.kind {
             ListObjectsIndexProviderKind::WalkerKeyOnly => {
@@ -5839,24 +6282,30 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
-        ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH, ENV_API_LIST_OBJECTS_QUORUM,
-        ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState, LIST_CURSOR_GENERATION_LIVE,
-        LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY, LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason,
-        ListIndexLifecycle, ListIndexLifecycleState, ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration,
-        ListMetadataIndexHealth, ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator,
-        ListObjectsIndexProviderKind, ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode,
-        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
-        NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus, PersistentKeyOnlyIndex, VerifiedIndexCandidateStats,
-        VersionMarker, current_list_objects_mutation_sequence, enforce_latest_listing_write_quorum,
-        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
-        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum,
-        list_metadata_resolution_params, list_objects_from_verified_index_candidates,
-        list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
-        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
-        list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env,
+        ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED,
+        ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH,
+        ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState,
+        LIST_CURSOR_GENERATION_LIVE, LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
+        LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
+        ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexGeneration, ListMetadataIndexHealth,
+        ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
+        ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
+        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
+        NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus, PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER,
+        PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER, PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER,
+        PERSISTENT_KEY_ONLY_INDEX_HEADER, PersistentKeyOnlyIndex, PersistentListMetadataObject, VerifiedIndexCandidateStats,
+        VersionMarker, current_list_objects_mutation_sequence, encode_persistent_list_metadata_object,
+        enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
+        latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
+        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
+        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
+        list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
+        list_objects_index_provider_from_env, list_objects_index_provider_state_from_env, list_objects_key_only_provider_health,
+        list_objects_metadata_fast_guardrails_from_env, list_objects_quorum_from_env, list_quorum_from_env,
         load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels,
         normalize_list_quorum, observe_list_objects_mutations_with_store, parse_namespace_mutation_journal_state,
-        parse_persistent_key_only_index, parse_version_marker, persist_observed_list_objects_mutation,
+        parse_persistent_key_only_index, parse_persistent_list_metadata_object, parse_version_marker,
+        persist_observed_list_objects_mutation, persistent_key_only_index_has_complete_metadata_snapshot,
         persistent_key_only_index_health, persistent_key_only_index_matches_provider, record_list_objects_index_opt_in_fallback,
         reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
         select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel, version_marker_for_entries,
@@ -6543,10 +6992,185 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn list_objects_index_mode_from_env_rejects_metadata_fast() {
+    fn list_objects_index_mode_from_env_rejects_metadata_fast_without_guardrails() {
         temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
-            assert_eq!(list_objects_index_mode_from_env(), None);
+            temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, || {
+                temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, || {
+                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), None);
+                });
+            });
         });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_rejects_metadata_fast_without_sla() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("metadata_fast"), || {
+            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
+                temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, || {
+                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), None);
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_accepts_metadata_fast_with_sla_guardrails() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
+            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
+                temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("5000"), || {
+                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), Some(5000));
+                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_index_mode_from_env_rejects_metadata_fast_over_sla_budget() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
+            temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
+                temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("60001"), || {
+                    assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), None);
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn persistent_list_metadata_object_round_trips_encoded_snapshot() {
+        let object = PersistentListMetadataObject {
+            name: "photos/2026/img\t01.jpg".to_string(),
+            size: 42,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+            etag: Some("etag-42".to_string()),
+            storage_class: Some("STANDARD".to_string()),
+        };
+
+        let encoded = encode_persistent_list_metadata_object(&object);
+        let parsed = parse_persistent_list_metadata_object(&encoded).expect("metadata object should parse");
+
+        assert_eq!(parsed, object);
+    }
+
+    #[test]
+    fn persistent_key_only_index_parses_legacy_keys_and_metadata_snapshots() {
+        let object = PersistentListMetadataObject {
+            name: "object-b".to_string(),
+            size: 7,
+            mod_time: None,
+            etag: Some("etag-b".to_string()),
+            storage_class: None,
+        };
+        let contents = format!(
+            "{PERSISTENT_KEY_ONLY_INDEX_HEADER}\n\
+             {PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER}bucket\n\
+             {PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER}generation-42\n\
+             {PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER}9\n\
+             object-a\n\
+             {}\n",
+            encode_persistent_list_metadata_object(&object)
+        );
+
+        let index = parse_persistent_key_only_index(&contents);
+
+        assert_eq!(index.bucket.as_deref(), Some("bucket"));
+        assert_eq!(index.generation, "generation-42");
+        assert_eq!(index.checkpoint_high_water_mark, 9);
+        assert_eq!(index.keys.as_slice(), &["object-a".to_string(), "object-b".to_string()]);
+        assert_eq!(index.objects.as_slice(), &[object]);
+        assert!(!persistent_key_only_index_has_complete_metadata_snapshot(&index));
+    }
+
+    #[test]
+    fn metadata_snapshot_candidates_page_without_live_verification() {
+        let objects = vec![
+            PersistentListMetadataObject {
+                name: "photos/2026/a.jpg".to_string(),
+                size: 1,
+                mod_time: None,
+                etag: Some("etag-a".to_string()),
+                storage_class: Some("STANDARD".to_string()),
+            },
+            PersistentListMetadataObject {
+                name: "photos/2026/nested/b.jpg".to_string(),
+                size: 2,
+                mod_time: None,
+                etag: Some("etag-b".to_string()),
+                storage_class: Some("STANDARD".to_string()),
+            },
+            PersistentListMetadataObject {
+                name: "photos/2026/z.jpg".to_string(),
+                size: 3,
+                mod_time: None,
+                etag: Some("etag-z".to_string()),
+                storage_class: Some("STANDARD".to_string()),
+            },
+        ];
+
+        let result = list_objects_from_metadata_snapshot_candidates(
+            "bucket",
+            "photos/2026/",
+            Some("photos/2026/a.jpg"),
+            &Some("/".to_string()),
+            2,
+            &objects,
+        );
+
+        assert_eq!(result.stats.candidate_keys, 3);
+        assert_eq!(result.stats.live_verify_attempts, 0);
+        assert_eq!(
+            result
+                .info
+                .objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            ["photos/2026/z.jpg"]
+        );
+        assert_eq!(result.info.objects[0].etag.as_deref(), Some("etag-z"));
+        assert_eq!(result.info.prefixes, vec!["photos/2026/nested/".to_string()]);
+        assert!(!result.info.is_truncated);
+    }
+
+    #[test]
+    fn metadata_fast_requires_complete_metadata_snapshot() {
+        let index = PersistentKeyOnlyIndex {
+            bucket: Some("bucket".to_string()),
+            generation: "generation-42".to_string(),
+            checkpoint_high_water_mark: 42,
+            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
+            objects: Arc::new(vec![PersistentListMetadataObject {
+                name: "a".to_string(),
+                size: 1,
+                mod_time: None,
+                etag: None,
+                storage_class: None,
+            }]),
+        };
+
+        assert!(!persistent_key_only_index_has_complete_metadata_snapshot(&index));
+
+        let complete = PersistentKeyOnlyIndex {
+            bucket: Some("bucket".to_string()),
+            generation: "generation-42".to_string(),
+            checkpoint_high_water_mark: 42,
+            keys: Arc::new(vec!["a".to_string()]),
+            objects: Arc::new(vec![PersistentListMetadataObject {
+                name: "a".to_string(),
+                size: 1,
+                mod_time: None,
+                etag: None,
+                storage_class: None,
+            }]),
+        };
+
+        assert!(persistent_key_only_index_has_complete_metadata_snapshot(&complete));
     }
 
     #[test]
@@ -6778,6 +7402,7 @@ mod test {
             generation: "generation-old".to_string(),
             checkpoint_high_water_mark: 42,
             keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
+            objects: Arc::new(Vec::new()),
         };
         let matching_provider = ListObjectsIndexProviderState::persistent_key_only(
             Some(PathBuf::from("/tmp/persistent-key-only.index")),
@@ -6800,6 +7425,7 @@ mod test {
             generation: "generation-42".to_string(),
             checkpoint_high_water_mark: 42,
             keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
+            objects: Arc::new(Vec::new()),
         };
 
         let health = persistent_key_only_index_health(
@@ -6824,6 +7450,7 @@ mod test {
             generation: "generation-42".to_string(),
             checkpoint_high_water_mark: 42,
             keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
+            objects: Arc::new(Vec::new()),
         };
 
         let health = persistent_key_only_index_health(
@@ -6849,6 +7476,7 @@ mod test {
             generation: "generation-42".to_string(),
             checkpoint_high_water_mark: 42,
             keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
+            objects: Arc::new(Vec::new()),
         };
 
         let health = persistent_key_only_index_health(
@@ -7153,6 +7781,86 @@ mod test {
         assert_eq!(
             select_list_index_provider_source_mode(&ListPathOptions::default(), ListSourceMode::IndexKeyOnly, &health),
             ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Degraded)
+        );
+    }
+
+    #[test]
+    fn metadata_fast_provider_selection_falls_back_when_checkpoint_lags() {
+        let mut lifecycle = ListIndexLifecycle::disabled(0);
+        lifecycle.begin_rebuild("generation-1", 100);
+        lifecycle.checkpoint_rebuild(100);
+        assert!(lifecycle.publish_rebuild());
+        lifecycle.observe_mutation_high_water_mark(101);
+        let health = lifecycle.health_snapshot();
+
+        assert_eq!(
+            select_list_index_provider_source_mode(&ListPathOptions::default(), ListSourceMode::IndexMetadataFast, &health),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Lagging)
+        );
+    }
+
+    fn assert_metadata_fast_falls_back_after_stale_mutation(workload: &str) {
+        let index = PersistentKeyOnlyIndex {
+            bucket: Some("bucket".to_string()),
+            generation: format!("generation-{workload}"),
+            checkpoint_high_water_mark: 100,
+            keys: Arc::new(vec![format!("photos/2026/{workload}.bin")]),
+            objects: Arc::new(vec![PersistentListMetadataObject {
+                name: format!("photos/2026/{workload}.bin"),
+                size: 1,
+                mod_time: None,
+                etag: Some("snapshot-etag".to_string()),
+                storage_class: Some("STANDARD".to_string()),
+            }]),
+        };
+        let health = persistent_key_only_index_health(
+            &index,
+            NamespaceMutationJournalSnapshot {
+                high_water_mark: 101,
+                degraded: false,
+            },
+        );
+
+        assert!(persistent_key_only_index_has_complete_metadata_snapshot(&index));
+        assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Lagging));
+        assert_eq!(
+            select_list_index_provider_source_mode(&ListPathOptions::default(), ListSourceMode::IndexMetadataFast, &health),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Lagging)
+        );
+    }
+
+    #[test]
+    fn metadata_fast_falls_back_after_stale_delete_marker_mutation() {
+        assert_metadata_fast_falls_back_after_stale_mutation("delete-marker");
+    }
+
+    #[test]
+    fn metadata_fast_falls_back_after_stale_overwrite_mutation() {
+        assert_metadata_fast_falls_back_after_stale_mutation("overwrite");
+    }
+
+    #[test]
+    fn metadata_fast_falls_back_after_stale_multipart_complete_mutation() {
+        assert_metadata_fast_falls_back_after_stale_mutation("multipart-complete");
+    }
+
+    #[test]
+    fn metadata_fast_provider_selection_rejects_generation_mismatch() {
+        let mut lifecycle = ListIndexLifecycle::disabled(0);
+        lifecycle.begin_rebuild("generation-2", 100);
+        lifecycle.checkpoint_rebuild(100);
+        assert!(lifecycle.publish_rebuild());
+        let health = lifecycle.health_snapshot();
+        let opts = ListPathOptions {
+            marker: Some(
+                "photos/2026/a.jpg[rustfs_cache:v2,id:list-cache-id,src:index_metadata_fast,gen:generation-1]".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_list_index_provider_source_mode(&opts, ListSourceMode::IndexMetadataFast, &health),
+            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::GenerationMismatch)
         );
     }
 
