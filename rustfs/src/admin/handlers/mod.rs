@@ -15,6 +15,7 @@
 pub mod account_info;
 pub mod audit;
 mod audit_runtime_config;
+pub mod batch_job;
 pub mod bucket_meta;
 pub mod cluster_snapshot;
 pub mod config_admin;

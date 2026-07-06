@@ -82,6 +82,12 @@ const SITE_REPLICATION_OPERATION: AdminActionRef = AdminActionRef::new("SiteRepl
 const SITE_REPLICATION_REMOVE: AdminActionRef = AdminActionRef::new("SiteReplicationRemoveAction");
 const SITE_REPLICATION_RESYNC: AdminActionRef = AdminActionRef::new("SiteReplicationResyncAction");
 const STORAGE_INFO: AdminActionRef = AdminActionRef::new("StorageInfoAdminAction");
+// MinIO admin compat: batch jobs and replication diff.
+const START_BATCH_JOB: AdminActionRef = AdminActionRef::new("StartBatchJobAction");
+const LIST_BATCH_JOBS: AdminActionRef = AdminActionRef::new("ListBatchJobsAction");
+const DESCRIBE_BATCH_JOB: AdminActionRef = AdminActionRef::new("DescribeBatchJobAction");
+const CANCEL_BATCH_JOB: AdminActionRef = AdminActionRef::new("CancelBatchJobAction");
+const REPLICATION_DIFF: AdminActionRef = AdminActionRef::new("ReplicationDiff");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeferredRoutePolicyReason {
@@ -1171,6 +1177,35 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
         COMMIT_TABLE,
         RouteRiskLevel::High,
+    ),
+    // MinIO admin compat: batch job lifecycle (backlog#613).
+    admin(HttpMethod::Post, "/rustfs/admin/v3/start-job", START_BATCH_JOB, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/list-jobs", LIST_BATCH_JOBS, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/status-job",
+        DESCRIBE_BATCH_JOB,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/describe-job",
+        DESCRIBE_BATCH_JOB,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Delete, "/rustfs/admin/v3/cancel-job", CANCEL_BATCH_JOB, RouteRiskLevel::High),
+    // MinIO admin compat: replication diff / MRF inspection (backlog#611).
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/replication/diff",
+        REPLICATION_DIFF,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/replication/mrf",
+        GET_REPLICATION_METRICS,
+        RouteRiskLevel::Sensitive,
     ),
 ];
 

@@ -244,6 +244,13 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/replicationmetrics"),
         admin_route(Method::PUT, "/v3/set-remote-target"),
         admin_route(Method::DELETE, "/v3/remove-remote-target"),
+        admin_route(Method::POST, "/v3/replication/diff"),
+        admin_route(Method::GET, "/v3/replication/mrf"),
+        admin_route(Method::POST, "/v3/start-job"),
+        admin_route(Method::GET, "/v3/list-jobs"),
+        admin_route(Method::GET, "/v3/status-job"),
+        admin_route(Method::GET, "/v3/describe-job"),
+        admin_route(Method::DELETE, "/v3/cancel-job"),
         admin_route(Method::PUT, "/v3/site-replication/add"),
         admin_route(Method::PUT, "/v3/site-replication/remove"),
         admin_route(Method::GET, "/v3/site-replication/info"),
@@ -1125,6 +1132,13 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
+    assert_route(&router, Method::POST, &admin_path("/v3/replication/diff"));
+    assert_route(&router, Method::GET, &admin_path("/v3/replication/mrf"));
+    assert_route(&router, Method::POST, &admin_path("/v3/start-job"));
+    assert_route(&router, Method::GET, &admin_path("/v3/list-jobs"));
+    assert_route(&router, Method::GET, &admin_path("/v3/status-job"));
+    assert_route(&router, Method::GET, &admin_path("/v3/describe-job"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/cancel-job"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/add"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/info"));
