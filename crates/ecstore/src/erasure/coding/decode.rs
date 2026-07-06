@@ -603,6 +603,17 @@ where
     R: AsyncRead + Unpin + Send + Sync,
 {
     pub async fn read(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
+        // On the reconstruction-verifying GET path, read every live shard reader
+        // in lockstep so all readers advance one block per stripe and stay
+        // mutually aligned. The adaptive data-first path below only reads
+        // `data_shards` readers per stripe and pulls in a parity reader as a
+        // substitute on demand; a parity reader first used mid-object is still
+        // positioned at its stream start (block 0) and returns an earlier stripe
+        // than the data shards, producing "inconsistent read source shards" and
+        // truncating large-object GETs under concurrency (backlog#832).
+        if self.verify_reconstruction {
+            return self.read_lockstep().await;
+        }
         // if self.readers.len() != self.total_shards {
         //     return Err(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers"));
         // }
@@ -953,6 +964,118 @@ where
                 self.data_shards,
                 low_cost_available >= self.data_shards,
             );
+        }
+
+        for i in retire_readers {
+            self.readers[i] = None;
+        }
+
+        (shards, errs)
+    }
+
+    /// Lockstep stripe read for the reconstruction-verifying GET path.
+    ///
+    /// Reads every still-live shard reader exactly once per stripe and waits for
+    /// all of them, so all readers advance by one block per stripe and remain
+    /// mutually block-aligned. This removes the desync that produced
+    /// "inconsistent read source shards" (backlog#832): with the adaptive
+    /// data-first path a parity reader pulled in as a substitute mid-object was
+    /// still at its stream start and returned an earlier stripe than the data
+    /// shards, so reconstruction verification correctly rejected the mismatch
+    /// and the large-object GET truncated mid-stream.
+    ///
+    /// Any reader that errors is retired for the rest of the object: a streaming
+    /// shard read that failed mid-block can no longer be trusted to be aligned,
+    /// so re-reading it on a later stripe would reintroduce the desync.
+    async fn read_lockstep(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
+        let num_readers = self.readers.len();
+        let shard_size = if self.offset + self.shard_size > self.shard_file_size {
+            self.shard_file_size - self.offset
+        } else {
+            self.shard_size
+        };
+
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
+        let mut errs: Vec<Option<Error>> = vec![None; num_readers];
+        if shard_size == 0 {
+            return (shards, errs);
+        }
+
+        self.buffers.ensure_slots(num_readers);
+        // Pre-claim per-slot buffers so the `self.readers` borrow below stays
+        // disjoint from `self.buffers`.
+        let has_reader: Vec<bool> = self.readers.iter().map(Option::is_some).collect();
+        let mut bufs: Vec<Option<Vec<u8>>> = Vec::with_capacity(num_readers);
+        for (i, present) in has_reader.iter().enumerate() {
+            bufs.push(if *present {
+                Some(self.buffers.take(i, shard_size))
+            } else {
+                None
+            });
+        }
+
+        let data_shards = self.data_shards;
+        let read_timeout = self.read_timeout;
+        let metrics_path = self.metrics_path;
+        let read_costs = self.read_costs.clone();
+        let locality_preference_enabled = self.locality_preference_enabled;
+        let stripe_read_start = metrics_path.map(|_| Instant::now());
+
+        let mut retire_readers = Vec::new();
+        let mut scheduled = 0usize;
+        let mut success = 0usize;
+        let mut completed = 0usize;
+        let mut failed = 0usize;
+        let mut first_shard_recorded = false;
+        // Scope the reader borrow (held by `reader_iter`/`sets`) so it is released
+        // before the retirement pass mutates `self.readers` below.
+        {
+            let mut sets = FuturesUnordered::new();
+            let reader_iter = ReaderLaunchIter::new(&mut self.readers, &read_costs, locality_preference_enabled);
+            for (i, reader) in reader_iter {
+                if reader.is_none() {
+                    continue;
+                }
+                let read_cost = read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
+                let recycled_buf = bufs[i].take();
+                scheduled += 1;
+                sets.push(read_shard(
+                    i,
+                    read_cost,
+                    reader,
+                    recycled_buf,
+                    shard_size,
+                    data_shards,
+                    read_timeout,
+                    metrics_path,
+                ));
+            }
+
+            while let Some((i, _read_cost, result, _should_retire)) = sets.next().await {
+                completed += 1;
+                if !first_shard_recorded {
+                    if let Some(path) = metrics_path {
+                        record_get_stage_duration_if_enabled(path, GET_STAGE_STRIPE_READ_FIRST_SHARD, stripe_read_start);
+                    }
+                    first_shard_recorded = true;
+                }
+                match result {
+                    Ok(v) => {
+                        shards[i] = Some(v);
+                        success += 1;
+                    }
+                    Err(e) => {
+                        errs[i] = Some(e);
+                        retire_readers.push(i);
+                        failed += 1;
+                    }
+                }
+            }
+        }
+
+        if let Some(path) = metrics_path {
+            record_get_stage_duration_if_enabled(path, GET_STAGE_STRIPE_READ_QUORUM, stripe_read_start);
+            rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
         }
 
         for i in retire_readers {
@@ -1585,6 +1708,73 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("inconsistent read source shards"));
         assert!(output.is_empty());
+    }
+
+    /// Regression for backlog#832: a data shard reader that dies partway through
+    /// a multi-stripe object must still reconstruct byte-exact output. The parity
+    /// readers that fill in for the failed data shard must be aligned to the
+    /// current stripe. Before the lockstep read path, parity readers were only
+    /// pulled in on demand and were still positioned at their stream start
+    /// (block 0), so they returned an earlier stripe than the surviving data
+    /// shards — every shard passed its own bitrot hash yet the set was mutually
+    /// inconsistent, so reconstruction verification rejected it ("inconsistent
+    /// read source shards") and the large-object GET truncated mid-stream.
+    #[tokio::test]
+    async fn test_erasure_decode_recovers_when_data_shard_dies_midway() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        // 200 bytes => 3 full stripes + 1 partial: the failing data shard reads
+        // the first stripe, then errors on every later stripe.
+        let total_data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let total_shards = DATA_SHARDS + PARITY_SHARDS;
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+        let hash_size = hash_algo.size();
+
+        let mut shard_writers: Vec<BitrotWriter<Cursor<Vec<u8>>>> = (0..total_shards)
+            .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone()))
+            .collect();
+
+        let mut offset = 0;
+        while offset < total_len {
+            let end = (offset + BLOCK_SIZE).min(total_len);
+            let shards = erasure.encode_data(&total_data[offset..end]).unwrap();
+            for (i, shard) in shards.iter().enumerate() {
+                shard_writers[i].write(shard).await.unwrap();
+            }
+            offset = end;
+        }
+
+        let shard_bufs: Vec<Vec<u8>> = shard_writers.into_iter().map(|w| w.into_inner().into_inner()).collect();
+
+        // Truncate data shard 0 to only its first (hash+data) block: it reads the
+        // first stripe successfully, then errors (UnexpectedEof reading the next
+        // block's hash), forcing every later stripe to be reconstructed from the
+        // parity shards. With all readers present the reconstruction must succeed.
+        let first_block_len = (hash_size + shard_size).min(shard_bufs[0].len());
+        let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = shard_bufs
+            .iter()
+            .enumerate()
+            .map(|(i, buf)| {
+                let bytes = if i == 0 {
+                    buf[..first_block_len].to_vec()
+                } else {
+                    buf.clone()
+                };
+                Some(BitrotReader::new(Cursor::new(bytes), shard_size, hash_algo.clone(), false))
+            })
+            .collect();
+
+        let mut output = Vec::new();
+        let (written, err) = erasure.decode(&mut output, readers, 0, total_len, total_len).await;
+        assert!(err.is_none(), "mid-object data-shard failure must still reconstruct: {err:?}");
+        assert_eq!(written, total_len, "short write after mid-object shard failure");
+        assert_eq!(output, total_data, "reconstructed bytes mismatch (stripe desync?)");
     }
 
     #[cfg(feature = "rio-v2")]

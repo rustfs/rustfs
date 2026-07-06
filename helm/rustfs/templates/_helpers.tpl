@@ -160,6 +160,15 @@ Merges (in order of increasing precedence):
 {{- end }}
 
 {{/*
+Resolve the Kubernetes cluster DNS domain (defaults to cluster.local).
+Trims any leading/trailing dots so callers can safely append it after `svc.`,
+falling back to cluster.local when the value is empty or only dots.
+*/}}
+{{- define "rustfs.clusterDomain" -}}
+{{- .Values.clusterDomain | default "cluster.local" | trimAll "." | default "cluster.local" -}}
+{{- end -}}
+
+{{/*
 Render RUSTFS_VOLUMES
 */}}
 {{- define "rustfs.volumes" -}}
@@ -170,10 +179,10 @@ Render RUSTFS_VOLUMES
 {{- end -}}
 
 {{- if eq (int .Values.replicaCount) 4 }}
-{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data/rustfs{0...%d}" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) .Release.Namespace (.Values.service.endpoint.port | int) (sub (.Values.replicaCount | int) 1) }}
+{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.%s:%d/data/rustfs{0...%d}" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) .Release.Namespace (include "rustfs.clusterDomain" .) (.Values.service.endpoint.port | int) (sub (.Values.replicaCount | int) 1) }}
 {{- end }}
 {{- if eq (int .Values.replicaCount) 16 }}
-{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) .Release.Namespace (.Values.service.endpoint.port | int) }}
+{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.%s:%d/data" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) .Release.Namespace (include "rustfs.clusterDomain" .) (.Values.service.endpoint.port | int) }}
 {{- end }}
 {{- end }}
 

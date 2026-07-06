@@ -18,6 +18,7 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | affinity.nodeAffinity | object | `{}` |  |
 | affinity.podAntiAffinity.enabled | bool | `true` |  |
 | affinity.podAntiAffinity.topologyKey | string | `"kubernetes.io/hostname"` |  |
+| clusterDomain | string | `"cluster.local"` | Kubernetes cluster DNS domain used to build in-cluster FQDNs for `RUSTFS_VOLUMES` (distributed mode) and mTLS server certificate SANs. Override for clusters not using the default `cluster.local`. Provide the DNS root only, without a `svc.` prefix or leading/trailing dots. |
 | commonLabels | object | `{}` | Labels to add to all deployed objects. |
 | config.rustfs.address | string | `":9000"` |  |
 | config.rustfs.console_address | string | `":9001"` |  |

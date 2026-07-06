@@ -12,12 +12,52 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+//! `NamespaceLocking` contract impl for `SetDisks` plus the set-disk locking
+//! helpers (P7 of the God-Object split, tracking backlog#815, issue
+//! backlog#822). The `NamespaceLocking` impl is relocated from set_disk/mod.rs
+//! and the lock formatting/mapping helpers from set_disk/lock.rs are collected
+//! here; the contract stays implemented `for SetDisks`, so its associated-type
+//! bounds are unchanged and helper access is via inherent calls.
+
+use super::super::*;
 use crate::disk::health_state::DriveMembershipSnapshot;
 use crate::runtime::sources as runtime_sources;
 
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
+    type Error = Error;
+    type NamespaceLock = NamespaceLockWrapper;
+
+    #[tracing::instrument(skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        let set_lock = if runtime_sources::setup_is_dist_erasure().await {
+            // Calculate quorum based on lockers count (majority)
+            let lockers_count = self.lockers.len();
+            let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
+            NamespaceLock::with_clients_and_quorum(
+                format!("set-{}-{}", self.pool_index, self.set_index),
+                self.lockers.clone(),
+                write_quorum,
+            )
+        } else {
+            NamespaceLock::Local(LocalLock::new(
+                format!("set-{}-{}", self.pool_index, self.set_index),
+                self.local_lock_manager.clone(),
+            ))
+        };
+
+        let resource = ObjectKey {
+            bucket: Arc::from(bucket),
+            object: Arc::from(object),
+            version: None,
+        };
+
+        Ok(NamespaceLockWrapper::new(set_lock, resource, self.locker_owner.clone()))
+    }
+}
+
 impl SetDisks {
-    pub(super) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
+    pub(in crate::set_disk) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
         match err {
             LockResult::Timeout => {
                 format!("{mode} lock acquisition timed out on {bucket}/{object} (owner={})", self.locker_owner)
@@ -30,7 +70,7 @@ impl SetDisks {
         }
     }
 
-    pub(super) fn format_lock_error_from_error(
+    pub(in crate::set_disk) fn format_lock_error_from_error(
         &self,
         bucket: &str,
         object: &str,
@@ -51,7 +91,7 @@ impl SetDisks {
         }
     }
 
-    pub(super) fn map_namespace_lock_error(
+    pub(in crate::set_disk) fn map_namespace_lock_error(
         &self,
         bucket: &str,
         object: &str,
@@ -72,7 +112,7 @@ impl SetDisks {
         }
     }
 
-    pub(super) async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
+    pub(in crate::set_disk) async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
         let rl = self.disks.read().await;
 
         rl.clone()
@@ -94,7 +134,7 @@ impl SetDisks {
         disks
     }
 
-    pub(super) async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
+    pub(in crate::set_disk) async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
         let snapshot = self.drive_membership_snapshot().await;
         let mut disks = snapshot.strict_online_candidates().into_iter().map(Some).collect::<Vec<_>>();
 
@@ -104,7 +144,7 @@ impl SetDisks {
         disks
     }
 
-    pub(super) async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
+    pub(in crate::set_disk) async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
         let snapshot = self.drive_membership_snapshot().await;
         let mut disks = snapshot
             .strict_online_local_candidates()
@@ -236,7 +276,7 @@ impl SetDisks {
         }
     }
 
-    pub(super) async fn _get_local_disks(&self) -> Vec<Option<DiskStore>> {
+    pub(in crate::set_disk) async fn _get_local_disks(&self) -> Vec<Option<DiskStore>> {
         let mut disks = self.get_disks_internal().await;
 
         let mut rng = rand::rng();
@@ -322,7 +362,7 @@ impl SetDisks {
         disk_lock[disk_idx] = Some(new_disk);
     }
 
-    pub(super) fn find_disk_index(&self, fm: &FormatV3) -> Result<(usize, usize)> {
+    pub(in crate::set_disk) fn find_disk_index(&self, fm: &FormatV3) -> Result<(usize, usize)> {
         self.format.check_other(fm)?;
 
         if fm.erasure.this.is_nil() {
@@ -340,7 +380,7 @@ impl SetDisks {
         Err(Error::other("DriveID: not found"))
     }
 
-    pub(super) async fn connect_endpoint(ep: &Endpoint) -> disk::error::Result<(DiskStore, FormatV3)> {
+    pub(in crate::set_disk) async fn connect_endpoint(ep: &Endpoint) -> disk::error::Result<(DiskStore, FormatV3)> {
         let disk = new_disk(
             ep,
             &DiskOption {
@@ -355,12 +395,15 @@ impl SetDisks {
         Ok((disk, fm))
     }
 
-    pub(super) async fn get_online_disk_with_healing(&self, incl_healing: bool) -> Result<(Vec<Option<DiskStore>>, bool)> {
+    pub(in crate::set_disk) async fn get_online_disk_with_healing(
+        &self,
+        incl_healing: bool,
+    ) -> Result<(Vec<Option<DiskStore>>, bool)> {
         let (new_disks, _, healing) = self.get_online_disk_with_healing_and_info(incl_healing).await?;
         Ok((new_disks, healing > 0))
     }
 
-    pub(super) async fn get_online_disk_with_healing_and_info(
+    pub(in crate::set_disk) async fn get_online_disk_with_healing_and_info(
         &self,
         incl_healing: bool,
     ) -> Result<(Vec<Option<DiskStore>>, Vec<DiskInfo>, usize)> {

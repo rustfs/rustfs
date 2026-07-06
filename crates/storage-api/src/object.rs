@@ -54,6 +54,11 @@ pub struct ExpirationOptions {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct ObjectLockDeleteOptions {
+    pub bypass_governance: bool,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct TransitionedObject {
     pub name: String,
     pub version_id: String,

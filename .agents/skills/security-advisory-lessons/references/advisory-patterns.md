@@ -40,6 +40,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 - `GHSA-3g29-xff2-92vp`: FTP `RETR` and `SIZE`/`MDTM` read paths authenticated the user but skipped IAM before calling storage. Lesson: non-HTTP protocol frontends must enforce the same per-operation authorization as the S3 API before backend access.
 - `GHSA-g3vq-vv42-f647`: FTPS `MKD` called `create_bucket` without checking `s3:CreateBucket`. Lesson: protocol command handlers need action-specific checks even when sibling handlers already authorize correctly.
+- `GHSA-3p3x-734c-h5vx`: FTPS and WebDAV compared secret keys with early-return string equality, while FTPS also returned distinguishable invalid-user and invalid-password failures. Lesson: password-style protocol auth needs constant-time secret comparison, indistinguishable failures where practical, and rate limiting.
 
 ### Filesystem paths and object key traversal
 
@@ -49,8 +50,11 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 ### Secrets, defaults, and cryptographic misuse
 
+- `GHSA-j59h-h7q5-q348`: RustFS shipped known default root credentials that could authenticate to S3, admin APIs, IAM, KMS, and console surfaces. Lesson: root credentials must be operator-provided or generated per install; known defaults and warnings are not acceptable for network-reachable deployments.
 - `GHSA-h956-rh7x-ppgj`: gRPC used the hard-coded token `rustfs rpc` on both client and server. Lesson: source-visible shared tokens are authentication bypasses.
 - `GHSA-r5qv-rc46-hv8q`: internode RPC HMAC secret fell back to the public default `rustfsadmin`. Lesson: RPC/internode auth must fail closed instead of silently using public defaults.
+- `GHSA-75fx-qg6f-8rm7` and `GHSA-68cw-96m3-h2cf`: internode RPC secrets were derivable from known root credentials, making raw storage RPC signatures forgeable when explicit RPC secrets were unset. Lesson: RPC auth keys must be independent random secrets, never derived from S3 root credentials, and raw storage RPC should not share the public S3 listener without an internode-only boundary.
+- `GHSA-m77q-r63m-pj89`: STS JWTs used the root secret key as the shared token signing key, allowing token forgery when the root secret was known. Lesson: STS signing keys need key separation, rotation, and key IDs; do not reuse root credentials for JWT/HMAC signing.
 - `GHSA-923g-jp7v-f97f`: license verification embedded a production RSA private key and used private-key decryption as authenticity. Lesson: ship verifying/public keys only and use real signature verification.
 
 ### Sensitive logging and debug output

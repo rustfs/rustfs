@@ -406,9 +406,8 @@ jobs:
             RELEASE=${{ steps.meta.outputs.docker_release }}
             CHANNEL=${{ steps.meta.outputs.docker_channel }}
             BUILDKIT_INLINE_CACHE=1
-          # Enable advanced BuildKit features for better performance
-          provenance: false
-          sbom: false
+          provenance: true
+          sbom: true
           # Add retry mechanism by splitting the build process
           no-cache: false
           pull: true

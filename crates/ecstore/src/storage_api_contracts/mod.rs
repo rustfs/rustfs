@@ -1,6 +1,3 @@
-// #730: storage contract traits are staged for facade migration and external owners.
-#![allow(dead_code)]
-
 use crate::error::Error;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use rustfs_filemeta::FileInfo;
@@ -27,48 +24,11 @@ pub(crate) mod lifecycle {
 }
 
 pub(crate) mod list {
-    use super::{Debug, Error, FileInfo, ObjectInfo};
     pub(crate) use rustfs_storage_api::{
         ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
         ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, VersionMarker, WalkOptions as StorageWalkOptions,
         WalkVersionsSortOrder,
     };
-    use tokio_util::sync::CancellationToken;
-
-    type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
-    type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
-    type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
-    type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
-
-    pub(crate) trait EcstoreListOperations:
-        ListOperations<
-            Error = Error,
-            ListObjectsV2Info = ListObjectsV2Info,
-            ListObjectVersionsInfo = ListObjectVersionsInfo,
-            ObjectInfoOrErr = ObjectInfoOrErr,
-            WalkOptions = WalkOptions,
-            WalkCancellation = CancellationToken,
-            WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-        > + Send
-        + Sync
-        + Debug
-    {
-    }
-
-    impl<T> EcstoreListOperations for T where
-        T: ListOperations<
-                Error = Error,
-                ListObjectsV2Info = ListObjectsV2Info,
-                ListObjectVersionsInfo = ListObjectVersionsInfo,
-                ObjectInfoOrErr = ObjectInfoOrErr,
-                WalkOptions = WalkOptions,
-                WalkCancellation = CancellationToken,
-                WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-            > + Send
-            + Sync
-            + Debug
-    {
-    }
 }
 
 pub(crate) mod multipart {
@@ -85,8 +45,8 @@ pub(crate) mod object {
     use super::{Debug, Error, FileInfo, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use crate::storage_api_contracts::range::HTTPRangeSpec;
     pub(crate) use rustfs_storage_api::{
-        DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockRetentionOptions, ObjectOperations, ObjectPreconditionError,
-        ObjectPreconditionPart, ObjectPreconditionState, ObjectToDelete,
+        DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockDeleteOptions, ObjectLockRetentionOptions, ObjectOperations,
+        ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState, ObjectToDelete,
     };
 
     pub(crate) trait EcstoreObjectIO:

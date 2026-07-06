@@ -784,6 +784,10 @@ pub struct WalkDirOptions {
     // Do a full recursive scan.
     pub recursive: bool,
 
+    // Include entries hidden by delete markers.
+    #[serde(default)]
+    pub incl_deleted: bool,
+
     // ReportNotFound will return errFileNotFound if all disks reports the BaseDir cannot be found.
     pub report_notfound: bool,
 
@@ -1030,6 +1034,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             base_dir: "/path/to/dir".to_string(),
             recursive: true,
+            incl_deleted: false,
             report_notfound: false,
             filter_prefix: Some("prefix_".to_string()),
             forward_to: Some("object/path".to_string()),
@@ -1041,6 +1046,7 @@ mod tests {
         assert_eq!(opts.bucket, "test-bucket");
         assert_eq!(opts.base_dir, "/path/to/dir");
         assert!(opts.recursive);
+        assert!(!opts.incl_deleted);
         assert!(!opts.report_notfound);
         assert_eq!(opts.filter_prefix, Some("prefix_".to_string()));
         assert_eq!(opts.forward_to, Some("object/path".to_string()));
