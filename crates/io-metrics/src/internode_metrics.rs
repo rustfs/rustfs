@@ -18,7 +18,7 @@ use std::sync::{
     Arc, LazyLock, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INTERNODE_OPERATION_READ_FILE_STREAM: &str = "read_file_stream";
 pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
@@ -444,6 +444,9 @@ const CLUSTER_SERVERS_OFFLINE_TOTAL: &str = "rustfs_cluster_servers_offline_tota
 struct PeerHealthState {
     online: bool,
     consecutive_failures: u32,
+    /// Last time a request was let through to re-probe an offline peer (grpc-optimization P3
+    /// offline bypass). `None` means "not yet re-probed since going offline".
+    last_reprobe: Option<Instant>,
 }
 
 impl Default for PeerHealthState {
@@ -452,6 +455,7 @@ impl Default for PeerHealthState {
         Self {
             online: true,
             consecutive_failures: 0,
+            last_reprobe: None,
         }
     }
 }
@@ -472,6 +476,7 @@ pub fn record_peer_reachable(addr: &str) {
     let entry = peers.entry(addr.to_string()).or_default();
     entry.online = true;
     entry.consecutive_failures = 0;
+    entry.last_reprobe = None;
     publish_offline_gauge(&peers);
 }
 
@@ -487,6 +492,46 @@ pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
         entry.online = false;
     }
     publish_offline_gauge(&peers);
+}
+
+/// Whether a cluster peer is currently considered offline (known and marked offline).
+pub fn cluster_peer_is_offline(addr: &str) -> bool {
+    CLUSTER_PEER_HEALTH
+        .lock()
+        .ok()
+        .and_then(|peers| peers.get(addr).map(|peer| !peer.online))
+        .unwrap_or(false)
+}
+
+/// Decide whether to fast-fail (bypass) an offline peer instead of attempting to reach it
+/// (grpc-optimization P3 offline bypass). Returns `true` to bypass.
+///
+/// Self-healing: for an offline peer this returns `true` most of the time, but lets one request
+/// through every `reprobe_interval` (returning `false` and recording the re-probe time) so the peer
+/// can recover via a normal dial even if no background monitor is running. Online peers are never
+/// bypassed.
+pub fn cluster_peer_should_bypass(addr: &str, reprobe_interval: Duration) -> bool {
+    let Ok(mut peers) = CLUSTER_PEER_HEALTH.lock() else {
+        return false;
+    };
+    let Some(entry) = peers.get_mut(addr) else {
+        return false;
+    };
+    if entry.online {
+        return false;
+    }
+    let now = Instant::now();
+    let due = match entry.last_reprobe {
+        None => true,
+        Some(last) => now.duration_since(last) >= reprobe_interval,
+    };
+    if due {
+        // Let this request through to re-probe; do not bypass.
+        entry.last_reprobe = Some(now);
+        false
+    } else {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -677,6 +722,43 @@ mod tests {
     #[test]
     fn cluster_servers_offline_total_name_is_stable() {
         assert_eq!(CLUSTER_SERVERS_OFFLINE_TOTAL, "rustfs_cluster_servers_offline_total");
+    }
+
+    #[test]
+    fn cluster_peer_should_bypass_is_self_healing() {
+        let addr = "http://cluster-peer-bypass-selfheal-test:9000";
+        let interval = Duration::from_secs(30);
+
+        // Online peer: never bypassed.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, interval));
+
+        // Take it offline (threshold 1 for the test).
+        record_peer_unreachable(addr, 1);
+        assert!(cluster_peer_is_offline(addr));
+
+        // First decision after going offline is a re-probe (not bypassed)...
+        assert!(!cluster_peer_should_bypass(addr, interval));
+        // ...and subsequent ones within the interval are bypassed.
+        assert!(cluster_peer_should_bypass(addr, interval));
+        assert!(cluster_peer_should_bypass(addr, interval));
+
+        // A zero interval always allows a re-probe (never strands the peer).
+        assert!(!cluster_peer_should_bypass(addr, Duration::ZERO));
+
+        // Recovery clears bypass entirely.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, interval));
+    }
+
+    #[test]
+    fn cluster_peer_should_bypass_ignores_unknown_and_online_peers() {
+        let addr = "http://cluster-peer-bypass-unknown-test:9000";
+        // Unknown peer: not bypassed.
+        assert!(!cluster_peer_should_bypass(addr, Duration::from_secs(5)));
+        // Known-online peer: not bypassed.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, Duration::from_secs(5)));
     }
 
     #[test]

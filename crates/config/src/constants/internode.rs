@@ -120,6 +120,34 @@ const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY);
 pub const ENV_INTERNODE_OFFLINE_FAILURE_THRESHOLD: &str = "RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD";
 pub const DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD: u32 = 3;
 
+/// Prewarm internode control channels in the background at remote-disk construction, moving the
+/// connect cost off the first RPC (grpc-optimization P3-1).
+///
+/// Best-effort and deduped per peer; failures fall through to the existing lazy connect + recovery
+/// monitor. Defaults to `false` (opt-in): enabling it dials every peer at startup, and it is not yet
+/// validated against a cold-start baseline.
+pub const ENV_INTERNODE_PREWARM: &str = "RUSTFS_INTERNODE_PREWARM";
+pub const DEFAULT_INTERNODE_PREWARM: bool = false;
+
+/// Fast-fail (bypass) internode RPCs to a peer already marked offline, instead of paying the connect
+/// timeout, letting quorum proceed sooner (grpc-optimization P3-2).
+///
+/// Defaults to `false` (opt-in): this touches peer routing (consistency-sensitive) and must be
+/// validated with the failover bench before rollout. It does NOT change quorum. The bypass is
+/// self-healing — one request per [`ENV_INTERNODE_OFFLINE_REPROBE_SECS`] is let through to recover a
+/// peer even without a background monitor. Single-env rollback.
+pub const ENV_INTERNODE_OFFLINE_BYPASS: &str = "RUSTFS_INTERNODE_OFFLINE_BYPASS";
+pub const DEFAULT_INTERNODE_OFFLINE_BYPASS: bool = false;
+
+/// Re-probe interval (seconds) for the offline bypass: while a peer is offline, one request is let
+/// through this often to attempt recovery. Clamped to a small minimum by callers. Defaults to 5s.
+pub const ENV_INTERNODE_OFFLINE_REPROBE_SECS: &str = "RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS";
+pub const DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS: u64 = 5;
+
+// Compile-time invariant: prewarm and offline-bypass are opt-in so the base build is unchanged.
+const _: () = assert!(!DEFAULT_INTERNODE_PREWARM);
+const _: () = assert!(!DEFAULT_INTERNODE_OFFLINE_BYPASS);
+
 // ── Control/bulk channel isolation (P1) ──
 // Large `bytes`-carrying unary RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion) otherwise
 // share the control-plane HTTP/2 connection with latency-sensitive lock/health RPCs; a large
@@ -234,6 +262,15 @@ mod tests {
     fn internode_offline_failure_threshold_defaults_and_env_name() {
         assert_eq!(DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD, 3);
         assert_eq!(ENV_INTERNODE_OFFLINE_FAILURE_THRESHOLD, "RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD");
+    }
+
+    #[test]
+    fn internode_p3_lifecycle_defaults_are_opt_in() {
+        // The opt-in (default-off) invariants are asserted at compile time next to the definitions.
+        assert_eq!(DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS, 5);
+        assert_eq!(ENV_INTERNODE_PREWARM, "RUSTFS_INTERNODE_PREWARM");
+        assert_eq!(ENV_INTERNODE_OFFLINE_BYPASS, "RUSTFS_INTERNODE_OFFLINE_BYPASS");
+        assert_eq!(ENV_INTERNODE_OFFLINE_REPROBE_SECS, "RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS");
     }
 
     #[test]

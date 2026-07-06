@@ -14,7 +14,7 @@
 
 use crate::cluster::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
-    node_service_time_out_client_for_class,
+    node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
 };
 use crate::cluster::rpc::internode_data_transport::{
     InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
@@ -186,6 +186,56 @@ pub struct RemoteDisk {
     data_transport: Arc<dyn InternodeDataTransport>,
 }
 
+// ── Connection lifecycle (grpc-optimization P3) ──
+
+/// Whether to prewarm the internode control channel in the background at construction (default off).
+fn internode_prewarm_enabled() -> bool {
+    rustfs_utils::get_env_bool(rustfs_config::ENV_INTERNODE_PREWARM, rustfs_config::DEFAULT_INTERNODE_PREWARM)
+}
+
+/// Whether to fast-fail RPCs to peers already marked offline (default off).
+fn internode_offline_bypass_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_OFFLINE_BYPASS,
+        rustfs_config::DEFAULT_INTERNODE_OFFLINE_BYPASS,
+    )
+}
+
+/// Re-probe interval for the offline bypass (>= 1s).
+fn internode_offline_reprobe_interval() -> Duration {
+    Duration::from_secs(
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_INTERNODE_OFFLINE_REPROBE_SECS,
+            rustfs_config::DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS,
+        )
+        .max(1),
+    )
+}
+
+/// Peers for which a control-channel prewarm has already been triggered, to dedup the N remote
+/// disks that map to a single peer address.
+static PREWARMED_PEERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Best-effort background prewarm of a peer's control channel (grpc-optimization P3-1). Deduped per
+/// peer; a dial failure just falls through to the existing lazy connect and recovery monitor.
+fn spawn_control_channel_prewarm(addr: String) {
+    {
+        let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
+            return;
+        };
+        if !prewarmed.insert(addr.clone()) {
+            return;
+        }
+    }
+    tokio::spawn(async move {
+        match node_service_time_out_client_no_auth(&addr).await {
+            Ok(_) => debug!(addr = %addr, "internode control channel prewarmed"),
+            Err(err) => debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)"),
+        }
+    });
+}
+
 impl RemoteDisk {
     fn recovery_monitor_span(addr: &str, endpoint: &Endpoint) -> tracing::Span {
         tracing::info_span!(
@@ -232,6 +282,12 @@ impl RemoteDisk {
             data_transport,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
+
+        // P3-1: move the connect cost off the first RPC by prewarming the control channel in the
+        // background. Deduped per peer, best-effort, opt-in.
+        if internode_prewarm_enabled() {
+            spawn_control_channel_prewarm(disk.addr.clone());
+        }
 
         Ok(disk)
     }
@@ -806,7 +862,24 @@ impl RemoteDisk {
         }
     }
 
+    /// P3-2 offline bypass: when enabled and this peer is marked offline, fast-fail instead of
+    /// paying the connect timeout, so the erasure layer proceeds on quorum sooner. This does not
+    /// change quorum. Self-healing — one request per re-probe interval is let through so the peer
+    /// recovers even without a background monitor. The recovery monitor's own probe path calls the
+    /// client directly and is unaffected.
+    fn offline_bypass_error(&self) -> Option<Error> {
+        if internode_offline_bypass_enabled()
+            && rustfs_io_metrics::internode_metrics::cluster_peer_should_bypass(&self.addr, internode_offline_reprobe_interval())
+        {
+            return Some(Error::other(format!("internode peer {} offline; fast-fail bypass (P3)", self.addr)));
+        }
+        None
+    }
+
     async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        if let Some(err) = self.offline_bypass_error() {
+            return Err(err);
+        }
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))
@@ -817,6 +890,9 @@ impl RemoteDisk {
     /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
     /// is disabled.
     async fn get_bulk_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        if let Some(err) = self.offline_bypass_error() {
+            return Err(err);
+        }
         node_service_time_out_client_for_class(
             &self.addr,
             TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
