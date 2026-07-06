@@ -708,17 +708,59 @@ impl ReplicationResyncer {
                         roi.version_id.map(|v| v.to_string()),
                     )
                     .await;
-                    let (size, err) = if let Err(err) = head_result {
-                        if roi.delete_marker {
+                    let (size, err) = match head_result {
+                        Ok(_) => {
                             st.replicated_count += 1;
-                        } else {
-                            st.failed_count += 1;
+                            st.replicated_size += roi.size;
+                            (roi.size, None)
                         }
-                        (0, Some(err))
-                    } else {
-                        st.replicated_count += 1;
-                        st.replicated_size += roi.size;
-                        (roi.size, None)
+                        Err(err) if roi.delete_marker => {
+                            // Verifying a replicated delete marker: only a
+                            // definitive 404/NoSuchKey or 405/MethodNotAllowed
+                            // confirms the marker propagated. Any other
+                            // (retryable/ambiguous) HEAD error leaves the outcome
+                            // unverified, so it must count as failed — not as a
+                            // blanket success (backlog#862 / #799 B13).
+                            let retryable = {
+                                let (is_not_found, code) = err
+                                    .as_service_error()
+                                    .map(|se| (se.is_not_found(), se.code()))
+                                    .unwrap_or((false, None));
+                                is_retryable_delete_replication_head_error(is_not_found, code)
+                            };
+                            if retryable {
+                                st.failed_count += 1;
+                                (0, Some(err))
+                            } else {
+                                st.replicated_count += 1;
+                                (0, None)
+                            }
+                        }
+                        Err(err) if is_version_id_format_mismatch(&err) => {
+                            // AWS-style target rejects the RustFS UUID versionId
+                            // (400). Re-verify without the versionId before
+                            // concluding the object failed to replicate, instead
+                            // of counting a well-replicated object as failed.
+                            match head_object_fallback(&bucket_name, target_client.as_ref(), &roi.name).await {
+                                Ok(Some(_)) => {
+                                    st.replicated_count += 1;
+                                    st.replicated_size += roi.size;
+                                    (roi.size, None)
+                                }
+                                Ok(None) => {
+                                    st.failed_count += 1;
+                                    (0, Some(err))
+                                }
+                                Err(e2) => {
+                                    st.failed_count += 1;
+                                    (0, Some(e2))
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            st.failed_count += 1;
+                            (0, Some(err))
+                        }
                     };
 
                     if err.is_some() {
@@ -2658,6 +2700,28 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo.size = size;
         rinfo.replication_action = replication_action;
 
+        if replication_action == ReplicationAction::None {
+            // The target already holds a matching object (reached here only via
+            // the version-id fallback ETag match above) — there is nothing to
+            // copy. Record it as synced and return, instead of falling into the
+            // metadata-unsupported failure branch below, which previously left
+            // AWS-style targets permanently FAILED and never converging
+            // (backlog#860 / #799 B11).
+            if self.op_type == ReplicationType::ExistingObject && !tgt_client.reset_id.is_empty() {
+                rinfo.resync_timestamp = format!(
+                    "{};{}",
+                    OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| "invalid-time".to_string()),
+                    tgt_client.reset_id
+                );
+                rinfo.replication_resynced = true;
+            }
+            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+            return rinfo;
+        }
+
+        // action == Metadata: metadata-only replication is not implemented.
         if replication_action != ReplicationAction::All {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(ERR_REPLICATION_METADATA_COPY_UNSUPPORTED.to_string());

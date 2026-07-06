@@ -614,7 +614,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         let parts_metadata = vec![fi.clone(); disks.len()];
 
-        let (shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
+        let (mut shuffle_disks, mut parts_metadatas) = Self::shuffle_disks_and_parts_metadata(&disks, &parts_metadata, &fi);
 
         let tmp_dir = Uuid::new_v4().to_string();
 
@@ -821,6 +821,21 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             } else {
                 Some(OffsetDateTime::now_utc())
             };
+
+            // Drop any disk whose shard did not fully commit (offline at writer
+            // setup, short write, or a write/shutdown error) so its truncated or
+            // absent shard is not renamed into place and counted toward write
+            // quorum. Otherwise redundancy is inflated: the object claims N good
+            // shards but one is short/corrupt, so a single later disk failure can
+            // drop it below reconstructable quorum (backlog#852 / #799 B3).
+            // `rename_data` re-checks write quorum over the surviving disks and
+            // rolls back if too few remain.
+            let committed_shards = drop_failed_writer_disks(&mut shuffle_disks, &writers);
+            if committed_shards < write_quorum {
+                return Err(Error::other(format!(
+                    "put_object write quorum unavailable after encode: {committed_shards} shard(s) committed, need {write_quorum}"
+                )));
+            }
 
             for (i, pfi) in parts_metadatas.iter_mut().enumerate() {
                 pfi.metadata = user_defined.clone();
@@ -2192,5 +2207,53 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut reader = get_object_reader.stream;
         tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
         Ok(())
+    }
+}
+
+/// Null out any disk whose shard writer failed (or was never created) so its
+/// truncated/absent shard is not committed by `rename_data`, and return the
+/// number of disks that still carry a fully-written shard. Extracted for unit
+/// testing the write-quorum accounting (backlog#852 / #799 B3).
+fn drop_failed_writer_disks<D, W>(disks: &mut [Option<D>], writers: &[Option<W>]) -> usize {
+    let mut committed = 0usize;
+    for (slot, writer) in disks.iter_mut().zip(writers.iter()) {
+        if writer.is_none() {
+            *slot = None;
+        } else if slot.is_some() {
+            committed += 1;
+        }
+    }
+    committed
+}
+
+#[cfg(test)]
+mod b3_write_quorum_tests {
+    use super::drop_failed_writer_disks;
+
+    #[test]
+    fn excludes_failed_writers_and_counts_committed() {
+        // Writer 2 failed (short write / error -> nulled). Its disk must be
+        // dropped so the truncated shard is not renamed or counted.
+        let mut disks = vec![Some(0u8), Some(1), Some(2), Some(3)];
+        let writers = vec![Some(()), Some(()), None, Some(())];
+        assert_eq!(drop_failed_writer_disks(&mut disks, &writers), 3);
+        assert_eq!(disks, vec![Some(0), Some(1), None, Some(3)]);
+    }
+
+    #[test]
+    fn offline_disk_stays_excluded_and_uncounted() {
+        // Disk 1 was offline at setup (disk None, writer None): stays None, not counted.
+        let mut disks = vec![Some(0u8), None, Some(2)];
+        let writers = vec![Some(()), None, Some(())];
+        assert_eq!(drop_failed_writer_disks(&mut disks, &writers), 2);
+        assert_eq!(disks, vec![Some(0), None, Some(2)]);
+    }
+
+    #[test]
+    fn all_writers_ok_keeps_every_disk() {
+        let mut disks = vec![Some(0u8), Some(1), Some(2)];
+        let writers = vec![Some(()), Some(()), Some(())];
+        assert_eq!(drop_failed_writer_disks(&mut disks, &writers), 3);
+        assert_eq!(disks, vec![Some(0), Some(1), Some(2)]);
     }
 }

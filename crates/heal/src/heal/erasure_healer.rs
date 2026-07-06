@@ -441,7 +441,53 @@ impl ErasureSetHealer {
             current_object_index = 0;
         }
 
-        // 5. mark task completed
+        // 5. finalize. Only declare the set healed when nothing failed —
+        // otherwise the resume/checkpoint state must survive so the failures are
+        // retried instead of being silently marked "completed" and discarded
+        // (backlog#855 / #799 B6).
+        if failed_objects > 0 {
+            if resume_manager.schedule_retry().await? {
+                // Retry budget remains: state has been reset for a full re-scan.
+                // Return Err so `heal_erasure_set` preserves (does not clean up)
+                // the resume/checkpoint state and the caller keeps the healing
+                // markers for the next heal run.
+                warn!(
+                    target: "rustfs::heal::erasure_healer",
+                    event = EVENT_HEAL_ERASURE_RESUME_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
+                    set_disk_id,
+                    failed_objects,
+                    state = "retry_scheduled",
+                    "Erasure set heal pass finished with failures; scheduled full re-heal retry"
+                );
+                return Err(Error::other(format!(
+                    "Erasure set heal incomplete: {failed_objects} object(s) failed; retry scheduled"
+                )));
+            }
+
+            // Retry budget exhausted: drop the resume/checkpoint state so this
+            // task does not loop, but keep the healing markers (return Err) so a
+            // later heal cycle / the background scanner starts a fresh attempt.
+            // Never silently claim a clean completion while objects are unhealed.
+            error!(
+                target: "rustfs::heal::erasure_healer",
+                event = EVENT_HEAL_ERASURE_RESUME_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
+                set_disk_id,
+                failed_objects,
+                state = "failed_after_retries",
+                "Erasure set heal exhausted retries with unrecovered failures"
+            );
+            let _ = resume_manager.cleanup().await;
+            let _ = checkpoint_manager.cleanup().await;
+            return Err(Error::other(format!(
+                "Erasure set heal exhausted retries with {failed_objects} unrecovered object(s)"
+            )));
+        }
+
+        // no failures — mark task completed
         resume_manager.mark_completed().await?;
 
         debug!(
