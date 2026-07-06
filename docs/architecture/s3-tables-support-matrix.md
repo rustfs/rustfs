@@ -34,7 +34,7 @@ catalog extension.
 | AWS S3 Tables endpoint shape | Profile generator | Generates the AWS catalog URI and S3 Tables warehouse ARN shape for migration docs. Full AWS S3 Tables API parity is not claimed. |
 | MinIO AIStor Tables profile | Profile generator plus RustFS alias smoke | RustFS exposes the alias shape, but does not claim all AIStor private extensions. |
 | Cloudflare R2 Data Catalog profile | Profile generator | Generates the catalog URI and warehouse-name shape for migration docs. Live RustFS interoperability is not claimed. |
-| Alibaba OSS Tables profile | Profile generator | Generates provider endpoint, `acs:osstables` warehouse ARN, and `osstables` signing-name shapes for migration docs. Live RustFS interoperability is not claimed. |
+| Alibaba OSS Tables profile | Profile generator | Generates provider endpoint, `acs:osstables` warehouse ARN, `osstables` signing-name, and `https://oss-{region}.aliyuncs.com` S3FileIO endpoint shapes for migration docs. Live RustFS interoperability is not claimed. |
 
 ## Client And Engine Matrix
 

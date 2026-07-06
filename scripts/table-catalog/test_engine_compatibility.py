@@ -284,6 +284,10 @@ class EngineCompatibilityTest(unittest.TestCase):
             "acs:osstables:cn-hangzhou:123456789012:bucket/analytics",
         )
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "osstables")
+        self.assertEqual(config["spark.sql.catalog.rustfs.s3.endpoint"], "https://oss-cn-hangzhou.aliyuncs.com")
+        self.assertEqual(config["spark.sql.catalog.rustfs.s3.access-key-id"], "rustfsadmin")
+        self.assertEqual(config["spark.sql.catalog.rustfs.s3.secret-access-key"], "rustfsadmin")
+        self.assertNotIn("spark.sql.catalog.rustfs.s3.path-style-access", config)
 
     def test_cli_spark_config_keeps_explicit_rest_overrides(self) -> None:
         payload = engine_compatibility.cli_json(

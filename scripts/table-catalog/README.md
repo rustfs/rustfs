@@ -150,11 +150,13 @@ the `selected_vendor_profile` object renders the active profile with the
 provided endpoint, account, bucket, and warehouse arguments.
 
 Spark vendor config generation only emits S3-compatible data-plane endpoint,
-path-style, and static S3 credential properties for profiles that explicitly use
-the supplied endpoint as object storage, such as RustFS and MinIO AIStor. AWS S3
-Tables, Cloudflare R2 Data Catalog, and OSS Tables reference profiles leave
-provider object I/O endpoint and credential selection to the provider-specific
-Spark/Iceberg runtime configuration instead of inheriting RustFS local defaults.
+path-style, and static S3 credential properties for profiles that require them.
+RustFS and MinIO AIStor use the supplied endpoint as object storage. Alibaba
+OSS Tables uses the documented `https://oss-{region}.aliyuncs.com` public
+S3FileIO endpoint by default. AWS S3 Tables and Cloudflare R2 Data Catalog
+reference profiles leave provider object I/O endpoint and credential selection
+to the provider-specific Spark/Iceberg runtime configuration instead of
+inheriting RustFS local defaults.
 
 The standalone engine helper also prints a vendor compatibility audit. This
 records the public reference source, catalog path, warehouse shape, signing

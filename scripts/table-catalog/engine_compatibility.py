@@ -59,6 +59,7 @@ VENDOR_SPARK_PROFILES: dict[str, dict[str, str]] = {
         "catalog_uri": "{endpoint}/iceberg",
         "warehouse": "acs:osstables:{region}:{account_id}:bucket/{table_bucket}",
         "rest_signing_name": "osstables",
+        "s3_endpoint": "https://oss-{region}.aliyuncs.com",
     },
 }
 
