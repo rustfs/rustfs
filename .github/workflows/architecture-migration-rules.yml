@@ -16,6 +16,7 @@ name: Architecture Migration Rules
 
 on:
   pull_request:
+    types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
     paths:
       - "ARCHITECTURE.md"
@@ -27,9 +28,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  cancel-closed-pr-runs:
+    name: Cancel Closed PR Runs
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain cancellation run
+        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
+
   architecture-migration-rules:
     name: Architecture Migration Rules
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

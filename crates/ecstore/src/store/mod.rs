@@ -413,7 +413,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         self.handle_verify_object_integrity(bucket, object, opts).await
     }
 
-    // TODO: review
     #[instrument(skip(self))]
     async fn copy_object(
         &self,
@@ -454,7 +453,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         }
         result
     }
-    // TODO: review
+
     #[instrument(skip(self))]
     async fn delete_objects(
         &self,

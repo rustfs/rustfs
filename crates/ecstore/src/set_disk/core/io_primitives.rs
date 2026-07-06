@@ -2476,7 +2476,6 @@ impl SetDisks {
 
         let mut futures = Vec::with_capacity(disks.len());
         if let Some(ret_err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            // TODO: add concurrency
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
@@ -2561,19 +2560,6 @@ impl SetDisks {
         } else {
             vec![None; disks.len()]
         };
-
-        // // TODO: reduce_common_data_dir
-        // if let Some(old_dir) = rename_ress
-        //     .iter()
-        //     .filter_map(|v| if v.is_some() { v.as_ref().unwrap().old_data_dir } else { None })
-        //     .map(|v| v.to_string())
-        //     .next()
-        // {
-        //     let cm_errs = self.commit_rename_data_dir(&shuffle_disks, &bucket, &object, &old_dir).await;
-        //     warn!("put_object commit_rename_data_dir:{:?}", &cm_errs);
-        // }
-
-        // self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await?;
 
         Ok((online_disks, versions, data_dir, cleanup_disks))
     }

@@ -24,6 +24,7 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/nix.yml'
   pull_request:
+    types: [ opened, synchronize, reopened, closed ]
     branches: [ "main" ]
     paths:
       - 'flake.nix'
@@ -34,15 +35,24 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 permissions:
   contents: read
   id-token: write
 
 jobs:
+  cancel-closed-pr-runs:
+    name: Cancel Closed PR Runs
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain cancellation run
+        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
+
   nix-validation:
     name: Nix Build & Check
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:

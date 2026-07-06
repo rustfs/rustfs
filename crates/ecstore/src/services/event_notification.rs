@@ -52,11 +52,6 @@ impl EventNotifier {
     }
 
     fn init_bucket_targets(&self, _api: ECStore) -> Result<(), std::io::Error> {
-        /*if err := self.target_list.Add(globalNotifyTargetList.Targets()...); err != nil {
-          return err
-        }
-        self.target_list = self.target_list.Init(runtime.GOMAXPROCS(0)) // TODO: make this configurable (y4m4)
-        nil*/
         warn!("init_bucket_targets called but currently no-op in this build");
         Ok(())
     }

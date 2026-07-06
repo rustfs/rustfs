@@ -355,10 +355,6 @@ impl ObjectStore {
     async fn list_iam_config_items(&self, prefix: &str, ctx: CancellationToken, sender: Sender<StringOrErr>) {
         // debug!("list iam config items, prefix: {}", &prefix);
 
-        // TODO: Implement walk, use walk
-
-        // let prefix = format!("{}{}", prefix, item);
-
         let store = self.object_api.clone();
 
         let (tx, mut rx) = mpsc::channel::<ObjectInfoOrErr>(100);
@@ -595,42 +591,6 @@ impl ObjectStore {
             Err(e) => Err(e.into()),
         }
     }
-
-    // async fn load_policy(&self, name: &str) -> Result<PolicyDoc> {
-    //     let mut policy = self
-    //         .load_iam_config::<PolicyDoc>(&format!("config/iam/policies/{name}/policy.json"))
-    //         .await?;
-
-    //     // FIXME:
-    //     // if policy.version == 0 {
-    //     //     policy.create_date = object.mod_time;
-    //     //     policy.update_date = object.mod_time;
-    //     // }
-
-    //     Ok(policy)
-    // }
-
-    // async fn load_user_identity(&self, user_type: UserType, name: &str) -> Result<Option<UserIdentity>> {
-    //     let mut user = self
-    //         .load_iam_config::<UserIdentity>(&format!(
-    //             "config/iam/{base}{name}/identity.json",
-    //             base = user_type.prefix(),
-    //             name = name
-    //         ))
-    //         .await?;
-
-    //     if user.credentials.is_expired() {
-    //         return Ok(None);
-    //     }
-
-    //     if user.credentials.access_key.is_empty() {
-    //         user.credentials.access_key = name.to_owned();
-    //     }
-
-    //     // todo, validate session token
-
-    //     Ok(Some(user))
-    // }
 }
 
 #[async_trait::async_trait]

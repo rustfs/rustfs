@@ -5398,8 +5398,6 @@ impl DefaultObjectUsecase {
         };
         let last_modified = info.mod_time.map(Timestamp::from);
 
-        // TODO: range download
-
         let content_length = info.get_actual_size().map_err(|e| {
             error!(error = %e, "Failed to resolve actual object size");
             ApiError::from(e)

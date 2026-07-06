@@ -338,6 +338,18 @@ impl SetDisks {
             }
         };
 
+        // The drive's format may place it in a different erasure set than this
+        // one. Claiming a misplaced drive into `self.disks` would let two sets
+        // manage the same drive and degrade together, so reject it here
+        // (backlog#799 B19).
+        if set_idx != self.set_index {
+            warn!(
+                "renew_disk: drive {:?} belongs to set {} but is being renewed on set {}; skipping",
+                ep, set_idx, self.set_index
+            );
+            return;
+        }
+
         // Check that the endpoint matches
 
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;

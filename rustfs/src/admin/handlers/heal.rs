@@ -1153,12 +1153,21 @@ mod tests {
         assert!(err.to_string().contains("invalid bucket name"));
     }
 
-    #[ignore] // FIXME: failed in github actions - keeping original test
     #[test]
     fn test_decode() {
+        // Mirror the production decode path (handler decodes the request body via
+        // serde_json::from_slice), not urlencoded.
         let b = b"{\"recursive\":false,\"dryRun\":false,\"remove\":false,\"recreate\":false,\"scanMode\":1,\"updateParity\":false,\"nolock\":false}";
-        let s: HealOpts = serde_urlencoded::from_bytes(b).unwrap();
-        debug!("Parsed HealOpts: {:?}", s);
+        let s: HealOpts = serde_json::from_slice(b).expect("HealOpts JSON body must decode");
+        assert!(!s.recursive);
+        assert!(!s.dry_run);
+        assert!(!s.remove);
+        assert!(!s.recreate);
+        assert_eq!(s.scan_mode, HealScanMode::Normal);
+        assert!(!s.update_parity);
+        assert!(!s.no_lock);
+        assert_eq!(s.pool, None);
+        assert_eq!(s.set, None);
     }
 
     #[tokio::test]
