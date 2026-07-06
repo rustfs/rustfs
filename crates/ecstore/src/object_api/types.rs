@@ -61,6 +61,7 @@ pub struct ObjectOptions {
 
     pub eval_metadata: Option<HashMap<String, String>>,
     pub object_lock_retention: Option<ObjectLockRetentionOptions>,
+    pub object_lock_delete: Option<crate::storage_api_contracts::object::ObjectLockDeleteOptions>,
 
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,

@@ -1327,10 +1327,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
 
         for (i, dobj) in objects.iter().enumerate() {
+            if del_errs[i].is_some() {
+                continue;
+            }
+
             let explicit_null_version = is_explicit_null_version(dobj.version_id);
+            let version_id = delete_file_info_version_id(dobj.version_id);
+            let check_opts = ObjectOptions {
+                version_id: version_id.map(|version_id| version_id.to_string()),
+                versioned: ver_cfg.prefix_enabled(dobj.object_name.as_str()),
+                version_suspended: ver_cfg.suspended(),
+                object_lock_delete: opts.object_lock_delete.clone(),
+                no_lock: true,
+                ..Default::default()
+            };
+            let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
+            if gerr.is_none()
+                && let Err(err) = check_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts).await
+            {
+                del_errs[i] = Some(err);
+                continue;
+            }
+
             let mut vr = FileInfo {
                 name: dobj.object_name.clone(),
-                version_id: delete_file_info_version_id(dobj.version_id),
+                version_id,
                 idx: i,
                 replication_state_internal: Some(dobj.replication_state()),
                 ..Default::default()
@@ -1529,6 +1550,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             } else {
                 return Err(err.clone());
             }
+        }
+
+        if version_found {
+            check_object_lock_delete(bucket, object, &goi, &opts).await?;
         }
 
         let otd = ObjectToDelete {

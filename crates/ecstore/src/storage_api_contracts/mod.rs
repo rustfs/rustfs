@@ -45,8 +45,8 @@ pub(crate) mod object {
     use super::{Debug, Error, FileInfo, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use crate::storage_api_contracts::range::HTTPRangeSpec;
     pub(crate) use rustfs_storage_api::{
-        DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockRetentionOptions, ObjectOperations, ObjectPreconditionError,
-        ObjectPreconditionPart, ObjectPreconditionState, ObjectToDelete,
+        DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockDeleteOptions, ObjectLockRetentionOptions, ObjectOperations,
+        ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState, ObjectToDelete,
     };
 
     pub(crate) trait EcstoreObjectIO:

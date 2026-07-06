@@ -188,7 +188,7 @@ use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
-    StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions,
+    StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions, StorageObjectOptions as ObjectOptions,
     StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 use crate::app::object_data_cache::{
@@ -4847,6 +4847,7 @@ impl DefaultObjectUsecase {
                 ObjectOptions {
                     versioned: version_cfg.enabled(),
                     version_suspended: version_cfg.suspended(),
+                    object_lock_delete: Some(StorageObjectLockDeleteOptions { bypass_governance }),
                     ..Default::default()
                 },
             )
@@ -5047,6 +5048,9 @@ impl DefaultObjectUsecase {
         let mut opts: ObjectOptions = del_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
+        opts.object_lock_delete = Some(StorageObjectLockDeleteOptions {
+            bypass_governance: has_bypass_governance_header(&req.headers),
+        });
         let force_delete = opts.delete_prefix;
 
         let lock_cfg = BucketObjectLockSys::get(&bucket).await;
