@@ -651,12 +651,22 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         let mut rstate = oi.replication_state();
                         rstate.replicate_decision_str = dsc.to_string();
 
+                        // Restore the original delete-marker mtime persisted with the entry so
+                        // the replica keeps the source timestamp. Old MRF files lack this field
+                        // (delete_marker_mtime = None) — fall back to None so the replica is
+                        // stamped with the current time, preserving pre-#867 behaviour
+                        // (backlog#867).
+                        let delete_marker_mtime = entry
+                            .delete_marker_mtime
+                            .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok());
+
                         let dv = DeletedObjectReplicationInfo {
                             delete_object: ReplicationDeletedObject {
                                 object_name: entry.object.clone(),
                                 version_id: entry.version_id,
                                 delete_marker_version_id: entry.delete_marker_version_id,
                                 delete_marker: entry.delete_marker,
+                                delete_marker_mtime,
                                 replication_state: Some(rstate),
                                 ..Default::default()
                             },
@@ -1509,6 +1519,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -1564,6 +1575,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -1584,6 +1596,9 @@ mod tests {
     #[test]
     fn mrf_entry_delete_marker_roundtrip() {
         let dm_vid = Uuid::new_v4();
+        // A specific, non-now() nanosecond timestamp: replay must preserve this exact value
+        // instead of stamping the replica with the current time (backlog#867).
+        let mtime_nanos = 1_705_312_200_123_456_789i64;
         let entry = MrfReplicateEntry {
             bucket: "del-bucket".to_string(),
             object: "key".to_string(),
@@ -1593,6 +1608,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: Some(dm_vid),
             delete_marker: true,
+            delete_marker_mtime: Some(mtime_nanos),
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -1606,6 +1622,11 @@ mod tests {
         assert_eq!(got.op, MrfOpKind::Delete);
         assert_eq!(got.delete_marker_version_id, Some(dm_vid));
         assert!(got.delete_marker);
+        assert_eq!(
+            got.delete_marker_mtime,
+            Some(mtime_nanos),
+            "delete-marker mtime must survive the MRF disk round-trip"
+        );
     }
 
     #[test]
@@ -1620,6 +1641,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
 
         let encoded = encode_mrf_file(&[entry]).expect("encode");
@@ -1647,6 +1669,7 @@ mod tests {
                 op: MrfOpKind::Object,
                 delete_marker_version_id: None,
                 delete_marker: false,
+                delete_marker_mtime: None,
             },
             MrfReplicateEntry {
                 bucket: "b".to_string(),
@@ -1657,6 +1680,7 @@ mod tests {
                 op: MrfOpKind::Delete,
                 delete_marker_version_id: Some(del_dm_vid),
                 delete_marker: true,
+                delete_marker_mtime: None,
             },
         ];
 
@@ -1685,6 +1709,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
         assert_eq!(obj_entry.op, MrfOpKind::Object);
 
@@ -1698,6 +1723,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: Some(Uuid::new_v4()),
             delete_marker: true,
+            delete_marker_mtime: None,
         };
         assert_eq!(del_entry.op, MrfOpKind::Delete);
 
@@ -1712,6 +1738,7 @@ mod tests {
             op: MrfOpKind::default(),
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
         assert_eq!(legacy_entry.op, MrfOpKind::Object, "legacy default must be Object");
     }
@@ -1758,5 +1785,8 @@ mod tests {
         assert_eq!(entry.op, MrfOpKind::Object, "missing op key must default to Object");
         assert!(!entry.delete_marker);
         assert_eq!(entry.delete_marker_version_id, None);
+        // The "deleteMarkerMtime" key was absent in old files — #[serde(default)] must fill in
+        // None so replay falls back to the current time (backlog#867 backward compatibility).
+        assert_eq!(entry.delete_marker_mtime, None, "missing deleteMarkerMtime key must default to None");
     }
 }

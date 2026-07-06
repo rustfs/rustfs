@@ -586,6 +586,13 @@ pub struct MrfReplicateEntry {
     // Old files lack this; default=false is correct.
     #[serde(rename = "deleteMarker", default)]
     pub delete_marker: bool,
+
+    // For delete entries: the original delete-marker mtime, persisted as Unix nanoseconds so
+    // replay stamps replicas with the source timestamp instead of the replay time. Old files
+    // lack this key; default=None means "unknown", and replay falls back to the current time
+    // to preserve pre-existing behaviour (backlog#867).
+    #[serde(rename = "deleteMarkerMtime", skip_serializing_if = "Option::is_none", default)]
+    pub delete_marker_mtime: Option<i64>,
 }
 
 pub trait ReplicationWorkerOperation: Any + Send + Sync {
@@ -787,6 +794,7 @@ impl ReplicationWorkerOperation for ReplicateObjectInfo {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         }
     }
 
@@ -837,6 +845,7 @@ impl ReplicateObjectInfo {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         }
     }
 }
