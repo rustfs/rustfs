@@ -29,7 +29,19 @@ use std::sync::{
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use super::DiskStore;
+use super::{DiskStore, EcstoreError};
+
+/// Outcome of classifying an error returned by [`HealStorageAPI::heal_object`].
+enum HealObjectOutcome {
+    /// The object/version is genuinely absent — nothing left to heal.
+    Absent,
+    /// A transient infrastructure condition (offline disk, unmet quorum,
+    /// contended lock). The object is skipped and retried on a later pass
+    /// instead of being recorded as processed.
+    Transient,
+    /// A real heal failure that should be recorded as failed.
+    Failed,
+}
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_ERASURE_HEALER: &str = "erasure_healer";
@@ -87,8 +99,44 @@ impl ErasureSetHealer {
         }
     }
 
-    fn is_object_not_found_message(message: &str) -> bool {
-        message.contains("File not found") || message.contains("not found")
+    /// Classify an error returned by [`HealStorageAPI::heal_object`].
+    ///
+    /// Both the inner `Ok((_, Some(err)))` and the outer `Err(err)` produced by
+    /// `heal_object` wrap `Error::Storage(StorageError)`, so match on that.
+    fn classify_heal_object_error(err: &Error) -> HealObjectOutcome {
+        let Error::Storage(se) = err else {
+            return HealObjectOutcome::Failed;
+        };
+
+        // Genuine object/version absence: nothing left to heal, treat as handled.
+        if matches!(
+            se,
+            EcstoreError::FileNotFound
+                | EcstoreError::FileVersionNotFound
+                | EcstoreError::ObjectNotFound(_, _)
+                | EcstoreError::VersionNotFound(_, _, _)
+        ) {
+            return HealObjectOutcome::Absent;
+        }
+
+        // Transient infrastructure conditions — skip and retry on a later pass.
+        // NOTE: do NOT use `StorageError::is_not_found()` here: it lumps
+        // `DiskNotFound`/`VolumeNotFound` together with object absence, which is
+        // exactly the conflation that previously let an offline drive be recorded
+        // as "healed/absent" and permanently skipped (backlog#856 / #799 B7).
+        if se.is_quorum_error()
+            || matches!(
+                se,
+                EcstoreError::DiskNotFound
+                    | EcstoreError::VolumeNotFound
+                    | EcstoreError::SlowDown
+                    | EcstoreError::OperationCanceled
+            )
+        {
+            return HealObjectOutcome::Transient;
+        }
+
+        HealObjectOutcome::Failed
     }
 
     pub fn new(
@@ -523,22 +571,13 @@ impl ErasureSetHealer {
                     } else if deep_scan {
                         match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
                             Ok((_result, None)) => Ok(true),
-                            Ok((_, Some(err))) => {
-                                let err_msg = err.to_string();
-                                if Self::is_object_not_found_message(&err_msg) {
-                                    Ok(false)
-                                } else {
-                                    Err(Error::other(err))
-                                }
-                            }
-                            Err(err) => {
-                                let err_msg = err.to_string();
-                                if Self::is_object_not_found_message(&err_msg) {
-                                    Ok(false)
-                                } else {
-                                    Err(err)
-                                }
-                            }
+                            Ok((_, Some(err))) | Err(err) => match Self::classify_heal_object_error(&err) {
+                                HealObjectOutcome::Absent => Ok(false),
+                                HealObjectOutcome::Transient => Err(Error::transient_skip(format!(
+                                    "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                ))),
+                                HealObjectOutcome::Failed => Err(err),
+                            },
                         }
                     } else {
                         let object_exists = match storage.object_exists(&bucket_name, &object_name).await {
@@ -576,8 +615,13 @@ impl ErasureSetHealer {
                             match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
                                 Ok((_result, None)) => Ok(true),
                                 Ok((_, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => Ok(false),
-                                Ok((_, Some(err))) => Err(Error::other(err)),
-                                Err(err) => Err(err),
+                                Ok((_, Some(err))) | Err(err) => match Self::classify_heal_object_error(&err) {
+                                    HealObjectOutcome::Absent => Ok(false),
+                                    HealObjectOutcome::Transient => Err(Error::transient_skip(format!(
+                                        "Skipped heal for {bucket_name}/{object_name} due to transient error: {err}"
+                                    ))),
+                                    HealObjectOutcome::Failed => Err(err),
+                                },
                             }
                         }
                     };
@@ -1051,5 +1095,52 @@ mod tests {
                 );
             },
         );
+    }
+
+    // Regression guards for backlog#856 / #799 B7: heal-object error
+    // classification must not conflate an offline drive (or unmet quorum) with
+    // genuine object absence, or transient failures get recorded as "healed" and
+    // permanently skipped.
+    use super::{EcstoreError, Error, HealObjectOutcome};
+
+    fn classify(err: EcstoreError) -> HealObjectOutcome {
+        ErasureSetHealer::classify_heal_object_error(&Error::Storage(err))
+    }
+
+    #[test]
+    fn disk_not_found_is_transient_not_absent() {
+        assert!(matches!(classify(EcstoreError::DiskNotFound), HealObjectOutcome::Transient));
+        assert!(matches!(classify(EcstoreError::VolumeNotFound), HealObjectOutcome::Transient));
+    }
+
+    #[test]
+    fn quorum_errors_are_transient() {
+        assert!(matches!(classify(EcstoreError::ErasureReadQuorum), HealObjectOutcome::Transient));
+        assert!(matches!(
+            classify(EcstoreError::InsufficientReadQuorum(String::new(), String::new())),
+            HealObjectOutcome::Transient
+        ));
+    }
+
+    #[test]
+    fn genuine_object_absence_is_absent() {
+        assert!(matches!(classify(EcstoreError::FileNotFound), HealObjectOutcome::Absent));
+        assert!(matches!(classify(EcstoreError::FileVersionNotFound), HealObjectOutcome::Absent));
+        assert!(matches!(
+            classify(EcstoreError::ObjectNotFound("bucket".into(), "object".into())),
+            HealObjectOutcome::Absent
+        ));
+        assert!(matches!(
+            classify(EcstoreError::VersionNotFound("bucket".into(), "object".into(), "vid".into())),
+            HealObjectOutcome::Absent
+        ));
+    }
+
+    #[test]
+    fn other_errors_are_failures() {
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Other("boom".into())),
+            HealObjectOutcome::Failed
+        ));
     }
 }
