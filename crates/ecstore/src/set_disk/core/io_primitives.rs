@@ -2688,10 +2688,14 @@ impl SetDisks {
         let dst_bucket = Arc::new(dst_bucket.to_string());
         let dst_object = Arc::new(dst_object.to_string());
 
-        // Match MinIO's multipart overwrite semantics: clear any stale destination
-        // part payload and metadata before the new per-disk rename fan-out begins.
-        self.cleanup_multipart_path(&[dst_object.to_string(), format!("{dst_object}.meta")])
-            .await;
+        // Do NOT pre-delete the destination part before renaming: the per-disk
+        // `rename_part` replaces `part.N` atomically (std::fs::rename) and rewrites
+        // `part.N.meta`, so the pre-delete is redundant — and destructive. It
+        // opened a window where an already-committed (ACKed) part was removed on
+        // every disk before the new rename landed, so a re-upload that then failed
+        // quorum destroyed the committed part outright (backlog#853 / #799 B4).
+        // The atomic rename overwrites in place; on quorum failure below we roll
+        // the destination back.
 
         let mut errs = Vec::with_capacity(disks.len());
 
