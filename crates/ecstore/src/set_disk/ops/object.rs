@@ -1623,12 +1623,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let rollback_dir = Uuid::new_v4();
-        let mut rollback_versions_by_index = vec![None; objects.len()];
-        for fi_vers in &vers {
-            for fi in &fi_vers.versions {
-                rollback_versions_by_index[fi.idx] = Some(fi_vers.clone());
-            }
-        }
 
         let disks = self.disks.read().await;
 
@@ -1715,25 +1709,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         let mut rollback_futures = Vec::new();
-        let mut handled_rollback_paths = HashSet::new();
-        for obj_idx in 0..objects.len() {
-            let Some(fi_vers) = rollback_versions_by_index[obj_idx].clone() else {
-                continue;
-            };
-
-            let should_rollback = del_errs[obj_idx].is_some();
+        for fi_vers in &vers {
+            // delete_versions commits one xl.meta per object group, so rollback must use the same boundary.
+            let should_rollback = fi_vers.versions.iter().any(|fi| del_errs[fi.idx].is_some());
             for (disk_idx, disk) in disks.iter().enumerate() {
-                if del_obj_errs[disk_idx][obj_idx].is_some() {
+                if fi_vers.versions.iter().any(|fi| del_obj_errs[disk_idx][fi.idx].is_some()) {
                     continue;
                 }
 
                 let Some(disk) = disk.as_ref() else {
                     continue;
                 };
-
-                if !handled_rollback_paths.insert((disk_idx, fi_vers.name.clone(), should_rollback)) {
-                    continue;
-                }
 
                 let disk = disk.clone();
                 let bucket = bucket.to_string();

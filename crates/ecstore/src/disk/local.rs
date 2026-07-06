@@ -175,6 +175,34 @@ async fn restore_delete_rollback(object_dir: &Path, xl_path: &Path, rollback_dir
     }
 }
 
+async fn restore_delete_rollback_after_error(
+    object_dir: &Path,
+    xl_path: &Path,
+    rollback_dir: Option<Uuid>,
+    volume: &str,
+    path: &str,
+    stage: &'static str,
+    err: DiskError,
+) -> DiskError {
+    let Some(rollback_dir) = rollback_dir else {
+        return err;
+    };
+
+    if let Err(restore_err) = restore_delete_rollback(object_dir, xl_path, rollback_dir).await {
+        warn!(
+            volume,
+            path,
+            rollback_dir = %rollback_dir,
+            stage,
+            cause = ?err,
+            error = ?restore_err,
+            "failed to restore delete rollback after local delete error"
+        );
+    }
+
+    err
+}
+
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DISK_LOCAL: &str = "disk_local";
 const EVENT_DISK_LOCAL_STARTUP_CLEANUP: &str = "disk_local_startup_cleanup";
@@ -1221,6 +1249,8 @@ fn mmap_page_size() -> Result<u64> {
 static RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static RENAME_DATA_FAIL_AFTER_METADATA_COMMIT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static DELETE_VERSION_FAIL_AFTER_DATA_STAGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn set_rename_data_fail_before_old_metadata_backup(dst_path: &str) {
@@ -1234,6 +1264,14 @@ fn set_rename_data_fail_after_metadata_commit(dst_path: &str) {
     *RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
         .lock()
         .expect("test failpoint lock should not be poisoned") = Some(dst_path.to_string());
+}
+
+#[cfg(test)]
+fn set_delete_version_fail_after_data_staged(path: &str) {
+    DELETE_VERSION_FAIL_AFTER_DATA_STAGED
+        .lock()
+        .expect("test failpoint lock should not be poisoned")
+        .push(path.to_string());
 }
 
 #[cfg(test)]
@@ -1256,6 +1294,19 @@ fn should_fail_after_metadata_commit(dst_path: &str) -> bool {
         .expect("test failpoint lock should not be poisoned");
     if target.as_deref() == Some(dst_path) {
         target.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn should_fail_after_delete_data_staged(path: &str) -> bool {
+    let mut targets = DELETE_VERSION_FAIL_AFTER_DATA_STAGED
+        .lock()
+        .expect("test failpoint lock should not be poisoned");
+    if let Some(index) = targets.iter().position(|target| target == path) {
+        targets.remove(index);
         true
     } else {
         false
@@ -1330,6 +1381,11 @@ fn should_crash_rename_data_at(_point: RenameDataCrashPoint, _dst_path: &str) ->
 
 #[cfg(not(test))]
 fn should_fail_after_metadata_commit(_dst_path: &str) -> bool {
+    false
+}
+
+#[cfg(not(test))]
+fn should_fail_after_delete_data_staged(_path: &str) -> bool {
     false
 }
 
@@ -3435,7 +3491,16 @@ impl LocalDisk {
                         continue;
                     }
 
-                    return Err(err);
+                    return Err(restore_delete_rollback_after_error(
+                        object_dir,
+                        &xlpath,
+                        rollback_dir,
+                        volume,
+                        path,
+                        "delete_versions_metadata_update",
+                        err,
+                    )
+                    .await);
                 }
             };
 
@@ -3443,15 +3508,62 @@ impl LocalDisk {
                 let vid = fi.version_id.unwrap_or_default();
                 let _ = fm.data.remove(vec![vid, dir]);
 
-                let dir_path = self.get_object_path(volume, format!("{path}/{dir}").as_str())?;
+                let dir_path = match self.get_object_path(volume, format!("{path}/{dir}").as_str()) {
+                    Ok(dir_path) => dir_path,
+                    Err(err) => {
+                        return Err(restore_delete_rollback_after_error(
+                            object_dir,
+                            &xlpath,
+                            rollback_dir,
+                            volume,
+                            path,
+                            "delete_versions_data_path",
+                            err,
+                        )
+                        .await);
+                    }
+                };
                 if let Some(rollback_dir) = rollback_dir {
                     let rollback_path = object_dir.join(rollback_dir.to_string());
-                    fs::create_dir_all(&rollback_path).await.map_err(to_file_error)?;
+                    if let Err(err) = fs::create_dir_all(&rollback_path).await {
+                        let err: DiskError = to_file_error(err).into();
+                        return Err(restore_delete_rollback_after_error(
+                            object_dir,
+                            &xlpath,
+                            Some(rollback_dir),
+                            volume,
+                            path,
+                            "delete_versions_rollback_dir",
+                            err,
+                        )
+                        .await);
+                    }
                     let rollback_data_path = rollback_path.join(dir.to_string());
                     if let Err(err) = rename_all(&dir_path, &rollback_data_path, &rollback_path).await
                         && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
                     {
-                        return Err(err);
+                        return Err(restore_delete_rollback_after_error(
+                            object_dir,
+                            &xlpath,
+                            Some(rollback_dir),
+                            volume,
+                            path,
+                            "delete_versions_stage_data",
+                            err,
+                        )
+                        .await);
+                    }
+                    if should_fail_after_delete_data_staged(path) {
+                        return Err(restore_delete_rollback_after_error(
+                            object_dir,
+                            &xlpath,
+                            Some(rollback_dir),
+                            volume,
+                            path,
+                            "delete_versions_test_after_stage",
+                            DiskError::Unexpected,
+                        )
+                        .await);
                     }
                 } else if let Err(err) = self.move_to_trash(&dir_path, true, false).await
                     && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
@@ -3464,42 +3576,53 @@ impl LocalDisk {
         // Remove xl.meta when no versions remain
         if fm.versions.is_empty() {
             if let Err(err) = self.delete_file(&volume_dir, &xlpath, true, false).await {
-                if let Some(rollback_dir) = rollback_dir
-                    && let Err(restore_err) = restore_delete_rollback(object_dir, &xlpath, rollback_dir).await
-                {
-                    warn!(
-                        volume,
-                        path,
-                        rollback_dir = %rollback_dir,
-                        error = ?restore_err,
-                        "failed to restore metadata after delete_versions commit error"
-                    );
-                }
-                return Err(err);
+                return Err(restore_delete_rollback_after_error(
+                    object_dir,
+                    &xlpath,
+                    rollback_dir,
+                    volume,
+                    path,
+                    "delete_versions_commit_delete",
+                    err,
+                )
+                .await);
             }
             return Ok(());
         }
 
         // Update xl.meta atomically: a concurrent reader or crash mid-write must
         // never observe a truncated xl.meta for versions that were not deleted.
-        let buf = fm.marshal_msg()?;
+        let buf = match fm.marshal_msg() {
+            Ok(buf) => buf,
+            Err(err) => {
+                let err: DiskError = err.into();
+                return Err(restore_delete_rollback_after_error(
+                    object_dir,
+                    &xlpath,
+                    rollback_dir,
+                    volume,
+                    path,
+                    "delete_versions_metadata_encode",
+                    err,
+                )
+                .await);
+            }
+        };
 
         if let Err(err) = self
             .write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
             .await
         {
-            if let Some(rollback_dir) = rollback_dir
-                && let Err(restore_err) = restore_delete_rollback(object_dir, &xlpath, rollback_dir).await
-            {
-                warn!(
-                    volume,
-                    path,
-                    rollback_dir = %rollback_dir,
-                    error = ?restore_err,
-                    "failed to restore metadata after delete_versions commit error"
-                );
-            }
-            return Err(err);
+            return Err(restore_delete_rollback_after_error(
+                object_dir,
+                &xlpath,
+                rollback_dir,
+                volume,
+                path,
+                "delete_versions_commit_write",
+                err,
+            )
+            .await);
         }
 
         Ok(())
@@ -6141,20 +6264,76 @@ impl DiskAPI for LocalDisk {
 
         if let Some(uuid) = old_dir {
             let vid = fi.version_id.unwrap_or_default();
-            let _ = meta.data.remove(vec![vid, uuid])?;
+            if let Err(err) = meta.data.remove(vec![vid, uuid]) {
+                let err: DiskError = err.into();
+                return Err(restore_delete_rollback_after_error(
+                    file_path.as_path(),
+                    &xl_path,
+                    rollback_dir,
+                    volume,
+                    path,
+                    "delete_version_metadata_update",
+                    err,
+                )
+                .await);
+            }
 
             let old_path = path_join(&[file_path.as_path(), Path::new(uuid.to_string().as_str())]);
-            check_path_length(old_path.to_string_lossy().as_ref())?;
+            if let Err(err) = check_path_length(old_path.to_string_lossy().as_ref()) {
+                return Err(restore_delete_rollback_after_error(
+                    file_path.as_path(),
+                    &xl_path,
+                    rollback_dir,
+                    volume,
+                    path,
+                    "delete_version_data_path",
+                    err,
+                )
+                .await);
+            }
 
             if let Some(rollback_dir) = rollback_dir {
                 let rollback_path = file_path.join(rollback_dir.to_string());
-                fs::create_dir_all(&rollback_path).await.map_err(to_file_error)?;
+                if let Err(err) = fs::create_dir_all(&rollback_path).await {
+                    let err: DiskError = to_file_error(err).into();
+                    return Err(restore_delete_rollback_after_error(
+                        file_path.as_path(),
+                        &xl_path,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        "delete_version_rollback_dir",
+                        err,
+                    )
+                    .await);
+                }
                 let rollback_data_path = rollback_path.join(uuid.to_string());
                 if let Err(err) = rename_all(&old_path, &rollback_data_path, &rollback_path).await
                     && err != DiskError::FileNotFound
                     && err != DiskError::VolumeNotFound
                 {
-                    return Err(err);
+                    return Err(restore_delete_rollback_after_error(
+                        file_path.as_path(),
+                        &xl_path,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        "delete_version_stage_data",
+                        err,
+                    )
+                    .await);
+                }
+                if should_fail_after_delete_data_staged(path) {
+                    return Err(restore_delete_rollback_after_error(
+                        file_path.as_path(),
+                        &xl_path,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        "delete_version_test_after_stage",
+                        DiskError::Unexpected,
+                    )
+                    .await);
                 }
             } else if let Err(err) = self.move_to_trash(&old_path, true, false).await
                 && err != DiskError::FileNotFound
@@ -6165,7 +6344,22 @@ impl DiskAPI for LocalDisk {
         }
 
         let commit_result = if !meta.versions.is_empty() {
-            let buf = meta.marshal_msg()?;
+            let buf = match meta.marshal_msg() {
+                Ok(buf) => buf,
+                Err(err) => {
+                    let err: DiskError = err.into();
+                    return Err(restore_delete_rollback_after_error(
+                        file_path.as_path(),
+                        &xl_path,
+                        rollback_dir,
+                        volume,
+                        path,
+                        "delete_version_metadata_encode",
+                        err,
+                    )
+                    .await);
+                }
+            };
             self.write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
                 .await
         } else {
@@ -6173,18 +6367,16 @@ impl DiskAPI for LocalDisk {
         };
 
         if let Err(err) = commit_result {
-            if let Some(rollback_dir) = rollback_dir
-                && let Err(restore_err) = restore_delete_rollback(file_path.as_path(), &xl_path, rollback_dir).await
-            {
-                warn!(
-                    volume,
-                    path,
-                    rollback_dir = %rollback_dir,
-                    error = ?restore_err,
-                    "failed to restore metadata after delete commit error"
-                );
-            }
-            return Err(err);
+            return Err(restore_delete_rollback_after_error(
+                file_path.as_path(),
+                &xl_path,
+                rollback_dir,
+                volume,
+                path,
+                "delete_version_commit",
+                err,
+            )
+            .await);
         }
 
         Ok(())
@@ -8582,6 +8774,123 @@ mod test {
         )
         .await
         .expect("undo should restore metadata and data");
+
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("metadata should be restored");
+        assert_eq!(restored_meta, old_meta);
+        assert_eq!(
+            fs::read(data_path.join("part.1"))
+                .await
+                .expect("part data should be restored"),
+            b"old-data"
+        );
+        assert!(!object_dir.join(rollback_dir.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_error_after_staging_restores_data_dir() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/delete-version-error";
+        let version_id = Uuid::parse_str("21212121-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("22222222-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("23232323-1111-2222-3333-444444444444").expect("rollback dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        let data_path = object_dir.join(data_dir.to_string());
+        fs::create_dir_all(&data_path).await.expect("data dir should be created");
+        fs::write(data_path.join("part.1"), b"old-data")
+            .await
+            .expect("part data should be written");
+
+        let old_fi = test_file_info(object, version_id, Some(data_dir), None);
+        let old_meta = test_meta(old_fi.clone());
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), old_meta.clone())
+            .await
+            .expect("old metadata should be written");
+
+        set_delete_version_fail_after_data_staged(object);
+        let err = disk
+            .delete_version(
+                bucket,
+                object,
+                old_fi,
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(rollback_dir),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("delete should fail after staging data");
+        assert_eq!(err, DiskError::Unexpected);
+
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("metadata should be restored");
+        assert_eq!(restored_meta, old_meta);
+        assert_eq!(
+            fs::read(data_path.join("part.1"))
+                .await
+                .expect("part data should be restored"),
+            b"old-data"
+        );
+        assert!(!object_dir.join(rollback_dir.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_versions_error_after_staging_restores_data_dir() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/delete-versions-error";
+        let version_id = Uuid::parse_str("24242424-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("25252525-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("26262626-1111-2222-3333-444444444444").expect("rollback dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        let data_path = object_dir.join(data_dir.to_string());
+        fs::create_dir_all(&data_path).await.expect("data dir should be created");
+        fs::write(data_path.join("part.1"), b"old-data")
+            .await
+            .expect("part data should be written");
+
+        let old_fi = test_file_info(object, version_id, Some(data_dir), None);
+        let old_meta = test_meta(old_fi.clone());
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), old_meta.clone())
+            .await
+            .expect("old metadata should be written");
+
+        set_delete_version_fail_after_data_staged(object);
+        let errs = disk
+            .delete_versions(
+                bucket,
+                vec![FileInfoVersions {
+                    name: object.to_string(),
+                    versions: vec![old_fi],
+                    ..Default::default()
+                }],
+                DeleteOptions {
+                    old_data_dir: Some(rollback_dir),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(errs, vec![Some(DiskError::Unexpected)]);
 
         let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
             .await
