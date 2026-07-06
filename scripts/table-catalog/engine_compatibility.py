@@ -57,8 +57,9 @@ VENDOR_SPARK_PROFILES: dict[str, dict[str, str]] = {
     },
     "oss-tables": {
         "catalog_uri": "{endpoint}/iceberg",
-        "warehouse": "{warehouse}",
-        "rest_signing_name": "s3",
+        "warehouse": "acs:osstables:{region}:{account_id}:bucket/{table_bucket}",
+        "rest_signing_name": "osstables",
+        "s3_endpoint": "https://oss-{region}.aliyuncs.com",
     },
 }
 
@@ -946,6 +947,231 @@ def production_operations_guide(
     )
 
 
+def audit_provider(
+    *,
+    profile: str,
+    display_name: str,
+    source: str,
+    catalog_base_path: str,
+    warehouse_shape: str,
+    signing_name: str,
+    auth_model: str,
+    rustfs_claim: str,
+    not_claimed: list[str],
+    notes: list[str],
+) -> OrderedDict[str, Any]:
+    return OrderedDict(
+        [
+            ("profile", profile),
+            ("display_name", display_name),
+            ("source", source),
+            ("catalog_base_path", catalog_base_path),
+            ("warehouse_shape", warehouse_shape),
+            ("signing_name", signing_name),
+            ("auth_model", auth_model),
+            ("rustfs_claim", rustfs_claim),
+            (
+                "audit_categories",
+                [
+                    "iceberg-rest-routes",
+                    "request-response-fields",
+                    "error-shapes",
+                    "permission-actions",
+                    "maintenance-semantics",
+                    "credential-vending",
+                    "client-live-run",
+                ],
+            ),
+            ("not_claimed", not_claimed),
+            ("notes", notes),
+        ]
+    )
+
+
+def validation_step(name: str, evidence: list[str]) -> OrderedDict[str, Any]:
+    return OrderedDict(
+        [
+            ("name", name),
+            ("status", "manual-audit-required"),
+            ("evidence", evidence),
+        ]
+    )
+
+
+def vendor_compatibility_audit() -> OrderedDict[str, Any]:
+    return OrderedDict(
+        [
+            ("claim_boundary", "reference profiles and gap audit"),
+            ("source_last_checked", "2026-07-05"),
+            ("promotion_policy", "live evidence required before compatibility claims expand"),
+            (
+                "providers",
+                [
+                    audit_provider(
+                        profile="aws-s3tables",
+                        display_name="Amazon S3 Tables Iceberg REST endpoint",
+                        source="https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-open-source.html",
+                        catalog_base_path="/iceberg",
+                        warehouse_shape="arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}",
+                        signing_name="s3tables",
+                        auth_model="sigv4-s3tables-iam",
+                        rustfs_claim="profile-generator-only",
+                        not_claimed=[
+                            "full AWS S3 Tables compatibility",
+                            "AWS Glue Iceberg REST endpoint parity",
+                            "Lake Formation governance parity",
+                            "CloudTrail event parity",
+                        ],
+                        notes=[
+                            "S3 Tables uses a table bucket ARN as the Iceberg REST prefix.",
+                            "S3 Tables only supports single-level namespaces.",
+                            "REST operations map to s3tables IAM actions and CloudTrail event names.",
+                        ],
+                    ),
+                    audit_provider(
+                        profile="minio-aistor",
+                        display_name="MinIO AIStor Tables",
+                        source="https://docs.min.io/aistor/developers/aistor-tables/aistor-tables-api/",
+                        catalog_base_path="/_iceberg",
+                        warehouse_shape="{warehouse}",
+                        signing_name="s3tables",
+                        auth_model="sigv4-s3tables-pbac",
+                        rustfs_claim="alias-smoke-plus-profile-generator",
+                        not_claimed=[
+                            "private-extension-parity",
+                            "full AIStor PBAC action parity",
+                            "AIStor engine compatibility matrix parity",
+                        ],
+                        notes=[
+                            "AIStor serves the Iceberg REST catalog from the S3 endpoint under /_iceberg.",
+                            "Catalog authentication uses SigV4 with service name s3tables.",
+                            "The RustFS /_iceberg alias is a compatibility surface, not a claim of all AIStor extensions.",
+                        ],
+                    ),
+                    audit_provider(
+                        profile="cloudflare-r2-data-catalog",
+                        display_name="Cloudflare R2 Data Catalog",
+                        source="https://developers.cloudflare.com/r2/data-catalog/manage-catalogs/",
+                        catalog_base_path="provider-catalog-uri",
+                        warehouse_shape="{warehouse_name}",
+                        signing_name="s3",
+                        auth_model="api-token",
+                        rustfs_claim="profile-generator-only",
+                        not_claimed=[
+                            "full Cloudflare R2 Data Catalog interoperability",
+                            "managed-maintenance-parity",
+                            "Cloudflare API token policy parity",
+                        ],
+                        notes=[
+                            "Enabling a Cloudflare catalog returns a Catalog URI and Warehouse name.",
+                            "Cloudflare documents optional compaction and snapshot expiration management.",
+                            "RustFS generates reference connection shapes but does not claim live Cloudflare interoperability.",
+                        ],
+                    ),
+                    audit_provider(
+                        profile="oss-tables",
+                        display_name="Alibaba Cloud OSS Tables",
+                        source="https://www.alibabacloud.com/help/en/oss/user-guide/spark-access-oss-tables",
+                        catalog_base_path="/iceberg",
+                        warehouse_shape="acs:osstables:{region}:{account_id}:bucket/{table_bucket}",
+                        signing_name="osstables",
+                        auth_model="sigv4-osstables",
+                        rustfs_claim="profile-generator-only",
+                        not_claimed=[
+                            "full Alibaba OSS Tables interoperability",
+                            "provider-error-code-parity",
+                            "Alibaba RAM policy parity",
+                            "internal-network-endpoint parity",
+                        ],
+                        notes=[
+                            "OSS Tables documents public and internal Iceberg REST endpoints.",
+                            "Spark configuration uses an acs:osstables warehouse ARN and rest.signing-name=osstables.",
+                            "RustFS reference profiles must not imply live OSS Tables interoperability without a recorded run.",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "required_validation_steps",
+                [
+                    validation_step(
+                        "route-and-field-shape",
+                        [
+                            "request path",
+                            "request fields",
+                            "response fields",
+                            "pagination fields",
+                            "unsupported route response",
+                        ],
+                    ),
+                    validation_step(
+                        "error-response-shape",
+                        [
+                            "HTTP status",
+                            "error code",
+                            "error message",
+                            "conflict response body",
+                            "not found response body",
+                        ],
+                    ),
+                    validation_step(
+                        "permission-action-mapping",
+                        [
+                            "catalog action",
+                            "table bucket resource",
+                            "namespace resource",
+                            "table resource",
+                            "ordinary S3 data-plane action",
+                        ],
+                    ),
+                    validation_step(
+                        "maintenance-behavior",
+                        [
+                            "compaction support",
+                            "snapshot expiration support",
+                            "orphan cleanup support",
+                            "scheduler behavior",
+                            "manual-review boundary",
+                        ],
+                    ),
+                    validation_step(
+                        "credential-model",
+                        [
+                            "catalog authentication",
+                            "data-plane authentication",
+                            "credential vending response",
+                            "temporary credential scope",
+                            "token expiration",
+                        ],
+                    ),
+                    validation_step(
+                        "client-live-run",
+                        [
+                            "client name",
+                            "client version",
+                            "RustFS build",
+                            "catalog backing",
+                            "expected status",
+                            "observed status",
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "global_not_claimed",
+                [
+                    "full AWS S3 Tables compatibility",
+                    "full MinIO AIStor private extension parity",
+                    "full Cloudflare R2 Data Catalog interoperability",
+                    "full Alibaba OSS Tables interoperability",
+                    "vendor-managed governance parity",
+                    "vendor-managed maintenance parity",
+                ],
+            ),
+        ]
+    )
+
+
 def live_conformance_harness(
     *,
     endpoint: str,
@@ -1199,6 +1425,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--metadata-location")
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--print-engine-matrix", action="store_true")
+    parser.add_argument("--print-vendor-audit", action="store_true")
     parser.add_argument("--print-live-conformance", action="store_true")
     parser.add_argument("--print-operations-guide", action="store_true")
     parser.add_argument("--print-spark-config", action="store_true")
@@ -1224,6 +1451,9 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
     printed = False
     if args.print_engine_matrix:
         print_json({"engine_compatibility": engine_compatibility_matrix()}, output)
+        printed = True
+    if args.print_vendor_audit:
+        print_json({"vendor_compatibility_audit": vendor_compatibility_audit()}, output)
         printed = True
     if args.print_spark_config:
         print_json(

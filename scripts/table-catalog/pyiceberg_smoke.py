@@ -118,16 +118,20 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "oss-tables": {
         "catalog_uri": "{endpoint}/iceberg",
         "rest_path": "/iceberg",
-        "rest_signing_name": "s3",
-        "warehouse": "{warehouse}",
+        "rest_signing_name": "osstables",
+        "warehouse": "acs:osstables:{region}:{account_id}:bucket/{table_bucket}",
         "credential_mode": "sigv4-s3fileio-credentials",
         "status": "reference-only",
         "compatibility_stage": "reference-only",
         "catalog_uri_shape": "{endpoint}/iceberg",
-        "warehouse_shape": "{warehouse}",
+        "warehouse_shape": "acs:osstables:{region}:{account_id}:bucket/{table_bucket}",
         "namespace_model": "provider-defined",
         "pagination_model": "vendor-specific",
-        "not_claimed": ["live RustFS interoperability", "Alibaba OSS Tables API parity"],
+        "not_claimed": [
+            "live RustFS interoperability",
+            "Alibaba OSS Tables API parity",
+            "provider-error-code parity",
+        ],
     },
 }
 

@@ -73,6 +73,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         )
         self.assertEqual(profiles["minio-aistor"]["rest_signing_name"], "s3tables")
         self.assertEqual(profiles["cloudflare-r2-data-catalog"]["credential_mode"], "catalog-vended")
+        self.assertEqual(profiles["oss-tables"]["rest_signing_name"], "osstables")
 
     def test_vendor_profiles_publish_migration_boundaries(self) -> None:
         profiles = pyiceberg_smoke.vendor_profiles()
@@ -88,6 +89,10 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(cloudflare["catalog_uri_shape"], "{catalog_uri}")
         self.assertEqual(cloudflare["credential_mode"], "catalog-vended")
         self.assertIn("live RustFS interoperability", cloudflare["not_claimed"])
+
+        oss = profiles["oss-tables"]
+        self.assertEqual(oss["warehouse_shape"], "acs:osstables:{region}:{account_id}:bucket/{table_bucket}")
+        self.assertIn("provider-error-code parity", oss["not_claimed"])
 
     def test_aws_reference_profile_formats_s3tables_warehouse_arn(self) -> None:
         args = self.parse_with_args([
@@ -108,6 +113,26 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(properties["uri"], "https://s3tables.us-east-1.amazonaws.com/iceberg")
         self.assertEqual(properties["warehouse"], "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics")
         self.assertEqual(properties["rest.signing-name"], "s3tables")
+
+    def test_oss_tables_reference_profile_formats_warehouse_arn(self) -> None:
+        args = self.parse_with_args([
+            "--profile",
+            "oss-tables",
+            "--endpoint",
+            "https://cn-hangzhou.oss-tables.aliyuncs.com",
+            "--region",
+            "cn-hangzhou",
+            "--account-id",
+            "123456789012",
+            "--table-bucket",
+            "analytics",
+        ])
+
+        properties = pyiceberg_smoke.catalog_properties(args)
+
+        self.assertEqual(properties["uri"], "https://cn-hangzhou.oss-tables.aliyuncs.com/iceberg")
+        self.assertEqual(properties["warehouse"], "acs:osstables:cn-hangzhou:123456789012:bucket/analytics")
+        self.assertEqual(properties["rest.signing-name"], "osstables")
 
     def test_cloudflare_reference_profile_uses_catalog_uri_and_warehouse_name(self) -> None:
         args = self.parse_with_args([
