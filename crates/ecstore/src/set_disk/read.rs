@@ -1024,36 +1024,78 @@ impl SetDisks {
             return Err(Error::other("codec streaming multipart part sizes do not match object size"));
         }
 
-        let mut readers = Vec::with_capacity(fi.parts.len());
-        for part in &fi.parts {
-            match Self::build_codec_streaming_part_reader(
-                bucket,
-                object,
-                fi,
-                &files,
-                &disks,
-                &erasure,
-                part.number,
-                0,
-                part.size,
-                part.size,
-                skip_verify_bitrot,
-                metrics_object_class,
-                metrics_size_bucket,
-                false,
-            )
-            .await?
-            {
-                GetCodecStreamingReaderBuildOutcome::Reader(reader) => readers.push(reader),
-                GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
-                    return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
-                }
+        // Lazy multipart construction (backlog#871): only the first part's
+        // shard readers are opened before streaming starts, so TTFB no longer
+        // pays for `parts x disks` file opens and an early client disconnect
+        // never touches the remaining parts. The first part stays eager so the
+        // dominant fallback conditions (missing shards, read quorum) are still
+        // detected before any byte is streamed and the whole request can fall
+        // back to the legacy duplex path.
+        let first_part = &fi.parts[0];
+        let first_reader = match Self::build_codec_streaming_part_reader(
+            bucket,
+            object,
+            fi,
+            &files,
+            &disks,
+            &erasure,
+            first_part.number,
+            0,
+            first_part.size,
+            first_part.size,
+            skip_verify_bitrot,
+            metrics_object_class,
+            metrics_size_bucket,
+            false,
+        )
+        .await?
+        {
+            GetCodecStreamingReaderBuildOutcome::Reader(reader) => reader,
+            GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
+                return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
             }
-        }
+        };
 
-        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(MultipartCodecStreamingReader::new(
-            readers,
-        ))))
+        let remaining_parts: Vec<(usize, usize)> = fi.parts[1..].iter().map(|part| (part.number, part.size)).collect();
+        let total_parts = fi.parts.len();
+        let ctx = Arc::new(LazyCodecPartContext {
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            fi: fi.clone(),
+            files,
+            disks,
+            erasure,
+            skip_verify_bitrot,
+            metrics_object_class,
+            metrics_size_bucket,
+        });
+        let builder: LazyPartBuilder = Box::new(move |remaining_index| {
+            let ctx = Arc::clone(&ctx);
+            let (part_number, part_size) = remaining_parts[remaining_index];
+            tokio::task::spawn(async move {
+                SetDisks::build_codec_streaming_part_reader(
+                    &ctx.bucket,
+                    &ctx.object,
+                    &ctx.fi,
+                    &ctx.files,
+                    &ctx.disks,
+                    &ctx.erasure,
+                    part_number,
+                    0,
+                    part_size,
+                    part_size,
+                    ctx.skip_verify_bitrot,
+                    ctx.metrics_object_class,
+                    ctx.metrics_size_bucket,
+                    false,
+                )
+                .await
+            })
+        });
+
+        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
+            LazyMultipartCodecStreamingReader::new(first_reader, total_parts, builder, get_codec_streaming_metrics_path()),
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1164,6 +1206,135 @@ impl SetDisks {
         Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
             coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
         )))
+    }
+}
+
+/// Owned context for lazily constructing codec streaming part readers after
+/// the first part has started streaming (backlog#871).
+struct LazyCodecPartContext {
+    bucket: String,
+    object: String,
+    fi: FileInfo,
+    files: Vec<FileInfo>,
+    disks: Vec<Option<DiskStore>>,
+    erasure: coding::Erasure,
+    skip_verify_bitrot: bool,
+    metrics_object_class: &'static str,
+    metrics_size_bucket: &'static str,
+}
+
+type LazyPartBuildHandle = tokio::task::JoinHandle<Result<GetCodecStreamingReaderBuildOutcome>>;
+type LazyPartBuilder = Box<dyn FnMut(usize) -> LazyPartBuildHandle + Send + Sync>;
+
+/// Multipart codec streaming reader that constructs part readers on demand.
+///
+/// The first part reader is built eagerly by the caller so the dominant
+/// fallback conditions are detected before any byte is streamed; every
+/// subsequent part is only built once the previous part reaches EOF. If a
+/// later part hits a fallback condition mid-stream, the reader surfaces a read
+/// error instead: data has already been streamed, so switching the whole
+/// request to the legacy path is no longer possible. The next request detects
+/// the condition on its eager first-part setup and falls back cleanly.
+struct LazyMultipartCodecStreamingReader {
+    current: Option<Box<dyn AsyncRead + Unpin + Send + Sync>>,
+    pending: Option<LazyPartBuildHandle>,
+    dispatched_remaining: usize,
+    total_parts: usize,
+    builder: LazyPartBuilder,
+    metrics_path: &'static str,
+}
+
+impl LazyMultipartCodecStreamingReader {
+    fn new(
+        first_reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        total_parts: usize,
+        builder: LazyPartBuilder,
+        metrics_path: &'static str,
+    ) -> Self {
+        Self {
+            current: Some(first_reader),
+            pending: None,
+            dispatched_remaining: 0,
+            total_parts,
+            builder,
+            metrics_path,
+        }
+    }
+}
+
+impl AsyncRead for LazyMultipartCodecStreamingReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let this = self.get_mut();
+        loop {
+            if let Some(reader) = this.current.as_mut() {
+                let filled_before = buf.filled().len();
+                match Pin::new(reader).poll_read(cx, buf) {
+                    Poll::Ready(Ok(())) if buf.filled().len() == filled_before => {
+                        // Part EOF: drop its shard readers before building the
+                        // next part.
+                        this.current = None;
+                    }
+                    result => return result,
+                }
+                continue;
+            }
+
+            if let Some(handle) = this.pending.as_mut() {
+                match Pin::new(handle).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(join_result) => {
+                        this.pending = None;
+                        match join_result {
+                            Ok(Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader))) => {
+                                this.current = Some(reader);
+                            }
+                            Ok(Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason))) => {
+                                record_get_object_pipeline_failure_for_path(
+                                    this.metrics_path,
+                                    GET_STAGE_READER_SETUP,
+                                    GetObjectFailureReason::ReadQuorum,
+                                );
+                                warn!(
+                                    metrics_path = this.metrics_path,
+                                    fallback_reason = ?reason,
+                                    state = "codec_streaming_mid_stream_fallback",
+                                    "Lazy multipart part construction hit a fallback condition mid-stream; surfacing read error"
+                                );
+                                return Poll::Ready(Err(std::io::Error::other(format!(
+                                    "codec streaming multipart reader cannot fall back mid-stream: {reason:?}"
+                                ))));
+                            }
+                            Ok(Err(err)) => return Poll::Ready(Err(std::io::Error::other(err))),
+                            Err(join_err) => return Poll::Ready(Err(std::io::Error::other(join_err))),
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if this.dispatched_remaining + 1 < this.total_parts {
+                let handle = (this.builder)(this.dispatched_remaining);
+                this.dispatched_remaining += 1;
+                this.pending = Some(handle);
+                continue;
+            }
+
+            return Poll::Ready(Ok(()));
+        }
+    }
+}
+
+impl Drop for LazyMultipartCodecStreamingReader {
+    fn drop(&mut self) {
+        // Abort an in-flight part construction so an early client disconnect
+        // does not keep opening shard readers in the background.
+        if let Some(handle) = self.pending.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -2468,6 +2639,86 @@ mod tests {
         }
 
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    fn lazy_test_builder(
+        parts: Vec<&'static [u8]>,
+        builds: Arc<AtomicUsize>,
+    ) -> Box<dyn FnMut(usize) -> LazyPartBuildHandle + Send + Sync> {
+        Box::new(move |remaining_index| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            let data = parts[remaining_index];
+            tokio::task::spawn(
+                async move { Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(Cursor::new(data.to_vec())))) },
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn lazy_multipart_codec_streaming_reader_reads_parts_in_order() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builder = lazy_test_builder(vec![b"multi", b"part"], Arc::clone(&builds));
+        let mut reader =
+            LazyMultipartCodecStreamingReader::new(Box::new(Cursor::new(b"hello ".to_vec())), 3, builder, "codec_streaming");
+
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("lazy multipart reader should stream all parts");
+
+        assert_eq!(output, b"hello multipart");
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "both remaining parts should be built exactly once");
+    }
+
+    #[tokio::test]
+    async fn lazy_multipart_codec_streaming_reader_defers_construction_until_needed() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builder = lazy_test_builder(vec![b"never"], Arc::clone(&builds));
+        {
+            let mut reader =
+                LazyMultipartCodecStreamingReader::new(Box::new(Cursor::new(b"abcdef".to_vec())), 2, builder, "codec_streaming");
+
+            let mut first = [0u8; 6];
+            reader
+                .read_exact(&mut first)
+                .await
+                .expect("first part should satisfy the read");
+            assert_eq!(&first, b"abcdef");
+        }
+
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "dropping the reader before crossing the part boundary must not build later parts"
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_multipart_codec_streaming_reader_surfaces_mid_stream_fallback_as_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_clone = Arc::clone(&builds);
+        let builder: Box<dyn FnMut(usize) -> LazyPartBuildHandle + Send + Sync> = Box::new(move |_| {
+            builds_clone.fetch_add(1, Ordering::SeqCst);
+            tokio::task::spawn(async move {
+                Ok(GetCodecStreamingReaderBuildOutcome::Fallback(GetCodecStreamingFallbackReason::Multipart))
+            })
+        });
+        let mut reader =
+            LazyMultipartCodecStreamingReader::new(Box::new(Cursor::new(b"first".to_vec())), 2, builder, "codec_streaming");
+
+        let mut output = Vec::new();
+        let err = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("mid-stream fallback must surface as a read error");
+
+        assert_eq!(output, b"first", "bytes streamed before the fallback stay intact");
+        assert!(
+            err.to_string().contains("cannot fall back mid-stream"),
+            "error should explain the mid-stream fallback: {err}"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
     fn inline_reader_setup_fileinfo(data: Option<&'static [u8]>) -> FileInfo {
