@@ -804,7 +804,7 @@ pub(crate) async fn update_erasure_type(setup_type: SetupType) {
 
 pub(crate) trait StorageDiskRpcExt {
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo>;
-    async fn delete_volume(&self, volume: &str) -> DiskResult<()>;
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> DiskResult<()>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>>;
     async fn batch_read_version(&self, req: BatchReadVersionReq) -> DiskResult<Vec<BatchReadVersionResp>>;
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions)
@@ -884,8 +884,8 @@ where
         ecstore_disk::DiskAPI::disk_info(self, opts).await
     }
 
-    async fn delete_volume(&self, volume: &str) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::delete_volume(self, volume).await
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::delete_volume(self, volume, force_delete).await
     }
 
     async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>> {
