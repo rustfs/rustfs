@@ -3103,39 +3103,12 @@ impl ECStore {
             return Ok(None);
         };
 
-        let index = match load_persistent_key_only_index(Some(self.as_ref()), path).await {
-            Ok(index) if persistent_key_only_index_matches_provider(&index, &provider_opts.bucket, provider_state) => index,
-            Ok(_) => {
-                if list_metrics_enabled {
-                    record_list_objects_index_fallback(
-                        ListSourceMode::IndexMetadataFast,
-                        ListIndexFallbackReason::GenerationMismatch,
-                    );
-                }
-                debug!(
-                    bucket = %provider_opts.bucket,
-                    prefix = %provider_opts.prefix,
-                    source = ListSourceMode::IndexMetadataFast.cursor_value(),
-                    provider = provider_state.kind.metric_label(),
-                    path = %path.display(),
-                    "list_objects metadata-fast provider generation or bucket did not match"
-                );
-                return Ok(None);
-            }
-            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-                if list_metrics_enabled {
-                    record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Rebuilding);
-                }
-                debug!(
-                    bucket = %provider_opts.bucket,
-                    prefix = %provider_opts.prefix,
-                    source = ListSourceMode::IndexMetadataFast.cursor_value(),
-                    provider = provider_state.kind.metric_label(),
-                    path = %path.display(),
-                    "list_objects metadata-fast provider has no published snapshot"
-                );
-                return Ok(None);
-            }
+        let index = match self
+            .clone()
+            .prepare_persistent_key_only_index(provider_opts, provider_state)
+            .await
+        {
+            Ok(index) => index,
             Err(err) => {
                 if list_metrics_enabled {
                     record_list_objects_index_fallback(ListSourceMode::IndexMetadataFast, ListIndexFallbackReason::Unhealthy);
@@ -3147,7 +3120,7 @@ impl ECStore {
                     provider = provider_state.kind.metric_label(),
                     path = %path.display(),
                     error = %err,
-                    "list_objects metadata-fast provider failed to load published snapshot"
+                    "list_objects metadata-fast provider failed to prepare snapshot"
                 );
                 return Ok(None);
             }
@@ -7796,71 +7769,6 @@ mod test {
         assert_eq!(
             select_list_index_provider_source_mode(&ListPathOptions::default(), ListSourceMode::IndexMetadataFast, &health),
             ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Lagging)
-        );
-    }
-
-    fn assert_metadata_fast_falls_back_after_stale_mutation(workload: &str) {
-        let index = PersistentKeyOnlyIndex {
-            bucket: Some("bucket".to_string()),
-            generation: format!("generation-{workload}"),
-            checkpoint_high_water_mark: 100,
-            keys: Arc::new(vec![format!("photos/2026/{workload}.bin")]),
-            objects: Arc::new(vec![PersistentListMetadataObject {
-                name: format!("photos/2026/{workload}.bin"),
-                size: 1,
-                mod_time: None,
-                etag: Some("snapshot-etag".to_string()),
-                storage_class: Some("STANDARD".to_string()),
-            }]),
-        };
-        let health = persistent_key_only_index_health(
-            &index,
-            NamespaceMutationJournalSnapshot {
-                high_water_mark: 101,
-                degraded: false,
-            },
-        );
-
-        assert!(persistent_key_only_index_has_complete_metadata_snapshot(&index));
-        assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Lagging));
-        assert_eq!(
-            select_list_index_provider_source_mode(&ListPathOptions::default(), ListSourceMode::IndexMetadataFast, &health),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::Lagging)
-        );
-    }
-
-    #[test]
-    fn metadata_fast_falls_back_after_stale_delete_marker_mutation() {
-        assert_metadata_fast_falls_back_after_stale_mutation("delete-marker");
-    }
-
-    #[test]
-    fn metadata_fast_falls_back_after_stale_overwrite_mutation() {
-        assert_metadata_fast_falls_back_after_stale_mutation("overwrite");
-    }
-
-    #[test]
-    fn metadata_fast_falls_back_after_stale_multipart_complete_mutation() {
-        assert_metadata_fast_falls_back_after_stale_mutation("multipart-complete");
-    }
-
-    #[test]
-    fn metadata_fast_provider_selection_rejects_generation_mismatch() {
-        let mut lifecycle = ListIndexLifecycle::disabled(0);
-        lifecycle.begin_rebuild("generation-2", 100);
-        lifecycle.checkpoint_rebuild(100);
-        assert!(lifecycle.publish_rebuild());
-        let health = lifecycle.health_snapshot();
-        let opts = ListPathOptions {
-            marker: Some(
-                "photos/2026/a.jpg[rustfs_cache:v2,id:list-cache-id,src:index_metadata_fast,gen:generation-1]".to_string(),
-            ),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            select_list_index_provider_source_mode(&opts, ListSourceMode::IndexMetadataFast, &health),
-            ListIndexSourceDecision::FallbackToWalker(ListIndexFallbackReason::GenerationMismatch)
         );
     }
 

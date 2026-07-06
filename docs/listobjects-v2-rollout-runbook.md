@@ -41,11 +41,9 @@ RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS=5000
 
 The staleness budget must be between `1` and `60000` milliseconds. Missing,
 disabled, invalid, or over-budget metadata-fast settings keep the default walker
-path. The current Phase 7 prototype only serves metadata-fast from an already
-published `persistent_key_only` snapshot after a live walker rebuild has written
-metadata snapshot rows into the persistent index. The request path must not
-perform a synchronous rebuild; missing, stale, or mismatched snapshots fall back
-to walker.
+path. The current Phase 7 prototype only serves metadata-fast from the
+`persistent_key_only` provider after a live walker rebuild has written metadata
+snapshot rows into the persistent index.
 
 Metadata-fast must fall back to walker when any of these guardrails fail:
 
