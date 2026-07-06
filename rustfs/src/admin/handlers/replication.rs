@@ -19,10 +19,11 @@ use crate::admin::runtime_sources::{current_object_store_handle, current_replica
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
-use crate::admin::storage_api::bucket::replication::BucketStats;
+use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
 use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat};
 use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
@@ -36,7 +37,7 @@ use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -245,6 +246,18 @@ pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::
         Method::DELETE,
         format!("{}{}", ADMIN_PREFIX, "/v3/remove-remote-target").as_str(),
         AdminOperation(&RemoveRemoteTargetHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/replication/diff").as_str(),
+        AdminOperation(&ReplicationDiffHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/replication/mrf").as_str(),
+        AdminOperation(&ReplicationMrfHandler {}),
     )?;
 
     Ok(())
@@ -581,6 +594,301 @@ impl Operation for RemoveRemoteTargetHandler {
         sys.update_all_targets(bucket, Some(&targets)).await;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
+    }
+}
+
+/// Upper bound on the number of object versions scanned per `POST
+/// /v3/replication/diff` request. RustFS has no persisted per-object
+/// replication-diff index, so the diff is computed by scanning object versions
+/// on demand. Cap the work so a single admin call cannot walk an arbitrarily
+/// large bucket. When the scan is truncated, `is_truncated` is set on the
+/// response so clients know the diff is partial.
+const REPLICATION_DIFF_MAX_SCAN: usize = 10_000;
+
+/// Number of object versions requested per `list_object_versions` page while
+/// computing a replication diff.
+const REPLICATION_DIFF_PAGE_SIZE: i32 = 1_000;
+
+/// A single object version whose replication is not yet complete, reported by
+/// `POST /v3/replication/diff`. Field names mirror MinIO's `madmin.DiffInfo`
+/// so MinIO-compatible admin clients can parse the response.
+#[derive(Debug, Serialize)]
+struct ReplicationDiffEntry {
+    #[serde(rename = "Object")]
+    object: String,
+    #[serde(rename = "VersionID", skip_serializing_if = "Option::is_none")]
+    version_id: Option<String>,
+    #[serde(rename = "Size")]
+    size: i64,
+    #[serde(rename = "IsDeleteMarker")]
+    is_delete_marker: bool,
+    #[serde(rename = "ReplicationStatus")]
+    replication_status: String,
+    #[serde(rename = "LastModified", skip_serializing_if = "Option::is_none")]
+    last_modified: Option<String>,
+}
+
+/// Response body for `POST /v3/replication/diff`.
+///
+/// `entries` lists object versions with a `PENDING` or `FAILED` replication
+/// status. `is_truncated` indicates the on-demand scan hit
+/// [`REPLICATION_DIFF_MAX_SCAN`] before reaching the end of the bucket, so the
+/// diff is partial and should be re-run with a narrower prefix.
+#[derive(Debug, Serialize)]
+struct ReplicationDiffResponse {
+    #[serde(rename = "Entries")]
+    entries: Vec<ReplicationDiffEntry>,
+    #[serde(rename = "IsTruncated")]
+    is_truncated: bool,
+    #[serde(rename = "ScannedVersions")]
+    scanned_versions: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicationDiffRequest {
+    #[serde(default)]
+    prefix: String,
+}
+
+/// `POST /v3/replication/diff`
+///
+/// Computes, on demand, the set of object versions in a bucket whose replication
+/// is still `PENDING` or has `FAILED`. RustFS stores the replication status on
+/// each object version (`x-amz-replication-status`) but has no pre-built diff
+/// index, so this handler scans object versions (bounded by
+/// [`REPLICATION_DIFF_MAX_SCAN`]) and returns the not-yet-replicated versions.
+///
+/// The bucket must exist and have a replication configuration, matching MinIO's
+/// behavior of returning `ReplicationConfigurationNotFoundError` otherwise.
+pub struct ReplicationDiffHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ReplicationDiffHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let cred = validate_replication_admin_request(&req, AdminAction::ReplicationDiff).await?;
+
+        let queries = extract_query_params(&req.uri);
+        let Some(bucket) = queries.get("bucket").filter(|b| !b.is_empty()).cloned() else {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
+        };
+
+        let Some(store) = current_object_store_handle() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        // A replication diff is only meaningful for a bucket that is configured
+        // for replication; mirror MinIO's not-found semantics otherwise.
+        if let Err(err) = get_replication_config(&bucket).await {
+            if err == StorageError::ConfigNotFound {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::ReplicationConfigurationNotFoundError,
+                    "replication configuration not found".to_string(),
+                ));
+            }
+            return Err(ApiError::from(err).into());
+        }
+
+        // Optional prefix can be supplied either as a query parameter (MinIO
+        // clients) or, for RustFS clients, as a small JSON body.
+        let mut prefix = queries.get("prefix").cloned().unwrap_or_default();
+        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key)
+            .await
+            .unwrap_or_default();
+        if prefix.is_empty() && !body.trim_ascii().is_empty() {
+            match serde_json::from_slice::<ReplicationDiffRequest>(&body) {
+                Ok(parsed) => prefix = parsed.prefix,
+                Err(e) => return Err(s3_error!(InvalidRequest, "invalid replication diff request body: {e}")),
+            }
+        }
+
+        let mut entries: Vec<ReplicationDiffEntry> = Vec::new();
+        let mut scanned_versions: usize = 0;
+        let mut marker: Option<String> = None;
+        let mut version_marker: Option<String> = None;
+        let mut is_truncated = false;
+
+        'scan: loop {
+            let listing = store
+                .clone()
+                .list_object_versions(&bucket, &prefix, marker.clone(), version_marker.clone(), None, REPLICATION_DIFF_PAGE_SIZE)
+                .await
+                .map_err(ApiError::from)?;
+
+            for object in &listing.objects {
+                scanned_versions += 1;
+
+                if matches!(object.replication_status, ReplicationStatusType::Pending | ReplicationStatusType::Failed) {
+                    entries.push(ReplicationDiffEntry {
+                        object: object.name.clone(),
+                        version_id: object.version_id.map(|v| v.to_string()),
+                        size: object.size,
+                        is_delete_marker: object.delete_marker,
+                        replication_status: object.replication_status.as_str().to_string(),
+                        last_modified: object
+                            .mod_time
+                            .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+                    });
+                }
+
+                if scanned_versions >= REPLICATION_DIFF_MAX_SCAN {
+                    // We stopped early; the diff is partial.
+                    is_truncated =
+                        listing.is_truncated || listing.next_marker.is_some() || listing.next_version_idmarker.is_some();
+                    break 'scan;
+                }
+            }
+
+            if !listing.is_truncated {
+                break;
+            }
+            marker = listing.next_marker;
+            version_marker = listing.next_version_idmarker;
+            if marker.is_none() && version_marker.is_none() {
+                break;
+            }
+        }
+
+        debug!(
+            bucket = %bucket,
+            prefix = %prefix,
+            scanned = scanned_versions,
+            pending_or_failed = entries.len(),
+            truncated = is_truncated,
+            "computed replication diff"
+        );
+
+        let response = ReplicationDiffResponse {
+            entries,
+            is_truncated,
+            scanned_versions,
+        };
+        let data = serde_json::to_vec(&response)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+    }
+}
+
+/// Failed-replication backlog for one remote target (ARN), summarised from the
+/// replication stats. RustFS tracks failed replications as aggregate counters,
+/// not an enumerable per-object MRF queue, so this reports the aggregate.
+#[derive(Debug, Serialize)]
+struct MrfTargetBacklog {
+    #[serde(rename = "ARN")]
+    arn: String,
+    #[serde(rename = "FailedCount")]
+    failed_count: i64,
+    #[serde(rename = "FailedSize")]
+    failed_size: i64,
+}
+
+/// Response body for `GET /v3/replication/mrf`.
+///
+/// MinIO streams individual MRF (most-recently-failed) entries. RustFS persists
+/// MRF entries to disk but does not expose a runtime query over that queue, so
+/// this endpoint reports the aggregate failed-replication backlog and the
+/// in-queue counters instead. See the handler docs and the PR limitations note.
+#[derive(Debug, Serialize)]
+struct MrfResponse {
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Targets")]
+    targets: Vec<MrfTargetBacklog>,
+    #[serde(rename = "TotalFailedCount")]
+    total_failed_count: i64,
+    #[serde(rename = "TotalFailedSize")]
+    total_failed_size: i64,
+    #[serde(rename = "QueuedCount")]
+    queued_count: i64,
+    #[serde(rename = "QueuedSize")]
+    queued_size: i64,
+    #[serde(rename = "PerObjectEntriesAvailable")]
+    per_object_entries_available: bool,
+}
+
+/// `GET /v3/replication/mrf`
+///
+/// Reports the failed-replication backlog (MinIO's MRF concept) for a bucket.
+///
+/// Compatibility note: MinIO returns a stream of individual MRF entries drained
+/// from its in-memory MRF queue. RustFS records failed replications as aggregate
+/// counters in the replication stats and persists MRF entries to disk without a
+/// runtime query API, so this handler returns the aggregate failed and queued
+/// counts per target instead of per-object rows. `PerObjectEntriesAvailable` is
+/// always `false` to make that limitation explicit to clients.
+pub struct ReplicationMrfHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ReplicationMrfHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_replication_admin_request(&req, AdminAction::GetReplicationMetricsAction).await?;
+
+        let queries = extract_query_params(&req.uri);
+        let Some(bucket) = queries.get("bucket").filter(|b| !b.is_empty()).cloned() else {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
+        };
+
+        let Some(store) = current_object_store_handle() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        if let Err(err) = get_replication_config(&bucket).await {
+            if err == StorageError::ConfigNotFound {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::ReplicationConfigurationNotFoundError,
+                    "replication configuration not found".to_string(),
+                ));
+            }
+            return Err(ApiError::from(err).into());
+        }
+
+        let bucket_stats = match current_replication_stats_handle() {
+            Some(s) => s.get_latest_replication_stats(&bucket).await,
+            None => BucketStats::default(),
+        };
+
+        let mut targets: Vec<MrfTargetBacklog> = Vec::new();
+        let mut total_failed_count: i64 = 0;
+        let mut total_failed_size: i64 = 0;
+        for (arn, stat) in &bucket_stats.replication_stats.stats {
+            total_failed_count += stat.failed.count;
+            total_failed_size += stat.failed.size;
+            targets.push(MrfTargetBacklog {
+                arn: arn.clone(),
+                failed_count: stat.failed.count,
+                failed_size: stat.failed.size,
+            });
+        }
+        targets.sort_by(|a, b| a.arn.cmp(&b.arn));
+
+        let queued = &bucket_stats.replication_stats.q_stat.curr;
+        let response = MrfResponse {
+            bucket,
+            targets,
+            total_failed_count,
+            total_failed_size,
+            queued_count: queued.count,
+            queued_size: queued.bytes,
+            per_object_entries_available: false,
+        };
+
+        let data = serde_json::to_vec(&response)
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize failed: {e}")))?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
 
