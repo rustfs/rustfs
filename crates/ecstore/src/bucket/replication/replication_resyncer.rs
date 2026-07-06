@@ -2052,8 +2052,22 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
             ..Default::default()
         };
 
-        if let Ok(u) = storage.put_object_metadata(&bucket, &object, &popts).await {
-            object_info = u;
+        match storage.put_object_metadata(&bucket, &object, &popts).await {
+            Ok(u) => object_info = u,
+            Err(e) => {
+                // Persisting the resynced replication status failed. Don't swallow
+                // it silently — the object's on-disk status now disagrees with the
+                // resync result and needs operator visibility (backlog#799 B23).
+                warn!(
+                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %bucket,
+                    object = %object,
+                    error = %e,
+                    "Failed to persist resynced replication status metadata"
+                );
+            }
         }
 
         if let Some(stats) = runtime_sources::replication_stats() {
