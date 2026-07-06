@@ -70,6 +70,7 @@ mod tests {
                 op: MrfOpKind::Object,
                 delete_marker_version_id: None,
                 delete_marker: false,
+                delete_marker_mtime: None,
             },
             MrfReplicateEntry {
                 bucket: "bucket-a".to_string(),
@@ -80,6 +81,7 @@ mod tests {
                 op: MrfOpKind::Delete,
                 delete_marker_version_id: Some(del_vid),
                 delete_marker: true,
+                delete_marker_mtime: Some(1_705_312_200_123_456_789),
             },
         ];
 
@@ -89,9 +91,15 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].version_id, Some(obj_vid));
         assert_eq!(decoded[0].op, MrfOpKind::Object);
+        assert_eq!(decoded[0].delete_marker_mtime, None);
         assert_eq!(decoded[1].delete_marker_version_id, Some(del_vid));
         assert_eq!(decoded[1].op, MrfOpKind::Delete);
         assert!(decoded[1].delete_marker);
+        assert_eq!(
+            decoded[1].delete_marker_mtime,
+            Some(1_705_312_200_123_456_789),
+            "delete-marker mtime must survive the MRF disk round-trip"
+        );
     }
 
     #[test]
@@ -121,6 +129,9 @@ mod tests {
         assert_eq!(decoded[0].retry_count, 2);
         assert_eq!(decoded[0].size, 100);
         assert_eq!(decoded[0].op, MrfOpKind::Object);
+        // Old files lack the deleteMarkerMtime key; it must default to None so replay keeps the
+        // pre-#867 fallback to the current time.
+        assert_eq!(decoded[0].delete_marker_mtime, None);
     }
 
     #[test]
