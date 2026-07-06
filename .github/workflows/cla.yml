@@ -16,7 +16,7 @@ name: CLA Check
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, closed]
   merge_group:
     types: [checks_requested]
   issue_comment:
@@ -28,9 +28,21 @@ permissions:
   issues: write
   checks: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  cancel-closed-pr-runs:
+    name: Cancel Closed PR Runs
+    if: github.event_name == 'pull_request_target' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain cancellation run
+        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
+
   cla:
-    if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
+    if: ${{ (github.event_name != 'issue_comment' || github.event.issue.pull_request) && (github.event_name != 'pull_request_target' || github.event.action != 'closed') }}
     runs-on: ubuntu-latest
     steps:
       - name: Report CLA result for merge queue
