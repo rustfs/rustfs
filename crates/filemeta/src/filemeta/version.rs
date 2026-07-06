@@ -42,6 +42,42 @@ const MSGPACK_FIXEXT8: u8 = 0xd7;
 const MSGPACK_TIME_EXT_LEGACY: i8 = 5;
 const MSGPACK_TIME_EXT_OFFICIAL: i8 = -1;
 
+/// Sentinel signature returned when a version has no computable body (invalid /
+/// missing inner object). Mirrors MinIO's `signatureErr` so such versions never
+/// collide with a real all-zero legacy signature.
+const SIGNATURE_ERR: [u8; 4] = [b'e', b'r', b'r', 0];
+
+/// Order-independent hash of a `String -> String` map, mirroring MinIO's
+/// `hashDeterministicString`. Msgpack map serialization order is not stable
+/// across disks, so map fields must be folded in with XOR (order-independent)
+/// rather than left in the marshaled body. Uses xxh64 (RustFS-internal only;
+/// signatures are recomputed on write and never compared against MinIO's).
+fn hash_deterministic_string(m: &HashMap<String, String>) -> u64 {
+    let mut crc: u64 = 0xc2b4_0bba_c11a_7295;
+    for (k, v) in m {
+        crc ^= (xxhash_rust::xxh64::xxh64(k.as_bytes(), 0) ^ 0x4ee3_bbaf_7ab2_506b)
+            .wrapping_add(xxhash_rust::xxh64::xxh64(v.as_bytes(), 0) ^ 0x8da4_c8da_6619_4257);
+    }
+    crc
+}
+
+/// Order-independent hash of a `String -> Vec<u8>` map, mirroring MinIO's
+/// `hashDeterministicBytes`. See [`hash_deterministic_string`].
+fn hash_deterministic_bytes(m: &HashMap<String, Vec<u8>>) -> u64 {
+    let mut crc: u64 = 0x1bbc_7e1d_de65_4743;
+    for (k, v) in m {
+        crc ^= (xxhash_rust::xxh64::xxh64(k.as_bytes(), 0) ^ 0x4ee3_bbaf_7ab2_506b)
+            .wrapping_add(xxhash_rust::xxh64::xxh64(v, 0) ^ 0x8da4_c8da_6619_4257);
+    }
+    crc
+}
+
+/// Fold a 64-bit crc into the 4-byte header signature, matching MinIO's
+/// `binary.LittleEndian.PutUint32(tmp, uint32(crc ^ (crc>>32)))`.
+fn fold_signature(crc: u64) -> [u8; 4] {
+    ((crc ^ (crc >> 32)) as u32).to_le_bytes()
+}
+
 fn read_msgp_string<R: std::io::Read>(rd: &mut R) -> Result<String> {
     let len = rmp::decode::read_str_len(rd)? as usize;
     let buf = read_exact_vec(rd, len)?;
@@ -651,41 +687,32 @@ impl FileMetaVersion {
         self.version_type == VersionType::Legacy
     }
 
-    /// Get signature for version
+    /// Compute the header signature for this version.
+    ///
+    /// The signature must be identical across all disks that hold the same
+    /// logical version, yet differ whenever any body field differs (tags,
+    /// user/system metadata, parts, size, ...). Otherwise a partial-write
+    /// divergence (e.g. `PutObjectTagging` reaching only some disks) shares the
+    /// same `version_id`+`mod_time` and becomes undetectable / unhealable — the
+    /// bug tracked in backlog#861 (B12), where this was hardcoded to `[0;4]`.
+    ///
+    /// Per-disk-varying fields (`erasure_index`) are excluded so identical
+    /// content never falsely diverges. Semantics follow MinIO's
+    /// `xlMetaV2Version.getSignature`.
     pub fn get_signature(&self) -> [u8; 4] {
         match self.version_type {
-            VersionType::Object => {
-                if let Some(ref obj) = self.object {
-                    // Calculate signature based on object metadata
-                    let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
-                    hasher.update(obj.version_id.unwrap_or_default().as_bytes());
-                    if let Some(mod_time) = obj.mod_time {
-                        hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
-                    }
-                    let hash = hasher.finish();
-                    let bytes = hash.to_le_bytes();
-                    [bytes[0], bytes[1], bytes[2], bytes[3]]
-                } else {
-                    [0; 4]
-                }
-            }
-            VersionType::Delete => {
-                if let Some(ref dm) = self.delete_marker {
-                    // Calculate signature for delete marker
-                    let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
-                    hasher.update(dm.version_id.unwrap_or_default().as_bytes());
-                    if let Some(mod_time) = dm.mod_time {
-                        hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
-                    }
-                    let hash = hasher.finish();
-                    let bytes = hash.to_le_bytes();
-                    [bytes[0], bytes[1], bytes[2], bytes[3]]
-                } else {
-                    [0; 4]
-                }
-            }
-            VersionType::Legacy => self.legacy_object.as_ref().map(MetaObjectV1::get_signature).unwrap_or([0; 4]),
-            _ => [0; 4],
+            VersionType::Object => self.object.as_ref().map(MetaObject::get_signature).unwrap_or(SIGNATURE_ERR),
+            VersionType::Delete => self
+                .delete_marker
+                .as_ref()
+                .map(MetaDeleteMarker::get_signature)
+                .unwrap_or(SIGNATURE_ERR),
+            VersionType::Legacy => self
+                .legacy_object
+                .as_ref()
+                .map(MetaObjectV1::get_signature)
+                .unwrap_or(SIGNATURE_ERR),
+            _ => SIGNATURE_ERR,
         }
     }
 
@@ -1099,7 +1126,7 @@ impl From<FileMetaVersion> for FileMetaVersionHeader {
         Self {
             version_id: value.get_version_id(),
             mod_time: value.get_mod_time(),
-            signature: [0, 0, 0, 0],
+            signature: value.get_signature(),
             version_type: value.version_type,
             flags,
             ec_n,
@@ -1551,6 +1578,35 @@ impl MetaObject {
         let mut wr = Vec::new();
         self.encode_to(&mut wr)?;
         Ok(wr)
+    }
+
+    /// Compute this object version's header signature, mirroring MinIO's
+    /// `xlMetaV2Object.Signature`. See [`FileMetaVersion::get_signature`] for
+    /// why divergence detection requires covering every body field.
+    pub fn get_signature(&self) -> [u8; 4] {
+        let mut c = self.clone();
+
+        // Zero fields that legitimately vary per disk within an erasure set.
+        c.erasure_index = 0;
+
+        // Treat an all-empty PartETags vector the same as an absent one, so two
+        // disks that encode `[]` vs `["", ""]` do not falsely diverge.
+        if c.part_etags.iter().all(String::is_empty) {
+            c.part_etags.clear();
+        }
+
+        // Fold maps in with an order-independent hash: msgpack map order is not
+        // stable across disks, so they must not be part of the marshaled body.
+        let mut crc = hash_deterministic_string(&c.meta_user);
+        crc ^= hash_deterministic_bytes(&c.meta_sys);
+        c.meta_sys.clear();
+        c.meta_user.clear();
+
+        if let Ok(bytes) = c.marshal_msg() {
+            crc ^= xxhash_rust::xxh64::xxh64(&bytes, XXHASH_SEED);
+        }
+
+        fold_signature(crc)
     }
 
     pub fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
@@ -2165,19 +2221,6 @@ impl MetaObject {
         self.meta_sys.retain(|k, _| !k.starts_with("X-Amz-Restore"));
     }
 
-    /// Get object signature
-    pub fn get_signature(&self) -> [u8; 4] {
-        let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
-        hasher.update(self.version_id.unwrap_or_default().as_bytes());
-        if let Some(mod_time) = self.mod_time {
-            hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
-        }
-        hasher.update(&self.size.to_le_bytes());
-        let hash = hasher.finish();
-        let bytes = hash.to_le_bytes();
-        [bytes[0], bytes[1], bytes[2], bytes[3]]
-    }
-
     pub fn init_free_version(&self, fi: &FileInfo) -> Result<(FileMetaVersion, bool)> {
         if fi.skip_tier_free_version() {
             return Ok((FileMetaVersion::default(), false));
@@ -2498,16 +2541,20 @@ impl MetaDeleteMarker {
         Ok(wr)
     }
 
-    /// Get delete marker signature
+    /// Compute this delete marker's header signature, mirroring MinIO's
+    /// `xlMetaV2DeleteMarker.Signature`. See [`FileMetaVersion::get_signature`].
     pub fn get_signature(&self) -> [u8; 4] {
-        let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
-        hasher.update(self.version_id.unwrap_or_default().as_bytes());
-        if let Some(mod_time) = self.mod_time {
-            hasher.update(&mod_time.unix_timestamp_nanos().to_le_bytes());
+        let mut c = self.clone();
+
+        // MetaSys is order-unstable across disks; fold it in separately.
+        let mut crc = hash_deterministic_bytes(&c.meta_sys);
+        c.meta_sys.clear();
+
+        if let Ok(bytes) = c.marshal_msg() {
+            crc ^= xxhash_rust::xxh64::xxh64(&bytes, XXHASH_SEED);
         }
-        let hash = hasher.finish();
-        let bytes = hash.to_le_bytes();
-        [bytes[0], bytes[1], bytes[2], bytes[3]]
+
+        fold_signature(crc)
     }
 }
 
@@ -3676,5 +3723,146 @@ mod tests {
             ts,
             "lookup must find the round-tripped reset status"
         );
+    }
+
+    // ---- Header signature (backlog#861 / B12) ----
+
+    fn signed_object() -> MetaObject {
+        MetaObject {
+            version_id: Some(sample_version_id()),
+            data_dir: Some(sample_version_id()),
+            erasure_algorithm: ErasureAlgo::ReedSolomon,
+            erasure_m: 2,
+            erasure_n: 4,
+            erasure_block_size: 1_048_576,
+            erasure_index: 3,
+            erasure_dist: vec![1, 2, 3, 4, 5, 6],
+            bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+            part_numbers: vec![1],
+            part_etags: vec!["etag-1".to_string()],
+            part_sizes: vec![11],
+            part_actual_sizes: vec![11],
+            size: 11,
+            mod_time: Some(sample_mod_time()),
+            meta_user: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn signature_is_no_longer_hardcoded_zero() {
+        // Regression for B12: the write-path header must carry a real signature.
+        let version = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(signed_object()),
+            ..Default::default()
+        };
+        let header = version.header();
+        assert_ne!(header.signature, [0, 0, 0, 0], "object header signature must be computed, not zeroed");
+        assert_eq!(header.signature, version.get_signature(), "header must use the computed signature");
+    }
+
+    #[test]
+    fn signature_ignores_per_disk_erasure_index() {
+        // Two disks in the same set hold the same version but differ only in the
+        // per-disk EcIndex; their signatures must match so heal does not see a
+        // false divergence.
+        let mut disk_a = signed_object();
+        disk_a.erasure_index = 1;
+        let mut disk_b = signed_object();
+        disk_b.erasure_index = 5;
+        assert_eq!(disk_a.get_signature(), disk_b.get_signature());
+    }
+
+    #[test]
+    fn signature_detects_tag_and_metadata_divergence() {
+        // The exact bug: same version_id + same mod_time, but a PutObjectTagging
+        // that only reached some disks. Signatures must differ so the divergence
+        // is detectable / healable.
+        let base = signed_object();
+
+        let mut tagged = base.clone();
+        tagged
+            .meta_sys
+            .insert("x-rustfs-internal-tags".to_string(), b"env=prod".to_vec());
+        assert_ne!(base.get_signature(), tagged.get_signature(), "meta_sys change must move the signature");
+
+        let mut user_changed = base.clone();
+        user_changed
+            .meta_user
+            .insert("x-amz-meta-owner".to_string(), "alice".to_string());
+        assert_ne!(
+            base.get_signature(),
+            user_changed.get_signature(),
+            "meta_user change must move the signature"
+        );
+
+        let mut resized = base.clone();
+        resized.size += 1;
+        resized.part_sizes = vec![12];
+        assert_ne!(base.get_signature(), resized.get_signature(), "body change must move the signature");
+    }
+
+    #[test]
+    fn signature_is_map_order_independent() {
+        // HashMap iteration order is not stable across disks; folding maps in
+        // order-independently must produce the same signature regardless.
+        let mut a = signed_object();
+        let mut b = signed_object();
+        for obj in [&mut a, &mut b] {
+            obj.meta_user.clear();
+        }
+        a.meta_user.insert("k1".into(), "v1".into());
+        a.meta_user.insert("k2".into(), "v2".into());
+        a.meta_user.insert("k3".into(), "v3".into());
+        // Insert in a different order into b.
+        b.meta_user.insert("k3".into(), "v3".into());
+        b.meta_user.insert("k1".into(), "v1".into());
+        b.meta_user.insert("k2".into(), "v2".into());
+        assert_eq!(a.get_signature(), b.get_signature());
+
+        // But a different value for the same key must still diverge.
+        let mut c = a.clone();
+        c.meta_user.insert("k2".into(), "changed".into());
+        assert_ne!(a.get_signature(), c.get_signature());
+    }
+
+    #[test]
+    fn signature_treats_empty_and_all_empty_part_etags_alike() {
+        let mut none = signed_object();
+        none.part_etags.clear();
+        let mut all_empty = signed_object();
+        all_empty.part_etags = vec![String::new(), String::new()];
+        assert_eq!(none.get_signature(), all_empty.get_signature());
+    }
+
+    #[test]
+    fn delete_marker_signature_detects_meta_sys_divergence() {
+        let base = MetaDeleteMarker {
+            version_id: Some(sample_version_id()),
+            mod_time: Some(sample_mod_time()),
+            meta_sys: HashMap::new(),
+        };
+        let mut diverged = base.clone();
+        diverged
+            .meta_sys
+            .insert("x-rustfs-internal-purgestatus".to_string(), b"pending".to_vec());
+        assert_ne!(base.get_signature(), diverged.get_signature());
+
+        // Same content is stable across recomputation.
+        assert_eq!(base.get_signature(), base.clone().get_signature());
+    }
+
+    #[test]
+    fn invalid_version_uses_error_sentinel_not_zero() {
+        // A version whose inner body is missing must not masquerade as an
+        // all-zero legacy signature.
+        let version = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: None,
+            ..Default::default()
+        };
+        assert_eq!(version.get_signature(), SIGNATURE_ERR);
+        assert_ne!(version.get_signature(), [0, 0, 0, 0]);
     }
 }
