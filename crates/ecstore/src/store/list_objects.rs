@@ -583,10 +583,7 @@ async fn advance_list_objects_mutation_sequence(bucket: &str, sequence: u64) -> 
 }
 
 pub(super) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
-    match observe_list_objects_mutations(store, bucket, 1).await {
-        Some(sequence) => sequence,
-        None => 0,
-    }
+    observe_list_objects_mutations(store, bucket, 1).await.unwrap_or_default()
 }
 
 pub(super) async fn observe_list_objects_mutations(store: &ECStore, bucket: &str, count: usize) -> Option<u64> {
@@ -598,10 +595,7 @@ async fn observe_list_objects_mutations_with_store(store: Option<&ECStore>, buck
         return None;
     }
 
-    let delta = match u64::try_from(count) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    };
+    let delta = u64::try_from(count).unwrap_or(u64::MAX);
     let next = LIST_OBJECTS_MUTATION_SEQUENCE
         .fetch_add(delta, Ordering::AcqRel)
         .saturating_add(delta);
@@ -1412,10 +1406,7 @@ fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
     keys.dedup();
     objects.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     objects.dedup_by(|left, right| left.name == right.name);
-    let checkpoint_high_water_mark = checkpoint_high_water_mark.unwrap_or_else(|| match u64::try_from(keys.len()) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    });
+    let checkpoint_high_water_mark = checkpoint_high_water_mark.unwrap_or_else(|| u64::try_from(keys.len()).unwrap_or(u64::MAX));
 
     PersistentKeyOnlyIndex {
         bucket,
@@ -2160,7 +2151,7 @@ fn list_objects_paginate(
 }
 
 enum VerifiedIndexVisibleEntry {
-    Object(ObjectInfo),
+    Object(Box<ObjectInfo>),
     Prefix(String),
 }
 
@@ -2305,7 +2296,7 @@ where
                 if collect_stats {
                     stats.live_verify_hits += 1;
                 }
-                visible_entries.push(VerifiedIndexVisibleEntry::Object(object));
+                visible_entries.push(VerifiedIndexVisibleEntry::Object(Box::new(object)));
                 if visible_entries.len() >= page_limit {
                     break;
                 }
@@ -2334,7 +2325,7 @@ where
     let mut prefixes = Vec::new();
     for entry in visible_entries {
         match entry {
-            VerifiedIndexVisibleEntry::Object(object) => objects.push(object),
+            VerifiedIndexVisibleEntry::Object(object) => objects.push(*object),
             VerifiedIndexVisibleEntry::Prefix(prefix) => prefixes.push(prefix),
         }
     }
@@ -2397,7 +2388,7 @@ fn list_objects_from_metadata_snapshot_candidates(
             }
         }
 
-        visible_entries.push(VerifiedIndexVisibleEntry::Object(object.to_object_info(bucket)));
+        visible_entries.push(VerifiedIndexVisibleEntry::Object(Box::new(object.to_object_info(bucket))));
         if visible_entries.len() >= page_limit {
             break;
         }
@@ -2419,7 +2410,7 @@ fn list_objects_from_metadata_snapshot_candidates(
     let mut prefixes = Vec::new();
     for entry in visible_entries {
         match entry {
-            VerifiedIndexVisibleEntry::Object(object) => objects.push(object),
+            VerifiedIndexVisibleEntry::Object(object) => objects.push(*object),
             VerifiedIndexVisibleEntry::Prefix(prefix) => prefixes.push(prefix),
         }
     }
@@ -3114,7 +3105,7 @@ impl ECStore {
                     ..Default::default()
                 });
             let reached_end = match list_result.err.take() {
-                Some(err) if err == rustfs_filemeta::Error::Unexpected => true,
+                Some(rustfs_filemeta::Error::Unexpected) => true,
                 Some(err) => return Err(Error::from(err)),
                 None => false,
             };
@@ -3692,14 +3683,13 @@ impl ECStore {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
-        if let Some(mode) = list_objects_index_mode_from_env() {
-            if let Some(result) = self
+        if let Some(mode) = list_objects_index_mode_from_env()
+            && let Some(result) = self
                 .clone()
                 .list_objects_from_opt_in_key_only_provider(&opts, mode, max_keys, incl_deleted)
                 .await?
-            {
-                return Ok(result);
-            }
+        {
+            return Ok(result);
         }
 
         // Optimization: use get for single object lookup with exact prefix
