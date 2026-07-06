@@ -508,6 +508,87 @@ impl LockShard {
         None
     }
 
+    /// Enumerate every currently held lock in this shard.
+    ///
+    /// Exclusive locks yield a single entry; shared locks yield one entry per
+    /// distinct owner so administrative "top locks" views can attribute every
+    /// holder. Entries for objects that are tracked but not currently locked
+    /// (e.g. pooled-but-idle state) are skipped.
+    pub fn list_locks(&self) -> Vec<crate::fast_lock::types::ObjectLockInfo> {
+        let objects = self.objects.read();
+        let mut infos = Vec::new();
+        for (key, state) in objects.iter() {
+            let Some(mode) = state.current_mode() else {
+                continue;
+            };
+            let priority = *state.priority.read();
+            match mode {
+                LockMode::Exclusive => {
+                    if let Some(info) = state.current_owner.read().clone() {
+                        let expires_at = info
+                            .acquired_at
+                            .checked_add(info.lock_timeout)
+                            .unwrap_or_else(|| info.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+                        infos.push(crate::fast_lock::types::ObjectLockInfo {
+                            key: key.clone(),
+                            mode,
+                            owner: info.owner,
+                            acquired_at: info.acquired_at,
+                            expires_at,
+                            priority,
+                        });
+                    }
+                }
+                LockMode::Shared => {
+                    for entry in state.shared_owners.read().iter() {
+                        let expires_at = entry
+                            .acquired_at
+                            .checked_add(entry.lock_timeout)
+                            .unwrap_or_else(|| entry.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+                        infos.push(crate::fast_lock::types::ObjectLockInfo {
+                            key: key.clone(),
+                            mode,
+                            owner: entry.owner.clone(),
+                            acquired_at: entry.acquired_at,
+                            expires_at,
+                            priority,
+                        });
+                    }
+                }
+            }
+        }
+        infos
+    }
+
+    /// Force-release every holder of a lock on `key`, regardless of owner.
+    ///
+    /// Returns the number of owners that were released. Used by the admin
+    /// force-unlock path to clear a stuck resource.
+    pub fn force_release_all(&self, key: &ObjectKey) -> usize {
+        let owners_modes: Vec<(Arc<str>, LockMode)> = {
+            let objects = self.objects.read();
+            let Some(state) = objects.get(key) else {
+                return 0;
+            };
+            let mut pairs = Vec::new();
+            if let Some(info) = state.current_owner.read().clone() {
+                pairs.push((info.owner, LockMode::Exclusive));
+            }
+            for entry in state.shared_owners.read().iter() {
+                pairs.push((entry.owner.clone(), LockMode::Shared));
+            }
+            pairs
+        };
+
+        let mut released = 0;
+        for (owner, mode) in owners_modes {
+            if self.release_lock(key, &owner, mode) {
+                released += 1;
+            }
+        }
+        released
+    }
+
     /// Get current load factor of the shard
     pub fn current_load_factor(&self) -> f64 {
         let objects = self.objects.read();
