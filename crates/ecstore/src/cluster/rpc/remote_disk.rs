@@ -14,6 +14,7 @@
 
 use crate::cluster::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
+    node_service_time_out_client_for_class,
 };
 use crate::cluster::rpc::internode_data_transport::{
     InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
@@ -39,6 +40,7 @@ use bytes::Bytes;
 use futures::lock::Mutex;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
@@ -808,6 +810,20 @@ impl RemoteDisk {
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+    }
+
+    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion).
+    /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
+    /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
+    /// is disabled.
+    async fn get_bulk_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        node_service_time_out_client_for_class(
+            &self.addr,
+            TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+            ChannelClass::Bulk,
+        )
+        .await
+        .map_err(|err| Error::other(format!("can not get client, err: {err}")))
     }
 
     async fn disk_ref(&self) -> String {
@@ -1602,7 +1618,7 @@ impl DiskAPI for RemoteDisk {
                 move || async move {
                     let disk = self.disk_ref().await;
                     let mut client = self
-                        .get_client()
+                        .get_bulk_client()
                         .await
                         .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                     let request = Request::new(BatchReadVersionRequest {
@@ -2256,7 +2272,7 @@ impl DiskAPI for RemoteDisk {
                 let read_multiple_req_bin = encode_msgpack(&req)?;
                 let disk = self.disk_ref().await;
                 let mut client = self
-                    .get_client()
+                    .get_bulk_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadMultipleRequest {
@@ -2303,7 +2319,7 @@ impl DiskAPI for RemoteDisk {
             || async {
                 let data_len = data.len();
                 let disk = self.disk_ref().await;
-                let mut client = self.get_client().await.map_err(|err| {
+                let mut client = self.get_bulk_client().await.map_err(|err| {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
@@ -2354,7 +2370,7 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let disk = self.disk_ref().await;
-                let mut client = self.get_client().await.map_err(|err| {
+                let mut client = self.get_bulk_client().await.map_err(|err| {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
                     Error::other(format!("can not get client, err: {err}"))
                 })?;

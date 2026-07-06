@@ -97,6 +97,32 @@ pub const ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE: &str = "RUSTFS_INTERNODE_RPC_MAX_M
 pub const ENV_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: &str = "RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES";
 pub const DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: usize = 8 * 1024 * 1024;
 
+// ── Control/bulk channel isolation (P1) ──
+// Large `bytes`-carrying unary RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion) otherwise
+// share the control-plane HTTP/2 connection with latency-sensitive lock/health RPCs; a large
+// transfer can head-of-line block a lock RPC (G2/G5). When isolation is enabled these bulk RPCs
+// are routed onto a separate per-peer channel pool. See grpc-optimization P1.
+
+/// Enable control/bulk internode gRPC channel isolation.
+///
+/// Defaults to `false`: this touches lock-RPC transport routing (consistency-sensitive), so it
+/// is opt-in and validated against a baseline before rollout. When `false`, bulk RPCs reuse the
+/// control channel exactly as before, so the switch is a single-env rollback.
+pub const ENV_INTERNODE_CHANNEL_ISOLATION: &str = "RUSTFS_INTERNODE_CHANNEL_ISOLATION";
+pub const DEFAULT_INTERNODE_CHANNEL_ISOLATION: bool = false;
+
+// Compile-time invariant: isolation is opt-in so the default build behaves exactly as before P1.
+const _: () = assert!(!DEFAULT_INTERNODE_CHANNEL_ISOLATION);
+
+/// Number of bulk channels maintained per peer when channel isolation is enabled.
+///
+/// A tonic `Channel` is a single TCP/HTTP2 connection; multiple bulk channels are round-robined
+/// to relieve the single-connection throughput ceiling for large transfers. Kept small (default
+/// 2) to avoid a connection storm; clamped to at least 1. Set to 1 to isolate bulk onto a single
+/// dedicated connection (still separate from control).
+pub const ENV_INTERNODE_BULK_CHANNELS: &str = "RUSTFS_INTERNODE_BULK_CHANNELS";
+pub const DEFAULT_INTERNODE_BULK_CHANNELS: usize = 2;
+
 /// Profile selector for conservative internode HTTP data-plane client tuning.
 pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";
 pub const DEFAULT_INTERNODE_HTTP_TUNING_PROFILE: &str = "legacy";
@@ -165,6 +191,14 @@ mod tests {
             "RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES"
         );
         assert_eq!(DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn internode_channel_isolation_defaults_and_env_names() {
+        // The isolation-off default is asserted at compile time next to the constant definition.
+        assert_eq!(DEFAULT_INTERNODE_BULK_CHANNELS, 2);
+        assert_eq!(ENV_INTERNODE_CHANNEL_ISOLATION, "RUSTFS_INTERNODE_CHANNEL_ISOLATION");
+        assert_eq!(ENV_INTERNODE_BULK_CHANNELS, "RUSTFS_INTERNODE_BULK_CHANNELS");
     }
 
     #[test]

@@ -19,11 +19,12 @@ mod generated;
 mod runtime_sources;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{cache_connection, evict_connection_with_log_level};
+use rustfs_common::{cache_connection, cached_connection, evict_connection_with_log_level};
 use std::{
     collections::HashMap,
     error::Error,
     sync::LazyLock,
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -139,6 +140,70 @@ pub fn internode_rpc_max_message_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, DEFAULT_GRPC_SERVER_MESSAGE_LEN)
 }
 
+/// Class of internode gRPC channel used to route an RPC (grpc-optimization P1).
+///
+/// - [`ChannelClass::Control`]: latency-sensitive control-plane RPCs (locks, health, small
+///   metadata). Always uses the per-peer control connection keyed by the bare address.
+/// - [`ChannelClass::Bulk`]: large `bytes`-carrying unary RPCs
+///   (`ReadAll`/`WriteAll`/`ReadMultiple`/`BatchReadVersion`). When channel isolation is enabled
+///   these are routed onto a separate per-peer bulk connection pool so a large transfer cannot
+///   head-of-line block a lock RPC on the shared HTTP/2 connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelClass {
+    Control,
+    Bulk,
+}
+
+/// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
+fn channel_isolation_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION,
+        rustfs_config::DEFAULT_INTERNODE_CHANNEL_ISOLATION,
+    )
+}
+
+/// Number of bulk channels maintained per peer (>= 1).
+fn bulk_channel_pool_size() -> usize {
+    rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_BULK_CHANNELS, rustfs_config::DEFAULT_INTERNODE_BULK_CHANNELS).max(1)
+}
+
+/// Round-robin cursor for selecting a bulk channel within a peer's pool. A single global cursor
+/// is sufficient: it advances once per bulk acquisition and `% pool_size` spreads consecutive
+/// acquisitions across the pool.
+static BULK_CHANNEL_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Connection-cache key for the `idx`-th bulk channel to `addr`. The NUL separator cannot appear
+/// in a URL, so a bulk key never collides with the control key (the bare `addr`).
+fn bulk_cache_key(addr: &str, idx: usize) -> String {
+    format!("{addr}\u{0}bulk\u{0}{idx}")
+}
+
+/// Acquire a cached-or-newly-dialed channel for the given peer and channel class.
+///
+/// For [`ChannelClass::Control`] (or whenever isolation is disabled) this is exactly the legacy
+/// behavior: reuse the cached control channel keyed by `addr`, else dial a new one. For
+/// [`ChannelClass::Bulk`] with isolation enabled, a channel is round-robin selected from the
+/// per-peer bulk pool and dialed on demand, physically isolating large transfers from
+/// control-plane RPCs.
+pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Channel, Box<dyn Error>> {
+    if class == ChannelClass::Control || !channel_isolation_enabled() {
+        if let Some(channel) = cached_connection(addr).await {
+            debug!("Using cached control gRPC channel for: {}", addr);
+            return Ok(channel);
+        }
+        return create_new_channel(addr).await;
+    }
+
+    let pool_size = bulk_channel_pool_size();
+    let idx = BULK_CHANNEL_CURSOR.fetch_add(1, Ordering::Relaxed) % pool_size;
+    let cache_key = bulk_cache_key(addr, idx);
+    if let Some(channel) = cached_connection(&cache_key).await {
+        debug!("Using cached bulk gRPC channel {} for: {}", idx, addr);
+        return Ok(channel);
+    }
+    build_channel(addr, &cache_key).await
+}
+
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
 ///
 /// This function is designed to detect dead peers quickly using env-configurable
@@ -149,7 +214,18 @@ pub fn internode_rpc_max_message_size() -> usize {
 /// - HTTP/2 keepalive timeout: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS` (3s)
 /// - RPC timeout: `DEFAULT_INTERNODE_RPC_TIMEOUT_SECS` (10s)
 pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
-    debug!("Creating new gRPC channel to: {}", addr);
+    // The control channel is cached under the bare address, preserving the legacy key.
+    build_channel(addr, addr).await
+}
+
+/// Dial a new gRPC channel to `dial_addr` and cache it under `cache_key`.
+///
+/// `dial_addr` is the real peer URL used for the TCP/TLS connection and hostname verification;
+/// `cache_key` is the connection-cache key. They are identical for control channels and differ
+/// for isolated bulk channels (see [`bulk_cache_key`]), letting several physically distinct
+/// channels to the same peer be cached independently.
+async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<dyn Error>> {
+    debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
     let connect_timeout = internode_connect_timeout();
     let tcp_keepalive = internode_tcp_keepalive();
@@ -157,7 +233,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     let http2_keepalive_timeout = internode_http2_keep_alive_timeout();
     let rpc_timeout = internode_rpc_timeout();
 
-    let mut connector = Endpoint::from_shared(addr.to_string())?
+    let mut connector = Endpoint::from_shared(dial_addr.to_string())?
         // Fast connection timeout for dead peer detection
         .connect_timeout(connect_timeout)
         // TCP-level keepalive - OS will probe connection
@@ -188,17 +264,17 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
     let mut stale_generation = false;
     {
         let generation_cache = TLS_GENERATION_CACHE.lock().await;
-        if let Some(cached_generation) = generation_cache.get(addr)
+        if let Some(cached_generation) = generation_cache.get(cache_key)
             && *cached_generation != generation
         {
             stale_generation = true;
         }
     }
-    if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+    if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
         if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
             let ca = Certificate::from_pem(cert_pem);
             // Derive the hostname from the HTTPS URL for TLS hostname verification.
-            let domain = addr
+            let domain = dial_addr
                 .trim_start_matches(RUSTFS_HTTPS_PREFIX)
                 .split('/')
                 .next()
@@ -218,11 +294,11 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
                 ClientTlsConfig::new().ca_certificate(ca)
             };
             connector = connector.tls_config(tls)?;
-            debug!("Configured TLS with custom root certificate for: {}", addr);
+            debug!("Configured TLS with custom root certificate for: {}", dial_addr);
         } else {
             // No custom root CA published — fall back to system roots.
             // This is the expected path when no TLS path is configured.
-            debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
+            debug!("No custom root certificate configured; using system roots for TLS: {}", dial_addr);
             connector = connector.tls_config(ClientTlsConfig::new())?;
         }
     }
@@ -238,17 +314,20 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         }
     };
 
-    cache_connection(addr.to_string(), channel.clone()).await;
+    cache_connection(cache_key.to_string(), channel.clone()).await;
     {
         let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
-        enforce_tls_generation_cache_bound(&mut generation_cache, generation, addr);
-        generation_cache.insert(addr.to_string(), generation);
+        enforce_tls_generation_cache_bound(&mut generation_cache, generation, cache_key);
+        generation_cache.insert(cache_key.to_string(), generation);
     }
     if stale_generation {
         runtime_sources::record_stale_grpc_channel_tls_generation();
     }
 
-    debug!("Successfully created and cached gRPC channel to: {}", addr);
+    debug!(
+        "Successfully created and cached gRPC channel to: {} (cache key: {})",
+        dial_addr, cache_key
+    );
     Ok(channel)
 }
 
@@ -287,6 +366,17 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
     };
     evict_connection_with_log_level(addr, cache_log_level).await;
     TLS_GENERATION_CACHE.lock().await.remove(addr);
+
+    // A peer failure typically affects every channel to that peer, so also drop any isolated
+    // bulk channels rather than leaving a half-dead connection cached. Round-robin selection
+    // means the caller cannot know which bulk index it hit, so evict the whole pool.
+    if channel_isolation_enabled() {
+        for idx in 0..bulk_channel_pool_size() {
+            let cache_key = bulk_cache_key(addr, idx);
+            evict_connection_with_log_level(&cache_key, cache_log_level).await;
+            TLS_GENERATION_CACHE.lock().await.remove(&cache_key);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +403,38 @@ mod tests {
         evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
 
         assert!(!rustfs_common::has_cached_connection(addr).await);
+    }
+
+    #[test]
+    fn bulk_cache_key_is_distinct_and_cannot_collide_with_control_key() {
+        let addr = "https://node-a:9000";
+        let k0 = bulk_cache_key(addr, 0);
+        let k1 = bulk_cache_key(addr, 1);
+        assert_ne!(k0, k1);
+        assert_ne!(k0, addr);
+        assert!(k0.starts_with(addr));
+        // The NUL separator cannot appear in a URL, so a bulk key never equals a real address.
+        assert!(k0.contains('\u{0}'));
+    }
+
+    #[test]
+    fn bulk_channel_pool_size_is_at_least_one() {
+        // Even without env configuration the pool size is clamped to a usable minimum.
+        assert!(bulk_channel_pool_size() >= 1);
+    }
+
+    #[tokio::test]
+    async fn get_channel_for_class_bulk_reuses_control_cache_when_isolation_disabled() {
+        // Isolation defaults off, so a Bulk request must reuse the control channel keyed by the
+        // bare address and must NOT create a separate bulk-keyed entry (zero behavior change).
+        let addr = "http://get-channel-isolation-off-test";
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        cache_connection(addr.to_string(), channel).await;
+
+        let acquired = get_channel_for_class(addr, ChannelClass::Bulk).await;
+        assert!(acquired.is_ok());
+        assert!(!rustfs_common::has_cached_connection(&bulk_cache_key(addr, 0)).await);
+
+        evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
     }
 }
