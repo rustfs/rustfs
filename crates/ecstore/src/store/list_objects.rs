@@ -7667,6 +7667,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn persistent_key_only_index_load_recovers_mutation_sequence_from_journal() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let index_path = tempdir.path().join("persistent-key-only.index");
@@ -7786,6 +7787,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn list_objects_mutation_sequence_advances_per_bucket() {
         reset_list_objects_mutation_sequences_for_test().await;
 
