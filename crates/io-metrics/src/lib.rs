@@ -95,6 +95,7 @@ pub mod config;
 pub mod deadlock_metrics;
 pub mod internode_metrics;
 pub mod io_metrics;
+pub mod list_objects_metrics;
 pub mod lock_metrics;
 pub mod performance;
 pub mod process_lock_metrics;
@@ -128,6 +129,12 @@ pub use capacity_metrics::{
 pub use io_metrics::{
     IoSchedulerStats, record_bandwidth_observation, record_buffer_size_adjustment, record_io_priority_decision,
     record_io_scheduler_decision, record_load_level_change, record_queue_operation, record_starvation_event,
+};
+pub use list_objects_metrics::{
+    LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
+    ListObjectsGatherObservation, ListObjectsIndexPageObservation, init_list_objects_metrics, record_list_objects_gather,
+    record_list_objects_index_attempt, record_list_objects_index_fallback, record_list_objects_index_live_verify_failure,
+    record_list_objects_index_served, record_list_objects_merge,
 };
 
 // Backpressure metrics exports
@@ -1938,6 +1945,46 @@ pub fn record_cgroup_memory_split(
     }
     if let Some(inactive_file_bytes) = inactive_file_bytes {
         gauge!("rustfs_memory_cgroup_inactive_file_bytes").set(inactive_file_bytes as f64);
+    }
+}
+
+/// Allocator memory stats captured from the active process allocator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AllocatorMemoryObservation {
+    pub reserved_bytes: Option<u64>,
+    pub committed_bytes: Option<u64>,
+    pub page_committed_bytes: Option<u64>,
+    pub malloc_requested_bytes: Option<u64>,
+    pub malloc_requested_peak_bytes: Option<u64>,
+    pub malloc_requested_total_bytes: Option<u64>,
+    pub heap_count: Option<u64>,
+}
+
+/// Record allocator-level memory attribution when supported by the allocator.
+#[inline(always)]
+pub fn record_allocator_memory_observation(backend: &'static str, observation: AllocatorMemoryObservation) {
+    if let Some(reserved_bytes) = observation.reserved_bytes {
+        gauge!("rustfs_memory_allocator_reserved_bytes", "backend" => backend).set(reserved_bytes as f64);
+    }
+    if let Some(committed_bytes) = observation.committed_bytes {
+        gauge!("rustfs_memory_allocator_committed_bytes", "backend" => backend).set(committed_bytes as f64);
+    }
+    if let Some(page_committed_bytes) = observation.page_committed_bytes {
+        gauge!("rustfs_memory_allocator_page_committed_bytes", "backend" => backend).set(page_committed_bytes as f64);
+    }
+    if let Some(malloc_requested_bytes) = observation.malloc_requested_bytes {
+        gauge!("rustfs_memory_allocator_malloc_requested_bytes", "backend" => backend).set(malloc_requested_bytes as f64);
+    }
+    if let Some(malloc_requested_peak_bytes) = observation.malloc_requested_peak_bytes {
+        gauge!("rustfs_memory_allocator_malloc_requested_peak_bytes", "backend" => backend)
+            .set(malloc_requested_peak_bytes as f64);
+    }
+    if let Some(malloc_requested_total_bytes) = observation.malloc_requested_total_bytes {
+        gauge!("rustfs_memory_allocator_malloc_requested_total_bytes", "backend" => backend)
+            .set(malloc_requested_total_bytes as f64);
+    }
+    if let Some(heap_count) = observation.heap_count {
+        gauge!("rustfs_memory_allocator_heap_count", "backend" => backend).set(heap_count as f64);
     }
 }
 

@@ -896,22 +896,28 @@ mod tests {
         assert!(base.replication_info_equals(&FileInfo::default()));
 
         // Differing mark_deleted breaks equality.
-        let mut marked = FileInfo::default();
-        marked.mark_deleted = true;
+        let marked = FileInfo {
+            mark_deleted: true,
+            ..Default::default()
+        };
         assert!(!base.replication_info_equals(&marked));
 
         // Differing replication_state_internal breaks equality (regression guard:
         // this field used to be ignored by replication_info_equals).
-        let mut with_state = FileInfo::default();
-        with_state.replication_state_internal = Some(ReplicationState {
-            replicate_decision_str: "arn:aws:s3:::dest".to_string(),
+        let with_state = FileInfo {
+            replication_state_internal: Some(ReplicationState {
+                replicate_decision_str: "arn:aws:s3:::dest".to_string(),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         assert!(!base.replication_info_equals(&with_state));
 
         // Equal replication states remain equal.
-        let mut with_state_clone = FileInfo::default();
-        with_state_clone.replication_state_internal = with_state.replication_state_internal.clone();
+        let with_state_clone = FileInfo {
+            replication_state_internal: with_state.replication_state_internal.clone(),
+            ..Default::default()
+        };
         assert!(with_state.replication_info_equals(&with_state_clone));
     }
 }
