@@ -97,6 +97,20 @@ pub const ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE: &str = "RUSTFS_INTERNODE_RPC_MAX_M
 pub const ENV_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: &str = "RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES";
 pub const DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: usize = 8 * 1024 * 1024;
 
+/// Stop dual-writing the JSON compatibility strings on internode metadata RPCs and send only the
+/// msgpack `_bin` payloads (grpc-optimization P2-1).
+///
+/// Defaults to `false` (dual-write, byte-for-byte legacy behavior). This is a rollout lever, not a
+/// wire-format change: it may only be enabled **after** the JSON-fallback counter
+/// (`rustfs_system_network_internode_msgpack_json_fallback_total`) has read zero across a release
+/// window fleet-wide, confirming every peer decodes `_bin` first. Single-env rollback. See
+/// `docs/operations/internode-msgpack-json-convergence-runbook.md`.
+pub const ENV_INTERNODE_RPC_MSGPACK_ONLY: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY";
+pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY: bool = false;
+
+// Compile-time invariant: dual-write by default so the base build is byte-for-byte legacy behavior.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY);
+
 // ── Control/bulk channel isolation (P1) ──
 // Large `bytes`-carrying unary RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion) otherwise
 // share the control-plane HTTP/2 connection with latency-sensitive lock/health RPCs; a large
@@ -199,6 +213,12 @@ mod tests {
         assert_eq!(DEFAULT_INTERNODE_BULK_CHANNELS, 2);
         assert_eq!(ENV_INTERNODE_CHANNEL_ISOLATION, "RUSTFS_INTERNODE_CHANNEL_ISOLATION");
         assert_eq!(ENV_INTERNODE_BULK_CHANNELS, "RUSTFS_INTERNODE_BULK_CHANNELS");
+    }
+
+    #[test]
+    fn internode_msgpack_only_env_name_is_stable() {
+        // The dual-write-by-default invariant is asserted at compile time next to the definition.
+        assert_eq!(ENV_INTERNODE_RPC_MSGPACK_ONLY, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY");
     }
 
     #[test]

@@ -140,6 +140,17 @@ pub fn internode_rpc_max_message_size() -> usize {
     rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, DEFAULT_GRPC_SERVER_MESSAGE_LEN)
 }
 
+/// Whether internode metadata RPCs should send only the msgpack `_bin` payloads and leave the JSON
+/// compatibility strings empty (grpc-optimization P2-1). Shared by the client (`remote_disk`) and
+/// server (`node_service`) send paths. Defaults to `false` (dual-write); see
+/// [`rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY`] and the convergence runbook before enabling.
+pub fn internode_rpc_msgpack_only() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY,
+    )
+}
+
 /// Class of internode gRPC channel used to route an RPC (grpc-optimization P1).
 ///
 /// - [`ChannelClass::Control`]: latency-sensitive control-plane RPCs (locks, health, small

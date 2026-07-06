@@ -843,6 +843,17 @@ fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(serializer.into_inner())
 }
 
+/// JSON compatibility string for a dual-encoded (`_bin` + text) request field. Returns an empty
+/// string when msgpack-only mode is enabled (grpc-optimization P2-1) so the redundant JSON copy is
+/// not sent; otherwise the legacy JSON encoding. Only use for fields whose peer decodes `_bin`
+/// first — the paired `_bin` (msgpack) field must always be sent alongside.
+fn compat_json<T: Serialize>(value: &T) -> Result<String> {
+    if rustfs_protos::internode_rpc_msgpack_only() {
+        return Ok(String::new());
+    }
+    Ok(serde_json::to_string(value)?)
+}
+
 fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT)).with_struct_map();
     value.serialize(&mut serializer)?;
@@ -1249,6 +1260,10 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
+                // `_bin` support for DeleteVersion is new (grpc-optimization P2); always dual-write
+                // JSON + msgpack until its fallback counter has read zero across a release window.
+                let file_info_bin = encode_msgpack(&fi)?;
+                let opts_bin = encode_msgpack(&opts)?;
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
@@ -1263,6 +1278,8 @@ impl DiskAPI for RemoteDisk {
                     file_info,
                     force_del_marker,
                     opts,
+                    file_info_bin: file_info_bin.into(),
+                    opts_bin: opts_bin.into(),
                 });
 
                 let response = client.delete_version(request).await?.into_inner();
@@ -1298,6 +1315,18 @@ impl DiskAPI for RemoteDisk {
             return vec![Some(DiskError::FaultyDisk); versions.len()];
         }
 
+        // `_bin` support for DeleteVersions is new (grpc-optimization P2); always dual-write JSON +
+        // msgpack until its fallback counter has read zero across a release window.
+        let opts_bin = match encode_msgpack(&opts) {
+            Ok(opts_bin) => opts_bin,
+            Err(err) => {
+                let mut errors = Vec::with_capacity(versions.len());
+                for _ in 0..versions.len() {
+                    errors.push(Some(Error::other(err.to_string())));
+                }
+                return errors;
+            }
+        };
         let opts = match serde_json::to_string(&opts) {
             Ok(opts) => opts,
             Err(err) => {
@@ -1309,9 +1338,20 @@ impl DiskAPI for RemoteDisk {
             }
         };
         let mut versions_str = Vec::with_capacity(versions.len());
+        let mut versions_bin = Vec::with_capacity(versions.len());
         for file_info_versions in versions.iter() {
             versions_str.push(match serde_json::to_string(file_info_versions) {
                 Ok(versions_str) => versions_str,
+                Err(err) => {
+                    let mut errors = Vec::with_capacity(versions.len());
+                    for _ in 0..versions.len() {
+                        errors.push(Some(Error::other(err.to_string())));
+                    }
+                    return errors;
+                }
+            });
+            versions_bin.push(match encode_msgpack(file_info_versions) {
+                Ok(versions_bin) => Bytes::from(versions_bin),
                 Err(err) => {
                     let mut errors = Vec::with_capacity(versions.len());
                     for _ in 0..versions.len() {
@@ -1337,6 +1377,8 @@ impl DiskAPI for RemoteDisk {
             volume: volume.to_string(),
             versions: versions_str,
             opts,
+            versions_bin,
+            opts_bin: opts_bin.into(),
         });
 
         // TODO: use Error not string
@@ -1438,7 +1480,7 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let file_info = serde_json::to_string(&fi)?;
+        let file_info = compat_json(&fi)?;
         let file_info_bin = encode_msgpack(&fi)?;
 
         self.execute_with_timeout_for_op(
@@ -1511,8 +1553,8 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let file_info = serde_json::to_string(&fi)?;
-        let opts_str = serde_json::to_string(&opts)?;
+        let file_info = compat_json(&fi)?;
+        let opts_str = compat_json(&opts)?;
         let file_info_bin = encode_msgpack(&fi)?;
         let opts_bin = encode_msgpack(opts)?;
 
@@ -1568,7 +1610,7 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let opts_str = serde_json::to_string(opts)?;
+        let opts_str = compat_json(opts)?;
         let opts_bin = encode_msgpack(opts)?;
 
         self.execute_with_timeout(
@@ -1624,7 +1666,7 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let batch_read_version_req = serde_json::to_string(&req)?;
+        let batch_read_version_req = compat_json(&req)?;
         let batch_read_version_req_bin = encode_msgpack(&req)?;
 
         let batch_result = self
@@ -1766,7 +1808,7 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout_for_op(
             "rename_data",
             || async {
-                let file_info = serde_json::to_string(&fi)?;
+                let file_info = compat_json(&fi)?;
                 let file_info_bin = encode_msgpack_named(&fi)?;
                 let mut client = self
                     .get_client()
@@ -2287,7 +2329,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let read_multiple_req = serde_json::to_string(&req)?;
+                let read_multiple_req = compat_json(&req)?;
                 let read_multiple_req_bin = encode_msgpack(&req)?;
                 let disk = self.disk_ref().await;
                 let mut client = self
@@ -2726,6 +2768,17 @@ mod tests {
 
         // An empty response has zero payload.
         assert_eq!(read_multiple_response_payload_len(&ReadMultipleResponse::default()), 0);
+    }
+
+    #[test]
+    fn compat_json_dual_writes_by_default() {
+        // msgpack-only defaults off, so compat_json returns the JSON encoding (dual-write). The
+        // empty-string (msgpack-only) path is exercised via the env flag in integration, not here,
+        // to keep this test independent of process-global env state.
+        let resp = sample_read_multiple_resp("file", b"data");
+        let json = compat_json(&resp).expect("compat_json should encode");
+        assert!(!json.is_empty());
+        assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
     }
 
     #[test]

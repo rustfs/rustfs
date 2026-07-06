@@ -81,25 +81,42 @@ first**. The following mapping is verified against the current code.
 | response | `ReadMultiple` resp list | per-item + list fallback |
 | response | `BatchReadVersion` resp list | per-item + list fallback |
 
-### NOT convergence-ready (no confirmed `_bin`-first peer decoder)
+### `_bin` support added THIS release — converge after their own window
 
-| Direction | Message / field | Note |
+The `DeleteVersion`/`DeleteVersions` protos had **no `_bin` fields**. They gained additive
+`*_bin` fields plus bin-first server decoders in this release, and the client now dual-writes
+them. They are **kept out** of the msgpack-only set (always dual-write) until their own
+fallback counter has read zero across a window with the new decoders fully deployed.
+
+| Direction | Message / field | Status |
 |---|---|---|
-| request | `DeleteVersion(s).opts` (`DeleteOptions`) | handler is not `_bin`-first; **upgrade the decoder to `decode_msgpack_or_json` first**, ship it a window, then converge. |
+| request | `DeleteVersion.file_info` (`FileInfo`) | `_bin` added; dual-write; converge after window |
+| request | `DeleteVersion.opts` (`DeleteOptions`) | `_bin` added; dual-write; converge after window |
+| request | `DeleteVersions.versions` (`FileInfoVersions`) | `_bin` added; dual-write; converge after window |
+| request | `DeleteVersions.opts` (`DeleteOptions`) | `_bin` added; dual-write; converge after window |
 
 > Any `*_bin` proto field not in the tables above must be mapped to a confirmed `_bin`-first
 > peer decoder before it is added to the convergence set.
 
+### Still JSON-only (no `_bin` field)
+
+| Direction | Message / field | Note |
+|---|---|---|
+| response | `DeleteVersion.raw_file_info` | proto has no `_bin`; needs an additive proto field before it can converge. |
+
 ## Stage 1 — Stop writing JSON (env-gated, after Stage 0 reads zero)
 
-Only after the counter has read zero for a full window across the fleet.
+The send-side lever is **implemented** and gated by the default-off env flag
+`RUSTFS_INTERNODE_RPC_MSGPACK_ONLY`. When enabled, the convergence-ready fields above send
+only `_bin` and leave the JSON string empty; the `_bin` payload is always sent and decoders
+keep the JSON read fallback unchanged. The delete fields are excluded (dual-write) per the
+section above.
 
-1. Land the send-side change gated by a **default-off** env flag
-   (`RUSTFS_INTERNODE_RPC_MSGPACK_ONLY`, default `false`): when enabled, the
-   convergence-ready fields above send only `_bin` and leave the JSON string empty. The
-   `_bin` payload is always sent; decoders keep the JSON read fallback unchanged.
-2. Roll out with the flag **off** (no behavior change), then enable it on one node and
-   watch the fallback counter for a soak period. If it stays zero, enable fleet-wide.
+Only enable it **after** Stage 0 has read zero for a full window across the fleet:
+
+1. Ship with the flag **off** (no behavior change).
+2. Enable it on one node (`RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true`, restart) and watch the
+   fallback counter for a soak period. If it stays zero, enable fleet-wide.
 3. **Rollback:** set `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false` (or unset) and restart. No
    wire-format was broken in this stage, so rollback is immediate and safe.
 
