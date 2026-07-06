@@ -78,6 +78,7 @@ impl Default for FS {
 impl FS {
     pub fn new() -> Self {
         rustfs_io_metrics::init_s3_metrics();
+        rustfs_io_metrics::init_list_objects_metrics();
         Self {}
     }
 
