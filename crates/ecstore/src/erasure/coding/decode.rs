@@ -629,6 +629,14 @@ where
             return (vec![None; num_readers], vec![None; num_readers]);
         }
 
+        // Advance to the next stripe so the following read() computes the correct
+        // (possibly shorter, final) stripe length. `offset` previously never
+        // advanced, so every stripe after the first reused the first stripe's
+        // geometry; combined with BitrotReader now rejecting short reads, the
+        // per-stripe expected length must be exact (backlog#799 B2). `self.offset`
+        // is only read above to derive `shard_size`, so advancing here is safe.
+        self.offset += shard_size;
+
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
         let mut errs = vec![None; num_readers];
         let read_costs = self.read_costs.as_slice();
@@ -1000,6 +1008,10 @@ where
         if shard_size == 0 {
             return (shards, errs);
         }
+
+        // Advance to the next stripe (see the matching note in `read`); the
+        // lockstep path must track stripe geometry identically (backlog#799 B2).
+        self.offset += shard_size;
 
         self.buffers.ensure_slots(num_readers);
         // Pre-claim per-slot buffers so the `self.readers` borrow below stays

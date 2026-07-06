@@ -40,6 +40,8 @@ Two rules keep this directory healthy:
 
 - [s3-compatibility-matrix.md](s3-compatibility-matrix.md)
 - [s3-tables-support-matrix.md](s3-tables-support-matrix.md)
+- [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md)
+- [minio-file-format-compat.md](minio-file-format-compat.md)
 
 ## Inventories & baselines (snapshots that feed migration work)
 
