@@ -111,6 +111,15 @@ pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY: bool = false;
 // Compile-time invariant: dual-write by default so the base build is byte-for-byte legacy behavior.
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY);
 
+/// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
+/// P3 observability).
+///
+/// A peer accrues a failure on each dial failure or RPC-triggered connection eviction, and flips
+/// back online on the next successful dial. Drives the `rustfs_cluster_servers_offline_total` gauge
+/// (parity with MinIO's `minio_cluster_servers_offline_total`). Clamped to at least 1. Defaults to 3.
+pub const ENV_INTERNODE_OFFLINE_FAILURE_THRESHOLD: &str = "RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD";
+pub const DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD: u32 = 3;
+
 // ── Control/bulk channel isolation (P1) ──
 // Large `bytes`-carrying unary RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion) otherwise
 // share the control-plane HTTP/2 connection with latency-sensitive lock/health RPCs; a large
@@ -219,6 +228,12 @@ mod tests {
     fn internode_msgpack_only_env_name_is_stable() {
         // The dual-write-by-default invariant is asserted at compile time next to the definition.
         assert_eq!(ENV_INTERNODE_RPC_MSGPACK_ONLY, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY");
+    }
+
+    #[test]
+    fn internode_offline_failure_threshold_defaults_and_env_name() {
+        assert_eq!(DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD, 3);
+        assert_eq!(ENV_INTERNODE_OFFLINE_FAILURE_THRESHOLD, "RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD");
     }
 
     #[test]

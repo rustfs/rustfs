@@ -151,6 +151,15 @@ pub fn internode_rpc_msgpack_only() -> bool {
     )
 }
 
+/// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
+/// P3). Drives the `rustfs_cluster_servers_offline_total` gauge.
+fn internode_offline_failure_threshold() -> u32 {
+    rustfs_utils::get_env_u32(
+        rustfs_config::ENV_INTERNODE_OFFLINE_FAILURE_THRESHOLD,
+        rustfs_config::DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD,
+    )
+}
+
 /// Class of internode gRPC channel used to route an RPC (grpc-optimization P1).
 ///
 /// - [`ChannelClass::Control`]: latency-sensitive control-plane RPCs (locks, health, small
@@ -317,10 +326,14 @@ async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<Channel, Box<
     let channel = match connector.connect().await {
         Ok(channel) => {
             runtime_sources::record_grpc_dial_result(dial_started_at.elapsed(), true);
+            // A successful dial marks the peer online (grpc-optimization P3). Keyed by the real
+            // peer address, so control and bulk channels to one peer share health state.
+            runtime_sources::record_peer_reachable(dial_addr);
             channel
         }
         Err(err) => {
             runtime_sources::record_grpc_dial_result(dial_started_at.elapsed(), false);
+            runtime_sources::record_peer_unreachable(dial_addr, internode_offline_failure_threshold());
             return Err(err.into());
         }
     };
@@ -377,6 +390,10 @@ pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: Conne
     };
     evict_connection_with_log_level(addr, cache_log_level).await;
     TLS_GENERATION_CACHE.lock().await.remove(addr);
+
+    // An RPC-triggered eviction is a peer-failure signal; feed it into the online/offline state so
+    // the peer flips offline after enough consecutive failures (grpc-optimization P3).
+    runtime_sources::record_peer_unreachable(addr, internode_offline_failure_threshold());
 
     // A peer failure typically affects every channel to that peer, so also drop any isolated
     // bulk channels rather than leaving a half-dead connection cached. Round-robin selection

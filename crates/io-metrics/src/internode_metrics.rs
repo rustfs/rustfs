@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use metrics::{counter, gauge};
+use std::collections::HashMap;
 use std::sync::{
-    Arc, LazyLock,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -430,6 +431,69 @@ pub fn global_internode_metrics() -> &'static Arc<InternodeMetrics> {
     &GLOBAL_INTERNODE_METRICS
 }
 
+// ── Cluster peer online/offline health (grpc-optimization P3) ──
+// Tracks reachability of each internode peer and exposes the count of offline peers as a gauge,
+// for parity with MinIO's `minio_cluster_servers_offline_total`. This is pure observability: it
+// does not change peer selection or quorum. A peer flips offline after a configured number of
+// consecutive failures and back online on the next successful dial.
+
+/// Gauge: number of internode peers currently considered offline.
+const CLUSTER_SERVERS_OFFLINE_TOTAL: &str = "rustfs_cluster_servers_offline_total";
+
+#[derive(Debug)]
+struct PeerHealthState {
+    online: bool,
+    consecutive_failures: u32,
+}
+
+impl Default for PeerHealthState {
+    fn default() -> Self {
+        // A newly observed peer is assumed online until it accrues failures.
+        Self {
+            online: true,
+            consecutive_failures: 0,
+        }
+    }
+}
+
+static CLUSTER_PEER_HEALTH: LazyLock<Mutex<HashMap<String, PeerHealthState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn publish_offline_gauge(peers: &HashMap<String, PeerHealthState>) {
+    let offline = peers.values().filter(|peer| !peer.online).count();
+    gauge!(CLUSTER_SERVERS_OFFLINE_TOTAL).set(offline as f64);
+}
+
+/// Record that a cluster peer is reachable: mark it online and reset its consecutive-failure
+/// counter. Called on a successful dial to `addr`.
+pub fn record_peer_reachable(addr: &str) {
+    let Ok(mut peers) = CLUSTER_PEER_HEALTH.lock() else {
+        return;
+    };
+    let entry = peers.entry(addr.to_string()).or_default();
+    entry.online = true;
+    entry.consecutive_failures = 0;
+    publish_offline_gauge(&peers);
+}
+
+/// Record a failed interaction with a cluster peer (dial failure or RPC-triggered eviction). After
+/// `failure_threshold` (>= 1) consecutive failures the peer flips offline.
+pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
+    let Ok(mut peers) = CLUSTER_PEER_HEALTH.lock() else {
+        return;
+    };
+    let entry = peers.entry(addr.to_string()).or_default();
+    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+    if entry.consecutive_failures >= failure_threshold.max(1) {
+        entry.online = false;
+    }
+    publish_offline_gauge(&peers);
+}
+
+#[cfg(test)]
+fn cluster_peer_online(addr: &str) -> Option<bool> {
+    CLUSTER_PEER_HEALTH.lock().ok()?.get(addr).map(|peer| peer.online)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +645,38 @@ mod tests {
         let metrics = InternodeMetrics::default();
         metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
         metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+    }
+
+    #[test]
+    fn cluster_peer_flips_offline_after_threshold_and_back_online() {
+        // Unique addr keeps this independent of the process-global registry / other tests.
+        let addr = "http://cluster-peer-health-unit-test:9000";
+        assert_eq!(cluster_peer_online(addr), None);
+
+        record_peer_unreachable(addr, 3);
+        record_peer_unreachable(addr, 3);
+        assert_eq!(cluster_peer_online(addr), Some(true), "still online below threshold");
+
+        record_peer_unreachable(addr, 3);
+        assert_eq!(cluster_peer_online(addr), Some(false), "offline at threshold");
+
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_online(addr), Some(true), "back online after a reachable dial");
+    }
+
+    #[test]
+    fn cluster_peer_threshold_is_clamped_to_at_least_one() {
+        let addr = "http://cluster-peer-health-clamp-test:9000";
+        // A zero threshold must not mean "never offline"; one failure suffices.
+        record_peer_unreachable(addr, 0);
+        assert_eq!(cluster_peer_online(addr), Some(false));
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_online(addr), Some(true));
+    }
+
+    #[test]
+    fn cluster_servers_offline_total_name_is_stable() {
+        assert_eq!(CLUSTER_SERVERS_OFFLINE_TOTAL, "rustfs_cluster_servers_offline_total");
     }
 
     #[test]
