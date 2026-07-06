@@ -609,6 +609,17 @@ impl SetDisks {
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
 
+        // Pipeline prefetch (backlog#870): while the current part decodes and
+        // streams out, the next part's bitrot reader setup (file opens +
+        // read-quorum wait across all disks) runs concurrently, so multipart
+        // reads no longer serialize setup latency between parts. Depth is one
+        // part; shared inputs move behind Arc so the prefetch task is 'static.
+        let use_mmap_read = object_mmap_read_enabled();
+        let files = Arc::new(files);
+        let disks = Arc::new(disks);
+        let prefetch_enabled = is_multipart_reader_setup_prefetch_enabled();
+        let mut prefetched: Option<(usize, PrefetchedReaderSetup)> = None;
+
         let mut total_read = 0;
         for current_part in part_indices {
             if total_read == length {
@@ -649,43 +660,97 @@ impl SetDisks {
                 "Streaming multipart part"
             );
 
-            let checksum_info = fi.erasure.get_checksum_info(part_number);
-            let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-                HashAlgorithm::HighwayHash256SLegacy
-            } else {
-                checksum_info.algorithm
-            };
+            let checksum_algo = multipart_part_checksum_algo(&fi, part_number);
             let read_length = till_offset.saturating_sub(read_offset);
 
-            let use_mmap_read = object_mmap_read_enabled();
-
-            let reader_setup_stage_start = Instant::now();
             let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
-            let reader_setup = create_bitrot_readers_until_quorum_with_preference(
-                &files,
-                &disks,
-                bucket,
-                object,
+            let sync_spec = PartReaderSetupSpec {
                 part_number,
                 read_offset,
                 read_length,
-                erasure.shard_size(),
                 checksum_algo,
-                skip_verify_bitrot,
-                use_mmap_read,
-                erasure.data_shards,
-                erasure.parity_shards,
-                BitrotReaderSetupMode::ReadQuorum,
-                prefer_data_blocks_first_reader_setup,
-                None,
-                Some(BitrotReaderSetupAttribution {
-                    path: metrics_path,
-                    object_class: metrics_object_class,
-                    size_bucket: metrics_size_bucket,
-                }),
-            )
-            .await;
-            let reader_setup_elapsed = reader_setup_stage_start.elapsed();
+            };
+            let mut setup_result = None;
+            if let Some((prefetched_part, handle)) = prefetched.take() {
+                if prefetched_part == current_part {
+                    setup_result = handle.join().await;
+                    if setup_result.is_none() {
+                        warn!(
+                            bucket,
+                            object,
+                            part_index = current_part,
+                            "Multipart reader-setup prefetch task did not complete; retrying synchronously"
+                        );
+                    }
+                }
+                // A stale prefetch guard is dropped here, aborting its task.
+            }
+            let (reader_setup, reader_setup_elapsed) = match setup_result {
+                Some(result) => result,
+                None => {
+                    setup_multipart_part_readers(
+                        &files,
+                        &disks,
+                        bucket,
+                        object,
+                        sync_spec,
+                        erasure.shard_size(),
+                        erasure.data_shards,
+                        erasure.parity_shards,
+                        skip_verify_bitrot,
+                        use_mmap_read,
+                        prefer_data_blocks_first_reader_setup,
+                        metrics_path,
+                        metrics_object_class,
+                        metrics_size_bucket,
+                    )
+                    .await
+                }
+            };
+
+            // Kick off the next part's reader setup before decoding this one
+            // so the disk opens overlap with decode + client writeback
+            // (backlog#870).
+            let remaining_after_current = length - total_read - part_length;
+            if prefetch_enabled && remaining_after_current > 0 && current_part < last_part_index {
+                let next_part = current_part + 1;
+                let next_number = fi.parts[next_part].number;
+                let next_size = fi.parts[next_part].size;
+                let next_length = next_size.min(remaining_after_current);
+                let spec = PartReaderSetupSpec {
+                    part_number: next_number,
+                    read_offset: 0,
+                    read_length: erasure.shard_file_offset(0, next_length, next_size),
+                    checksum_algo: multipart_part_checksum_algo(&fi, next_number),
+                };
+                let files = Arc::clone(&files);
+                let disks = Arc::clone(&disks);
+                let bucket = bucket.to_owned();
+                let object = object.to_owned();
+                let shard_size = erasure.shard_size();
+                let data_shards = erasure.data_shards;
+                let parity_shards = erasure.parity_shards;
+                let handle = tokio::task::spawn(async move {
+                    setup_multipart_part_readers(
+                        &files,
+                        &disks,
+                        &bucket,
+                        &object,
+                        spec,
+                        shard_size,
+                        data_shards,
+                        parity_shards,
+                        skip_verify_bitrot,
+                        use_mmap_read,
+                        prefer_data_blocks_first_reader_setup,
+                        metrics_path,
+                        metrics_object_class,
+                        metrics_size_bucket,
+                    )
+                    .await
+                });
+                prefetched = Some((next_part, PrefetchedReaderSetup::new(handle)));
+            }
             rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
                 metrics_path,
@@ -1206,6 +1271,101 @@ impl SetDisks {
         Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
             coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
         )))
+    }
+}
+
+/// Per-part parameters for a multipart bitrot reader setup.
+struct PartReaderSetupSpec {
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    checksum_algo: HashAlgorithm,
+}
+
+/// Resolve the bitrot checksum algorithm for one part, honoring the legacy
+/// HighwayHash flag.
+fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgorithm {
+    let checksum_info = fi.erasure.get_checksum_info(part_number);
+    if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+        HashAlgorithm::HighwayHash256SLegacy
+    } else {
+        checksum_info.algorithm
+    }
+}
+
+/// Run one part's bitrot reader setup and measure its wall-clock duration.
+///
+/// Shared by the synchronous path and the prefetch task in
+/// `get_object_with_fileinfo` (backlog#870) so both report the same
+/// stage-duration semantics.
+#[allow(clippy::too_many_arguments)]
+async fn setup_multipart_part_readers(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    spec: PartReaderSetupSpec,
+    shard_size: usize,
+    data_shards: usize,
+    parity_shards: usize,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    prefer_data_blocks_first: bool,
+    metrics_path: &'static str,
+    metrics_object_class: &'static str,
+    metrics_size_bucket: &'static str,
+) -> (BitrotReaderSetup, Duration) {
+    let started = Instant::now();
+    let setup = create_bitrot_readers_until_quorum_with_preference(
+        files,
+        disks,
+        bucket,
+        object,
+        spec.part_number,
+        spec.read_offset,
+        spec.read_length,
+        shard_size,
+        spec.checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        BitrotReaderSetupMode::ReadQuorum,
+        prefer_data_blocks_first,
+        None,
+        Some(BitrotReaderSetupAttribution {
+            path: metrics_path,
+            object_class: metrics_object_class,
+            size_bucket: metrics_size_bucket,
+        }),
+    )
+    .await;
+    (setup, started.elapsed())
+}
+
+/// Guard around an in-flight prefetch of the next part's reader setup
+/// (backlog#870). Dropping the guard without consuming it aborts the task so
+/// error returns and early breaks stop the background disk IO.
+struct PrefetchedReaderSetup(Option<tokio::task::JoinHandle<(BitrotReaderSetup, Duration)>>);
+
+impl PrefetchedReaderSetup {
+    fn new(handle: tokio::task::JoinHandle<(BitrotReaderSetup, Duration)>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Wait for the prefetch to finish; `None` means the task was cancelled
+    /// or panicked and the caller must set up synchronously.
+    async fn join(mut self) -> Option<(BitrotReaderSetup, Duration)> {
+        let handle = self.0.take()?;
+        handle.await.ok()
+    }
+}
+
+impl Drop for PrefetchedReaderSetup {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
     }
 }
 
