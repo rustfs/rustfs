@@ -231,26 +231,95 @@ jobs:
 
       - name: Download static console assets
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           mkdir -p ./rustfs/static
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            if curl.exe --fail -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300; then
-              unzip -o console.zip -d ./rustfs/static
-              rm console.zip
+
+          verify_sha256() {
+            local expected="$1"
+            local file="$2"
+
+            if command -v sha256sum >/dev/null 2>&1; then
+              printf '%s  %s\n' "$expected" "$file" | sha256sum -c -
+            elif command -v shasum >/dev/null 2>&1; then
+              printf '%s  %s\n' "$expected" "$file" | shasum -a 256 -c -
             else
-              echo "Warning: Failed to download console assets, continuing without them"
-              echo "// Static assets not available" > ./rustfs/static/empty.txt
+              echo "No SHA-256 verification tool found" >&2
+              return 1
             fi
+          }
+
+          download_console_assets() {
+            local curl_bin="curl"
+            local python_bin="python3"
+            local console_api="https://api.github.com/repos/rustfs/console/releases/latest"
+            local console_json="console-release.json"
+            local console_url
+            local console_sha256
+            local curl_auth_args=()
+
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              curl_bin="curl.exe"
+            else
+              chmod +w ./rustfs/static/LICENSE || true
+            fi
+
+            if ! command -v "$python_bin" >/dev/null 2>&1; then
+              python_bin="python"
+            fi
+            if ! command -v "$python_bin" >/dev/null 2>&1; then
+              echo "No Python interpreter found for release metadata parsing" >&2
+              return 1
+            fi
+
+            if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+              curl_auth_args=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28")
+            fi
+
+            "$curl_bin" "${curl_auth_args[@]}" --fail -L "$console_api" \
+              -o "$console_json" --retry 3 --retry-delay 5 --max-time 300 || return 1
+
+            read -r console_url console_sha256 < <("$python_bin" - "$console_json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              release = json.load(handle)
+
+          for asset in release.get("assets", []):
+              name = asset.get("name", "")
+              digest = asset.get("digest", "")
+              url = asset.get("browser_download_url", "")
+              if name.startswith("rustfs-console-") and name.endswith(".zip") and digest.startswith("sha256:") and url:
+                  print(url, digest.split(":", 1)[1])
+                  break
+          else:
+              raise SystemExit("no console zip asset with sha256 digest found")
+          PY
+            ) || return 1
+
+            if [[ -z "$console_url" || -z "$console_sha256" ]]; then
+              echo "Console release metadata is missing URL or SHA-256 digest" >&2
+              return 1
+            fi
+
+            "$curl_bin" --fail -L "$console_url" -o console.zip --retry 3 --retry-delay 5 --max-time 300 || return 1
+            verify_sha256 "$console_sha256" console.zip || return 2
+            unzip -o console.zip -d ./rustfs/static || return 2
+          }
+
+          if download_console_assets; then
+            rm -f console.zip console-release.json
           else
-            chmod +w ./rustfs/static/LICENSE || true
-            if curl --fail -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
-              -o console.zip --retry 3 --retry-delay 5 --max-time 300; then
-              unzip -o console.zip -d ./rustfs/static
-              rm console.zip
-            else
-              echo "Warning: Failed to download console assets, continuing without them"
-              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            status=$?
+            rm -f console.zip console-release.json
+            if [[ "$status" -eq 2 ]]; then
+              echo "Console asset integrity verification failed" >&2
+              exit 1
             fi
+            echo "Warning: Failed to download verified console assets, continuing without them"
+            echo "// Static assets not available" > ./rustfs/static/empty.txt
           fi
 
       - name: Build RustFS
@@ -765,8 +834,10 @@ jobs:
           OSSUTIL_VERSION="2.1.1"
           OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
           OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-amd64"
+          OSSUTIL_SHA256="60f3a808cbbdfd4b5269b8f967c6a66f564c9dacff52d93a5d21a588976ab5a2"
 
-          curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          curl --fail -L -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          printf '%s  %s\n' "$OSSUTIL_SHA256" "$OSSUTIL_ZIP" | sha256sum -c -
           unzip "$OSSUTIL_ZIP"
           OSSUTIL_BIN="${RUNNER_TEMP}/ossutil"
           mv "${OSSUTIL_DIR}/ossutil" "$OSSUTIL_BIN"
