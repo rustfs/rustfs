@@ -557,7 +557,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     /// Delete a volume (bucket directory). When `force_delete` is false a
     /// non-empty volume is refused with `VolumeNotEmpty` (non-recursive); when
     /// true it is removed recursively. Callers on the heal/dangling path must
-    /// pass false so a mis-classified bucket that still holds data cannot be
+    /// pass false so a misclassified bucket that still holds data cannot be
     /// wiped (backlog#799 B1).
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()>;
 

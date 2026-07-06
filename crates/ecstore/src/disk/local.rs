@@ -4369,7 +4369,7 @@ impl DiskAPI for LocalDisk {
 
         // Non-force is non-recursive: `remove_dir` (rmdir) fails atomically with
         // `DirectoryNotEmpty` -> VolumeNotEmpty if the bucket still holds any
-        // object data, so a mis-classified "dangling" bucket on the heal path
+        // object data, so a misclassified "dangling" bucket on the heal path
         // (or a non-force S3 DeleteBucket on a populated bucket) can never be
         // recursively wiped. Only an explicit `force_delete` (e.g. S3 force
         // bucket delete) removes recursively. Mirrors MinIO's
@@ -5892,7 +5892,7 @@ mod test {
     async fn delete_volume_non_force_refuses_non_empty_bucket() {
         // backlog#799 B1: a non-force delete_volume must refuse a bucket that
         // still holds object data (VolumeNotEmpty) and leave it intact, so a
-        // mis-classified "dangling" bucket cannot be recursively wiped. Only an
+        // misclassified "dangling" bucket cannot be recursively wiped. Only an
         // explicit force delete removes it recursively.
         let test_dir = "./test_b1_delete_volume_guard";
         let _ = fs::remove_dir_all(&test_dir).await;

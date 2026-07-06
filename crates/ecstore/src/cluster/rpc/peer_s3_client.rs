@@ -1041,7 +1041,7 @@ pub(crate) async fn heal_bucket_local_on_disks(
                     Some(disk) => {
                         // Non-force: a bucket that still holds object data refuses
                         // deletion (VolumeNotEmpty) instead of being recursively
-                        // wiped, so a mis-classified "dangling" bucket cannot lose
+                        // wiped, so a misclassified "dangling" bucket cannot lose
                         // data (backlog#799 B1). Surface that refusal instead of
                         // discarding it — it signals the bucket is not dangling.
                         match disk.delete_volume(&bucket, false).await {
