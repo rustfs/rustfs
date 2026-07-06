@@ -220,6 +220,18 @@ fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool 
     opts.versioned && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
 }
 
+/// Whether a delete-time lookup miss on a directory key should trigger an orphan
+/// empty-directory tree purge (issue #4189).
+///
+/// The lookup surfaces *version*-not-found here, not object-not-found: `del_opts`
+/// pins `version_id = Uuid::nil()` for directory keys, so a missing dir object fails
+/// the specific-version lookup. Both misses must be accepted, otherwise the real
+/// HTTP delete path (which always sets the nil version) never reaches the purge and
+/// the ghost folder survives with a fake 204 — the exact #4189 symptom.
+fn should_purge_orphan_dir_on_missing(err: &Error, object: &str) -> bool {
+    (is_err_object_not_found(err) || is_err_version_not_found(err)) && rustfs_utils::path::is_dir_object(object)
+}
+
 fn version_aware_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
     let mut lookup_opts = opts.clone();
     lookup_opts.no_lock = no_lock;
@@ -957,10 +969,7 @@ impl ECStore {
                 // disk as an orphan empty-directory tree (issue #4189): listings show
                 // it as a common prefix, but no regular delete path can remove it.
                 // Purge the orphan tree so folder deletes actually take effect.
-                if is_err_object_not_found(&err)
-                    && rustfs_utils::path::is_dir_object(object)
-                    && self.purge_orphan_dir_object(bucket, object).await
-                {
+                if should_purge_orphan_dir_on_missing(&err, object) && self.purge_orphan_dir_object(bucket, object).await {
                     return Ok(ObjectInfo {
                         bucket: bucket.to_owned(),
                         name: decode_dir_object(object),
@@ -1773,6 +1782,43 @@ mod tests {
         assert!(!should_create_delete_marker_for_missing_object(&version_delete));
         assert!(!should_create_delete_marker_for_missing_object(&delete_marker_replication));
         assert!(!should_create_delete_marker_for_missing_object(&data_movement));
+    }
+
+    // issue #4189 regression: `del_opts` pins `version_id = Uuid::nil()` on directory
+    // keys, so deleting a ghost folder over HTTP fails the lookup with *version*-not-found
+    // (not object-not-found). The orphan-purge guard must accept both misses, or the
+    // ghost tree survives behind a fake 204 — the exact reported symptom.
+    #[test]
+    fn should_purge_orphan_dir_on_version_not_found_for_dir_key() {
+        assert!(
+            should_purge_orphan_dir_on_missing(&StorageError::FileVersionNotFound, "ghost/"),
+            "the real HTTP delete path yields version-not-found on dir keys and must reach the purge"
+        );
+        assert!(
+            should_purge_orphan_dir_on_missing(
+                &StorageError::VersionNotFound("bucket".into(), "ghost/".into(), Uuid::nil().to_string()),
+                "ghost/"
+            ),
+            "typed VersionNotFound on a dir key must also reach the purge"
+        );
+    }
+
+    #[test]
+    fn should_purge_orphan_dir_on_object_not_found_for_dir_key() {
+        assert!(should_purge_orphan_dir_on_missing(&StorageError::FileNotFound, "ghost/"));
+        assert!(should_purge_orphan_dir_on_missing(
+            &StorageError::ObjectNotFound("bucket".into(), "ghost/".into()),
+            "ghost/"
+        ));
+    }
+
+    #[test]
+    fn should_not_purge_orphan_dir_for_regular_key_or_other_errors() {
+        // A regular (non-directory) key must never trigger a prefix purge, even on a miss.
+        assert!(!should_purge_orphan_dir_on_missing(&StorageError::FileVersionNotFound, "regular.txt"));
+        assert!(!should_purge_orphan_dir_on_missing(&StorageError::FileNotFound, "regular.txt"));
+        // Non-miss errors (e.g. quorum failures) must not be masked by a purge attempt.
+        assert!(!should_purge_orphan_dir_on_missing(&StorageError::ErasureReadQuorum, "ghost/"));
     }
 
     #[test]
