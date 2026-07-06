@@ -24,6 +24,7 @@ pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
 pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
+pub const INTERNODE_OPERATION_GRPC_READ_MULTIPLE: &str = "grpc_read_multiple";
 pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
 pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
 pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
@@ -47,6 +48,8 @@ const INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL: &str = "rustfs_system_network_int
 const INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL: &str = "rustfs_system_network_internode_operation_stall_timeouts_total";
 const INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL: &str =
     "rustfs_system_network_internode_operation_write_shutdown_errors_total";
+const INTERNODE_OPERATION_PAYLOAD_BYTES: &str = "rustfs_system_network_internode_operation_payload_bytes";
+const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_internode_operation_large_payloads_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +115,14 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
     InternodeOperationMetricDescriptor {
         name: ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
         labels: QUORUM_FAILURE_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_PAYLOAD_BYTES,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
     },
 ];
 
@@ -315,6 +326,22 @@ impl InternodeMetrics {
             .increment(1);
     }
 
+    /// Record the payload size (bytes) of a completed internode operation into a histogram
+    /// keyed by operation+backend. Used to size which unary `bytes`-carrying RPCs
+    /// (`ReadAll`/`ReadMultiple`/`WriteAll`) would benefit from being moved off the shared
+    /// control-plane channel (see docs/grpc-optimization P1).
+    pub fn record_operation_payload_bytes(&self, operation: &'static str, backend: &'static str, bytes: usize) {
+        metrics::histogram!(INTERNODE_OPERATION_PAYLOAD_BYTES, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
+            .record(bytes as f64);
+    }
+
+    /// Increment the large-payload counter for an operation+backend whose payload exceeded the
+    /// caller-configured warning threshold. Feeds alerting on large unary RPCs that contend with
+    /// latency-sensitive control-plane traffic on the shared connection.
+    pub fn record_large_operation_payload(&self, operation: &'static str, backend: &'static str) {
+        counter!(INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+    }
+
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
@@ -450,7 +477,7 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 13);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 15);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
         }
@@ -465,6 +492,9 @@ mod tests {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
         }
         assert_eq!(INTERNODE_OPERATION_METRICS[12].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        // Payload histogram + large-payload counter carry operation+backend labels.
+        assert_eq!(INTERNODE_OPERATION_METRICS[13].labels, &[OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[14].labels, &[OPERATION_LABEL, BACKEND_LABEL]);
     }
 
     #[test]
@@ -511,6 +541,15 @@ mod tests {
             INTERNODE_OPERATION_METRICS[12].name,
             "rustfs_system_storage_erasure_write_quorum_failures_total"
         );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[13].name,
+            "rustfs_system_network_internode_operation_payload_bytes"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[14].name,
+            "rustfs_system_network_internode_operation_large_payloads_total"
+        );
+        assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
     }
 
     #[test]

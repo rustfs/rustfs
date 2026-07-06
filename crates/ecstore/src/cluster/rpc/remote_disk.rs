@@ -838,6 +838,17 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Res
     serde_json::from_str(json).map_err(Error::from)
 }
 
+/// Aggregate encoded size (bytes) of a `ReadMultiple` response, preferring the msgpack payloads
+/// and falling back to the JSON compatibility strings. Used to size the RPC for the payload
+/// histogram / large-payload alerting (grpc-optimization P0 instrumentation).
+fn read_multiple_response_payload_len(response: &ReadMultipleResponse) -> usize {
+    if !response.read_multiple_resps_bin.is_empty() {
+        response.read_multiple_resps_bin.iter().map(|buf| buf.len()).sum()
+    } else {
+        response.read_multiple_resps.iter().map(|item| item.len()).sum()
+    }
+}
+
 fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint: &Endpoint) -> Result<Vec<ReadMultipleResp>> {
     if !response.read_multiple_resps_bin.is_empty() {
         if !response.read_multiple_resps.is_empty()
@@ -2260,6 +2271,10 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_multiple_recv_bytes(
+                    read_multiple_response_payload_len(&response),
+                );
+
                 let read_multiple_resps = decode_read_multiple_response_items(response, &self.endpoint)?;
 
                 Ok(read_multiple_resps)
@@ -2648,6 +2663,34 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].file, "json");
         assert_eq!(decoded[0].data, b"fallback");
+    }
+
+    #[test]
+    fn read_multiple_response_payload_len_prefers_msgpack_and_falls_back_to_json() {
+        let bin_a = encode_msgpack(&sample_read_multiple_resp("a", b"binary")).expect("msgpack should encode");
+        let bin_b = encode_msgpack(&sample_read_multiple_resp("b", b"more")).expect("msgpack should encode");
+        let json = serde_json::to_string(&sample_read_multiple_resp("j", b"fallback")).expect("json should encode");
+
+        // When msgpack bins are present, the length is their aggregate size (JSON strings ignored).
+        let with_bin = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![json.clone()],
+            read_multiple_resps_bin: vec![bin_a.clone().into(), bin_b.clone().into()],
+            error: None,
+        };
+        assert_eq!(read_multiple_response_payload_len(&with_bin), bin_a.len() + bin_b.len());
+
+        // With no msgpack bins, the JSON compatibility strings are summed instead.
+        let json_only = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![json.clone()],
+            read_multiple_resps_bin: Vec::new(),
+            error: None,
+        };
+        assert_eq!(read_multiple_response_payload_len(&json_only), json.len());
+
+        // An empty response has zero payload.
+        assert_eq!(read_multiple_response_payload_len(&ReadMultipleResponse::default()), 0);
     }
 
     #[test]

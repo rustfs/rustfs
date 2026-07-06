@@ -39,6 +39,64 @@ pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
 pub const ENV_INTERNODE_RPC_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS";
 pub const DEFAULT_INTERNODE_RPC_TIMEOUT_SECS: u64 = 30;
 
+// ── Client-side internode gRPC channel tuning (P0) ──
+// These mirror the server-side HTTP/2 transport tuning in `rustfs/src/server/http.rs`
+// on the *client* `tonic` `Endpoint` used for internode control-plane RPCs. Prior to
+// this, the client channel only set timeouts/keepalive, leaving Nagle enabled and the
+// default 64KiB HTTP/2 window in place — hurting small lock-RPC latency and large
+// metadata-response throughput respectively.
+
+/// Disable Nagle's algorithm on internode gRPC client sockets.
+///
+/// Latency-sensitive control-plane RPCs (locks, health, small metadata) send tiny
+/// frames; Nagle batching adds avoidable delay. Defaults to `true` (nodelay on),
+/// matching the server socket configuration.
+pub const ENV_INTERNODE_RPC_TCP_NODELAY: &str = "RUSTFS_INTERNODE_RPC_TCP_NODELAY";
+pub const DEFAULT_INTERNODE_RPC_TCP_NODELAY: bool = true;
+
+// Compile-time invariant: nodelay defaults on so latency-sensitive control-plane RPCs are not
+// batched by Nagle, matching the server socket configuration.
+const _: () = assert!(DEFAULT_INTERNODE_RPC_TCP_NODELAY);
+
+/// HTTP/2 initial stream window size (bytes) for internode gRPC client channels.
+///
+/// The library default (64KiB) throttles larger unary responses (e.g. `ReadMultiple`,
+/// `BatchReadVersion`) by the bandwidth-delay product. Set to 0 to fall back to the
+/// `tonic`/`hyper` default. Defaults to 1MiB.
+pub const ENV_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE";
+pub const DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE: u32 = 1024 * 1024;
+
+/// HTTP/2 initial connection window size (bytes) for internode gRPC client channels.
+///
+/// Should be >= the stream window so multiple concurrent streams are not starved by the
+/// connection-level flow-control window. Set to 0 to fall back to the library default.
+/// Defaults to 2MiB.
+pub const ENV_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE";
+pub const DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
+
+// Compile-time invariant: the connection-level window must be >= the per-stream window, or
+// concurrent streams would be starved by the connection-level flow-control budget.
+const _: () = assert!(DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE >= DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE);
+
+/// Maximum encoded message size (bytes) for internode gRPC, applied to both the client
+/// `NodeServiceClient` and the server `NodeServiceServer`.
+///
+/// Without this, `tonic`'s default 4MiB decode limit silently caps `bytes`-carrying
+/// unary RPCs (`ReadAll`/`WriteAll`/`ReadMultiple`/`BatchReadVersion`); a large multi-version
+/// `xl.meta` or an aggregated response then fails with `out_of_range`. The default comes
+/// from `rustfs_protos::DEFAULT_GRPC_SERVER_MESSAGE_LEN` (100MiB) at the call sites.
+pub const ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE: &str = "RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE";
+
+/// Payload-size threshold (bytes) above which a unary internode gRPC response counts as a
+/// "large payload" for alerting.
+///
+/// Large `ReadAll`/`ReadMultiple` responses share the control-plane channel with
+/// latency-sensitive lock/health RPCs and can head-of-line block them (see grpc-optimization
+/// G2). This threshold drives the `rustfs_system_network_internode_operation_large_payloads_total`
+/// counter so operators can size which paths need channel isolation in P1. Defaults to 8MiB.
+pub const ENV_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: &str = "RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES";
+pub const DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: usize = 8 * 1024 * 1024;
+
 /// Profile selector for conservative internode HTTP data-plane client tuning.
 pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";
 pub const DEFAULT_INTERNODE_HTTP_TUNING_PROFILE: &str = "legacy";
@@ -83,6 +141,30 @@ mod tests {
         assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS, 20);
         assert_eq!(DEFAULT_INTERNODE_RPC_TIMEOUT_SECS, 30);
         assert_eq!(DEFAULT_INTERNODE_HTTP_TUNING_PROFILE, "legacy");
+    }
+
+    #[test]
+    fn internode_rpc_channel_tuning_defaults() {
+        assert_eq!(DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE, 1024 * 1024);
+        assert_eq!(DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE, 2 * 1024 * 1024);
+        // The nodelay-on and connection-window >= stream-window invariants are enforced at
+        // compile time next to the constant definitions.
+    }
+
+    #[test]
+    fn internode_rpc_channel_tuning_env_names_are_stable() {
+        assert_eq!(ENV_INTERNODE_RPC_TCP_NODELAY, "RUSTFS_INTERNODE_RPC_TCP_NODELAY");
+        assert_eq!(
+            ENV_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE,
+            "RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE"
+        );
+        assert_eq!(ENV_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE, "RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE");
+        assert_eq!(ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, "RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE");
+        assert_eq!(
+            ENV_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES,
+            "RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES"
+        );
+        assert_eq!(DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES, 8 * 1024 * 1024);
     }
 
     #[test]

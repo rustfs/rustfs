@@ -43,7 +43,10 @@ pub async fn node_service_time_out_client(
         }
     };
 
-    Ok(NodeServiceClient::with_interceptor(channel, interceptor))
+    let max_message_size = rustfs_protos::internode_rpc_max_message_size();
+    Ok(NodeServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size))
 }
 
 pub async fn node_service_time_out_client_no_auth(

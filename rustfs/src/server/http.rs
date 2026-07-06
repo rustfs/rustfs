@@ -69,6 +69,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Status};
 use tower::{Service, ServiceBuilder};
 use tower_http::add_extension::AddExtensionLayer;
@@ -1047,7 +1048,19 @@ fn process_connection(
         // Note: NodeService is not Clone (holds LocalPeerS3Client), and the SwiftService
         // type is feature-gated, so we cannot pre-build the full hybrid service.
         // The construction cost is negligible (struct wrapping only, no I/O).
-        let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
+        // Align the server codec limit with the client (both default to
+        // `DEFAULT_GRPC_SERVER_MESSAGE_LEN`, 100 MiB) so `bytes`-carrying unary RPCs are not
+        // capped by tonic's 4 MiB default. Env-overridable via RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE.
+        // The codec size limits live on `NodeServiceServer`, so set them before wrapping the
+        // service in the auth interceptor (which returns an `InterceptedService` without those
+        // methods).
+        let rpc_max_message_size = rustfs_protos::internode_rpc_max_message_size();
+        let rpc_service = InterceptedService::new(
+            NodeServiceServer::new(make_server())
+                .max_decoding_message_size(rpc_max_message_size)
+                .max_encoding_message_size(rpc_max_message_size),
+            check_auth,
+        );
 
         #[cfg(feature = "swift")]
         let http_service = SwiftService::new(true, None, s3_service);

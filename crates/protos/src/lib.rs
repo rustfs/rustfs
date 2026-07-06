@@ -101,6 +101,44 @@ fn internode_rpc_timeout() -> Duration {
     ))
 }
 
+fn internode_rpc_tcp_nodelay() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_TCP_NODELAY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_TCP_NODELAY,
+    )
+}
+
+/// HTTP/2 initial stream window size for the client channel, or `None` to use the
+/// library default (a configured value of `0` opts out).
+fn internode_rpc_http2_stream_window() -> Option<u32> {
+    match rustfs_utils::get_env_u32(
+        rustfs_config::ENV_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE,
+        rustfs_config::DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE,
+    ) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
+/// HTTP/2 initial connection window size for the client channel, or `None` to use the
+/// library default (a configured value of `0` opts out).
+fn internode_rpc_http2_conn_window() -> Option<u32> {
+    match rustfs_utils::get_env_u32(
+        rustfs_config::ENV_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE,
+        rustfs_config::DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE,
+    ) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
+/// Maximum encoded/decoded internode gRPC message size (bytes), shared by the client
+/// `NodeServiceClient` and server `NodeServiceServer`. Defaults to
+/// [`DEFAULT_GRPC_SERVER_MESSAGE_LEN`] (100 MiB) when the env var is unset.
+pub fn internode_rpc_max_message_size() -> usize {
+    rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, DEFAULT_GRPC_SERVER_MESSAGE_LEN)
+}
+
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
 ///
 /// This function is designed to detect dead peers quickly using env-configurable
@@ -124,6 +162,8 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         .connect_timeout(connect_timeout)
         // TCP-level keepalive - OS will probe connection
         .tcp_keepalive(Some(tcp_keepalive))
+        // Disable Nagle so latency-sensitive control-plane RPCs (locks/health) are not batched
+        .tcp_nodelay(internode_rpc_tcp_nodelay())
         // HTTP/2 PING frames for application-layer health check
         .http2_keep_alive_interval(http2_keepalive_interval)
         // How long to wait for PING ACK before considering connection dead
@@ -132,6 +172,16 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         .keep_alive_while_idle(true)
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(rpc_timeout);
+
+    // Raise HTTP/2 flow-control windows above the 64KiB library default so larger unary
+    // responses (ReadMultiple/BatchReadVersion) are not throttled by the BDP. Mirrors the
+    // server-side window tuning in `rustfs/src/server/http.rs`.
+    if let Some(stream_window) = internode_rpc_http2_stream_window() {
+        connector = connector.initial_stream_window_size(stream_window);
+    }
+    if let Some(conn_window) = internode_rpc_http2_conn_window() {
+        connector = connector.initial_connection_window_size(conn_window);
+    }
 
     let outbound_tls = runtime_sources::outbound_tls_state().await;
     let generation = outbound_tls.generation.0;

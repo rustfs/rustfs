@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_OPERATION_PUT_FILE_STREAM,
-    INTERNODE_TRANSPORT_BACKEND_GRPC, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_GRPC, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+    global_internode_metrics,
 };
 
 #[cfg(test)]
@@ -70,6 +71,37 @@ pub(crate) fn record_remote_disk_grpc_read_all_recv_bytes(bytes: usize) {
         INTERNODE_TRANSPORT_BACKEND_GRPC,
         bytes,
     );
+    record_grpc_payload_size(INTERNODE_OPERATION_GRPC_READ_ALL, bytes);
+}
+
+pub(crate) fn record_remote_disk_grpc_read_multiple_recv_bytes(bytes: usize) {
+    global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        bytes,
+    );
+    record_grpc_payload_size(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, bytes);
+}
+
+/// Payload-size threshold (bytes) above which a unary internode gRPC response is counted as a
+/// "large payload" for alerting. Env-overridable via `RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES`.
+fn internode_rpc_large_payload_warn_bytes() -> usize {
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES,
+        rustfs_config::DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES,
+    )
+}
+
+/// Record the payload size of a completed unary gRPC RPC into the operation histogram, and
+/// flag it as a large payload when it crosses the configured threshold. This instrumentation
+/// sizes which `bytes`-carrying RPCs contend with latency-sensitive control-plane traffic on
+/// the shared channel, feeding the P1 channel-isolation decision (see docs/grpc-optimization).
+fn record_grpc_payload_size(operation: &'static str, bytes: usize) {
+    let metrics = global_internode_metrics();
+    metrics.record_operation_payload_bytes(operation, INTERNODE_TRANSPORT_BACKEND_GRPC, bytes);
+    if bytes >= internode_rpc_large_payload_warn_bytes() {
+        metrics.record_large_operation_payload(operation, INTERNODE_TRANSPORT_BACKEND_GRPC);
+    }
 }
 
 #[cfg(test)]
