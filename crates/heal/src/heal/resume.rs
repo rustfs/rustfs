@@ -168,6 +168,19 @@ impl ResumeState {
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
+    /// Reset per-pass progress so a retry re-scans the whole set from the
+    /// start. `retry_count`/`max_retries` are intentionally preserved so
+    /// retries stay bounded.
+    pub fn reset_for_retry(&mut self) {
+        self.completed_buckets.clear();
+        self.processed_objects = 0;
+        self.successful_objects = 0;
+        self.failed_objects = 0;
+        self.skipped_objects = 0;
+        self.completed = false;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
     pub fn set_error(&mut self, error: String) {
         self.error_message = Some(error);
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -331,6 +344,22 @@ impl ResumeManager {
         self.save_state().await
     }
 
+    /// Arm a bounded retry: if the retry budget remains, bump the retry
+    /// counter, reset per-pass progress (so the next resume re-scans the whole
+    /// set), persist, and return `true`. Returns `false` when retries are
+    /// exhausted, leaving the state untouched.
+    pub async fn schedule_retry(&self) -> Result<bool> {
+        let mut state = self.state.write().await;
+        if !state.can_retry() {
+            return Ok(false);
+        }
+        state.increment_retry();
+        state.reset_for_retry();
+        drop(state);
+        self.save_state().await?;
+        Ok(true)
+    }
+
     /// cleanup resume state
     pub async fn cleanup(&self) -> Result<()> {
         let state = self.state.read().await;
@@ -480,6 +509,15 @@ impl ResumeCheckpoint {
         self.skipped_objects.clear();
         self.failed_objects.clear();
     }
+
+    /// Reset the scan to the start and clear the per-object sets so a retry
+    /// re-scans the whole set.
+    pub fn reset_for_retry(&mut self) {
+        self.update_position(0, 0);
+        self.processed_objects.clear();
+        self.skipped_objects.clear();
+        self.failed_objects.clear();
+    }
 }
 
 /// resume checkpoint manager
@@ -557,6 +595,14 @@ impl CheckpointManager {
     pub async fn complete_page(&self, bucket_index: usize, object_index: usize) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.complete_page(bucket_index, object_index);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    /// Reset the checkpoint to the start of the scan for a retry, then persist.
+    pub async fn reset_for_retry(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.reset_for_retry();
         drop(checkpoint);
         self.save_checkpoint_throttled().await
     }
@@ -806,6 +852,56 @@ mod tests {
         state.total_objects = 100;
         let progress = state.get_progress_percentage();
         assert_eq!(progress, 10.0);
+    }
+
+    #[test]
+    fn reset_for_retry_clears_progress_but_keeps_retry_budget() {
+        // backlog#855 / #799 B6: a retry must re-scan from the start without
+        // spending the retry budget's identity.
+        let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
+        let mut state = ResumeState::new("t".to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
+        state.update_progress(10, 8, 2, 0);
+        state.complete_bucket("bucket1");
+        state.increment_retry();
+        state.mark_completed();
+
+        state.reset_for_retry();
+
+        assert!(!state.completed, "retry must un-complete the task");
+        assert_eq!(state.completed_buckets.len(), 0, "all buckets must be re-scanned");
+        assert_eq!(state.processed_objects, 0);
+        assert_eq!(state.successful_objects, 0);
+        assert_eq!(state.failed_objects, 0);
+        assert_eq!(state.skipped_objects, 0);
+        assert_eq!(state.retry_count, 1, "retry budget must be preserved");
+    }
+
+    #[test]
+    fn can_retry_is_bounded_by_max_retries() {
+        let mut state = ResumeState::new("t".to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), vec![]);
+        assert!(state.can_retry());
+        for _ in 0..state.max_retries {
+            assert!(state.can_retry());
+            state.increment_retry();
+        }
+        assert!(!state.can_retry(), "retries must stop after max_retries");
+    }
+
+    #[test]
+    fn checkpoint_reset_for_retry_rewinds_position_and_clears_sets() {
+        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
+        checkpoint.update_position(3, 42);
+        checkpoint.add_processed_object("bucket/a".to_string());
+        checkpoint.add_failed_object("bucket/b".to_string());
+        checkpoint.add_skipped_object("bucket/c".to_string());
+
+        checkpoint.reset_for_retry();
+
+        assert_eq!(checkpoint.current_bucket_index, 0);
+        assert_eq!(checkpoint.current_object_index, 0);
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
     }
 
     #[tokio::test]
