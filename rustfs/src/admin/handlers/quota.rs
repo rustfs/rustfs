@@ -15,6 +15,7 @@
 //! Quota admin handlers for HTTP API
 
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
+use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_bucket_metadata_handle, current_object_store_handle};
 use crate::admin::storage_api::bucket::metadata_sys::BucketMetadataSys;
@@ -24,6 +25,7 @@ use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -284,10 +286,34 @@ impl Operation for SetBucketQuotaHandler {
             .ok_or_else(|| s3_error!(InternalError, "{}", rustfs_config::QUOTA_METADATA_SYSTEM_ERROR_MSG))?;
         let mut quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        quota_checker
+        let updated_at = quota_checker
             .set_quota_config(&bucket, quota.clone())
             .await
             .map_err(|e| s3_error!(InternalError, "failed to set quota: {}", e))?;
+
+        if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
+            bucket: bucket.clone(),
+            r#type: "quota-config".to_string(),
+            quota: Some(
+                serde_json::to_value(&quota).map_err(|e| s3_error!(InternalError, "failed to encode quota payload: {}", e))?,
+            ),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                event = EVENT_ADMIN_QUOTA_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_QUOTA,
+                action = "set_bucket_quota",
+                bucket = %bucket,
+                state = "site_replication_hook_failed",
+                error = ?err,
+                "admin quota state"
+            );
+        }
 
         // Get real-time usage from data usage system
         let current_usage = current_usage_from_context(&bucket).await;
@@ -427,10 +453,34 @@ impl Operation for ClearBucketQuotaHandler {
 
         // Clear quota (set to None)
         let quota = BucketQuota::new(None);
-        quota_checker
+        let updated_at = quota_checker
             .set_quota_config(&bucket, quota.clone())
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear quota: {}", e))?;
+
+        if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
+            bucket: bucket.clone(),
+            r#type: "quota-config".to_string(),
+            quota: Some(
+                serde_json::to_value(&quota).map_err(|e| s3_error!(InternalError, "failed to encode quota payload: {}", e))?,
+            ),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                event = EVENT_ADMIN_QUOTA_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_QUOTA,
+                action = "clear_bucket_quota",
+                bucket = %bucket,
+                state = "site_replication_hook_failed",
+                error = ?err,
+                "admin quota state"
+            );
+        }
 
         info!(
             event = EVENT_ADMIN_QUOTA_STATE,

@@ -360,10 +360,40 @@ impl Operation for SetUserStatus {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        iam_store
-            .set_user_status(ak, status)
+        let updated_at = iam_store
+            .set_user_status(ak, status.clone())
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to set user status: {e}")))?;
+
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "iam-user".to_string(),
+            iam_user: Some(SRIAMUser {
+                access_key: ak.to_string(),
+                is_delete_req: false,
+                user_req: Some(AddOrUpdateUserReq {
+                    secret_key: String::new(),
+                    policy: None,
+                    status: status.clone(),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_USER,
+                event = EVENT_ADMIN_USER_STATE,
+                access_key = %ak,
+                action = "set_user_status",
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "admin user state"
+            );
+        }
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
