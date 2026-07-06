@@ -488,7 +488,7 @@ impl SetDisks {
                                     // Don't leak the partially-written healed shards in
                                     // .rustfs/tmp when heal fails midway (backlog#799 B20).
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
-                                    return Err(e.into());
+                                    return Err(e);
                                 }
                                 // close_bitrot_writers(&mut writers).await?;
 
