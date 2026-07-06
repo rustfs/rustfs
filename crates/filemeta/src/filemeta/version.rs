@@ -2467,7 +2467,11 @@ impl MetaDeleteMarker {
                     }
                 }
                 other => {
-                    return Err(Error::other(format!("unsupported field in MetaDeleteMarker: {other}")));
+                    // Skip unknown fields for forward compatibility, matching
+                    // MetaObject::decode_from. A newer writer's extra keys must not
+                    // break decoding of a delete marker (backlog#799 B17).
+                    tracing::debug!(field = %other, "MetaDeleteMarker::decode_from: skipping unknown field");
+                    skip_msgp_value(rd)?;
                 }
             }
         }
@@ -3616,5 +3620,29 @@ mod tests {
             .expect_err("invalid free-version UUID should return an error instead of panicking");
 
         assert!(matches!(err, Error::UuidParse(_)));
+    }
+
+    #[test]
+    fn delete_marker_decode_skips_unknown_fields_for_forward_compat() {
+        // A newer writer emits the three known fields plus an extra one. Decoding
+        // must skip the unknown field instead of erroring (backlog#799 B17).
+        let vid = Uuid::from_u128(0x1234);
+        let mut buf = Vec::new();
+        rmp::encode::write_map_len(&mut buf, 4).unwrap();
+        rmp::encode::write_str(&mut buf, "ID").unwrap();
+        rmp::encode::write_bin(&mut buf, vid.as_bytes()).unwrap();
+        rmp::encode::write_str(&mut buf, "MTime").unwrap();
+        rmp::encode::write_sint(&mut buf, 1_700_000_000_000_000_000i64).unwrap();
+        rmp::encode::write_str(&mut buf, "MetaSys").unwrap();
+        rmp::encode::write_map_len(&mut buf, 0).unwrap();
+        // Unknown field a future version added.
+        rmp::encode::write_str(&mut buf, "FutureField").unwrap();
+        rmp::encode::write_str(&mut buf, "ignored").unwrap();
+
+        let mut dm = MetaDeleteMarker::default();
+        dm.decode_from(&mut std::io::Cursor::new(buf))
+            .expect("unknown fields must be skipped, not rejected");
+        assert_eq!(dm.version_id, Some(vid));
+        assert!(dm.mod_time.is_some());
     }
 }

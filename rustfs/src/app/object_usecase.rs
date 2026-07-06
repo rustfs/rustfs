@@ -5581,6 +5581,12 @@ impl DefaultObjectUsecase {
         {
             response.headers.insert(header_name, header_value);
         }
+        if info.replication_status != ReplicationStatusType::Empty
+            && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_BUCKET_REPLICATION_STATUS.to_ascii_lowercase().as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(info.replication_status.as_str())
+        {
+            response.headers.insert(header_name, header_value);
+        }
 
         let result = Ok(response);
         let _ = helper.complete(&result);
