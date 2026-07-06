@@ -2326,7 +2326,14 @@ fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<
                 _ => {
                     if let Some(arn) = sub_key.strip_prefix("replication-reset-") {
                         has = true;
-                        rs.reset_statuses_map.insert(arn.to_string(), v.clone());
+                        // Store the canonical full-header key so the map matches
+                        // the key `target_reset_header()` produces on the
+                        // write/lookup side. Storing the bare ARN keyed the map
+                        // inconsistently (bare on read, full on write), which
+                        // could drop reset state across merge/reflatten cycles
+                        // (backlog#799 B16).
+                        rs.reset_statuses_map
+                            .insert(crate::replication::target_reset_header(arn), v.clone());
                     }
                 }
             }
@@ -3644,5 +3651,30 @@ mod tests {
             .expect("unknown fields must be skipped, not rejected");
         assert_eq!(dm.version_id, Some(vid));
         assert!(dm.mod_time.is_some());
+    }
+
+    #[test]
+    fn get_internal_replication_state_keeps_canonical_reset_key() {
+        // The reset status is stored on disk under the full internal key; parsing
+        // must keep it keyed by `target_reset_header(arn)` (not the bare ARN) so
+        // `ReplicationState::target_state` finds it after a round trip
+        // (backlog#799 B16).
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let ts = "2026-06-30T00:00:00Z;reset-1".to_string();
+        let key = crate::replication::target_reset_header(arn);
+        let mut metadata = HashMap::new();
+        metadata.insert(key.clone(), ts.clone());
+
+        let rs = get_internal_replication_state(&metadata).expect("reset state should parse");
+        assert_eq!(
+            rs.reset_statuses_map.get(&key),
+            Some(&ts),
+            "map must be keyed by target_reset_header, not the bare ARN"
+        );
+        assert_eq!(
+            rs.target_state(arn).resync_timestamp,
+            ts,
+            "lookup must find the round-tripped reset status"
+        );
     }
 }
