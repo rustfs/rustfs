@@ -21,7 +21,7 @@ use super::replication_filemeta_boundary::{
 };
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
-use super::replication_object_config::ReplicationConfig;
+use super::replication_object_config::{ReplicationConfig, check_replicate_delete};
 use super::replication_queue_boundary::{
     DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState,
     ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
@@ -39,9 +39,10 @@ use super::replication_resyncer::{
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
-    ObjectInfo, ObjectOptions, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
+    ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
 };
 use super::replication_target_boundary::ReplicationTargetStore;
+use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use lazy_static::lazy_static;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
@@ -617,12 +618,46 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         // Reconstruct a heal delete and re-queue it.  We do NOT call
                         // get_object_info here because the delete-marker or version may
                         // already be absent from the local store — that is expected.
+                        //
+                        // The MRF entry does not persist the replication decision and the
+                        // source object is gone, so re-derive the decision from the live
+                        // bucket config (mirroring get_heal_replicate_object_info) and set
+                        // it on the reconstructed delete. Without this the decision string
+                        // is empty and the delete replicates to zero targets — a silent
+                        // no-op that leaves replicas diverged (backlog#858 / #799 B9).
+                        let versioned = ReplicationVersioningStore::prefix_enabled(&entry.bucket, &entry.object).await;
+                        let oi = ObjectInfo {
+                            bucket: entry.bucket.clone(),
+                            name: entry.object.clone(),
+                            version_id: entry.version_id,
+                            delete_marker: entry.delete_marker,
+                            ..Default::default()
+                        };
+                        let dsc = check_replicate_delete(
+                            &entry.bucket,
+                            &ObjectToDelete {
+                                object_name: entry.object.clone(),
+                                version_id: entry.version_id,
+                                ..Default::default()
+                            },
+                            &oi,
+                            &ObjectOptions {
+                                versioned,
+                                ..Default::default()
+                            },
+                            None,
+                        )
+                        .await;
+                        let mut rstate = oi.replication_state();
+                        rstate.replicate_decision_str = dsc.to_string();
+
                         let dv = DeletedObjectReplicationInfo {
                             delete_object: ReplicationDeletedObject {
                                 object_name: entry.object.clone(),
                                 version_id: entry.version_id,
                                 delete_marker_version_id: entry.delete_marker_version_id,
                                 delete_marker: entry.delete_marker,
+                                replication_state: Some(rstate),
                                 ..Default::default()
                             },
                             bucket: entry.bucket.clone(),
