@@ -178,10 +178,22 @@ allocator snapshots when available, and
 cross-page fallback continuity evidence. It also writes
 `metadata_fast/chaos/fallback-probes.csv` for generation-mismatch fallback and,
 when `--journal-path` is explicitly set for a local journal probe, degraded
-journal fallback/restore evidence. The chaos probe uses a small independent page
-size (`--chaos-max-keys`, default `3`) and compares the old continuation-token
-page against a fresh post-mutation listing slice to prove no duplicate and no
-skipped keys across the fallback boundary.
+journal fallback/restore evidence. By default, the harness also restarts
+metadata-fast with controlled `RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_*`
+settings and records `metadata_fast/chaos/quorum-journal-probes.csv` plus
+quorum degraded/restore ratio files. The system-journal chaos entrypoint also
+requires `RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED=true`, so bucket,
+status, or sequence parameters alone cannot mutate internal state; the harness
+records a disabled-gate negative probe before enabling degraded injection. The
+serving process caches the chaos config on first use, so the harness restarts
+RustFS for disabled-gate, degraded, restore, and final serving probes. That
+probe asks the serving process to write
+`.rustfs.sys/listobjects/ns-journal/v1/<bucket>/state` through the normal
+quorum-backed internal metadata writer instead of letting the benchmark script
+edit internal state directly. The chaos probe uses a small independent page size
+(`--chaos-max-keys`, default `3`) and compares the old continuation-token page
+against a fresh post-mutation listing slice to prove no duplicate and no skipped
+keys across the fallback boundary.
 
 ## Canary Gates
 

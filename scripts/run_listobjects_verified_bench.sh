@@ -36,10 +36,15 @@ PREPARE_ONLY="${PREPARE_ONLY:-false}"
 REUSE_PREPARED_DATA="${REUSE_PREPARED_DATA:-false}"
 RUN_METADATA_FAST="${RUN_METADATA_FAST:-true}"
 RUN_CHAOS="${RUN_CHAOS:-true}"
+RUN_QUORUM_JOURNAL_CHAOS="${RUN_QUORUM_JOURNAL_CHAOS:-true}"
 CHAOS_MAX_KEYS="${CHAOS_MAX_KEYS:-3}"
 METADATA_FAST_STALENESS_MS="${METADATA_FAST_STALENESS_MS:-5000}"
 PROMETHEUS_QUERY_URL="${PROMETHEUS_QUERY_URL:-http://localhost:9090/api/v1/query}"
 PROMETHEUS_JOB="${PROMETHEUS_JOB:-rustfs-app-metrics}"
+JOURNAL_CHAOS_ENABLED=""
+JOURNAL_CHAOS_BUCKET=""
+JOURNAL_CHAOS_SEQUENCE=""
+JOURNAL_CHAOS_STATUS=""
 
 SERVER_PID=""
 RESOURCE_SAMPLER_PID=""
@@ -76,6 +81,8 @@ Options:
   --reuse-prepared-data  Reuse --data-root and skip warp data preparation.
   --skip-metadata-fast   Skip metadata-fast benchmark mode.
   --skip-chaos           Skip metadata-fast stale/fallback chaos probes.
+  --skip-quorum-journal-chaos
+                         Skip quorum-backed .rustfs.sys degraded/restore probe.
   --chaos-max-keys <n>   Metadata-fast chaos page size (default: 3).
   --metadata-fast-staleness-ms <n>
                          Metadata-fast staleness SLA in milliseconds (default: 5000).
@@ -89,8 +96,8 @@ Environment:
   WARMUP_DURATION, METER_INTERVAL, RESOURCE_SAMPLE_INTERVAL, SKIP_BUILD,
   BUILD_PROFILE, INDEX_PROVIDER, INDEX_GENERATION, KEY_INDEX_PATH,
   NAMESPACE_JOURNAL_PATH, PREBUILD_KEY_INDEX, PREPARE_ONLY, REUSE_PREPARED_DATA,
-  RUN_METADATA_FAST, RUN_CHAOS, CHAOS_MAX_KEYS, METADATA_FAST_STALENESS_MS,
-  PROMETHEUS_QUERY_URL, PROMETHEUS_JOB.
+  RUN_METADATA_FAST, RUN_CHAOS, RUN_QUORUM_JOURNAL_CHAOS, CHAOS_MAX_KEYS,
+  METADATA_FAST_STALENESS_MS, PROMETHEUS_QUERY_URL, PROMETHEUS_JOB.
 USAGE
 }
 
@@ -129,6 +136,7 @@ parse_args() {
       --reuse-prepared-data) REUSE_PREPARED_DATA="true"; shift ;;
       --skip-metadata-fast) RUN_METADATA_FAST="false"; shift ;;
       --skip-chaos) RUN_CHAOS="false"; shift ;;
+      --skip-quorum-journal-chaos) RUN_QUORUM_JOURNAL_CHAOS="false"; shift ;;
       --chaos-max-keys) CHAOS_MAX_KEYS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --metadata-fast-staleness-ms) METADATA_FAST_STALENESS_MS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --prometheus-query-url) PROMETHEUS_QUERY_URL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -244,6 +252,10 @@ start_server() {
     unset RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH
     unset RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION
     unset RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH
+    unset RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED
+    unset RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET
+    unset RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE
+    unset RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS
     unset RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED
     unset RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS
     if [[ "$mode" == "opt_in_verified" || "$mode" == "metadata_fast" ]]; then
@@ -259,6 +271,16 @@ start_server() {
         export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION="$INDEX_GENERATION"
         if [[ -n "$NAMESPACE_JOURNAL_PATH" ]]; then
           export RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH="$NAMESPACE_JOURNAL_PATH"
+        fi
+        if [[ -n "$JOURNAL_CHAOS_BUCKET" && -n "$JOURNAL_CHAOS_STATUS" ]]; then
+          if [[ -n "$JOURNAL_CHAOS_ENABLED" ]]; then
+            export RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED="$JOURNAL_CHAOS_ENABLED"
+          fi
+          export RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET="$JOURNAL_CHAOS_BUCKET"
+          export RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS="$JOURNAL_CHAOS_STATUS"
+          if [[ -n "$JOURNAL_CHAOS_SEQUENCE" ]]; then
+            export RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE="$JOURNAL_CHAOS_SEQUENCE"
+          fi
         fi
       fi
     fi
@@ -999,6 +1021,120 @@ write_local_journal_state() {
   mv "$tmp_file" "$state_file"
 }
 
+run_metadata_fast_quorum_journal_chaos() {
+  local bucket="$1"
+  local out_dir="$2"
+  mkdir -p "$out_dir"
+
+  local summary="$out_dir/quorum-journal-probes.csv"
+  local degraded_response="$out_dir/quorum-degraded-fallback.xml"
+  local disabled_gate_rebuild_response="$out_dir/quorum-disabled-gate-rebuild.xml"
+  local disabled_gate_response="$out_dir/quorum-disabled-gate.xml"
+  local restore_state_response="$out_dir/quorum-restore-state.xml"
+  local restore_rebuild_response="$out_dir/quorum-restore-rebuild.xml"
+  local restore_response="$out_dir/quorum-restore.xml"
+  local disabled_gate_fallbacks
+
+  echo "probe,status,detail" >"$summary"
+  if [[ "$RUN_QUORUM_JOURNAL_CHAOS" != "true" ]]; then
+    echo "quorum_degraded,skipped,RUN_QUORUM_JOURNAL_CHAOS=false" >>"$summary"
+    return 0
+  fi
+  if [[ -n "$NAMESPACE_JOURNAL_PATH" ]]; then
+    echo "quorum_degraded,skipped,local namespace journal override is active" >>"$summary"
+    return 0
+  fi
+
+  stop_server
+
+  JOURNAL_CHAOS_ENABLED=""
+  JOURNAL_CHAOS_BUCKET=""
+  JOURNAL_CHAOS_SEQUENCE=""
+  JOURNAL_CHAOS_STATUS=""
+  start_server opt_in_verified "$out_dir/quorum-disabled-gate-rebuild-rustfs.log" false
+  if signed_list_once "$bucket" "$disabled_gate_rebuild_response" 1; then
+    echo "quorum_disabled_gate_rebuild,ok,bucket=${bucket}; provider=rebuild" >>"$summary"
+  else
+    echo "quorum_disabled_gate_rebuild,failed,bucket=${bucket}; provider=rebuild" >>"$summary"
+  fi
+  stop_server
+
+  JOURNAL_CHAOS_ENABLED=""
+  JOURNAL_CHAOS_BUCKET="$bucket"
+  JOURNAL_CHAOS_SEQUENCE=""
+  JOURNAL_CHAOS_STATUS="degraded"
+  start_server metadata_fast "$out_dir/quorum-disabled-gate-rustfs.log" false
+  signed_list_page "$bucket" "$disabled_gate_response" "$CHAOS_MAX_KEYS" ""
+  sleep "$((METER_INTERVAL + 2))"
+  write_ratio_summary "metadata_fast_quorum_disabled_gate" "$out_dir/quorum-disabled-gate-rustfs.log" "$out_dir/quorum-disabled-gate-index-ratios.csv"
+  write_fallback_reason_summary \
+    "metadata_fast_quorum_disabled_gate" \
+    "$out_dir/quorum-disabled-gate-rustfs.log" \
+    "$out_dir/quorum-disabled-gate-index-fallback-reasons.csv"
+  disabled_gate_fallbacks="$(awk -F',' 'NR == 2 {print $3 + 0}' "$out_dir/quorum-disabled-gate-index-ratios.csv")"
+  if [[ "$disabled_gate_fallbacks" -eq 0 ]]; then
+    echo "quorum_disabled_gate,ok,bucket=${bucket}; status=degraded; enabled=unset" >>"$summary"
+  else
+    echo "quorum_disabled_gate,failed,bucket=${bucket}; status=degraded; enabled=unset; fallbacks=${disabled_gate_fallbacks}" >>"$summary"
+  fi
+  stop_server
+
+  JOURNAL_CHAOS_ENABLED="true"
+  JOURNAL_CHAOS_BUCKET="$bucket"
+  JOURNAL_CHAOS_SEQUENCE=""
+  JOURNAL_CHAOS_STATUS="degraded"
+  start_server metadata_fast "$out_dir/quorum-degraded-rustfs.log" false
+  if signed_list_page "$bucket" "$degraded_response" "$CHAOS_MAX_KEYS" ""; then
+    echo "quorum_degraded,ok,bucket=${bucket}; status=degraded" >>"$summary"
+  else
+    echo "quorum_degraded,failed,bucket=${bucket}; status=degraded" >>"$summary"
+  fi
+  sleep "$((METER_INTERVAL + 2))"
+  write_ratio_summary "metadata_fast_quorum_degraded" "$out_dir/quorum-degraded-rustfs.log" "$out_dir/quorum-degraded-index-ratios.csv"
+  write_fallback_reason_summary \
+    "metadata_fast_quorum_degraded" \
+    "$out_dir/quorum-degraded-rustfs.log" \
+    "$out_dir/quorum-degraded-index-fallback-reasons.csv"
+  stop_server
+
+  JOURNAL_CHAOS_ENABLED="true"
+  JOURNAL_CHAOS_STATUS="healthy"
+  start_server metadata_fast "$out_dir/quorum-restore-state-rustfs.log" false
+  if signed_list_page "$bucket" "$restore_state_response" "$CHAOS_MAX_KEYS" ""; then
+    echo "quorum_restore_state,ok,bucket=${bucket}; status=healthy" >>"$summary"
+  else
+    echo "quorum_restore_state,failed,bucket=${bucket}; status=healthy" >>"$summary"
+  fi
+  stop_server
+
+  JOURNAL_CHAOS_ENABLED=""
+  JOURNAL_CHAOS_BUCKET=""
+  JOURNAL_CHAOS_SEQUENCE=""
+  JOURNAL_CHAOS_STATUS=""
+
+  start_server opt_in_verified "$out_dir/quorum-restore-rebuild-rustfs.log" false
+  if signed_list_once "$bucket" "$restore_rebuild_response" 1; then
+    echo "quorum_restore_rebuild,ok,bucket=${bucket}; provider=rebuild" >>"$summary"
+  else
+    echo "quorum_restore_rebuild,failed,bucket=${bucket}; provider=rebuild" >>"$summary"
+  fi
+  stop_server
+
+  start_server metadata_fast "$out_dir/quorum-restore-rustfs.log" false
+  if signed_list_page "$bucket" "$restore_response" "$CHAOS_MAX_KEYS" ""; then
+    echo "quorum_restore,ok,bucket=${bucket}; status=healthy; provider=metadata_fast" >>"$summary"
+  else
+    echo "quorum_restore,failed,bucket=${bucket}; status=healthy; provider=metadata_fast" >>"$summary"
+  fi
+  sleep "$((METER_INTERVAL + 2))"
+  write_ratio_summary "metadata_fast_quorum_restore" "$out_dir/quorum-restore-rustfs.log" "$out_dir/quorum-restore-index-ratios.csv"
+  write_fallback_reason_summary \
+    "metadata_fast_quorum_restore" \
+    "$out_dir/quorum-restore-rustfs.log" \
+    "$out_dir/quorum-restore-index-fallback-reasons.csv"
+  stop_server
+}
+
 run_mode() {
   local mode="$1"
   local bucket="$2"
@@ -1031,6 +1167,8 @@ run_mode() {
     sleep "$((METER_INTERVAL + 2))"
     write_ratio_summary "${mode}_after_chaos" "$mode_dir/rustfs.log" "$mode_dir/chaos/index-ratios-after-chaos.csv"
     write_fallback_reason_summary "${mode}_after_chaos" "$mode_dir/rustfs.log" "$mode_dir/chaos/index-fallback-reasons-after-chaos.csv"
+    log_info "Running metadata-fast quorum-backed namespace journal degraded probe"
+    run_metadata_fast_quorum_journal_chaos "$bucket" "$mode_dir/chaos"
   fi
 
   stop_server
@@ -1062,6 +1200,7 @@ write_manifest() {
     echo "reuse_prepared_data=$REUSE_PREPARED_DATA"
     echo "run_metadata_fast=$RUN_METADATA_FAST"
     echo "run_chaos=$RUN_CHAOS"
+    echo "run_quorum_journal_chaos=$RUN_QUORUM_JOURNAL_CHAOS"
     echo "chaos_max_keys=$CHAOS_MAX_KEYS"
     echo "metadata_fast_staleness_ms=$METADATA_FAST_STALENESS_MS"
     echo "prometheus_query_url=$PROMETHEUS_QUERY_URL"
@@ -1120,6 +1259,13 @@ write_combined_summary() {
       summary_csv_section "Fallback probes" "$OUT_DIR/metadata_fast/chaos/fallback-probes.csv"
       summary_csv_section "Ratios after chaos" "$OUT_DIR/metadata_fast/chaos/index-ratios-after-chaos.csv"
       summary_csv_section "Fallback reasons after chaos" "$OUT_DIR/metadata_fast/chaos/index-fallback-reasons-after-chaos.csv"
+      summary_csv_section "Quorum journal probes" "$OUT_DIR/metadata_fast/chaos/quorum-journal-probes.csv"
+      summary_csv_section "Quorum disabled-gate ratios" "$OUT_DIR/metadata_fast/chaos/quorum-disabled-gate-index-ratios.csv"
+      summary_csv_section "Quorum disabled-gate fallback reasons" "$OUT_DIR/metadata_fast/chaos/quorum-disabled-gate-index-fallback-reasons.csv"
+      summary_csv_section "Quorum degraded ratios" "$OUT_DIR/metadata_fast/chaos/quorum-degraded-index-ratios.csv"
+      summary_csv_section "Quorum degraded fallback reasons" "$OUT_DIR/metadata_fast/chaos/quorum-degraded-index-fallback-reasons.csv"
+      summary_csv_section "Quorum restore ratios" "$OUT_DIR/metadata_fast/chaos/quorum-restore-index-ratios.csv"
+      summary_csv_section "Quorum restore fallback reasons" "$OUT_DIR/metadata_fast/chaos/quorum-restore-index-fallback-reasons.csv"
     fi
   } >"$summary"
 }

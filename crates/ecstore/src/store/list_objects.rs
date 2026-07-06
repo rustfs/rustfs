@@ -269,6 +269,10 @@ const ENV_API_LIST_OBJECTS_INDEX_PROVIDER: &str = "RUSTFS_LIST_OBJECTS_INDEX_PRO
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH";
 const ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION: &str = "RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION";
 const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH";
+const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED";
+const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET";
+const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE";
+const ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS: &str = "RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS";
 const ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED";
 const ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: &str = "RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS";
 const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
@@ -514,6 +518,8 @@ static LIST_OBJECTS_NAMESPACE_JOURNAL_LOCK: OnceCell<RwLock<()>> = OnceCell::con
 static LIST_OBJECTS_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE: OnceCell<RwLock<HashMap<String, u64>>> = OnceCell::const_new();
 static LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
+static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG: OnceCell<Option<NamespaceMutationJournalChaosConfig>> = OnceCell::const_new();
+static LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED: OnceCell<RwLock<HashSet<String>>> = OnceCell::const_new();
 
 async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentKeyOnlyIndexCache>> {
     PERSISTENT_KEY_ONLY_INDEX_CACHE
@@ -535,6 +541,19 @@ async fn list_objects_bucket_mutation_sequence() -> &'static RwLock<HashMap<Stri
 
 async fn list_objects_namespace_journal_degraded_buckets() -> &'static RwLock<HashSet<String>> {
     LIST_OBJECTS_NAMESPACE_JOURNAL_DEGRADED_BUCKETS
+        .get_or_init(|| async { RwLock::new(HashSet::new()) })
+        .await
+}
+
+async fn list_objects_namespace_journal_chaos_config() -> Option<&'static NamespaceMutationJournalChaosConfig> {
+    LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_CONFIG
+        .get_or_init(|| async { namespace_mutation_journal_chaos_config_from_env() })
+        .await
+        .as_ref()
+}
+
+async fn list_objects_namespace_journal_chaos_applied() -> &'static RwLock<HashSet<String>> {
+    LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_APPLIED
         .get_or_init(|| async { RwLock::new(HashSet::new()) })
         .await
 }
@@ -615,6 +634,25 @@ enum NamespaceMutationJournalStatus {
     Degraded,
 }
 
+impl NamespaceMutationJournalStatus {
+    fn from_env_value(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY) {
+            Some(Self::Healthy)
+        } else if value.eq_ignore_ascii_case(LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED) {
+            Some(Self::Degraded)
+        } else {
+            None
+        }
+    }
+
+    fn env_value(self) -> &'static str {
+        match self {
+            Self::Healthy => LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_HEALTHY,
+            Self::Degraded => LIST_OBJECTS_NAMESPACE_JOURNAL_STATUS_DEGRADED,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NamespaceMutationJournalState {
     bucket: Option<String>,
@@ -626,6 +664,13 @@ struct NamespaceMutationJournalState {
 struct NamespaceMutationJournalSnapshot {
     high_water_mark: u64,
     degraded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamespaceMutationJournalChaosConfig {
+    bucket: String,
+    status: NamespaceMutationJournalStatus,
+    sequence: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -702,6 +747,126 @@ fn list_objects_namespace_journal_root_from_env() -> Option<PathBuf> {
     std::env::var_os(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH)
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn namespace_mutation_journal_chaos_enabled_from_env() -> bool {
+    std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED)
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true"))
+}
+
+fn namespace_mutation_journal_chaos_bucket_from_env() -> Option<String> {
+    std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET)
+        .ok()
+        .filter(|bucket| !bucket.is_empty())
+}
+
+fn namespace_mutation_journal_chaos_sequence_from_env() -> Option<u64> {
+    std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn namespace_mutation_journal_chaos_status_from_env() -> Option<NamespaceMutationJournalStatus> {
+    std::env::var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS)
+        .ok()
+        .and_then(|value| NamespaceMutationJournalStatus::from_env_value(&value))
+}
+
+fn namespace_mutation_journal_chaos_config_from_env() -> Option<NamespaceMutationJournalChaosConfig> {
+    if !namespace_mutation_journal_chaos_enabled_from_env() {
+        return None;
+    }
+
+    let Some(bucket) = namespace_mutation_journal_chaos_bucket_from_env() else {
+        warn!(
+            bucket_env = ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET,
+            "list objects namespace journal chaos is enabled without a target bucket; skipping injection"
+        );
+        return None;
+    };
+    let Some(status) = namespace_mutation_journal_chaos_status_from_env() else {
+        warn!(
+            status_env = ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS,
+            "list objects namespace journal chaos is enabled with an invalid status; skipping injection"
+        );
+        return None;
+    };
+
+    Some(NamespaceMutationJournalChaosConfig {
+        bucket,
+        status,
+        sequence: namespace_mutation_journal_chaos_sequence_from_env(),
+    })
+}
+
+fn namespace_mutation_journal_chaos_applied_key(bucket: &str, status: NamespaceMutationJournalStatus) -> String {
+    let mut key = String::with_capacity(bucket.len() + 1 + status.env_value().len());
+    key.push_str(bucket);
+    key.push(':');
+    key.push_str(status.env_value());
+    key
+}
+
+async fn maybe_apply_system_namespace_mutation_journal_chaos(store: &ECStore, bucket: &str, default_sequence: u64) {
+    let Some(config) = list_objects_namespace_journal_chaos_config().await else {
+        return;
+    };
+    if config.bucket != bucket {
+        return;
+    };
+
+    if list_objects_namespace_journal_root_from_env().is_some() {
+        warn!(
+            bucket = %bucket,
+            status = config.status.env_value(),
+            "list objects namespace journal chaos requires the quorum-backed system journal; skipping local journal override"
+        );
+        return;
+    }
+
+    let applied_key = namespace_mutation_journal_chaos_applied_key(bucket, config.status);
+    let applied = list_objects_namespace_journal_chaos_applied().await;
+    {
+        let applied = applied.read().await;
+        if applied.contains(&applied_key) {
+            return;
+        }
+    }
+
+    let sequence = config.sequence.unwrap_or(default_sequence);
+    let result = match config.status {
+        NamespaceMutationJournalStatus::Healthy => {
+            write_namespace_mutation_journal_state(NamespaceMutationJournalBackend::System(store), bucket, sequence, true)
+                .await
+                .map(|_| ())
+        }
+        NamespaceMutationJournalStatus::Degraded => {
+            write_namespace_mutation_journal_degraded_state(NamespaceMutationJournalBackend::System(store), bucket, sequence)
+                .await
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            applied.write().await.insert(applied_key);
+            warn!(
+                bucket = %bucket,
+                sequence,
+                status = config.status.env_value(),
+                "applied controlled list objects namespace journal chaos state"
+            );
+        }
+        Err(err) => {
+            warn!(
+                bucket = %bucket,
+                sequence,
+                status = config.status.env_value(),
+                error = %err,
+                "failed to apply controlled list objects namespace journal chaos state"
+            );
+        }
+    }
 }
 
 fn list_objects_namespace_journal_root_from_provider_path(provider_path: &Path) -> Option<PathBuf> {
@@ -3144,6 +3309,13 @@ impl ECStore {
             );
             return Ok(None);
         }
+
+        maybe_apply_system_namespace_mutation_journal_chaos(
+            self.as_ref(),
+            &provider_opts.bucket,
+            index.checkpoint_high_water_mark,
+        )
+        .await;
 
         let current_sequence = current_list_objects_mutation_snapshot(Some(self.as_ref()), &provider_opts.bucket).await;
         let health = persistent_key_only_index_health(&index, current_sequence);
@@ -6256,7 +6428,9 @@ mod test {
     use super::{
         ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
         ENV_API_LIST_OBJECTS_INDEX_PROVIDER_PATH, ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED,
-        ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH,
+        ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET,
+        ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE,
+        ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH,
         ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState,
         LIST_CURSOR_GENERATION_LIVE, LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
         LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
@@ -6276,9 +6450,11 @@ mod test {
         list_objects_index_provider_from_env, list_objects_index_provider_state_from_env, list_objects_key_only_provider_health,
         list_objects_metadata_fast_guardrails_from_env, list_objects_quorum_from_env, list_quorum_from_env,
         load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels,
-        normalize_list_quorum, observe_list_objects_mutations_with_store, parse_namespace_mutation_journal_state,
-        parse_persistent_key_only_index, parse_persistent_list_metadata_object, parse_version_marker,
-        persist_observed_list_objects_mutation, persistent_key_only_index_has_complete_metadata_snapshot,
+        namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
+        namespace_mutation_journal_chaos_enabled_from_env, namespace_mutation_journal_chaos_sequence_from_env,
+        namespace_mutation_journal_chaos_status_from_env, normalize_list_quorum, observe_list_objects_mutations_with_store,
+        parse_namespace_mutation_journal_state, parse_persistent_key_only_index, parse_persistent_list_metadata_object,
+        parse_version_marker, persist_observed_list_objects_mutation, persistent_key_only_index_has_complete_metadata_snapshot,
         persistent_key_only_index_health, persistent_key_only_index_matches_provider, record_list_objects_index_opt_in_fallback,
         reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
         select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel, version_marker_for_entries,
@@ -7274,6 +7450,109 @@ mod test {
         assert_eq!(state.bucket.as_deref(), Some("photos"));
         assert_eq!(state.high_water_mark, 123);
         assert_eq!(state.status, NamespaceMutationJournalStatus::Healthy);
+    }
+
+    #[test]
+    fn namespace_mutation_journal_chaos_env_accepts_controlled_status() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("degraded"), || {
+            assert_eq!(
+                namespace_mutation_journal_chaos_status_from_env(),
+                Some(NamespaceMutationJournalStatus::Degraded)
+            );
+        });
+        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("HEALTHY"), || {
+            assert_eq!(
+                namespace_mutation_journal_chaos_status_from_env(),
+                Some(NamespaceMutationJournalStatus::Healthy)
+            );
+        });
+        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("unknown"), || {
+            assert_eq!(namespace_mutation_journal_chaos_status_from_env(), None);
+        });
+    }
+
+    #[test]
+    fn namespace_mutation_journal_chaos_env_requires_explicit_enable() {
+        temp_env::with_var_unset(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, || {
+            assert!(!namespace_mutation_journal_chaos_enabled_from_env());
+        });
+        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("true"), || {
+            assert!(namespace_mutation_journal_chaos_enabled_from_env());
+        });
+        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("1"), || {
+            assert!(namespace_mutation_journal_chaos_enabled_from_env());
+        });
+        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("on"), || {
+            assert!(namespace_mutation_journal_chaos_enabled_from_env());
+        });
+        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("false"), || {
+            assert!(!namespace_mutation_journal_chaos_enabled_from_env());
+        });
+    }
+
+    #[test]
+    fn namespace_mutation_journal_chaos_env_reads_bucket_and_sequence() {
+        temp_env::with_vars(
+            [
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, Some("bench-bucket")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE, Some("42")),
+            ],
+            || {
+                assert_eq!(namespace_mutation_journal_chaos_bucket_from_env().as_deref(), Some("bench-bucket"));
+                assert_eq!(namespace_mutation_journal_chaos_sequence_from_env(), Some(42));
+            },
+        );
+        temp_env::with_var(ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE, Some("not-a-number"), || {
+            assert_eq!(namespace_mutation_journal_chaos_sequence_from_env(), None);
+        });
+    }
+
+    #[test]
+    fn namespace_mutation_journal_chaos_config_requires_enable_bucket_and_status() {
+        temp_env::with_vars(
+            [
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("true")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, Some("bench-bucket")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("degraded")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_SEQUENCE, Some("42")),
+            ],
+            || {
+                let config = namespace_mutation_journal_chaos_config_from_env().expect("enabled chaos config should parse");
+                assert_eq!(config.bucket, "bench-bucket");
+                assert_eq!(config.status, NamespaceMutationJournalStatus::Degraded);
+                assert_eq!(config.sequence, Some(42));
+            },
+        );
+        temp_env::with_vars(
+            [
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("false")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, Some("bench-bucket")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("degraded")),
+            ],
+            || {
+                assert_eq!(namespace_mutation_journal_chaos_config_from_env(), None);
+            },
+        );
+        temp_env::with_vars(
+            [
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("true")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, Some("bench-bucket")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("invalid")),
+            ],
+            || {
+                assert_eq!(namespace_mutation_journal_chaos_config_from_env(), None);
+            },
+        );
+        temp_env::with_vars(
+            [
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_ENABLED, Some("true")),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_BUCKET, None::<&str>),
+                (ENV_API_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_STATUS, Some("degraded")),
+            ],
+            || {
+                assert_eq!(namespace_mutation_journal_chaos_config_from_env(), None);
+            },
+        );
     }
 
     #[tokio::test]
