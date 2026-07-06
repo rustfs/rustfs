@@ -597,7 +597,7 @@ impl SetDisks {
 
         // Erasure params come from on-disk metadata; zero values must fail the read
         // instead of panicking on the block/shard divisions below.
-        if erasure.block_size == 0 || erasure.data_shards == 0 {
+        if !erasure.has_valid_dimensions() {
             return Err(Error::other(format!(
                 "invalid erasure metadata for {bucket}/{object}: block_size={}, data_blocks={}",
                 erasure.block_size, erasure.data_shards
@@ -959,14 +959,24 @@ impl SetDisks {
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
-
         let erasure = coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
             fi.uses_legacy_checksum,
         );
+
+        // Erasure params come from on-disk metadata; zero values must fail the read
+        // instead of panicking on the block/shard divisions inside the codec
+        // streaming reader below. Mirrors the legacy multipart guard.
+        if !erasure.has_valid_dimensions() {
+            return Err(Error::other(format!(
+                "invalid erasure metadata for {bucket}/{object}: block_size={}, data_blocks={}",
+                erasure.block_size, erasure.data_shards
+            )));
+        }
+
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
         if fi.parts.len() == 1 {
             let part = &fi.parts[0];
@@ -2294,6 +2304,34 @@ mod tests {
             fi,
             lock_optimization_enabled,
         )
+    }
+
+    #[tokio::test]
+    async fn codec_streaming_reader_rejects_zero_block_size_metadata() {
+        // Corrupted on-disk metadata: valid data/parity blocks but block_size == 0.
+        // The codec streaming entry must reject this and return an error instead of
+        // panicking on the block_size division inside the reader (mirrors the legacy
+        // multipart guard). The guard fires before any disk access, so empty disk /
+        // parts-metadata slices are sufficient.
+        let mut fi = codec_streaming_test_fileinfo(1024, 1);
+        fi.erasure.block_size = 0;
+
+        let result = SetDisks::get_object_decode_reader_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &fi,
+            &[],
+            &[],
+            0,
+            0,
+            false,
+            "test-object-class",
+            "test-size-bucket",
+            false,
+        )
+        .await;
+
+        assert!(result.is_err(), "zero block_size metadata must be rejected, not panic");
     }
 
     #[tokio::test]
