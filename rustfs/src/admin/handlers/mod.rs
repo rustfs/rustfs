@@ -19,6 +19,7 @@ pub mod batch_job;
 pub mod bucket_meta;
 pub mod cluster_snapshot;
 pub mod config_admin;
+pub mod diagnostics;
 pub mod event;
 pub mod extensions;
 pub mod group;

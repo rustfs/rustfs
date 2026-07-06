@@ -15,6 +15,7 @@
 use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::runtime_sources::current_object_store_handle;
 use crate::admin::runtime_sources::{
     DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase,
 };
@@ -34,7 +35,16 @@ use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
+
+/// Global service-freeze flag toggled by `POST /v3/service?action=freeze`.
+///
+/// NOTE: RustFS does not currently route S3 request admission through this flag,
+/// so freezing is advisory only — it records intent and is reflected in the
+/// response, but does not actually suspend request handling. This is documented
+/// in the handler and surfaced to the caller via `frozen_effective=false`.
+static SERVICE_FROZEN: AtomicBool = AtomicBool::new(false);
 
 const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
 const LOG_SUBSYSTEM_SYSTEM_ADMIN: &str = "system_admin";
@@ -96,6 +106,12 @@ pub fn register_system_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
     )?;
 
     r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/update").as_str(),
+        AdminOperation(&UpdateHandler {}),
+    )?;
+
+    r.insert(
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/info").as_str(),
         AdminOperation(&ServerInfoHandler {}),
@@ -141,11 +157,232 @@ pub fn register_system_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
 }
 pub struct ServiceHandle {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceAction {
+    Restart,
+    Stop,
+    Freeze,
+    Unfreeze,
+}
+
+impl ServiceAction {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "restart" => Some(Self::Restart),
+            "stop" => Some(Self::Stop),
+            "freeze" => Some(Self::Freeze),
+            "unfreeze" => Some(Self::Unfreeze),
+            _ => None,
+        }
+    }
+}
+
+fn service_action_from_uri(uri: &http::Uri) -> Option<ServiceAction> {
+    uri.query().and_then(|q| {
+        url::form_urlencoded::parse(q.as_bytes()).find_map(|(k, v)| if k == "action" { ServiceAction::parse(&v) } else { None })
+    })
+}
+
+#[derive(Serialize)]
+struct ServiceActionResponse {
+    action: &'static str,
+    accepted: bool,
+    /// Whether the action takes real effect on this build (vs advisory only).
+    effective: bool,
+    message: &'static str,
+}
+
+/// Ask the process to shut down gracefully by raising SIGTERM to itself.
+///
+/// The existing `wait_for_shutdown()` signal handler observes SIGTERM and runs
+/// the full graceful-shutdown sequence (drains servers, flushes audit/event
+/// notifiers). RustFS has no in-process supervisor that re-execs the binary, so
+/// `restart` and `stop` are both honored as a graceful stop; a process manager
+/// (systemd, k8s) is responsible for restarting the binary. This is documented
+/// in the response so operators are not misled into expecting an in-process
+/// re-exec.
+// SAFETY: the only unsafe operation is `libc::raise(SIGTERM)`, which delivers a
+// signal to the current process using a compile-time constant signal number and
+// no pointers. It simply routes into the existing `wait_for_shutdown()` SIGTERM
+// handler that runs the graceful-shutdown sequence.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn request_graceful_shutdown() {
+    // Defer slightly so the HTTP response can flush before shutdown begins.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // SAFETY: see the function-level comment; `libc::raise` with a constant
+        // signal number is async-signal-safe and takes no pointer arguments.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn request_graceful_shutdown() {}
+
 #[async_trait::async_trait]
 impl Operation for ServiceHandle {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        log_system_request_rejected!("service_handle", "not_implemented");
-        Err(s3_error!(NotImplemented))
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials.as_ref() else {
+            log_system_request_rejected!("service_handle", "missing_credentials");
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let Some(action) = service_action_from_uri(&req.uri) else {
+            log_system_request_rejected!("service_handle", "invalid_action");
+            return Err(s3_error!(InvalidRequest, "action must be one of: restart, stop, freeze, unfreeze"));
+        };
+
+        // restart/stop are destructive; freeze/unfreeze map to their own actions.
+        let admin_action = match action {
+            ServiceAction::Restart => AdminAction::ServiceRestartAdminAction,
+            ServiceAction::Stop => AdminAction::ServiceStopAdminAction,
+            ServiceAction::Freeze | ServiceAction::Unfreeze => AdminAction::ServiceFreezeAdminAction,
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(admin_action)], remote_addr).await?;
+
+        let response = match action {
+            ServiceAction::Restart => {
+                info!(
+                    event = "service_control",
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM_ADMIN,
+                    action = "restart",
+                    "admin requested service restart; initiating graceful shutdown (process manager must relaunch)"
+                );
+                request_graceful_shutdown();
+                ServiceActionResponse {
+                    action: "restart",
+                    accepted: true,
+                    effective: true,
+                    message: "graceful shutdown initiated; the supervising process manager is responsible for relaunch",
+                }
+            }
+            ServiceAction::Stop => {
+                info!(
+                    event = "service_control",
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM_ADMIN,
+                    action = "stop",
+                    "admin requested service stop; initiating graceful shutdown"
+                );
+                request_graceful_shutdown();
+                ServiceActionResponse {
+                    action: "stop",
+                    accepted: true,
+                    effective: true,
+                    message: "graceful shutdown initiated",
+                }
+            }
+            ServiceAction::Freeze => {
+                SERVICE_FROZEN.store(true, Ordering::SeqCst);
+                warn!(
+                    event = "service_control",
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM_ADMIN,
+                    action = "freeze",
+                    "service freeze flag set; note request admission is not yet gated by this flag"
+                );
+                ServiceActionResponse {
+                    action: "freeze",
+                    accepted: true,
+                    effective: false,
+                    message: "freeze flag recorded, but RustFS does not yet gate request admission on it (advisory only)",
+                }
+            }
+            ServiceAction::Unfreeze => {
+                SERVICE_FROZEN.store(false, Ordering::SeqCst);
+                info!(
+                    event = "service_control",
+                    component = LOG_COMPONENT_ADMIN_API,
+                    subsystem = LOG_SUBSYSTEM_SYSTEM_ADMIN,
+                    action = "unfreeze",
+                    "service freeze flag cleared"
+                );
+                ServiceActionResponse {
+                    action: "unfreeze",
+                    accepted: true,
+                    effective: false,
+                    message: "freeze flag cleared (advisory only)",
+                }
+            }
+        };
+
+        let data = serde_json::to_vec(&response).map_err(|e| {
+            log_system_request_failed!("service_handle", "serialize_service_response_failed", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize service response")
+        })?;
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        log_system_response_emitted!("service_handle");
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+    }
+}
+
+pub struct UpdateHandler {}
+
+#[derive(Serialize)]
+struct ServerUpdateStatus {
+    current_version: String,
+    updated_version: String,
+    /// Always false: RustFS ships no in-process binary self-update mechanism.
+    update_applied: bool,
+    message: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Operation for UpdateHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials.as_ref() else {
+            log_system_request_rejected!("server_update", "missing_credentials");
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerUpdateAdminAction)],
+            remote_addr,
+        )
+        .await?;
+
+        // MinIO's server-update downloads and swaps the binary in place. RustFS
+        // intentionally does not implement in-process self-update: binaries are
+        // managed by the packaging/orchestration layer (container image, systemd
+        // unit, package manager). We honor the request/response contract and
+        // report that no update was applied rather than faking success.
+        let current = crate::version::get_version();
+        let response = ServerUpdateStatus {
+            current_version: current.clone(),
+            updated_version: current,
+            update_applied: false,
+            message: "in-process self-update is not supported; manage the RustFS binary via your image/package/orchestrator",
+        };
+        info!(
+            event = "server_update",
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_SYSTEM_ADMIN,
+            "server update requested; self-update unsupported, returning MinIO-compatible no-op status"
+        );
+
+        let data = serde_json::to_vec(&response).map_err(|e| {
+            log_system_request_failed!("server_update", "serialize_update_status_failed", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize update status")
+        })?;
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        log_system_response_emitted!("server_update");
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
 }
 
@@ -229,11 +466,101 @@ impl Operation for ServerInfoHandler {
 
 pub struct InspectDataHandler {}
 
+/// Upper bound on how many bytes a single inspect-data response streams, to keep
+/// an operator-facing diagnostic from materializing an arbitrarily large object.
+const INSPECT_DATA_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn inspect_data_target(uri: &http::Uri) -> Option<(String, String)> {
+    let mut volume: Option<String> = None;
+    let mut file: Option<String> = None;
+    if let Some(query) = uri.query() {
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            match k.as_ref() {
+                // Accept MinIO's `volume`/`file` names and the friendlier
+                // `bucket`/`object` aliases.
+                "volume" | "bucket" => volume = Some(v.into_owned()),
+                "file" | "object" | "prefix" => file = Some(v.into_owned()),
+                _ => {}
+            }
+        }
+    }
+    match (volume, file) {
+        (Some(v), Some(f)) if !v.is_empty() && !f.is_empty() => Some((v, f)),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for InspectDataHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        log_system_request_rejected!("inspect_data", "not_implemented");
-        Err(s3_error!(NotImplemented))
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        use crate::admin::storage_api::contract::object::ObjectIO as _;
+        use crate::admin::storage_api::object::StorageObjectOptions;
+        use tokio::io::AsyncReadExt;
+
+        let Some(input_cred) = req.credentials.as_ref() else {
+            log_system_request_rejected!("inspect_data", "missing_credentials");
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::InspectDataAction)],
+            remote_addr,
+        )
+        .await?;
+
+        // MinIO's inspect-data exports a signed archive of raw drive files for a
+        // `volume`/`file` glob. RustFS erasure-codes and (optionally) encrypts
+        // object data across drives, so there is no single on-disk file to hand
+        // back; instead we return the reconstructed raw object bytes for the
+        // requested `volume` (bucket) + `file` (object), which is the honest,
+        // usable form of "inspect this object's data" against an EC store.
+        let Some((bucket, object)) = inspect_data_target(&req.uri) else {
+            return Err(s3_error!(
+                InvalidRequest,
+                "inspect-data requires `volume` (bucket) and `file` (object) query parameters"
+            ));
+        };
+
+        let Some(store) = current_object_store_handle() else {
+            log_system_request_failed!("inspect_data", "object_store_unavailable", "not initialized");
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
+        };
+
+        let mut reader = store
+            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &StorageObjectOptions::default())
+            .await
+            .map_err(|err| {
+                log_system_request_failed!("inspect_data", "open_object_reader_failed", err);
+                S3Error::with_message(S3ErrorCode::NoSuchKey, format!("failed to open object `{bucket}/{object}`: {err}"))
+            })?;
+
+        // Read up to the cap + 1 so we can detect and reject over-large targets.
+        let mut buf = Vec::new();
+        let mut limited = (&mut reader).take((INSPECT_DATA_MAX_BYTES as u64) + 1);
+        limited
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to read object data: {e}")))?;
+        if buf.len() > INSPECT_DATA_MAX_BYTES {
+            return Err(s3_error!(
+                InvalidRequest,
+                "object exceeds the {INSPECT_DATA_MAX_BYTES}-byte inspect-data limit; fetch it via the S3 API instead"
+            ));
+        }
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        if let Ok(disposition) = HeaderValue::from_str(&format!("attachment; filename=\"inspect-{bucket}-{object}.bin\"")) {
+            header.insert(http::header::CONTENT_DISPOSITION, disposition);
+        }
+        log_system_response_emitted!("inspect_data");
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(buf)), header))
     }
 }
 
