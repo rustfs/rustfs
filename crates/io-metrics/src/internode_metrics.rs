@@ -29,12 +29,19 @@ pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
 pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
 pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
 
+/// Direction of a msgpack/JSON codec decode, for the JSON-fallback counter: a server decoding a
+/// peer's request vs a client decoding a peer's response (grpc-optimization P2).
+pub const INTERNODE_MSGPACK_DIRECTION_REQUEST: &str = "request";
+pub const INTERNODE_MSGPACK_DIRECTION_RESPONSE: &str = "response";
+
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
 const CLASSIFICATION_LABEL: &str = "classification";
 const STAGE_LABEL: &str = "stage";
 const DOMINANT_ERROR_LABEL: &str = "dominant_error";
 const HTTP_VERSION_LABEL: &str = "http_version";
+const DIRECTION_LABEL: &str = "direction";
+const MESSAGE_LABEL: &str = "message";
 const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
 const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
@@ -50,6 +57,7 @@ const INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL: &str =
     "rustfs_system_network_internode_operation_write_shutdown_errors_total";
 const INTERNODE_OPERATION_PAYLOAD_BYTES: &str = "rustfs_system_network_internode_operation_payload_bytes";
 const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_internode_operation_large_payloads_total";
+const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +350,15 @@ impl InternodeMetrics {
         counter!(INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
     }
 
+    /// Count a decode that fell back to the JSON compatibility field because the msgpack `_bin`
+    /// payload was absent. Both internode RPC directions dual-encode msgpack + JSON today; this
+    /// counter must read zero across a release window before the redundant JSON fields can be
+    /// dropped (grpc-optimization P2). `direction` is [`INTERNODE_MSGPACK_DIRECTION_REQUEST`] or
+    /// [`INTERNODE_MSGPACK_DIRECTION_RESPONSE`]; `message` is the low-cardinality value name.
+    pub fn record_msgpack_json_fallback(&self, direction: &'static str, message: &'static str) {
+        counter!(INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL, DIRECTION_LABEL => direction, MESSAGE_LABEL => message).increment(1);
+    }
+
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
@@ -550,6 +567,20 @@ mod tests {
             "rustfs_system_network_internode_operation_large_payloads_total"
         );
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
+        assert_eq!(
+            INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL,
+            "rustfs_system_network_internode_msgpack_json_fallback_total"
+        );
+        assert_eq!(INTERNODE_MSGPACK_DIRECTION_REQUEST, "request");
+        assert_eq!(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "response");
+    }
+
+    #[test]
+    fn msgpack_json_fallback_counter_records_without_panicking() {
+        // Smoke test: the counter accepts both directions and a static message label.
+        let metrics = InternodeMetrics::default();
+        metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
+        metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
     }
 
     #[test]

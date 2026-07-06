@@ -833,24 +833,31 @@ impl RemoteDisk {
     }
 }
 
+/// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
+/// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
+const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+
 fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::new());
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT));
     value.serialize(&mut serializer)?;
     Ok(serializer.into_inner())
 }
 
 fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::new()).with_struct_map();
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT)).with_struct_map();
     value.serialize(&mut serializer)?;
     Ok(serializer.into_inner())
 }
 
-fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Result<T> {
+fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &'static str) -> Result<T> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
         return T::deserialize(&mut deserializer).map_err(Error::from);
     }
 
+    // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
+    // must read zero across a release window before the redundant JSON fields can be dropped (P2).
+    crate::cluster::rpc::runtime_sources::record_response_json_fallback(value_name);
     serde_json::from_str(json).map_err(Error::from)
 }
 
@@ -885,7 +892,7 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
 
         let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps_bin.len());
         for (index, buf) in response.read_multiple_resps_bin.iter().enumerate() {
-            let resp = decode_msgpack_or_json::<ReadMultipleResp>(buf, "").map_err(|err| {
+            let resp = decode_msgpack_or_json::<ReadMultipleResp>(buf, "", "ReadMultipleResp").map_err(|err| {
                 Error::other(format!("decode ReadMultipleResp msgpack item {index} from {endpoint} failed: {err}"))
             })?;
             read_multiple_resps.push(resp);
@@ -893,6 +900,10 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
         return Ok(read_multiple_resps);
     }
 
+    // No msgpack payloads present: the whole list fell back to the JSON compatibility field (P2).
+    if !response.read_multiple_resps.is_empty() {
+        crate::cluster::rpc::runtime_sources::record_response_json_fallback("ReadMultipleResp");
+    }
     let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps.len());
     for (index, json_str) in response.read_multiple_resps.iter().enumerate() {
         let resp = serde_json::from_str::<ReadMultipleResp>(json_str)
@@ -926,7 +937,7 @@ fn decode_batch_read_version_response_items(
 
         let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps_bin.len());
         for (index, buf) in response.batch_read_version_resps_bin.iter().enumerate() {
-            let resp = decode_msgpack_or_json::<BatchReadVersionResp>(buf, "").map_err(|err| {
+            let resp = decode_msgpack_or_json::<BatchReadVersionResp>(buf, "", "BatchReadVersionResp").map_err(|err| {
                 Error::other(format!("decode BatchReadVersionResp msgpack item {index} from {endpoint} failed: {err}"))
             })?;
             batch_read_version_resps.push(resp);
@@ -934,6 +945,10 @@ fn decode_batch_read_version_response_items(
         return Ok(batch_read_version_resps);
     }
 
+    // No msgpack payloads present: the whole list fell back to the JSON compatibility field (P2).
+    if !response.batch_read_version_resps.is_empty() {
+        crate::cluster::rpc::runtime_sources::record_response_json_fallback("BatchReadVersionResp");
+    }
     let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps.len());
     for (index, json_str) in response.batch_read_version_resps.iter().enumerate() {
         let resp = serde_json::from_str::<BatchReadVersionResp>(json_str).map_err(|err| {
@@ -1578,7 +1593,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info)?;
+                let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info, "FileInfo")?;
 
                 Ok(file_info)
             },
@@ -1715,7 +1730,8 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let raw_file_info = decode_msgpack_or_json::<RawFileInfo>(&response.raw_file_info_bin, &response.raw_file_info)?;
+                let raw_file_info =
+                    decode_msgpack_or_json::<RawFileInfo>(&response.raw_file_info_bin, &response.raw_file_info, "RawFileInfo")?;
 
                 Ok(raw_file_info)
             },
@@ -1772,8 +1788,11 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let rename_data_resp =
-                    decode_msgpack_or_json::<RenameDataResp>(&response.rename_data_resp_bin, &response.rename_data_resp)?;
+                let rename_data_resp = decode_msgpack_or_json::<RenameDataResp>(
+                    &response.rename_data_resp_bin,
+                    &response.rename_data_resp,
+                    "RenameDataResp",
+                )?;
 
                 Ok(rename_data_resp)
             },

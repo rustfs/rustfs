@@ -21,7 +21,8 @@ use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    INTERNODE_MSGPACK_DIRECTION_REQUEST, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
@@ -29,18 +30,29 @@ use std::io::Cursor;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
-fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &str) -> std::result::Result<T, DiskError> {
+/// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
+/// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
+const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+
+fn decode_msgpack_or_json<T: DeserializeOwned>(
+    binary: &[u8],
+    json: &str,
+    value_name: &'static str,
+) -> std::result::Result<T, DiskError> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
         return T::deserialize(&mut deserializer)
             .map_err(|err| DiskError::other(format!("decode {value_name} msgpack failed: {err}")));
     }
 
+    // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
+    // must read zero across a release window before the redundant JSON fields can be dropped (P2).
+    global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, value_name);
     serde_json::from_str(json).map_err(|err| DiskError::other(format!("decode {value_name} failed: {err}")))
 }
 
 fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::new());
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT));
     value
         .serialize(&mut serializer)
         .map_err(|err| DiskError::other(format!("encode {value_name} msgpack failed: {err}")))?;
@@ -48,7 +60,7 @@ fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::resu
 }
 
 fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::new()).with_struct_map();
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT)).with_struct_map();
     value
         .serialize(&mut serializer)
         .map_err(|err| DiskError::other(format!("encode {value_name} named msgpack failed: {err}")))?;

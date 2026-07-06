@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_WRITE_ALL,
-    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_GRPC, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-    global_internode_metrics,
+    INTERNODE_MSGPACK_DIRECTION_RESPONSE, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 
 #[cfg(test)]
@@ -102,6 +102,12 @@ fn record_grpc_payload_size(operation: &'static str, bytes: usize) {
     if bytes >= internode_rpc_large_payload_warn_bytes() {
         metrics.record_large_operation_payload(operation, INTERNODE_TRANSPORT_BACKEND_GRPC);
     }
+}
+
+/// Count a client-side response decode that fell back to the JSON compatibility field because the
+/// msgpack `_bin` payload was absent (grpc-optimization P2). `message` is the value name.
+pub(crate) fn record_response_json_fallback(message: &'static str) {
+    global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, message);
 }
 
 #[cfg(test)]
