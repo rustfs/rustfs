@@ -2110,7 +2110,9 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            schedule_dir(&mut dir_stack, meta.name, false, None);
+                            if opts.recursive || self.directory_has_visible_listing_entry(&opts.bucket, &meta.name).await? {
+                                schedule_dir(&mut dir_stack, meta.name, false, None);
+                            }
                         }
 
                         continue;
@@ -2160,6 +2162,76 @@ impl LocalDisk {
         }
 
         Ok(())
+    }
+
+    async fn directory_has_visible_listing_entry(&self, bucket: &str, dir_name: &str) -> Result<bool> {
+        let mut stack = vec![dir_name.trim_matches('/').to_owned()];
+
+        while let Some(current) = stack.pop() {
+            if current.is_empty() {
+                continue;
+            }
+
+            let entries = match self.list_dir("", bucket, &current, -1).await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    if err == DiskError::VolumeNotFound || err == Error::FileNotFound {
+                        continue;
+                    }
+
+                    return Err(err);
+                }
+            };
+
+            let mut data_dirs_to_skip = HashSet::new();
+            let mut child_dirs = Vec::new();
+
+            for entry in entries {
+                if entry == STORAGE_FORMAT_FILE {
+                    let metadata_path = path_join_buf(&[current.as_str(), STORAGE_FORMAT_FILE]);
+                    match self.read_metadata(bucket, metadata_path.as_str()).await {
+                        Ok(metadata) => {
+                            let file_meta = match FileMeta::load(&metadata) {
+                                Ok(file_meta) => file_meta,
+                                Err(_) => return Ok(true),
+                            };
+
+                            if file_meta_counts_toward_limit(&file_meta) {
+                                return Ok(true);
+                            }
+
+                            if let Ok(data_dirs) = file_meta.get_data_dirs() {
+                                for data_dir in data_dirs.iter().flatten() {
+                                    data_dirs_to_skip.insert(data_dir.to_string());
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if err != Error::FileNotFound && err != Error::IsNotRegular {
+                                return Err(err);
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+
+                if entry.ends_with(SLASH_SEPARATOR) {
+                    let child = entry.trim_end_matches(SLASH_SEPARATOR);
+                    if !child.is_empty() {
+                        child_dirs.push(child.to_owned());
+                    }
+                }
+            }
+
+            for child in child_dirs {
+                if !data_dirs_to_skip.contains(&child) {
+                    stack.push(path_join_buf(&[current.as_str(), child.as_str()]));
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 
@@ -5294,6 +5366,128 @@ mod test {
 
         assert!(has_visible_object);
         assert_eq!(objs_returned, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_skips_dirs_with_only_hidden_delete_markers() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn hidden_versioned_object_metadata(name: &str, delete_version_id: &str, object_version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version({
+                let mut fi = FileInfo::new(name, 1, 1);
+                fi.version_id = Some(Uuid::parse_str(object_version_id).expect("test version id should parse"));
+                fi.mod_time = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
+                fi
+            })
+            .expect("object metadata should be valid");
+            fm.add_version(FileInfo {
+                name: name.to_owned(),
+                deleted: true,
+                version_id: Some(Uuid::parse_str(delete_version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("hidden metadata should encode")
+        }
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str) -> Vec<String> {
+            let (reader, mut writer) = tokio::io::duplex(4096);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: base_dir.to_string(),
+                recursive: false,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        let hidden_object = bucket_dir.join("hidden/deleted.txt");
+        fs::create_dir_all(&hidden_object)
+            .await
+            .expect("hidden object dir should be created");
+        fs::write(
+            hidden_object.join(STORAGE_FORMAT_FILE),
+            hidden_versioned_object_metadata(
+                "hidden/deleted.txt",
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ),
+        )
+        .await
+        .expect("hidden object metadata should be written");
+
+        let nested_hidden_object = bucket_dir.join("hidden/nested/deleted.txt");
+        fs::create_dir_all(&nested_hidden_object)
+            .await
+            .expect("nested hidden object dir should be created");
+        fs::write(
+            nested_hidden_object.join(STORAGE_FORMAT_FILE),
+            hidden_versioned_object_metadata(
+                "hidden/nested/deleted.txt",
+                "33333333-3333-3333-3333-333333333333",
+                "44444444-4444-4444-4444-444444444444",
+            ),
+        )
+        .await
+        .expect("nested hidden object metadata should be written");
+
+        let visible_object = bucket_dir.join("visible/nested/object.txt");
+        fs::create_dir_all(&visible_object)
+            .await
+            .expect("visible object dir should be created");
+        fs::write(
+            visible_object.join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("visible/nested/object.txt", "55555555-5555-5555-5555-555555555555"),
+        )
+        .await
+        .expect("visible object metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let root_names = scan_names(&disk, bucket, "").await;
+        assert!(!root_names.contains(&"hidden/".to_string()));
+        assert!(root_names.contains(&"visible/".to_string()));
+
+        let hidden_names = scan_names(&disk, bucket, "hidden/").await;
+        assert!(!hidden_names.contains(&"hidden/nested/".to_string()));
+
+        let visible_names = scan_names(&disk, bucket, "visible/").await;
+        assert!(visible_names.contains(&"visible/nested/".to_string()));
     }
 
     #[cfg(unix)]
