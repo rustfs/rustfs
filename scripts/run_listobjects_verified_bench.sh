@@ -34,6 +34,10 @@ NAMESPACE_JOURNAL_PATH="${NAMESPACE_JOURNAL_PATH:-}"
 PREBUILD_KEY_INDEX="${PREBUILD_KEY_INDEX:-false}"
 PREPARE_ONLY="${PREPARE_ONLY:-false}"
 REUSE_PREPARED_DATA="${REUSE_PREPARED_DATA:-false}"
+RUN_METADATA_FAST="${RUN_METADATA_FAST:-true}"
+RUN_CHAOS="${RUN_CHAOS:-true}"
+CHAOS_MAX_KEYS="${CHAOS_MAX_KEYS:-3}"
+METADATA_FAST_STALENESS_MS="${METADATA_FAST_STALENESS_MS:-5000}"
 PROMETHEUS_QUERY_URL="${PROMETHEUS_QUERY_URL:-http://localhost:9090/api/v1/query}"
 PROMETHEUS_JOB="${PROMETHEUS_JOB:-rustfs-app-metrics}"
 
@@ -70,6 +74,11 @@ Options:
   --prebuild-key-index   Build persistent key-only index from the bench script.
   --prepare-only         Prepare bucket data and exit without running modes.
   --reuse-prepared-data  Reuse --data-root and skip warp data preparation.
+  --skip-metadata-fast   Skip metadata-fast benchmark mode.
+  --skip-chaos           Skip metadata-fast stale/fallback chaos probes.
+  --chaos-max-keys <n>   Metadata-fast chaos page size (default: 3).
+  --metadata-fast-staleness-ms <n>
+                         Metadata-fast staleness SLA in milliseconds (default: 5000).
   --prometheus-query-url <url>
                          Prometheus API query URL or UI /query URL.
   -h, --help             Show this help.
@@ -80,6 +89,7 @@ Environment:
   WARMUP_DURATION, METER_INTERVAL, RESOURCE_SAMPLE_INTERVAL, SKIP_BUILD,
   BUILD_PROFILE, INDEX_PROVIDER, INDEX_GENERATION, KEY_INDEX_PATH,
   NAMESPACE_JOURNAL_PATH, PREBUILD_KEY_INDEX, PREPARE_ONLY, REUSE_PREPARED_DATA,
+  RUN_METADATA_FAST, RUN_CHAOS, CHAOS_MAX_KEYS, METADATA_FAST_STALENESS_MS,
   PROMETHEUS_QUERY_URL, PROMETHEUS_JOB.
 USAGE
 }
@@ -117,6 +127,10 @@ parse_args() {
       --prebuild-key-index) PREBUILD_KEY_INDEX="true"; shift ;;
       --prepare-only) PREPARE_ONLY="true"; shift ;;
       --reuse-prepared-data) REUSE_PREPARED_DATA="true"; shift ;;
+      --skip-metadata-fast) RUN_METADATA_FAST="false"; shift ;;
+      --skip-chaos) RUN_CHAOS="false"; shift ;;
+      --chaos-max-keys) CHAOS_MAX_KEYS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --metadata-fast-staleness-ms) METADATA_FAST_STALENESS_MS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --prometheus-query-url) PROMETHEUS_QUERY_URL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown arg: $1" ;;
@@ -230,8 +244,15 @@ start_server() {
     unset RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH
     unset RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_GENERATION
     unset RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_PATH
-    if [[ "$mode" == "opt_in_verified" ]]; then
+    unset RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED
+    unset RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS
+    if [[ "$mode" == "opt_in_verified" || "$mode" == "metadata_fast" ]]; then
       export RUSTFS_LIST_OBJECTS_INDEX_MODE=index_key_only
+      if [[ "$mode" == "metadata_fast" ]]; then
+        export RUSTFS_LIST_OBJECTS_INDEX_MODE=index_metadata_fast
+        export RUSTFS_LIST_OBJECTS_METADATA_FAST_ENABLED=true
+        export RUSTFS_LIST_OBJECTS_METADATA_FAST_STALENESS_MS="$METADATA_FAST_STALENESS_MS"
+      fi
       export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER="$INDEX_PROVIDER"
       if [[ "$INDEX_PROVIDER" == "persistent_key_only" || "$INDEX_PROVIDER" == "persisted_key_only" ]]; then
         export RUSTFS_LIST_OBJECTS_INDEX_PROVIDER_PATH="$KEY_INDEX_PATH"
@@ -276,13 +297,15 @@ prepare_bucket() {
 write_key_index() {
   local bucket="$1"
   local index_path="$2"
-  local index_dir tmp_keys sorted_keys tmp_index token page response_file next_token key_count
+  local index_dir tmp_keys tmp_objects sorted_keys tmp_index token page response_file next_token key_count
   index_dir="$(dirname "$index_path")"
   tmp_keys="${index_path}.keys.tmp"
+  tmp_objects="${index_path}.objects.tmp"
   sorted_keys="${index_path}.keys.sorted.tmp"
   tmp_index="${index_path}.tmp"
   mkdir -p "$index_dir"
   : >"$tmp_keys"
+  : >"$tmp_objects"
 
   token=""
   page=0
@@ -302,6 +325,7 @@ write_key_index() {
       -o "$response_file" \
       "$url"
     extract_xml_keys <"$response_file" >>"$tmp_keys" || true
+    extract_metadata_object_rows <"$response_file" >>"$tmp_objects" || true
     next_token="$(extract_next_token <"$response_file" || true)"
     rm -f "$response_file"
     if [[ -z "$next_token" ]]; then
@@ -319,29 +343,210 @@ write_key_index() {
     echo "# generation=${INDEX_GENERATION}"
     echo "# checkpoint_high_water_mark=${key_count}"
     cat "$sorted_keys"
+    cat "$tmp_objects"
   } >"$tmp_index"
   mv "$tmp_index" "$index_path"
-  rm -f "$tmp_keys" "$sorted_keys"
+  rm -f "$tmp_keys" "$tmp_objects" "$sorted_keys"
 }
 
 extract_xml_keys() {
-  grep -o '<Key>[^<]*</Key>' | sed 's:<Key>::g; s:</Key>::g'
+  python3 -c 'import sys, xml.etree.ElementTree as ET
+root = ET.fromstring(sys.stdin.read())
+for elem in root.iter():
+    if elem.tag.rsplit("}", 1)[-1] == "Key" and elem.text:
+        print(elem.text)'
 }
 
 extract_next_token() {
-  grep -o '<NextContinuationToken>[^<]*</NextContinuationToken>' | sed 's:<NextContinuationToken>::g; s:</NextContinuationToken>::g' | head -n 1
+  python3 -c 'import sys, xml.etree.ElementTree as ET
+root = ET.fromstring(sys.stdin.read())
+for elem in root.iter():
+    if elem.tag.rsplit("}", 1)[-1] == "NextContinuationToken" and elem.text:
+        print(elem.text)
+        break'
+}
+
+xml_tag_text() {
+  local tag="$1"
+  python3 -c 'import sys, xml.etree.ElementTree as ET
+tag = sys.argv[1]
+root = ET.fromstring(sys.stdin.read())
+for elem in root.iter():
+    if elem.tag.rsplit("}", 1)[-1] == tag and elem.text:
+        print(elem.text)
+        break' "$tag"
+}
+
+extract_metadata_object_rows() {
+  python3 -c 'import base64, datetime, sys, xml.etree.ElementTree as ET
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+def text(parent, name):
+    for child in parent:
+        if local_name(child.tag) == name:
+            return child.text or ""
+    return ""
+def enc(value):
+    if not value:
+        return "-"
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+def nanos(value):
+    if not value:
+        return "-"
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return str(int(dt.timestamp() * 1_000_000_000))
+    except ValueError:
+        return "-"
+root = ET.fromstring(sys.stdin.read())
+for contents in root.iter():
+    if local_name(contents.tag) != "Contents":
+        continue
+    key = text(contents, "Key")
+    if not key:
+        continue
+    size = text(contents, "Size") or "0"
+    etag = text(contents, "ETag").strip("\"")
+    storage_class = text(contents, "StorageClass")
+    print("# object\t{}\t{}\t{}\t{}\t{}".format(
+        enc(key),
+        size,
+        nanos(text(contents, "LastModified")),
+        enc(etag),
+        enc(storage_class),
+    ))'
 }
 
 signed_list_once() {
   local bucket="$1"
   local response_file="$2"
   local max_keys="${3:-1}"
+  signed_list_page "$bucket" "$response_file" "$max_keys" ""
+}
+
+signed_list_page() {
+  local bucket="$1"
+  local response_file="$2"
+  local max_keys="${3:-1}"
+  local token="${4:-}"
+  local url="${ENDPOINT}/${bucket}?list-type=2&max-keys=${max_keys}"
+  if [[ -n "$token" ]]; then
+    local encoded_token
+    encoded_token="$(printf '%s' "$token" | urlencode)"
+    url="${url}&continuation-token=${encoded_token}"
+  fi
   curl -fsS \
     --user "${ACCESS_KEY}:${SECRET_KEY}" \
     --aws-sigv4 "aws:amz:${REGION}:s3" \
     -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
     -o "$response_file" \
-    "${ENDPOINT}/${bucket}?list-type=2&max-keys=${max_keys}"
+    "$url"
+}
+
+urlencode_path() {
+  python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/-_.~"))' "$1"
+}
+
+signed_put_object() {
+  local bucket="$1"
+  local key="$2"
+  local body_file="$3"
+  local out_file="$4"
+  local encoded_key
+  encoded_key="$(urlencode_path "$key")"
+  curl -fsS \
+    --request PUT \
+    --user "${ACCESS_KEY}:${SECRET_KEY}" \
+    --aws-sigv4 "aws:amz:${REGION}:s3" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    --upload-file "$body_file" \
+    -o "$out_file" \
+    "${ENDPOINT}/${bucket}/${encoded_key}"
+}
+
+signed_delete_object() {
+  local bucket="$1"
+  local key="$2"
+  local out_file="$3"
+  local encoded_key
+  encoded_key="$(urlencode_path "$key")"
+  curl -fsS \
+    --request DELETE \
+    --user "${ACCESS_KEY}:${SECRET_KEY}" \
+    --aws-sigv4 "aws:amz:${REGION}:s3" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    -o "$out_file" \
+    "${ENDPOINT}/${bucket}/${encoded_key}"
+}
+
+response_etag() {
+  awk 'BEGIN{IGNORECASE=1} /^etag:/ {gsub("\r", "", $0); sub("^[^:]*:[[:space:]]*", "", $0); print $0; exit}' "$1"
+}
+
+signed_multipart_complete() {
+  local bucket="$1"
+  local key="$2"
+  local work_dir="$3"
+  local encoded_key upload_xml upload_id encoded_upload_id part1_file part2_file part1_headers part2_headers etag1 etag2 complete_xml
+  encoded_key="$(urlencode_path "$key")"
+  upload_xml="$work_dir/multipart-init.xml"
+
+  curl -fsS \
+    --request POST \
+    --user "${ACCESS_KEY}:${SECRET_KEY}" \
+    --aws-sigv4 "aws:amz:${REGION}:s3" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    -o "$upload_xml" \
+    "${ENDPOINT}/${bucket}/${encoded_key}?uploads"
+  upload_id="$(xml_tag_text UploadId <"$upload_xml")"
+  [[ -n "$upload_id" ]] || die "multipart initiate did not return UploadId"
+  encoded_upload_id="$(printf '%s' "$upload_id" | urlencode)"
+
+  part1_file="$work_dir/multipart-part-1.bin"
+  part2_file="$work_dir/multipart-part-2.bin"
+  part1_headers="$work_dir/multipart-part-1.headers"
+  part2_headers="$work_dir/multipart-part-2.headers"
+  python3 -c 'from pathlib import Path; Path(__import__("sys").argv[1]).write_bytes(b"a" * (5 * 1024 * 1024)); Path(__import__("sys").argv[2]).write_bytes(b"b")' "$part1_file" "$part2_file"
+
+  curl -fsS \
+    --request PUT \
+    --user "${ACCESS_KEY}:${SECRET_KEY}" \
+    --aws-sigv4 "aws:amz:${REGION}:s3" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    --upload-file "$part1_file" \
+    -D "$part1_headers" \
+    -o "$work_dir/multipart-part-1.out" \
+    "${ENDPOINT}/${bucket}/${encoded_key}?partNumber=1&uploadId=${encoded_upload_id}"
+  curl -fsS \
+    --request PUT \
+    --user "${ACCESS_KEY}:${SECRET_KEY}" \
+    --aws-sigv4 "aws:amz:${REGION}:s3" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    --upload-file "$part2_file" \
+    -D "$part2_headers" \
+    -o "$work_dir/multipart-part-2.out" \
+    "${ENDPOINT}/${bucket}/${encoded_key}?partNumber=2&uploadId=${encoded_upload_id}"
+
+  etag1="$(response_etag "$part1_headers")"
+  etag2="$(response_etag "$part2_headers")"
+  [[ -n "$etag1" && -n "$etag2" ]] || die "multipart part upload did not return ETags"
+  complete_xml="$work_dir/multipart-complete.xml"
+  {
+    echo "<CompleteMultipartUpload>"
+    echo "  <Part><PartNumber>1</PartNumber><ETag>${etag1}</ETag></Part>"
+    echo "  <Part><PartNumber>2</PartNumber><ETag>${etag2}</ETag></Part>"
+    echo "</CompleteMultipartUpload>"
+  } >"$complete_xml"
+
+  curl -fsS \
+    --request POST \
+    --user "${ACCESS_KEY}:${SECRET_KEY}" \
+    --aws-sigv4 "aws:amz:${REGION}:s3" \
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    -H "Content-Type: application/xml" \
+    --data-binary "@${complete_xml}" \
+    -o "$work_dir/multipart-complete.out" \
+    "${ENDPOINT}/${bucket}/${encoded_key}?uploadId=${encoded_upload_id}"
 }
 
 urlencode() {
@@ -660,6 +865,82 @@ write_resource_summary() {
   ' "$samples_file" >"$summary_file"
 }
 
+run_metadata_fast_chaos() {
+  local bucket="$1"
+  local out_dir="$2"
+  mkdir -p "$out_dir"
+
+  local summary="$out_dir/chaos-summary.csv"
+  local page1="$out_dir/page1-before-mutation.xml"
+  local page2="$out_dir/page2-after-mutation.xml"
+  local fresh_after="$out_dir/fresh-after-mutation.xml"
+  local page1_keys="$out_dir/page1-before-mutation.keys"
+  local page2_keys="$out_dir/page2-after-mutation.keys"
+  local fresh_after_keys="$out_dir/fresh-after-mutation.keys"
+  local expected_page2_keys="$out_dir/expected-page2-after-mutation.keys"
+  local body_file="$out_dir/overwrite-body.bin"
+  local delete_out="$out_dir/delete.out"
+  local overwrite_out="$out_dir/overwrite.out"
+  local token first_key second_key multipart_key overlap last_key monotonic_status no_skip_status page1_count page2_count fresh_max_keys
+
+  echo "probe,status,detail" >"$summary"
+
+  signed_list_page "$bucket" "$page1" "$CHAOS_MAX_KEYS" ""
+  extract_xml_keys <"$page1" >"$page1_keys"
+  token="$(extract_next_token <"$page1" || true)"
+  page1_count="$(awk 'END{print NR + 0}' "$page1_keys")"
+  if [[ -z "$token" || "$page1_count" -lt 2 ]]; then
+    echo "initial_page,skipped,requires at least two keys and a continuation token" >>"$summary"
+    return 0
+  fi
+  echo "initial_page,ok,keys=${page1_count}; continuation_token=yes" >>"$summary"
+
+  first_key="$(sed -n '1p' "$page1_keys")"
+  second_key="$(sed -n '2p' "$page1_keys")"
+  printf 'metadata-fast overwrite probe %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$body_file"
+
+  signed_put_object "$bucket" "$first_key" "$body_file" "$overwrite_out"
+  echo "overwrite,ok,key=${first_key}" >>"$summary"
+
+  signed_delete_object "$bucket" "$second_key" "$delete_out"
+  echo "delete,ok,key=${second_key}" >>"$summary"
+
+  multipart_key="zzzz-metadata-fast-chaos-multipart-$(date +%s).bin"
+  signed_multipart_complete "$bucket" "$multipart_key" "$out_dir"
+  echo "multipart_complete,ok,key=${multipart_key}" >>"$summary"
+
+  signed_list_page "$bucket" "$page2" "$CHAOS_MAX_KEYS" "$token"
+  extract_xml_keys <"$page2" >"$page2_keys"
+  page2_count="$(awk 'END{print NR + 0}' "$page2_keys")"
+
+  overlap="$(comm -12 <(LC_ALL=C sort "$page1_keys") <(LC_ALL=C sort "$page2_keys") | awk 'END{print NR + 0}')"
+  if [[ "$overlap" -eq 0 ]]; then
+    echo "continuation_no_duplicate,ok,overlap=0" >>"$summary"
+  else
+    echo "continuation_no_duplicate,failed,overlap=${overlap}" >>"$summary"
+    return 1
+  fi
+
+  last_key="$(tail -n 1 "$page1_keys")"
+  monotonic_status="ok"
+  if [[ -n "$last_key" ]] && ! awk -v last="$last_key" 'NF && $0 <= last { bad = 1 } END { exit bad }' "$page2_keys"; then
+    monotonic_status="failed"
+  fi
+  echo "continuation_monotonic,${monotonic_status},page2_keys=${page2_count}; last_page1=${last_key}" >>"$summary"
+  [[ "$monotonic_status" == "ok" ]] || return 1
+
+  fresh_max_keys=$((page1_count + page2_count + CHAOS_MAX_KEYS))
+  signed_list_page "$bucket" "$fresh_after" "$fresh_max_keys" ""
+  extract_xml_keys <"$fresh_after" >"$fresh_after_keys"
+  awk -v last="$last_key" 'NF && $0 > last { print }' "$fresh_after_keys" | head -n "$page2_count" >"$expected_page2_keys"
+  no_skip_status="ok"
+  if ! cmp -s "$expected_page2_keys" "$page2_keys"; then
+    no_skip_status="failed"
+  fi
+  echo "continuation_no_skip,${no_skip_status},expected_next_keys=$(awk 'END{print NR + 0}' "$expected_page2_keys"); actual_page2_keys=${page2_count}" >>"$summary"
+  [[ "$no_skip_status" == "ok" ]]
+}
+
 run_mode() {
   local mode="$1"
   local bucket="$2"
@@ -685,6 +966,15 @@ run_mode() {
   write_fallback_reason_summary "$mode" "$mode_dir/rustfs.log" "$mode_dir/index-fallback-reasons.csv"
   write_resource_summary "$mode_dir/resource-samples.csv" "$mode_dir/resource-summary.csv"
   write_prometheus_snapshot "$mode" "$mode_dir"
+
+  if [[ "$mode" == "metadata_fast" && "$RUN_CHAOS" == "true" ]]; then
+    log_info "Running metadata-fast chaos probes"
+    run_metadata_fast_chaos "$bucket" "$mode_dir/chaos"
+    sleep "$((METER_INTERVAL + 2))"
+    write_ratio_summary "${mode}_after_chaos" "$mode_dir/rustfs.log" "$mode_dir/chaos/index-ratios-after-chaos.csv"
+    write_fallback_reason_summary "${mode}_after_chaos" "$mode_dir/rustfs.log" "$mode_dir/chaos/index-fallback-reasons-after-chaos.csv"
+  fi
+
   stop_server
 }
 
@@ -712,9 +1002,24 @@ write_manifest() {
     echo "prebuild_key_index=$PREBUILD_KEY_INDEX"
     echo "prepare_only=$PREPARE_ONLY"
     echo "reuse_prepared_data=$REUSE_PREPARED_DATA"
+    echo "run_metadata_fast=$RUN_METADATA_FAST"
+    echo "run_chaos=$RUN_CHAOS"
+    echo "chaos_max_keys=$CHAOS_MAX_KEYS"
+    echo "metadata_fast_staleness_ms=$METADATA_FAST_STALENESS_MS"
     echo "prometheus_query_url=$PROMETHEUS_QUERY_URL"
     echo "prometheus_job=$PROMETHEUS_JOB"
   } >"$OUT_DIR/manifest.env"
+}
+
+summary_csv_section() {
+  local title="$1"
+  local file="$2"
+  if [[ -f "$file" ]]; then
+    echo "### $title"
+    echo
+    cat "$file"
+    echo
+  fi
 }
 
 write_combined_summary() {
@@ -728,43 +1033,35 @@ write_combined_summary() {
     echo
     echo "## Warp"
     echo
-    echo "### Walker"
-    echo
-    cat "$OUT_DIR/walker/list-summary.csv"
-    echo
-    echo "### Opt-in verified"
-    echo
-    cat "$OUT_DIR/opt_in_verified/list-summary.csv"
+    summary_csv_section "Walker" "$OUT_DIR/walker/list-summary.csv"
+    summary_csv_section "Opt-in verified" "$OUT_DIR/opt_in_verified/list-summary.csv"
+    summary_csv_section "Metadata-fast" "$OUT_DIR/metadata_fast/list-summary.csv"
     echo
     echo "## Index Ratios"
     echo
-    echo "### Walker"
-    echo
-    cat "$OUT_DIR/walker/index-ratios.csv"
-    echo
-    echo "### Opt-in verified"
-    echo
-    cat "$OUT_DIR/opt_in_verified/index-ratios.csv"
+    summary_csv_section "Walker" "$OUT_DIR/walker/index-ratios.csv"
+    summary_csv_section "Opt-in verified" "$OUT_DIR/opt_in_verified/index-ratios.csv"
+    summary_csv_section "Metadata-fast" "$OUT_DIR/metadata_fast/index-ratios.csv"
     echo
     echo "## Fallback Reasons"
     echo
-    echo "### Walker"
-    echo
-    cat "$OUT_DIR/walker/index-fallback-reasons.csv"
-    echo
-    echo "### Opt-in verified"
-    echo
-    cat "$OUT_DIR/opt_in_verified/index-fallback-reasons.csv"
+    summary_csv_section "Walker" "$OUT_DIR/walker/index-fallback-reasons.csv"
+    summary_csv_section "Opt-in verified" "$OUT_DIR/opt_in_verified/index-fallback-reasons.csv"
+    summary_csv_section "Metadata-fast" "$OUT_DIR/metadata_fast/index-fallback-reasons.csv"
     echo
     echo "## Resource Samples"
     echo
-    echo "### Walker"
-    echo
-    cat "$OUT_DIR/walker/resource-summary.csv"
-    echo
-    echo "### Opt-in verified"
-    echo
-    cat "$OUT_DIR/opt_in_verified/resource-summary.csv"
+    summary_csv_section "Walker" "$OUT_DIR/walker/resource-summary.csv"
+    summary_csv_section "Opt-in verified" "$OUT_DIR/opt_in_verified/resource-summary.csv"
+    summary_csv_section "Metadata-fast" "$OUT_DIR/metadata_fast/resource-summary.csv"
+    if [[ -f "$OUT_DIR/metadata_fast/chaos/chaos-summary.csv" ]]; then
+      echo
+      echo "## Metadata-fast Chaos"
+      echo
+      summary_csv_section "Chaos probes" "$OUT_DIR/metadata_fast/chaos/chaos-summary.csv"
+      summary_csv_section "Ratios after chaos" "$OUT_DIR/metadata_fast/chaos/index-ratios-after-chaos.csv"
+      summary_csv_section "Fallback reasons after chaos" "$OUT_DIR/metadata_fast/chaos/index-fallback-reasons-after-chaos.csv"
+    fi
   } >"$summary"
 }
 
@@ -811,6 +1108,9 @@ main() {
 
   run_mode walker "$bucket" false
   run_mode opt_in_verified "$bucket" false
+  if [[ "$RUN_METADATA_FAST" == "true" ]]; then
+    run_mode metadata_fast "$bucket" false
+  fi
   write_combined_summary
 
   log_info "Summary: $OUT_DIR/summary.md"

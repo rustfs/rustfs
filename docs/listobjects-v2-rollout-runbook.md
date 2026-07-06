@@ -151,12 +151,34 @@ or release tracker.
 - `cargo fmt --all --check`
 - Benchmark large bucket walker baseline.
 - Benchmark opt-in verified mode p50, p95, p99.
+- Benchmark metadata-fast mode p50, p95, p99 with the same bucket and release
+  binary.
 - Record fallback ratio and fallback reasons.
 - Record live verification IO amplification.
 - Record CPU and allocation delta.
 - Run overwrite/delete/multipart-complete adversarial tests.
 - Run crash during rebuild and restart recovery tests.
 - Confirm rollback by unsetting `RUSTFS_LIST_OBJECTS_INDEX_MODE`.
+
+The current executable benchmark and chaos entrypoint is:
+
+```bash
+scripts/run_listobjects_verified_bench.sh \
+  --release \
+  --objects 100000 \
+  --duration 60s \
+  --warmup-duration 20s
+```
+
+It writes per-mode `list-summary.csv` files with p50/p95/p99 latency,
+`index-ratios.csv` files with fallback ratio and verification amplification,
+`resource-summary.csv` files with process CPU/RSS attribution, Prometheus
+allocator snapshots when available, and
+`metadata_fast/chaos/chaos-summary.csv` for overwrite/delete/multipart plus
+cross-page fallback continuity evidence. The chaos probe uses a small
+independent page size (`--chaos-max-keys`, default `3`) and compares the old
+continuation-token page against a fresh post-mutation listing slice to prove no
+duplicate and no skipped keys across the fallback boundary.
 
 ## Canary Gates
 
