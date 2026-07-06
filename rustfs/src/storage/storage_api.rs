@@ -197,8 +197,8 @@ pub(crate) mod rpc_consumer {
             ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
             ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt,
             StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref,
-            get_local_server_property, load_bucket_metadata, reload_transition_tier_config, set_bucket_metadata,
-            validate_batch_read_version_item_count,
+            get_local_server_property, load_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata,
+            set_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -1168,6 +1168,10 @@ pub(crate) async fn get_bucket_website_config(bucket: &str) -> Result<(s3s::dto:
 
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
+}
+
+pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
+    ecstore_bucket::metadata_sys::remove_bucket_metadata(bucket).await
 }
 
 pub(crate) async fn update_bucket_metadata_config(

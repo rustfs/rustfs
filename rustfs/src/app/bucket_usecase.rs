@@ -452,6 +452,29 @@ fn notify_bucket_metadata_reload(
     });
 }
 
+/// Notify peers to drop their cached metadata for a bucket that was just deleted,
+/// so they stop serving stale bucket configuration. Runs in the background to
+/// avoid blocking the delete response.
+fn notify_bucket_metadata_delete(bucket: String, request_context: Option<request_context::RequestContext>) {
+    spawn_background_with_context(request_context, async move {
+        if let Some(notification_sys) = current_notification_system() {
+            for peer_err in notification_sys
+                .delete_bucket_metadata(&bucket)
+                .await
+                .into_iter()
+                .filter(|e| e.err.is_some())
+            {
+                warn!(
+                    bucket = %bucket,
+                    host = %peer_err.host,
+                    error = ?peer_err.err,
+                    "failed to notify peer to delete bucket metadata"
+                );
+            }
+        }
+    });
+}
+
 fn validate_replication_config_targets(targets: &BucketTargets, config: &ReplicationConfiguration) -> S3Result<()> {
     let configured_arns = targets
         .targets
@@ -1132,6 +1155,10 @@ impl DefaultBucketUsecase {
         if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
         }
+
+        // Notify peers to drop their cached metadata for the now-deleted bucket.
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        notify_bucket_metadata_delete(input.bucket.clone(), request_context);
 
         let result = Ok(S3Response::new(DeleteBucketOutput {}));
         let _ = helper.complete(&result);

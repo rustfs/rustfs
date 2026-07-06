@@ -791,7 +791,6 @@ mod tests {
     use serde_json::json;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;
-    use tracing::debug;
 
     #[test]
     fn test_heal_opts_serialization() {
