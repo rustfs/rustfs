@@ -365,7 +365,6 @@ impl ObjectInfo {
             if let Some(size_str) = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE)
                 && !size_str.is_empty()
             {
-                // Todo: deal with error
                 let size = size_str.parse::<i64>().map_err(|e| std::io::Error::other(e.to_string()))?;
                 return Ok(size);
             }
@@ -508,8 +507,6 @@ impl ObjectInfo {
                 error: part.error.clone(),
             })
             .collect::<Vec<_>>();
-
-        // TODO: part checksums
 
         ObjectInfo {
             bucket: bucket.to_string(),

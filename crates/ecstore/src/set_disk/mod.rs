@@ -1901,14 +1901,6 @@ impl SetDisks {
 
     //     Ok(())
     // }
-
-    // Shuffle the order
-
-    // Shuffle the order
-
-    // Return shuffled partsMetadata depending on distribution.
-
-    // shuffle_disks TODO: use origin value
 }
 
 fn is_explicit_null_version(version_id: Option<Uuid>) -> bool {

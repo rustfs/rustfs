@@ -176,7 +176,6 @@ impl Sets {
 
         let sets = Arc::new(Self {
             id: fm.id,
-            // sets: todo!(),
             disk_set,
             pool_idx,
             endpoints: endpoints.clone(),
@@ -194,46 +193,12 @@ impl Sets {
         let rx1 = rx.resubscribe();
         tokio::spawn(async move { asets.monitor_and_connect_endpoints(rx1).await });
 
-        // let sets2 = sets.clone();
-        // let rx2 = rx.resubscribe();
-        // tokio::spawn(async move { sets2.cleanup_deleted_objects_loop(rx2).await });
-
         Ok(sets)
     }
 
     pub fn set_drive_count(&self) -> usize {
         self.set_drive_count
     }
-
-    // pub async fn cleanup_deleted_objects_loop(self: Arc<Self>, mut rx: Receiver<()>) {
-    //     tokio::time::sleep(Duration::from_secs(5)).await;
-
-    //     info!("start cleanup_deleted_objects_loop");
-
-    //     // TODO: config interval
-    //     let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
-    //     loop {
-    //         tokio::select! {
-    //            _= interval.tick()=>{
-
-    //             info!("cleanup_deleted_objects_loop tick");
-
-    //             for set in self.disk_set.iter() {
-    //                 set.clone().cleanup_deleted_objects().await;
-    //             }
-
-    //             interval.reset();
-    //            },
-
-    //            _ = rx.recv() => {
-    //             warn!("cleanup_deleted_objects_loop ctx cancelled");
-    //             break;
-    //            }
-    //         }
-    //     }
-
-    //     warn!("cleanup_deleted_objects_loop exit");
-    // }
 
     pub async fn monitor_and_connect_endpoints(&self, mut rx: Receiver<()>) {
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -326,17 +291,6 @@ impl Sets {
             DistributionAlgoVersion::V2 | DistributionAlgoVersion::V3 => sip_hash(input, self.disk_set.len(), self.id.as_bytes()),
         }
     }
-
-    // async fn commit_rename_data_dir(
-    //     &self,
-    //     disks: &Vec<Option<DiskStore>>,
-    //     bucket: &str,
-    //     object: &str,
-    //     data_dir: &str,
-    //     // write_quorum: usize,
-    // ) -> Vec<Option<Error>> {
-    //     unimplemented!()
-    // }
 
     async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         let mut futures = Vec::new();

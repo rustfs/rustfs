@@ -1785,14 +1785,7 @@ impl LocalDisk {
         DiskMetrics::default()
     }
 
-    async fn bitrot_verify(
-        &self,
-        part_path: &PathBuf,
-        part_size: usize,
-        algo: HashAlgorithm,
-        sum: &[u8],
-        shard_size: usize,
-    ) -> Result<()> {
+    async fn bitrot_verify(&self, part_path: &PathBuf, part_size: usize, algo: HashAlgorithm, shard_size: usize) -> Result<()> {
         let retry_count = bitrot_size_mismatch_retry_count();
         let retry_delay = bitrot_size_mismatch_retry_delay();
 
@@ -1801,16 +1794,7 @@ impl LocalDisk {
             let meta = file.metadata().await.map_err(to_file_error)?;
             let file_size = meta.len() as usize;
 
-            match bitrot_verify(
-                Box::new(file),
-                file_size,
-                part_size,
-                algo.clone(),
-                Bytes::copy_from_slice(sum),
-                shard_size,
-            )
-            .await
-            {
+            match bitrot_verify(Box::new(file), file_size, part_size, algo.clone(), shard_size).await {
                 Ok(()) => return Ok(()),
                 Err(err) if attempt < retry_count && is_bitrot_size_mismatch_error(&err) => {
                     info!(
@@ -2622,7 +2606,6 @@ impl DiskAPI for LocalDisk {
                     &part_path,
                     erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
-                    &checksum_info.hash,
                     erasure.shard_size(),
                 )
                 .await

@@ -918,7 +918,6 @@ fn decode_batch_read_version_response_items(
     Ok(batch_read_version_resps)
 }
 
-// TODO: all api need to handle errors
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
     #[tracing::instrument(skip(self))]
@@ -1184,56 +1183,6 @@ impl DiskAPI for RemoteDisk {
         )
         .await
     }
-
-    // // FIXME: TODO: use writer
-    // #[tracing::instrument(skip(self, wr))]
-    // async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
-    //     let now = std::time::SystemTime::now();
-    //     info!("walk_dir {}/{}/{:?}", self.endpoint.to_string(), opts.bucket, opts.filter_prefix);
-    //     let mut wr = wr;
-    //     let mut out = MetacacheWriter::new(&mut wr);
-    //     let mut buf = Vec::new();
-    //     opts.serialize(&mut Serializer::new(&mut buf))?;
-    //     let mut client = node_service_time_out_client(&self.addr)
-    //         .await
-    //         .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
-    //     let request = Request::new(WalkDirRequest {
-    //         disk: self.endpoint.to_string(),
-    //         walk_dir_options: buf.into(),
-    //     });
-    //     let mut response = client.walk_dir(request).await?.into_inner();
-
-    //     loop {
-    //         match response.next().await {
-    //             Some(Ok(resp)) => {
-    //                 if !resp.success {
-    //                     if let Some(err) = resp.error_info {
-    //                         if err == "Unexpected EOF" {
-    //                             return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, err)));
-    //                         } else {
-    //                             return Err(Error::other(err));
-    //                         }
-    //                     }
-
-    //                     return Err(Error::other("unknown error"));
-    //                 }
-    //                 let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-    //                     .map_err(|_| Error::other(format!("Unexpected response: {:?}", response)))?;
-    //                 out.write_obj(&entry).await?;
-    //             }
-    //             None => break,
-    //             _ => return Err(Error::other(format!("Unexpected response: {:?}", response))),
-    //         }
-    //     }
-
-    //     info!(
-    //         "walk_dir {}/{:?} done {:?}",
-    //         opts.bucket,
-    //         opts.filter_prefix,
-    //         now.elapsed().unwrap_or_default()
-    //     );
-    //     Ok(())
-    // }
 
     #[tracing::instrument(skip(self))]
     async fn delete_version(

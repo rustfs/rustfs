@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
 use std::io::IoSlice;
@@ -221,7 +220,6 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     want_size: usize,
     part_size: usize,
     algo: HashAlgorithm,
-    _want: Bytes, // FIXME: useless parameter?
     mut shard_size: usize,
 ) -> std::io::Result<()> {
     let mut hash_buf = vec![0; algo.size()];

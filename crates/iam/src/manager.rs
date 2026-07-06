@@ -384,7 +384,6 @@ where
         Ok(())
     }
 
-    // TODO: Check if exists, whether retry is possible
     #[tracing::instrument(level = "debug", skip(self))]
     async fn save_iam_formatter(self: Arc<Self>) -> Result<()> {
         let path = get_iam_format_file_path();

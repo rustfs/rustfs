@@ -115,7 +115,6 @@ impl ContextProvider for MetadataProvider {
     }
 
     fn options(&self) -> &ConfigOptions {
-        // TODO refactor
         &self.config_options
     }
 

@@ -783,8 +783,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 .try_get_index()
                 .map(crate::io_support::rio::compression_index_storage_bytes);
 
-            //TODO: userDefined
-
             let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
             if let Some(ref tag) = opts.preserve_etag {
                 etag = tag.clone();
@@ -1726,8 +1724,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
-        // TODO: nslock
-
         // Guard lock for metadata update
         let _lock_guard = if !opts.no_lock {
             Some(self.acquire_write_lock_diag("put_object_metadata", bucket, object).await?)
@@ -2179,11 +2175,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
 
-        // TODO: userdeefined
-
         self.update_object_meta(bucket, object, fi.clone(), disks.as_slice()).await?;
 
-        // TODO: versioned
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
 
