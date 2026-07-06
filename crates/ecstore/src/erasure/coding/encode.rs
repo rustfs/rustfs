@@ -159,6 +159,7 @@ impl<'a> MultiWriter<'a> {
                     }
                     Err(e) => {
                         *err = Some(Error::from(e));
+                        *writer_opt = None; // Mark as failed so the caller drops this disk before commit
                     }
                 }
             }
