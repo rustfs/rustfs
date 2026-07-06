@@ -567,8 +567,6 @@ pub(crate) mod bucket {
         }
 
         pub(crate) mod objectlock_sys {
-            pub(crate) type BucketObjectLockSys =
-                crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::BucketObjectLockSys;
             pub(crate) type ObjectLockBlockReason =
                 crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
 
