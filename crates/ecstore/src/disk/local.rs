@@ -2110,7 +2110,10 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            if opts.recursive || self.directory_has_visible_listing_entry(&opts.bucket, &meta.name).await? {
+                            if opts.recursive
+                                || opts.incl_deleted
+                                || self.directory_has_visible_listing_entry(&opts.bucket, &meta.name).await?
+                            {
                                 schedule_dir(&mut dir_stack, meta.name, false, None);
                             }
                         }
@@ -5402,13 +5405,14 @@ mod test {
             fm.marshal_msg().expect("visible metadata should encode")
         }
 
-        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str) -> Vec<String> {
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, incl_deleted: bool) -> Vec<String> {
             let (reader, mut writer) = tokio::io::duplex(4096);
             let mut out = MetacacheWriter::new(&mut writer);
             let opts = WalkDirOptions {
                 bucket: bucket.to_string(),
                 base_dir: base_dir.to_string(),
                 recursive: false,
+                incl_deleted,
                 ..Default::default()
             };
             let mut objs_returned = 0;
@@ -5479,15 +5483,21 @@ mod test {
             Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
 
-        let root_names = scan_names(&disk, bucket, "").await;
+        let root_names = scan_names(&disk, bucket, "", false).await;
         assert!(!root_names.contains(&"hidden/".to_string()));
         assert!(root_names.contains(&"visible/".to_string()));
 
-        let hidden_names = scan_names(&disk, bucket, "hidden/").await;
+        let hidden_names = scan_names(&disk, bucket, "hidden/", false).await;
         assert!(!hidden_names.contains(&"hidden/nested/".to_string()));
 
-        let visible_names = scan_names(&disk, bucket, "visible/").await;
+        let visible_names = scan_names(&disk, bucket, "visible/", false).await;
         assert!(visible_names.contains(&"visible/nested/".to_string()));
+
+        let versioned_root_names = scan_names(&disk, bucket, "", true).await;
+        assert!(versioned_root_names.contains(&"hidden/".to_string()));
+
+        let versioned_hidden_names = scan_names(&disk, bucket, "hidden/", true).await;
+        assert!(versioned_hidden_names.contains(&"hidden/nested/".to_string()));
     }
 
     #[cfg(unix)]
