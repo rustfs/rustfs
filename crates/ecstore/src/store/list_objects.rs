@@ -273,6 +273,9 @@ const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v1
 const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
 const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
 const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
+const PERSISTENT_KEY_ONLY_MUTATION_HEADER: &str = "# rustfs-listobjects-mutation-v1";
+const PERSISTENT_KEY_ONLY_MUTATION_BUCKET_HEADER: &str = "# bucket=";
+const PERSISTENT_KEY_ONLY_MUTATION_HIGH_WATER_MARK_HEADER: &str = "# high_water_mark=";
 
 /// Identifies the source that produced a ListObjects page.
 ///
@@ -458,6 +461,7 @@ struct PersistentKeyOnlyIndex {
 }
 
 static PERSISTENT_KEY_ONLY_INDEX_CACHE: OnceCell<RwLock<Option<PersistentKeyOnlyIndexCache>>> = OnceCell::const_new();
+static PERSISTENT_KEY_ONLY_MUTATION_STATE_LOCK: OnceCell<RwLock<()>> = OnceCell::const_new();
 static LIST_OBJECTS_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE: OnceCell<RwLock<HashMap<String, u64>>> = OnceCell::const_new();
 
@@ -467,10 +471,40 @@ async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentK
         .await
 }
 
+async fn persistent_key_only_mutation_state_lock() -> &'static RwLock<()> {
+    PERSISTENT_KEY_ONLY_MUTATION_STATE_LOCK
+        .get_or_init(|| async { RwLock::new(()) })
+        .await
+}
+
 async fn list_objects_bucket_mutation_sequence() -> &'static RwLock<HashMap<String, u64>> {
     LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE
         .get_or_init(|| async { RwLock::new(HashMap::new()) })
         .await
+}
+
+fn advance_global_list_objects_mutation_sequence(sequence: u64) -> u64 {
+    let mut current = LIST_OBJECTS_MUTATION_SEQUENCE.load(Ordering::Acquire);
+    loop {
+        if current >= sequence {
+            return current;
+        }
+        match LIST_OBJECTS_MUTATION_SEQUENCE.compare_exchange(current, sequence, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return sequence,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+async fn advance_list_objects_mutation_sequence(bucket: &str, sequence: u64) -> u64 {
+    let sequence = advance_global_list_objects_mutation_sequence(sequence);
+    let sequences = list_objects_bucket_mutation_sequence().await;
+    let mut sequences = sequences.write().await;
+    sequences
+        .entry(bucket.to_owned())
+        .and_modify(|current| *current = (*current).max(sequence))
+        .or_insert(sequence);
+    sequence
 }
 
 pub(super) async fn observe_list_objects_mutation(bucket: &str) -> u64 {
@@ -498,6 +532,7 @@ pub(super) async fn observe_list_objects_mutations(bucket: &str, count: usize) -
         .entry(bucket.to_owned())
         .and_modify(|current| *current = (*current).max(next))
         .or_insert(next);
+    persist_observed_list_objects_mutation(bucket, next).await;
     Some(next)
 }
 
@@ -512,6 +547,153 @@ async fn reset_list_objects_mutation_sequences_for_test() {
     LIST_OBJECTS_MUTATION_SEQUENCE.store(0, Ordering::Release);
     let sequences = list_objects_bucket_mutation_sequence().await;
     sequences.write().await.clear();
+}
+
+fn persistent_key_only_mutation_path(index_path: &Path, bucket: &str) -> PathBuf {
+    let mut mutation_path = index_path.to_path_buf();
+    let file_name = index_path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or("persistent-key-only.index");
+    mutation_path.set_file_name(format!("{file_name}.{bucket}.mutation"));
+    mutation_path
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistentKeyOnlyMutationState {
+    bucket: Option<String>,
+    high_water_mark: u64,
+}
+
+fn parse_persistent_key_only_mutation_state(contents: &str) -> Option<PersistentKeyOnlyMutationState> {
+    let mut bucket = None;
+    let mut high_water_mark = None;
+
+    for line in contents.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line == PERSISTENT_KEY_ONLY_MUTATION_HEADER {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_MUTATION_BUCKET_HEADER) {
+            if !value.is_empty() {
+                bucket = Some(value.to_owned());
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix(PERSISTENT_KEY_ONLY_MUTATION_HIGH_WATER_MARK_HEADER) {
+            high_water_mark = value.parse::<u64>().ok();
+        }
+    }
+
+    high_water_mark.map(|high_water_mark| PersistentKeyOnlyMutationState { bucket, high_water_mark })
+}
+
+async fn load_persistent_key_only_mutation_sequence(index_path: &Path, bucket: &str) -> Result<Option<u64>> {
+    let mutation_path = persistent_key_only_mutation_path(index_path, bucket);
+    let lock = persistent_key_only_mutation_state_lock().await;
+    // Sidecar IO is serialized without taking any other locks so the persisted high-water mark cannot regress.
+    let _guard = lock.read().await;
+    let contents = match tokio::fs::read_to_string(&mutation_path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(Error::Io(err)),
+    };
+    Ok(parse_persistent_key_only_mutation_state(&contents).and_then(|state| {
+        state
+            .bucket
+            .as_deref()
+            .is_none_or(|persisted_bucket| persisted_bucket == bucket)
+            .then_some(state.high_water_mark)
+    }))
+}
+
+async fn write_persistent_key_only_mutation_sequence(index_path: &Path, bucket: &str, sequence: u64) -> Result<u64> {
+    let mutation_path = persistent_key_only_mutation_path(index_path, bucket);
+    let lock = persistent_key_only_mutation_state_lock().await;
+    // Sidecar IO is serialized without taking any other locks so the persisted high-water mark cannot regress.
+    let _guard = lock.write().await;
+
+    let persisted_sequence = match tokio::fs::read_to_string(&mutation_path).await {
+        Ok(contents) => parse_persistent_key_only_mutation_state(&contents)
+            .and_then(|state| {
+                state
+                    .bucket
+                    .as_deref()
+                    .is_none_or(|persisted_bucket| persisted_bucket == bucket)
+                    .then_some(state.high_water_mark)
+            })
+            .unwrap_or(0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(Error::Io(err)),
+    };
+    let sequence = sequence.max(persisted_sequence);
+
+    if let Some(parent) = mutation_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.map_err(Error::Io)?;
+    }
+
+    let mut contents = String::new();
+    contents.push_str(PERSISTENT_KEY_ONLY_MUTATION_HEADER);
+    contents.push('\n');
+    contents.push_str(PERSISTENT_KEY_ONLY_MUTATION_BUCKET_HEADER);
+    contents.push_str(bucket);
+    contents.push('\n');
+    contents.push_str(PERSISTENT_KEY_ONLY_MUTATION_HIGH_WATER_MARK_HEADER);
+    contents.push_str(&sequence.to_string());
+    contents.push('\n');
+
+    let tmp_path = mutation_path.with_extension("mutation.tmp");
+    tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
+    tokio::fs::rename(&tmp_path, &mutation_path).await.map_err(Error::Io)?;
+    Ok(sequence)
+}
+
+async fn invalidate_persistent_key_only_index(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(
+                index_path = %path.display(),
+                error = %err,
+                "failed to remove persistent key-only index after mutation checkpoint persist failure"
+            );
+        }
+    }
+
+    let cache = persistent_key_only_index_cache().await;
+    let mut cached = cache.write().await;
+    if cached.as_ref().is_some_and(|cached| cached.path == path) {
+        *cached = None;
+    }
+}
+
+async fn persist_observed_list_objects_mutation(bucket: &str, sequence: u64) {
+    if is_reserved_or_invalid_bucket(bucket, false) {
+        return;
+    }
+
+    let Some(path) = list_objects_index_provider_path_from_env().filter(|_| {
+        matches!(
+            list_objects_index_provider_from_env(),
+            Some(ListObjectsIndexProviderKind::PersistentKeyOnly)
+        )
+    }) else {
+        return;
+    };
+
+    if let Err(err) = write_persistent_key_only_mutation_sequence(&path, bucket, sequence).await {
+        warn!(
+            bucket = %bucket,
+            sequence,
+            index_path = %path.display(),
+            error = %err,
+            "persistent key-only mutation checkpoint persist failed; invalidating index snapshot"
+        );
+        invalidate_persistent_key_only_index(&path).await;
+    }
 }
 
 fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
@@ -621,6 +803,7 @@ async fn write_persistent_key_only_index(
 
     let tmp_path = path.with_extension("tmp");
     tokio::fs::write(&tmp_path, contents).await.map_err(Error::Io)?;
+    write_persistent_key_only_mutation_sequence(path, bucket, checkpoint_high_water_mark).await?;
     tokio::fs::rename(&tmp_path, path).await.map_err(Error::Io)?;
 
     Ok(PersistentKeyOnlyIndex {
@@ -650,6 +833,13 @@ async fn load_persistent_key_only_index(path: &Path) -> Result<Arc<PersistentKey
 
     let contents = tokio::fs::read_to_string(path).await.map_err(Error::Io)?;
     let index = Arc::new(parse_persistent_key_only_index(&contents));
+    if let Some(bucket) = index.bucket.as_deref() {
+        let restored_sequence = load_persistent_key_only_mutation_sequence(path, bucket)
+            .await?
+            .unwrap_or(index.checkpoint_high_water_mark)
+            .max(index.checkpoint_high_water_mark);
+        advance_list_objects_mutation_sequence(bucket, restored_sequence).await;
+    }
     let mut cached = cache.write().await;
     *cached = Some(PersistentKeyOnlyIndexCache {
         path: path.to_path_buf(),
@@ -2201,6 +2391,13 @@ impl ECStore {
         }
 
         if incl_deleted || !mode.can_satisfy_strong_listing() || !mode.requires_live_metadata_verification() {
+            if list_metrics_enabled {
+                record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
+            }
+            return Ok(None);
+        }
+
+        if is_reserved_or_invalid_bucket(&opts.bucket, false) {
             if list_metrics_enabled {
                 record_list_objects_index_fallback(mode, ListIndexFallbackReason::UnsupportedRequest);
             }
@@ -5212,12 +5409,14 @@ mod test {
         list_metadata_resolution_params, list_objects_from_verified_index_candidates,
         list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
         list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
-        list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
-        merge_entry_channels, normalize_list_quorum, observe_list_objects_mutation, observe_list_objects_mutations,
-        parse_persistent_key_only_index, parse_version_marker, persistent_key_only_index_health,
+        list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env,
+        load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
+        observe_list_objects_mutation, observe_list_objects_mutations, parse_persistent_key_only_index,
+        parse_persistent_key_only_mutation_state, parse_version_marker, persistent_key_only_index_health,
         record_list_objects_index_opt_in_fallback, reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry,
         resolve_listing_entries, select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel,
-        version_marker_for_entries, walk_result_from_set_errors,
+        version_marker_for_entries, walk_result_from_set_errors, write_persistent_key_only_index,
+        write_persistent_key_only_mutation_sequence,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
@@ -6018,6 +6217,58 @@ mod test {
                 "photos/c.jpg".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn parse_persistent_key_only_mutation_state_reads_bucket_and_high_water_mark() {
+        let state = parse_persistent_key_only_mutation_state(
+            "# rustfs-listobjects-mutation-v1\n\
+             # bucket=photos\n\
+             # high_water_mark=123\n",
+        )
+        .expect("mutation state should parse");
+
+        assert_eq!(state.bucket.as_deref(), Some("photos"));
+        assert_eq!(state.high_water_mark, 123);
+    }
+
+    #[tokio::test]
+    async fn persistent_key_only_mutation_sequence_write_never_regresses() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let index_path = tempdir.path().join("persistent-key-only.index");
+
+        assert_eq!(
+            write_persistent_key_only_mutation_sequence(&index_path, "bucket", 7)
+                .await
+                .expect("mutation sequence should be written"),
+            7
+        );
+        assert_eq!(
+            write_persistent_key_only_mutation_sequence(&index_path, "bucket", 3)
+                .await
+                .expect("mutation sequence should not regress"),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_key_only_index_load_recovers_mutation_sequence_from_sidecar() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let index_path = tempdir.path().join("persistent-key-only.index");
+        let keys = vec!["object-a".to_string(), "object-b".to_string()];
+
+        write_persistent_key_only_index(&index_path, "bucket", "generation-42", 5, &keys)
+            .await
+            .expect("index should be written");
+        write_persistent_key_only_mutation_sequence(&index_path, "bucket", 9)
+            .await
+            .expect("sidecar mutation sequence should be written");
+        reset_list_objects_mutation_sequences_for_test().await;
+
+        let index = load_persistent_key_only_index(&index_path).await.expect("index should load");
+
+        assert_eq!(index.checkpoint_high_water_mark, 5);
+        assert_eq!(current_list_objects_mutation_sequence("bucket").await, 9);
     }
 
     #[test]

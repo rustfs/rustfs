@@ -31,6 +31,8 @@ INDEX_PROVIDER="${INDEX_PROVIDER:-persistent_key_only}"
 INDEX_GENERATION="${INDEX_GENERATION:-bench-$(date +%Y%m%d%H%M%S)}"
 KEY_INDEX_PATH="${KEY_INDEX_PATH:-${OUT_DIR}/persistent-key-only.index}"
 PREBUILD_KEY_INDEX="${PREBUILD_KEY_INDEX:-false}"
+PREPARE_ONLY="${PREPARE_ONLY:-false}"
+REUSE_PREPARED_DATA="${REUSE_PREPARED_DATA:-false}"
 PROMETHEUS_QUERY_URL="${PROMETHEUS_QUERY_URL:-http://localhost:9090/api/v1/query}"
 PROMETHEUS_JOB="${PROMETHEUS_JOB:-rustfs-app-metrics}"
 
@@ -64,6 +66,8 @@ Options:
   --index-provider <v>   Opt-in provider (default: persistent_key_only).
   --key-index-path <p>   Persistent key-only index path.
   --prebuild-key-index   Build persistent key-only index from the bench script.
+  --prepare-only         Prepare bucket data and exit without running modes.
+  --reuse-prepared-data  Reuse --data-root and skip warp data preparation.
   --prometheus-query-url <url>
                          Prometheus API query URL or UI /query URL.
   -h, --help             Show this help.
@@ -73,7 +77,8 @@ Environment:
   REGION, OBJECTS, OBJECT_SIZE, CONCURRENCY, MAX_KEYS, DURATION,
   WARMUP_DURATION, METER_INTERVAL, RESOURCE_SAMPLE_INTERVAL, SKIP_BUILD,
   BUILD_PROFILE, INDEX_PROVIDER, INDEX_GENERATION, KEY_INDEX_PATH,
-  PREBUILD_KEY_INDEX, PROMETHEUS_QUERY_URL, PROMETHEUS_JOB.
+  PREBUILD_KEY_INDEX, PREPARE_ONLY, REUSE_PREPARED_DATA,
+  PROMETHEUS_QUERY_URL, PROMETHEUS_JOB.
 USAGE
 }
 
@@ -107,6 +112,8 @@ parse_args() {
       --index-provider) INDEX_PROVIDER="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --key-index-path) KEY_INDEX_PATH="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --prebuild-key-index) PREBUILD_KEY_INDEX="true"; shift ;;
+      --prepare-only) PREPARE_ONLY="true"; shift ;;
+      --reuse-prepared-data) REUSE_PREPARED_DATA="true"; shift ;;
       --prometheus-query-url) PROMETHEUS_QUERY_URL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown arg: $1" ;;
@@ -633,6 +640,8 @@ write_manifest() {
     echo "index_generation=$INDEX_GENERATION"
     echo "key_index_path=$KEY_INDEX_PATH"
     echo "prebuild_key_index=$PREBUILD_KEY_INDEX"
+    echo "prepare_only=$PREPARE_ONLY"
+    echo "reuse_prepared_data=$REUSE_PREPARED_DATA"
     echo "prometheus_query_url=$PROMETHEUS_QUERY_URL"
     echo "prometheus_job=$PROMETHEUS_JOB"
   } >"$OUT_DIR/manifest.env"
@@ -690,20 +699,35 @@ main() {
   local prep_dir="$OUT_DIR/prepare"
   mkdir -p "$prep_dir"
 
-  log_info "Starting RustFS for data preparation"
-  start_server walker "$prep_dir/rustfs.log" true
-  log_info "Preparing bucket=$bucket objects=$OBJECTS with warp list"
-  prepare_bucket "$bucket" "$WARMUP_DURATION" "$prep_dir/warp-prepare.log" || {
-    tail -n 80 "$prep_dir/warp-prepare.log" >&2 || true
-    return 1
-  }
+  if [[ "$REUSE_PREPARED_DATA" == "true" ]]; then
+    log_info "Reusing prepared data root: $DATA_ROOT"
+  else
+    log_info "Starting RustFS for data preparation"
+    start_server walker "$prep_dir/rustfs.log" true
+    log_info "Preparing bucket=$bucket objects=$OBJECTS with warp list"
+    prepare_bucket "$bucket" "$WARMUP_DURATION" "$prep_dir/warp-prepare.log" || {
+      tail -n 80 "$prep_dir/warp-prepare.log" >&2 || true
+      return 1
+    }
+  fi
+
   if [[ "$PREBUILD_KEY_INDEX" == "true" ]]; then
+    if [[ "$REUSE_PREPARED_DATA" == "true" ]]; then
+      log_info "Starting RustFS to build persistent key-only index from reused data"
+      start_server walker "$prep_dir/rustfs.log" false
+    fi
     log_info "Writing persistent key-only index from bench script: $KEY_INDEX_PATH"
     write_key_index "$bucket" "$KEY_INDEX_PATH"
+    stop_server
   else
     log_info "Skipping bench-side key index generation; opt-in mode will rebuild through RustFS lifecycle"
+    stop_server
   fi
-  stop_server
+
+  if [[ "$PREPARE_ONLY" == "true" ]]; then
+    log_info "Prepare-only mode complete: $DATA_ROOT"
+    return 0
+  fi
 
   run_mode walker "$bucket" false
   run_mode opt_in_verified "$bucket" false
