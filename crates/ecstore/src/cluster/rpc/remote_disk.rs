@@ -708,7 +708,18 @@ impl RemoteDisk {
         let max_retries = internode_idempotent_read_retries();
         let mut attempt = 0usize;
         loop {
-            match self.execute_with_timeout_for_op(op, &operation, timeout_duration).await {
+            // Only the final attempt marks the disk faulty / evicts the channel. Earlier retries
+            // ignore the failure, so a transient error cannot flip the disk into a faulty
+            // short-circuit (which would defeat the retry) or over-count failures.
+            let health_action = if attempt >= max_retries {
+                FailureHealthAction::MarkFailure
+            } else {
+                FailureHealthAction::IgnoreFailure
+            };
+            match self
+                .execute_with_timeout_for_op_and_health_action(op, &operation, timeout_duration, health_action)
+                .await
+            {
                 Err(err) if attempt < max_retries && is_network_like_disk_error(&err) => {
                     attempt += 1;
                     let backoff = REMOTE_DISK_READ_RETRY_BASE_BACKOFF

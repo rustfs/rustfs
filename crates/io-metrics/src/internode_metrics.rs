@@ -470,9 +470,8 @@ fn publish_offline_gauge(peers: &HashMap<String, PeerHealthState>) {
 /// Record that a cluster peer is reachable: mark it online and reset its consecutive-failure
 /// counter. Called on a successful dial to `addr`.
 pub fn record_peer_reachable(addr: &str) {
-    let Ok(mut peers) = CLUSTER_PEER_HEALTH.lock() else {
-        return;
-    };
+    // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
+    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = peers.entry(addr.to_string()).or_default();
     entry.online = true;
     entry.consecutive_failures = 0;
@@ -483,9 +482,8 @@ pub fn record_peer_reachable(addr: &str) {
 /// Record a failed interaction with a cluster peer (dial failure or RPC-triggered eviction). After
 /// `failure_threshold` (>= 1) consecutive failures the peer flips offline.
 pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
-    let Ok(mut peers) = CLUSTER_PEER_HEALTH.lock() else {
-        return;
-    };
+    // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
+    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = peers.entry(addr.to_string()).or_default();
     entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     if entry.consecutive_failures >= failure_threshold.max(1) {
@@ -496,11 +494,8 @@ pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
 
 /// Whether a cluster peer is currently considered offline (known and marked offline).
 pub fn cluster_peer_is_offline(addr: &str) -> bool {
-    CLUSTER_PEER_HEALTH
-        .lock()
-        .ok()
-        .and_then(|peers| peers.get(addr).map(|peer| !peer.online))
-        .unwrap_or(false)
+    let peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    peers.get(addr).map(|peer| !peer.online).unwrap_or(false)
 }
 
 /// Decide whether to fast-fail (bypass) an offline peer instead of attempting to reach it
@@ -511,9 +506,7 @@ pub fn cluster_peer_is_offline(addr: &str) -> bool {
 /// can recover via a normal dial even if no background monitor is running. Online peers are never
 /// bypassed.
 pub fn cluster_peer_should_bypass(addr: &str, reprobe_interval: Duration) -> bool {
-    let Ok(mut peers) = CLUSTER_PEER_HEALTH.lock() else {
-        return false;
-    };
+    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(entry) = peers.get_mut(addr) else {
         return false;
     };
