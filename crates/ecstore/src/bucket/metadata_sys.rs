@@ -295,7 +295,6 @@ impl BucketMetadataSys {
         let mut futures = Vec::new();
 
         for bucket in buckets.iter() {
-            // TODO: HealBucket
             let api = self.api.clone();
             let bucket = bucket.clone();
             futures.push(async move {
@@ -319,14 +318,13 @@ impl BucketMetadataSys {
 
         let mut mp = self.metadata_map.write().await;
 
-        // TODO:EventNotifier,BucketTargetSys
+        // TODO: EventNotifier
         for res in results {
             match res {
                 Ok(res) => {
                     if let Some(bucket) = buckets.get(idx) {
                         let x = Arc::new(res);
                         mp.insert(bucket.clone(), x.clone());
-                        // TODO:EventNotifier,BucketTargetSys
                         BucketTargetSys::get().set(bucket, &x).await;
                     }
                 }

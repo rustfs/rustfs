@@ -439,8 +439,6 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
         return Err(s3_error!(InternalError, "action cred not init"));
     };
 
-    // TODO: REPLICATION
-
     let (token, secret) = if cred.is_service_account() {
         (cred.session_token.as_str(), cred.secret_key.as_str())
     } else {

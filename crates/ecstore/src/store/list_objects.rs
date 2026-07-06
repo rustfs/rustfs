@@ -1542,12 +1542,6 @@ impl ECStore {
             .instrument(tracing::Span::current()),
         );
 
-        // let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
-
-        // TODO: cancelList
-
-        // let merge_res = merge_entry_channels(rx, inputs, sender.clone(), 1).await;
-
         let results = join_all(futures).await;
 
         let mut all_at_eof = true;
@@ -1571,10 +1565,6 @@ impl ECStore {
         if is_all_not_found(&errs) {
             return Ok(Vec::new());
         }
-
-        // merge_res?;
-
-        // TODO check cancel
 
         for err in errs.iter() {
             if let Some(err) = err {
@@ -2010,9 +2000,6 @@ async fn gather_results(
             entry.name = entry.name.replace("\\", "/");
         }
 
-        // TODO: rx.recv()
-
-        // TODO: isLatestDeletemarker
         if !opts.include_directories
             && (entry.is_dir() || (!opts.versioned && entry.is_object() && entry.is_latest_delete_marker()))
         {
@@ -2212,7 +2199,6 @@ async fn merge_entry_channels(
                         if !dir_matches {
                             // dir and object has the save name
                             if other_entry.is_dir() {
-                                // TODO: read next entry to top
                                 if !select_from(&rx, &mut in_channels, other_idx, &mut top, &mut n_done).await? {
                                     return Ok(());
                                 }

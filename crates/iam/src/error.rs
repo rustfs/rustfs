@@ -286,21 +286,6 @@ pub fn is_err_no_such_service_account(err: &Error) -> bool {
     matches!(err, Error::NoSuchServiceAccount(_))
 }
 
-// pub fn clone_err(e: &Error) -> Error {
-//     if let Some(e) = e.downcast_ref::<DiskError>() {
-//         clone_disk_err(e)
-//     } else if let Some(e) = e.downcast_ref::<std::io::Error>() {
-//         if let Some(code) = e.raw_os_error() {
-//             Error::new(std::io::Error::from_raw_os_error(code))
-//         } else {
-//             Error::new(std::io::Error::new(e.kind(), e.to_string()))
-//         }
-//     } else {
-//         //TODO: Optimize other types
-//         Error::msg(e.to_string())
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;

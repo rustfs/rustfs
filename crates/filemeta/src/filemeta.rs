@@ -111,7 +111,7 @@ pub use version::*;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub versions: Vec<FileMetaShallowVersion>,
-    pub data: InlineData, // TODO: xlMetaInlineData
+    pub data: InlineData,
     pub meta_ver: u8,
 }
 
@@ -707,7 +707,6 @@ impl FileMeta {
         for ver in self.versions.iter() {
             let header = &ver.header;
 
-            // TODO: freeVersion
             if header.free_version() {
                 non_free_versions -= 1;
                 if include_free_versions

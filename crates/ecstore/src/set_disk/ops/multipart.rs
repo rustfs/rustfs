@@ -1181,8 +1181,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 checksum_combined.extend_from_slice(cs.raw.as_slice());
             }
 
-            // TODO: check min part size
-
             object_size += ext_part.size;
             object_actual_size += ext_part.actual_size;
 
