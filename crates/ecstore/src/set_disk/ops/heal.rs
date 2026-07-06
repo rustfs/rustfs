@@ -484,7 +484,12 @@ impl SetDisks {
                                 // Heal each part. erasure.Heal() will write the healed
                                 // part to .rustfs/tmp/uuid/ which needs to be renamed
                                 // later to the final location.
-                                erasure.heal(&mut writers, readers, part.size, &prefer).await?;
+                                if let Err(e) = erasure.heal(&mut writers, readers, part.size, &prefer).await {
+                                    // Don't leak the partially-written healed shards in
+                                    // .rustfs/tmp when heal fails midway (backlog#799 B20).
+                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    return Err(e.into());
+                                }
                                 // close_bitrot_writers(&mut writers).await?;
 
                                 for (index, disk_op) in out_dated_disks.iter_mut().enumerate() {
@@ -523,6 +528,8 @@ impl SetDisks {
                                 }
 
                                 if disks_to_heal_count == 0 {
+                                    // Clean up healed shards written to .rustfs/tmp before bailing (B20).
+                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
                                     return Ok((
                                         result,
                                         Some(DiskError::other(format!(
@@ -570,18 +577,30 @@ impl SetDisks {
 
                                         let d_path = Path::new(&encode_dir_object(object)).join(rm_data_dir);
 
-                                        disk.delete(
-                                            bucket,
-                                            d_path.to_str().expect("operation should succeed"),
-                                            DeleteOptions {
-                                                immediate: true,
-
-                                                recursive: true,
-
-                                                ..Default::default()
-                                            },
-                                        )
-                                        .await?;
+                                        if let Err(e) = disk
+                                            .delete(
+                                                bucket,
+                                                d_path.to_str().expect("operation should succeed"),
+                                                DeleteOptions {
+                                                    immediate: true,
+                                                    recursive: true,
+                                                    ..Default::default()
+                                                },
+                                            )
+                                            .await
+                                        {
+                                            // The healed shard has already been renamed into place; a
+                                            // failure cleaning up the old remote data dir must not abort
+                                            // the heal and leak the tmp shards (backlog#799 B20).
+                                            warn!(
+                                                component = LOG_COMPONENT_ECSTORE,
+                                                subsystem = LOG_SUBSYSTEM_HEAL,
+                                                bucket,
+                                                object,
+                                                error = %e,
+                                                "Heal remote data-dir cleanup failed"
+                                            );
+                                        }
                                     }
 
                                     for (i, v) in result.before.drives.iter().enumerate() {
