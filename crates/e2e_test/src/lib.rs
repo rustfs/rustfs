@@ -175,4 +175,16 @@ mod admin_timeout_regression_test;
 #[cfg(test)]
 mod overwrite_cleanup_regression_test;
 
+// Regression test for backlog#601: `GET //` ListBuckets browser compatibility.
+#[cfg(test)]
+mod list_buckets_double_slash_test;
+
+// Regression test for backlog#629(b): region-aware CreateBucket SigV4.
+#[cfg(test)]
+mod create_bucket_region_test;
+
+// Regression coverage for backlog#618 item 8: copy-source invalid-date header.
+#[cfg(test)]
+mod copy_source_invalid_date_test;
+
 pub mod tls_gen;

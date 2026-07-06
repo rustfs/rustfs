@@ -22,9 +22,9 @@ use crate::server::{
     compress::{HttpCompressionConfig, PathAwareHttpCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
-        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer,
-        S3ErrorMessageCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+        BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
+        HeadRequestBodyFixLayer, ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer,
+        RequestLoggingLayer, S3ErrorMessageCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     tls_material::{
         TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
@@ -1097,6 +1097,7 @@ fn process_connection(
         // 20. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
         // 21. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // 22. VirtualHostStyleHintLayer              — actionable error for unroutable virtual-hosted-style (conditional)
+        // 23. DoubleSlashListBucketsCompatLayer      — rewrites `GET //` to `GET /` for ListBuckets (MinIO browser compat)
         // ─────────────────────────────────────────────────────────────
         // Batch 1 intentionally keeps the external and internode stacks behaviorally
         // identical while giving each path family a named construction boundary.
@@ -1265,6 +1266,7 @@ fn process_connection(
                 .layer(HeadRequestBodyFixLayer)
                 .layer(PublicHealthEndpointLayer)
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
+                .layer(DoubleSlashListBucketsCompatLayer)
                 .service(service)
         };
         let build_internode_stack = |service| {
@@ -1414,6 +1416,7 @@ fn process_connection(
                 .layer(HeadRequestBodyFixLayer)
                 .layer(PublicHealthEndpointLayer)
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
+                .layer(DoubleSlashListBucketsCompatLayer)
                 .service(service)
         };
         let external_stack_service = build_external_stack(external_service);
