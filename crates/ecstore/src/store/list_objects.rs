@@ -525,6 +525,7 @@ struct ListingSupplementOptions {
     bucket: String,
     path: String,
     recursive: bool,
+    incl_deleted: bool,
     filter_prefix: Option<String>,
     forward_to: Option<String>,
     per_disk_limit: i32,
@@ -653,6 +654,7 @@ async fn read_fallback_listing_disk(
                 bucket: options.bucket,
                 base_dir: options.path,
                 recursive: options.recursive,
+                incl_deleted: options.incl_deleted,
                 report_notfound: false,
                 filter_prefix: options.filter_prefix,
                 forward_to: options.forward_to,
@@ -1707,6 +1709,7 @@ impl ECStore {
                             bucket: bucket.to_owned(),
                             path: path.clone(),
                             recursive: true,
+                            incl_deleted: !opts.latest_only,
                             filter_prefix: Some(filter_prefix.clone()),
                             forward_to: opts.marker.clone(),
                             per_disk_limit: bounded_usize_to_i32(opts.limit),
@@ -1726,6 +1729,7 @@ impl ECStore {
                             bucket: bucket.to_owned(),
                             path,
                             recursive: true,
+                            incl_deleted: !opts.latest_only,
                             filter_prefix: Some(filter_prefix),
                             forward_to: opts.marker.clone(),
                             min_disks: raw_min_disks,
@@ -2032,7 +2036,7 @@ async fn gather_results(
             continue;
         }
 
-        if !opts.incl_deleted && entry.is_object() && entry.is_latest_delete_marker() && !entry.is_object_dir() {
+        if !opts.incl_deleted && entry.is_object() && entry.is_latest_delete_marker() {
             continue;
         }
 
@@ -2824,6 +2828,7 @@ impl Sets {
                         bucket: bucket.to_owned(),
                         path: path.clone(),
                         recursive: true,
+                        incl_deleted: !opts.latest_only,
                         filter_prefix: Some(filter_prefix.clone()),
                         forward_to: opts.marker.clone(),
                         per_disk_limit: bounded_usize_to_i32(opts.limit),
@@ -2843,6 +2848,7 @@ impl Sets {
                         bucket: bucket.to_owned(),
                         path,
                         recursive: true,
+                        incl_deleted: !opts.latest_only,
                         filter_prefix: Some(filter_prefix),
                         forward_to: opts.marker.clone(),
                         min_disks: raw_min_disks,
@@ -3673,6 +3679,7 @@ impl SetDisks {
                 bucket: bucket.clone(),
                 path: opts.base_dir.clone(),
                 recursive: opts.recursive,
+                incl_deleted: opts.incl_deleted,
                 filter_prefix: opts.filter_prefix.clone(),
                 forward_to: opts.marker.clone(),
                 per_disk_limit: limit,
@@ -3692,6 +3699,7 @@ impl SetDisks {
                 bucket: opts.bucket,
                 path: opts.base_dir,
                 recursive: opts.recursive,
+                incl_deleted: opts.incl_deleted,
                 filter_prefix: opts.filter_prefix,
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
@@ -3917,6 +3925,27 @@ mod test {
         }
     }
 
+    fn test_delete_marker_meta_entry(name: &str) -> MetaCacheEntry {
+        let mut meta = FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: "bucket".to_owned(),
+            name: name.to_owned(),
+            deleted: true,
+            version_id: Some(Uuid::from_u128(1)),
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+            ..Default::default()
+        })
+        .expect("test metadata should accept delete marker version");
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
     #[test]
     fn fallback_entries_for_object_filters_claimed_physical_disks() {
         let mut entries = FallbackListingEntries::new();
@@ -3948,6 +3977,7 @@ mod test {
                 bucket: "bucket".to_string(),
                 path: String::new(),
                 recursive: true,
+                incl_deleted: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 100,
@@ -3961,6 +3991,7 @@ mod test {
                 bucket: "bucket".to_string(),
                 path: String::new(),
                 recursive: true,
+                incl_deleted: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 0,
@@ -4007,6 +4038,7 @@ mod test {
                 bucket: "bucket".to_string(),
                 path: String::new(),
                 recursive: true,
+                incl_deleted: false,
                 filter_prefix: None,
                 forward_to: None,
                 per_disk_limit: 0,
@@ -4224,6 +4256,57 @@ mod test {
 
         assert_eq!(names, ["obj-b"]);
         assert!(result.err.is_some());
+
+        let state = timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("gather_results should finish after input closes")
+            .expect("gather_results task should not panic")
+            .expect("gather_results should succeed");
+        assert_eq!(state, GatherResultsState::InputClosed);
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_skips_directory_delete_marker_by_default() {
+        let (entry_tx, entry_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+
+        entry_tx
+            .send(test_delete_marker_meta_entry("folder/"))
+            .await
+            .expect("directory delete marker should be queued");
+        entry_tx
+            .send(test_object_meta_entry("visible"))
+            .await
+            .expect("visible object should be queued");
+        drop(entry_tx);
+
+        let handle = tokio::spawn(gather_results(
+            cancel.clone(),
+            ListPathOptions {
+                bucket: "bucket".to_owned(),
+                separator: Some("/".to_owned()),
+                include_directories: true,
+                limit: 2,
+                ..Default::default()
+            },
+            entry_rx,
+            result_tx,
+        ));
+
+        let result = timeout(Duration::from_secs(1), result_rx.recv())
+            .await
+            .expect("eof result should be sent promptly")
+            .expect("eof result should be present");
+        let entries = result.entries.expect("result entries should be present");
+        let names = entries
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["visible".to_string()]);
 
         let state = timeout(Duration::from_secs(1), handle)
             .await
