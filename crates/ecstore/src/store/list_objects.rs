@@ -47,7 +47,10 @@ use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
 use tokio::sync::broadcast::{self};
@@ -455,11 +458,60 @@ struct PersistentKeyOnlyIndex {
 }
 
 static PERSISTENT_KEY_ONLY_INDEX_CACHE: OnceCell<RwLock<Option<PersistentKeyOnlyIndexCache>>> = OnceCell::const_new();
+static LIST_OBJECTS_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE: OnceCell<RwLock<HashMap<String, u64>>> = OnceCell::const_new();
 
 async fn persistent_key_only_index_cache() -> &'static RwLock<Option<PersistentKeyOnlyIndexCache>> {
     PERSISTENT_KEY_ONLY_INDEX_CACHE
         .get_or_init(|| async { RwLock::new(None) })
         .await
+}
+
+async fn list_objects_bucket_mutation_sequence() -> &'static RwLock<HashMap<String, u64>> {
+    LIST_OBJECTS_BUCKET_MUTATION_SEQUENCE
+        .get_or_init(|| async { RwLock::new(HashMap::new()) })
+        .await
+}
+
+pub(super) async fn observe_list_objects_mutation(bucket: &str) -> u64 {
+    match observe_list_objects_mutations(bucket, 1).await {
+        Some(sequence) => sequence,
+        None => 0,
+    }
+}
+
+pub(super) async fn observe_list_objects_mutations(bucket: &str, count: usize) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+
+    let delta = match u64::try_from(count) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    };
+    let next = LIST_OBJECTS_MUTATION_SEQUENCE
+        .fetch_add(delta, Ordering::AcqRel)
+        .saturating_add(delta);
+    let sequences = list_objects_bucket_mutation_sequence().await;
+    let mut sequences = sequences.write().await;
+    sequences
+        .entry(bucket.to_owned())
+        .and_modify(|current| *current = (*current).max(next))
+        .or_insert(next);
+    Some(next)
+}
+
+async fn current_list_objects_mutation_sequence(bucket: &str) -> u64 {
+    let sequences = list_objects_bucket_mutation_sequence().await;
+    let sequences = sequences.read().await;
+    sequences.get(bucket).copied().unwrap_or(0)
+}
+
+#[cfg(test)]
+async fn reset_list_objects_mutation_sequences_for_test() {
+    LIST_OBJECTS_MUTATION_SEQUENCE.store(0, Ordering::Release);
+    let sequences = list_objects_bucket_mutation_sequence().await;
+    sequences.write().await.clear();
 }
 
 fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
@@ -510,11 +562,13 @@ fn parse_persistent_key_only_index(contents: &str) -> PersistentKeyOnlyIndex {
     }
 }
 
-fn persistent_key_only_index_health(index: &PersistentKeyOnlyIndex) -> ListIndexHealthSnapshot {
+fn persistent_key_only_index_health(index: &PersistentKeyOnlyIndex, current_mutation_sequence: u64) -> ListIndexHealthSnapshot {
     let mut lifecycle = ListIndexLifecycle::disabled(0);
-    lifecycle.begin_rebuild(&index.generation, index.checkpoint_high_water_mark);
+    let mutation_high_water_mark = current_mutation_sequence.max(index.checkpoint_high_water_mark);
+    lifecycle.begin_rebuild(&index.generation, mutation_high_water_mark);
     lifecycle.checkpoint_rebuild(index.checkpoint_high_water_mark);
     let _ = lifecycle.publish_rebuild();
+    lifecycle.observe_mutation_high_water_mark(mutation_high_water_mark);
     lifecycle.health_snapshot()
 }
 
@@ -536,6 +590,7 @@ async fn write_persistent_key_only_index(
     path: &Path,
     bucket: &str,
     generation: &str,
+    checkpoint_high_water_mark: u64,
     keys: &[String],
 ) -> Result<PersistentKeyOnlyIndex> {
     if let Some(parent) = path.parent()
@@ -547,10 +602,6 @@ async fn write_persistent_key_only_index(
     let mut keys = keys.to_vec();
     keys.sort_unstable();
     keys.dedup();
-    let checkpoint_high_water_mark = match u64::try_from(keys.len()) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    };
     let mut contents = String::new();
     contents.push_str(PERSISTENT_KEY_ONLY_INDEX_HEADER);
     contents.push('\n');
@@ -1995,15 +2046,9 @@ impl ListPathOptions {
 }
 
 impl ECStore {
-    async fn rebuild_persistent_key_only_index(
-        self: Arc<Self>,
-        opts: &ListPathOptions,
-        path: &Path,
-        configured_generation: Option<&str>,
-    ) -> Result<Arc<PersistentKeyOnlyIndex>> {
+    async fn collect_persistent_key_only_index_keys(self: Arc<Self>, opts: &ListPathOptions) -> Result<Vec<String>> {
         let mut marker = None;
         let mut keys = Vec::new();
-        let generation = generated_persistent_key_only_generation(configured_generation);
 
         loop {
             let previous_marker = marker.clone();
@@ -2064,8 +2109,39 @@ impl ECStore {
             }
         }
 
-        write_persistent_key_only_index(path, &opts.bucket, &generation, &keys).await?;
-        load_persistent_key_only_index(path).await
+        Ok(keys)
+    }
+
+    async fn rebuild_persistent_key_only_index(
+        self: Arc<Self>,
+        opts: &ListPathOptions,
+        path: &Path,
+        configured_generation: Option<&str>,
+    ) -> Result<Arc<PersistentKeyOnlyIndex>> {
+        let generation = generated_persistent_key_only_generation(configured_generation);
+        const MAX_REBUILD_ATTEMPTS: usize = 3;
+
+        for attempt in 1..=MAX_REBUILD_ATTEMPTS {
+            let start_sequence = current_list_objects_mutation_sequence(&opts.bucket).await;
+            let keys = self.clone().collect_persistent_key_only_index_keys(opts).await?;
+            let end_sequence = current_list_objects_mutation_sequence(&opts.bucket).await;
+            if start_sequence == end_sequence {
+                write_persistent_key_only_index(path, &opts.bucket, &generation, end_sequence, &keys).await?;
+                return load_persistent_key_only_index(path).await;
+            }
+
+            debug!(
+                bucket = %opts.bucket,
+                attempt,
+                start_sequence,
+                end_sequence,
+                "persistent key-only index rebuild raced with object mutations"
+            );
+        }
+
+        Err(Error::other(
+            "persistent key-only index rebuild could not reach a stable mutation checkpoint",
+        ))
     }
 
     async fn prepare_persistent_key_only_index(
@@ -2078,7 +2154,15 @@ impl ECStore {
         };
 
         match load_persistent_key_only_index(path).await {
-            Ok(index) if index.bucket.as_deref().is_none_or(|bucket| bucket == opts.bucket) => Ok(index),
+            Ok(index) if index.bucket.as_deref().is_none_or(|bucket| bucket == opts.bucket) => {
+                let current_sequence = current_list_objects_mutation_sequence(&opts.bucket).await;
+                if current_sequence <= index.checkpoint_high_water_mark {
+                    Ok(index)
+                } else {
+                    self.rebuild_persistent_key_only_index(opts, path, provider_state.persistent_generation.as_deref())
+                        .await
+                }
+            }
             Ok(_) => {
                 self.rebuild_persistent_key_only_index(opts, path, provider_state.persistent_generation.as_deref())
                     .await
@@ -2205,7 +2289,8 @@ impl ECStore {
                     .await
                 {
                     Ok(index) => {
-                        let health = persistent_key_only_index_health(&index);
+                        let current_sequence = current_list_objects_mutation_sequence(&provider_opts.bucket).await;
+                        let health = persistent_key_only_index_health(&index, current_sequence);
                         match select_list_index_provider_source_mode(&provider_opts, mode, &health) {
                             ListIndexSourceDecision::FallbackToWalker(reason) => {
                                 if list_metrics_enabled {
@@ -5121,14 +5206,16 @@ mod test {
         ListMetadataIndexKeyLookup, ListMetadataIndexPage, ListMetadataIndexPageIterator, ListObjectsIndexProviderKind,
         ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
         ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, PersistentKeyOnlyIndex, VerifiedIndexCandidateStats,
-        VersionMarker, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object,
-        gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
-        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_verified_index_candidates,
+        VersionMarker, current_list_objects_mutation_sequence, enforce_latest_listing_write_quorum,
+        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
+        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum,
+        list_metadata_resolution_params, list_objects_from_verified_index_candidates,
         list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
         list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
         list_objects_key_only_provider_health, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
-        merge_entry_channels, normalize_list_quorum, parse_persistent_key_only_index, parse_version_marker,
-        persistent_key_only_index_health, record_list_objects_index_opt_in_fallback, resolve_agreed_listing_entry,
+        merge_entry_channels, normalize_list_quorum, observe_list_objects_mutation, observe_list_objects_mutations,
+        parse_persistent_key_only_index, parse_version_marker, persistent_key_only_index_health,
+        record_list_objects_index_opt_in_fallback, reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry,
         resolve_listing_entries, select_list_index_provider_source_mode, select_list_index_source_mode, send_or_cancel,
         version_marker_for_entries, walk_result_from_set_errors,
     };
@@ -5942,13 +6029,45 @@ mod test {
             keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
         };
 
-        let health = persistent_key_only_index_health(&index);
+        let health = persistent_key_only_index_health(&index, 42);
 
         assert_eq!(health.state, ListIndexLifecycleState::Healthy);
         assert_eq!(health.active_generation.as_deref(), Some("generation-42"));
         assert_eq!(health.checkpoint_high_water_mark, 42);
         assert_eq!(health.mutation_high_water_mark, 42);
         assert_eq!(health.fallback_reason, None);
+    }
+
+    #[test]
+    fn persistent_key_only_index_health_reports_lagging_mutation_checkpoint() {
+        let index = PersistentKeyOnlyIndex {
+            bucket: Some("bucket".to_string()),
+            generation: "generation-42".to_string(),
+            checkpoint_high_water_mark: 42,
+            keys: Arc::new(vec!["a".to_string(), "b".to_string()]),
+        };
+
+        let health = persistent_key_only_index_health(&index, 43);
+
+        assert_eq!(health.state, ListIndexLifecycleState::Lagging);
+        assert_eq!(health.active_generation.as_deref(), Some("generation-42"));
+        assert_eq!(health.checkpoint_high_water_mark, 42);
+        assert_eq!(health.mutation_high_water_mark, 43);
+        assert_eq!(health.mutation_lag, 1);
+        assert_eq!(health.fallback_reason, Some(ListIndexFallbackReason::Lagging));
+    }
+
+    #[tokio::test]
+    async fn list_objects_mutation_sequence_advances_per_bucket() {
+        reset_list_objects_mutation_sequences_for_test().await;
+
+        assert_eq!(current_list_objects_mutation_sequence("bucket-a").await, 0);
+        assert_eq!(observe_list_objects_mutation("bucket-a").await, 1);
+        assert_eq!(observe_list_objects_mutations("bucket-a", 2).await, Some(3));
+        assert_eq!(current_list_objects_mutation_sequence("bucket-a").await, 3);
+        assert_eq!(current_list_objects_mutation_sequence("bucket-b").await, 0);
+        assert_eq!(observe_list_objects_mutations("bucket-b", 0).await, None);
+        assert_eq!(current_list_objects_mutation_sequence("bucket-b").await, 0);
     }
 
     #[test]
