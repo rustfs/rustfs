@@ -356,7 +356,7 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
             enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject)
                 .await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(bucket).await;
+            list_objects::observe_list_objects_mutation(self, bucket).await;
         }
         result
     }
@@ -432,7 +432,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         )
         .await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(dst_bucket).await;
+            list_objects::observe_list_objects_mutation(self, dst_bucket).await;
         }
         result
     }
@@ -441,7 +441,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
         let result = self.handle_delete_object_version(bucket, object, fi, force_del_marker).await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(bucket).await;
+            list_objects::observe_list_objects_mutation(self, bucket).await;
         }
         result
     }
@@ -450,7 +450,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         let result = self.handle_delete_object(bucket, object, opts).await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(bucket).await;
+            list_objects::observe_list_objects_mutation(self, bucket).await;
         }
         result
     }
@@ -465,7 +465,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         let result = self.handle_delete_objects(bucket, objects, opts).await;
         let success_count = result.1.iter().filter(|err| err.is_none()).count();
         if success_count > 0 {
-            list_objects::observe_list_objects_mutations(bucket, success_count).await;
+            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
         }
         result
     }
@@ -685,13 +685,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         let result = enqueue_transition_after_write(
-            self.handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+            self.clone()
+                .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await,
             LcEventSrc::S3CompleteMultipartUpload,
         )
         .await;
         if result.is_ok() {
-            list_objects::observe_list_objects_mutation(bucket).await;
+            list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;
         }
         result
     }
