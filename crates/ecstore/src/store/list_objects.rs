@@ -1789,7 +1789,7 @@ fn list_objects_index_mode_from_env() -> Option<ListSourceMode> {
     } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE) || value.eq_ignore_ascii_case("verified_page") {
         Some(ListSourceMode::IndexVerifiedPage)
     } else if value.eq_ignore_ascii_case(LIST_CURSOR_SOURCE_INDEX_METADATA_FAST) || value.eq_ignore_ascii_case("metadata_fast") {
-        list_objects_metadata_fast_guardrails_from_env().map(|_| ListSourceMode::IndexMetadataFast)
+        Some(ListSourceMode::IndexMetadataFast)
     } else {
         None
     }
@@ -6965,12 +6965,12 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn list_objects_index_mode_from_env_rejects_metadata_fast_without_guardrails() {
+    fn list_objects_index_mode_from_env_accepts_metadata_fast_without_guardrails() {
         temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
             temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, || {
                 temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, || {
                     assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
-                    assert_eq!(list_objects_index_mode_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
                 });
             });
         });
@@ -6978,12 +6978,12 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn list_objects_index_mode_from_env_rejects_metadata_fast_without_sla() {
+    fn list_objects_index_mode_from_env_accepts_metadata_fast_without_sla() {
         temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("metadata_fast"), || {
             temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
                 temp_env::with_var_unset(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, || {
                     assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
-                    assert_eq!(list_objects_index_mode_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
                 });
             });
         });
@@ -7004,12 +7004,12 @@ mod test {
 
     #[test]
     #[serial_test::serial]
-    fn list_objects_index_mode_from_env_rejects_metadata_fast_over_sla_budget() {
+    fn list_objects_index_mode_from_env_accepts_metadata_fast_over_sla_budget() {
         temp_env::with_var(ENV_API_LIST_OBJECTS_INDEX_MODE, Some("index_metadata_fast"), || {
             temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_ENABLED, Some("true"), || {
                 temp_env::with_var(ENV_API_LIST_OBJECTS_METADATA_FAST_STALENESS_MS, Some("60001"), || {
                     assert_eq!(list_objects_metadata_fast_guardrails_from_env(), None);
-                    assert_eq!(list_objects_index_mode_from_env(), None);
+                    assert_eq!(list_objects_index_mode_from_env(), Some(ListSourceMode::IndexMetadataFast));
                 });
             });
         });
