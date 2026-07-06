@@ -17,7 +17,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::contract::bucket::{
     BucketOptions, DeleteBucketOptions, MakeBucketOptions,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskError, StoragePeerS3ClientExt as _, load_bucket_metadata, set_bucket_metadata,
+    DiskError, StoragePeerS3ClientExt as _, load_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
 };
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_protos::proto_gen::node_service::*;
@@ -30,13 +30,26 @@ impl NodeService {
         request: Request<DeleteBucketMetadataRequest>,
     ) -> Result<Response<DeleteBucketMetadataResponse>, Status> {
         let request = request.into_inner();
-        let _bucket = request.bucket;
+        let bucket = request.bucket;
+        if bucket.is_empty() {
+            return Ok(Response::new(DeleteBucketMetadataResponse {
+                success: false,
+                error_info: Some("bucket name is missing".to_string()),
+            }));
+        }
 
-        //todo
-        Ok(Response::new(DeleteBucketMetadataResponse {
-            success: true,
-            error_info: None,
-        }))
+        // Drop the bucket's cached metadata on this peer so it stops serving
+        // stale configuration after the bucket has been deleted.
+        match remove_bucket_metadata(&bucket).await {
+            Ok(_) => Ok(Response::new(DeleteBucketMetadataResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(DeleteBucketMetadataResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
     }
 
     pub(super) async fn handle_load_bucket_metadata(
