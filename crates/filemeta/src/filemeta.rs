@@ -24,9 +24,9 @@ use rustfs_utils::http::headers::{
     AMZ_STORAGE_CLASS,
 };
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS,
-    SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, has_internal_suffix, insert_bytes,
-    is_internal_key,
+    AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING,
+    SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS,
+    SUFFIX_REPLICATION_TIMESTAMP, has_internal_suffix, insert_bytes, is_internal_key,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,47 @@ pub use version::*;
 
 // type ScanHeaderVersionFn = Box<dyn Fn(usize, &[u8], &[u8]) -> Result<()>>;
 
+/// Order two shallow versions newest-first, deriving a total order from the
+/// canonical `FileMetaVersionHeader::sorts_before` predicate.
+///
+/// This MUST match `sorts_before` exactly: the header-only merge path
+/// (`metacache`) and latest-version selection (`version.rs`) both key off
+/// `sorts_before`, so any divergence here makes different code paths disagree
+/// on which version is latest when several share a `mod_time` — e.g. an object
+/// and a delete marker with identical timestamps flipping between "present" and
+/// "deleted" depending on which path last sorted (backlog#799 B15).
+fn cmp_shallow_versions_for_order(a: &FileMetaShallowVersion, b: &FileMetaShallowVersion) -> Ordering {
+    if a.header.sorts_before(&b.header) {
+        Ordering::Less
+    } else if b.header.sorts_before(&a.header) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
+/// Persists replication reset state into `meta_sys` under BOTH internal
+/// prefixes (`x-rustfs-internal-*` and `x-minio-internal-*`).
+///
+/// Reset entries reach this point keyed either by a bare ARN
+/// (`ObjectInfo::replication_state`) or by an already-prefixed internal key
+/// (`get_internal_replication_state` / `target_reset_header`). The old code
+/// inserted the key verbatim: a bare ARN was written with no internal prefix at
+/// all, so read-back — which only recognizes prefixed keys — silently dropped
+/// the reset state, and a rustfs-only key was invisible to MinIO-compatible
+/// readers (backlog#799 B16). Normalize every entry to the canonical
+/// `replication-reset-<arn>` suffix and write both prefixes.
+fn persist_reset_statuses(meta_sys: &mut HashMap<String, Vec<u8>>, reset_statuses_map: &HashMap<String, String>) {
+    for (k, v) in reset_statuses_map {
+        let suffix = k
+            .strip_prefix(RUSTFS_INTERNAL_PREFIX)
+            .or_else(|| k.strip_prefix(MINIO_INTERNAL_PREFIX))
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{SUFFIX_REPLICATION_RESET}-{k}"));
+        insert_bytes(meta_sys, &suffix, v.as_bytes().to_vec());
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub versions: Vec<FileMetaShallowVersion>,
@@ -157,19 +198,7 @@ impl FileMeta {
             return;
         }
 
-        self.versions.sort_by(|a, b| {
-            if a.header.mod_time != b.header.mod_time {
-                b.header.mod_time.cmp(&a.header.mod_time)
-            } else if a.header.version_type != b.header.version_type {
-                b.header.version_type.cmp(&a.header.version_type)
-            } else if a.header.version_id != b.header.version_id {
-                b.header.version_id.cmp(&a.header.version_id)
-            } else if a.header.flags != b.header.flags {
-                b.header.flags.cmp(&a.header.flags)
-            } else {
-                b.cmp(a)
-            }
-        });
+        self.versions.sort_by(cmp_shallow_versions_for_order);
     }
 
     fn find_inline_data_for_version(&self, version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
@@ -260,19 +289,7 @@ impl FileMeta {
             }
         }
 
-        self.versions.sort_by(|a, b| {
-            if a.header.mod_time != b.header.mod_time {
-                b.header.mod_time.cmp(&a.header.mod_time)
-            } else if a.header.version_type != b.header.version_type {
-                b.header.version_type.cmp(&a.header.version_type)
-            } else if a.header.version_id != b.header.version_id {
-                b.header.version_id.cmp(&a.header.version_id)
-            } else if a.header.flags != b.header.flags {
-                b.header.flags.cmp(&a.header.flags)
-            } else {
-                b.cmp(a)
-            }
-        });
+        self.versions.sort_by(cmp_shallow_versions_for_order);
         Ok(())
     }
 
@@ -485,15 +502,10 @@ impl FileMeta {
                 insert_bytes(&mut delete_marker.meta_sys, SUFFIX_PURGESTATUS, value);
             }
 
-            if let Some(delete_marker) = ventry.delete_marker.as_mut() {
-                for (k, v) in fi
-                    .replication_state_internal
-                    .as_ref()
-                    .map(|v| v.reset_statuses_map.clone())
-                    .unwrap_or_default()
-                {
-                    delete_marker.meta_sys.insert(k.clone(), v.clone().as_bytes().to_vec());
-                }
+            if let Some(delete_marker) = ventry.delete_marker.as_mut()
+                && let Some(state) = fi.replication_state_internal.as_ref()
+            {
+                persist_reset_statuses(&mut delete_marker.meta_sys, &state.reset_statuses_map);
             }
         }
 
@@ -565,13 +577,8 @@ impl FileMeta {
                                 }
                             }
 
-                            for (k, v) in fi
-                                .replication_state_internal
-                                .as_ref()
-                                .map(|v| v.reset_statuses_map.clone())
-                                .unwrap_or_default()
-                            {
-                                delete_marker.meta_sys.insert(k.clone(), v.clone().as_bytes().to_vec());
+                            if let Some(state) = fi.replication_state_internal.as_ref() {
+                                persist_reset_statuses(&mut delete_marker.meta_sys, &state.reset_statuses_map);
                             }
                         }
 
@@ -601,13 +608,8 @@ impl FileMeta {
                                 .as_bytes()
                                 .to_vec();
                             insert_bytes(&mut obj.meta_sys, SUFFIX_PURGESTATUS, value);
-                            for (k, v) in fi
-                                .replication_state_internal
-                                .as_ref()
-                                .map(|v| v.reset_statuses_map.clone())
-                                .unwrap_or_default()
-                            {
-                                obj.meta_sys.insert(k.clone(), v.clone().as_bytes().to_vec());
+                            if let Some(state) = fi.replication_state_internal.as_ref() {
+                                persist_reset_statuses(&mut obj.meta_sys, &state.reset_statuses_map);
                             }
                         }
 
@@ -933,6 +935,93 @@ mod test {
         buf.push(0xce); // u32
         buf.extend_from_slice(&crc.to_be_bytes());
         buf
+    }
+
+    /// Regression for backlog#799 B15: `sort_by_mod_time` must order versions
+    /// identically to `FileMetaVersionHeader::sorts_before`. When an object and
+    /// a delete marker share a `mod_time`, the old tie-break sorted the delete
+    /// marker first (so the object looked deleted) while `sorts_before` — used
+    /// by the metacache merge and latest-version selection — puts the object
+    /// first. That divergence made different code paths disagree on latest.
+    #[test]
+    fn sort_by_mod_time_matches_sorts_before_on_equal_mod_time() {
+        let mod_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap());
+        let obj_id = Uuid::from_u128(1);
+        let del_id = Uuid::from_u128(2);
+
+        let object = FileMetaShallowVersion {
+            header: FileMetaVersionHeader {
+                version_id: Some(obj_id),
+                mod_time,
+                version_type: VersionType::Object,
+                ..Default::default()
+            },
+            meta: Vec::new(),
+        };
+        let delete_marker = FileMetaShallowVersion {
+            header: FileMetaVersionHeader {
+                version_id: Some(del_id),
+                mod_time,
+                version_type: VersionType::Delete,
+                ..Default::default()
+            },
+            meta: Vec::new(),
+        };
+
+        // sorts_before is the canonical predicate: object precedes the marker.
+        assert!(object.header.sorts_before(&delete_marker.header));
+        assert!(!delete_marker.header.sorts_before(&object.header));
+
+        // Insert marker-first so a wrong tie-break would leave it at index 0.
+        let mut fm = FileMeta {
+            versions: vec![delete_marker, object],
+            ..Default::default()
+        };
+        fm.sort_by_mod_time();
+
+        assert_eq!(
+            fm.versions[0].header.version_type,
+            VersionType::Object,
+            "object must sort before an equal-mod_time delete marker, matching sorts_before"
+        );
+        assert_eq!(fm.versions[1].header.version_type, VersionType::Delete);
+        assert!(fm.is_sorted_by_mod_time());
+    }
+
+    /// Regression for backlog#799 B16: replication reset state must be
+    /// persisted under both internal prefixes, never as a bare ARN. A bare-ARN
+    /// key (produced by `ObjectInfo::replication_state`) has no internal prefix,
+    /// so read-back — which only recognizes prefixed keys — silently dropped it.
+    #[test]
+    fn persist_reset_statuses_normalizes_to_dual_prefixed_keys() {
+        let arn = "arn:rustfs:replication::target:bucket";
+        let ts = "2026-06-30T00:00:00Z;reset-1";
+        let suffix = format!("{SUFFIX_REPLICATION_RESET}-{arn}");
+        let rustfs_key = format!("{RUSTFS_INTERNAL_PREFIX}{suffix}");
+        let minio_key = format!("{MINIO_INTERNAL_PREFIX}{suffix}");
+
+        // Bare-ARN key must be normalized to prefixed keys, never written raw.
+        let mut bare = HashMap::new();
+        bare.insert(arn.to_string(), ts.to_string());
+        let mut meta_sys = HashMap::new();
+        persist_reset_statuses(&mut meta_sys, &bare);
+        assert_eq!(meta_sys.get(&rustfs_key).map(Vec::as_slice), Some(ts.as_bytes()));
+        assert_eq!(meta_sys.get(&minio_key).map(Vec::as_slice), Some(ts.as_bytes()));
+        assert!(
+            !meta_sys.contains_key(arn),
+            "bare ARN key must never be persisted (it is dropped on read)"
+        );
+        assert_eq!(meta_sys.len(), 2);
+
+        // An already-prefixed key must land on the same canonical dual keys,
+        // not gain a second prefix.
+        let mut prefixed = HashMap::new();
+        prefixed.insert(rustfs_key.clone(), ts.to_string());
+        let mut meta_sys2 = HashMap::new();
+        persist_reset_statuses(&mut meta_sys2, &prefixed);
+        assert_eq!(meta_sys2.get(&rustfs_key).map(Vec::as_slice), Some(ts.as_bytes()));
+        assert_eq!(meta_sys2.get(&minio_key).map(Vec::as_slice), Some(ts.as_bytes()));
+        assert_eq!(meta_sys2.len(), 2, "must not create a double-prefixed key");
     }
 
     /// Regression test for rustfs/rustfs#2715: a corrupted version count in
