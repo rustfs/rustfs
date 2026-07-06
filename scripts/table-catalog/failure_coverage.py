@@ -209,6 +209,16 @@ def rehearsal_phase(name: str, objective: str, steps: list[dict[str, Any]]) -> d
     }
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from err
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def disaster_recovery_rehearsal_plan(
     *,
     warehouse: str,
@@ -360,6 +370,213 @@ def disaster_recovery_rehearsal_plan(
     }
 
 
+def scale_fault_rehearsal_plan(
+    *,
+    warehouse: str,
+    namespace: str,
+    table: str,
+    rest_path: str = "/iceberg",
+    table_warehouse_location: str | None = None,
+    writer_count: int = 8,
+    maintenance_worker_count: int = 2,
+    iteration_count: int = 50,
+    catalog_backing: str = "object-backed-or-durable-strong",
+) -> dict[str, Any]:
+    table_endpoint = table_path(warehouse, namespace, table, rest_path=rest_path)
+    table_warehouse_location = table_warehouse_location or f"s3://{warehouse}/tables/table-id"
+    return {
+        "mode": "manual-or-ci-optional",
+        "ci_gate": "RUSTFS_TABLE_CATALOG_SCALE_FAULT_REHEARSAL=1",
+        "parameters": {
+            "writer_count": writer_count,
+            "maintenance_worker_count": maintenance_worker_count,
+            "iteration_count": iteration_count,
+            "catalog_backing": catalog_backing,
+        },
+        "preconditions": [
+            "run against a disposable table or a table restored from backup",
+            "record the RustFS build, catalog backing mode, node count, and object backend before starting",
+            "capture baseline loadTable metadata location, version token, generation, and warehouse prefix",
+            "enable only opt-in clients and workers for this rehearsal run",
+        ],
+        "expected_invariants": [
+            "current metadata generation is monotonic",
+            "each conflicting writer cohort has one winner and retryable conflicts for stale writers",
+            "maintenance jobs never delete reachable table objects",
+            "scheduler and worker leases recover without duplicate active jobs for the same table",
+            "durable backing migration stays blocked while recovery or replay blockers exist",
+            "rollback/import under load either commits a validated metadata location or conflicts without pointer movement",
+        ],
+        "phases": [
+            rehearsal_phase(
+                "concurrent-commit-stress",
+                "Stress single-table CAS behavior while preserving pointer and generation invariants.",
+                [
+                    probe_step(
+                        "spawn-concurrent-writers",
+                        "CLIENT-STRESS",
+                        table_endpoint,
+                        "single-winner-per-conflict-cohort",
+                        "run concurrent append/commit attempts and record winner commit id, conflicts, final metadata location, token, and generation",
+                        {
+                            "writer-count": writer_count,
+                            "iteration-count": iteration_count,
+                        },
+                    ),
+                    probe_step(
+                        "load-table-after-writer-cohort",
+                        "GET",
+                        table_endpoint,
+                        "200",
+                        "loadTable returns one current metadata location and a generation that advanced monotonically",
+                    ),
+                    probe_step(
+                        "diagnostics-after-writer-cohort",
+                        "GET",
+                        table_path(warehouse, namespace, table, "/catalog/diagnostics", rest_path),
+                        "200",
+                        "diagnostics report no unexpected commit recovery blockers after the writer cohort",
+                    ),
+                ],
+            ),
+            rehearsal_phase(
+                "maintenance-scheduler-failover",
+                "Exercise queued maintenance, worker claim, expired lease recovery, and stale plan rejection.",
+                [
+                    probe_step(
+                        "queue-maintenance-job",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/maintenance/scheduler/run", rest_path),
+                        "200",
+                        "scheduler queues at most one active maintenance job for the table",
+                        {
+                            "scheduler-id": "scale-fault-rehearsal-scheduler",
+                        },
+                    ),
+                    probe_step(
+                        "claim-worker-job",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/maintenance/worker/run", rest_path),
+                        "200-or-409",
+                        "one worker claims or executes the queued job while peer workers observe backpressure or no work",
+                        {
+                            "worker-count": maintenance_worker_count,
+                        },
+                    ),
+                    probe_step(
+                        "recover-expired-lease",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/maintenance/scheduler/run", rest_path),
+                        "200-or-409",
+                        "expired scheduler or worker leases are recovered without creating duplicate active jobs",
+                        {
+                            "scheduler-id": "scale-fault-rehearsal-recovery",
+                        },
+                    ),
+                    probe_step(
+                        "stale-maintenance-plan-check",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/maintenance/metadata", rest_path),
+                        "409-or-manual-review",
+                        "stale maintenance plans fail closed before deleting objects or committing metadata",
+                        {
+                            "dry-run": False,
+                            "expected-metadata-location": "stale-metadata-location-from-before-writer-cohort",
+                        },
+                    ),
+                ],
+            ),
+            rehearsal_phase(
+                "durable-backing-cutover-under-load",
+                "Verify durable backing cutover preflight remains explainable under recent write and maintenance churn.",
+                [
+                    probe_step(
+                        "capture-cutover-backup",
+                        "OPERATOR",
+                        table_path(warehouse, namespace, table, "/catalog/export", rest_path),
+                        "catalog-backup-recorded",
+                        "record catalog-backup artifacts, current metadata location, idempotency indexes, and rollback mode before cutover",
+                    ),
+                    probe_step(
+                        "migration-dry-run-before-cutover",
+                        "GET",
+                        warehouse_path(warehouse, "/catalog/migration", rest_path),
+                        "200",
+                        "migration dry-run reports inventory, replay blockers, idempotency blockers, and recommended actions",
+                    ),
+                ],
+            ),
+            rehearsal_phase(
+                "recovery-rollback-import-under-load",
+                "Exercise recovery and operator-selected rollback/import paths after stress activity.",
+                [
+                    probe_step(
+                        "safe-recovery-repair-under-load",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/catalog/recovery", rest_path),
+                        "200",
+                        "safe repair handles recoverable idempotency gaps without moving the table pointer",
+                        {
+                            "mode": "safe-repair",
+                        },
+                    ),
+                    probe_step(
+                        "rollback-conflict-check",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/catalog/rollback", rest_path),
+                        "200-or-409",
+                        "rollback either commits the operator-selected metadata location or conflicts without pointer movement",
+                        {
+                            "metadata-location": "metadata-location-from-backup",
+                            "version-token": "current-version-token-from-load-table",
+                        },
+                    ),
+                    probe_step(
+                        "import-conflict-check",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/catalog/import", rest_path),
+                        "200-or-409",
+                        "import validates metadata identity and conflicts without pointer/token/generation movement when stale",
+                        {
+                            "metadata-location": "metadata-location-from-backup",
+                            "properties": {
+                                "rehearsal-source": "scale-fault-backup",
+                            },
+                        },
+                    ),
+                ],
+            ),
+            rehearsal_phase(
+                "post-run-evidence",
+                "Record the evidence needed before any scale or fault claim can be promoted.",
+                [
+                    probe_step(
+                        "load-table-after-scale-fault-run",
+                        "GET",
+                        table_endpoint,
+                        "200",
+                        "loadTable returns the final intended metadata location, version token, and generation",
+                    ),
+                    probe_step(
+                        "table-data-plane-policy-probe",
+                        "S3-PROBE",
+                        table_warehouse_location,
+                        "inside-allowed-outside-denied",
+                        "ordinary S3 object access still maps table warehouse objects to the table policy boundary",
+                    ),
+                    probe_step(
+                        "capture-run-artifacts",
+                        "EVIDENCE",
+                        "operator-recorded-artifacts",
+                        "recorded",
+                        "record RustFS build, catalog backing, writer count, worker count, iteration count, final metadata location, observed conflicts, recovered leases, and failed-closed operations",
+                    ),
+                ],
+            ),
+        ],
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Print RustFS S3 Tables production failure coverage helpers.")
     parser.add_argument("--warehouse", default="rustfs-s3table-smoke")
@@ -367,9 +584,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--table", default="events")
     parser.add_argument("--rest-path", default="/iceberg")
     parser.add_argument("--table-warehouse-location")
+    parser.add_argument("--writer-count", type=positive_int, default=8)
+    parser.add_argument("--maintenance-worker-count", type=positive_int, default=2)
+    parser.add_argument("--iteration-count", type=positive_int, default=50)
+    parser.add_argument("--catalog-backing", default="object-backed-or-durable-strong")
     parser.add_argument("--print-failure-matrix", action="store_true")
     parser.add_argument("--print-failure-probes", action="store_true")
     parser.add_argument("--print-disaster-recovery-rehearsal", action="store_true")
+    parser.add_argument("--print-scale-fault-rehearsal", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -414,6 +636,24 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
                     table=args.table,
                     rest_path=args.rest_path,
                     table_warehouse_location=args.table_warehouse_location,
+                )
+            },
+            output,
+        )
+        printed = True
+    if args.print_scale_fault_rehearsal:
+        print_json(
+            {
+                "scale_fault_rehearsal": scale_fault_rehearsal_plan(
+                    warehouse=args.warehouse,
+                    namespace=args.namespace,
+                    table=args.table,
+                    rest_path=args.rest_path,
+                    table_warehouse_location=args.table_warehouse_location,
+                    writer_count=args.writer_count,
+                    maintenance_worker_count=args.maintenance_worker_count,
+                    iteration_count=args.iteration_count,
+                    catalog_backing=args.catalog_backing,
                 )
             },
             output,

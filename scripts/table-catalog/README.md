@@ -234,6 +234,15 @@ python3 scripts/table-catalog/failure_coverage.py \
   --table events \
   --table-warehouse-location s3://rustfs-s3table-smoke/tables/table-id \
   --print-disaster-recovery-rehearsal
+python3 scripts/table-catalog/failure_coverage.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --table-warehouse-location s3://rustfs-s3table-smoke/tables/table-id \
+  --writer-count 8 \
+  --maintenance-worker-count 2 \
+  --iteration-count 50 \
+  --print-scale-fault-rehearsal
 ```
 
 The generated probe plan covers stale-token commit conflicts, missing metadata
@@ -342,6 +351,48 @@ location, and expected response status for each run. Treat migration blockers,
 manual-review diagnostics, stale rollback/import conflicts, and data-plane
 policy failures as fail-closed results that require operator investigation
 before cutover or release claims.
+
+## Scale And Fault Rehearsal
+
+The scale and fault rehearsal plan is a machine-readable opt-in runbook for
+production-style stress and failure evidence. It does not run the stress test by
+itself and does not promote compatibility or scale claims without recorded live
+results.
+
+Generate the rehearsal plan:
+
+```bash
+python3 scripts/table-catalog/failure_coverage.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --table-warehouse-location s3://rustfs-s3table-smoke/tables/table-id \
+  --writer-count 8 \
+  --maintenance-worker-count 2 \
+  --iteration-count 50 \
+  --catalog-backing durable-strong \
+  --print-scale-fault-rehearsal
+```
+
+The plan is gated for CI by:
+
+```text
+RUSTFS_TABLE_CATALOG_SCALE_FAULT_REHEARSAL=1
+```
+
+The generated phases cover:
+
+- concurrent writer cohorts that must produce a single successful commit per
+  conflict group and retryable conflicts for stale writers
+- maintenance scheduler queueing, worker claim, lease expiry recovery, and stale
+  plan fail-closed checks
+- durable backing migration dry-run and catalog backup evidence before cutover
+- safe recovery repair, rollback, and import conflict behavior after stress
+- final `loadTable`, table data-plane policy, and operator artifact capture
+
+Record the RustFS build, catalog backing mode, writer count, worker count,
+iteration count, final metadata location, conflict counts, recovered leases, and
+failed-closed operations before using the run as release evidence.
 
 ## Production Operations Guide
 
