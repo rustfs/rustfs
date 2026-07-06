@@ -457,21 +457,18 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
     if let Some(holder) = &tls_acceptor {
         spawn_reload_loop(tls_path.to_string(), holder.clone());
     }
-    // Obtain the listener address
+    // Obtain the listener address.
     let local_addr: SocketAddr = listener.local_addr()?;
-    let local_ip = match rustfs_utils::get_local_ip() {
-        Some(ip) => ip,
-        None => {
-            warn!(
-                event = "local_ip_fallback",
-                component = LOG_COMPONENT_SERVER,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                fallback_ip = %local_addr.ip(),
-                "Falling back to listener IP for startup endpoint logging"
-            );
-            local_addr.ip()
-        }
-    };
+    let local_ip = local_addr.ip();
+    if local_ip.is_unspecified() {
+        warn!(
+            event = "local_ip_wildcard",
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            listener_ip = %local_ip,
+            "Listener uses a wildcard IP; startup endpoint logging will include the wildcard address"
+        );
+    }
     let local_port = local_addr.port();
 
     let local_ip_str = if local_ip.is_ipv6() {

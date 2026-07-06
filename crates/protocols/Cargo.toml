@@ -136,7 +136,3 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
-
-# io-uring is Linux-only. Scope the feature to Linux targets.
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio = { workspace = true, features = ["io-uring"] }

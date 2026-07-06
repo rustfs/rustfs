@@ -170,7 +170,3 @@ harness = false
 
 [lib]
 doctest = false
-
-# io-uring is Linux-only. Scope the feature to Linux targets.
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio = { workspace = true, features = ["io-uring"] }
