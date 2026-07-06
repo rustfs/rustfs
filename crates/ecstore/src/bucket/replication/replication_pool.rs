@@ -693,9 +693,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Starts the MRF persister — ongoing background task.
     ///
     /// Drains `mrf_save_rx` (entries that overflowed the normal worker channels) and
-    /// writes them to the on-disk MRF file every 10 seconds or when 1 000 entries
-    /// accumulate.  The file is overwritten (not appended) on each flush so it always
-    /// reflects the current pending backlog.
+    /// writes them to the on-disk MRF file every 10 seconds or when 1 000 new
+    /// entries accumulate.  Each flush rewrites the whole cumulative backlog so no
+    /// previously-persisted (and not-yet-replayed) entry is lost; the file is only
+    /// consumed and cleared at startup.
     async fn start_mrf_persister(&self) {
         let Some(mut rx) = self.mrf_save_rx.lock().await.take() else {
             return;
@@ -703,7 +704,19 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let storage = self.storage.clone();
 
         let handle = tokio::spawn(async move {
+            // The on-disk MRF file is a restart-recovery backstop: entries are
+            // only replayed (and the file cleared) at startup, never during the
+            // run. So the file must hold the *cumulative* set of overflow entries
+            // written this run. `pending` is therefore kept cumulative and the
+            // whole set is rewritten on each flush — clearing it after a flush
+            // let the next flush overwrite the file and drop everything written
+            // earlier (backlog#859 / #799 B10). Bounded by `MRF_PENDING_CAP` so a
+            // sustained failure storm can't grow it without limit.
+            const MRF_PENDING_CAP: usize = 200_000;
             let mut pending: Vec<MrfReplicateEntry> = Vec::new();
+            let mut flushed_len = 0usize;
+            let mut dirty = false;
+            let mut capped = false;
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -711,22 +724,41 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 tokio::select! {
                     entry = rx.recv() => match entry {
                         Some(e) => {
+                            if pending.len() >= MRF_PENDING_CAP {
+                                if !capped {
+                                    capped = true;
+                                    warn!(
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                        cap = MRF_PENDING_CAP,
+                                        "MRF pending backlog hit cap — dropping further recovery entries for this run"
+                                    );
+                                }
+                                continue;
+                            }
                             pending.push(e);
-                            if pending.len() >= 1000 && flush_mrf_to_disk(&pending, &storage).await {
-                                pending.clear();
+                            dirty = true;
+                            // Flush eagerly once enough new entries have accumulated
+                            // since the last write (measured against the flushed
+                            // set, not the absolute length, so a large backlog is
+                            // not rewritten on every single add).
+                            if pending.len() - flushed_len >= 1000 && flush_mrf_to_disk(&pending, &storage).await {
+                                flushed_len = pending.len();
+                                dirty = false;
                             }
                         }
                         None => {
                             // Channel closed (pool shutting down) — final flush.
-                            if !pending.is_empty() {
+                            if dirty {
                                 flush_mrf_to_disk(&pending, &storage).await;
                             }
                             break;
                         }
                     },
                     _ = interval.tick() => {
-                        if !pending.is_empty() && flush_mrf_to_disk(&pending, &storage).await {
-                            pending.clear();
+                        if dirty && flush_mrf_to_disk(&pending, &storage).await {
+                            flushed_len = pending.len();
+                            dirty = false;
                         }
                     }
                 }
