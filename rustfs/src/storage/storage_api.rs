@@ -43,7 +43,8 @@ pub(crate) mod contract {
 
     pub(crate) mod object {
         pub(crate) use super::super::storage_contracts::{
-            DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockRetentionOptions, ObjectOperations, ObjectToDelete,
+            DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockDeleteOptions, ObjectLockRetentionOptions, ObjectOperations,
+            ObjectToDelete,
         };
     }
 
@@ -59,6 +60,7 @@ pub(crate) mod contract {
 pub(crate) type StorageDeletedObject = contract::object::DeletedObject;
 pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
+pub(crate) type StorageObjectLockDeleteOptions = contract::object::ObjectLockDeleteOptions;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;

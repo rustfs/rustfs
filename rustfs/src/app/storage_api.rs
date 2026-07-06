@@ -967,11 +967,12 @@ pub(crate) mod object_usecase {
         object_utils, options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
     };
     pub(crate) use crate::storage::storage_api::{
-        ECStore, RFC1123, StorageDeletedObject, StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete,
-        StoragePutObjReader, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
-        parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
-        strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key,
-        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
+        ECStore, RFC1123, StorageDeletedObject, StorageObjectInfo, StorageObjectLockDeleteOptions, StorageObjectOptions,
+        StorageObjectToDelete, StoragePutObjReader, check_preconditions, get_validated_store, has_replication_rules,
+        parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
+        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
+        validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+        wrap_response_with_cors,
     };
 }
 

@@ -45,7 +45,7 @@
 
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
-use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
+use crate::bucket::object_lock::objectlock_sys::{check_object_lock_for_deletion, check_retention_for_modification};
 use crate::bucket::replication::{
     ReplicateDecision, ReplicationObjectBridge, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
     replication_state_to_filemeta,
@@ -2526,6 +2526,29 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
     }
 
     Ok(())
+}
+
+async fn check_object_lock_delete(bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+    if set_disk_delete_creates_delete_marker(opts) {
+        return Ok(());
+    }
+
+    let bypass_governance = opts
+        .object_lock_delete
+        .as_ref()
+        .is_some_and(|delete_opts| delete_opts.bypass_governance);
+    if check_object_lock_for_deletion(bucket, obj_info, bypass_governance)
+        .await
+        .is_some()
+    {
+        return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+    }
+
+    Ok(())
+}
+
+fn set_disk_delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
+    opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
 fn should_preserve_delete_replication_state(opts: &ObjectOptions) -> bool {
@@ -5970,6 +5993,65 @@ mod tests {
 
         check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
             .expect("GOVERNANCE shortening with bypass should remain allowed");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_blocks_compliance_version_delete() {
+        let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            versioned: true,
+            ..Default::default()
+        };
+
+        let err = check_object_lock_delete("bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("COMPLIANCE retention must block explicit version deletion");
+
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_allows_versioned_delete_marker_creation() {
+        let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            version_id: None,
+            versioned: true,
+            version_suspended: false,
+            ..Default::default()
+        };
+
+        check_object_lock_delete("bucket", "object", &obj_info, &opts)
+            .await
+            .expect("versioned delete marker creation should not delete the locked version");
     }
 
     #[test]
