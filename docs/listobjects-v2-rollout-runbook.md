@@ -175,10 +175,13 @@ It writes per-mode `list-summary.csv` files with p50/p95/p99 latency,
 `resource-summary.csv` files with process CPU/RSS attribution, Prometheus
 allocator snapshots when available, and
 `metadata_fast/chaos/chaos-summary.csv` for overwrite/delete/multipart plus
-cross-page fallback continuity evidence. The chaos probe uses a small
-independent page size (`--chaos-max-keys`, default `3`) and compares the old
-continuation-token page against a fresh post-mutation listing slice to prove no
-duplicate and no skipped keys across the fallback boundary.
+cross-page fallback continuity evidence. It also writes
+`metadata_fast/chaos/fallback-probes.csv` for generation-mismatch fallback and,
+when `--journal-path` is explicitly set for a local journal probe, degraded
+journal fallback/restore evidence. The chaos probe uses a small independent page
+size (`--chaos-max-keys`, default `3`) and compares the old continuation-token
+page against a fresh post-mutation listing slice to prove no duplicate and no
+skipped keys across the fallback boundary.
 
 ## Canary Gates
 

@@ -553,6 +553,10 @@ urlencode() {
   python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read().strip(), safe=""))'
 }
 
+base64_token() {
+  python3 -c 'import base64, sys; print(base64.b64encode(sys.stdin.read().encode("utf-8")).decode("ascii"))'
+}
+
 percentile_summary() {
   local values_file="$1"
   python3 - "$values_file" <<'PY'
@@ -871,9 +875,12 @@ run_metadata_fast_chaos() {
   mkdir -p "$out_dir"
 
   local summary="$out_dir/chaos-summary.csv"
+  local fallback_summary="$out_dir/fallback-probes.csv"
   local page1="$out_dir/page1-before-mutation.xml"
   local page2="$out_dir/page2-after-mutation.xml"
   local fresh_after="$out_dir/fresh-after-mutation.xml"
+  local generation_mismatch="$out_dir/generation-mismatch.xml"
+  local degraded_response="$out_dir/degraded-fallback.xml"
   local page1_keys="$out_dir/page1-before-mutation.keys"
   local page2_keys="$out_dir/page2-after-mutation.keys"
   local fresh_after_keys="$out_dir/fresh-after-mutation.keys"
@@ -881,9 +888,10 @@ run_metadata_fast_chaos() {
   local body_file="$out_dir/overwrite-body.bin"
   local delete_out="$out_dir/delete.out"
   local overwrite_out="$out_dir/overwrite.out"
-  local token first_key second_key multipart_key overlap last_key monotonic_status no_skip_status page1_count page2_count fresh_max_keys
+  local token first_key second_key multipart_key overlap last_key monotonic_status no_skip_status page1_count page2_count fresh_max_keys forged_token journal_sequence
 
   echo "probe,status,detail" >"$summary"
+  echo "probe,status,detail" >"$fallback_summary"
 
   signed_list_page "$bucket" "$page1" "$CHAOS_MAX_KEYS" ""
   extract_xml_keys <"$page1" >"$page1_keys"
@@ -938,7 +946,57 @@ run_metadata_fast_chaos() {
     no_skip_status="failed"
   fi
   echo "continuation_no_skip,${no_skip_status},expected_next_keys=$(awk 'END{print NR + 0}' "$expected_page2_keys"); actual_page2_keys=${page2_count}" >>"$summary"
-  [[ "$no_skip_status" == "ok" ]]
+  [[ "$no_skip_status" == "ok" ]] || return 1
+
+  forged_token="$(printf '%s[rustfs_cache:v2,return:,src:index_metadata_fast,gen:%s-mismatch]' "$last_key" "$INDEX_GENERATION" | base64_token)"
+  if signed_list_page "$bucket" "$generation_mismatch" "$CHAOS_MAX_KEYS" "$forged_token"; then
+    echo "generation_mismatch,ok,forged_generation=${INDEX_GENERATION}-mismatch" >>"$fallback_summary"
+  else
+    echo "generation_mismatch,failed,forged_generation=${INDEX_GENERATION}-mismatch" >>"$fallback_summary"
+  fi
+
+  if [[ -z "$NAMESPACE_JOURNAL_PATH" ]]; then
+    echo "degraded,skipped,requires --journal-path to avoid mutating quorum-backed journal state" >>"$fallback_summary"
+    return 0
+  fi
+
+  journal_sequence="$(journal_high_water_mark "$NAMESPACE_JOURNAL_PATH" "$bucket")"
+  write_local_journal_state "$NAMESPACE_JOURNAL_PATH" "$bucket" "$journal_sequence" "degraded"
+  if signed_list_page "$bucket" "$degraded_response" "$CHAOS_MAX_KEYS" ""; then
+    echo "degraded,ok,journal_path=${NAMESPACE_JOURNAL_PATH}; high_water_mark=${journal_sequence}" >>"$fallback_summary"
+  else
+    echo "degraded,failed,journal_path=${NAMESPACE_JOURNAL_PATH}; high_water_mark=${journal_sequence}" >>"$fallback_summary"
+  fi
+  write_local_journal_state "$NAMESPACE_JOURNAL_PATH" "$bucket" "$journal_sequence" "healthy"
+  echo "degraded_restore,ok,journal_path=${NAMESPACE_JOURNAL_PATH}; high_water_mark=${journal_sequence}" >>"$fallback_summary"
+}
+
+journal_high_water_mark() {
+  local root="$1"
+  local bucket="$2"
+  local state_file="${root}/${bucket}.state"
+  if [[ -f "$state_file" ]]; then
+    awk -F= '/^# high_water_mark=/ {print $2; found=1; exit} END {if(!found) print "0"}' "$state_file"
+  else
+    echo "0"
+  fi
+}
+
+write_local_journal_state() {
+  local root="$1"
+  local bucket="$2"
+  local high_water_mark="$3"
+  local status="$4"
+  local state_file="${root}/${bucket}.state"
+  local tmp_file="${state_file}.tmp"
+  mkdir -p "$root"
+  {
+    echo "# rustfs-listobjects-namespace-journal-v1"
+    echo "# bucket=${bucket}"
+    echo "# high_water_mark=${high_water_mark}"
+    echo "# status=${status}"
+  } >"$tmp_file"
+  mv "$tmp_file" "$state_file"
 }
 
 run_mode() {
@@ -1059,6 +1117,7 @@ write_combined_summary() {
       echo "## Metadata-fast Chaos"
       echo
       summary_csv_section "Chaos probes" "$OUT_DIR/metadata_fast/chaos/chaos-summary.csv"
+      summary_csv_section "Fallback probes" "$OUT_DIR/metadata_fast/chaos/fallback-probes.csv"
       summary_csv_section "Ratios after chaos" "$OUT_DIR/metadata_fast/chaos/index-ratios-after-chaos.csv"
       summary_csv_section "Fallback reasons after chaos" "$OUT_DIR/metadata_fast/chaos/index-fallback-reasons-after-chaos.csv"
     fi
