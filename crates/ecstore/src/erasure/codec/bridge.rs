@@ -206,6 +206,9 @@ impl RustfsCodecDecodeEngine {
             return Ok(());
         }
 
+        // All slots must be present here: the verification path reconstructs
+        // missing parity alongside data (see `reconstruct_into`), so a `None`
+        // slot is an internal invariant violation, not a degraded-read state.
         let mut shard_refs = Vec::with_capacity(self.data_shards + self.parity_shards);
         for (index, shard) in shards.iter().enumerate() {
             let shard = shard.as_ref().ok_or_else(|| {
@@ -274,9 +277,25 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
 
         if let Some(codec) = self.codec()? {
             let needs_source_parity_verification = self.needs_source_parity_verification(shards);
-            codec
-                .reconstruct_data_opt(shards)
-                .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))?;
+            if needs_source_parity_verification {
+                // Rebuild missing parity together with missing data so the
+                // shard set is complete for `verify`. Rebuilt parity is
+                // consistent with the reconstructed data by construction, so
+                // the verification below is equivalent to checking only the
+                // originally-present source parity — the same semantics as the
+                // legacy `decode_data_with_reconstruction_verification` path.
+                // Rebuilding only data here would leave missing parity slots
+                // as `None` and misreport a recoverable degraded read (for
+                // example one missing data shard plus one missing parity
+                // shard) as an inconsistent-source failure.
+                codec
+                    .reconstruct_opt(shards)
+                    .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))?;
+            } else {
+                codec
+                    .reconstruct_data_opt(shards)
+                    .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))?;
+            }
             self.verify_source_parity(&codec, shards, needs_source_parity_verification)?;
         }
 
@@ -518,6 +537,86 @@ mod tests {
 
         assert!(reconstruct_with(&legacy, &mut legacy_shards).is_err());
         assert!(reconstruct_with(&rustfs, &mut rustfs_shards).is_err());
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_recovers_missing_data_and_parity() {
+        // backlog#868 item 2: one missing data shard plus one missing parity
+        // shard is recoverable, but the parity verification path used to
+        // require every shard slot to be present after data-only
+        // reconstruction and misreported this degraded read as a failure.
+        let erasure = Erasure::new(6, 4, 96);
+        let mut shards = encoded_shards(&erasure, &(0u8..=191u8).collect::<Vec<_>>());
+        let expected_data = shards.iter().take(erasure.data_shards).cloned().collect::<Vec<_>>();
+        shards[1] = None;
+        shards[erasure.data_shards + 1] = None;
+
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        reconstruct_with(&engine, &mut shards).expect("one missing data shard plus one missing parity shard is recoverable");
+
+        assert_eq!(shards.iter().take(erasure.data_shards).cloned().collect::<Vec<_>>(), expected_data);
+        assert!(shards[erasure.data_shards + 1].is_some(), "missing parity is rebuilt for verification");
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_matches_legacy_on_missing_data_and_parity() {
+        let erasure = Erasure::new(6, 4, 96);
+        let mut legacy_shards = encoded_shards(&erasure, &(0u8..=191u8).rev().collect::<Vec<_>>());
+        let mut rustfs_shards = legacy_shards.clone();
+        for shards in [&mut legacy_shards, &mut rustfs_shards] {
+            shards[2] = None;
+            shards[erasure.data_shards] = None;
+        }
+
+        let legacy = LegacyEcDecodeEngine::new(erasure.clone());
+        let rustfs = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+
+        reconstruct_with(&legacy, &mut legacy_shards).expect("legacy should recover missing data plus parity");
+        reconstruct_with(&rustfs, &mut rustfs_shards).expect("rustfs codec should recover missing data plus parity");
+
+        assert_eq!(
+            rustfs_shards.iter().take(erasure.data_shards).cloned().collect::<Vec<_>>(),
+            legacy_shards.iter().take(erasure.data_shards).cloned().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_rejects_corrupt_parity_with_missing_data_and_parity() {
+        // The degraded-read allowance must not weaken inconsistent-source
+        // rejection: with one data and one parity shard missing, a corrupted
+        // surviving parity shard still fails verification.
+        let erasure = Erasure::new(6, 4, 96);
+        let mut shards = encoded_shards(&erasure, &(0u8..=191u8).collect::<Vec<_>>());
+        shards[0] = None;
+        shards[erasure.data_shards] = None;
+        let Some(corrupt_parity) = shards[erasure.data_shards + 1].as_mut() else {
+            panic!("test parity shard should be present");
+        };
+        corrupt_parity[0] ^= 0x80;
+
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let err = reconstruct_with(&engine, &mut shards).expect_err("corrupt surviving parity must still be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_rejects_stale_data_with_missing_data_and_parity() {
+        let erasure = Erasure::new(6, 4, 96);
+        let mut shards = encoded_shards(&erasure, &(0u8..=191u8).collect::<Vec<_>>());
+        shards[0] = None;
+        shards[erasure.data_shards] = None;
+        let Some(stale_data) = shards[1].as_mut() else {
+            panic!("test data shard should be present");
+        };
+        stale_data[0] ^= 0x40;
+
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let err = reconstruct_with(&engine, &mut shards).expect_err("stale surviving data must still be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
     }
 
     #[test]
