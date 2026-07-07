@@ -732,7 +732,12 @@ pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {
 }
 
 pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) {
-    ecstore_bucket::migration::try_migrate_iam_config(store).await;
+    // MinIO encrypts IAM identity/service-account files at rest with a key derived
+    // from the root credentials. Inject the IAM crate's decryption so those blobs
+    // are decrypted before normalization instead of being skipped as "incompatible".
+    let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
+        Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
+    ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn)).await;
 }
 
 pub(crate) fn init_ecstore_config() {
@@ -799,7 +804,13 @@ pub(crate) fn set_global_rustfs_port(value: u16) {
 }
 
 pub(crate) async fn try_migrate_server_config(store: Arc<ECStore>) {
-    ecstore_config::try_migrate_server_config(store).await;
+    // MinIO encrypts the server config at rest with a key derived from the root
+    // credentials. Inject the IAM crate's decryption (same key sources as IAM
+    // config) so an encrypted legacy config is decrypted before decoding instead
+    // of being skipped as "incompatible".
+    let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
+        Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
+    ecstore_config::try_migrate_server_config(store, Some(decrypt_fn)).await;
 }
 
 pub(crate) async fn update_erasure_type(setup_type: SetupType) {

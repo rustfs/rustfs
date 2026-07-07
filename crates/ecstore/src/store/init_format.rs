@@ -28,7 +28,7 @@ use crate::{
 use futures::future::join_all;
 use rustfs_config::server_config::KVS;
 use std::collections::{HashMap, hash_map::Entry};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
@@ -74,9 +74,27 @@ pub async fn connect_load_init_formats(
     if first_disk && should_init_erasure_disks(&errs) {
         // UnformattedDisk, try migrate from MinIO format first, else create new format
         info!("first_disk && should_init_erasure_disks");
-        if let Ok(fm) = try_migrate_format(disks, set_count, set_drive_count).await {
-            info!("Migrated format from MinIO config");
-            return Ok(fm);
+        match try_migrate_format(disks, set_count, set_drive_count).await {
+            Ok(LegacyFormatOutcome::Migrated(fm)) => {
+                info!("Migrated format from MinIO config");
+                return Ok(*fm);
+            }
+            Ok(LegacyFormatOutcome::Incompatible) => {
+                // A MinIO format.json was found on disk but could not be migrated
+                // (topology/version mismatch or parse failure). Falling through to
+                // create a FRESH RustFS format changes the object placement layout,
+                // so the pre-existing MinIO objects will not be readable. Surface
+                // this loudly instead of silently discarding the legacy data.
+                error!(
+                    "Detected MinIO format.json on disk but could NOT migrate it; initializing a fresh RustFS format instead. \
+                     Existing MinIO objects will not be readable under the new format. Ensure the RustFS pool / erasure-set \
+                     topology exactly matches the original MinIO deployment, and that no stale .rustfs.sys/format.json remains."
+                );
+            }
+            Ok(LegacyFormatOutcome::None) => {}
+            Err(e) => {
+                warn!("MinIO format migration attempt failed, will initialize a fresh format: {e}");
+            }
         }
         let fm = init_format_erasure(disks, set_count, set_drive_count, deployment_id).await?;
         return Ok(fm);
@@ -152,25 +170,54 @@ async fn init_format_erasure(
     get_format_erasure_in_quorum(&fms)
 }
 
-/// Tries to migrate format
-/// Returns Ok(FormatV3) if migration succeeds, Err otherwise.
-async fn try_migrate_format(disks: &[Option<DiskStore>], set_count: usize, set_drive_count: usize) -> Result<FormatV3> {
+/// Outcome of attempting to migrate an on-disk MinIO `format.json`.
+enum LegacyFormatOutcome {
+    /// A compatible MinIO format was found and migrated into RustFS format files.
+    /// Boxed to keep the enum small (`FormatV3` is large; the others are unit variants).
+    Migrated(Box<FormatV3>),
+    /// A MinIO `format.json` was present but could not be migrated (topology /
+    /// version mismatch, or a parse failure). The caller must decide how to
+    /// proceed; creating a fresh format would leave the legacy objects unreadable.
+    Incompatible,
+    /// No MinIO `format.json` was present on any disk (a normal fresh install).
+    None,
+}
+
+/// Tries to migrate an on-disk MinIO `format.json` into RustFS format files.
+///
+/// Returns [`LegacyFormatOutcome`] describing whether a legacy format was present
+/// and, if so, whether it was compatible. `Err` is only returned for genuine IO
+/// failures while persisting the migrated format.
+async fn try_migrate_format(
+    disks: &[Option<DiskStore>],
+    set_count: usize,
+    set_drive_count: usize,
+) -> Result<LegacyFormatOutcome> {
+    let mut legacy_seen = false;
+
     for disk in disks.iter().flatten() {
         let data = match disk.read_all(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE).await {
             Ok(d) if !d.is_empty() => d,
             _ => continue,
         };
+        // A non-empty MinIO format.json exists on at least one disk.
+        legacy_seen = true;
 
-        let fm = FormatV3::try_from(data.as_ref()).map_err(|e| Error::other(format!("parse MinIO format: {e}")))?;
+        let fm = match FormatV3::try_from(data.as_ref()) {
+            Ok(fm) => fm,
+            Err(e) => {
+                warn!("failed to parse MinIO format.json, skipping this disk: {e}");
+                continue;
+            }
+        };
 
-        let first_set = fm
-            .erasure
-            .sets
-            .first()
-            .ok_or_else(|| Error::other("MinIO format: erasure.sets is empty"))?;
+        let Some(first_set) = fm.erasure.sets.first() else {
+            warn!("MinIO format.json has empty erasure.sets, skipping this disk");
+            continue;
+        };
         if fm.erasure.sets.len() != set_count || first_set.len() != set_drive_count {
-            debug!(
-                "MinIO format set count mismatch: got {}x{}, expected {}x{}",
+            warn!(
+                "MinIO format topology mismatch: got {}x{}, expected {}x{}; skipping migration for this disk",
                 fm.erasure.sets.len(),
                 first_set.len(),
                 set_count,
@@ -180,7 +227,10 @@ async fn try_migrate_format(disks: &[Option<DiskStore>], set_count: usize, set_d
         }
 
         if fm.erasure.version != FormatErasureVersion::V3 {
-            debug!("MinIO format erasure version not V3: {:?}", fm.erasure.version);
+            warn!(
+                "MinIO format erasure version is not V3 ({:?}); skipping migration for this disk",
+                fm.erasure.version
+            );
             continue;
         }
 
@@ -200,10 +250,14 @@ async fn try_migrate_format(disks: &[Option<DiskStore>], set_count: usize, set_d
         }
 
         save_format_file_all(disks, &fms).await?;
-        return get_format_erasure_in_quorum(&fms);
+        return Ok(LegacyFormatOutcome::Migrated(Box::new(get_format_erasure_in_quorum(&fms)?)));
     }
 
-    Err(Error::other("no MinIO format to migrate"))
+    Ok(if legacy_seen {
+        LegacyFormatOutcome::Incompatible
+    } else {
+        LegacyFormatOutcome::None
+    })
 }
 
 pub fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 
 import failure_coverage
 
@@ -158,6 +160,103 @@ class FailureCoverageTest(unittest.TestCase):
         self.assertEqual(document["disaster_recovery_rehearsal"]["phases"][0]["name"], "capture-baseline")
         first_step = document["disaster_recovery_rehearsal"]["phases"][0]["steps"][0]
         self.assertEqual(first_step["path"], "/_iceberg/v1/lake/namespaces/sales/tables/orders/catalog/export")
+
+    def test_scale_fault_rehearsal_plan_covers_load_and_fault_paths(self) -> None:
+        rehearsal = failure_coverage.scale_fault_rehearsal_plan(
+            warehouse="lake",
+            namespace="sales",
+            table="orders",
+            rest_path="/iceberg",
+            table_warehouse_location="s3://lake/tables/orders",
+            writer_count=8,
+            maintenance_worker_count=3,
+            iteration_count=50,
+            catalog_backing="durable-strong",
+        )
+
+        self.assertEqual(rehearsal["mode"], "manual-or-ci-optional")
+        self.assertEqual(rehearsal["ci_gate"], "RUSTFS_TABLE_CATALOG_SCALE_FAULT_REHEARSAL=1")
+        self.assertEqual(rehearsal["parameters"]["writer_count"], 8)
+        self.assertEqual(rehearsal["parameters"]["maintenance_worker_count"], 3)
+        self.assertEqual(rehearsal["parameters"]["iteration_count"], 50)
+        self.assertEqual(rehearsal["parameters"]["catalog_backing"], "durable-strong")
+        self.assertIn("current metadata generation is monotonic", rehearsal["expected_invariants"])
+        self.assertIn("maintenance jobs never delete reachable table objects", rehearsal["expected_invariants"])
+
+        phases = {phase["name"]: phase for phase in rehearsal["phases"]}
+        self.assertIn("concurrent-commit-stress", phases)
+        self.assertIn("maintenance-scheduler-failover", phases)
+        self.assertIn("durable-backing-cutover-under-load", phases)
+        self.assertIn("recovery-rollback-import-under-load", phases)
+        self.assertIn("post-run-evidence", phases)
+
+        commit_steps = {step["name"]: step for step in phases["concurrent-commit-stress"]["steps"]}
+        self.assertEqual(commit_steps["spawn-concurrent-writers"]["method"], "CLIENT-STRESS")
+        self.assertEqual(commit_steps["spawn-concurrent-writers"]["expected_status"], "single-winner-per-conflict-cohort")
+        self.assertEqual(commit_steps["load-table-after-writer-cohort"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders")
+
+        scheduler_steps = {step["name"]: step for step in phases["maintenance-scheduler-failover"]["steps"]}
+        self.assertEqual(scheduler_steps["queue-maintenance-job"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders/maintenance/scheduler/run")
+        self.assertEqual(scheduler_steps["claim-worker-job"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders/maintenance/worker/run")
+        self.assertEqual(scheduler_steps["recover-expired-lease"]["expected_status"], "200-or-409")
+
+        cutover_steps = {step["name"]: step for step in phases["durable-backing-cutover-under-load"]["steps"]}
+        self.assertEqual(cutover_steps["migration-dry-run-before-cutover"]["path"], "/iceberg/v1/lake/catalog/migration")
+        self.assertIn("catalog-backup", cutover_steps["capture-cutover-backup"]["expected_behavior"])
+
+        recovery_steps = {step["name"]: step for step in phases["recovery-rollback-import-under-load"]["steps"]}
+        self.assertEqual(recovery_steps["safe-recovery-repair-under-load"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders/catalog/recovery")
+        self.assertEqual(recovery_steps["rollback-conflict-check"]["expected_status"], "200-or-409")
+
+        evidence_steps = {step["name"]: step for step in phases["post-run-evidence"]["steps"]}
+        self.assertEqual(evidence_steps["table-data-plane-policy-probe"]["path"], "s3://lake/tables/orders")
+        self.assertEqual(evidence_steps["capture-run-artifacts"]["method"], "EVIDENCE")
+
+    def test_cli_prints_scale_fault_rehearsal_plan(self) -> None:
+        payload = failure_coverage.cli_json(
+            [
+                "--warehouse",
+                "lake",
+                "--namespace",
+                "sales",
+                "--table",
+                "orders",
+                "--rest-path",
+                "/_iceberg",
+                "--table-warehouse-location",
+                "s3://lake/tables/orders",
+                "--writer-count",
+                "6",
+                "--maintenance-worker-count",
+                "2",
+                "--iteration-count",
+                "25",
+                "--catalog-backing",
+                "durable-strong",
+                "--print-scale-fault-rehearsal",
+            ]
+        )
+        document = json.loads(payload)
+
+        rehearsal = document["scale_fault_rehearsal"]
+        self.assertEqual(rehearsal["parameters"]["writer_count"], 6)
+        self.assertEqual(rehearsal["parameters"]["maintenance_worker_count"], 2)
+        self.assertEqual(rehearsal["parameters"]["iteration_count"], 25)
+        first_step = rehearsal["phases"][0]["steps"][0]
+        self.assertEqual(first_step["path"], "/_iceberg/v1/lake/namespaces/sales/tables/orders")
+
+    def test_cli_rejects_non_positive_scale_fault_counts(self) -> None:
+        invalid_count_flags = [
+            ("--writer-count", "0"),
+            ("--maintenance-worker-count", "-1"),
+            ("--iteration-count", "0"),
+        ]
+
+        for flag, value in invalid_count_flags:
+            with self.subTest(flag=flag):
+                with redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit):
+                        failure_coverage.cli_json([flag, value, "--print-scale-fault-rehearsal"])
 
 
 if __name__ == "__main__":
