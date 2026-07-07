@@ -450,6 +450,10 @@ message ReadMultipleResponse {
 message DeleteVolumeRequest {
   string disk = 1;
   string volume = 2;
+  // When false (default), a non-empty volume is refused (VolumeNotEmpty); when
+  // true, the volume is deleted recursively. Old peers omit this field, which
+  // decodes to false — the safe, non-recursive behavior (backlog#799 B1).
+  bool force = 3;
 }
 
 message DeleteVolumeResponse {
