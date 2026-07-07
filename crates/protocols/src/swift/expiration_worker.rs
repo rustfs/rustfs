@@ -656,16 +656,18 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    type MetadataResult = SwiftResult<Option<HashMap<String, String>>>;
+
     #[derive(Default)]
     #[allow(clippy::type_complexity)]
     struct MockExpirationObjectBackend {
-        metadata_results: Mutex<VecDeque<SwiftResult<Option<HashMap<String, String>>>>>,
+        metadata_results: Mutex<VecDeque<MetadataResult>>,
         delete_results: Mutex<VecDeque<SwiftResult<()>>>,
         deleted_objects: Mutex<Vec<(String, String, String)>>,
     }
 
     impl MockExpirationObjectBackend {
-        fn with_metadata_result(result: SwiftResult<Option<HashMap<String, String>>>) -> Self {
+        fn with_metadata_result(result: MetadataResult) -> Self {
             Self {
                 metadata_results: Mutex::new(VecDeque::from([result])),
                 ..Default::default()

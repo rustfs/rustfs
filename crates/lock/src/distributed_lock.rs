@@ -20,11 +20,14 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_io_metrics::{
-    record_read_lock_held_acquire, record_read_lock_held_release, record_write_lock_held_acquire, record_write_lock_held_release,
+    record_lock_refresh_quorum_lost, record_read_lock_held_acquire, record_read_lock_held_release,
+    record_write_lock_held_acquire, record_write_lock_held_release,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::task::JoinSet;
+use tokio::sync::Notify;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -72,6 +75,24 @@ fn is_unrecoverable_quorum_error(error: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(UNRECOVERABLE_QUORUM_FAILURE_PREFIX))
 }
 
+/// Derive a safe heartbeat interval for a freshly acquired guard.
+///
+/// Deliberately avoids `Duration::clamp` (which asserts `min <= max` and would panic for
+/// sub-second ttls where `ttl - 1s` underflows to zero). Returns `None` for degenerate cases so
+/// no heartbeat is spawned:
+/// - `entries_len <= 1`: single/degenerate path (matches a local, non-distributed lock),
+/// - `interval.is_zero()` or `interval >= ttl`: too small a ttl / too large an interval to renew.
+fn derive_refresh_interval(entries_len: usize, ttl: Duration, injected: Option<Duration>) -> Option<Duration> {
+    if entries_len <= 1 {
+        return None;
+    }
+    let interval = injected.unwrap_or(ttl / 3);
+    if interval.is_zero() || interval >= ttl {
+        return None;
+    }
+    Some(interval)
+}
+
 fn classify_lock_failure(error: &str) -> LockAcquireFailureKind {
     if is_unrecoverable_quorum_error(error) {
         return LockAcquireFailureKind::UnrecoverableQuorum;
@@ -103,6 +124,35 @@ fn should_warn_lock_failure(error: &str) -> bool {
     )
 }
 
+/// Observability channel for lock-loss: set once when a guard's heartbeat detects it has
+/// lost refresh quorum. Phase 1 only signals (warn + metric + this flag); Phase 2 (backlog#899)
+/// will `select!` on `notified()` inside long write operations to abort and avoid split-brain.
+#[derive(Debug, Default)]
+pub struct LockLostSignal {
+    lost: AtomicBool,
+    notify: Notify,
+}
+
+impl LockLostSignal {
+    fn mark_lost(&self) {
+        self.lost.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Whether refresh quorum has been lost for the associated guard.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the lock is declared lost (immediately if already lost).
+    pub async fn notified(&self) {
+        if self.is_lost() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
 /// A RAII guard for distributed locks that releases the lock asynchronously when dropped.
 #[derive(Debug)]
 pub struct DistributedLockGuard {
@@ -115,6 +165,11 @@ pub struct DistributedLockGuard {
     lock_type: LockType,
     /// If true, Drop will not try to release (used if user manually released).
     disarmed: bool,
+    /// Background heartbeat task that periodically refreshes the per-client leases.
+    /// `None` for degenerate/single-client paths that do not need renewal.
+    refresh_task: Option<JoinHandle<()>>,
+    /// Lock-loss signal, shared with the heartbeat task.
+    lock_lost: Arc<LockLostSignal>,
 }
 
 impl DistributedLockGuard {
@@ -123,13 +178,95 @@ impl DistributedLockGuard {
     /// - `lock_id` is the id returned to the caller (`lock_id()`).
     /// - `entries` is the full list of underlying (LockId, client) pairs
     ///   that should be released when this guard is dropped.
-    pub(crate) fn new(lock_id: LockId, entries: Vec<(LockId, Arc<dyn LockClient>)>, lock_type: LockType) -> Self {
+    /// - `refresh_interval`: `Some` spawns a heartbeat that refreshes every entry on that
+    ///   cadence; `None` (degenerate/single-client, or interval derived away) spawns nothing.
+    /// - `refresh_quorum`: minimum refreshes that must keep succeeding; if `not_found` exceeds
+    ///   `entries.len() - refresh_quorum` the guard is declared lost.
+    /// - `owner`/`resource`: diagnostics only.
+    pub(crate) fn new(
+        lock_id: LockId,
+        entries: Vec<(LockId, Arc<dyn LockClient>)>,
+        lock_type: LockType,
+        refresh_interval: Option<Duration>,
+        refresh_quorum: usize,
+        owner: String,
+        resource: ObjectKey,
+    ) -> Self {
         record_lock_held_acquire(lock_type);
+        let lock_lost = Arc::new(LockLostSignal::default());
+        let refresh_task = refresh_interval.and_then(|interval| {
+            // Only spawn when a tokio runtime is available; guard construction off-runtime
+            // (e.g. some tests) simply skips the heartbeat.
+            tokio::runtime::Handle::try_current().ok().map(|handle| {
+                let entries = entries.clone();
+                let lock_lost = lock_lost.clone();
+                handle.spawn(Self::run_heartbeat(entries, interval, refresh_quorum, lock_lost, owner, resource))
+            })
+        });
         Self {
             lock_id,
             entries,
             lock_type,
             disarmed: false,
+            refresh_task,
+            lock_lost,
+        }
+    }
+
+    /// Heartbeat loop: every `interval`, refresh all entries and classify the outcomes.
+    /// `Ok(true)` = refreshed, `Ok(false)` = not_found, `Err` = RPC jitter (ignored, absorbed by
+    /// the ttl > interval margin and retried next tick). Declares the lock lost when
+    /// `not_found > entries.len() - refresh_quorum`. Phase 1 does not release on loss: the guarded
+    /// operation is still running, and tearing the lock down here would only widen the window.
+    async fn run_heartbeat(
+        entries: Vec<(LockId, Arc<dyn LockClient>)>,
+        interval: Duration,
+        refresh_quorum: usize,
+        lock_lost: Arc<LockLostSignal>,
+        owner: String,
+        resource: ObjectKey,
+    ) {
+        let tolerable_not_found = entries.len().saturating_sub(refresh_quorum);
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires immediately; skip it so the first refresh lands one interval
+        // after acquisition rather than right away.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+
+            let results = join_all(entries.iter().map(|(lock_id, client)| {
+                let lock_id = lock_id.clone();
+                let client = client.clone();
+                async move { client.refresh(&lock_id).await }
+            }))
+            .await;
+
+            let mut refreshed = 0usize;
+            let mut not_found = 0usize;
+            for result in &results {
+                match result {
+                    Ok(true) => refreshed += 1,
+                    Ok(false) => not_found += 1,
+                    // RPC jitter: count as neither; the ttl > interval margin covers a transient
+                    // dip and the next tick retries.
+                    Err(_) => {}
+                }
+            }
+
+            if not_found > tolerable_not_found {
+                warn!(
+                    resource = %resource,
+                    owner = %owner,
+                    refreshed,
+                    not_found,
+                    entries = entries.len(),
+                    refresh_quorum,
+                    "lock refresh lost quorum"
+                );
+                record_lock_refresh_quorum_lost();
+                lock_lost.mark_lost();
+            }
         }
     }
 
@@ -138,9 +275,32 @@ impl DistributedLockGuard {
         &self.lock_id
     }
 
+    /// Whether the guard's heartbeat has observed a refresh-quorum loss.
+    pub fn is_lock_lost(&self) -> bool {
+        self.lock_lost.is_lost()
+    }
+
+    /// Shared lock-loss signal (used by callers to `select!` on `notified()`; Phase 2).
+    pub fn lock_lost(&self) -> Arc<LockLostSignal> {
+        self.lock_lost.clone()
+    }
+
+    /// Abort the heartbeat task, if running. Idempotent.
+    ///
+    /// Aborting may truncate an in-flight refresh, but refresh is idempotent and only extends
+    /// an existing lease (never creates one): a late refresh reaching a backend that already
+    /// dropped the entry returns `Ok(false)` with no side effect.
+    fn stop_heartbeat(&mut self) {
+        if let Some(task) = self.refresh_task.take() {
+            task.abort();
+        }
+    }
+
     /// Manually disarm the guard so dropping it won't release the lock.
     /// Call this if you explicitly released the lock elsewhere.
     pub fn disarm(&mut self) {
+        // Stop renewing a lock the caller says it released elsewhere.
+        self.stop_heartbeat();
         if !self.disarmed {
             record_lock_held_release(self.lock_type);
         }
@@ -157,6 +317,10 @@ impl DistributedLockGuard {
     /// to prevent double-release on drop.
     /// Returns true if release was scheduled or the guard was already disarmed.
     pub fn release(&mut self) -> bool {
+        // Stop the heartbeat before releasing so no refresh races the unlock. Abort is safe even
+        // if disarmed (take() makes it idempotent / a no-op when never spawned).
+        self.stop_heartbeat();
+
         if self.disarmed {
             // Lock was already released, return true to indicate lock is in released state
             return true;
@@ -272,7 +436,18 @@ impl DistributedLock {
                 .map(|info| info.id.clone())
                 .unwrap_or_else(|| LockId::new_unique(&request.resource));
 
-            Ok(Some(DistributedLockGuard::new(aggregate_lock_id, individual_locks, request.lock_type)))
+            // Heartbeat operates on the per-client individual locks (their per-client ids), never
+            // the aggregate id, so refreshes round-trip to the exact backend entries.
+            let refresh_interval = derive_refresh_interval(individual_locks.len(), request.ttl, request.refresh_interval);
+            Ok(Some(DistributedLockGuard::new(
+                aggregate_lock_id,
+                individual_locks,
+                request.lock_type,
+                refresh_interval,
+                required_quorum,
+                request.owner.clone(),
+                request.resource.clone(),
+            )))
         } else {
             // Check if it's a timeout or quorum failure
             if let Some(error_msg) = &resp.error {
@@ -836,11 +1011,293 @@ mod tests {
     };
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
     use std::assert_matches;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{
         collections::{HashMap, VecDeque},
         sync::{Arc, Mutex},
         time::Duration,
     };
+
+    #[derive(Clone, Copy, Debug)]
+    enum RefreshOutcome {
+        Alive,    // Ok(true)  refresh succeeded
+        NotFound, // Ok(false) remote already lost the lock (reclaimed / never held)
+        RpcError, // Err        RPC jitter
+    }
+
+    /// Counting test client: acquires successfully and echoes back request.lock_id as
+    /// the per-client id, so the guard heartbeat calls refresh with that id; refresh
+    /// increments a counter and returns per the configured outcome.
+    #[derive(Debug)]
+    struct RefreshCountingClient {
+        refresh_calls: Arc<AtomicUsize>,
+        outcome: RefreshOutcome,
+        active: tokio::sync::Mutex<std::collections::HashSet<LockId>>,
+    }
+
+    impl RefreshCountingClient {
+        fn new(outcome: RefreshOutcome, counter: Arc<AtomicUsize>) -> Arc<Self> {
+            Arc::new(Self {
+                refresh_calls: counter,
+                outcome,
+                active: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for RefreshCountingClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+            self.active.lock().await.insert(request.lock_id.clone());
+            let info = LockInfo {
+                id: request.lock_id.clone(),
+                resource: request.resource.clone(),
+                lock_type: request.lock_type,
+                status: crate::types::LockStatus::Acquired,
+                owner: request.owner.clone(),
+                acquired_at: std::time::SystemTime::now(),
+                expires_at: std::time::SystemTime::now() + request.ttl,
+                last_refreshed: std::time::SystemTime::now(),
+                metadata: request.metadata.clone(),
+                priority: request.priority,
+                wait_start_time: None,
+            };
+            Ok(LockResponse::success(info, Duration::ZERO))
+        }
+        async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            Ok(self.active.lock().await.remove(lock_id))
+        }
+        async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                RefreshOutcome::Alive => Ok(true),
+                RefreshOutcome::NotFound => Ok(false),
+                RefreshOutcome::RpcError => Err(LockError::internal("refresh rpc jitter")),
+            }
+        }
+        async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.release(lock_id).await
+        }
+        async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+        async fn get_stats(&self) -> crate::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn is_online(&self) -> bool {
+            true
+        }
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    fn counting_clients(outcomes: &[RefreshOutcome]) -> (Vec<Arc<dyn LockClient>>, Vec<Arc<AtomicUsize>>) {
+        let mut clients: Vec<Arc<dyn LockClient>> = Vec::new();
+        let mut counters = Vec::new();
+        for outcome in outcomes {
+            let counter = Arc::new(AtomicUsize::new(0));
+            clients.push(RefreshCountingClient::new(*outcome, counter.clone()) as Arc<dyn LockClient>);
+            counters.push(counter);
+        }
+        (clients, counters)
+    }
+
+    // A1 -- heartbeat broadcasts refresh every interval; a live lock stays refreshed (#899 keepalive).
+    #[tokio::test]
+    async fn heartbeat_keeps_distributed_lock_refreshed() {
+        let (clients, counters) = counting_clients(&[
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+        ]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(200))
+            .with_ttl(Duration::from_millis(120))
+            .with_refresh_interval(Duration::from_millis(20)); // interval < ttl -> spawn
+
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("acquire should not error")
+            .expect("quorum should be reached");
+
+        tokio::time::sleep(Duration::from_millis(90)).await; // spans >2 intervals
+
+        // The guard tracks exactly the quorum of per-client locks (excess successes are cleaned
+        // up on acquire), so the heartbeat broadcasts to at least `quorum` clients.
+        let refreshed_clients = counters.iter().filter(|c| c.load(Ordering::SeqCst) >= 1).count();
+        assert!(
+            refreshed_clients >= 3,
+            "heartbeat should refresh at least the quorum of tracked clients, got {refreshed_clients}"
+        );
+        assert!(!guard.is_lock_lost(), "all-alive refresh must not signal lock loss");
+        drop(guard);
+    }
+
+    // A2 -- single client (degenerate path) spawns no heartbeat (matches localLockInstance).
+    #[tokio::test]
+    async fn single_client_guard_spawns_no_heartbeat() {
+        let (clients, counters) = counting_clients(&[RefreshOutcome::Alive]);
+        let lock = DistributedLock::new("test".to_string(), clients, 1);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(120))
+            .with_refresh_interval(Duration::from_millis(20));
+
+        let guard = lock.acquire_guard(&request).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        assert_eq!(counters[0].load(Ordering::SeqCst), 0, "single-client guard must not run a heartbeat");
+        drop(guard);
+    }
+
+    // A3 -- dropping the guard aborts the heartbeat before release; no refresh lands after drop.
+    #[tokio::test]
+    async fn dropping_guard_stops_heartbeat() {
+        let (clients, counters) = counting_clients(&[
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+        ]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(120))
+            .with_refresh_interval(Duration::from_millis(20));
+
+        let guard = lock.acquire_guard(&request).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(guard); // should abort the heartbeat first
+        let after_drop: Vec<usize> = counters.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+
+        tokio::time::sleep(Duration::from_millis(80)).await; // wait >2 more intervals
+        for (idx, counter) in counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                after_drop[idx],
+                "client {idx} must not be refreshed after guard drop"
+            );
+        }
+    }
+
+    // A4 -- losing refresh quorum (not_found > n - refresh_quorum) signals lock loss.
+    // 4 clients / write-quorum 3 -> n-quorum = 1; 2 NotFound (>1) -> lost.
+    #[tokio::test]
+    async fn heartbeat_quorum_loss_signals_lock_lost() {
+        let (clients, _counters) = counting_clients(&[
+            RefreshOutcome::NotFound,
+            RefreshOutcome::NotFound,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+        ]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(120))
+            .with_refresh_interval(Duration::from_millis(20));
+
+        let guard = lock.acquire_guard(&request).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await; // at least one tick
+
+        assert!(
+            guard.is_lock_lost(),
+            "losing refresh quorum (2 not_found of 4, quorum 3) must signal lock loss"
+        );
+        let signal = guard.lock_lost();
+        tokio::time::timeout(Duration::from_millis(20), signal.notified())
+            .await
+            .expect("lock_lost().notified() must resolve once quorum lost");
+        drop(guard);
+    }
+
+    // A5 -- refresh RPC jitter (Err) is not counted as not_found; the lock is not declared lost.
+    #[tokio::test]
+    async fn heartbeat_rpc_error_not_counted_as_lock_lost() {
+        let (clients, _counters) = counting_clients(&[
+            RefreshOutcome::RpcError,
+            RefreshOutcome::RpcError,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+        ]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(120))
+            .with_refresh_interval(Duration::from_millis(20));
+
+        let guard = lock.acquire_guard(&request).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert!(
+            !guard.is_lock_lost(),
+            "RPC jitter (Err) must NOT be counted as not_found; lock must not be declared lost"
+        );
+        drop(guard);
+    }
+
+    // A6 -- sub-second ttl boundary: no panic, and skip heartbeat when interval>=ttl
+    //        (fixes clamp panic; aligns with the 50ms-ttl distributed path in namespace tests).
+    #[tokio::test]
+    async fn subsecond_ttl_guard_does_not_panic_and_skips_heartbeat() {
+        // tiny ttl; the point is that acquire must not panic.
+        let (clients, _counters) = counting_clients(&[RefreshOutcome::Alive, RefreshOutcome::Alive, RefreshOutcome::Alive]);
+        let lock = DistributedLock::new("test".to_string(), clients, 2);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(100))
+            .with_ttl(Duration::from_millis(50)); // a clamp(1s, ttl-1s) would panic here
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("subsecond ttl acquire must not panic")
+            .expect("quorum should be reached");
+        drop(guard);
+
+        // inject interval >= ttl -> degenerate to no spawn
+        let (clients2, counters2) = counting_clients(&[RefreshOutcome::Alive, RefreshOutcome::Alive, RefreshOutcome::Alive]);
+        let lock2 = DistributedLock::new("test".to_string(), clients2, 2);
+        let request2 = LockRequest::new(ObjectKey::new("bucket", "object2"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(50))
+            .with_refresh_interval(Duration::from_millis(50)); // interval >= ttl -> None
+        let guard2 = lock2.acquire_guard(&request2).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        for c in &counters2 {
+            assert_eq!(c.load(Ordering::SeqCst), 0, "interval>=ttl must not spawn heartbeat");
+        }
+        drop(guard2);
+    }
+
+    // A7 -- disarm() must also stop the heartbeat (public API gap).
+    #[tokio::test]
+    async fn disarm_stops_heartbeat() {
+        let (clients, counters) = counting_clients(&[
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+        ]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(120))
+            .with_refresh_interval(Duration::from_millis(20));
+
+        let mut guard = lock.acquire_guard(&request).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        guard.disarm(); // should abort the heartbeat
+        let after_disarm: Vec<usize> = counters.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        for (idx, counter) in counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                after_disarm[idx],
+                "disarm() must stop the heartbeat for client {idx}"
+            );
+        }
+        drop(guard);
+    }
 
     #[derive(Debug)]
     struct ResponseClient {
