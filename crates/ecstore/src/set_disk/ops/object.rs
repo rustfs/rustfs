@@ -893,12 +893,21 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
             let mut cleanup_stage_ms: Option<u64> = None;
             if let Some(old_dir) = op_old_dir {
+                let committed_dir = fi.data_dir.unwrap_or_default().to_string();
                 let cleanup_stage_start = Instant::now();
-                self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
-                    .await?;
+                // backlog#898: reclaiming the dereferenced old data dir is
+                // best-effort and returns a receipt (never `Err`). A failed GC
+                // here must not negate an already-committed, durable write, so we
+                // deliberately do NOT `?`-propagate it into a 503. On residue the
+                // report path emits the leak metric and enqueues a heal.
+                let cleanup = self
+                    .commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), &committed_dir, write_quorum)
+                    .await;
                 let cleanup_ms = cleanup_stage_start.elapsed().as_millis() as u64;
                 cleanup_stage_ms = Some(cleanup_ms);
                 rustfs_io_metrics::record_put_object_stage_duration("set_disk_old_data_cleanup", cleanup_ms as f64);
+                self.report_old_data_dir_cleanup(bucket, object, &old_dir.to_string(), &cleanup)
+                    .await;
                 if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                     warn!(
                         event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,

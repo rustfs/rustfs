@@ -4667,6 +4667,128 @@ mod tests {
         assert!(obj0.join(other.to_string()).exists(), "locally referenced data dir must survive");
     }
 
+    // backlog#898 A5: old == committed data dir => anti-misdelete guard skips the
+    // whole cleanup; the live (just-committed) dir must be left untouched.
+    #[tokio::test]
+    async fn commit_rename_data_dir_skips_delete_when_old_equals_committed_dir() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let bucket = "bucket";
+        let object = "object";
+        fs::create_dir_all(root.join(bucket))
+            .await
+            .expect("bucket volume should be created");
+
+        let same_dir = Uuid::parse_str("55555555-5555-5555-5555-555555555555").expect("dir should parse");
+        let data_path = root.join(bucket).join(object).join(same_dir.to_string());
+        fs::create_dir_all(&data_path).await.expect("data dir should be created");
+        fs::write(data_path.join("part.1"), b"live")
+            .await
+            .expect("live part should be written");
+
+        let set = make_set_disks_with(vec![Some(disk.clone())]).await;
+        let cleanup = set
+            .commit_rename_data_dir(&[Some(disk.clone())], bucket, object, &same_dir.to_string(), &same_dir.to_string(), 1)
+            .await;
+
+        assert_eq!(cleanup.attempted, 0, "guard must skip: no delete may be issued");
+        assert!(cleanup.unreclaimed_disks.is_empty());
+        assert!(!cleanup.has_residue());
+        assert!(data_path.join("part.1").exists(), "committed data dir must NOT be deleted");
+    }
+
+    // backlog#898 A5b: old != committed and old dir exists => normal reclaim; the
+    // dereferenced old dir is physically removed and the receipt reports success.
+    #[tokio::test]
+    async fn commit_rename_data_dir_reclaims_distinct_old_dir() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let bucket = "bucket";
+        let object = "object";
+        fs::create_dir_all(root.join(bucket))
+            .await
+            .expect("bucket volume should be created");
+
+        let old_dir = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("old dir should parse");
+        let new_dir = Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("new dir should parse");
+        let old_path = root.join(bucket).join(object).join(old_dir.to_string());
+        fs::create_dir_all(&old_path).await.expect("old data dir should be created");
+        fs::write(old_path.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+
+        let set = make_set_disks_with(vec![Some(disk.clone())]).await;
+        let cleanup = set
+            .commit_rename_data_dir(&[Some(disk.clone())], bucket, object, &old_dir.to_string(), &new_dir.to_string(), 1)
+            .await;
+
+        assert_eq!(cleanup.attempted, 1);
+        assert_eq!(cleanup.reclaimed, 1);
+        assert!(!cleanup.has_residue());
+        assert!(!cleanup.below_quorum);
+        assert!(!old_path.exists(), "dereferenced old data dir must be physically removed");
+    }
+
+    // backlog#898 group B (end-to-end): a real overwrite whose post-commit old
+    // data dir cleanup is forced to fail (via the test-only fault seam) must
+    // still return 200 with the new ObjectInfo — no false-negative ACK.
+    #[tokio::test]
+    async fn put_object_overwrite_returns_ok_when_old_data_dir_cleanup_fails() {
+        use crate::set_disk::core::io_primitives::cleanup_fault_injection;
+
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-cleanup-fault";
+        let object = "object-below-quorum-cleanup";
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        // v1: establishes an old data dir that the overwrite will try to reclaim.
+        let mut reader = PutObjReader::from_vec(b"hello".to_vec());
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..ObjectOptions::default()
+                },
+            )
+            .await
+            .expect("first write should succeed");
+
+        // Force the old-data-dir cleanup delete to fail on disk 0 during the
+        // overwrite. rename_data still commits; only the GC of the dereferenced
+        // old dir fails, which must NOT turn the PUT into a 503.
+        let _fault = cleanup_fault_injection::fail_cleanup_on(object, &[0]);
+
+        let mut reader = PutObjReader::from_vec(b"goodbye!!".to_vec());
+        let oi = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..ObjectOptions::default()
+                },
+            )
+            .await
+            .expect("overwrite must return Ok even when old-data-dir cleanup fails");
+
+        assert_eq!(oi.size, 9, "returned ObjectInfo must reflect the new committed write");
+
+        // The committed new version must be readable with the new size.
+        let read_back = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("committed object must be readable after a failed cleanup");
+        assert_eq!(read_back.size, 9, "HEAD must observe the new version, not stale metadata");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn test_acquire_dist_delete_object_locks_batch_succeeds_with_two_healthy_lockers() {
