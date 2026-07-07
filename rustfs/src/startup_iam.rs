@@ -430,7 +430,7 @@ mod hint_tests {
 mod tests {
     use super::{
         IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, IamBootstrapDisposition,
-        compute_backoff_interval, iam_bootstrap_failure_hint, publish_ready_for_iam_bootstrap_with, run_iam_recovery_loop,
+        compute_backoff_interval, publish_ready_for_iam_bootstrap_with, run_iam_recovery_loop,
     };
     use rustfs_common::{GlobalReadiness, SystemStage};
     use std::io::Error;
