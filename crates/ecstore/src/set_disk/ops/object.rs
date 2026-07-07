@@ -2171,7 +2171,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         //     }
         //     _lock_guard = guard_opt;
         // }
-        let (mut fi, _, disks) = self.get_object_fileinfo(bucket, object, opts, false).await?;
+        // Force the full quorum fanout (allow_early_stop=false): `disks` is the
+        // write target below, and an early-stop subset would only carry read
+        // quorum, failing write quorum on update_object_meta (backlog#872).
+        let (mut fi, _, disks) = self.get_object_fileinfo_gated(bucket, object, opts, false, false).await?;
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
 

@@ -168,6 +168,24 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+        // Read-only callers (GET/HEAD/tag read) may use the metadata early-stop
+        // fast path.
+        self.get_object_fileinfo_gated(bucket, object, opts, read_data, true).await
+    }
+
+    /// Like `get_object_fileinfo`, but `allow_early_stop=false` forces the full
+    /// quorum fanout. Read-before-write callers (object tagging) must use this:
+    /// the returned online-disk set is the write target, and the early-stop
+    /// subset would fail write quorum (backlog#872 regression fix).
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(in crate::set_disk) async fn get_object_fileinfo_gated(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+        allow_early_stop: bool,
+    ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
         let vid = opts.version_id.clone().unwrap_or_default();
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
@@ -223,7 +241,8 @@ impl SetDisks {
 
         // Early-stop for safe metadata reads is handled inside
         // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
-        // core/io_primitives.rs); unsafe requests fall back to full-wait.
+        // core/io_primitives.rs); unsafe requests and callers that opt out
+        // (allow_early_stop=false) fall back to full-wait.
         let (parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
             &disks,
             "",
@@ -233,6 +252,7 @@ impl SetDisks {
             read_data,
             false,
             opts.incl_free_versions,
+            allow_early_stop,
             self.default_parity_count,
         )
         .await?;
@@ -2509,6 +2529,31 @@ mod tests {
             // back to the full-wait fanout.
             assert!(!should_allow_metadata_early_stop(false, "", false, false));
         });
+    }
+
+    #[test]
+    fn metadata_early_stop_permitted_respects_caller_opt_out() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+            ],
+            || {
+                // Read-before-write callers (object tagging) pass
+                // caller_allows_early_stop=false and must never early-stop, even
+                // for an otherwise-eligible safe metadata-only read. The
+                // early-stop subset would fail write quorum (backlog#872).
+                assert!(!metadata_early_stop_permitted(false, true, false, "", false, false));
+                assert!(!metadata_early_stop_permitted(false, true, false, "version-id", false, false));
+                // With the caller allowing it and every other condition safe,
+                // the fast path is permitted.
+                assert!(metadata_early_stop_permitted(true, true, false, "", false, false));
+                // observe=false (non-observed fanout) also disables early-stop.
+                assert!(!metadata_early_stop_permitted(true, false, false, "", false, false));
+                // Data reads are never eligible regardless of caller opt-in.
+                assert!(!metadata_early_stop_permitted(true, true, true, "", false, false));
+            },
+        );
     }
 
     #[test]

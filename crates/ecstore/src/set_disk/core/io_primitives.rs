@@ -1721,6 +1721,23 @@ pub(in crate::set_disk) fn should_allow_metadata_early_stop(
         || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing)
 }
 
+/// Final gate for the metadata early-stop fast path.
+///
+/// `caller_allows_early_stop=false` unconditionally forces the full quorum
+/// fanout so read-before-write callers (object tagging) get the complete
+/// online-disk set as their write target; the early-stop subset would only
+/// carry read quorum and fail write quorum (backlog#872 regression).
+pub(in crate::set_disk) fn metadata_early_stop_permitted(
+    caller_allows_early_stop: bool,
+    observe: bool,
+    read_data: bool,
+    version_id: &str,
+    healing: bool,
+    incl_free_versions: bool,
+) -> bool {
+    caller_allows_early_stop && observe && should_allow_metadata_early_stop(read_data, version_id, healing, incl_free_versions)
+}
+
 impl SetDisks {
     pub(in crate::set_disk) async fn read_parts(
         disks: &[Option<DiskStore>],
@@ -1797,6 +1814,7 @@ impl SetDisks {
             healing,
             incl_free_versions,
             false,
+            true,
             0,
         )
         .await?;
@@ -1813,6 +1831,7 @@ impl SetDisks {
         read_data: bool,
         healing: bool,
         incl_free_versions: bool,
+        allow_early_stop: bool,
         default_parity_count: usize,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
         Self::read_all_fileinfo_inner(
@@ -1825,6 +1844,7 @@ impl SetDisks {
             healing,
             incl_free_versions,
             true,
+            allow_early_stop,
             default_parity_count,
         )
         .await
@@ -1841,10 +1861,18 @@ impl SetDisks {
         healing: bool,
         incl_free_versions: bool,
         observe: bool,
+        // When false, the caller opts out of the early-stop fast path even for
+        // otherwise-eligible reads. Read-before-write callers (e.g. object
+        // tagging) must set this so the returned online-disk set reflects the
+        // full quorum fanout rather than the early-stop subset — writing to the
+        // subset would fail write quorum (backlog#872 regression).
+        caller_allows_early_stop: bool,
         default_parity_count: usize,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
-        let early_stop_enabled = observe && (is_get_metadata_early_stop_enabled() || is_version_early_stop_enabled());
-        let allow_early_stop = observe && should_allow_metadata_early_stop(read_data, version_id, healing, incl_free_versions);
+        let early_stop_enabled =
+            caller_allows_early_stop && observe && (is_get_metadata_early_stop_enabled() || is_version_early_stop_enabled());
+        let allow_early_stop =
+            metadata_early_stop_permitted(caller_allows_early_stop, observe, read_data, version_id, healing, incl_free_versions);
         if allow_early_stop {
             return Self::read_all_fileinfo_early_stop(
                 disks,
