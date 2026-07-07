@@ -294,9 +294,43 @@ impl S3PeerSys {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errors, BUCKET_OP_IGNORED_ERRS, (errors.len() / 2) + 1) {
+        for i in 0..self.pools_count {
+            let per_pool_errs = pool_participant_errors(&self.clients, &errors, i);
+            if let Some(err) = reduce_pool_write_quorum_errs(&per_pool_errs) {
+                if !Error::is_err_object_not_found(&err) && !opts.no_recreate {
+                    let make_bucket_opts = MakeBucketOptions::default();
+                    let mut rollback_futures = Vec::new();
+                    for (client, delete_err) in self.clients.iter().zip(errors.iter()) {
+                        if delete_err.is_none() {
+                            rollback_futures.push(client.make_bucket(bucket, &make_bucket_opts));
+                        }
+                    }
+                    for rollback_result in join_all(rollback_futures).await {
+                        if let Err(rollback_err) = rollback_result {
+                            warn!("delete_bucket rollback make_bucket failed: {rollback_err}");
+                        }
+                    }
+                }
+                return Err(err);
+            }
+        }
+
+        if self.pools_count == 0
+            && let Some(err) = reduce_write_quorum_errs(&errors, BUCKET_OP_IGNORED_ERRS, (errors.len() / 2) + 1)
+        {
             if !Error::is_err_object_not_found(&err) && !opts.no_recreate {
-                let _ = self.make_bucket(bucket, &MakeBucketOptions::default()).await;
+                let make_bucket_opts = MakeBucketOptions::default();
+                let mut rollback_futures = Vec::new();
+                for (client, delete_err) in self.clients.iter().zip(errors.iter()) {
+                    if delete_err.is_none() {
+                        rollback_futures.push(client.make_bucket(bucket, &make_bucket_opts));
+                    }
+                }
+                for rollback_result in join_all(rollback_futures).await {
+                    if let Err(rollback_err) = rollback_result {
+                        warn!("delete_bucket rollback make_bucket failed: {rollback_err}");
+                    }
+                }
             }
             return Err(err);
         }
@@ -586,11 +620,12 @@ impl PeerS3Client for LocalPeerS3Client {
             }
         }
 
-        // For errVolumeNotEmpty, do not delete; recreate only the entries already removed
-
-        for (idx, err) in errs.into_iter().enumerate() {
-            if err.is_none() && recreate {
-                let _ = local_disks[idx].make_volume(bucket).await;
+        for (idx, err) in errs.iter().enumerate() {
+            if err.is_none()
+                && recreate
+                && let Err(rollback_err) = local_disks[idx].make_volume(bucket).await
+            {
+                warn!("local delete_bucket rollback make_volume failed: {rollback_err}");
             }
         }
 
@@ -598,7 +633,18 @@ impl PeerS3Client for LocalPeerS3Client {
             return Err(Error::VolumeNotEmpty);
         }
 
-        // TODO: reduceWriteQuorumErrs
+        if let Some(err) = reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, (local_disks.len() / 2) + 1) {
+            if !Error::is_err_object_not_found(&err) && !opts.no_recreate {
+                for (idx, delete_err) in errs.iter().enumerate() {
+                    if delete_err.is_none()
+                        && let Err(rollback_err) = local_disks[idx].make_volume(bucket).await
+                    {
+                        warn!("local delete_bucket rollback make_volume failed: {rollback_err}");
+                    }
+                }
+            }
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -1117,6 +1163,7 @@ mod tests {
     use std::{
         io,
         pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
         task::{Context, Poll},
     };
     use tempfile::TempDir;
@@ -1143,6 +1190,8 @@ mod tests {
         pools: Option<Vec<usize>>,
         make_bucket_result: Result<()>,
         list_bucket_result: Result<Vec<BucketInfo>>,
+        delete_bucket_result: Result<()>,
+        make_bucket_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1152,6 +1201,7 @@ mod tests {
         }
 
         async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
+            self.make_bucket_calls.fetch_add(1, Ordering::SeqCst);
             self.make_bucket_result.clone()
         }
 
@@ -1160,7 +1210,7 @@ mod tests {
         }
 
         async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
-            unreachable!("not used by quorum tests")
+            self.delete_bucket_result.clone()
         }
 
         async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
@@ -1184,15 +1234,39 @@ mod tests {
         test_peer_with_results(pools, Ok(()), list_bucket_result)
     }
 
+    fn test_peer_with_delete_bucket(pools: &[usize], delete_bucket_result: Result<()>) -> Client {
+        test_peer_with_delete_bucket_and_make_counter(pools, delete_bucket_result, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn test_peer_with_delete_bucket_and_make_counter(
+        pools: &[usize],
+        delete_bucket_result: Result<()>,
+        make_bucket_calls: Arc<AtomicUsize>,
+    ) -> Client {
+        test_peer_with_all_results(pools, Ok(()), Ok(Vec::new()), delete_bucket_result, make_bucket_calls)
+    }
+
     fn test_peer_with_results(
         pools: &[usize],
         make_bucket_result: Result<()>,
         list_bucket_result: Result<Vec<BucketInfo>>,
     ) -> Client {
+        test_peer_with_all_results(pools, make_bucket_result, list_bucket_result, Ok(()), Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn test_peer_with_all_results(
+        pools: &[usize],
+        make_bucket_result: Result<()>,
+        list_bucket_result: Result<Vec<BucketInfo>>,
+        delete_bucket_result: Result<()>,
+        make_bucket_calls: Arc<AtomicUsize>,
+    ) -> Client {
         Arc::new(Box::new(TestPeerS3Client {
             pools: Some(pools.to_vec()),
             make_bucket_result,
             list_bucket_result,
+            delete_bucket_result,
+            make_bucket_calls,
         }))
     }
 
@@ -1535,5 +1609,81 @@ mod tests {
 
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].name, bucket.name);
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_fails_when_any_pool_misses_write_quorum() {
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_delete_bucket(&[0], Ok(())),
+                test_peer_with_delete_bucket(&[0], Ok(())),
+                test_peer_with_delete_bucket(&[0], Err(Error::VolumeNotEmpty)),
+                test_peer_with_delete_bucket(&[0], Err(Error::VolumeNotEmpty)),
+                test_peer_with_delete_bucket(&[1], Ok(())),
+                test_peer_with_delete_bucket(&[1], Ok(())),
+                test_peer_with_delete_bucket(&[1], Ok(())),
+                test_peer_with_delete_bucket(&[1], Ok(())),
+            ],
+            pools_count: 2,
+        };
+
+        let err = peer_sys
+            .delete_bucket("partially-deleted-bucket", &DeleteBucketOptions::default())
+            .await
+            .expect_err("pool 0 should fail because it did not reach write quorum");
+
+        assert_eq!(err, Error::ErasureWriteQuorum);
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_succeeds_when_every_pool_reaches_write_quorum() {
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_delete_bucket(&[0], Ok(())),
+                test_peer_with_delete_bucket(&[0], Ok(())),
+                test_peer_with_delete_bucket(&[0], Ok(())),
+                test_peer_with_delete_bucket(&[0], Err(Error::DiskNotFound)),
+                test_peer_with_delete_bucket(&[1], Ok(())),
+                test_peer_with_delete_bucket(&[1], Ok(())),
+                test_peer_with_delete_bucket(&[1], Ok(())),
+                test_peer_with_delete_bucket(&[1], Err(Error::DiskNotFound)),
+            ],
+            pools_count: 2,
+        };
+
+        peer_sys
+            .delete_bucket("deleted-bucket", &DeleteBucketOptions::default())
+            .await
+            .expect("each pool reached write quorum");
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_rolls_back_only_successful_deletes_on_failure() {
+        let make_bucket_calls = (0..8).map(|_| Arc::new(AtomicUsize::new(0))).collect::<Vec<_>>();
+        let peer_sys = S3PeerSys {
+            clients: vec![
+                test_peer_with_delete_bucket_and_make_counter(&[0], Ok(()), make_bucket_calls[0].clone()),
+                test_peer_with_delete_bucket_and_make_counter(&[0], Ok(()), make_bucket_calls[1].clone()),
+                test_peer_with_delete_bucket_and_make_counter(&[0], Err(Error::DiskAccessDenied), make_bucket_calls[2].clone()),
+                test_peer_with_delete_bucket_and_make_counter(&[0], Err(Error::DiskAccessDenied), make_bucket_calls[3].clone()),
+                test_peer_with_delete_bucket_and_make_counter(&[1], Err(Error::DiskAccessDenied), make_bucket_calls[4].clone()),
+                test_peer_with_delete_bucket_and_make_counter(&[1], Err(Error::DiskAccessDenied), make_bucket_calls[5].clone()),
+                test_peer_with_delete_bucket_and_make_counter(&[1], Err(Error::DiskAccessDenied), make_bucket_calls[6].clone()),
+                test_peer_with_delete_bucket_and_make_counter(&[1], Err(Error::DiskAccessDenied), make_bucket_calls[7].clone()),
+            ],
+            pools_count: 2,
+        };
+
+        let err = peer_sys
+            .delete_bucket("rolled-back-bucket", &DeleteBucketOptions::default())
+            .await
+            .expect_err("delete failure should return the quorum error");
+
+        assert_eq!(err, Error::ErasureWriteQuorum);
+        let calls = make_bucket_calls
+            .iter()
+            .map(|call_count| call_count.load(Ordering::SeqCst))
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec![1, 1, 0, 0, 0, 0, 0, 0]);
     }
 }

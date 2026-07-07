@@ -31,7 +31,7 @@ mod storage_api;
 
 use rustfs_filemeta::{FileInfoOpts, get_file_info};
 use rustfs_utils::HashAlgorithm;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use storage_api::legacy_bitrot_read::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, create_bitrot_reader, new_disk};
 use tokio::fs;
 
@@ -44,15 +44,46 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn legacy_test_root() -> PathBuf {
+    std::env::var_os("RUSTFS_LEGACY_TEST_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(workspace_root)
+}
+
+fn legacy_test_disk(root: &Path) -> String {
+    if let Some(disk) = std::env::var_os("RUSTFS_LEGACY_TEST_DISK") {
+        return disk.to_string_lossy().into_owned();
+    }
+    if root.join("test/.minio.sys/format.json").exists() {
+        "test".to_string()
+    } else {
+        "test1".to_string()
+    }
+}
+
+fn legacy_format_exists(root: &Path, disk_name: &str) -> bool {
+    let disk_root = root.join(disk_name);
+    disk_root.join(".rustfs.sys/format.json").exists() || disk_root.join(".minio.sys/format.json").exists()
+}
+
+fn legacy_object_meta_exists(root: &Path, disk_name: &str, bucket: &str, object: &str) -> bool {
+    root.join(disk_name)
+        .join(bucket)
+        .join(object)
+        .join(STORAGE_FORMAT_FILE)
+        .exists()
+}
+
 fn legacy_test_data_exists() -> bool {
     if std::env::var("RUSTFS_SKIP_LEGACY_TEST").unwrap_or_default() == "1" {
         return false;
     }
-    let root = workspace_root();
-    let format_path = root.join("test1/.rustfs.sys/format.json");
-    let ktvzip_meta = root.join("test1/vvvv/ktvzip.tar.gz").join(STORAGE_FORMAT_FILE);
-    let path_traversal_meta = root.join("test1/vvvv/path_traversal.md").join(STORAGE_FORMAT_FILE);
-    format_path.exists() && (ktvzip_meta.exists() || path_traversal_meta.exists())
+    let root = legacy_test_root();
+    let disk_name = legacy_test_disk(&root);
+    let bucket = "vvvv";
+    legacy_format_exists(&root, &disk_name)
+        && (legacy_object_meta_exists(&root, &disk_name, bucket, "ktvzip.tar.gz")
+            || legacy_object_meta_exists(&root, &disk_name, bucket, "path_traversal.md"))
 }
 
 async fn run_legacy_bitrot_test_for_object(root: &std::path::Path, disk_name: &str, bucket: &str, object: &str) -> bool {
@@ -227,23 +258,25 @@ async fn run_legacy_bitrot_test_for_object(root: &std::path::Path, disk_name: &s
 #[tokio::test]
 async fn test_legacy_bitrot_read() {
     if !legacy_test_data_exists() {
-        eprintln!("Skipping legacy bitrot test: test1/vvvv xl.meta or RUSTFS_SKIP_LEGACY_TEST");
+        eprintln!("Skipping legacy bitrot test: legacy fixture xl.meta not found or RUSTFS_SKIP_LEGACY_TEST=1");
         return;
     }
 
-    // let root = workspace_root();
-    let root = PathBuf::from("/Users/weisd/project/minio");
-
-    let disk_name = "test";
+    let root = legacy_test_root();
+    let disk_name = legacy_test_disk(&root);
     let bucket = "vvvv";
+    let mut checked = 0usize;
 
-    // Try both EC (part files) and inline objects
-    let ok = run_legacy_bitrot_test_for_object(&root, disk_name, bucket, "ktvzip.tar.gz").await;
+    for object in ["ktvzip.tar.gz", "path_traversal.md"] {
+        if !legacy_object_meta_exists(&root, &disk_name, bucket, object) {
+            eprintln!("Skipping missing legacy object fixture: {object}");
+            continue;
+        }
 
-    eprintln!("ok: {:?}", ok);
+        checked += 1;
+        let ok = run_legacy_bitrot_test_for_object(&root, &disk_name, bucket, object).await;
+        assert!(ok, "create_bitrot_reader failed for {object}");
+    }
 
-    assert!(ok, "create_bitrot_reader  failed for both ktvzip.tar.gz and path_traversal.md");
-
-    let ok = run_legacy_bitrot_test_for_object(&root, disk_name, bucket, "path_traversal.md").await;
-    assert!(ok, "create_bitrot_reader  failed for path_traversal.md");
+    assert!(checked > 0, "legacy bitrot fixture preflight found no readable objects");
 }
