@@ -350,8 +350,7 @@ impl FileMetaShallowVersion {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
-        let file_version = self.parse_version_meta()?;
-        Ok(file_version.into_fileinfo(volume, path, all_parts))
+        self.parse_version_meta()?.into_fileinfo(volume, path, all_parts)
     }
 }
 
@@ -673,7 +672,9 @@ impl FileMetaVersion {
         FileMetaVersionHeader::from(self.clone())
     }
 
-    pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileInfo {
+    pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
+        // Only the Object arm carries part arrays and can fail the length guard; the
+        // Legacy and Delete arms have no part arrays and stay infallible.
         let mut fi = match self.version_type {
             VersionType::Invalid | VersionType::Legacy => {
                 if let Some(ref legacy) = self.legacy_object {
@@ -691,7 +692,7 @@ impl FileMetaVersion {
                 self.object
                     .as_ref()
                     .unwrap_or(&default_object)
-                    .into_fileinfo(volume, path, all_parts)
+                    .into_fileinfo(volume, path, all_parts)?
             }
             VersionType::Delete => {
                 let default_marker = MetaDeleteMarker::default();
@@ -702,7 +703,7 @@ impl FileMetaVersion {
             }
         };
         fi.uses_legacy_checksum = self.uses_legacy_checksum;
-        fi
+        Ok(fi)
     }
 
     /// Support for Legacy version type
@@ -2255,22 +2256,37 @@ impl MetaObject {
         Ok(())
     }
 
-    pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> FileInfo {
+    pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
         let version_id = self.version_id.filter(|&vid| !vid.is_nil());
 
         let parts = if all_parts {
-            let mut parts = vec![ObjectPartInfo::default(); self.part_numbers.len()];
+            let n = self.part_numbers.len();
+            // Required fields: `part_sizes`/`part_actual_sizes` must match `part_numbers`
+            // exactly. These arrays are decoded from independent msgpack length prefixes
+            // (`decode_from`), so a truncated/half-written/bitrot xl.meta can leave them
+            // shorter (or longer) than `part_numbers`. Indexing without this guard would
+            // panic; silently defaulting to 0 would miscompute Content-Length / Range /
+            // multipart boundaries and hand corrupt data to the client (worse than an
+            // error). `n == 0` preserves the legitimate "no-part object / legacy / empty
+            // array" wire (MinIO parity: empty PartNumbers is valid).
+            if n != 0 && (self.part_sizes.len() != n || self.part_actual_sizes.len() != n) {
+                return Err(Error::FileCorrupt);
+            }
+            let mut parts = vec![ObjectPartInfo::default(); n];
 
             for (i, part) in parts.iter_mut().enumerate() {
                 part.number = self.part_numbers[i];
                 part.size = self.part_sizes[i];
                 part.actual_size = self.part_actual_sizes[i];
 
-                if self.part_etags.len() == self.part_numbers.len() {
+                // etag/index stay soft-guarded: they are recomputable / optional, an empty
+                // PartETags is legitimate MinIO interop, and a length mismatch there does
+                // not corrupt returned data.
+                if self.part_etags.len() == n {
                     part.etag = self.part_etags[i].clone();
                 }
 
-                if self.part_indices.len() == self.part_numbers.len() {
+                if self.part_indices.len() == n {
                     part.index = if self.part_indices[i].is_empty() {
                         None
                     } else {
@@ -2350,7 +2366,7 @@ impl MetaObject {
             .map(|v| String::from_utf8_lossy(&v).to_string())
             .unwrap_or_default();
 
-        FileInfo {
+        Ok(FileInfo {
             version_id,
             erasure,
             data_dir: self.data_dir,
@@ -2368,7 +2384,7 @@ impl MetaObject {
             transition_version_id,
             transition_tier,
             ..Default::default()
-        }
+        })
     }
 
     pub fn set_transition(&mut self, fi: &FileInfo) {
@@ -3266,6 +3282,97 @@ mod tests {
         OffsetDateTime::from_unix_timestamp_nanos(1_705_312_200_123_456_789).unwrap()
     }
 
+    // ----------------------------------------------------------------------
+    // backlog#900: MetaObject::into_fileinfo part-array length guard.
+    // ----------------------------------------------------------------------
+
+    fn object_with_parts(part_numbers: Vec<usize>, part_sizes: Vec<usize>, part_actual_sizes: Vec<i64>) -> MetaObject {
+        MetaObject {
+            version_id: Some(sample_version_id()),
+            erasure_algorithm: ErasureAlgo::ReedSolomon,
+            erasure_m: 2,
+            erasure_n: 2,
+            erasure_block_size: 1_048_576,
+            bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+            part_numbers,
+            part_sizes,
+            part_actual_sizes,
+            mod_time: Some(sample_mod_time()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn into_fileinfo_rejects_short_part_sizes() {
+        // part_numbers=2 but part_sizes=1 -> old code indexed self.part_sizes[1] and panicked.
+        let obj = object_with_parts(vec![1, 2], vec![10], vec![10, 20]);
+        let res = obj.into_fileinfo("bucket", "key", true);
+        assert!(matches!(res, Err(Error::FileCorrupt)), "short part_sizes must map to FileCorrupt");
+    }
+
+    #[test]
+    fn into_fileinfo_rejects_short_part_actual_sizes_including_empty() {
+        let obj = object_with_parts(vec![1, 2], vec![10, 20], vec![]);
+        let res = obj.into_fileinfo("bucket", "key", true);
+        assert!(matches!(res, Err(Error::FileCorrupt)), "empty part_actual_sizes must map to FileCorrupt");
+    }
+
+    #[test]
+    fn into_fileinfo_rejects_over_long_part_sizes() {
+        // Strict equality: an over-long array is corrupt too (MinIO would panic on any mismatch).
+        let obj = object_with_parts(vec![1], vec![10, 20], vec![10]);
+        let res = obj.into_fileinfo("bucket", "key", true);
+        assert!(matches!(res, Err(Error::FileCorrupt)), "over-long part_sizes must map to FileCorrupt");
+    }
+
+    #[test]
+    fn into_fileinfo_all_parts_false_skips_validation() {
+        // all_parts=false never enters the parts loop -> Ok, empty parts. Regression guard.
+        let obj = object_with_parts(vec![1, 2], vec![10], vec![10, 20]);
+        let fi = obj
+            .into_fileinfo("bucket", "key", false)
+            .expect("all_parts=false must not validate parts");
+        assert!(fi.parts.is_empty());
+    }
+
+    #[test]
+    fn into_fileinfo_healthy_parts_decode_field_by_field() {
+        let mut obj = object_with_parts(vec![1, 2], vec![100, 200], vec![111, 222]);
+        obj.part_etags = vec!["etag-1".to_string(), "etag-2".to_string()];
+        obj.part_indices = vec![Bytes::from_static(b"idx1"), Bytes::new()];
+
+        let fi = obj.into_fileinfo("b", "k", true).expect("healthy parts must decode");
+        assert_eq!(fi.parts.len(), 2);
+        assert_eq!(fi.parts[0].number, 1);
+        assert_eq!(fi.parts[0].size, 100);
+        assert_eq!(fi.parts[0].actual_size, 111);
+        assert_eq!(fi.parts[0].etag, "etag-1");
+        assert_eq!(fi.parts[0].index.as_deref(), Some(&b"idx1"[..]));
+        assert_eq!(fi.parts[1].number, 2);
+        assert_eq!(fi.parts[1].size, 200);
+        assert_eq!(fi.parts[1].actual_size, 222);
+        assert_eq!(fi.parts[1].etag, "etag-2");
+        assert_eq!(fi.parts[1].index, None); // empty bytes -> None
+    }
+
+    #[test]
+    fn into_fileinfo_empty_part_numbers_is_valid() {
+        // No-part object (empty part_numbers) is legitimate: n==0 -> no guard -> Ok, no parts.
+        let obj = object_with_parts(vec![], vec![], vec![]);
+        let fi = obj.into_fileinfo("b", "k", true).expect("no-part object must be valid");
+        assert!(fi.parts.is_empty());
+    }
+
+    #[test]
+    fn into_fileinfo_etag_soft_guard_not_regressed() {
+        // size/actual match (pass hard guard) but etag length differs -> soft guard: empty etag, not corrupt.
+        let mut obj = object_with_parts(vec![1, 2], vec![10, 20], vec![10, 20]);
+        obj.part_etags = vec!["only-one".to_string()];
+        let fi = obj.into_fileinfo("b", "k", true).expect("etag soft guard must not fail");
+        assert_eq!(fi.parts.len(), 2);
+        assert_eq!(fi.parts[0].etag, ""); // soft guard: len mismatch -> default empty
+    }
+
     fn sample_header() -> FileMetaVersionHeader {
         FileMetaVersionHeader {
             version_id: Some(sample_version_id()),
@@ -3506,7 +3613,7 @@ mod tests {
         assert!(decoded.valid());
         assert!(decoded.legacy_object.is_some());
 
-        let fi = decoded.into_fileinfo("bucket", "hello.txt", true);
+        let fi = decoded.into_fileinfo("bucket", "hello.txt", true).expect("into_fileinfo");
         assert_eq!(fi.volume, "bucket");
         assert_eq!(fi.name, "hello.txt");
         assert_eq!(fi.size, 11);
@@ -3541,7 +3648,7 @@ mod tests {
         assert!(decoded.delete_marker.is_some());
         assert!(decoded.uses_legacy_checksum);
 
-        let fi = decoded.into_fileinfo("bucket", "gone.txt", true);
+        let fi = decoded.into_fileinfo("bucket", "gone.txt", true).expect("into_fileinfo");
         assert!(fi.deleted);
         assert_eq!(fi.volume, "bucket");
         assert_eq!(fi.name, "gone.txt");
@@ -3576,7 +3683,7 @@ mod tests {
         assert_eq!(delete_marker.version_id, Some(version_id));
         assert_eq!(delete_marker.mod_time, Some(mod_time));
 
-        let fi = decoded.into_fileinfo("bucket", "deleted.txt", true);
+        let fi = decoded.into_fileinfo("bucket", "deleted.txt", true).expect("into_fileinfo");
         assert!(fi.deleted);
         assert_eq!(fi.version_id, Some(version_id));
         assert_eq!(fi.mod_time, Some(mod_time));
@@ -3650,7 +3757,9 @@ mod tests {
         assert_eq!(object.version_id, None);
         assert_eq!(object.data_dir, None);
 
-        let fi = decoded.into_fileinfo("bucket", "legacy-nil.txt", true);
+        let fi = decoded
+            .into_fileinfo("bucket", "legacy-nil.txt", true)
+            .expect("into_fileinfo");
         assert_eq!(fi.version_id, None);
         assert_eq!(fi.data_dir, None);
         assert_eq!(fi.metadata.get("content-type").map(String::as_str), Some("text/plain"));
@@ -3678,7 +3787,7 @@ mod tests {
         assert_eq!(delete_marker.version_id, None);
         assert_eq!(delete_marker.mod_time, Some(sample_mod_time()));
 
-        let fi = decoded.into_fileinfo("bucket", "deleted.txt", true);
+        let fi = decoded.into_fileinfo("bucket", "deleted.txt", true).expect("into_fileinfo");
         assert!(fi.deleted);
         assert_eq!(fi.version_id, None);
         assert_eq!(fi.mod_time, Some(sample_mod_time()));
@@ -3728,7 +3837,9 @@ mod tests {
 
     #[test]
     fn meta_object_transition_version_id_absent_yields_none() {
-        let fi = make_meta_object_with_sys(HashMap::new()).into_fileinfo("b", "k", false);
+        let fi = make_meta_object_with_sys(HashMap::new())
+            .into_fileinfo("b", "k", false)
+            .expect("into_fileinfo");
         assert_eq!(fi.transition_version_id, None);
     }
 
@@ -3736,7 +3847,9 @@ mod tests {
     fn meta_object_transition_version_id_empty_bytes_yields_none() {
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, vec![]);
-        let fi = make_meta_object_with_sys(sys).into_fileinfo("b", "k", false);
+        let fi = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect("into_fileinfo");
         assert_eq!(fi.transition_version_id, None);
     }
 
@@ -3745,7 +3858,9 @@ mod tests {
         // Regression: old code used unwrap_or_default() which turned nil bytes into Some(Uuid::nil())
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, Uuid::nil().as_bytes().to_vec());
-        let fi = make_meta_object_with_sys(sys).into_fileinfo("b", "k", false);
+        let fi = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect("into_fileinfo");
         assert_eq!(fi.transition_version_id, None);
     }
 
@@ -3754,7 +3869,9 @@ mod tests {
         let id = sample_version_id();
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_TRANSITIONED_VERSION_ID, id.as_bytes().to_vec());
-        let fi = make_meta_object_with_sys(sys).into_fileinfo("b", "k", false);
+        let fi = make_meta_object_with_sys(sys)
+            .into_fileinfo("b", "k", false)
+            .expect("into_fileinfo");
         assert_eq!(fi.transition_version_id, Some(id));
     }
 
