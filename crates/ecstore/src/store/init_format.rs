@@ -77,7 +77,7 @@ pub async fn connect_load_init_formats(
         match try_migrate_format(disks, set_count, set_drive_count).await {
             Ok(LegacyFormatOutcome::Migrated(fm)) => {
                 info!("Migrated format from MinIO config");
-                return Ok(fm);
+                return Ok(*fm);
             }
             Ok(LegacyFormatOutcome::Incompatible) => {
                 // A MinIO format.json was found on disk but could not be migrated
@@ -173,7 +173,8 @@ async fn init_format_erasure(
 /// Outcome of attempting to migrate an on-disk MinIO `format.json`.
 enum LegacyFormatOutcome {
     /// A compatible MinIO format was found and migrated into RustFS format files.
-    Migrated(FormatV3),
+    /// Boxed to keep the enum small (`FormatV3` is large; the others are unit variants).
+    Migrated(Box<FormatV3>),
     /// A MinIO `format.json` was present but could not be migrated (topology /
     /// version mismatch, or a parse failure). The caller must decide how to
     /// proceed; creating a fresh format would leave the legacy objects unreadable.
@@ -249,7 +250,7 @@ async fn try_migrate_format(
         }
 
         save_format_file_all(disks, &fms).await?;
-        return Ok(LegacyFormatOutcome::Migrated(get_format_erasure_in_quorum(&fms)?));
+        return Ok(LegacyFormatOutcome::Migrated(Box::new(get_format_erasure_in_quorum(&fms)?)));
     }
 
     Ok(if legacy_seen {
