@@ -241,7 +241,7 @@ async fn reliable_rename_inner(
     let mut i = 0;
     loop {
         if let Err(e) = super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
-            if i == 0 {
+            if should_retry_rename(&e, i) {
                 i += 1;
                 continue;
             }
@@ -261,6 +261,19 @@ async fn reliable_rename_inner(
     }
 
     Ok(())
+}
+
+/// Whether a failed `rename` in [`reliable_rename_inner`] should be retried.
+///
+/// Only the first failure is retried, and `NotFound` is never retried: the
+/// retry does not recreate the missing source or parent directory, so a second
+/// attempt is guaranteed to fail identically. Skipping it spares speculative
+/// cleanup renames (e.g. `move_to_trash` on an already-removed tmp path) a
+/// pointless second syscall. This predicate is shared by the `rename_data`
+/// commit path via `rename_all`, so any relaxation here must keep genuine
+/// transient errors retryable.
+fn should_retry_rename(err: &io::Error, attempt: usize) -> bool {
+    attempt == 0 && err.kind() != io::ErrorKind::NotFound
 }
 
 pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
@@ -364,6 +377,38 @@ mod tests {
             .expect("missing cleanup source must be ignored");
 
         assert!(!dst.exists());
+    }
+
+    #[test]
+    fn rename_retry_never_retries_not_found() {
+        // NotFound is terminal for the retry loop: the retry does not recreate
+        // the missing source/parent, so a second rename would fail identically.
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "missing");
+        assert!(!should_retry_rename(&not_found, 0));
+        assert!(!should_retry_rename(&not_found, 1));
+    }
+
+    #[test]
+    fn rename_retry_allows_single_retry_for_other_errors() {
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(should_retry_rename(&denied, 0));
+        assert!(!should_retry_rename(&denied, 1));
+    }
+
+    #[tokio::test]
+    async fn rename_all_moves_existing_directory_tree() {
+        // Guards the rename_data commit path, which funnels through
+        // reliable_rename_inner via rename_all.
+        let temp_dir = tempdir().expect("create temp dir");
+        let src = temp_dir.path().join("src-dir");
+        std::fs::create_dir_all(src.join("nested")).expect("create src tree");
+        std::fs::write(src.join("nested").join("part.1"), b"payload").expect("write part");
+        let dst = temp_dir.path().join("dst-parent").join("dst-dir");
+
+        rename_all(&src, &dst, temp_dir.path()).await.expect("rename must succeed");
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(dst.join("nested").join("part.1")).expect("read moved part"), b"payload");
     }
 
     #[tokio::test]
