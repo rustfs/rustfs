@@ -782,6 +782,10 @@ pub(crate) fn shutdown_background_services() {
     ecstore_global::shutdown_background_services();
 }
 
+pub(crate) fn shutdown_background_monitors() {
+    rustfs_ecstore::shutdown_background_monitors();
+}
+
 pub(crate) fn set_global_endpoints(endpoints: Vec<PoolEndpoints>) {
     ecstore_global::set_global_endpoints(endpoints);
 }

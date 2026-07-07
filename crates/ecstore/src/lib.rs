@@ -48,6 +48,17 @@ pub fn set_workload_admission_snapshot_provider(
     runtime::sources::set_workload_admission_snapshot_provider(provider)
 }
 
+/// Request shutdown of all long-lived peer/disk background monitor tasks.
+///
+/// Call this during graceful shutdown, *before* the Tokio runtime is dropped, so
+/// each monitor future (and the `tracing::Span` it holds) is dropped while the
+/// runtime and tracing subscriber are still alive. This avoids the
+/// thread-local-storage `on_close` panic that can otherwise abort the process
+/// during worker-thread teardown (issue #4264). Idempotent and cheap.
+pub fn shutdown_background_monitors() {
+    cluster::rpc::shutdown_background_monitors();
+}
+
 #[cfg(test)]
 mod rio_tests {
     #[test]
