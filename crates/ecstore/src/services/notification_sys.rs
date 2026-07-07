@@ -1024,10 +1024,28 @@ fn handle_peer_failure(
     if let Some(ref cached) = c.last_storage_info
         && c.storage_failures < CONSECUTIVE_FAILURE_THRESHOLD
     {
+        debug!(
+            event = "peer_probe_failure",
+            peer = host,
+            probe = "storage_info",
+            consecutive_failures = c.storage_failures,
+            threshold = CONSECUTIVE_FAILURE_THRESHOLD,
+            "peer storage_info probe failed; returning cached state until the offline threshold is reached"
+        );
         return Some(cached.clone());
     }
 
     if c.storage_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+        if c.storage_failures == CONSECUTIVE_FAILURE_THRESHOLD {
+            warn!(
+                event = "peer_marked_offline",
+                peer = host,
+                probe = "storage_info",
+                consecutive_failures = c.storage_failures,
+                threshold = CONSECUTIVE_FAILURE_THRESHOLD,
+                "reporting peer disks offline after consecutive storage_info failures"
+            );
+        }
         return Some(StorageInfo {
             disks: get_offline_disks(host, endpoints),
             ..Default::default()
@@ -1049,6 +1067,15 @@ fn update_storage_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, 
             poisoned.into_inner()
         }
     };
+    if c.storage_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+        info!(
+            event = "peer_recovered_online",
+            peer = host,
+            probe = "storage_info",
+            consecutive_failures = c.storage_failures,
+            "peer storage_info probe succeeded again; peer disks reported online"
+        );
+    }
     c.last_storage_info = Some(info.clone());
     c.storage_failures = 0;
 }
@@ -1076,10 +1103,39 @@ fn handle_server_info_failure(
     if let Some(ref cached) = c.last_server_info
         && c.server_failures < CONSECUTIVE_FAILURE_THRESHOLD
     {
+        debug!(
+            event = "peer_probe_failure",
+            peer = host,
+            consecutive_failures = c.server_failures,
+            threshold = CONSECUTIVE_FAILURE_THRESHOLD,
+            "peer server_info probe failed; returning cached state until the offline threshold is reached"
+        );
         return cached.clone();
     }
 
     if c.server_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+        // Log the transition exactly once (at the crossing) so the console's
+        // "node offline" verdict has a matching WARN in the observer's logs
+        // (rustfs/backlog#888: nodes were marked offline with no log naming
+        // the transition). Later failures while already offline stay at DEBUG
+        // to avoid repeating the warning every probe cycle.
+        if c.server_failures == CONSECUTIVE_FAILURE_THRESHOLD {
+            warn!(
+                event = "peer_marked_offline",
+                peer = host,
+                consecutive_failures = c.server_failures,
+                threshold = CONSECUTIVE_FAILURE_THRESHOLD,
+                "marking peer offline for admin/console reporting after consecutive server_info failures; \
+                 a background recovery probe will restore it automatically once reachable"
+            );
+        } else {
+            debug!(
+                event = "peer_still_offline",
+                peer = host,
+                consecutive_failures = c.server_failures,
+                "peer server_info probe failed while peer is already reported offline"
+            );
+        }
         return offline_server_properties(host, endpoints);
     }
 
@@ -1098,6 +1154,14 @@ fn update_server_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, i
             poisoned.into_inner()
         }
     };
+    if c.server_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+        info!(
+            event = "peer_recovered_online",
+            peer = host,
+            consecutive_failures = c.server_failures,
+            "peer server_info probe succeeded again; peer is back online for admin/console reporting"
+        );
+    }
     c.last_server_info = Some(info.clone());
     c.server_failures = 0;
 }
