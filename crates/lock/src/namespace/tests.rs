@@ -1235,3 +1235,94 @@ async fn test_namespace_lock_distributed_failure_retries_and_cleans_up_late_succ
 
     drop(write_guard);
 }
+
+// C1 -- a long-held write lock survives past its ttl thanks to the heartbeat; a
+// contender fails to steal it while it is held (#899 direct regression).
+// Without a heartbeat: owner-a's per-node entries expire after ttl, owner-b triggers
+// reclaim and steals it -> contended.is_some() -> assertion fails (red). Once fixed the
+// entries stay refreshed -> is_none() (green).
+#[tokio::test]
+async fn distributed_write_lock_survives_past_ttl_with_heartbeat() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let clients = managers
+        .iter()
+        .map(|m| Arc::new(LocalClient::with_manager(m.clone())) as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = Arc::new(NamespaceLock::with_clients("heartbeat-keepalive".to_string(), clients));
+    let resource = create_test_object_key("bucket", "object-heartbeat-keepalive");
+
+    let req_a = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-a")
+        .with_acquire_timeout(Duration::from_millis(200))
+        .with_ttl(Duration::from_millis(150))
+        .with_refresh_interval(Duration::from_millis(40)); // < ttl -> spawn heartbeat
+
+    let guard_a = lock
+        .acquire_guard(&req_a)
+        .await
+        .expect("owner-a acquire should not error")
+        .expect("owner-a should hold the distributed write lock");
+
+    tokio::time::sleep(Duration::from_millis(400)).await; // hold well past a single ttl window
+
+    let req_b = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-b")
+        .with_acquire_timeout(Duration::from_millis(150))
+        .with_ttl(Duration::from_millis(150));
+    let contended = lock.acquire_guard(&req_b).await.expect("owner-b acquire should not error");
+    assert!(
+        contended.is_none(),
+        "heartbeat must keep owner-a's lock alive; owner-b must not steal it past ttl"
+    );
+
+    drop(guard_a);
+    let mut acquired_after_release = false;
+    for _ in 0..20 {
+        let req_c = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-b")
+            .with_acquire_timeout(Duration::from_millis(150))
+            .with_ttl(Duration::from_millis(150));
+        if let Some(g) = lock.acquire_guard(&req_c).await.expect("acquire should not error") {
+            drop(g);
+            acquired_after_release = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(acquired_after_release, "after owner-a releases, owner-b must eventually acquire");
+}
+
+// C2 -- a crashed owner (leaving orphan entries that are never refreshed again) has its
+// lock eventually reclaimed; no permanent deadlock (#698 scavenger). Must stay green.
+#[tokio::test]
+async fn crashed_owner_distributed_lock_is_reclaimed() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let node_clients = managers
+        .iter()
+        .map(|m| Arc::new(LocalClient::with_manager(m.clone())))
+        .collect::<Vec<_>>();
+    let resource = create_test_object_key("bucket", "object-crashed-owner");
+
+    // Simulate a dead coordinator: plant short-ttl orphan entries on each node backend,
+    // then never refresh them.
+    for c in &node_clients {
+        let orphan = LockRequest::new(resource.clone(), LockType::Exclusive, "dead-owner").with_ttl(Duration::from_millis(60));
+        let resp = c.acquire_lock(&orphan).await.expect("orphan acquire");
+        assert!(resp.success, "orphan entry should be planted on each node");
+    }
+
+    tokio::time::sleep(Duration::from_millis(120)).await; // ttl elapses
+
+    let clients = node_clients
+        .iter()
+        .map(|c| c.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = NamespaceLock::with_clients("crashed-owner-recovery".to_string(), clients);
+
+    let req_new = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-live")
+        .with_acquire_timeout(Duration::from_millis(300))
+        .with_ttl(Duration::from_millis(150));
+    let recovered = lock
+        .acquire_guard(&req_new)
+        .await
+        .expect("acquire should not error")
+        .expect("stale orphan entries must be reclaimed; no permanent deadlock (#698)");
+    drop(recovered);
+}

@@ -9387,6 +9387,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
+ "sysinfo",
  "time",
 ]
 

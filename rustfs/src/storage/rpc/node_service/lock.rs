@@ -33,6 +33,41 @@ fn lock_result_from_error(error: impl Into<String>) -> GenerallyLockResult {
     }
 }
 
+/// Delegate a refresh RPC to the node's lock backend (`LocalClient::refresh`).
+///
+/// Extracted as a free function (decoupled from the `current_lock_client()` OnceLock
+/// global) so it can be unit-tested against a real `LocalClient`, mirroring the existing
+/// `lock_result_from_release` free-function test style.
+///
+/// Contract (see backlog#899 design, open question on not-found signalling): a lock the
+/// backend no longer holds returns `success=false` with `error_info=None`, so
+/// `RemoteClient::refresh` keeps mapping it to `Ok(false)` (a real not_found signal for the
+/// coordinator heartbeat) rather than `Err`. `error_info` is reserved for genuine RPC/backend
+/// errors. TODO(backlog#899): maintainers to confirm whether not-found should instead carry a
+/// distinguishable error_info prefix that `RemoteClient::refresh` decodes explicitly.
+async fn refresh_lock(
+    lock_client: &std::sync::Arc<dyn rustfs_lock::client::LockClient>,
+    args: &LockRequest,
+) -> GenerallyLockResponse {
+    match lock_client.refresh(&args.lock_id).await {
+        Ok(true) => GenerallyLockResponse {
+            success: true,
+            error_info: None,
+            lock_info: None,
+        },
+        Ok(false) => GenerallyLockResponse {
+            success: false,
+            error_info: None,
+            lock_info: None,
+        },
+        Err(err) => GenerallyLockResponse {
+            success: false,
+            error_info: Some(format!("can not refresh, resource: {0}, err: {1}", args.resource, err)),
+            lock_info: None,
+        },
+    }
+}
+
 fn lock_result_from_release(lock_id: &rustfs_lock::LockId, success: bool) -> GenerallyLockResult {
     if success {
         GenerallyLockResult {
@@ -51,7 +86,7 @@ impl NodeService {
         request: Request<GenerallyLockRequest>,
     ) -> Result<Response<GenerallyLockResponse>, Status> {
         let request = request.into_inner();
-        let _args: LockRequest = match serde_json::from_str(&request.args) {
+        let args: LockRequest = match serde_json::from_str(&request.args) {
             Ok(args) => args,
             Err(err) => {
                 return Ok(Response::new(GenerallyLockResponse {
@@ -62,11 +97,8 @@ impl NodeService {
             }
         };
 
-        Ok(Response::new(GenerallyLockResponse {
-            success: true,
-            error_info: None,
-            lock_info: None,
-        }))
+        let lock_client = self.get_lock_client()?;
+        Ok(Response::new(refresh_lock(&lock_client, &args).await))
     }
 
     pub(super) async fn handle_force_un_lock(
@@ -302,5 +334,51 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.error_info.as_deref(), Some("lock conflict"));
         assert!(result.lock_info.is_none());
+    }
+
+    // B1 -- refresh_lock delegates to LocalClient::refresh for a held lock, returns
+    //        success=true, and actually extends expires_at (inverts the "parse then drop" stub).
+    #[tokio::test]
+    async fn refresh_lock_delegates_to_lock_client_and_extends_entry() {
+        use super::refresh_lock;
+        use rustfs_lock::client::LockClient;
+        use rustfs_lock::{LocalClient, LockRequest, LockStatus, LockType, ObjectKey};
+        use std::sync::Arc;
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let req = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(std::time::Duration::from_secs(30));
+        let acquired = client.acquire_lock(&req).await.expect("acquire");
+        assert!(acquired.success, "precondition: lock acquired");
+
+        let resp = refresh_lock(&client, &req).await;
+        assert!(
+            resp.success,
+            "handle_refresh must delegate to lock_client.refresh and succeed for a held lock"
+        );
+        assert!(resp.error_info.is_none());
+
+        let status = client.check_status(&req.lock_id).await.unwrap().expect("entry present");
+        assert_eq!(status.status, LockStatus::Acquired, "refresh must extend the entry, keeping it Acquired");
+    }
+
+    // B2 -- refresh_lock reports a non-existent lock_id as success=false
+    //        (feeds broadcast_refresh a real not_found signal; the stub's unconditional
+    //         true would permanently mask lock loss).
+    #[tokio::test]
+    async fn refresh_lock_reports_missing_lock_as_failure() {
+        use super::refresh_lock;
+        use rustfs_lock::client::LockClient;
+        use rustfs_lock::{LocalClient, LockRequest, LockType, ObjectKey};
+        use std::sync::Arc;
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let req = LockRequest::new(ObjectKey::new("bucket", "ghost"), LockType::Exclusive, "owner");
+
+        let resp = refresh_lock(&client, &req).await;
+        assert!(
+            !resp.success,
+            "refresh of a non-existent lock must return success=false (not the stub's unconditional true)"
+        );
     }
 }

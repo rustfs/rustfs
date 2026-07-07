@@ -716,9 +716,21 @@ impl FileMeta {
                     && let Ok(found_free_fi) = ver.parse_version_meta()
                     && found_free_fi.version_type != VersionType::Invalid
                 {
-                    let mut free_fi = found_free_fi.into_fileinfo(volume, path, all_parts);
-                    free_fi.is_latest = true;
-                    found_free_version = Some(free_fi);
+                    // Graceful degradation: the free-version replication-accounting record
+                    // is auxiliary metadata; a corrupt one must not tank an otherwise
+                    // healthy primary-version read. Log and skip rather than propagate.
+                    // Known side effect: if a disk holds only free versions and they are
+                    // corrupt, `into_fileinfo` falls through to `FileNotFound` (not
+                    // `FileCorrupt`), so that disk is not enqueued for heal.
+                    match found_free_fi.into_fileinfo(volume, path, all_parts) {
+                        Ok(mut free_fi) => {
+                            free_fi.is_latest = true;
+                            found_free_version = Some(free_fi);
+                        }
+                        Err(e) => {
+                            warn!(volume, path, error = %e, "skipping corrupt free version during into_fileinfo");
+                        }
+                    }
                 }
 
                 if header.version_id != Some(vid) {
@@ -919,6 +931,52 @@ mod test {
     use crate::test_data::*;
     use proptest::collection::vec;
     use proptest::prelude::*;
+
+    /// backlog#580: RustFS parses real MinIO-written object xl.meta (inline,
+    /// versioned, and multipart) into equivalent `FileInfo`. Object metadata is
+    /// the strong part of MinIO interop; this pins it against real fixtures.
+    #[test]
+    fn parses_real_minio_object_xlmeta() {
+        // Small inlined object.
+        let small = create_minio_small_object_xlmeta().expect("load small fixture");
+        let (major, _minor, _hdr, meta_ver) = FileMeta::read_format_versions(&small).unwrap();
+        assert_eq!(major, 1);
+        assert_eq!(meta_ver, FileMeta::load(&small).unwrap().meta_ver);
+        let fm = FileMeta::load(&small).expect("parse small MinIO xl.meta");
+        assert_eq!(fm.versions.len(), 1);
+        let fi = fm
+            .into_fileinfo("interop", "small.txt", "", false, false, true)
+            .expect("small fileinfo");
+        assert_eq!(fi.size, 19, "small.txt size");
+        assert_eq!(fi.num_versions, 1);
+        assert!(fi.is_latest);
+
+        // Versioned object: two object versions plus a delete marker (latest).
+        let versioned = create_minio_versioned_object_xlmeta().expect("load versioned fixture");
+        let fm = FileMeta::load(&versioned).expect("parse versioned MinIO xl.meta");
+        assert_eq!(fm.versions.len(), 3, "two object versions + one delete marker");
+        let delete_markers = fm
+            .versions
+            .iter()
+            .filter(|v| v.header.version_type == VersionType::Delete)
+            .count();
+        assert_eq!(delete_markers, 1, "delete marker parsed from MinIO xl.meta");
+        let fi = fm
+            .into_fileinfo("interop", "versioned.txt", "", false, false, true)
+            .expect("versioned fileinfo");
+        assert_eq!(fi.num_versions, 3);
+        assert!(fi.version_id.is_some(), "versioned object carries a version id");
+
+        // Larger object stored as an erasure-coded part (not inlined).
+        let large = create_minio_large_object_xlmeta().expect("load large fixture");
+        let fm = FileMeta::load(&large).expect("parse large MinIO xl.meta");
+        assert_eq!(fm.versions.len(), 1);
+        let fi = fm
+            .into_fileinfo("interop", "large.bin", "", false, false, true)
+            .expect("large fileinfo");
+        assert_eq!(fi.size, 300_000, "large.bin size");
+        assert!(!fi.parts.is_empty(), "multipart/part layout present");
+    }
 
     /// Wraps a raw meta block in a valid XL2 container (header, bin32 length
     /// prefix, and CRC trailer) so decode tests exercise the meta parsing
@@ -1497,6 +1555,84 @@ mod test {
         }
     }
 
+    // ------------------------------------------------------------------
+    // backlog#900: CRC-valid but semantically corrupt part arrays must
+    // produce Err(FileCorrupt), never panic.
+    // ------------------------------------------------------------------
+
+    fn valid_object_version(version_id: Uuid, part_sizes: Vec<usize>) -> FileMetaVersion {
+        FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(MetaObject {
+                version_id: Some(version_id),
+                erasure_algorithm: ErasureAlgo::ReedSolomon,
+                erasure_m: 2,
+                erasure_n: 2,
+                erasure_block_size: 1 << 20,
+                bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                part_numbers: vec![1, 2],
+                part_sizes, // caller-injected (short = corrupt)
+                part_actual_sizes: vec![10, 20],
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn crc_valid_but_part_arrays_corrupt_into_fileinfo_errors_not_panics() {
+        // A short part_sizes Object version round-trips through the real codec: the CRC is
+        // valid and load succeeds, but into_fileinfo(all_parts) hits the length guard and
+        // returns Err(FileCorrupt) rather than panicking.
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(valid_object_version(Uuid::new_v4(), vec![10]))
+            .expect("add corrupt-parts version");
+
+        let encoded = fm.marshal_msg().expect("marshal recomputes a valid CRC");
+        let loaded = FileMeta::load(&encoded).expect("CRC-valid meta must load (lazy, parts not decoded yet)");
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loaded.into_fileinfo("bucket", "key", "", true, false, true)
+        }));
+        let inner = caught.expect("into_fileinfo must not panic on CRC-valid but semantically corrupt parts");
+        assert!(matches!(inner, Err(Error::FileCorrupt)), "expected FileCorrupt");
+    }
+
+    proptest! {
+        #[test]
+        fn into_fileinfo_never_panics_on_arbitrary_loaded_meta(input in vec(any::<u8>(), 0..=4096)) {
+            // Complements filemeta_load_never_panics_on_arbitrary_bytes: for every FileMeta
+            // that loads, into_fileinfo(all_parts=true) must not panic (Ok or Err).
+            if let Ok(fm) = FileMeta::load(&input) {
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fm.into_fileinfo("b", "k", "", true, false, true)
+                }));
+                prop_assert!(caught.is_ok(), "into_fileinfo panicked on loaded meta");
+            }
+        }
+    }
+
+    #[test]
+    fn into_file_info_versions_fails_whole_listing_on_one_corrupt_version() {
+        // One corrupt version among healthy ones fails the whole listing (into_file_info_versions
+        // uses `?`, so no partial results). This is the established failure semantics of the
+        // merge-first exact-versions path (backlog#900 §3.3), strictly better than a panic.
+        let healthy_id = Uuid::new_v4();
+        let corrupt_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(valid_object_version(healthy_id, vec![10, 20]))
+            .expect("healthy");
+        fm.add_version_filemata(valid_object_version(corrupt_id, vec![10]))
+            .expect("corrupt"); // short part_sizes
+
+        let fm = FileMeta::load(&fm.marshal_msg().expect("marshal")).expect("load");
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fm.into_file_info_versions("bucket", "key", true)));
+        let inner = caught.expect("must not panic");
+        assert!(matches!(inner, Err(Error::FileCorrupt)), "whole-listing must fail with FileCorrupt");
+    }
+
     #[test]
     fn test_performance_with_large_metadata() {
         // Test performance with large metadata files
@@ -2009,7 +2145,7 @@ mod test {
         fm.update_object_version(update).unwrap();
 
         let (_, version) = fm.find_version(version_id).unwrap();
-        let stored = version.into_fileinfo("bucket", "test", true);
+        let stored = version.into_fileinfo("bucket", "test", true).expect("into_fileinfo");
         assert_eq!(stored.metadata.get("x-amz-meta-owner"), Some(&"alice".to_string()));
         assert_eq!(stored.checksum, Some(checksum));
     }

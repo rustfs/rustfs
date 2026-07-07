@@ -4710,7 +4710,7 @@ mod tests {
 
         // Distinct payloads with distinct sizes: a mixed-generation reassembly
         // would produce bytes matching none of them (or fail the read outright).
-        let candidates: Vec<Vec<u8>> = (0..6)
+        let candidates: Vec<Vec<u8>> = (0..3)
             .map(|g| {
                 let len = 4096 + g * 512;
                 vec![b'a' + g as u8; len]
@@ -4722,14 +4722,22 @@ mod tests {
         // 1. A lost/stolen fast-lock wakeup could strand a waiter until the
         //    deadline — fixed for real in fast_lock::shard by bounding each
         //    notification wait (NOTIFY_WAIT_CAP re-polling).
-        // 2. Under the full nextest suite on loaded CI disks, the six
-        //    *legitimately serialized* cross-disk commits can exceed the small
-        //    default acquire timeout (5s) all by themselves — observed on CI
-        //    even with fix 1 in place. Raise the timeout to the production
-        //    default (30s) for the concurrent section so the guard asserts the
-        //    correctness property (exactly one intact generation), not disk
-        //    latency. `#[serial]` keeps the process-wide env override isolated.
-        let results = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("30"))], async {
+        // 2. Under the full nextest suite on loaded CI disks, the
+        //    *legitimately serialized* cross-disk commits can exceed the
+        //    acquire deadline all by themselves — observed on CI at the 5s
+        //    default and the 30s production default with six resends, and
+        //    again at 60s, which is a hard ceiling: fast_lock clamps every
+        //    requested timeout to MAX_ACQUIRE_TIMEOUT (60s), so raising the
+        //    env override higher is a no-op (the Timeout error still reports
+        //    the requested value). Keep the guard about the correctness
+        //    property, not disk latency: request the full 60s ceiling and cap
+        //    the queue depth at three resends, so the last waiter sits behind
+        //    at most two serialized commits (~12s each on the slowest observed
+        //    CI runner, comfortably inside the deadline). Three concurrent
+        //    resends still race the streaming phase and contend on the commit
+        //    lock, which is all the generation-mixing regression needs.
+        //    `#[serial]` keeps the process-wide env override isolated.
+        let results = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("60"))], async {
             let mut tasks = tokio::task::JoinSet::new();
             for payload in candidates.iter().cloned() {
                 let store = ecstore.clone();

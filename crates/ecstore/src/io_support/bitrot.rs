@@ -27,7 +27,7 @@ use rustfs_utils::HashAlgorithm;
 use std::future::Future;
 use std::io::{self, Cursor};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -134,7 +134,7 @@ impl AsyncRead for FirstReadMetricsReader {
 }
 
 struct DeferredObjectReader {
-    state: Mutex<DeferredObjectReaderState>,
+    state: Arc<Mutex<DeferredObjectReaderState>>,
 }
 
 enum DeferredObjectReaderState {
@@ -147,7 +147,64 @@ enum DeferredObjectReaderState {
 impl DeferredObjectReader {
     fn new(source: BitrotReaderSource) -> Self {
         Self {
-            state: Mutex::new(DeferredObjectReaderState::Pending(Some(source))),
+            state: Arc::new(Mutex::new(DeferredObjectReaderState::Pending(Some(source)))),
+        }
+    }
+
+    fn stripe_handle(&self, stripe_stride: usize) -> DeferredReaderStripeHandle {
+        DeferredReaderStripeHandle {
+            state: Arc::clone(&self.state),
+            stripe_stride,
+        }
+    }
+}
+
+/// Handle to a still-unopened [`DeferredObjectReader`] that can advance the
+/// pending open offset by whole bitrot blocks (stripes) before the first read.
+///
+/// The GET lockstep decode reads only the data shards while the object is
+/// healthy and keeps every parity slot as an unopened deferred reader. When a
+/// data shard dies at stripe `k`, the decoder uses this handle to shift the
+/// parity reader's pending open offset by `k` encoded blocks — the same
+/// `bitrot_encoded_range` geometry used when the reader was created — so its
+/// first read returns stripe `k` and the lockstep alignment invariant holds
+/// (backlog#923; alignment rule from backlog#832).
+///
+/// `stripe_stride` is `shard_size + checksum_algo.size()` per full stripe.
+/// For `hash_size == 0` (e.g. `HashAlgorithm::None`) this degrades to the
+/// identity mapping `k * shard_size`, matching `bitrot_encoded_range`.
+#[derive(Clone)]
+pub(crate) struct DeferredReaderStripeHandle {
+    state: Arc<Mutex<DeferredObjectReaderState>>,
+    stripe_stride: usize,
+}
+
+impl DeferredReaderStripeHandle {
+    /// Advance the pending source by `stripes` full stripes.
+    ///
+    /// Returns `false` when the reader has already been opened (or failed):
+    /// its stream position is then unknown to the caller and it must not be
+    /// engaged mid-object.
+    pub(crate) fn advance_stripes(&self, stripes: usize) -> bool {
+        if stripes == 0 {
+            return true;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        match &mut *state {
+            DeferredObjectReaderState::Pending(Some(source)) => {
+                let Some(delta) = self.stripe_stride.checked_mul(stripes) else {
+                    return false;
+                };
+                let Some(offset) = source.offset.checked_add(delta) else {
+                    return false;
+                };
+                source.offset = offset;
+                source.length = source.length.saturating_sub(delta);
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -471,6 +528,38 @@ pub fn create_deferred_bitrot_reader(
     skip_verify: bool,
     use_mmap_read: bool,
 ) -> BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>> {
+    create_deferred_bitrot_reader_with_stripe_handle(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        offset,
+        length,
+        shard_size,
+        checksum_algo,
+        skip_verify,
+        use_mmap_read,
+    )
+    .0
+}
+
+/// Like [`create_deferred_bitrot_reader`], but also returns a
+/// [`DeferredReaderStripeHandle`] that can realign the still-unopened reader
+/// to a later stripe before its first read (backlog#923).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
+    inline_data: Option<Bytes>,
+    disk: Option<DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
+    use_mmap_read: bool,
+) -> (BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>, DeferredReaderStripeHandle) {
+    let stripe_stride = shard_size + checksum_algo.size();
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
     let source = BitrotReaderSource {
         inline_data,
@@ -483,7 +572,15 @@ pub fn create_deferred_bitrot_reader(
         stage_metrics: None,
     };
 
-    BitrotReader::new(Box::new(DeferredObjectReader::new(source)), shard_size, checksum_algo, skip_verify)
+    let deferred = DeferredObjectReader::new(source);
+    let handle = deferred.stripe_handle(stripe_stride);
+    let reader = BitrotReader::new(
+        Box::new(deferred) as Box<dyn AsyncRead + Send + Sync + Unpin>,
+        shard_size,
+        checksum_algo,
+        skip_verify,
+    );
+    (reader, handle)
 }
 
 /// Create a new BitrotWriterWrapper based on the provided parameters
@@ -739,6 +836,139 @@ mod tests {
 
         assert_eq!(n, shard_size);
         assert_eq!(&out[..n], b"efgh");
+    }
+
+    /// Merge gate for backlog#923: engaging a parity shard at stripe `k`
+    /// converts `k` stripes into an encoded byte offset via the
+    /// `bitrot_encoded_range` geometry. Cover both on-disk formats: the
+    /// streaming checksum layout (32-byte hash per block) and the
+    /// no-per-block-hash layout (`hash_size == 0`), where the mapping must
+    /// degrade to the identity `k * shard_size`.
+    #[tokio::test]
+    async fn test_deferred_stripe_handle_aligns_reader_to_requested_stripe() {
+        let shard_size = 4;
+        let payload = b"aaaabbbbccccdddd"; // 4 full bitrot blocks
+
+        for algo in [HashAlgorithm::HighwayHash256S, HashAlgorithm::None] {
+            let mut writer =
+                create_bitrot_writer(true, None, "test-volume", "test-path", payload.len() as i64, shard_size, algo.clone())
+                    .await
+                    .expect("inline bitrot writer");
+            for chunk in payload.chunks(shard_size) {
+                writer.write(chunk).await.expect("write chunk");
+            }
+            let inline_data = writer.into_inline_data().expect("inline buffer");
+
+            for stripe in 0..payload.len() / shard_size {
+                let (mut reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
+                    Some(inline_data.clone().into()),
+                    None,
+                    "test-bucket",
+                    "test-path",
+                    0,
+                    payload.len(),
+                    shard_size,
+                    algo.clone(),
+                    false,
+                    false,
+                );
+
+                assert!(
+                    handle.advance_stripes(stripe),
+                    "pending deferred reader must accept a stripe advance (algo={algo:?}, stripe={stripe})"
+                );
+
+                let mut out = [0u8; 4];
+                let n = reader.read(&mut out).await.expect("read shard block after stripe advance");
+                assert_eq!(n, shard_size);
+                assert_eq!(
+                    &out[..n],
+                    &payload[stripe * shard_size..(stripe + 1) * shard_size],
+                    "advanced reader must return exactly stripe {stripe} (algo={algo:?})"
+                );
+            }
+        }
+    }
+
+    /// Bitrot verification must stay active for a parity shard engaged
+    /// mid-object: after `advance_stripes(k)` the reader verifies stripe `k`'s
+    /// block against stripe `k`'s stored hash.
+    #[tokio::test]
+    async fn test_deferred_stripe_handle_preserves_bitrot_verification_after_advance() {
+        let shard_size = 4;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let payload = b"aaaabbbbccccdddd";
+
+        let mut writer =
+            create_bitrot_writer(true, None, "test-volume", "test-path", payload.len() as i64, shard_size, algo.clone())
+                .await
+                .expect("inline bitrot writer");
+        for chunk in payload.chunks(shard_size) {
+            writer.write(chunk).await.expect("write chunk");
+        }
+        let mut inline_data = writer.into_inline_data().expect("inline buffer");
+
+        // Corrupt one payload byte of block 2 (blocks are hash + data).
+        let block_len = algo.size() + shard_size;
+        inline_data[2 * block_len + algo.size()] ^= 0x01;
+
+        let (mut reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            Some(inline_data.into()),
+            None,
+            "test-bucket",
+            "test-path",
+            0,
+            payload.len(),
+            shard_size,
+            algo,
+            false,
+            false,
+        );
+        assert!(handle.advance_stripes(2));
+
+        let mut out = [0u8; 4];
+        let err = reader
+            .read(&mut out)
+            .await
+            .expect_err("bitrot mismatch at the advanced stripe must fail the read");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A reader that has already been opened has an unknown stream position
+    /// from the handle's point of view; the advance must be refused so the
+    /// caller retires the reader instead of engaging it out of alignment.
+    #[tokio::test]
+    async fn test_deferred_stripe_handle_rejects_advance_after_open() {
+        let shard_size = 4;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let payload = b"aaaabbbb";
+
+        let mut writer =
+            create_bitrot_writer(true, None, "test-volume", "test-path", payload.len() as i64, shard_size, algo.clone())
+                .await
+                .expect("inline bitrot writer");
+        for chunk in payload.chunks(shard_size) {
+            writer.write(chunk).await.expect("write chunk");
+        }
+        let inline_data = writer.into_inline_data().expect("inline buffer");
+
+        let (mut reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            Some(inline_data.into()),
+            None,
+            "test-bucket",
+            "test-path",
+            0,
+            payload.len(),
+            shard_size,
+            algo,
+            false,
+            false,
+        );
+
+        let mut out = [0u8; 4];
+        reader.read(&mut out).await.expect("first read opens the deferred source");
+
+        assert!(!handle.advance_stripes(1), "an opened deferred reader must reject stripe advances");
     }
 
     #[tokio::test]

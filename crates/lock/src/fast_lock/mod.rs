@@ -58,6 +58,13 @@ pub const DEFAULT_SHARD_COUNT: usize = 1024;
 /// Default lock timeout (lease TTL; lock is released if not refreshed within this duration)
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default heartbeat interval for refreshing a held distributed lock (lease renewal cadence).
+///
+/// Kept at ttl/3 of `DEFAULT_LOCK_TIMEOUT` so a lock tolerates losing two consecutive refresh
+/// cycles before its lease expires. TODO(backlog#899): maintainers to confirm this default vs
+/// MinIO's 10s/20s interval-vs-validity and the #814 latency budget.
+pub const DEFAULT_LOCK_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Default acquire timeout - common value for local/low-latency; use env to increase for slow storage
 pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(DEFAULT_RUSTFS_ACQUIRE_TIMEOUT);
 

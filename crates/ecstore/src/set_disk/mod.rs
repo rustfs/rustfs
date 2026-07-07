@@ -6080,6 +6080,41 @@ mod tests {
         assert_eq!(result, Some(uuid1)); // Ignore None votes; uuid1 should still meet quorum
     }
 
+    fn rename_versions_signature(first_key: u8, version_count: usize) -> Vec<u8> {
+        let mut signature = vec![0; version_count * 16];
+        signature[7] = first_key;
+        signature
+    }
+
+    #[test]
+    fn test_reduce_common_versions_requires_write_quorum() {
+        let common = rename_versions_signature(1, 1);
+        let other = rename_versions_signature(2, 1);
+
+        let disk_versions = vec![Some(common.clone()), Some(common.clone()), Some(other)];
+        let result = SetDisks::reduce_common_versions(&disk_versions, 2);
+        assert_eq!(result, Some(common));
+
+        let split_versions = vec![
+            Some(rename_versions_signature(1, 1)),
+            Some(rename_versions_signature(2, 1)),
+            None,
+        ];
+        let result = SetDisks::reduce_common_versions(&split_versions, 2);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_select_rename_data_versions_keeps_longer_success_disparity() {
+        let common = rename_versions_signature(1, 1);
+        let longer = rename_versions_signature(2, 2);
+        let disk_versions = vec![Some(common.clone()), Some(common), Some(longer.clone())];
+        let errs = vec![None, None, None];
+
+        let result = SetDisks::select_rename_data_versions(&disk_versions, &errs, 2);
+        assert_eq!(result, Some(longer));
+    }
+
     #[test]
     fn test_object_quorum_from_meta_returns_not_found_when_all_metadata_is_missing() {
         let errs = vec![

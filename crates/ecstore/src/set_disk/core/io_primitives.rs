@@ -48,7 +48,8 @@ use crate::diagnostics::get::{
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader, object_mmap_read_enabled,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled,
 };
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -911,6 +912,10 @@ pub(in crate::set_disk) const DIRECT_MEMORY_BITROT_READER_STAGE_METRICS: BitrotR
 
 pub(in crate::set_disk) struct BitrotReaderSetup {
     pub(in crate::set_disk) readers: Vec<Option<ObjectBitrotReader>>,
+    /// Per-slot stripe handles for readers that are still unopened deferred
+    /// readers. The lockstep GET decode uses them to open a parity shard
+    /// aligned to the stripe where a data shard failed (backlog#923).
+    pub(in crate::set_disk) deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
     pub(in crate::set_disk) errors: Vec<Option<DiskError>>,
     pub(in crate::set_disk) scheduled: Vec<bool>,
     pub(in crate::set_disk) attempted: Vec<bool>,
@@ -985,6 +990,7 @@ impl BitrotReaderSetup {
     pub(in crate::set_disk) fn new(shards: usize) -> Self {
         Self {
             readers: (0..shards).map(|_| None).collect(),
+            deferred_stripe_handles: (0..shards).map(|_| None).collect(),
             errors: vec![Some(DiskError::DiskNotFound); shards],
             scheduled: vec![false; shards],
             attempted: vec![false; shards],
@@ -1110,8 +1116,14 @@ impl BitrotReaderSetup {
         }
     }
 
-    pub(in crate::set_disk) fn retain_deferred_reader(&mut self, idx: usize, reader: ObjectBitrotReader) {
+    pub(in crate::set_disk) fn retain_deferred_reader(
+        &mut self,
+        idx: usize,
+        reader: ObjectBitrotReader,
+        stripe_handle: DeferredReaderStripeHandle,
+    ) {
         self.readers[idx] = Some(reader);
+        self.deferred_stripe_handles[idx] = Some(stripe_handle);
         self.errors[idx] = None;
         self.deferred_count = self.deferred_count.saturating_add(1);
     }
@@ -1204,21 +1216,58 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        setup.retain_deferred_reader(
-            idx,
-            create_deferred_bitrot_reader(
-                inline_data,
-                disk,
-                bucket,
-                &path,
-                read_offset,
-                read_length,
-                shard_size,
-                checksum_algo.clone(),
-                skip_verify_bitrot,
-                use_mmap_read,
-            ),
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            inline_data,
+            disk,
+            bucket,
+            &path,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
         );
+        setup.retain_deferred_reader(idx, reader, stripe_handle);
+    }
+
+    // With the data-shards-only lockstep gate on (backlog#923), the GET decode
+    // reads only the data shards while the object is healthy; a parity reader
+    // is engaged on demand and must therefore stay unopened so its start
+    // offset can be advanced to the failing stripe. A parity reader that was
+    // opened eagerly during setup is pinned at the stripe-0 stream position
+    // and could never be engaged mid-object, so swap it for an unopened
+    // deferred reader carrying a stripe handle. The eager open already proved
+    // the shard is reachable; no shard bytes were read from it, and the
+    // ready/error bookkeeping that quorum decisions rely on is left untouched.
+    // Gate off (default): keep the eagerly opened parity readers exactly as
+    // before — the lockstep path reads them on every stripe.
+    if !crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled() {
+        return;
+    }
+    for idx in data_shards..disks.len() {
+        if setup.readers[idx].is_none() || setup.deferred_stripe_handles[idx].is_some() {
+            continue;
+        }
+
+        let inline_data = files[idx].data.clone();
+        let disk = disks[idx].clone();
+        let data_dir = files[idx].data_dir.unwrap_or_default();
+        let path = format!("{object}/{data_dir}/part.{part_number}");
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            inline_data,
+            disk,
+            bucket,
+            &path,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
+        );
+        setup.readers[idx] = Some(reader);
+        setup.deferred_stripe_handles[idx] = Some(stripe_handle);
     }
 }
 
@@ -2242,30 +2291,40 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let finfo = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
-            Ok(res) => res,
-            Err(err) => {
-                for item in errs.iter_mut() {
-                    if item.is_none() {
-                        *item = Some(err.clone().into());
+        // Determine the winning version id. When the merged representative decodes to
+        // a valid FileInfo, use its version id. When it is undecodable (Err from
+        // corrupt part arrays) OR decodes but is not valid (e.g. a shallow merged
+        // representative missing erasure detail), do NOT poison every disk: derive the
+        // winning vid from the intact version header and fall into the per-disk loop
+        // below, so healthy disks still populate `meta_file_infos` to satisfy
+        // read_quorum while corrupt disks fail `into_fileinfo` and are flagged
+        // `FileCorrupt` for heal. If every disk is corrupt, they all fail in the loop,
+        // leaving no valid FileInfo so the caller's read_quorum fails cleanly instead
+        // of panicking or returning half-corrupt data. Only when there is no non-free
+        // version header at all is there genuinely nothing to read.
+        //
+        // `into_fileinfo` with an empty version_id selects the first non-free version
+        // (see FileMeta::into_fileinfo); replicate that selection from the header here.
+        let vid = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
+            Ok(finfo) if finfo.is_valid() => finfo.version_id.unwrap_or(Uuid::nil()),
+            _ => match meta
+                .versions
+                .iter()
+                .find(|v| !v.header.free_version())
+                .and_then(|v| v.header.version_id)
+            {
+                Some(id) => id,
+                None => {
+                    for item in errs.iter_mut() {
+                        if item.is_none() {
+                            *item = Some(DiskError::FileCorrupt);
+                        }
                     }
-                }
 
-                return (meta_file_infos, errs);
-            }
+                    return (meta_file_infos, errs);
+                }
+            },
         };
-
-        if !finfo.is_valid() {
-            for item in errs.iter_mut() {
-                if item.is_none() {
-                    *item = Some(DiskError::FileCorrupt);
-                }
-            }
-
-            return (meta_file_infos, errs);
-        }
-
-        let vid = finfo.version_id.unwrap_or(Uuid::nil());
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
@@ -2394,6 +2453,13 @@ enum OrphanDirScan {
     Empty(Vec<String>),
     /// The prefix does not exist on this disk.
     Missing,
+}
+
+fn rename_data_versions_key(versions: &[u8]) -> Option<[u8; 8]> {
+    let prefix = versions.get(..8)?;
+    let mut key = [0; 8];
+    key.copy_from_slice(prefix);
+    Some(key)
 }
 
 impl SetDisks {
@@ -2567,10 +2633,8 @@ impl SetDisks {
             return Err(ret_err);
         }
 
-        let versions = None;
-        // TODO: reduceCommonVersions
-
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
+        let versions = Self::select_rename_data_versions(&disk_versions, &errs, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
@@ -2592,6 +2656,7 @@ impl SetDisks {
         Ok((online_disks, versions, data_dir, cleanup_disks))
     }
 
+<<<<<<< HEAD
     /// Reclaim the old (now dereferenced) `object/<old_data_dir>` on the disks
     /// that just committed the new version.
     ///
@@ -2613,6 +2678,66 @@ impl SetDisks {
     /// caller re-surfaces it by enqueuing an object heal on residue (see
     /// `report_old_data_dir_cleanup`), and the leaked residue is made observable
     /// via `rustfs_old_data_dir_leaked_total`.
+=======
+    pub(in crate::set_disk) fn reduce_common_versions(disk_versions: &[Option<Vec<u8>>], write_quorum: usize) -> Option<Vec<u8>> {
+        let mut versions_count = HashMap::new();
+
+        for versions in disk_versions.iter().flatten() {
+            if let Some(key) = rename_data_versions_key(versions) {
+                *versions_count.entry(key).or_insert(0usize) += 1;
+            }
+        }
+
+        let (common_versions, max_count) = versions_count
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .unwrap_or(([0; 8], 0));
+
+        if max_count < write_quorum {
+            return None;
+        }
+
+        disk_versions
+            .iter()
+            .flatten()
+            .find(|versions| rename_data_versions_key(versions).is_some_and(|key| key == common_versions))
+            .cloned()
+    }
+
+    pub(in crate::set_disk) fn select_rename_data_versions(
+        disk_versions: &[Option<Vec<u8>>],
+        errs: &[Option<DiskError>],
+        write_quorum: usize,
+    ) -> Option<Vec<u8>> {
+        let mut versions = Self::reduce_common_versions(disk_versions, write_quorum);
+        for (dversions, err) in disk_versions.iter().zip(errs.iter()) {
+            if err.is_some() {
+                continue;
+            }
+            let Some(dversions) = dversions.as_ref().filter(|versions| !versions.is_empty()) else {
+                continue;
+            };
+
+            match versions.as_ref() {
+                Some(current_versions) if dversions != current_versions => {
+                    if dversions.len() > current_versions.len() {
+                        versions = Some(dversions.clone());
+                    }
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    versions = Some(dversions.clone());
+                    break;
+                }
+            }
+        }
+
+        versions
+    }
+
+    #[allow(dead_code)]
+>>>>>>> origin/main
     #[tracing::instrument(level = "debug", skip(self, disks))]
     pub(in crate::set_disk) async fn commit_rename_data_dir(
         &self,
@@ -3963,6 +4088,7 @@ mod tests {
         release_read_repair_heal_reservation(&key).await;
     }
 
+<<<<<<< HEAD
     // ========================================================================
     // backlog#898 — groups A/C: pure old-data-dir cleanup classification.
     // ========================================================================
@@ -4077,5 +4203,82 @@ mod tests {
     fn clean_cleanup_receipt_triggers_no_actions() {
         let receipt = classify_old_data_dir_cleanup(&[None, None], &[true, true], 1);
         assert_eq!(old_data_dir_cleanup_actions(&receipt), CleanupActions::default());
+=======
+    // ------------------------------------------------------------------
+    // backlog#900: pick_latest_quorum_files_info must survive a single
+    // corrupt-part disk (even in the merged representative slot) by deriving
+    // the vid from the header and falling into the per-disk loop, flagging the
+    // corrupt disk for heal instead of poisoning the whole read.
+    // ------------------------------------------------------------------
+
+    use rustfs_filemeta::{ChecksumAlgo, ErasureAlgo, FileMeta, FileMetaVersion, MetaObject, RawFileInfo, VersionType};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    fn raw_object_version(vid: Uuid, part_sizes: Vec<usize>) -> RawFileInfo {
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(MetaObject {
+                version_id: Some(vid),
+                erasure_algorithm: ErasureAlgo::ReedSolomon,
+                erasure_m: 2,
+                erasure_n: 1,
+                erasure_index: 1,
+                erasure_dist: vec![1, 2, 3],
+                erasure_block_size: 1 << 20,
+                bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                part_numbers: vec![1, 2],
+                part_sizes,
+                part_actual_sizes: vec![10, 20],
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        RawFileInfo {
+            buf: fm.marshal_msg().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_latest_quorum_masks_single_corrupt_disk_in_representative_slot() {
+        let vid = Uuid::new_v4();
+        // Deterministic: the corrupt disk is fixed at index 0 (representative slot).
+        let fileinfos = vec![
+            Some(raw_object_version(vid, vec![10])),
+            Some(raw_object_version(vid, vec![10, 20])),
+            Some(raw_object_version(vid, vec![10, 20])),
+        ];
+        let errs = vec![None, None, None];
+
+        let (infos, out_errs) = SetDisks::pick_latest_quorum_files_info(fileinfos, errs, "bucket", "obj", false, false).await;
+
+        // The corrupt representative disk is flagged for heal.
+        assert_eq!(out_errs[0], Some(DiskError::FileCorrupt), "corrupt representative disk must be flagged");
+        // Good disks still produce valid FileInfo, satisfying read_quorum (3.div_ceil(2)=2).
+        let good = infos.iter().filter(|fi| fi.is_valid()).count();
+        assert!(good >= 2, "quorum of good disks must survive corrupt representative, got {good}");
+    }
+
+    #[tokio::test]
+    async fn pick_latest_quorum_all_corrupt_fails_clean_without_panic() {
+        let vid = Uuid::new_v4();
+        let fileinfos = vec![
+            Some(raw_object_version(vid, vec![10])),
+            Some(raw_object_version(vid, vec![10])),
+            Some(raw_object_version(vid, vec![10])),
+        ];
+        let errs = vec![None, None, None];
+
+        let (infos, out_errs) = SetDisks::pick_latest_quorum_files_info(fileinfos, errs, "bucket", "obj", false, false).await;
+
+        assert!(
+            out_errs.iter().all(|e| e == &Some(DiskError::FileCorrupt)),
+            "all disks must be flagged corrupt"
+        );
+        assert!(infos.iter().all(|fi| !fi.is_valid()), "no half-corrupt FileInfo may be returned");
+>>>>>>> origin/main
     }
 }

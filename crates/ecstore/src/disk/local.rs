@@ -36,7 +36,7 @@ use crate::erasure::coding::bitrot_verify;
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
-use parking_lot::RwLock as ParkingLotRwLock;
+use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     get_file_info, read_xl_meta_no_data,
@@ -513,6 +513,28 @@ pub struct FormatInfo {
 pub enum InternalBuf<'a> {
     Ref(&'a [u8]),
     Owned(Bytes),
+}
+
+/// Durability mode for `write_all_internal`.
+///
+/// `FileOnly` is reserved for tmp files the caller immediately renames away.
+/// The safe-rename recipe (file content fdatasync -> rename -> fsync of the
+/// destination parent directory) never needs the tmp directory entry to be
+/// durable: the rename removes it, and a crash before the rename means the
+/// operation was never acknowledged, so there is nothing to recover. Files
+/// that stay where they are written (format.json via `write_all_public`, the
+/// old-metadata rollback backup in `rename_data`, ...) must use `FileAndDir`
+/// so both the contents and the new directory entry survive power loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncMode {
+    /// No fsync; durability is not required (or drive sync is disabled).
+    None,
+    /// fdatasync the file contents, then fsync its parent directory.
+    FileAndDir,
+    /// fdatasync only the file contents. Only valid when the caller renames
+    /// the file away right after the write and fsyncs the rename
+    /// destination's parent directory before acknowledging.
+    FileOnly,
 }
 
 struct FileCacheReclaimWriter {
@@ -1461,6 +1483,7 @@ pub struct LocalDisk {
     pub major: u64,
     pub minor: u64,
     pub nrrequests: u64,
+    scan_locks: Arc<ParkingLotMutex<HashSet<(String, String)>>>,
     // Performance optimization fields
     path_cache: Arc<ParkingLotRwLock<HashMap<String, PathBuf>>>,
     current_dir: Arc<OnceLock<PathBuf>>,
@@ -1698,6 +1721,7 @@ impl LocalDisk {
             minor: Default::default(),
             major: Default::default(),
             nrrequests: Default::default(),
+            scan_locks: Arc::new(ParkingLotMutex::new(HashSet::new())),
             // // format_legacy,
             // format_file_info: Mutex::new(format_meta),
             // format_data: Mutex::new(format_data),
@@ -2058,6 +2082,20 @@ impl LocalDisk {
 
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
         reject_local_disk_symlink_components(&self.root, path)
+    }
+
+    fn try_acquire_scan_lock(&self, opts: &WalkDirOptions) -> Result<LocalScanLockGuard> {
+        let key = local_disk_scan_lock_key(&opts.bucket, &opts.base_dir, opts.filter_prefix.as_deref());
+        let mut scan_locks = self.scan_locks.lock();
+
+        if !scan_locks.insert(key.clone()) {
+            return Err(DiskError::DiskOngoingReq);
+        }
+
+        Ok(LocalScanLockGuard {
+            scan_locks: Arc::clone(&self.scan_locks),
+            key,
+        })
     }
 
     // Batch path generation with single lock acquisition
@@ -2446,7 +2484,12 @@ impl LocalDisk {
         let tmp_volume_dir = self.get_bucket_path(super::RUSTFS_META_TMP_BUCKET)?;
         let tmp_file_path = self.get_object_path(super::RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
-        self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), sync, &tmp_volume_dir)
+        // The tmp file is renamed to its final location right below, so only
+        // its contents must be durable here (SyncMode::FileOnly): the rename
+        // drops the tmp directory entry, and the destination parent directory
+        // is fsynced after the rename.
+        let tmp_sync = if sync { SyncMode::FileOnly } else { SyncMode::None };
+        self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), tmp_sync, &tmp_volume_dir)
             .await?;
 
         rename_all(tmp_file_path, &file_path, volume_dir).await?;
@@ -2470,14 +2513,17 @@ impl LocalDisk {
 
         let volume_dir = self.get_bucket_path(volume)?;
 
-        self.write_all_private(volume, path, data, true, &volume_dir).await?;
+        // Files written here (format.json, ...) stay where they land — no
+        // rename follows — so the new directory entry must be fsynced too.
+        self.write_all_private(volume, path, data, SyncMode::FileAndDir, &volume_dir)
+            .await?;
 
         Ok(())
     }
 
     // write_all_private with check_path_length
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: bool, skip_parent: &Path) -> Result<()> {
+    async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -2487,24 +2533,33 @@ impl LocalDisk {
         Ok(())
     }
     // write_all_internal do write file
-    async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
+    async fn write_all_internal(
+        &self,
+        file_path: &Path,
+        data: InternalBuf<'_>,
+        sync: SyncMode,
+        skip_parent: &Path,
+    ) -> Result<()> {
         let skip_parent = if skip_parent.as_os_str().is_empty() {
             self.root.as_path()
         } else {
             skip_parent
         };
 
-        let sync = sync && drive_sync_enabled();
+        let sync = if drive_sync_enabled() { sync } else { SyncMode::None };
 
         match data {
             InternalBuf::Ref(buf) => {
                 let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
                 f.write_all(buf).await.map_err(to_file_error)?;
-                if sync {
+                if sync != SyncMode::None {
                     f.sync_data().await.map_err(to_file_error)?;
                     // Persist the directory entry too, so a freshly created file
-                    // survives power loss along with its contents.
-                    if let Some(parent) = file_path.parent() {
+                    // survives power loss along with its contents. Skipped for
+                    // FileOnly: the caller renames the file away immediately.
+                    if sync == SyncMode::FileAndDir
+                        && let Some(parent) = file_path.parent()
+                    {
                         os::fsync_dir(parent).await.map_err(to_file_error)?;
                     }
                 }
@@ -2526,9 +2581,14 @@ impl LocalDisk {
                         .map_err(to_file_error)?;
 
                     std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
-                    if sync {
+                    if sync != SyncMode::None {
                         f.sync_data().map_err(to_file_error)?;
-                        if let Some(parent) = path.parent() {
+                        // See the Ref branch above: FileOnly callers rename the
+                        // file away, so the tmp directory entry never needs to
+                        // become durable.
+                        if sync == SyncMode::FileAndDir
+                            && let Some(parent) = path.parent()
+                        {
                             os::fsync_dir_std(parent).map_err(to_file_error)?;
                         }
                     }
@@ -3013,6 +3073,46 @@ impl Drop for ScanGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
+}
+
+struct LocalScanLockGuard {
+    scan_locks: Arc<ParkingLotMutex<HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for LocalScanLockGuard {
+    fn drop(&mut self) {
+        self.scan_locks.lock().remove(&self.key);
+    }
+}
+
+fn local_disk_scan_lock_key(bucket: &str, base_dir: &str, filter_prefix: Option<&str>) -> (String, String) {
+    let mut prefix = base_dir.trim_matches('/').to_owned();
+    if let Some(filter_prefix) = filter_prefix
+        .map(|prefix| prefix.trim_matches('/'))
+        .filter(|prefix| !prefix.is_empty())
+    {
+        if prefix.is_empty() {
+            prefix.push_str(filter_prefix);
+        } else {
+            prefix.push_str(SLASH_SEPARATOR);
+            prefix.push_str(filter_prefix);
+        }
+    }
+
+    (bucket.to_owned(), prefix)
+}
+
+fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
+    if meta.versions.len() > 10 {
+        return None;
+    }
+
+    let mut signature = Vec::with_capacity(meta.versions.len() * 16);
+    for version in meta.versions.iter() {
+        signature.extend_from_slice(version.header.version_id.unwrap_or_default().as_bytes());
+    }
+    Some(signature)
 }
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
@@ -3850,6 +3950,8 @@ impl DiskAPI for LocalDisk {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
+        let _scan_lock = self.try_acquire_scan_lock(&opts)?;
+
         let mut wr = wr;
 
         let mut out = MetacacheWriter::new(&mut wr);
@@ -4031,14 +4133,20 @@ impl DiskAPI for LocalDisk {
                 let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
             }
             xlmeta.add_version(fi)?;
+            let version_signature = rename_data_versions_signature(&xlmeta);
             let new_dst_buf = xlmeta.marshal_msg()?;
 
             let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
+            // This tmp xl.meta is renamed onto dst_file_path at the commit
+            // point below, so only its contents must be durable before the
+            // rename (SyncMode::FileOnly); the dst parent directory is fsynced
+            // after the commit rename, and a crash before the rename means the
+            // PUT was never acknowledged.
             self.write_all_private(
                 src_volume,
                 &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE),
                 new_dst_buf.into(),
-                true,
+                SyncMode::FileOnly,
                 src_file_parent,
             )
             .await?;
@@ -4087,6 +4195,9 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::Unexpected);
             }
 
+            // The rollback backup stays where it is written (no rename) and is
+            // the sole restore source for a later undo_write, so it keeps
+            // SyncMode::FileAndDir: contents and directory entry both durable.
             if let Some(old_data_dir) = has_old_data_dir
                 && let Some(dst_buf) = has_dst_buf.as_ref()
                 && let Err(err) = self
@@ -4094,7 +4205,7 @@ impl DiskAPI for LocalDisk {
                         dst_volume,
                         &format!("{}/{}/{}", &dst_path, &old_data_dir, STORAGE_FORMAT_FILE_BACKUP),
                         dst_buf.clone().into(),
-                        true,
+                        SyncMode::FileAndDir,
                         &skip_parent,
                     )
                     .await
@@ -4151,7 +4262,7 @@ impl DiskAPI for LocalDisk {
 
             Ok(RenameDataResp {
                 old_data_dir: has_old_data_dir,
-                sign: None,
+                sign: version_signature,
             })
         } else {
             // Inline: merge read + parse + write + rename into single spawn_blocking
@@ -4163,7 +4274,7 @@ impl DiskAPI for LocalDisk {
                 None
             };
 
-            let (old_data_dir, _dst_buf) = tokio::task::spawn_blocking(move || {
+            let (old_data_dir, version_signature) = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -4185,6 +4296,7 @@ impl DiskAPI for LocalDisk {
                     let _ = xlmeta.data.remove_two(version_id, *d);
                 }
                 xlmeta.add_version(fi)?;
+                let version_signature = rename_data_versions_signature(&xlmeta);
                 let new_buf = xlmeta.marshal_msg()?;
 
                 // Write new xl.meta + rename
@@ -4249,7 +4361,7 @@ impl DiskAPI for LocalDisk {
                     os::fsync_dir_std(dst_parent)?;
                 }
 
-                Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
+                Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>), std::io::Error>((old_data_dir, version_signature))
             })
             .await
             .map_err(DiskError::from)??;
@@ -4263,7 +4375,7 @@ impl DiskAPI for LocalDisk {
 
             Ok(RenameDataResp {
                 old_data_dir,
-                sign: None,
+                sign: version_signature,
             })
         }
     }
@@ -4828,7 +4940,7 @@ mod test {
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncReadExt, ReadBuf};
+    use tokio::io::{AsyncReadExt, AsyncWrite, ReadBuf};
 
     fn test_file_info(name: &str, version_id: Uuid, data_dir: Option<Uuid>, data: Option<Bytes>) -> FileInfo {
         let size = data
@@ -4857,6 +4969,82 @@ mod test {
             Ok(()) | Err(DiskError::VolumeExists) => {}
             Err(err) => panic!("test volume should be available: {err:?}"),
         }
+    }
+
+    struct BlockingScanWriter {
+        entered_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl AsyncWrite for BlockingScanWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            if let Some(tx) = self.entered_tx.take() {
+                let _ = tx.send(());
+            }
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_disk_scan_rejects_concurrent_same_prefix_and_releases_on_cancel() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let bucket = "test-bucket";
+        let object_dir = dir.path().join(bucket).join("prefix/object");
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("object metadata should be written");
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "prefix/".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let first_disk = Arc::clone(&disk);
+        let first_opts = opts.clone();
+        let mut blocking_writer = BlockingScanWriter {
+            entered_tx: Some(entered_tx),
+        };
+        let first_scan = tokio::spawn(async move { first_disk.walk_dir(first_opts, &mut blocking_writer).await });
+
+        entered_rx.await.expect("first scan should enter write path");
+
+        let mut second_writer = tokio::io::sink();
+        let second_scan = disk.walk_dir(opts.clone(), &mut second_writer).await;
+        assert!(
+            matches!(second_scan, Err(DiskError::DiskOngoingReq)),
+            "concurrent scan of same bucket and prefix must be rejected, got {second_scan:?}"
+        );
+
+        first_scan.abort();
+        assert!(
+            first_scan
+                .await
+                .expect_err("first scan task should be cancelled")
+                .is_cancelled(),
+            "aborting the blocked scan should cancel the task"
+        );
+
+        let mut after_cancel_writer = tokio::io::sink();
+        let after_cancel = disk.walk_dir(opts, &mut after_cancel_writer).await;
+        assert!(
+            after_cancel.is_ok(),
+            "cancelled scan must release the bucket/prefix lock, got {after_cancel:?}"
+        );
     }
 
     #[tokio::test]
@@ -4905,6 +5093,7 @@ mod test {
             .expect("rename_data should commit");
 
         assert_eq!(resp.old_data_dir, Some(old_data_dir));
+        assert_eq!(resp.sign, Some(version_id.as_bytes().to_vec()));
         assert!(
             dst_object_dir
                 .join(old_data_dir.to_string())
@@ -4916,6 +5105,160 @@ mod test {
                 .join(old_data_dir.to_string())
                 .join(STORAGE_FORMAT_FILE)
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_all_meta_skips_tmp_parent_dir_fsync_but_fsyncs_dst_parent() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        assert!(drive_sync_enabled(), "test requires the default drive-sync configuration");
+
+        let bucket = "sync-meta-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let meta_path = format!("dir/object/{STORAGE_FORMAT_FILE}");
+        disk.write_all_meta(bucket, &meta_path, b"payload", true)
+            .await
+            .expect("write_all_meta should succeed");
+
+        let dst_file_path = disk.get_object_path(bucket, &meta_path).expect("dst path should resolve");
+        assert_eq!(
+            tokio::fs::read(&dst_file_path).await.expect("xl.meta should exist"),
+            b"payload",
+            "renamed xl.meta must carry the written contents"
+        );
+
+        let tmp_parent = disk
+            .get_bucket_path(RUSTFS_META_TMP_BUCKET)
+            .expect("tmp bucket path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&tmp_parent),
+            "tmp parent dir must not be fsynced for a write-then-rename tmp file"
+        );
+
+        let dst_parent = dst_file_path.parent().expect("dst file should have a parent").to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&dst_parent),
+            "destination parent dir must be fsynced after the commit rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_all_public_still_fsyncs_parent_dir() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        assert!(drive_sync_enabled(), "test requires the default drive-sync configuration");
+
+        let bucket = "sync-public-bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        disk.write_all(bucket, "config/settings.json", Bytes::from_static(b"payload"))
+            .await
+            .expect("write_all should succeed");
+
+        let file_path = disk
+            .get_object_path(bucket, "config/settings.json")
+            .expect("file path should resolve");
+        let parent = file_path.parent().expect("file should have a parent").to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&parent),
+            "direct (non-renamed) writes must keep fsyncing their parent dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_non_inline_skips_tmp_parent_dir_fsync() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        assert!(drive_sync_enabled(), "test requires the default drive-sync configuration");
+
+        let bucket = "sync-rename-bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-sync-write";
+        let version_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("55555555-5555-5555-5555-555555555555").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("66666666-6666-6666-6666-666666666666").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let dst_object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit");
+
+        // The tmp xl.meta write point uses SyncMode::FileOnly: its parent dir
+        // ({tmp}/{tmp_object}) must not be fsynced.
+        let tmp_meta_parent = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{STORAGE_FORMAT_FILE}"))
+            .expect("tmp meta path should resolve")
+            .parent()
+            .expect("tmp meta should have a parent")
+            .to_path_buf();
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&tmp_meta_parent),
+            "tmp xl.meta parent dir must not be fsynced for the write-then-rename tmp file"
+        );
+
+        // The commit sequence itself is untouched: the destination parent dir
+        // is fsynced after the commit rename, ...
+        let dst_meta_parent = disk
+            .get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("dst meta path should resolve")
+            .parent()
+            .expect("dst meta should have a parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&dst_meta_parent),
+            "destination parent dir must be fsynced after the commit rename"
+        );
+
+        // ... and the rollback backup (which stays in place, no rename) still
+        // fsyncs its parent dir (SyncMode::FileAndDir).
+        let backup_parent = disk
+            .get_object_path(bucket, &format!("{object}/{old_data_dir}/{STORAGE_FORMAT_FILE_BACKUP}"))
+            .expect("backup path should resolve")
+            .parent()
+            .expect("backup should have a parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&backup_parent),
+            "old-metadata rollback backup must keep fsyncing its parent dir"
         );
     }
 
@@ -4958,6 +5301,7 @@ mod test {
             .expect("inline rename_data should commit");
 
         assert_eq!(resp.old_data_dir, Some(old_data_dir));
+        assert_eq!(resp.sign, Some(version_id.as_bytes().to_vec()));
         let backup_path = dst_object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
         assert!(backup_path.exists());
         // The rollback backup must contain the previous metadata bytes verbatim so
