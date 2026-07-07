@@ -517,4 +517,122 @@ mod tests {
         assert_eq!(decoded.id, 123);
         assert_eq!(decoded.targets_map["arn:replication::1:dest"].resync_id, "reset-1");
     }
+
+    fn decode_hex(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex fixture"))
+            .collect()
+    }
+
+    /// backlog#580 Phase 2/4: end-to-end proof that `try_migrate_bucket_metadata`
+    /// pulls a real MinIO-written bucket-metadata blob from a `.minio.sys` layout
+    /// into `.rustfs.sys`, and that the migrated blob loads every config. Uses a
+    /// throwaway 4-drive local ECStore. Fixture: `tests/fixtures/minio/README.md`.
+    #[tokio::test]
+    async fn migrates_real_minio_bucket_metadata_end_to_end() {
+        use crate::bucket::metadata::{BUCKET_METADATA_FILE, BucketMetadata};
+        use crate::config::com::read_config;
+        use crate::disk::endpoint::Endpoint;
+        use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
+        use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+        use crate::object_api::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+        use crate::storage_api_contracts::object::{ObjectIO, ObjectOperations};
+        use crate::store::{ECStore, init_local_disks};
+        use rustfs_utils::path::SLASH_SEPARATOR;
+        use tokio::fs;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let blob = decode_hex(include_str!("../../tests/fixtures/minio/bucket_metadata.blob.hex"));
+
+        // --- Stand up a throwaway 4-drive local ECStore. ---
+        let base = std::path::PathBuf::from(format!("/tmp/rustfs_minio_migrate_test_{}", Uuid::new_v4()));
+        let disk_paths: Vec<_> = (1..=4).map(|i| base.join(format!("disk{i}"))).collect();
+        for p in &disk_paths {
+            fs::create_dir_all(p).await.unwrap();
+        }
+        let mut endpoints = Vec::new();
+        for (i, p) in disk_paths.iter().enumerate() {
+            let mut ep = Endpoint::try_from(p.to_str().unwrap()).unwrap();
+            ep.set_pool_index(0);
+            ep.set_set_index(0);
+            ep.set_disk_index(i);
+            endpoints.push(ep);
+        }
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "minio-migrate-test".to_string(),
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        }]);
+        init_local_disks(endpoint_pools.clone()).await.unwrap();
+        let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new())
+            .await
+            .unwrap();
+        let existing: Vec<String> = ecstore
+            .list_bucket(&BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), existing).await;
+
+        let meta_path = format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}interop{SLASH_SEPARATOR}{BUCKET_METADATA_FILE}");
+        let put_opts = ObjectOptions::default();
+
+        // --- Arrange the pre-migration state a MinIO import starts from: the ---
+        // bucket exists and its config lives under `.minio.sys`, while `.rustfs.sys`
+        // has no metadata for it yet.
+        ecstore.make_bucket("interop", &MakeBucketOptions::default()).await.unwrap();
+        let _ = ecstore
+            .delete_object(RUSTFS_META_BUCKET, &meta_path, ObjectOptions::default())
+            .await;
+        // MinIO leaves its `.minio.sys` meta volume on every drive; recreate it so
+        // the source object can be seeded through the object layer.
+        for p in &disk_paths {
+            fs::create_dir_all(p.join(MIGRATING_META_BUCKET)).await.ok();
+        }
+        let mut src = PutObjReader::from_vec(blob.clone());
+        ecstore
+            .put_object(MIGRATING_META_BUCKET, &meta_path, &mut src, &put_opts)
+            .await
+            .expect("seed .minio.sys bucket metadata");
+
+        // --- Run the real startup migration. ---
+        super::try_migrate_bucket_metadata(ecstore.clone()).await;
+
+        // --- The migrated `.rustfs.sys` blob must carry every MinIO config, ---
+        // byte-identical to the source (typed XML/JSON parsing of these fields is
+        // covered by the bucket-metadata parse-parity test).
+        let migrated = read_config(ecstore.clone(), &meta_path)
+            .await
+            .expect("read migrated bucket metadata");
+        BucketMetadata::check_header(&migrated).expect("migrated blob has a valid header");
+        let bm = BucketMetadata::unmarshal(&migrated[4..]).expect("unmarshal migrated bucket metadata");
+        let src = BucketMetadata::unmarshal(&blob[4..]).expect("unmarshal source bucket metadata");
+
+        assert_eq!(bm.name, "interop");
+        assert_eq!(bm.policy_config_json, src.policy_config_json, "policy migrated intact");
+        assert_eq!(bm.lifecycle_config_xml, src.lifecycle_config_xml, "lifecycle migrated intact");
+        assert_eq!(bm.object_lock_config_xml, src.object_lock_config_xml, "object-lock migrated intact");
+        assert_eq!(bm.versioning_config_xml, src.versioning_config_xml, "versioning migrated intact");
+        assert_eq!(bm.tagging_config_xml, src.tagging_config_xml, "tagging migrated intact");
+        assert_eq!(bm.quota_config_json, src.quota_config_json, "quota migrated intact");
+        assert_eq!(bm.notification_config_xml, src.notification_config_xml, "notification migrated intact");
+        assert_eq!(bm.encryption_config_xml, src.encryption_config_xml, "encryption migrated intact");
+        assert_eq!(bm.replication_config_xml, src.replication_config_xml, "replication migrated intact");
+        assert!(!bm.lifecycle_config_xml.is_empty(), "lifecycle present");
+        assert!(!bm.replication_config_xml.is_empty(), "replication present");
+
+        fs::remove_dir_all(&base).await.ok();
+    }
 }

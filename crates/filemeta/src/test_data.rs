@@ -151,6 +151,26 @@ pub fn create_issue_2434_legacy_meta_v2_pool_xlmeta() -> Result<Vec<u8>> {
     decode_hex_fixture(include_str!("../tests/fixtures/issue_2434_legacy_meta_v2_pool.hex"))
 }
 
+/// Real MinIO-written xl.meta for a small inlined object (`small.txt`, 19 bytes),
+/// captured from MinIO `RELEASE.2025-07-23` — see `tests/fixtures/minio/README.md`
+/// (backlog#580).
+pub fn create_minio_small_object_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/minio/object_small_txt.xlmeta.hex"))
+}
+
+/// Real MinIO-written xl.meta for a versioned object (`versioned.txt`, two
+/// versions) — see `tests/fixtures/minio/README.md` (backlog#580).
+pub fn create_minio_versioned_object_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/minio/object_versioned_txt.xlmeta.hex"))
+}
+
+/// Real MinIO-written xl.meta for a larger, non-inlined object (`large.bin`,
+/// 300 KiB, stored as `part.1`) — see `tests/fixtures/minio/README.md`
+/// (backlog#580).
+pub fn create_minio_large_object_xlmeta() -> Result<Vec<u8>> {
+    decode_hex_fixture(include_str!("../tests/fixtures/minio/object_large_bin.xlmeta.hex"))
+}
+
 fn write_legacy_time(wr: &mut Vec<u8>, ts: OffsetDateTime) {
     wr.push(MSGPACK_EXT8);
     wr.push(12);

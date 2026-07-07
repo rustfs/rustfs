@@ -920,6 +920,52 @@ mod test {
     use proptest::collection::vec;
     use proptest::prelude::*;
 
+    /// backlog#580: RustFS parses real MinIO-written object xl.meta (inline,
+    /// versioned, and multipart) into equivalent `FileInfo`. Object metadata is
+    /// the strong part of MinIO interop; this pins it against real fixtures.
+    #[test]
+    fn parses_real_minio_object_xlmeta() {
+        // Small inlined object.
+        let small = create_minio_small_object_xlmeta().expect("load small fixture");
+        let (major, _minor, _hdr, meta_ver) = FileMeta::read_format_versions(&small).unwrap();
+        assert_eq!(major, 1);
+        assert_eq!(meta_ver, FileMeta::load(&small).unwrap().meta_ver);
+        let fm = FileMeta::load(&small).expect("parse small MinIO xl.meta");
+        assert_eq!(fm.versions.len(), 1);
+        let fi = fm
+            .into_fileinfo("interop", "small.txt", "", false, false, true)
+            .expect("small fileinfo");
+        assert_eq!(fi.size, 19, "small.txt size");
+        assert_eq!(fi.num_versions, 1);
+        assert!(fi.is_latest);
+
+        // Versioned object: two object versions plus a delete marker (latest).
+        let versioned = create_minio_versioned_object_xlmeta().expect("load versioned fixture");
+        let fm = FileMeta::load(&versioned).expect("parse versioned MinIO xl.meta");
+        assert_eq!(fm.versions.len(), 3, "two object versions + one delete marker");
+        let delete_markers = fm
+            .versions
+            .iter()
+            .filter(|v| v.header.version_type == VersionType::Delete)
+            .count();
+        assert_eq!(delete_markers, 1, "delete marker parsed from MinIO xl.meta");
+        let fi = fm
+            .into_fileinfo("interop", "versioned.txt", "", false, false, true)
+            .expect("versioned fileinfo");
+        assert_eq!(fi.num_versions, 3);
+        assert!(fi.version_id.is_some(), "versioned object carries a version id");
+
+        // Larger object stored as an erasure-coded part (not inlined).
+        let large = create_minio_large_object_xlmeta().expect("load large fixture");
+        let fm = FileMeta::load(&large).expect("parse large MinIO xl.meta");
+        assert_eq!(fm.versions.len(), 1);
+        let fi = fm
+            .into_fileinfo("interop", "large.bin", "", false, false, true)
+            .expect("large fileinfo");
+        assert_eq!(fi.size, 300_000, "large.bin size");
+        assert!(!fi.parts.is_empty(), "multipart/part layout present");
+    }
+
     /// Wraps a raw meta block in a valid XL2 container (header, bin32 length
     /// prefix, and CRC trailer) so decode tests exercise the meta parsing
     /// itself rather than the envelope checks.
