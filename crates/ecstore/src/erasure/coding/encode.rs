@@ -87,6 +87,48 @@ fn use_bytesmut_ingest() -> bool {
         rustfs_utils::get_env_bool(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST)
     })
 }
+/// Read up to `limit` bytes into `buf`'s uninitialized spare capacity, appending after its
+/// current length, and distinguish a clean EOF from a short read.
+///
+/// Mirrors `rustfs_utils::read_full_or_eof` semantics: returns `Ok(None)` when EOF is reached
+/// before any byte is read, `Ok(Some(n))` once at least one byte is read, preserves
+/// `InvalidData` errors (e.g. checksum mismatches) raised after a partial fill, and wraps other
+/// partial-fill errors as `UnexpectedEof`. Unlike `resize` followed by a slice read, the spare
+/// capacity is never zero-filled first, so full-block ingest skips a per-block memset.
+async fn read_full_buf_or_eof<R>(reader: &mut R, buf: &mut BytesMut, limit: usize) -> std::io::Result<Option<usize>>
+where
+    R: AsyncRead + Unpin,
+{
+    use bytes::BufMut as _;
+    use tokio::io::AsyncReadExt as _;
+
+    debug_assert!(buf.is_empty(), "block ingest buffer must start empty");
+    debug_assert!(limit > 0, "limit must be non-zero (block_size is validated upstream)");
+    let mut total = 0;
+    while total < limit {
+        let mut limited = (&mut *buf).limit(limit - total);
+        let n = match reader.read_buf(&mut limited).await {
+            Ok(n) => n,
+            Err(e) => {
+                if total == 0 {
+                    return Err(e);
+                }
+                // Preserve InvalidData (e.g. checksum mismatch) instead of wrapping it as
+                // UnexpectedEof, so proper error handling can occur upstream.
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    return Err(e);
+                }
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    if total == 0 { Ok(None) } else { Ok(Some(total)) }
+}
+
 fn queued_block_bytes(block: &[Bytes]) -> usize {
     block.iter().map(Bytes::len).sum()
 }
@@ -371,9 +413,27 @@ impl Erasure {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn encode<R>(
         self: Arc<Self>,
+        reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        let use_bytesmut_ingest = use_bytesmut_ingest();
+        self.encode_with_ingest_mode(reader, writers, quorum, use_bytesmut_ingest)
+            .await
+    }
+
+    /// Streaming encode with an explicit ingest-buffer strategy. `encode` resolves the
+    /// strategy from `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST`; tests call this directly to
+    /// exercise both paths regardless of the cached environment value.
+    async fn encode_with_ingest_mode<R>(
+        self: Arc<Self>,
         mut reader: R,
         writers: &mut [Option<BitrotWriterWrapper>],
         quorum: usize,
+        use_bytesmut_ingest: bool,
     ) -> std::io::Result<(R, usize)>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -393,20 +453,24 @@ impl Erasure {
 
         let task = tokio::spawn(async move {
             let block_size = self.block_size;
-            let use_bytesmut_ingest = use_bytesmut_ingest();
             let mut total = 0;
             if use_bytesmut_ingest {
-                let mut buf = BytesMut::with_capacity(block_size);
-                buf.resize(block_size, 0);
+                // HP-10 (rustfs/backlog#931): reserve the EC-expanded block size up front.
+                // Both shard-size formulas are monotone in data_len, so the resize to
+                // `need_total_size` inside `encode_data_bytes_mut` always stays within this
+                // capacity and never reallocates. Reading into uninitialized spare capacity
+                // (instead of resize + slice read) also skips zero-filling each fresh buffer.
+                let ingest_capacity = expanded_block_bytes.max(block_size);
+                let mut buf = BytesMut::with_capacity(ingest_capacity);
                 loop {
-                    match rustfs_utils::read_full_or_eof(&mut reader, &mut buf[..]).await {
+                    match read_full_buf_or_eof(&mut reader, &mut buf, block_size).await {
                         Ok(Some(n)) => {
                             debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
+                            debug_assert_eq!(buf.len(), n, "ingest buffer length must equal bytes read");
                             total += n;
                             let encode_buf = buf;
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
-                            buf = BytesMut::with_capacity(block_size);
-                            buf.resize(block_size, 0);
+                            buf = BytesMut::with_capacity(ingest_capacity);
                             let queued_bytes = queued_block_bytes(&res);
                             rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
@@ -1154,6 +1218,103 @@ mod tests {
         assert!(err.to_string().contains("single-block non-inline fast path"));
         for c in committed {
             assert!(c.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_full_buf_or_eof_returns_none_on_empty_reader() {
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        let mut buf = BytesMut::with_capacity(16);
+
+        let res = read_full_buf_or_eof(&mut reader, &mut buf, 8).await.unwrap();
+
+        assert_eq!(res, None);
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_full_buf_or_eof_reads_partial_tail() {
+        let data = b"tail".to_vec();
+        let mut reader = Cursor::new(data.clone());
+        let mut buf = BytesMut::with_capacity(64);
+
+        let res = read_full_buf_or_eof(&mut reader, &mut buf, 16).await.unwrap();
+
+        assert_eq!(res, Some(data.len()));
+        assert_eq!(&buf[..], &data[..]);
+        assert!(buf.capacity() >= 64, "pre-reserved spare capacity must be kept");
+    }
+
+    #[tokio::test]
+    async fn read_full_buf_or_eof_stops_at_limit() {
+        let data = vec![7u8; 32];
+        let mut reader = Cursor::new(data.clone());
+        let mut buf = BytesMut::with_capacity(64);
+
+        let res = read_full_buf_or_eof(&mut reader, &mut buf, 16).await.unwrap();
+
+        assert_eq!(res, Some(16));
+        assert_eq!(&buf[..], &data[..16]);
+
+        // The remaining bytes are still readable as the next block.
+        let mut next = BytesMut::with_capacity(64);
+        let res = read_full_buf_or_eof(&mut reader, &mut next, 16).await.unwrap();
+        assert_eq!(res, Some(16));
+        assert_eq!(&next[..], &data[16..]);
+    }
+
+    async fn committed_shards_for_ingest_mode(use_bytesmut_ingest: bool, uses_legacy: bool, payload: &[u8]) -> Vec<Vec<u8>> {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+            .iter()
+            .map(|c| Some(bitrot_writer(DeferredCommitWriter::new(c.clone()), BLOCK_SIZE / DATA_SHARDS)))
+            .collect();
+
+        let erasure = Arc::new(Erasure::new_with_options(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE, uses_legacy));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload.to_vec()));
+        let (_reader, total) = erasure
+            .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, use_bytesmut_ingest)
+            .await
+            .expect("encode should succeed");
+        assert_eq!(total, payload.len());
+
+        committed
+            .iter()
+            .map(|c| c.lock().expect("committed buffer should be lockable").clone())
+            .collect()
+    }
+
+    /// HP-10 (rustfs/backlog#931) merge gate: the BytesMut ingest path must produce
+    /// byte-for-byte identical shard streams to the default Vec ingest path, for both
+    /// legacy-aware shard-size formulas, across empty, sub-block, exactly-full-block,
+    /// and multi-block-with-partial-tail payloads.
+    #[tokio::test]
+    async fn bytesmut_ingest_matches_vec_ingest_byte_for_byte() {
+        const BLOCK_SIZE: usize = 64;
+        let payloads: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"tiny".to_vec(),
+            (0..BLOCK_SIZE as u32).map(|i| i as u8).collect(), // exactly one full block
+            vec![3u8; BLOCK_SIZE * 4],                         // whole number of blocks
+            (0..(BLOCK_SIZE * 3 + 7) as u32).map(|i| (i % 251) as u8).collect(), // partial tail
+        ];
+
+        for uses_legacy in [false, true] {
+            for payload in &payloads {
+                let vec_path = committed_shards_for_ingest_mode(false, uses_legacy, payload).await;
+                let bytesmut_path = committed_shards_for_ingest_mode(true, uses_legacy, payload).await;
+                assert_eq!(
+                    vec_path,
+                    bytesmut_path,
+                    "ingest paths must be byte-identical (legacy={uses_legacy}, payload_len={})",
+                    payload.len()
+                );
+            }
         }
     }
 
