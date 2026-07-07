@@ -150,6 +150,22 @@ pub const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: u64 = 75;
 pub const ENV_HTTP1_MAX_BUF_SIZE: &str = "RUSTFS_HTTP1_MAX_BUF_SIZE";
 pub const DEFAULT_HTTP1_MAX_BUF_SIZE: usize = 64 * 1024; // 64 KB
 
+/// Environment variable for the S3 request-body inter-chunk read timeout
+/// (seconds). Default: 300. Set to 0 to disable.
+///
+/// This bounds how long a `PutObject`/upload may wait for the *next* body chunk
+/// while more bytes are still expected. It resets on every chunk, so it does not
+/// penalize slow-but-progressing uploads — it only fires when a peer sends a
+/// partial body and then goes silent *without* closing the connection (no EOF).
+/// A reverse proxy or CDN that forwards a truncated body this way would
+/// otherwise make RustFS wait forever for bytes that never arrive; with this
+/// timeout the stalled read is aborted and logged with the received/expected
+/// byte counts, turning a silent hang into an actionable diagnostic (issue
+/// #3076). A short-body that arrives with a proper EOF is already rejected
+/// promptly and is unaffected by this setting.
+pub const ENV_HTTP_REQUEST_BODY_READ_TIMEOUT: &str = "RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT";
+pub const DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT: u64 = 300;
+
 // ── TLS Hot Reload Parameters ──
 
 /// Environment variable to enable TLS certificate hot reload

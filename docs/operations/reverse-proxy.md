@@ -152,6 +152,13 @@ Run each step and note where behavior diverges:
 3. **Check idle reuse.** If failures are intermittent and correlate with upload
    size, it is almost always the keep-alive mismatch above. Lower the proxy
    keepalive (or disable it) and retry.
+   - If instead the upload **hangs indefinitely** (rather than resetting), the
+     proxy is likely forwarding a *partial* body and then going silent without
+     closing the connection. RustFS bounds this wait with
+     `RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT` (default 300s; `0` disables) and, on
+     timeout, logs a `put_object_body_read_stalled` event with the
+     received/expected byte counts — grep the server log for it to confirm a
+     truncated-body forwarding problem.
 4. **Compare bytes.** Confirm the proxy forwards exactly `Content-Length` body
    bytes with no compression/transformation.
 5. **Confirm signed headers survive.** `Host` and `x-amz-*` headers must reach
