@@ -143,6 +143,9 @@ jobs:
       - name: Check architecture migration rules
         run: ./scripts/check_architecture_migration_rules.sh
 
+      - name: Check tokio io-uring feature guard
+        run: ./scripts/check_no_tokio_io_uring.sh
+
   test-and-lint:
     name: Test and Lint
     needs: skip-check
