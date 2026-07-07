@@ -109,7 +109,8 @@ fn get_mapped_policy_path(name: &str, user_type: UserType, is_group: bool) -> St
 enum LoadMode {
     /// On-line load on behalf of a live request: takes namespace locks.
     Locked,
-    /// Bulk snapshot load during bootstrap/reload: bypasses namespace locks.
+    /// Cache-refresh load (bootstrap/reload `load_all`, or a notification-path
+    /// single-object refresh): bypasses namespace locks.
     BootstrapNoLock,
 }
 
@@ -1088,6 +1089,33 @@ impl Store for ObjectStore {
         }
         let _ = ctx.cancel(); // TODO: check if this is needed
         Ok(())
+    }
+
+    // Notification-path cache refreshes read lock-free (see the trait docs):
+    // they are best-effort and stale-tolerant, so they must not fail on the
+    // node-counted lock quorum. Deletions triggered by these refreshes keep
+    // their locked write semantics.
+    async fn load_user_no_lock(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+        self.load_user_with(name, user_type, m, LoadMode::BootstrapNoLock).await
+    }
+    async fn load_group_no_lock(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+        self.load_group_with(name, m, LoadMode::BootstrapNoLock).await
+    }
+    async fn load_policy_doc_no_lock(&self, name: &str, m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+        let info = self.load_policy_with(name, LoadMode::BootstrapNoLock).await?;
+        m.insert(name.to_owned(), info);
+
+        Ok(())
+    }
+    async fn load_mapped_policy_no_lock(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        m: &mut HashMap<String, MappedPolicy>,
+    ) -> Result<()> {
+        self.load_mapped_policy_with(name, user_type, is_group, m, LoadMode::BootstrapNoLock)
+            .await
     }
 
     async fn load_all(&self, cache: &Cache) -> Result<()> {

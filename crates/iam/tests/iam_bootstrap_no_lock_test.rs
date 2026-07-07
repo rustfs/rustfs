@@ -135,6 +135,16 @@ async fn load_all_bypasses_namespace_lock_quorum() {
             .await
             .unwrap_or_else(|err| panic!("load_all must bypass namespace locks (locked path failed with: {locked_err}): {err}"));
 
+        // P3 step 1: notification-path cache refreshes use the same lock-free
+        // reads, so a cross-node notification must also be able to refresh
+        // this group while the lock quorum is unavailable.
+        let mut notification_read = HashMap::new();
+        store
+            .load_group_no_lock(TEST_GROUP, &mut notification_read)
+            .await
+            .expect("lock-free notification-path load_group must succeed while the lock quorum is unavailable");
+        assert_eq!(notification_read[TEST_GROUP].members, TEST_MEMBERS);
+
         // Back in single-node mode the locked path works again; verify the
         // data survived the whole exercise intact (fail-closed integrity).
         drop(_mode_guard);
