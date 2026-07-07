@@ -286,6 +286,7 @@ jobs:
 
             read -r console_url console_sha256 < <("$python_bin" - "$console_json" <<'PY'
           import json
+          import re
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as handle:
@@ -296,7 +297,10 @@ jobs:
               digest = asset.get("digest", "")
               url = asset.get("browser_download_url", "")
               if name.startswith("rustfs-console-") and name.endswith(".zip") and digest.startswith("sha256:") and url:
-                  print(url, digest.split(":", 1)[1])
+                  sha256 = digest.split(":", 1)[1]
+                  if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+                      raise SystemExit(f"console zip asset has invalid sha256 digest: {sha256}")
+                  sys.stdout.buffer.write(f"{url} {sha256}\n".encode("utf-8"))
                   break
           else:
               raise SystemExit("no console zip asset with sha256 digest found")
