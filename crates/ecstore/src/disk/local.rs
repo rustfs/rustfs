@@ -3869,10 +3869,28 @@ impl DiskAPI for LocalDisk {
                     && let Some(dst_parent) = dst.parent()
                 {
                     let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
-                    if let Some(old_parent) = old_path.parent() {
+                    let old_parent = old_path.parent().map(|p| p.to_path_buf());
+                    if let Some(ref old_parent) = old_parent {
                         std::fs::create_dir_all(old_parent)?;
                     }
-                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
+                    // This rollback backup is the sole restore source for a later
+                    // undo_write when the set-level write quorum fails. Persist it as
+                    // durably as the new xl.meta written above (and as the non-inline
+                    // branch does): a bare std::fs::write leaves both the bytes and the
+                    // new directory entry in the page cache, so a crash before a
+                    // rollback could restore a lost or truncated backup.
+                    let mut backup = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&old_path)?;
+                    std::io::Write::write_all(&mut backup, buf)?;
+                    if sync {
+                        backup.sync_data()?;
+                        if let Some(ref old_parent) = old_parent {
+                            os::fsync_dir_std(old_parent)?;
+                        }
+                    }
                 }
 
                 match std::fs::rename(&src, &dst) {
@@ -4581,11 +4599,12 @@ mod test {
         ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
 
         let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let old_meta = test_meta(old_fi);
         let dst_object_dir = dir.path().join(bucket).join(object);
         fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
             .await
             .expect("old data dir should be created");
-        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), &old_meta)
             .await
             .expect("old metadata should be written");
 
@@ -4601,11 +4620,15 @@ mod test {
             .expect("inline rename_data should commit");
 
         assert_eq!(resp.old_data_dir, Some(old_data_dir));
-        assert!(
-            dst_object_dir
-                .join(old_data_dir.to_string())
-                .join(STORAGE_FORMAT_FILE_BACKUP)
-                .exists()
+        let backup_path = dst_object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        assert!(backup_path.exists());
+        // The rollback backup must contain the previous metadata bytes verbatim so
+        // that undo_write can restore the prior committed object; guards the inline
+        // backup write against truncation/corruption regressions.
+        assert_eq!(
+            fs::read(&backup_path).await.expect("backup should be readable"),
+            old_meta,
+            "inline rollback backup must contain the previous metadata bytes verbatim"
         );
         assert!(
             !dst_object_dir
