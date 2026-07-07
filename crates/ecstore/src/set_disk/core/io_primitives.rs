@@ -48,7 +48,8 @@ use crate::diagnostics::get::{
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader, object_mmap_read_enabled,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled,
 };
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -911,6 +912,10 @@ pub(in crate::set_disk) const DIRECT_MEMORY_BITROT_READER_STAGE_METRICS: BitrotR
 
 pub(in crate::set_disk) struct BitrotReaderSetup {
     pub(in crate::set_disk) readers: Vec<Option<ObjectBitrotReader>>,
+    /// Per-slot stripe handles for readers that are still unopened deferred
+    /// readers. The lockstep GET decode uses them to open a parity shard
+    /// aligned to the stripe where a data shard failed (backlog#923).
+    pub(in crate::set_disk) deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
     pub(in crate::set_disk) errors: Vec<Option<DiskError>>,
     pub(in crate::set_disk) scheduled: Vec<bool>,
     pub(in crate::set_disk) attempted: Vec<bool>,
@@ -985,6 +990,7 @@ impl BitrotReaderSetup {
     pub(in crate::set_disk) fn new(shards: usize) -> Self {
         Self {
             readers: (0..shards).map(|_| None).collect(),
+            deferred_stripe_handles: (0..shards).map(|_| None).collect(),
             errors: vec![Some(DiskError::DiskNotFound); shards],
             scheduled: vec![false; shards],
             attempted: vec![false; shards],
@@ -1110,8 +1116,14 @@ impl BitrotReaderSetup {
         }
     }
 
-    pub(in crate::set_disk) fn retain_deferred_reader(&mut self, idx: usize, reader: ObjectBitrotReader) {
+    pub(in crate::set_disk) fn retain_deferred_reader(
+        &mut self,
+        idx: usize,
+        reader: ObjectBitrotReader,
+        stripe_handle: DeferredReaderStripeHandle,
+    ) {
         self.readers[idx] = Some(reader);
+        self.deferred_stripe_handles[idx] = Some(stripe_handle);
         self.errors[idx] = None;
         self.deferred_count = self.deferred_count.saturating_add(1);
     }
@@ -1204,21 +1216,58 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        setup.retain_deferred_reader(
-            idx,
-            create_deferred_bitrot_reader(
-                inline_data,
-                disk,
-                bucket,
-                &path,
-                read_offset,
-                read_length,
-                shard_size,
-                checksum_algo.clone(),
-                skip_verify_bitrot,
-                use_mmap_read,
-            ),
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            inline_data,
+            disk,
+            bucket,
+            &path,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
         );
+        setup.retain_deferred_reader(idx, reader, stripe_handle);
+    }
+
+    // With the data-shards-only lockstep gate on (backlog#923), the GET decode
+    // reads only the data shards while the object is healthy; a parity reader
+    // is engaged on demand and must therefore stay unopened so its start
+    // offset can be advanced to the failing stripe. A parity reader that was
+    // opened eagerly during setup is pinned at the stripe-0 stream position
+    // and could never be engaged mid-object, so swap it for an unopened
+    // deferred reader carrying a stripe handle. The eager open already proved
+    // the shard is reachable; no shard bytes were read from it, and the
+    // ready/error bookkeeping that quorum decisions rely on is left untouched.
+    // Gate off (default): keep the eagerly opened parity readers exactly as
+    // before — the lockstep path reads them on every stripe.
+    if !crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled() {
+        return;
+    }
+    for idx in data_shards..disks.len() {
+        if setup.readers[idx].is_none() || setup.deferred_stripe_handles[idx].is_some() {
+            continue;
+        }
+
+        let inline_data = files[idx].data.clone();
+        let disk = disks[idx].clone();
+        let data_dir = files[idx].data_dir.unwrap_or_default();
+        let path = format!("{object}/{data_dir}/part.{part_number}");
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            inline_data,
+            disk,
+            bucket,
+            &path,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
+        );
+        setup.readers[idx] = Some(reader);
+        setup.deferred_stripe_handles[idx] = Some(stripe_handle);
     }
 }
 
