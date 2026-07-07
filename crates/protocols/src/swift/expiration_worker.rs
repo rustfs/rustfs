@@ -657,6 +657,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[derive(Default)]
+    #[allow(clippy::type_complexity)]
     struct MockExpirationObjectBackend {
         metadata_results: Mutex<VecDeque<SwiftResult<Option<HashMap<String, String>>>>>,
         delete_results: Mutex<VecDeque<SwiftResult<()>>>,
