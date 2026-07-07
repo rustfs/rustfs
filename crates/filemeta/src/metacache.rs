@@ -1987,4 +1987,63 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+
+    // ------------------------------------------------------------------
+    // backlog#900: metacache boundaries live outside the HTTP CatchPanicLayer
+    // (background / listing chains). A corrupt-part xl.meta must yield Err,
+    // not panic, so it cannot poison a worker.
+    // ------------------------------------------------------------------
+
+    fn corrupt_parts_filemeta() -> FileMeta {
+        use crate::{ChecksumAlgo, ErasureAlgo, MetaObject, VersionType};
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(MetaObject {
+                version_id: Some(Uuid::new_v4()),
+                erasure_algorithm: ErasureAlgo::ReedSolomon,
+                erasure_m: 2,
+                erasure_n: 2,
+                erasure_block_size: 1 << 20,
+                bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                part_numbers: vec![1, 2],
+                part_sizes: vec![10], // corrupt: shorter than part_numbers
+                part_actual_sizes: vec![10, 20],
+                mod_time: Some(time::OffsetDateTime::now_utc()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("add version");
+        // Round-trip once so the corrupt array survives exactly like on disk.
+        FileMeta::load(&fm.marshal_msg().expect("marshal")).expect("load")
+    }
+
+    #[test]
+    fn metacache_to_fileinfo_returns_err_not_panic_on_corrupt_parts() {
+        let entry = MetaCacheEntry {
+            name: "obj".to_string(),
+            metadata: Vec::new(),
+            cached: Some(corrupt_parts_filemeta()),
+            reusable: false,
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.to_fileinfo("bucket")));
+        let inner = caught.expect("to_fileinfo must not panic");
+        assert!(matches!(inner, Err(Error::FileCorrupt)), "expected FileCorrupt from metacache boundary");
+    }
+
+    #[test]
+    fn metacache_file_info_versions_returns_err_not_panic_on_corrupt_parts() {
+        // file_info_versions reads self.metadata (not cached), so fill marshaled bytes.
+        let bytes = corrupt_parts_filemeta().marshal_msg().expect("marshal");
+        let entry = MetaCacheEntry {
+            name: "obj".to_string(),
+            metadata: bytes,
+            cached: None,
+            reusable: false,
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.file_info_versions("bucket")));
+        let inner = caught.expect("file_info_versions must not panic");
+        assert!(matches!(inner, Err(Error::FileCorrupt)), "expected FileCorrupt");
+    }
 }
