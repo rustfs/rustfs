@@ -3203,7 +3203,7 @@ impl SetDisks {
     /// * The set of referenced data dirs is the UNION of `get_data_dirs()` across
     ///   every online disk's `xl.meta`, so a dir named by *any* replica is kept.
     /// * If a disk holds the object directory but its `xl.meta` is missing or
-    ///   unparseable, the object is treated as degraded and NOTHING is removed —
+    ///   unparsable, the object is treated as degraded and NOTHING is removed —
     ///   the unreadable copy could be the only one naming a live data dir, and a
     ///   heal must run first.
     /// * Only subdirectories whose names parse as a UUID are ever considered;
@@ -3272,7 +3272,7 @@ impl SetDisks {
                     warn!(
                         target: "rustfs_ecstore::set_disk",
                         bucket, object, error = %err,
-                        "reclaim_orphan_data_dirs: aborting, unparseable xl.meta on a disk"
+                        "reclaim_orphan_data_dirs: aborting, unparsable xl.meta on a disk"
                     );
                     return Ok(0);
                 }
