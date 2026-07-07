@@ -1050,7 +1050,7 @@ mod tests {
         let disks = shuffle_test_disks(&tempdir, parts.len()).await;
 
         let (expected_disks, expected_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
-        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks.clone(), parts, &fi);
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
 
         assert_eq!(owned_parts, expected_parts, "owned shuffle must place identical metadata");
         let expected_slots: Vec<bool> = expected_disks.iter().map(Option::is_some).collect();
@@ -1065,7 +1065,7 @@ mod tests {
         let disks = shuffle_test_disks(&tempdir, parts.len()).await;
 
         let (expected_disks, expected_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
-        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks.clone(), parts, &fi);
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
 
         assert_eq!(owned_parts, expected_parts, "fallback placement must match the borrowing variant");
         let expected_slots: Vec<bool> = expected_disks.iter().map(Option::is_some).collect();

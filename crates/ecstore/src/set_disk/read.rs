@@ -1457,6 +1457,19 @@ impl AsyncRead for LazyMultipartCodecStreamingReader {
                                 this.current = Some(reader);
                             }
                             Ok(Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason))) => {
+                                // KNOWN LIMITATION (backlog#871 follow-up): once
+                                // earlier parts have streamed we can no longer
+                                // hand the whole request back to the legacy
+                                // duplex path, so a degraded later part surfaces
+                                // as a read error even though legacy per-part
+                                // decode could still reconstruct it. This only
+                                // affects the OPT-IN multipart codec streaming
+                                // path (RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+                                // default off): the first part stays eager so the
+                                // common case where part 1 is already degraded
+                                // still falls back cleanly before any byte ships.
+                                // A proper fix (in-place per-part legacy
+                                // degradation) is tracked as a follow-up.
                                 record_get_object_pipeline_failure_for_path(
                                     this.metrics_path,
                                     GET_STAGE_READER_SETUP,

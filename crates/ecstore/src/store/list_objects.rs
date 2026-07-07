@@ -4816,12 +4816,18 @@ async fn merge_entry_channels(
             }
         }
 
-        if winner.entry.name > last {
+        // Gate emission on the same cleaned key the heap orders by, not the raw
+        // name. The heap pops in non-decreasing cleaned order, so comparing the
+        // raw name here could drop a legitimate entry whose cleaned order and
+        // raw order disagree (e.g. redundant slashes or `./` segments).
+        let emit = winner.sort_key() > last.as_str();
+        if emit {
             last.clear();
-            last.push_str(&winner.entry.name);
-            if !send_or_cancel(&rx, &out_channel, winner.entry).await? {
-                return Ok(());
-            }
+            last.push_str(winner.sort_key());
+        }
+        let MergeHead { entry, .. } = *winner;
+        if emit && !send_or_cancel(&rx, &out_channel, entry).await? {
+            return Ok(());
         }
 
         for &idx in &refill {
@@ -9237,7 +9243,7 @@ mod test {
         );
         assert!(fvs.versions[0].is_latest, "the first (newest) version carries is_latest");
 
-        let mut ascending = fvs.versions.clone();
+        let mut ascending = fvs.versions;
         ascending.reverse();
         assert!(
             ascending[0].mod_time <= ascending[1].mod_time,
@@ -9284,6 +9290,38 @@ mod test {
         let mut expected = names;
         expected.push("obj-99".to_owned());
         assert_eq!(results, expected);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_emits_when_cleaned_order_differs_from_raw_order() {
+        // Regression: `a//c` cleans to `a/c` and `a/b` is already clean. In
+        // cleaned order `a/b` < `a/c`, but raw byte order is the opposite
+        // (`a//c` < `a/b` because '/' < 'b'). The heap pops in cleaned order,
+        // so gating emission on the raw name would drop `a//c` after `a/b` is
+        // emitted. Both distinct keys must survive.
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        tx_a.send(test_meta_entry("a/b")).await.unwrap();
+        drop(tx_a);
+        tx_b.send(test_meta_entry("a//c")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            results,
+            vec!["a/b", "a//c"],
+            "distinct cleaned keys must both be emitted in cleaned order"
+        );
     }
 
     #[tokio::test]
