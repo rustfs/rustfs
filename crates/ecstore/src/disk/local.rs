@@ -7019,7 +7019,7 @@ mod test {
                 latencies_us.push(lat);
             }
             done += batch;
-            if done % file_count == 0 {
+            if done.is_multiple_of(file_count) {
                 drop_dataset_cache(&paths);
             }
         }
