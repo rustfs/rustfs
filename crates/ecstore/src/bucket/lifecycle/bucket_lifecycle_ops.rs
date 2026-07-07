@@ -4731,8 +4731,12 @@ mod tests {
             });
         }
 
-        // Every concurrent resend must succeed; the fix must not serialize the
-        // streaming phase into lock-acquire timeouts.
+        // Every concurrent resend must succeed. The per-uploadId commit lock must
+        // not starve a waiter into a lock-acquire timeout: the shared fast-lock
+        // notify pool could otherwise route this lock's wakeup to a waiter of an
+        // unrelated lock and strand this one until the deadline (fixed in
+        // fast_lock::shard by bounding each notification wait, so a lost/stolen
+        // wakeup degrades to bounded re-polling instead of a hard timeout).
         let mut results = Vec::new();
         while let Some(joined) = tasks.join_next().await {
             let outcome = joined.expect("put_object_part task should not panic");

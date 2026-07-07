@@ -9054,6 +9054,7 @@ dependencies = [
  "rustfs-concurrency",
  "rustfs-config",
  "rustfs-credentials",
+ "rustfs-crypto",
  "rustfs-data-usage",
  "rustfs-erasure-codec",
  "rustfs-filemeta",
