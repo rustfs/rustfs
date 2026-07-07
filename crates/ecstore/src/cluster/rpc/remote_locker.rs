@@ -73,6 +73,7 @@ impl RemoteClient {
             priority: LockPriority::Normal,
             deadlock_detection: false,
             suppress_contention_logs: false,
+            refresh_interval: None,
         }
     }
 

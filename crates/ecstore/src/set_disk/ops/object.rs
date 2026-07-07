@@ -1031,16 +1031,45 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             );
         }
 
-        if let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
-            warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
-        } else if issue3031_diag_enabled() {
-            warn!(
-                target: "rustfs_ecstore::set_disk",
-                bucket = %bucket,
-                object = %object,
-                tmp_dir = %tmp_dir,
-                "issue3031_put_object_tmp_cleanup_done"
-            );
+        if result.is_ok() {
+            // Success path: `rename_data` has already moved the data dir out of
+            // the tmp workspace and removed the (empty) tmp dir where it could,
+            // so this delete_all is a speculative safety net that normally hits
+            // a missing path. It still must run — `rename_data`'s `remove_std`
+            // only removes empty directories and silently ignores failures —
+            // but it has no reason to run on the response path: under
+            // fsync-heavy load the same-disk queueing behind it was measured to
+            // add ~9ms average (p99 77ms) to PUT latency (backlog#924 / HP-3).
+            // If the process dies before the spawned task runs, the stale tmp
+            // entry is reclaimed by cleanup_stale_tmp_objects (24h expiry,
+            // 5-minute background loop).
+            let set_disks = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = set_disks.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
+                    warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+                } else if issue3031_diag_enabled() {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        tmp_dir = %tmp_dir,
+                        "issue3031_put_object_tmp_cleanup_done"
+                    );
+                }
+            });
+        } else {
+            // Failure path (quorum loss / rollback): keep the cleanup inline so
+            // a failed PUT never returns while its tmp shards are still on disk
+            // (state-residue hardening tracked by backlog#864 / backlog#898).
+            if let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
+                warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+            } else if issue3031_diag_enabled() {
+                warn!(
+                    target: "rustfs_ecstore::set_disk",
+                    bucket = %bucket,
+                    object = %object,
+                    tmp_dir = %tmp_dir,
+                    "issue3031_put_object_tmp_cleanup_done"
+                );
+            }
         }
 
         result
@@ -2254,5 +2283,167 @@ mod b3_write_quorum_tests {
         let writers = vec![Some(()), Some(()), Some(())];
         assert_eq!(drop_failed_writer_disks(&mut disks, &writers), 3);
         assert_eq!(disks, vec![Some(0), Some(1), Some(2)]);
+    }
+}
+
+#[cfg(test)]
+mod put_object_tmp_cleanup_tests {
+    //! Regression coverage for backlog#924 (HP-3): the speculative tmp-dir
+    //! cleanup at the end of a successful PUT runs on a spawned task (off the
+    //! response path), while a failed PUT must still clean its tmp shards
+    //! inline before returning.
+    //!
+    //! The `SetDisks` under test is constructed directly on formatted local
+    //! disks (same pattern as the `ops/locking.rs` tests) so the tests stay
+    //! hermetic: no global local-disk registry, lock clients, or ECStore
+    //! instance is touched, and each test owns its tmp workspace.
+
+    use super::*;
+    use crate::disk::DiskAPI as _;
+    use crate::store::init_format::save_format_file;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    /// Large enough that the erasure shards are written as real tmp files
+    /// (never inlined into xl.meta), so both tests exercise actual cleanup.
+    const TEST_OBJECT_SIZE: usize = 1 << 20;
+
+    async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_idx);
+
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("local disk should be created");
+
+        let mut disk_format = format.clone();
+        disk_format.erasure.this = format.erasure.sets[0][disk_idx];
+        save_format_file(&Some(disk.clone()), &Some(disk_format))
+            .await
+            .expect("format should be saved");
+
+        (dir, endpoint, disk)
+    }
+
+    async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disk_stores = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disk_stores.push(disk.clone());
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "tmp-cleanup-test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        (temp_dirs, disk_stores, set_disks)
+    }
+
+    /// Entries under `.rustfs.sys/tmp` on every disk, excluding the `.trash`
+    /// staging directory (trash reclamation is a background concern).
+    async fn non_trash_tmp_entries(temp_dirs: &[TempDir]) -> Vec<String> {
+        let mut leftovers = Vec::new();
+        for temp_dir in temp_dirs {
+            let tmp_path = temp_dir.path().join(RUSTFS_META_TMP_BUCKET);
+            let mut read_dir = match tokio::fs::read_dir(&tmp_path).await {
+                Ok(read_dir) => read_dir,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => panic!("tmp dir {tmp_path:?} should be listable: {err}"),
+            };
+            while let Some(entry) = read_dir.next_entry().await.expect("tmp dir entry should be readable") {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name != ".trash" {
+                    leftovers.push(format!("{}/{name}", tmp_path.display()));
+                }
+            }
+        }
+        leftovers
+    }
+
+    #[tokio::test]
+    async fn put_object_success_eventually_cleans_tmp_workspace() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+
+        let bucket = "tmp-clean-ok-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(vec![7u8; TEST_OBJECT_SIZE]);
+        set_disks
+            .put_object(bucket, "hot-path-object", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put_object should succeed");
+
+        // The speculative cleanup runs on a spawned task off the PUT response
+        // path, so poll for the tmp workspace to drain instead of asserting
+        // immediately.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let leftovers = non_trash_tmp_entries(&temp_dirs).await;
+            if leftovers.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "tmp workspace should drain after a successful PUT, leftovers: {leftovers:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn put_object_failure_cleans_tmp_workspace_inline() {
+        let (temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
+
+        // The bucket volume is never created, so the shards are written into
+        // the tmp workspace and the commit fails at rename_data with a quorum
+        // error — exercising the failure-path cleanup.
+        let mut reader = PutObjReader::from_vec(vec![9u8; TEST_OBJECT_SIZE]);
+        let err = set_disks
+            .put_object("tmp-clean-missing-bucket", "orphan-object", &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("put_object into a missing bucket volume must fail");
+
+        // No polling: the failure path must clean the tmp workspace inline,
+        // before put_object returns (backlog#864 / backlog#898 hardening).
+        let leftovers = non_trash_tmp_entries(&temp_dirs).await;
+        assert!(
+            leftovers.is_empty(),
+            "failed PUT must not leave tmp shards behind, leftovers: {leftovers:?}, err: {err}"
+        );
+
+        drop(temp_dirs);
     }
 }
