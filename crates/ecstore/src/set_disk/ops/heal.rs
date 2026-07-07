@@ -624,6 +624,20 @@ impl SetDisks {
 
                         record_capacity_scope_if_needed(None, &out_dated_disks);
 
+                        // The object is healthy here; sweep any data dirs left behind
+                        // by pre-#3510 unversioned overwrites, which the dangling paths
+                        // above never touch (issues #3231, #3191). Best effort — a
+                        // failure must not fail the heal.
+                        match self.reclaim_orphan_data_dirs(bucket, object).await {
+                            Ok(removed) if removed > 0 => {
+                                info!(bucket, object, removed, "heal_object: reclaimed orphaned data directories");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(bucket, object, error = %e, "heal_object: orphan data-dir reclaim failed");
+                            }
+                        }
+
                         Ok((result, None))
                     }
                     Err(err) => Ok((result, Some(err))),

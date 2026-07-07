@@ -4487,6 +4487,151 @@ mod tests {
         );
     }
 
+    // Build an `xl.meta` under `object_dir` whose versions reference `data_dirs`
+    // (one Object version per data dir, each with its own version id).
+    async fn write_object_meta_with_data_dirs(object_dir: &std::path::Path, bucket: &str, object: &str, data_dirs: &[Uuid]) {
+        fs::create_dir_all(object_dir).await.expect("object dir should be created");
+        let mut meta = FileMeta::default();
+        for data_dir in data_dirs {
+            let mut fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 1);
+            fi.name = object.to_string();
+            fi.version_id = Some(Uuid::new_v4());
+            fi.data_dir = Some(*data_dir);
+            fi.size = 1;
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            meta.add_version(fi).expect("metadata should accept file info");
+        }
+        let buf = meta.marshal_msg().expect("metadata should encode");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), buf)
+            .await
+            .expect("metadata should be written");
+    }
+
+    // #3231/#3191: a data dir on disk that no version references (a pre-#3510
+    // unversioned-overwrite leak) must be reclaimed, leaving the live one intact.
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_removes_unreferenced_dir() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+
+        let object_dir = root.join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+        fs::write(object_dir.join(live.to_string()).join("part.1"), b"live")
+            .await
+            .expect("live part should be written");
+        fs::create_dir_all(object_dir.join(orphan.to_string()))
+            .await
+            .expect("orphan data dir should be created");
+        fs::write(object_dir.join(orphan.to_string()).join("part.1"), b"stale")
+            .await
+            .expect("orphan part should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("reclaim should succeed");
+
+        assert_eq!(removed, 1, "exactly the unreferenced data dir should be removed");
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+        assert!(!object_dir.join(orphan.to_string()).exists(), "orphaned data dir must be removed");
+        assert!(object_dir.join(STORAGE_FORMAT_FILE).exists(), "metadata must be preserved");
+    }
+
+    // Nothing to reclaim when every physical data dir is still referenced.
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_keeps_referenced_dir() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let live = Uuid::new_v4();
+
+        let object_dir = root.join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("reclaim should succeed");
+
+        assert_eq!(removed, 0, "no data dir should be removed");
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+    }
+
+    // Fail closed: a data dir present without a readable xl.meta is degraded, and
+    // must never be removed (a heal has to run first).
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_aborts_when_meta_missing() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let stray = Uuid::new_v4();
+
+        let object_dir = root.join("bucket").join("obj");
+        fs::create_dir_all(object_dir.join(stray.to_string()))
+            .await
+            .expect("data dir should be created");
+        fs::write(object_dir.join(stray.to_string()).join("part.1"), b"data")
+            .await
+            .expect("part should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("reclaim should succeed");
+
+        assert_eq!(removed, 0, "must not remove data dirs when metadata is absent");
+        assert!(
+            object_dir.join(stray.to_string()).exists(),
+            "degraded object's data dir must be preserved"
+        );
+    }
+
+    // Cross-replica union: a data dir referenced by ANOTHER disk's xl.meta must be
+    // kept even where the local replica does not name it.
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_keeps_dir_referenced_by_other_replica() {
+        let (dir0, disk0) = make_single_local_disk().await;
+        let (dir1, disk1) = make_single_local_disk().await;
+        let shared = Uuid::new_v4();
+
+        // disk0: meta references only a different dir, but physically holds `shared`.
+        let other = Uuid::new_v4();
+        let obj0 = dir0.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&obj0, "bucket", "obj", &[other]).await;
+        fs::create_dir_all(obj0.join(other.to_string()))
+            .await
+            .expect("dir should be created");
+        fs::create_dir_all(obj0.join(shared.to_string()))
+            .await
+            .expect("dir should be created");
+
+        // disk1: meta references `shared`.
+        let obj1 = dir1.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&obj1, "bucket", "obj", &[shared]).await;
+        fs::create_dir_all(obj1.join(shared.to_string()))
+            .await
+            .expect("dir should be created");
+
+        let set = make_set_disks_with(vec![Some(disk0), Some(disk1)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("reclaim should succeed");
+
+        assert_eq!(removed, 0, "a dir referenced by any replica must be kept");
+        assert!(obj0.join(shared.to_string()).exists(), "cross-referenced data dir must survive");
+        assert!(obj0.join(other.to_string()).exists(), "locally referenced data dir must survive");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn test_acquire_dist_delete_object_locks_batch_succeeds_with_two_healthy_lockers() {
