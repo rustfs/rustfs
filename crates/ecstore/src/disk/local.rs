@@ -3883,12 +3883,13 @@ impl DiskAPI for LocalDisk {
                         .create(true)
                         .write(true)
                         .truncate(true)
-                        .open(&old_path)?;
-                    std::io::Write::write_all(&mut backup, buf)?;
+                        .open(&old_path)
+                        .map_err(to_file_error)?;
+                    std::io::Write::write_all(&mut backup, buf).map_err(to_file_error)?;
                     if sync {
-                        backup.sync_data()?;
+                        backup.sync_data().map_err(to_file_error)?;
                         if let Some(ref old_parent) = old_parent {
-                            os::fsync_dir_std(old_parent)?;
+                            os::fsync_dir_std(old_parent).map_err(to_file_error)?;
                         }
                     }
                 }
