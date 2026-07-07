@@ -237,6 +237,52 @@ closing the two partial encodings — not a rewrite.
 - Exit criterion: a CI job that fails if a real MinIO-written object or bucket
   blob cannot be read.
 
+#### Phase 1 status — first fixtures landed (verified 2026-07-07)
+
+A real MinIO `RELEASE.2025-07-23` single-drive instance wrote a bucket with
+versioning, object-lock (GOVERNANCE default), lifecycle, tagging, quota, and a
+public-download policy, plus inline / versioned / multipart objects. The on-disk
+`xl.meta` blobs are captured as hex fixtures
+(`crates/filemeta/tests/fixtures/minio/`, `crates/ecstore/tests/fixtures/minio/`).
+
+Proven by regression tests:
+
+- **Object `xl.meta` read parity** — `parses_real_minio_object_xlmeta`
+  (`crates/filemeta/src/filemeta.rs`): small inline, two-object-version + delete
+  marker, and multipart objects all parse to the expected `FileInfo`.
+- **Bucket-metadata parse parity** — `parses_real_minio_bucket_metadata_blob_without_loss`
+  (`crates/ecstore/src/bucket/metadata.rs`): the msgpack blob decodes via the
+  PascalCase MinIO field names, and `parse_all_configs` loads **all ten** config
+  types present in the corpus without loss — policy, lifecycle (**including
+  MinIO's `<ExpiryUpdatedAt>` extension**), object-lock, versioning, tagging,
+  quota, notification, encryption (SSE-S3), and replication (**including the
+  `DeleteMarkerReplication` / `ExistingObjectReplication` MinIO extensions**).
+- **Inline bucket-metadata read parity** — `reads_minio_inline_bucket_metadata_via_bitrot`
+  (`crates/ecstore/src/bucket/metadata.rs`): MinIO stores an inlined object body
+  as `[HighwayHash256 (32B)][body]`. The "`inline_data` 前缀不同" that weisd
+  raised on 2026-03-06 is exactly that bitrot prefix — **not** a format
+  incompatibility. Feeding the raw inline shard through RustFS's `BitrotReader`
+  with the default `HighwayHash256S` verifies the checksum (confirming RustFS's
+  hash matches MinIO's) and yields the exact `.metadata.bin` blob, which then
+  parses. So the object-layer inline read is compatible; the earlier "extract
+  `fi.data` directly" concern was reading the shard before the bitrot layer
+  strips its prefix.
+- **End-to-end migration** — `migrates_real_minio_bucket_metadata_end_to_end`
+  (`crates/ecstore/src/bucket/migration.rs`): on a throwaway 4-drive local
+  `ECStore`, a real MinIO `.metadata.bin` seeded under a `.minio.sys` layout is
+  migrated by `try_migrate_bucket_metadata` into `.rustfs.sys`, and the migrated
+  blob carries every config (policy / lifecycle / object-lock / versioning /
+  tagging / quota / notification / encryption / replication) byte-identical to
+  the source. This exercises the Phase 2 source adapter
+  (`MIGRATING_META_BUCKET = ".minio.sys"`) end-to-end through the object layer —
+  proven, not just present.
+
+Still to broaden: transitioned `xl.meta`; CORS, public-access-block, and bucket
+ACL configs (the SNSD test binary/`mc` did not expose these); and bucket-targets
+credentials, which MinIO stores KMS-encrypted (a documented partial). These run
+as ordinary crate tests, so they already execute in the normal `cargo
+test`/nextest CI jobs.
+
 ### Phase 2 — MinIO source adapter for migration
 
 - Generalize the importer in `crates/ecstore/src/bucket/migration.rs` so the
@@ -256,14 +302,26 @@ closing the two partial encodings — not a rewrite.
   scope; if not, keep the blob round-trippable but document the enforcement
   limit (already reflected in the router compatibility matrix).
 
-### Phase 4 — Round-trip / write-back parity (stretch)
+### Phase 4 — Round-trip / write-back parity (non-goal for migration)
 
-- Prove a MinIO binary can re-read a RustFS-written `xl.meta` and
-  `.metadata.bin` (the reverse direction). This is a stretch goal because
-  RustFS writes meta_ver 3 and MinIO's acceptance of specific v3 features must
-  be validated per feature.
-- Exit criterion: a MinIO instance mounted on a RustFS-written drive set serves
-  objects and bucket configs without repair.
+Proving a MinIO binary can re-read a *RustFS-written drive set* (the reverse
+direction) is **out of scope for the migration use case**, which is one-way
+MinIO → RustFS:
+
+- RustFS's meta bucket is `.rustfs.sys` (`crates/ecstore/src/disk/mod.rs:29`);
+  MinIO looks for `.minio.sys`. A MinIO binary pointed at a RustFS drive set
+  does not find `format.json` or bucket configs and refuses the set — this is a
+  set-level divergence, not an object-format one.
+- The object-level `xl.meta` format *does* match (proven above), so the reverse
+  direction is limited by drive-set discovery, not by per-object encoding.
+- The supported flow is one-way: `try_migrate_bucket_metadata` /
+  `try_migrate_iam_config` / `format.json` migration import a MinIO layout into
+  RustFS. There is no requirement to keep a live MinIO able to serve
+  RustFS-written drives.
+
+If a true bidirectional round-trip is ever needed, it would require RustFS to
+optionally write the `.minio.sys` set layout — a separate feature, not part of
+the interop/migration story tracked here.
 
 ---
 
