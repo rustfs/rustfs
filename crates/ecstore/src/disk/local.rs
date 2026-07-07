@@ -666,6 +666,565 @@ fn should_reclaim_file_cache_after_read(length: usize) -> bool {
     length >= threshold
 }
 
+/// Write-open semantics for [`LocalIoBackend::open_write`].
+///
+/// `Truncate` mirrors `DiskAPI::create_file` (O_CREATE|O_WRONLY|O_TRUNC, no
+/// volume access check, cache-reclaim writer); `Append` mirrors
+/// `DiskAPI::append_file` (O_CREATE|O_APPEND|O_WRONLY, volume access check).
+/// The access-check asymmetry is preserved historical behavior.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WriteMode {
+    Truncate { size_hint: i64 },
+    Append,
+}
+
+/// Local-disk file I/O backend behind [`LocalDisk`].
+///
+/// Models the real per-file operations of the `DiskAPI` hot path so an
+/// alternative backend (e.g. a runtime-probed io_uring implementation) can be
+/// swapped in without touching callers. The default [`StdBackend`] preserves
+/// the pre-trait behavior byte-for-byte. Commit-point durability
+/// (fdatasync -> rename -> fsync-dir in `rename_data`) is deliberately NOT
+/// part of this trait.
+#[async_trait::async_trait]
+pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
+    /// Positioned whole-range read returning owned bytes
+    /// (mirrors `read_file_mmap_copy_with_metrics`).
+    async fn pread_bytes(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes>;
+
+    /// Open a bounded streaming reader over `offset..offset+length`
+    /// (mirrors `read_file_stream`).
+    async fn open_read_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
+
+    /// Open a whole-file streaming reader (mirrors `read_file`).
+    async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader>;
+
+    /// Open a writer (mirrors `create_file`/`append_file` per [`WriteMode`]).
+    async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter>;
+}
+
+/// Default [`LocalIoBackend`]: tokio blocking-pool file I/O plus the
+/// mmap-copy / direct-read-copy positioned read, moved verbatim from the
+/// former `DiskAPI` method bodies on `LocalDisk`.
+#[derive(Debug)]
+pub(crate) struct StdBackend {
+    root: PathBuf,
+}
+
+impl StdBackend {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
+        let mut skip_parent = skip_parent.as_ref();
+        if skip_parent.as_os_str().is_empty() {
+            skip_parent = self.root.as_path();
+        }
+
+        if let Some(parent) = path.as_ref().parent()
+            && parent != skip_parent
+        {
+            os::make_dir_all(parent, skip_parent).await?;
+        }
+
+        let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;
+
+        Ok(f)
+    }
+
+    async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
+        let f = super::fs::open_file(path.as_ref(), O_RDONLY).await.map_err(to_file_error)?;
+        Ok(f)
+    }
+}
+
+#[async_trait::async_trait]
+impl LocalIoBackend for StdBackend {
+    /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
+    // SAFETY: Unix unsafe calls in this function only query page size and mmap
+    // a read-only file region after bounds and alignment are validated.
+    #[allow(unsafe_code)]
+    async fn pread_bytes(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        let metrics = metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
+        let metrics_enabled = metrics.is_some();
+
+        let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
+        let Some(end_offset) = offset.checked_add(length) else {
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+            }
+            return Err(DiskError::FileCorrupt);
+        };
+
+        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
+        // Non-Unix: fall back to efficient read
+        #[cfg(unix)]
+        {
+            use memmap2::MmapOptions;
+            use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+            struct MmapCopyReadResult {
+                bytes: Bytes,
+                access_check_duration: StdDuration,
+                path_resolve_duration: StdDuration,
+                metadata_lookup_duration: StdDuration,
+                metadata_validate_duration: StdDuration,
+                file_open_duration: StdDuration,
+                mmap_map_duration: StdDuration,
+                mmap_copy_duration: StdDuration,
+                direct_read_copy_duration: StdDuration,
+                mmap_map_fault_delta: MmapPageFaultDelta,
+                mmap_copy_fault_delta: MmapPageFaultDelta,
+                direct_read_copy_fault_delta: MmapPageFaultDelta,
+                blocking_task_duration: StdDuration,
+            }
+
+            enum MmapCopyReadError {
+                Disk(DiskError),
+                OutOfBounds { actual_size: u64 },
+            }
+
+            impl From<DiskError> for MmapCopyReadError {
+                fn from(err: DiskError) -> Self {
+                    Self::Disk(err)
+                }
+            }
+
+            let start = StdInstant::now();
+            let root = self.root.clone();
+            let volume_owned = volume.to_owned();
+            let path_owned = path.to_owned();
+
+            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
+            let should_populate_mmap_read = should_populate_mmap_read(length);
+            let read_copy_method = local_read_copy_method();
+            let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
+            let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
+            let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
+            let read_result = tokio::task::spawn_blocking(move || {
+                let blocking_task_start = metrics_enabled.then(StdInstant::now);
+
+                let access_check_start = metrics_enabled.then(StdInstant::now);
+                let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
+                if !skip_access_checks(&volume_owned) {
+                    access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+                }
+                let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let path_resolve_start = metrics_enabled.then(StdInstant::now);
+                let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
+                check_path_length(file_path.to_string_lossy().as_ref())?;
+                let path_resolve_duration = path_resolve_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let file_open_start = metrics_enabled.then(StdInstant::now);
+                let mut file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
+                let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
+                let meta = file.metadata().map_err(DiskError::from)?;
+                let metadata_lookup_duration = metadata_lookup_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let metadata_validate_start = metrics_enabled.then(StdInstant::now);
+                if meta.len() < end_offset_u64 {
+                    return Err(MmapCopyReadError::OutOfBounds { actual_size: meta.len() });
+                }
+                let metadata_validate_duration =
+                    metadata_validate_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                #[cfg(target_os = "macos")]
+                if should_reclaim_after_read {
+                    let _ = set_std_fd_nocache(&file);
+                }
+
+                let mut mmap_map_duration = StdDuration::ZERO;
+                let mut mmap_copy_duration = StdDuration::ZERO;
+                let mut direct_read_copy_duration = StdDuration::ZERO;
+                let mut mmap_map_fault_delta = MmapPageFaultDelta::default();
+                let mut mmap_copy_fault_delta = MmapPageFaultDelta::default();
+                let mut direct_read_copy_fault_delta = MmapPageFaultDelta::default();
+                let mut _reclaim_offset = offset_u64;
+                let mut _reclaim_len = length;
+
+                let bytes = match read_copy_method {
+                    LocalReadCopyMethod::MmapCopy => {
+                        // mmap offsets on Unix must be page-size aligned. Align the
+                        // mapping down to the nearest page boundary, then slice out the
+                        // originally requested logical range.
+                        let page_size = mmap_page_size()?;
+                        let aligned_offset = offset_u64 - (offset_u64 % page_size);
+                        let logical_offset =
+                            usize::try_from(offset_u64 - aligned_offset).map_err(|_| DiskError::other("mmap offset overflow"))?;
+                        let map_len = logical_offset
+                            .checked_add(length)
+                            .ok_or_else(|| DiskError::other("mmap length overflow"))?;
+                        _reclaim_offset = aligned_offset;
+                        _reclaim_len = map_len;
+
+                        // SAFETY: The file is opened as read-only, and we're mapping a region
+                        // that we've already verified exists and is within file bounds. The
+                        // file offset passed to mmap is page-size aligned as required on Unix.
+                        let mmap_map_start = metrics_enabled.then(StdInstant::now);
+                        let mmap_map_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                        let mut mmap_options = MmapOptions::new();
+                        mmap_options.offset(aligned_offset).len(map_len);
+                        if should_populate_mmap_read {
+                            mmap_options.populate();
+                        }
+                        let mmap = unsafe { mmap_options.map(&file) }.map_err(DiskError::other)?;
+                        let mmap_map_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                        mmap_map_duration = mmap_map_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                        mmap_map_fault_delta = mmap_page_fault_delta(mmap_map_faults_before, mmap_map_faults_after);
+
+                        // Copy only the requested logical range into a Bytes buffer. This
+                        // avoids undefined behavior from treating OS-managed mmap memory as
+                        // allocator-managed Vec storage, at the cost of an extra copy.
+                        let end = logical_offset
+                            .checked_add(length)
+                            .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                        let mmap_copy_start = metrics_enabled.then(StdInstant::now);
+                        let mmap_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                        let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
+                        let mmap_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                        mmap_copy_duration = mmap_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                        mmap_copy_fault_delta = mmap_page_fault_delta(mmap_copy_faults_before, mmap_copy_faults_after);
+                        bytes
+                    }
+                    LocalReadCopyMethod::DirectReadCopy => {
+                        use std::io::{Read as _, Seek as _};
+
+                        let direct_read_copy_start = metrics_enabled.then(StdInstant::now);
+                        let direct_read_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                        file.seek(SeekFrom::Start(offset_u64)).map_err(DiskError::from)?;
+                        let mut buffer = vec![0; length];
+                        file.read_exact(&mut buffer).map_err(DiskError::from)?;
+                        let direct_read_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                        direct_read_copy_duration =
+                            direct_read_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                        direct_read_copy_fault_delta =
+                            mmap_page_fault_delta(direct_read_copy_faults_before, direct_read_copy_faults_after);
+                        Bytes::from(buffer)
+                    }
+                };
+
+                #[cfg(target_os = "linux")]
+                if should_reclaim_after_read && _reclaim_len > 0 {
+                    use core::num::NonZeroU64;
+                    use rustix::fs::{Advice, fadvise};
+
+                    let reclaim_len = NonZeroU64::new(
+                        u64::try_from(_reclaim_len).map_err(|_| DiskError::other("read reclaim length overflow"))?,
+                    )
+                    .ok_or_else(|| DiskError::other("read reclaim length overflow"))?;
+                    fadvise(&file, _reclaim_offset, Some(reclaim_len), Advice::DontNeed)
+                        .map_err(std::io::Error::from)
+                        .map_err(DiskError::from)?;
+                }
+
+                let blocking_task_duration = blocking_task_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                Ok::<MmapCopyReadResult, MmapCopyReadError>(MmapCopyReadResult {
+                    bytes,
+                    access_check_duration,
+                    path_resolve_duration,
+                    metadata_lookup_duration,
+                    metadata_validate_duration,
+                    file_open_duration,
+                    mmap_map_duration,
+                    mmap_copy_duration,
+                    direct_read_copy_duration,
+                    mmap_map_fault_delta,
+                    mmap_copy_fault_delta,
+                    direct_read_copy_fault_delta,
+                    blocking_task_duration,
+                })
+            })
+            .await
+            .map_err(DiskError::from)
+            .map_err(MmapCopyReadError::Disk)
+            .and_then(|result| result);
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.blocking_wait_stage, blocking_wait_start);
+            }
+            let read_result = match read_result {
+                Ok(read_result) => read_result,
+                Err(MmapCopyReadError::Disk(err)) => return Err(err),
+                Err(MmapCopyReadError::OutOfBounds { actual_size }) => {
+                    error!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        volume,
+                        path,
+                        offset,
+                        length,
+                        actual_size,
+                        reason = "read_file_mmap_copy_out_of_bounds",
+                        "Disk local read fallback failed"
+                    );
+                    return Err(DiskError::FileCorrupt);
+                }
+            };
+            if metrics_enabled && let Some(metrics) = metrics {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.blocking_task_stage,
+                    read_result.blocking_task_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.access_check_stage,
+                    read_result.access_check_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.path_resolve_stage,
+                    read_result.path_resolve_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.metadata_lookup_stage,
+                    read_result.metadata_lookup_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.metadata_validate_stage,
+                    read_result.metadata_validate_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.file_open_stage,
+                    read_result.file_open_duration.as_secs_f64(),
+                );
+                match read_copy_method {
+                    LocalReadCopyMethod::MmapCopy => {
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            metrics.path,
+                            metrics.mmap_map_stage,
+                            read_result.mmap_map_duration.as_secs_f64(),
+                        );
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            metrics.path,
+                            metrics.mmap_copy_stage,
+                            read_result.mmap_copy_duration.as_secs_f64(),
+                        );
+                        record_mmap_page_fault_delta(metrics.path, metrics.mmap_map_stage, read_result.mmap_map_fault_delta);
+                        record_mmap_page_fault_delta(metrics.path, metrics.mmap_copy_stage, read_result.mmap_copy_fault_delta);
+                    }
+                    LocalReadCopyMethod::DirectReadCopy => {
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            metrics.path,
+                            metrics.direct_read_copy_stage,
+                            read_result.direct_read_copy_duration.as_secs_f64(),
+                        );
+                        record_direct_read_page_fault_delta(
+                            metrics.path,
+                            metrics.direct_read_copy_stage,
+                            read_result.direct_read_copy_fault_delta,
+                        );
+                    }
+                }
+            }
+            let bytes = read_result.bytes;
+
+            // Log successful mmap read metrics
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            // Record mmap read metrics
+            rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
+
+            debug!(
+                size = length,
+                duration_ms = duration_ms,
+                mmap_populate = should_populate_mmap_read,
+                read_copy_method = ?read_copy_method,
+                "mmap_read_success"
+            );
+
+            return Ok(bytes);
+        }
+
+        // Non-Unix fallback: efficient read into Bytes
+        #[cfg(not(unix))]
+        {
+            // Record zero-copy fallback
+            rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
+
+            debug!(reason = "non_unix_platform", "zero_copy_fallback");
+
+            let access_check_start = metrics_enabled.then(std::time::Instant::now);
+            let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+            if !skip_access_checks(volume) {
+                access(&volume_dir)
+                    .await
+                    .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+            }
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.access_check_stage, access_check_start);
+            }
+
+            let path_resolve_start = metrics_enabled.then(std::time::Instant::now);
+            let file_path = local_disk_object_path(&self.root, volume, path)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.path_resolve_stage, path_resolve_start);
+            }
+
+            let file_path_clone = file_path.clone();
+            let metadata_lookup_start = metrics_enabled.then(std::time::Instant::now);
+            let meta_result = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
+                .await
+                .map_err(DiskError::from)
+                .and_then(|result| result);
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_lookup_stage, metadata_lookup_start);
+            }
+            let meta = meta_result?;
+
+            let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
+            if meta.len() < end_offset as u64 {
+                if let Some(metrics) = metrics {
+                    record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+                }
+                error!(
+                    event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    volume,
+                    path,
+                    offset,
+                    length,
+                    actual_size = meta.len(),
+                    reason = "read_file_mmap_copy_out_of_bounds",
+                    "Disk local read fallback failed"
+                );
+                return Err(DiskError::FileCorrupt);
+            }
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+            }
+
+            let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+
+            if offset > 0 {
+                f.seek(SeekFrom::Start(offset as u64)).await?;
+            }
+
+            let mut buffer = vec![0; length];
+            f.read_exact(&mut buffer).await?;
+
+            Ok(Bytes::from(buffer))
+        }
+    }
+
+    async fn open_read_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+        if !skip_access_checks(volume) {
+            access(&volume_dir)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+
+        let file_path = local_disk_object_path(&self.root, volume, path)?;
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+
+        let mut f = self.open_file_read_only(file_path).await?;
+
+        let meta = f.metadata().await?;
+        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+        if meta.len() < end_offset as u64 {
+            error!(
+                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                path,
+                offset,
+                length,
+                actual_size = meta.len(),
+                reason = "read_file_stream_out_of_bounds",
+                "Disk local read fallback failed"
+            );
+            return Err(DiskError::FileCorrupt);
+        }
+
+        if offset > 0 {
+            f.seek(SeekFrom::Start(offset as u64)).await?;
+        }
+
+        let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
+        let reader = FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop);
+        Ok(Box::new(StallTimeoutReader::new(reader, get_object_disk_read_timeout())))
+    }
+
+    async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader> {
+        let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+        if !skip_access_checks(volume) {
+            access(&volume_dir)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+
+        let file_path = local_disk_object_path(&self.root, volume, path)?;
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+
+        let f = self.open_file_read_only(file_path).await?;
+
+        Ok(Box::new(f))
+    }
+
+    async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
+        match mode {
+            WriteMode::Truncate { size_hint } => {
+                let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+                let file_path = local_disk_object_path(&self.root, volume, path)?;
+                check_path_length(file_path.to_string_lossy().as_ref())?;
+
+                if let Some(parent) = file_path.parent() {
+                    os::make_dir_all(parent, &volume_dir).await?;
+                }
+                // O_TRUNC: if a file already exists at this path, stale trailing bytes past
+                // the new content would otherwise survive and mismatch the metadata size.
+                let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY | O_TRUNC)
+                    .await
+                    .map_err(to_file_error)?;
+                let reclaim_on_shutdown = should_reclaim_file_cache_after_write(size_hint);
+
+                Ok(Box::new(FileCacheReclaimWriter::new(f, size_hint.max(0) as usize, reclaim_on_shutdown)))
+            }
+            WriteMode::Append => {
+                let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+                if !skip_access_checks(volume) {
+                    access(&volume_dir)
+                        .await
+                        .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+                }
+
+                let file_path = local_disk_object_path(&self.root, volume, path)?;
+                check_path_length(file_path.to_string_lossy().as_ref())?;
+
+                let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
+
+                Ok(Box::new(f))
+            }
+        }
+    }
+}
+
 pub struct LocalDisk {
     pub root: PathBuf,
     pub format_path: PathBuf,
@@ -688,6 +1247,7 @@ pub struct LocalDisk {
     startup_cleanup_ready: Arc<AtomicU32>,
     startup_cleanup_notify: Arc<Notify>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
+    io_backend: Arc<dyn LocalIoBackend>,
 }
 
 impl Drop for LocalDisk {
@@ -923,6 +1483,7 @@ impl LocalDisk {
             startup_cleanup_ready,
             startup_cleanup_notify,
             exit_signal: None,
+            io_backend: Arc::new(StdBackend::new(root.clone())),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
             log_startup_disk_error("get_disk_info", &root, err);
@@ -2976,103 +3537,26 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let volume_dir = self.get_bucket_path(volume)?;
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        //  TODO: writeAllDirect io.copy
-        // info!("file_path: {:?}", file_path);
-        if let Some(parent) = file_path.parent() {
-            os::make_dir_all(parent, &volume_dir).await?;
-        }
-        // O_TRUNC: if a file already exists at this path, stale trailing bytes past
-        // the new content would otherwise survive and mismatch the metadata size.
-        let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY | O_TRUNC)
+        self.io_backend
+            .open_write(volume, path, WriteMode::Truncate { size_hint: _file_size })
             .await
-            .map_err(to_file_error)?;
-        let reclaim_on_shutdown = should_reclaim_file_cache_after_write(_file_size);
-
-        Ok(Box::new(FileCacheReclaimWriter::new(f, _file_size.max(0) as usize, reclaim_on_shutdown)))
-
-        // Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume) {
-            access(&volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
-
-        Ok(Box::new(f))
+        self.io_backend.open_write(volume, path, WriteMode::Append).await
     }
 
     // TODO: io verifier
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        // warn!("disk read_file: volume: {}, path: {}", volume, path);
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume) {
-            access(&volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        let f = self.open_file_read_only(file_path).await?;
-
-        Ok(Box::new(f))
+        self.io_backend.open_full_read(volume, path).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume) {
-            access(&volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        let mut f = self.open_file_read_only(file_path).await?;
-
-        let meta = f.metadata().await?;
-        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
-        if meta.len() < end_offset as u64 {
-            error!(
-                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                volume,
-                path,
-                offset,
-                length,
-                actual_size = meta.len(),
-                reason = "read_file_stream_out_of_bounds",
-                "Disk local read fallback failed"
-            );
-            return Err(DiskError::FileCorrupt);
-        }
-
-        if offset > 0 {
-            f.seek(SeekFrom::Start(offset as u64)).await?;
-        }
-
-        let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
-        let reader = FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop);
-        Ok(Box::new(StallTimeoutReader::new(reader, get_object_disk_read_timeout())))
+        self.io_backend.open_read_stream(volume, path, offset, length).await
     }
 
     /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
@@ -3086,9 +3570,6 @@ impl DiskAPI for LocalDisk {
     }
 
     /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
-    // SAFETY: Unix unsafe calls in this function only query page size and mmap
-    // a read-only file region after bounds and alignment are validated.
-    #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_mmap_copy_with_metrics(
         &self,
@@ -3098,375 +3579,7 @@ impl DiskAPI for LocalDisk {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<Bytes> {
-        let metrics = metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
-        let metrics_enabled = metrics.is_some();
-
-        let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
-        let Some(end_offset) = offset.checked_add(length) else {
-            if let Some(metrics) = metrics {
-                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
-            }
-            return Err(DiskError::FileCorrupt);
-        };
-
-        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
-        // Non-Unix: fall back to efficient read
-        #[cfg(unix)]
-        {
-            use memmap2::MmapOptions;
-            use std::time::{Duration as StdDuration, Instant as StdInstant};
-
-            struct MmapCopyReadResult {
-                bytes: Bytes,
-                access_check_duration: StdDuration,
-                path_resolve_duration: StdDuration,
-                metadata_lookup_duration: StdDuration,
-                metadata_validate_duration: StdDuration,
-                file_open_duration: StdDuration,
-                mmap_map_duration: StdDuration,
-                mmap_copy_duration: StdDuration,
-                direct_read_copy_duration: StdDuration,
-                mmap_map_fault_delta: MmapPageFaultDelta,
-                mmap_copy_fault_delta: MmapPageFaultDelta,
-                direct_read_copy_fault_delta: MmapPageFaultDelta,
-                blocking_task_duration: StdDuration,
-            }
-
-            enum MmapCopyReadError {
-                Disk(DiskError),
-                OutOfBounds { actual_size: u64 },
-            }
-
-            impl From<DiskError> for MmapCopyReadError {
-                fn from(err: DiskError) -> Self {
-                    Self::Disk(err)
-                }
-            }
-
-            let start = StdInstant::now();
-            let root = self.root.clone();
-            let volume_owned = volume.to_owned();
-            let path_owned = path.to_owned();
-
-            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
-            let should_populate_mmap_read = should_populate_mmap_read(length);
-            let read_copy_method = local_read_copy_method();
-            let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
-            let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
-            let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
-            let read_result = tokio::task::spawn_blocking(move || {
-                let blocking_task_start = metrics_enabled.then(StdInstant::now);
-
-                let access_check_start = metrics_enabled.then(StdInstant::now);
-                let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
-                if !skip_access_checks(&volume_owned) {
-                    access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
-                }
-                let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-
-                let path_resolve_start = metrics_enabled.then(StdInstant::now);
-                let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
-                check_path_length(file_path.to_string_lossy().as_ref())?;
-                let path_resolve_duration = path_resolve_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-
-                let file_open_start = metrics_enabled.then(StdInstant::now);
-                let mut file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
-                let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-
-                let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
-                let meta = file.metadata().map_err(DiskError::from)?;
-                let metadata_lookup_duration = metadata_lookup_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-
-                let metadata_validate_start = metrics_enabled.then(StdInstant::now);
-                if meta.len() < end_offset_u64 {
-                    return Err(MmapCopyReadError::OutOfBounds { actual_size: meta.len() });
-                }
-                let metadata_validate_duration =
-                    metadata_validate_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-
-                #[cfg(target_os = "macos")]
-                if should_reclaim_after_read {
-                    let _ = set_std_fd_nocache(&file);
-                }
-
-                let mut mmap_map_duration = StdDuration::ZERO;
-                let mut mmap_copy_duration = StdDuration::ZERO;
-                let mut direct_read_copy_duration = StdDuration::ZERO;
-                let mut mmap_map_fault_delta = MmapPageFaultDelta::default();
-                let mut mmap_copy_fault_delta = MmapPageFaultDelta::default();
-                let mut direct_read_copy_fault_delta = MmapPageFaultDelta::default();
-                let mut _reclaim_offset = offset_u64;
-                let mut _reclaim_len = length;
-
-                let bytes = match read_copy_method {
-                    LocalReadCopyMethod::MmapCopy => {
-                        // mmap offsets on Unix must be page-size aligned. Align the
-                        // mapping down to the nearest page boundary, then slice out the
-                        // originally requested logical range.
-                        let page_size = mmap_page_size()?;
-                        let aligned_offset = offset_u64 - (offset_u64 % page_size);
-                        let logical_offset =
-                            usize::try_from(offset_u64 - aligned_offset).map_err(|_| DiskError::other("mmap offset overflow"))?;
-                        let map_len = logical_offset
-                            .checked_add(length)
-                            .ok_or_else(|| DiskError::other("mmap length overflow"))?;
-                        _reclaim_offset = aligned_offset;
-                        _reclaim_len = map_len;
-
-                        // SAFETY: The file is opened as read-only, and we're mapping a region
-                        // that we've already verified exists and is within file bounds. The
-                        // file offset passed to mmap is page-size aligned as required on Unix.
-                        let mmap_map_start = metrics_enabled.then(StdInstant::now);
-                        let mmap_map_faults_before = read_mmap_page_fault_counts(metrics_enabled);
-                        let mut mmap_options = MmapOptions::new();
-                        mmap_options.offset(aligned_offset).len(map_len);
-                        if should_populate_mmap_read {
-                            mmap_options.populate();
-                        }
-                        let mmap = unsafe { mmap_options.map(&file) }.map_err(DiskError::other)?;
-                        let mmap_map_faults_after = read_mmap_page_fault_counts(metrics_enabled);
-                        mmap_map_duration = mmap_map_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-                        mmap_map_fault_delta = mmap_page_fault_delta(mmap_map_faults_before, mmap_map_faults_after);
-
-                        // Copy only the requested logical range into a Bytes buffer. This
-                        // avoids undefined behavior from treating OS-managed mmap memory as
-                        // allocator-managed Vec storage, at the cost of an extra copy.
-                        let end = logical_offset
-                            .checked_add(length)
-                            .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
-                        let mmap_copy_start = metrics_enabled.then(StdInstant::now);
-                        let mmap_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
-                        let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
-                        let mmap_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
-                        mmap_copy_duration = mmap_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-                        mmap_copy_fault_delta = mmap_page_fault_delta(mmap_copy_faults_before, mmap_copy_faults_after);
-                        bytes
-                    }
-                    LocalReadCopyMethod::DirectReadCopy => {
-                        use std::io::{Read as _, Seek as _};
-
-                        let direct_read_copy_start = metrics_enabled.then(StdInstant::now);
-                        let direct_read_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
-                        file.seek(SeekFrom::Start(offset_u64)).map_err(DiskError::from)?;
-                        let mut buffer = vec![0; length];
-                        file.read_exact(&mut buffer).map_err(DiskError::from)?;
-                        let direct_read_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
-                        direct_read_copy_duration =
-                            direct_read_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-                        direct_read_copy_fault_delta =
-                            mmap_page_fault_delta(direct_read_copy_faults_before, direct_read_copy_faults_after);
-                        Bytes::from(buffer)
-                    }
-                };
-
-                #[cfg(target_os = "linux")]
-                if should_reclaim_after_read && _reclaim_len > 0 {
-                    use core::num::NonZeroU64;
-                    use rustix::fs::{Advice, fadvise};
-
-                    let reclaim_len = NonZeroU64::new(
-                        u64::try_from(_reclaim_len).map_err(|_| DiskError::other("read reclaim length overflow"))?,
-                    )
-                    .ok_or_else(|| DiskError::other("read reclaim length overflow"))?;
-                    fadvise(&file, _reclaim_offset, Some(reclaim_len), Advice::DontNeed)
-                        .map_err(std::io::Error::from)
-                        .map_err(DiskError::from)?;
-                }
-
-                let blocking_task_duration = blocking_task_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-
-                Ok::<MmapCopyReadResult, MmapCopyReadError>(MmapCopyReadResult {
-                    bytes,
-                    access_check_duration,
-                    path_resolve_duration,
-                    metadata_lookup_duration,
-                    metadata_validate_duration,
-                    file_open_duration,
-                    mmap_map_duration,
-                    mmap_copy_duration,
-                    direct_read_copy_duration,
-                    mmap_map_fault_delta,
-                    mmap_copy_fault_delta,
-                    direct_read_copy_fault_delta,
-                    blocking_task_duration,
-                })
-            })
-            .await
-            .map_err(DiskError::from)
-            .map_err(MmapCopyReadError::Disk)
-            .and_then(|result| result);
-            if let Some(metrics) = metrics {
-                record_mmap_copy_stage(metrics, metrics.blocking_wait_stage, blocking_wait_start);
-            }
-            let read_result = match read_result {
-                Ok(read_result) => read_result,
-                Err(MmapCopyReadError::Disk(err)) => return Err(err),
-                Err(MmapCopyReadError::OutOfBounds { actual_size }) => {
-                    error!(
-                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        volume,
-                        path,
-                        offset,
-                        length,
-                        actual_size,
-                        reason = "read_file_mmap_copy_out_of_bounds",
-                        "Disk local read fallback failed"
-                    );
-                    return Err(DiskError::FileCorrupt);
-                }
-            };
-            if metrics_enabled && let Some(metrics) = metrics {
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics.path,
-                    metrics.blocking_task_stage,
-                    read_result.blocking_task_duration.as_secs_f64(),
-                );
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics.path,
-                    metrics.access_check_stage,
-                    read_result.access_check_duration.as_secs_f64(),
-                );
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics.path,
-                    metrics.path_resolve_stage,
-                    read_result.path_resolve_duration.as_secs_f64(),
-                );
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics.path,
-                    metrics.metadata_lookup_stage,
-                    read_result.metadata_lookup_duration.as_secs_f64(),
-                );
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics.path,
-                    metrics.metadata_validate_stage,
-                    read_result.metadata_validate_duration.as_secs_f64(),
-                );
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics.path,
-                    metrics.file_open_stage,
-                    read_result.file_open_duration.as_secs_f64(),
-                );
-                match read_copy_method {
-                    LocalReadCopyMethod::MmapCopy => {
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            metrics.path,
-                            metrics.mmap_map_stage,
-                            read_result.mmap_map_duration.as_secs_f64(),
-                        );
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            metrics.path,
-                            metrics.mmap_copy_stage,
-                            read_result.mmap_copy_duration.as_secs_f64(),
-                        );
-                        record_mmap_page_fault_delta(metrics.path, metrics.mmap_map_stage, read_result.mmap_map_fault_delta);
-                        record_mmap_page_fault_delta(metrics.path, metrics.mmap_copy_stage, read_result.mmap_copy_fault_delta);
-                    }
-                    LocalReadCopyMethod::DirectReadCopy => {
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            metrics.path,
-                            metrics.direct_read_copy_stage,
-                            read_result.direct_read_copy_duration.as_secs_f64(),
-                        );
-                        record_direct_read_page_fault_delta(
-                            metrics.path,
-                            metrics.direct_read_copy_stage,
-                            read_result.direct_read_copy_fault_delta,
-                        );
-                    }
-                }
-            }
-            let bytes = read_result.bytes;
-
-            // Log successful mmap read metrics
-            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            // Record mmap read metrics
-            rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
-
-            debug!(
-                size = length,
-                duration_ms = duration_ms,
-                mmap_populate = should_populate_mmap_read,
-                read_copy_method = ?read_copy_method,
-                "mmap_read_success"
-            );
-
-            return Ok(bytes);
-        }
-
-        // Non-Unix fallback: efficient read into Bytes
-        #[cfg(not(unix))]
-        {
-            // Record zero-copy fallback
-            rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
-
-            debug!(reason = "non_unix_platform", "zero_copy_fallback");
-
-            let access_check_start = metrics_enabled.then(std::time::Instant::now);
-            let volume_dir = self.get_bucket_path(volume)?;
-            if !skip_access_checks(volume) {
-                access(&volume_dir)
-                    .await
-                    .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-            }
-            if let Some(metrics) = metrics {
-                record_mmap_copy_stage(metrics, metrics.access_check_stage, access_check_start);
-            }
-
-            let path_resolve_start = metrics_enabled.then(std::time::Instant::now);
-            let file_path = self.get_object_path(volume, path)?;
-            check_path_length(file_path.to_string_lossy().as_ref())?;
-            if let Some(metrics) = metrics {
-                record_mmap_copy_stage(metrics, metrics.path_resolve_stage, path_resolve_start);
-            }
-
-            let file_path_clone = file_path.clone();
-            let metadata_lookup_start = metrics_enabled.then(std::time::Instant::now);
-            let meta_result = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
-                .await
-                .map_err(DiskError::from)
-                .and_then(|result| result);
-            if let Some(metrics) = metrics {
-                record_mmap_copy_stage(metrics, metrics.metadata_lookup_stage, metadata_lookup_start);
-            }
-            let meta = meta_result?;
-
-            let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
-            if meta.len() < end_offset as u64 {
-                if let Some(metrics) = metrics {
-                    record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
-                }
-                error!(
-                    event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    volume,
-                    path,
-                    offset,
-                    length,
-                    actual_size = meta.len(),
-                    reason = "read_file_mmap_copy_out_of_bounds",
-                    "Disk local read fallback failed"
-                );
-                return Err(DiskError::FileCorrupt);
-            }
-            if let Some(metrics) = metrics {
-                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
-            }
-
-            let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
-
-            if offset > 0 {
-                f.seek(SeekFrom::Start(offset as u64)).await?;
-            }
-
-            let mut buffer = vec![0; length];
-            f.read_exact(&mut buffer).await?;
-
-            Ok(Bytes::from(buffer))
-        }
+        self.io_backend.pread_bytes(volume, path, offset, length, metrics).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -6371,5 +6484,84 @@ mod test {
     fn test_is_bitrot_size_mismatch_error_only_matches_target_message() {
         assert!(is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot shard file size mismatch")));
         assert!(!is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot hash mismatch")));
+    }
+
+    /// Differential test for the LocalIoBackend refactor: every read shape
+    /// (pread via mmap_copy, pread via direct_read_copy, bounded stream, full
+    /// read) must return byte-identical data for the same (offset, length),
+    /// including ranges straddling page boundaries and the file tail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn io_backend_read_shapes_return_identical_bytes() {
+        use tempfile::tempdir;
+        use tokio::io::AsyncReadExt;
+
+        const FILE_LEN: usize = 64 * 1024;
+
+        // Deterministic pseudo-random content (LCG) so failures are reproducible.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let content: Vec<u8> = (0..FILE_LEN)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let content = Bytes::from(content);
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+        disk.make_volume("test-volume").await.expect("operation should succeed");
+        disk.write_all("test-volume", "blob.bin", content.clone())
+            .await
+            .expect("operation should succeed");
+
+        let page = mmap_page_size().expect("page size should be available") as usize;
+        let ranges = [
+            (0usize, FILE_LEN),
+            (1, 17),
+            (page - 1, 2),
+            (page, page),
+            (2 * page - 1, page + 2),
+            (FILE_LEN - 7, 7),
+            (0, 0),
+        ];
+
+        for (offset, length) in ranges {
+            let expected = content.slice(offset..offset + length);
+
+            for method in [
+                RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY,
+                RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY,
+            ] {
+                let got = temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some(method))], async {
+                    disk.read_file_mmap_copy("test-volume", "blob.bin", offset, length)
+                        .await
+                        .expect("operation should succeed")
+                })
+                .await;
+                assert_eq!(got, expected, "pread_bytes({method}) mismatch at offset={offset} length={length}");
+            }
+
+            let mut stream = disk
+                .read_file_stream("test-volume", "blob.bin", offset, length)
+                .await
+                .expect("operation should succeed");
+            let mut streamed = vec![0u8; length];
+            stream.read_exact(&mut streamed).await.expect("operation should succeed");
+            assert_eq!(
+                Bytes::from(streamed),
+                expected,
+                "open_read_stream mismatch at offset={offset} length={length}"
+            );
+        }
+
+        let mut full = disk
+            .read_file("test-volume", "blob.bin")
+            .await
+            .expect("operation should succeed");
+        let mut all = Vec::new();
+        full.read_to_end(&mut all).await.expect("operation should succeed");
+        assert_eq!(Bytes::from(all), content, "open_full_read mismatch");
     }
 }
