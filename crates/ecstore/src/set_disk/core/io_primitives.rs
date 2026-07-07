@@ -2656,29 +2656,6 @@ impl SetDisks {
         Ok((online_disks, versions, data_dir, cleanup_disks))
     }
 
-<<<<<<< HEAD
-    /// Reclaim the old (now dereferenced) `object/<old_data_dir>` on the disks
-    /// that just committed the new version.
-    ///
-    /// # Deliberate divergence from MinIO (backlog#898)
-    ///
-    /// This runs *after* the write is authoritatively committed (`rename_data`
-    /// returned `Ok`, i.e. the new version is durable on >= write_quorum disks
-    /// and immediately readable). The target `object/<old_data_dir>` has already
-    /// been dereferenced from every committed replica's `xl.meta`, so removing
-    /// it is pure space reclamation. MinIO couples a below-quorum failure here
-    /// back into the client response (`erasure-object.go:1577`); RustFS
-    /// historically mirrored that (`reduce_write_quorum_errs` -> `Err` ->
-    /// 503/SlowDown), producing a **false-negative ACK** for an already-durable
-    /// write. We deliberately break that coupling: this function **never returns
-    /// `Err`**. It returns a structured [`OldDataDirCleanup`] receipt whose
-    /// fields are signals only — none of them can negate an already-ACKed write.
-    ///
-    /// The disk-health signal that MinIO raises via 503 is not dropped; the
-    /// caller re-surfaces it by enqueuing an object heal on residue (see
-    /// `report_old_data_dir_cleanup`), and the leaked residue is made observable
-    /// via `rustfs_old_data_dir_leaked_total`.
-=======
     pub(in crate::set_disk) fn reduce_common_versions(disk_versions: &[Option<Vec<u8>>], write_quorum: usize) -> Option<Vec<u8>> {
         let mut versions_count = HashMap::new();
 
@@ -2736,8 +2713,27 @@ impl SetDisks {
         versions
     }
 
-    #[allow(dead_code)]
->>>>>>> origin/main
+    /// Reclaim the old (now dereferenced) `object/<old_data_dir>` on the disks
+    /// that just committed the new version.
+    ///
+    /// # Deliberate divergence from MinIO (backlog#898)
+    ///
+    /// This runs *after* the write is authoritatively committed (`rename_data`
+    /// returned `Ok`, i.e. the new version is durable on >= write_quorum disks
+    /// and immediately readable). The target `object/<old_data_dir>` has already
+    /// been dereferenced from every committed replica's `xl.meta`, so removing
+    /// it is pure space reclamation. MinIO couples a below-quorum failure here
+    /// back into the client response (`erasure-object.go:1577`); RustFS
+    /// historically mirrored that (`reduce_write_quorum_errs` -> `Err` ->
+    /// 503/SlowDown), producing a **false-negative ACK** for an already-durable
+    /// write. We deliberately break that coupling: this function **never returns
+    /// `Err`**. It returns a structured [`OldDataDirCleanup`] receipt whose
+    /// fields are signals only — none of them can negate an already-ACKed write.
+    ///
+    /// The disk-health signal that MinIO raises via 503 is not dropped; the
+    /// caller re-surfaces it by enqueuing an object heal on residue (see
+    /// `report_old_data_dir_cleanup`), and the leaked residue is made observable
+    /// via `rustfs_old_data_dir_leaked_total`.
     #[tracing::instrument(level = "debug", skip(self, disks))]
     pub(in crate::set_disk) async fn commit_rename_data_dir(
         &self,
@@ -4088,7 +4084,6 @@ mod tests {
         release_read_repair_heal_reservation(&key).await;
     }
 
-<<<<<<< HEAD
     // ========================================================================
     // backlog#898 — groups A/C: pure old-data-dir cleanup classification.
     // ========================================================================
@@ -4203,7 +4198,8 @@ mod tests {
     fn clean_cleanup_receipt_triggers_no_actions() {
         let receipt = classify_old_data_dir_cleanup(&[None, None], &[true, true], 1);
         assert_eq!(old_data_dir_cleanup_actions(&receipt), CleanupActions::default());
-=======
+    }
+
     // ------------------------------------------------------------------
     // backlog#900: pick_latest_quorum_files_info must survive a single
     // corrupt-part disk (even in the merged representative slot) by deriving
@@ -4279,6 +4275,5 @@ mod tests {
             "all disks must be flagged corrupt"
         );
         assert!(infos.iter().all(|fi| !fi.is_valid()), "no half-corrupt FileInfo may be returned");
->>>>>>> origin/main
     }
 }
