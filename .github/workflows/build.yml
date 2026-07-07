@@ -243,13 +243,24 @@ jobs:
           verify_sha256() {
             local expected="$1"
             local file="$2"
+            local actual=""
+            local actual_line=""
 
             if command -v sha256sum >/dev/null 2>&1; then
-              printf '%s  %s\n' "$expected" "$file" | sha256sum -c -
+              actual_line=$(sha256sum -- "$file") || return 1
             elif command -v shasum >/dev/null 2>&1; then
-              printf '%s  %s\n' "$expected" "$file" | shasum -a 256 -c -
+              actual_line=$(shasum -a 256 -- "$file") || return 1
             else
               echo "No SHA-256 verification tool found" >&2
+              return 1
+            fi
+            actual="${actual_line%%[[:space:]]*}"
+
+            if [ "$actual" = "$expected" ]; then
+              echo "SHA256 verified OK: $actual"
+              return 0
+            else
+              echo "SHA256 mismatch: expected=$expected actual=$actual" >&2
               return 1
             fi
           }
