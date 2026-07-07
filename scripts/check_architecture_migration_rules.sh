@@ -1845,7 +1845,12 @@ if [[ -s "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
   report_failure "external runtime crates must source ECStore API symbols through their local storage_api boundary: $(paste -sd '; ' "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
 fi
 
+# crates/iam/tests/ecstore_test_compat/mod.rs is a reviewed test-only
+# boundary: the sequential-restart regression test (rustfs#4304) needs
+# api::global::update_erasure_type to flip into distributed-erasure mode so
+# namespace-lock acquisition fails while storage reads stay healthy.
 cat >"$GLOBAL_FACADE_BOUNDARY_EXPECTED_FILE" <<'EOF'
+crates/iam/tests/ecstore_test_compat/mod.rs
 rustfs/src/storage/storage_api.rs
 EOF
 

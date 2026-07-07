@@ -194,8 +194,22 @@ fn readiness_gate_blocks_path(path: &str, readiness: &GlobalReadiness) -> bool {
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
-fn service_not_ready_response() -> Response<BoxBody> {
-    let body: BoxBody = Full::new(Bytes::from_static(b"Service not ready"))
+/// Header exposing which startup dependency the readiness gate is waiting
+/// on, so operators can diagnose a 503 without shell access (rustfs#4304).
+const READINESS_PENDING_HEADER: &str = "x-rustfs-readiness-pending";
+
+/// Maps the current startup stage to the dependency the gate is waiting on.
+fn readiness_pending_dependency(stage: rustfs_common::SystemStage) -> &'static str {
+    match stage {
+        rustfs_common::SystemStage::Booting => "storage_quorum",
+        rustfs_common::SystemStage::StorageReady => "iam",
+        rustfs_common::SystemStage::IamReady | rustfs_common::SystemStage::FullReady => "startup_finalization",
+    }
+}
+
+fn service_not_ready_response(stage: rustfs_common::SystemStage) -> Response<BoxBody> {
+    let pending = readiness_pending_dependency(stage);
+    let body: BoxBody = Full::new(Bytes::from(format!("Service not ready: waiting for {pending}")))
         .map_err(|e| -> BoxError { Box::new(e) })
         .boxed_unsync();
 
@@ -210,6 +224,9 @@ fn service_not_ready_response() -> Response<BoxBody> {
     response
         .headers_mut()
         .insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(READINESS_PENDING_HEADER, HeaderValue::from_static(pending));
     response
 }
 
@@ -236,7 +253,7 @@ where
             let path = req.uri().path();
             debug!("ReadinessGateService: Received request for path: {}", path);
             if readiness_gate_blocks_path(path, &readiness) {
-                return Ok(service_not_ready_response());
+                return Ok(service_not_ready_response(readiness.current_stage()));
             }
             let resp = inner.call(req).await?;
             // System is ready, forward to the actual S3/RPC handlers
@@ -1205,7 +1222,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_not_ready_response_preserves_observable_contract() {
-        let response = service_not_ready_response();
+        let response = service_not_ready_response(rustfs_common::SystemStage::Booting);
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -1229,11 +1246,27 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("text/plain; charset=utf-8")
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(READINESS_PENDING_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("storage_quorum")
+        );
         let body = match response.into_body().collect().await {
             Ok(body) => body.to_bytes(),
             Err(err) => panic!("not-ready body should collect: {err}"),
         };
-        assert_eq!(body, Bytes::from_static(b"Service not ready"));
+        assert_eq!(body, Bytes::from_static(b"Service not ready: waiting for storage_quorum"));
+    }
+
+    /// rustfs#4304: operators must be able to tell from the 503 alone which
+    /// startup dependency the node is blocked on.
+    #[test]
+    fn readiness_pending_dependency_maps_every_stage() {
+        assert_eq!(readiness_pending_dependency(rustfs_common::SystemStage::Booting), "storage_quorum");
+        assert_eq!(readiness_pending_dependency(rustfs_common::SystemStage::StorageReady), "iam");
+        assert_eq!(readiness_pending_dependency(rustfs_common::SystemStage::IamReady), "startup_finalization");
     }
 
     #[test]
