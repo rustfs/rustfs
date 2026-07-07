@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod background_monitor;
 pub(crate) mod client;
 pub(crate) mod context_propagation;
 pub(crate) mod http_auth;
@@ -22,6 +23,8 @@ pub(crate) mod remote_disk;
 pub(crate) mod remote_locker;
 pub(crate) mod runtime_sources;
 
+pub use background_monitor::shutdown_background_monitors;
+pub(crate) use background_monitor::spawn_background_monitor;
 pub use client::{
     TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
 };

@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
@@ -693,12 +693,9 @@ impl RemotePeerS3Client {
                         let cancel_clone = cancel_token.clone();
                         let span = Self::recovery_monitor_span(&addr_clone);
 
-                        tokio::spawn(
-                            async move {
-                                Self::monitor_remote_peer_recovery(addr_clone, health_clone, cancel_clone).await;
-                            }
-                            .instrument(span),
-                        );
+                        super::spawn_background_monitor(span, async move {
+                            Self::monitor_remote_peer_recovery(addr_clone, health_clone, cancel_clone).await;
+                        });
                     }
                 }
             }
@@ -802,12 +799,9 @@ impl RemotePeerS3Client {
             let cancel_token = self.cancel_token.clone();
             let addr = self.addr.clone();
             let span = Self::recovery_monitor_span(&addr);
-            tokio::spawn(
-                async move {
-                    Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
-                }
-                .instrument(span),
-            );
+            super::spawn_background_monitor(span, async move {
+                Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
+            });
         }
     }
 }

@@ -68,7 +68,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, service::interceptor::InterceptedService, transport::Channel};
-use tracing::{Instrument, debug, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -393,12 +393,9 @@ impl RemoteDisk {
         let health = Arc::clone(&self.health);
         let cancel_token = self.cancel_token.clone();
         let span = Self::recovery_monitor_span(&addr, &endpoint);
-        tokio::spawn(
-            async move {
-                Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
-            }
-            .instrument(span),
-        );
+        super::spawn_background_monitor(span, async move {
+            Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
+        });
     }
 
     #[cfg(test)]
@@ -407,21 +404,18 @@ impl RemoteDisk {
         let endpoint = self.endpoint.clone();
         let addr = self.addr.clone();
         let span = Self::recovery_monitor_span(&addr, &endpoint);
-        tokio::spawn(
-            async move {
-                warn!(
-                    event = EVENT_REMOTE_DISK_HEALTH,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-                    endpoint = %endpoint,
-                    addr,
-                    state = "probe",
-                    "remote disk recovery monitor log probe"
-                );
-                let _ = tx.send(());
-            }
-            .instrument(span),
-        );
+        super::spawn_background_monitor(span, async move {
+            warn!(
+                event = EVENT_REMOTE_DISK_HEALTH,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                endpoint = %endpoint,
+                addr,
+                state = "probe",
+                "remote disk recovery monitor log probe"
+            );
+            let _ = tx.send(());
+        });
         rx
     }
 
@@ -478,12 +472,9 @@ impl RemoteDisk {
             let cancel_clone = cancel_token.clone();
             let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
 
-            tokio::spawn(
-                async move {
-                    Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-                }
-                .instrument(span),
-            );
+            super::spawn_background_monitor(span, async move {
+                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
+            });
         }
 
         loop {
@@ -544,12 +535,9 @@ impl RemoteDisk {
                         let cancel_clone = cancel_token.clone();
                         let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
 
-                        tokio::spawn(
-                            async move {
-                                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-                            }
-                            .instrument(span),
-                        );
+                        super::spawn_background_monitor(span, async move {
+                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
+                        });
                     }
                 }
             }

@@ -85,8 +85,8 @@ pub async fn init_global_config_sys(api: Arc<ECStore>) -> Result<()> {
     GLOBAL_CONFIG_SYS.init(api).await
 }
 
-pub async fn try_migrate_server_config(api: Arc<ECStore>) {
-    com::try_migrate_server_config(api).await
+pub async fn try_migrate_server_config(api: Arc<ECStore>, decrypt_fn: Option<crate::bucket::migration::LegacyBlobDecryptFn>) {
+    com::try_migrate_server_config(api, decrypt_fn).await
 }
 
 pub fn init() {

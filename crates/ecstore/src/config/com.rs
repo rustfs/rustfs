@@ -1089,7 +1089,7 @@ fn is_object_not_found(err: &Error) -> bool {
     *err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _) | Error::BucketNotFound(_))
 }
 
-pub async fn try_migrate_server_config<S>(api: Arc<S>)
+pub async fn try_migrate_server_config<S>(api: Arc<S>, decrypt_fn: Option<crate::bucket::migration::LegacyBlobDecryptFn>)
 where
     S: ObjectIO<
             Error = Error,
@@ -1160,6 +1160,15 @@ where
             warn!("read legacy server config body failed: {:?}", err);
             return;
         }
+    };
+
+    // MinIO encrypts the server config at rest with a key derived from the root
+    // credentials. Decrypt before decoding; fall back to the raw bytes when no key
+    // applies (plaintext configs) so existing behavior holds. The decrypted bytes
+    // also become the fidelity seed for `encode_server_config_blob` below.
+    let data = match &decrypt_fn {
+        Some(decrypt) => decrypt(&data).unwrap_or(data),
+        None => data,
     };
 
     let cfg = match decode_server_config_blob(&data) {
@@ -1808,6 +1817,30 @@ mod tests {
         let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
         let kvs = cfg.get_value("storage_class", "_").expect("storage_class should exist");
         assert!(kvs.0[0].hidden_if_empty);
+    }
+
+    #[test]
+    fn test_encrypted_server_config_requires_decrypt_before_decode() {
+        // Reproduces the MinIO drop-in migration gap for the server config: MinIO
+        // encrypts config.json at rest, so decode fails outright. The migration's
+        // decrypt callback must run first to recover it.
+        let plaintext = r#"{"storage_class":{"_":[{"key":"standard","value":"EC:2"}]}}"#.as_bytes();
+        let ciphertext = rustfs_crypto::encrypt_data(b"root-secret-key", plaintext).expect("encrypt config blob");
+
+        // Old behavior: decode cannot parse ciphertext -> Err -> migration skipped.
+        assert!(
+            decode_server_config_blob(&ciphertext).is_err(),
+            "ciphertext must not decode as a server config"
+        );
+
+        // With the decrypt callback recovering plaintext first, decode succeeds.
+        let decrypt_fn: crate::bucket::migration::LegacyBlobDecryptFn =
+            std::sync::Arc::new(|data: &[u8]| rustfs_crypto::decrypt_data(b"root-secret-key", data).ok());
+        let recovered = decrypt_fn(&ciphertext).expect("callback should decrypt the config blob");
+        assert_eq!(recovered, plaintext);
+        let cfg = decode_server_config_blob(&recovered).expect("decode should succeed on decrypted plaintext");
+        let kvs = cfg.get_value("storage_class", "_").expect("storage_class should exist");
+        assert_eq!(kvs.0[0].value, "EC:2");
     }
 
     #[test]
@@ -3023,10 +3056,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_recovery_falls_back_to_default_config_when_blob_stays_corrupt() {
         // Heal cannot repair the blob (all shards corrupt): boot with the
         // default config instead of crash-looping (issue #4156).
         // RUSTFS_CONFIG_RECOVER_ON_CORRUPTION is unset, so the default (on) applies.
+        // `#[serial]` keeps this off-by-default read from racing the sibling test
+        // that toggles ENV_CONFIG_RECOVER_ON_CORRUPTION via a process-wide env var.
         let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(corrupt_config_blob()), None));
 
         let cfg = read_config_without_migrate_with_recovery(store.clone())

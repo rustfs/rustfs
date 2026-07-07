@@ -459,13 +459,23 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
+// Enabled by default (backlog#872): the early-stop path only engages for
+// requests `should_allow_metadata_early_stop` classifies as safe (metadata-only
+// reads without version_id / healing / free-version needs) and still requires
+// a full read-quorum agreement before stopping. Set the env var to `false` to
+// fall back to full-wait metadata fanout.
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
 
 const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
+
+// --- Multipart Reader-Setup Prefetch Configuration (backlog#870) ---
+
+const ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: &str = "RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH";
+const DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: bool = true;
 
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -677,6 +687,31 @@ fn is_version_early_stop_enabled() -> bool {
             rustfs_utils::get_env_bool(
                 ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
                 DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
+            )
+        })
+    }
+}
+
+/// Check if multipart reads prefetch the next part's bitrot reader setup
+/// while the current part decodes (backlog#870).
+///
+/// **Note**: Cached via `OnceLock` in production. In test builds the env var
+/// is read directly so that `temp_env` overrides take effect.
+fn is_multipart_reader_setup_prefetch_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH,
+            DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH,
+                DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH,
             )
         })
     }
@@ -6897,6 +6932,119 @@ mod tests {
             .expect("range read should succeed");
 
         assert_eq!(out, payload[range_offset..range_offset + range_length]);
+    }
+
+    #[tokio::test]
+    async fn multipart_reads_stream_all_parts_with_setup_prefetch() {
+        use tokio::io::AsyncReadExt;
+        use uuid::Uuid;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let bucket = "bucket";
+        let object = "object";
+        // Three parts with distinct fill bytes so cross-part ordering bugs and
+        // prefetch boundary mistakes surface as content mismatches
+        // (backlog#870 exercises the prefetch hit path for parts 2 and 3).
+        let parts: Vec<Vec<u8>> = vec![
+            vec![b'a'; 2 * 1024 * 1024 + 111],
+            vec![b'b'; 1024 * 1024 + 17],
+            vec![b'c'; 3 * 1024 * 1024 + 923],
+        ];
+        let total_size: usize = parts.iter().map(|part| part.len()).sum();
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+
+        let mut fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+        let data_dir = Uuid::new_v4();
+        fi.data_dir = Some(data_dir);
+        fi.size = total_size as i64;
+        for (index, part) in parts.iter().enumerate() {
+            fi.add_object_part(index + 1, String::new(), part.len(), None, part.len() as i64, None, None);
+        }
+
+        let erasure = coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
+
+        for (index, payload) in parts.iter().enumerate() {
+            let part_number = index + 1;
+            let shard_path = format!("{object}/{data_dir}/part.{part_number}");
+            let checksum_info = fi.erasure.get_checksum_info(part_number);
+
+            let mut bitrot_writer = create_bitrot_writer(
+                true,
+                None,
+                bucket,
+                &shard_path,
+                payload.len() as i64,
+                erasure.shard_size(),
+                checksum_info.algorithm.clone(),
+            )
+            .await
+            .expect("bitrot writer should be created");
+
+            for chunk in payload.chunks(erasure.shard_size()) {
+                bitrot_writer.write(chunk).await.expect("payload chunk should be written");
+            }
+
+            let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
+            disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+                .await
+                .expect("encoded shard should be stored");
+        }
+
+        let files = vec![fi.clone()];
+        let disks = vec![Some(disk.clone())];
+        let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+        let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
+
+        let read_task = tokio::spawn(async move {
+            SetDisks::get_object_with_fileinfo(
+                bucket,
+                object,
+                0,
+                total_size as i64,
+                &mut writer,
+                fi,
+                files,
+                &disks,
+                0,
+                0,
+                true,
+                false,
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+                metrics_size_bucket,
+            )
+            .await
+        });
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("all part bytes should be readable");
+
+        read_task
+            .await
+            .expect("read task should complete")
+            .expect("multipart read should succeed");
+
+        let expected: Vec<u8> = parts.concat();
+        assert_eq!(out.len(), expected.len(), "all parts should be streamed");
+        assert_eq!(out, expected, "part contents and ordering must survive setup prefetch");
     }
 
     #[test]
