@@ -6988,19 +6988,38 @@ mod test {
         }
         drop_dataset_cache(&paths);
 
+        // Concurrency models the EC GET shape: FuturesUnordered over shard
+        // reads. concurrency=1 keeps the original sequential behavior.
+        let concurrency = env_usize("RUSTFS_BENCH_CONCURRENCY", 1).max(1);
+        let disk = std::sync::Arc::new(disk);
+
         let mut latencies_us = Vec::with_capacity(reads);
         let cpu_before = cpu_time_secs();
         let wall_start = Instant::now();
-        for r in 0..reads {
-            let name = format!("shard-{:04}.bin", pick(file_count));
-            let t = Instant::now();
-            let bytes = disk
-                .read_file_mmap_copy(VOLUME, &name, 0, shard_len)
-                .await
-                .expect("bench read");
-            latencies_us.push(t.elapsed().as_secs_f64() * 1e6);
-            assert_eq!(bytes.len(), shard_len);
-            if (r + 1) % file_count == 0 {
+        let mut done = 0usize;
+        while done < reads {
+            use futures::StreamExt;
+
+            let batch = concurrency.min(reads - done);
+            let mut tasks = futures::stream::FuturesUnordered::new();
+            for _ in 0..batch {
+                let name = format!("shard-{:04}.bin", pick(file_count));
+                let disk = disk.clone();
+                tasks.push(async move {
+                    let t = Instant::now();
+                    let bytes = disk
+                        .read_file_mmap_copy(VOLUME, &name, 0, shard_len)
+                        .await
+                        .expect("bench read");
+                    assert_eq!(bytes.len(), shard_len);
+                    t.elapsed().as_secs_f64() * 1e6
+                });
+            }
+            while let Some(lat) = tasks.next().await {
+                latencies_us.push(lat);
+            }
+            done += batch;
+            if done % file_count == 0 {
                 drop_dataset_cache(&paths);
             }
         }
@@ -7012,7 +7031,7 @@ mod test {
         let direct_enabled = std::env::var(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE).unwrap_or_default();
 
         println!(
-            "BENCH_RESULT {{\"direct_io_enabled\":\"{direct_enabled}\",\"shard_mib\":{shard_mib},\"file_count\":{file_count},\
+            "BENCH_RESULT {{\"direct_io_enabled\":\"{direct_enabled}\",\"concurrency\":{concurrency},\"shard_mib\":{shard_mib},\"file_count\":{file_count},\
 \"reads\":{reads},\"p50_us\":{:.1},\"p95_us\":{:.1},\"p99_us\":{:.1},\"mean_us\":{:.1},\"wall_s\":{wall:.3},\
 \"cpu_s\":{cpu:.3},\"throughput_mib_s\":{:.1}}}",
             percentile(&latencies_us, 0.50),
