@@ -531,7 +531,7 @@ impl AsyncRead for HashReader {
         let before = buf.filled().len();
         match this.inner.poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => {
+            Poll::Ready(Ok(())) => crate::hp_measure_block!("HashReader::on_chunk", {
                 let data = &buf.filled()[before..];
                 let filled = data.len();
 
@@ -612,7 +612,7 @@ impl AsyncRead for HashReader {
                     *this.checksum_on_finish = true;
                 }
                 Poll::Ready(Ok(()))
-            }
+            }),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
     }

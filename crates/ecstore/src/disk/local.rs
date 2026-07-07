@@ -2338,6 +2338,7 @@ impl LocalDisk {
         Ok((buf, mtime))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
 
@@ -2364,6 +2365,7 @@ impl LocalDisk {
         Ok((data, modtime))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
         // TODO: timeout support
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
@@ -3417,6 +3419,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
+        crate::hp_guard!("LocalDisk::read_all");
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let format_info = self.format_info.read().await;
             if !format_info.data.is_empty() {
@@ -3433,11 +3436,13 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip_all)]
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
+        crate::hp_guard!("LocalDisk::write_all");
         self.write_all_public(volume, path, data).await
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
+        crate::hp_guard!("LocalDisk::delete");
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume)
             && let Err(e) = access(&volume_dir).await
@@ -3794,6 +3799,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        crate::hp_guard!("LocalDisk::rename_file");
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
@@ -3852,6 +3858,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
+        crate::hp_guard!("LocalDisk::create_file");
         if !origvolume.is_empty() {
             let origvolume_dir = self.get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume) {
@@ -3875,11 +3882,13 @@ impl DiskAPI for LocalDisk {
     // TODO: io verifier
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
+        crate::hp_guard!("LocalDisk::read_file");
         self.io_backend.open_full_read(volume, path).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        crate::hp_guard!("LocalDisk::read_file_stream");
         self.io_backend.open_read_stream(volume, path, offset, length).await
     }
 
@@ -4031,6 +4040,7 @@ impl DiskAPI for LocalDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
+        crate::hp_guard!("LocalDisk::rename_data");
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         if !skip_access_checks(src_volume)
             && let Err(e) = super::fs::access_std(&src_volume_dir)
@@ -4524,6 +4534,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        crate::hp_guard!("LocalDisk::write_metadata");
         let p = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
         let mut meta = FileMeta::new();
@@ -4557,6 +4568,7 @@ impl DiskAPI for LocalDisk {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
+        crate::hp_guard!("LocalDisk::read_version");
         if !org_volume.is_empty() {
             let org_volume_path = self.get_bucket_path(org_volume)?;
             if !skip_access_checks(org_volume) {
@@ -4652,6 +4664,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
+        crate::hp_guard!("LocalDisk::read_xl");
         let file_path = self.get_object_path(volume, path)?;
         let file_dir = self.get_bucket_path(volume)?;
 
@@ -4881,6 +4894,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        crate::hp_guard!("LocalDisk::read_metadata");
         let file_path = self.get_object_path(volume, path)?;
         let volume_dir = self.get_bucket_path(volume)?;
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;

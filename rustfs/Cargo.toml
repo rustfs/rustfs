@@ -60,11 +60,19 @@ full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp"]
 manual-test-runners = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope"]
+hotpath = [
+    "dep:hotpath",
+    "hotpath/hotpath",
+    "rustfs-ecstore/hotpath",
+    "rustfs-filemeta/hotpath",
+    "rustfs-rio/hotpath",
+]
 
 [lints]
 workspace = true
 
 [dependencies]
+hotpath = { workspace = true, optional = true }
 # RustFS Internal Crates
 rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }

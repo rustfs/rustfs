@@ -28,7 +28,12 @@ documentation = "https://docs.rs/rustfs-rio/latest/rustfs_rio/"
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+
 [dependencies]
+hotpath = { workspace = true, optional = true }
 arc-swap.workspace = true
 tokio = { workspace = true, features = ["full"] }
 rand = { workspace = true }

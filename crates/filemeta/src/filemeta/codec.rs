@@ -19,6 +19,7 @@ impl FileMeta {
         !matches!(Self::check_xl2_v1(buf), Err(_e))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "FileMeta"))]
     pub fn load(buf: &[u8]) -> Result<FileMeta> {
         let mut xl = FileMeta::default();
         xl.unmarshal_msg(buf)?;
@@ -111,6 +112,7 @@ impl FileMeta {
         Ok((bin_len, remaining))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "FileMeta"))]
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let i = buf.len() as u64;
 
@@ -324,6 +326,7 @@ impl FileMeta {
         }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "FileMeta"))]
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut wr = Vec::new();
 
