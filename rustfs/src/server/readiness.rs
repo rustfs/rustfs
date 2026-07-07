@@ -43,8 +43,34 @@ use tokio::sync::Mutex;
 use tower::{Layer, Service};
 use tracing::{debug, info};
 
-pub const STARTUP_RUNTIME_READINESS_MAX_WAIT: Duration = Duration::from_secs(30);
+/// Default upper bound for the startup runtime-readiness wait.
+///
+/// This is the compile-time fallback used when
+/// [`rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS`] is unset or `0`. The
+/// effective value is resolved at runtime by [`startup_runtime_readiness_max_wait`],
+/// which lets slow multi-node cold starts (Docker/K8s/NAS) extend the budget past
+/// the internal DNS-retry and format-load windows without a rebuild.
+pub const STARTUP_RUNTIME_READINESS_MAX_WAIT: Duration =
+    Duration::from_secs(rustfs_config::DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS);
 pub const STARTUP_RUNTIME_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Resolve the effective startup runtime-readiness wait.
+///
+/// Reads `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS`, falling back to
+/// [`STARTUP_RUNTIME_READINESS_MAX_WAIT`] when unset. A configured value of `0`
+/// is treated as "use the default" rather than an instant timeout, so an empty or
+/// misconfigured env var can never make the server give up on readiness immediately.
+fn startup_runtime_readiness_max_wait() -> Duration {
+    let secs = rustfs_utils::get_env_u64(
+        rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS,
+        rustfs_config::DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS,
+    );
+    if secs == 0 {
+        STARTUP_RUNTIME_READINESS_MAX_WAIT
+    } else {
+        Duration::from_secs(secs)
+    }
+}
 const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
 const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
 
@@ -227,7 +253,7 @@ pub async fn publish_ready_when_runtime_ready(
     state_manager: Option<&ServiceStateManager>,
 ) -> Result<(), std::io::Error> {
     wait_for_runtime_readiness_with(
-        STARTUP_RUNTIME_READINESS_MAX_WAIT,
+        startup_runtime_readiness_max_wait(),
         STARTUP_RUNTIME_READINESS_POLL_INTERVAL,
         collect_node_readiness,
         |dependency_readiness| {
@@ -914,8 +940,30 @@ mod tests {
     #[test]
     fn startup_runtime_readiness_wait_constants_are_ordered() {
         assert!(STARTUP_RUNTIME_READINESS_MAX_WAIT > STARTUP_RUNTIME_READINESS_POLL_INTERVAL);
-        assert_eq!(STARTUP_RUNTIME_READINESS_MAX_WAIT.as_secs(), 30);
+        assert_eq!(
+            STARTUP_RUNTIME_READINESS_MAX_WAIT.as_secs(),
+            rustfs_config::DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS
+        );
         assert_eq!(STARTUP_RUNTIME_READINESS_POLL_INTERVAL.as_secs(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn startup_runtime_readiness_max_wait_reads_env_override() {
+        // An explicit override extends (or shortens) the budget.
+        with_var(rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS, Some("240"), || {
+            assert_eq!(startup_runtime_readiness_max_wait(), Duration::from_secs(240));
+        });
+
+        // Unset falls back to the compile-time default.
+        with_var(rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS, None::<&str>, || {
+            assert_eq!(startup_runtime_readiness_max_wait(), STARTUP_RUNTIME_READINESS_MAX_WAIT);
+        });
+
+        // Zero is treated as "use default", never an instant timeout.
+        with_var(rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS, Some("0"), || {
+            assert_eq!(startup_runtime_readiness_max_wait(), STARTUP_RUNTIME_READINESS_MAX_WAIT);
+        });
     }
 
     fn peer_health_test_pools() -> EndpointServerPools {
