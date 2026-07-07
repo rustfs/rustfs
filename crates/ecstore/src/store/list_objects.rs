@@ -4377,7 +4377,7 @@ impl ECStore {
                         continue;
                     }
 
-                    let fvs = match if opts.include_free_versions {
+                    let mut fvs = match if opts.include_free_versions {
                         entry.file_info_versions_with_free_versions(&bucket_clone)
                     } else {
                         entry.file_info_versions(&bucket_clone)
@@ -4396,8 +4396,13 @@ impl ECStore {
                         }
                     };
 
+                    // `FileMeta` keeps versions newest-first (`sort_by_mod_time`
+                    // sorts descending), so ascending emission is the exact
+                    // reverse. Callers such as replication resync walk with the
+                    // default (ascending) order so that re-applied versions
+                    // preserve the original version-stack order.
                     if opts.versions_sort == WalkVersionsSortOrder::Ascending {
-                        //TODO: SORT
+                        fvs.versions.reverse();
                     }
 
                     for fi in fvs.versions.iter() {
@@ -9212,6 +9217,36 @@ mod test {
         handle.await.unwrap().unwrap();
 
         assert_eq!(results, vec!["obj-a", "obj-b"]);
+    }
+
+    #[test]
+    fn walk_ascending_versions_contract_reverses_newest_first_metadata() {
+        // Documents the invariant the walk `versions_sort` handling relies on:
+        // `FileMeta` keeps versions newest-first, so ascending emission is the
+        // exact reverse of `file_info_versions` output.
+        let older = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let newer = time::OffsetDateTime::from_unix_timestamp(1_705_312_500).expect("valid timestamp");
+        let entry =
+            test_object_meta_entry_with_erasure_versions("obj-a", &[(older, "etag-old", 4, 2), (newer, "etag-new", 4, 2)]);
+
+        let fvs = entry.file_info_versions("bucket").expect("versions should parse");
+        assert_eq!(fvs.versions.len(), 2, "both versions should be visible");
+        assert!(
+            fvs.versions[0].mod_time >= fvs.versions[1].mod_time,
+            "file_info_versions must yield newest-first"
+        );
+        assert!(fvs.versions[0].is_latest, "the first (newest) version carries is_latest");
+
+        let mut ascending = fvs.versions.clone();
+        ascending.reverse();
+        assert!(
+            ascending[0].mod_time <= ascending[1].mod_time,
+            "reversing newest-first output must produce ascending mod_time order"
+        );
+        assert!(
+            ascending.last().expect("versions present").is_latest,
+            "ascending emission ends with the latest version"
+        );
     }
 
     #[tokio::test]
