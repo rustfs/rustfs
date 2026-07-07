@@ -234,10 +234,10 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 const-str = { version = "1.1.0", features = ["std", "proc"] }
 convert_case = "0.11.0"
 criterion = { version = "0.8", features = ["html_reports"] }
-crossbeam-queue = "0.3.12"
-crossbeam-channel = "0.5.15"
-crossbeam-deque = "0.8.6"
-crossbeam-utils = "0.8.21"
+crossbeam-queue = "0.3.13"
+crossbeam-channel = "0.5.16"
+crossbeam-deque = "0.8.7"
+crossbeam-utils = "0.8.22"
 datafusion = { git = "https://github.com/apache/datafusion.git", rev = "dae03ee062b2abf986de8df12ea82fb1578a2d99" }
 derive_builder = "0.20.2"
 enumset = "1.1.13"
@@ -330,7 +330,7 @@ libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
 suppaftp = { version = "10.0.0", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
-russh = { version = "0.62.1", features = ["serde"] }
+russh = { version = "0.62.2", features = ["serde"] }
 russh-sftp = "2.3.0"
 
 # WebDAV

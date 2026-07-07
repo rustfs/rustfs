@@ -243,13 +243,24 @@ jobs:
           verify_sha256() {
             local expected="$1"
             local file="$2"
+            local actual=""
+            local actual_line=""
 
             if command -v sha256sum >/dev/null 2>&1; then
-              printf '%s  %s\n' "$expected" "$file" | sha256sum -c -
+              actual_line=$(sha256sum -- "$file") || return 1
             elif command -v shasum >/dev/null 2>&1; then
-              printf '%s  %s\n' "$expected" "$file" | shasum -a 256 -c -
+              actual_line=$(shasum -a 256 -- "$file") || return 1
             else
               echo "No SHA-256 verification tool found" >&2
+              return 1
+            fi
+            actual="${actual_line%%[[:space:]]*}"
+
+            if [ "$actual" = "$expected" ]; then
+              echo "SHA256 verified OK: $actual"
+              return 0
+            else
+              echo "SHA256 mismatch: expected=$expected actual=$actual" >&2
               return 1
             fi
           }
@@ -286,6 +297,7 @@ jobs:
 
             read -r console_url console_sha256 < <("$python_bin" - "$console_json" <<'PY'
           import json
+          import re
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as handle:
@@ -296,7 +308,10 @@ jobs:
               digest = asset.get("digest", "")
               url = asset.get("browser_download_url", "")
               if name.startswith("rustfs-console-") and name.endswith(".zip") and digest.startswith("sha256:") and url:
-                  print(url, digest.split(":", 1)[1])
+                  sha256 = digest.split(":", 1)[1]
+                  if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+                      raise SystemExit(f"console zip asset has invalid sha256 digest: {sha256}")
+                  sys.stdout.buffer.write(f"{url} {sha256}\n".encode("utf-8"))
                   break
           else:
               raise SystemExit("no console zip asset with sha256 digest found")
