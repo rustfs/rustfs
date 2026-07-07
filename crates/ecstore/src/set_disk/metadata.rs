@@ -839,6 +839,55 @@ impl SetDisks {
         Err(DiskError::ErasureReadQuorum)
     }
 
+    /// Ownership-taking variant of `shuffle_disks_and_parts_metadata_by_index`
+    /// (backlog#873): callers that already own the vectors avoid one deep
+    /// `FileInfo` clone per disk by moving entries into their shuffled slots.
+    ///
+    /// Semantics match the borrowing variant, including the fallback to the
+    /// mod-time based placement when `parity_blocks` or more sources are
+    /// inconsistent; the consistency check runs as a read-only first pass so
+    /// the fallback still sees the untouched inputs.
+    pub(super) fn shuffle_disks_and_parts_metadata_by_index_owned(
+        mut disks: Vec<Option<DiskStore>>,
+        mut parts_metadata: Vec<FileInfo>,
+        fi: &FileInfo,
+    ) -> (Vec<Option<DiskStore>>, Vec<FileInfo>) {
+        let distribution = &fi.erasure.distribution;
+
+        let mut inconsistent = 0;
+        for (k, v) in parts_metadata.iter().enumerate() {
+            if disks[k].is_none() || !v.is_valid() || distribution[k] != v.erasure.index {
+                inconsistent += 1;
+            }
+        }
+
+        let use_by_index = inconsistent < fi.erasure.parity_blocks;
+        let init = fi.mod_time.is_none();
+
+        let mut shuffled_disks = vec![None; disks.len()];
+        let mut shuffled_parts_metadata = vec![FileInfo::default(); parts_metadata.len()];
+
+        for k in 0..parts_metadata.len() {
+            if disks[k].is_none() {
+                continue;
+            }
+            let eligible = if use_by_index {
+                parts_metadata[k].is_valid() && distribution[k] == parts_metadata[k].erasure.index
+            } else {
+                init || parts_metadata[k].is_valid()
+            };
+            if !eligible {
+                continue;
+            }
+
+            let block_idx = distribution[k];
+            shuffled_parts_metadata[block_idx - 1] = std::mem::take(&mut parts_metadata[k]);
+            shuffled_disks[block_idx - 1] = disks[k].take();
+        }
+
+        (shuffled_disks, shuffled_parts_metadata)
+    }
+
     pub(super) fn shuffle_disks_and_parts_metadata_by_index(
         disks: &[Option<DiskStore>],
         parts_metadata: &[FileInfo],
@@ -947,5 +996,80 @@ impl SetDisks {
             shuffled_parts_errs[idx - 1] = *v;
         }
         shuffled_parts_errs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn shuffle_test_disks(tempdir: &tempfile::TempDir, count: usize) -> Vec<Option<DiskStore>> {
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+        // The shuffle only inspects Some/None and clones the Arc handle, so
+        // one shared disk handle per slot is sufficient.
+        (0..count).map(|_| Some(disk.clone())).collect()
+    }
+
+    fn shuffle_fixture(consistent: bool) -> (FileInfo, Vec<FileInfo>) {
+        let mut fi = FileInfo::new("bucket/object", 2, 1);
+        fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        fi.size = 1;
+        fi.add_object_part(1, String::new(), 1, None, 1, None, None);
+
+        let slots = fi.erasure.distribution.len();
+        let parts = (0..slots)
+            .map(|k| {
+                let mut part_fi = fi.clone();
+                part_fi.erasure.index = if consistent {
+                    fi.erasure.distribution[k]
+                } else {
+                    // Misplace every source so the by-index pass is rejected
+                    // and the mod-time fallback placement runs instead.
+                    fi.erasure.distribution[(k + 1) % slots]
+                };
+                part_fi
+            })
+            .collect();
+        (fi, parts)
+    }
+
+    #[tokio::test]
+    async fn owned_shuffle_matches_borrowing_variant_when_consistent() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let (fi, parts) = shuffle_fixture(true);
+        let disks = shuffle_test_disks(&tempdir, parts.len()).await;
+
+        let (expected_disks, expected_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks.clone(), parts, &fi);
+
+        assert_eq!(owned_parts, expected_parts, "owned shuffle must place identical metadata");
+        let expected_slots: Vec<bool> = expected_disks.iter().map(Option::is_some).collect();
+        let owned_slots: Vec<bool> = owned_disks.iter().map(Option::is_some).collect();
+        assert_eq!(owned_slots, expected_slots, "owned shuffle must fill identical disk slots");
+    }
+
+    #[tokio::test]
+    async fn owned_shuffle_matches_borrowing_variant_on_fallback() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let (fi, parts) = shuffle_fixture(false);
+        let disks = shuffle_test_disks(&tempdir, parts.len()).await;
+
+        let (expected_disks, expected_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks.clone(), parts, &fi);
+
+        assert_eq!(owned_parts, expected_parts, "fallback placement must match the borrowing variant");
+        let expected_slots: Vec<bool> = expected_disks.iter().map(Option::is_some).collect();
+        let owned_slots: Vec<bool> = owned_disks.iter().map(Option::is_some).collect();
+        assert_eq!(owned_slots, expected_slots, "fallback disk slots must match the borrowing variant");
     }
 }
