@@ -53,7 +53,7 @@ use tokio::{net::TcpStream, time::Duration};
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 pub const PEER_RESTSIGNAL: &str = "signal";
 pub const PEER_RESTSUB_SYS: &str = "sub-sys";
@@ -184,15 +184,29 @@ impl PeerRestClient {
         let offline = Arc::clone(&self.offline);
         let recovery_running = Arc::clone(&self.recovery_running);
         let span = Self::recovery_monitor_span(&grid_host);
+        // The offline flag and its recovery are the silent half of
+        // rustfs/backlog#888: log the monitor's start and its success so an
+        // "offline then back" episode leaves a trace on the observing node.
+        warn!(
+            event = "peer_connection_marked_offline",
+            grid_host = %self.grid_host,
+            "peer RPC connection marked offline after a network-like failure; starting background recovery monitor"
+        );
         super::spawn_background_monitor(span, async move {
             let mut delay = get_drive_active_check_interval();
             let connect_timeout = get_drive_active_check_timeout();
 
-            for _ in 0..PEER_REST_RECOVERY_MAX_ATTEMPTS {
+            for attempt in 1..=PEER_REST_RECOVERY_MAX_ATTEMPTS {
                 tokio::time::sleep(delay).await;
                 if Self::perform_connectivity_check(&grid_host, connect_timeout).await.is_ok() {
                     offline.store(false, Ordering::Release);
                     recovery_running.store(false, Ordering::Release);
+                    info!(
+                        event = "peer_connection_recovered",
+                        grid_host = %grid_host,
+                        attempts = attempt,
+                        "peer connectivity restored by background recovery monitor"
+                    );
                     return;
                 }
 
