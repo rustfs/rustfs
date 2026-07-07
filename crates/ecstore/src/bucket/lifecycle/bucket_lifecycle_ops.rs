@@ -3513,6 +3513,71 @@ mod tests {
         }
     }
 
+    // Run `test_fn` with durable (fsync) writes disabled, restoring the original
+    // `RUSTFS_DRIVE_SYNC_ENABLE` afterwards even if the test panics. Disabling
+    // drive sync strips the unbounded per-commit `fsync` latency out of the
+    // serialized `put_object_part_commit` critical section, so a burst of
+    // concurrent same-part resends cannot pile up past the lock-acquire deadline
+    // under parallel-CI IO starvation (the flake fixed here). The generation
+    // invariant the caller asserts is independent of whether shards are fsynced.
+    //
+    // The env is mutated only in the synchronous prologue/epilogue around the whole
+    // test future — before any concurrent task is spawned and after
+    // `catch_unwind().await` has driven every task to completion — and the caller is
+    // `#[serial]`, so the shared multipart test store (which reads
+    // `RUSTFS_DRIVE_SYNC_ENABLE` only on active rename/write paths) never reads it
+    // while it is being written.
+    //
+    // SAFETY: `env::set_var`/`env::remove_var` never overlap an env read; see the
+    // prologue/epilogue + `#[serial]` argument above. No concurrent reader/writer
+    // can observe a torn update.
+    #[allow(unsafe_code)]
+    async fn with_drive_sync_disabled<F, Fut>(test_fn: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        const KEY: &str = "RUSTFS_DRIVE_SYNC_ENABLE";
+        let original = env::var_os(KEY);
+        unsafe {
+            env::set_var(KEY, "false");
+        }
+
+        let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+
+        match original {
+            Some(value) => unsafe {
+                env::set_var(KEY, value);
+            },
+            None => unsafe {
+                env::remove_var(KEY);
+            },
+        }
+
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    // Deterministic guard that `with_drive_sync_disabled` actually turns fsync off
+    // inside the scope and restores the prior setting afterwards. This is what lets
+    // `concurrent_resend_same_part_commits_one_generation` rely on tiny, fsync-free
+    // commit holds instead of an IO-latency-sensitive lock deadline.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn drive_sync_disabled_helper_scopes_env() {
+        let before = crate::disk::local::drive_sync_enabled();
+        with_drive_sync_disabled(|| async {
+            assert!(!crate::disk::local::drive_sync_enabled(), "drive sync must be disabled inside the scope");
+        })
+        .await;
+        assert_eq!(
+            crate::disk::local::drive_sync_enabled(),
+            before,
+            "drive sync must be restored to its original value after the scope"
+        );
+    }
+
     // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
     // single-thread runtime (`worker_threads = 1`), so no concurrent reader/writer can access
     // process environment while `env::set_var`/`env::remove_var` is active.
@@ -4696,106 +4761,114 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn concurrent_resend_same_part_commits_one_generation() {
-        use crate::storage_api_contracts::object::ObjectIO as _;
+        // Durable writes are disabled for the duration: this test asserts the
+        // one-generation invariant, not fsync behaviour, and keeping fsync out of
+        // the serialized commit critical section prevents parallel-CI IO
+        // starvation from inflating a commit hold past the lock-acquire deadline
+        // and turning a healthy serialization into a spurious `Lock(Timeout)`.
+        with_drive_sync_disabled(|| async {
+            use crate::storage_api_contracts::object::ObjectIO as _;
 
-        let (_paths, ecstore) = setup_test_env().await;
-        let bucket = format!("multipart-resend-{}", Uuid::new_v4().simple());
-        let object = "resend/object.txt";
-        create_test_bucket(&ecstore, &bucket).await;
+            let (_paths, ecstore) = setup_test_env().await;
+            let bucket = format!("multipart-resend-{}", Uuid::new_v4().simple());
+            let object = "resend/object.txt";
+            create_test_bucket(&ecstore, &bucket).await;
 
-        let upload = ecstore
-            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
-            .await
-            .expect("multipart upload should be created");
+            let upload = ecstore
+                .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
 
-        // Distinct payloads with distinct sizes: a mixed-generation reassembly
-        // would produce bytes matching none of them (or fail the read outright).
-        let candidates: Vec<Vec<u8>> = (0..6)
-            .map(|g| {
-                let len = 4096 + g * 512;
-                vec![b'a' + g as u8; len]
-            })
-            .collect();
+            // Distinct payloads with distinct sizes: a mixed-generation reassembly
+            // would produce bytes matching none of them (or fail the read outright).
+            let candidates: Vec<Vec<u8>> = (0..6)
+                .map(|g| {
+                    let len = 4096 + g * 512;
+                    vec![b'a' + g as u8; len]
+                })
+                .collect();
 
-        let mut tasks = tokio::task::JoinSet::new();
-        for payload in candidates.iter().cloned() {
-            let store = ecstore.clone();
-            let bucket = bucket.clone();
-            let upload_id = upload.upload_id.clone();
-            tasks.spawn(async move {
-                let mut data = PutObjReader::from_vec(payload.clone());
-                store
-                    .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
-                    .await
-                    .map(|info| (info, payload))
-            });
-        }
+            let mut tasks = tokio::task::JoinSet::new();
+            for payload in candidates.iter().cloned() {
+                let store = ecstore.clone();
+                let bucket = bucket.clone();
+                let upload_id = upload.upload_id.clone();
+                tasks.spawn(async move {
+                    let mut data = PutObjReader::from_vec(payload.clone());
+                    store
+                        .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
+                        .await
+                        .map(|info| (info, payload))
+                });
+            }
 
-        // Every concurrent resend must succeed. The per-uploadId commit lock must
-        // not starve a waiter into a lock-acquire timeout: the shared fast-lock
-        // notify pool could otherwise route this lock's wakeup to a waiter of an
-        // unrelated lock and strand this one until the deadline (fixed in
-        // fast_lock::shard by bounding each notification wait, so a lost/stolen
-        // wakeup degrades to bounded re-polling instead of a hard timeout).
-        let mut results = Vec::new();
-        while let Some(joined) = tasks.join_next().await {
-            let outcome = joined.expect("put_object_part task should not panic");
-            results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
-        }
-        assert_eq!(results.len(), candidates.len());
+            // Every concurrent resend must succeed. The per-uploadId commit lock must
+            // not starve a waiter into a lock-acquire timeout: the shared fast-lock
+            // notify pool could otherwise route this lock's wakeup to a waiter of an
+            // unrelated lock and strand this one until the deadline (fixed in
+            // fast_lock::shard by bounding each notification wait, so a lost/stolen
+            // wakeup degrades to bounded re-polling instead of a hard timeout).
+            let mut results = Vec::new();
+            while let Some(joined) = tasks.join_next().await {
+                let outcome = joined.expect("put_object_part task should not panic");
+                results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
+            }
+            assert_eq!(results.len(), candidates.len());
 
-        // Exactly one generation is visible after the serialized commits, and its
-        // recorded size/etag matches one of the payloads we actually wrote.
-        let parts = ecstore
-            .list_object_parts(
-                &bucket,
-                object,
-                &upload.upload_id,
-                None,
-                crate::set_disk::MAX_PARTS_COUNT,
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("multipart parts should be readable after concurrent resends");
-        assert_eq!(parts.parts.len(), 1, "only one generation of part 1 should remain visible");
-        let visible = &parts.parts[0];
-        assert_eq!(visible.part_num, 1);
+            // Exactly one generation is visible after the serialized commits, and its
+            // recorded size/etag matches one of the payloads we actually wrote.
+            let parts = ecstore
+                .list_object_parts(
+                    &bucket,
+                    object,
+                    &upload.upload_id,
+                    None,
+                    crate::set_disk::MAX_PARTS_COUNT,
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("multipart parts should be readable after concurrent resends");
+            assert_eq!(parts.parts.len(), 1, "only one generation of part 1 should remain visible");
+            let visible = &parts.parts[0];
+            assert_eq!(visible.part_num, 1);
 
-        let winner = results
-            .iter()
-            .find(|(info, _)| info.etag == visible.etag && info.size == visible.size)
-            .map(|(_, payload)| payload.clone())
-            .expect("the visible part must match exactly one payload that was committed");
+            let winner = results
+                .iter()
+                .find(|(info, _)| info.etag == visible.etag && info.size == visible.size)
+                .map(|(_, payload)| payload.clone())
+                .expect("the visible part must match exactly one payload that was committed");
 
-        let completed = ecstore
-            .clone()
-            .complete_multipart_upload(
-                &bucket,
-                object,
-                &upload.upload_id,
-                vec![crate::storage_api_contracts::multipart::CompletePart {
-                    part_num: 1,
-                    etag: visible.etag.clone(),
-                    checksum_crc32: None,
-                    checksum_crc32c: None,
-                    checksum_sha1: None,
-                    checksum_sha256: None,
-                    checksum_crc64nvme: None,
-                }],
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("complete multipart upload should succeed with the committed generation");
-        assert_eq!(completed.size, winner.len() as i64);
+            let completed = ecstore
+                .clone()
+                .complete_multipart_upload(
+                    &bucket,
+                    object,
+                    &upload.upload_id,
+                    vec![crate::storage_api_contracts::multipart::CompletePart {
+                        part_num: 1,
+                        etag: visible.etag.clone(),
+                        checksum_crc32: None,
+                        checksum_crc32c: None,
+                        checksum_sha1: None,
+                        checksum_sha256: None,
+                        checksum_crc64nvme: None,
+                    }],
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("complete multipart upload should succeed with the committed generation");
+            assert_eq!(completed.size, winner.len() as i64);
 
-        // The reassembled object bytes must equal the winning generation exactly
-        // — proof that no shard from a different generation leaked into the read.
-        let mut reader = ecstore
-            .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
-            .await
-            .expect("completed object should be readable");
-        let bytes = reader.read_all().await.expect("object bytes should be readable");
-        assert_eq!(bytes, winner, "reassembled object must match one intact generation, not a mix of shards");
+            // The reassembled object bytes must equal the winning generation exactly
+            // — proof that no shard from a different generation leaked into the read.
+            let mut reader = ecstore
+                .get_object_reader(&bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("completed object should be readable");
+            let bytes = reader.read_all().await.expect("object bytes should be readable");
+            assert_eq!(bytes, winner, "reassembled object must match one intact generation, not a mix of shards");
+        })
+        .await;
     }
 
     #[tokio::test]
