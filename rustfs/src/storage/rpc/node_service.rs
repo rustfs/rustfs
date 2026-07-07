@@ -2061,6 +2061,7 @@ mod tests {
         let request = Request::new(DeleteVolumeRequest {
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
+            force: false,
         });
 
         let response = service.delete_volume(request).await;

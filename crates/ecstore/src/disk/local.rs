@@ -4364,12 +4364,23 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
-        // TODO: avoid recursive deletion; return errVolumeNotEmpty when files remain
+        // Non-force is non-recursive: `remove_dir` (rmdir) fails atomically with
+        // `DirectoryNotEmpty` -> VolumeNotEmpty if the bucket still holds any
+        // object data, so a misclassified "dangling" bucket on the heal path
+        // (or a non-force S3 DeleteBucket on a populated bucket) can never be
+        // recursively wiped. Only an explicit `force_delete` (e.g. S3 force
+        // bucket delete) removes recursively. Mirrors MinIO's
+        // xlStorage.DeleteVol (Remove vs RemoveAll). (backlog#799 B1)
+        let res = if force_delete {
+            fs::remove_dir_all(&p).await
+        } else {
+            fs::remove_dir(&p).await
+        };
 
-        if let Err(err) = fs::remove_dir_all(&p).await {
+        if let Err(err) = res {
             let e: DiskError = to_volume_error(err).into();
             if e != DiskError::VolumeNotFound {
                 return Err(e);
@@ -5762,7 +5773,7 @@ mod test {
 
         disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
-        disk.delete_volume("a").await.expect("operation should succeed");
+        disk.delete_volume("a", true).await.expect("operation should succeed");
 
         let _ = fs::remove_dir_all(&p).await;
     }
@@ -5871,7 +5882,48 @@ mod test {
             .expect("operation should succeed");
 
         // Clean up
-        disk.delete_volume("test-volume").await.expect("operation should succeed");
+        disk.delete_volume("test-volume", true)
+            .await
+            .expect("operation should succeed");
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn delete_volume_non_force_refuses_non_empty_bucket() {
+        // backlog#799 B1: a non-force delete_volume must refuse a bucket that
+        // still holds object data (VolumeNotEmpty) and leave it intact, so a
+        // misclassified "dangling" bucket cannot be recursively wiped. Only an
+        // explicit force delete removes it recursively.
+        let test_dir = "./test_b1_delete_volume_guard";
+        let _ = fs::remove_dir_all(&test_dir).await;
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        disk.make_volume("b1-bucket").await.expect("operation should succeed");
+        let data: Vec<u8> = vec![1, 2, 3];
+        disk.write_all("b1-bucket", "obj.dat", data.clone().into())
+            .await
+            .expect("operation should succeed");
+
+        // Non-force must refuse and preserve the data.
+        let err = disk
+            .delete_volume("b1-bucket", false)
+            .await
+            .expect_err("non-empty bucket must be refused");
+        assert!(matches!(err, DiskError::VolumeNotEmpty), "expected VolumeNotEmpty, got {err:?}");
+        assert!(
+            disk.stat_volume("b1-bucket").await.is_ok(),
+            "bucket must still exist after a refused non-force delete"
+        );
+        assert_eq!(disk.read_all("b1-bucket", "obj.dat").await.expect("data preserved"), data);
+
+        // Force removes it recursively.
+        disk.delete_volume("b1-bucket", true)
+            .await
+            .expect("force delete removes non-empty");
+        assert!(disk.stat_volume("b1-bucket").await.is_err(), "bucket must be gone after force delete");
+
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
@@ -5899,7 +5951,7 @@ mod test {
 
         // Test deleting volumes
         for vol in &volumes {
-            disk.delete_volume(vol).await.expect("operation should succeed");
+            disk.delete_volume(vol, true).await.expect("operation should succeed");
         }
 
         // Clean up the test directory
