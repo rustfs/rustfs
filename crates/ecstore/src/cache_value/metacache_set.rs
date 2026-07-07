@@ -280,6 +280,13 @@ async fn list_path_raw_inner(
                         );
                     }
                     Err(err) => {
+                        if err.is_metacache_output_stream_closed() {
+                            rustfs_io_metrics::record_stage_duration(
+                                "metacache_walk_dir_primary",
+                                primary_walk_started.elapsed().as_secs_f64() * 1000.0,
+                            );
+                            return Ok(());
+                        }
                         rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_primary_failed",
                             primary_walk_started.elapsed().as_secs_f64() * 1000.0,
@@ -427,6 +434,13 @@ async fn list_path_raw_inner(
                         last_err = None;
                     }
                     Err(err) => {
+                        if err.is_metacache_output_stream_closed() {
+                            rustfs_io_metrics::record_stage_duration(
+                                "metacache_walk_dir_fallback",
+                                fallback_walk_started.elapsed().as_secs_f64() * 1000.0,
+                            );
+                            return Ok(());
+                        }
                         rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_fallback_failed",
                             fallback_walk_started.elapsed().as_secs_f64() * 1000.0,
@@ -490,7 +504,7 @@ async fn list_path_raw_inner(
             // );
 
             if rx.is_cancelled() {
-                return Err(DiskError::other("canceled"));
+                return Ok(());
             }
 
             let mut top_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
@@ -780,6 +794,9 @@ async fn list_path_raw_inner(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
+                if err.is_metacache_output_stream_closed() {
+                    continue;
+                }
                 if is_missing_path_error(&err) {
                     debug!(
                         event = EVENT_METACACHE_LISTING,
@@ -1082,6 +1099,43 @@ mod tests {
 
         let listing = result.expect("list_path_raw should abort unresponsive producer instead of hanging");
         listing.expect("unresponsive producer within failure budget should not fail quorum EOF");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_treats_external_cancel_as_successful_shutdown() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        list_path_raw(
+            cancel,
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::IgnoreCancel],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("external cancellation should stop listing without a synthetic canceled error");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_ignores_closed_output_stream_after_quorum_eof() {
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Eof,
+                    TestReaderBehavior::Eof,
+                    TestReaderBehavior::ProducerError(DiskError::metacache_output_stream_closed()),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closed metacache output after quorum EOF should not fail listing");
     }
 
     #[tokio::test]

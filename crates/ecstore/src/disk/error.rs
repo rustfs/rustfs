@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use rustfs_rio::{InternodeHttpError, InternodeHttpErrorKind};
+use std::error::Error as StdError;
 use std::hash::{Hash, Hasher};
 use std::io::{self};
 use std::path::PathBuf;
 
 pub type Error = DiskError;
 pub type Result<T> = core::result::Result<T, Error>;
+
+const METACACHE_OUTPUT_STREAM_CLOSED: &str = "metacache output stream closed";
 
 // DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
@@ -158,6 +161,26 @@ impl DiskError {
         DiskError::Io(std::io::Error::other(error))
     }
 
+    pub(crate) fn metacache_output_stream_closed() -> Self {
+        DiskError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, METACACHE_OUTPUT_STREAM_CLOSED))
+    }
+
+    pub(crate) fn is_metacache_output_stream_closed(&self) -> bool {
+        matches!(
+            self,
+            DiskError::Io(io_error)
+                if io_error.kind() == std::io::ErrorKind::BrokenPipe
+                    && io_error.to_string() == METACACHE_OUTPUT_STREAM_CLOSED
+        )
+    }
+
+    pub(crate) fn contains_io_error_kind(&self, kind: std::io::ErrorKind) -> bool {
+        match self {
+            DiskError::Io(io_error) => io_error_chain_contains_kind(io_error, kind),
+            _ => false,
+        }
+    }
+
     pub fn is_all_not_found(errs: &[Option<DiskError>]) -> bool {
         for err in errs.iter() {
             if let Some(err) = err {
@@ -258,6 +281,29 @@ impl From<rustfs_filemeta::Error> for DiskError {
             e => DiskError::other(e),
         }
     }
+}
+
+fn io_error_chain_contains_kind(io_error: &std::io::Error, kind: std::io::ErrorKind) -> bool {
+    if io_error.kind() == kind {
+        return true;
+    }
+
+    let mut source = StdError::source(io_error);
+    while let Some(err) = source {
+        if let Some(io_error) = err.downcast_ref::<std::io::Error>()
+            && io_error.kind() == kind
+        {
+            return true;
+        }
+        if let Some(disk_error) = err.downcast_ref::<DiskError>()
+            && disk_error.contains_io_error_kind(kind)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+
+    false
 }
 
 impl From<std::io::Error> for DiskError {
@@ -898,6 +944,23 @@ mod tests {
         let converted_io: std::io::Error = disk_error.into();
         assert_eq!(converted_io.kind(), std::io::ErrorKind::BrokenPipe);
         assert!(converted_io.to_string().contains("broken pipe"));
+    }
+
+    #[test]
+    fn test_wrapped_io_error_kind_detection() {
+        let filemeta_error = rustfs_filemeta::Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe"));
+        let disk_error = DiskError::from(filemeta_error);
+
+        assert!(disk_error.contains_io_error_kind(std::io::ErrorKind::BrokenPipe));
+        assert!(!disk_error.contains_io_error_kind(std::io::ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn test_metacache_output_stream_closed_classification_survives_clone() {
+        let disk_error = DiskError::metacache_output_stream_closed();
+
+        assert!(disk_error.is_metacache_output_stream_closed());
+        assert!(disk_error.clone().is_metacache_output_stream_closed());
     }
 
     #[test]
