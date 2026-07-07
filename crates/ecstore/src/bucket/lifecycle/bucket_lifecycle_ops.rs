@@ -4717,31 +4717,43 @@ mod tests {
             })
             .collect();
 
-        let mut tasks = tokio::task::JoinSet::new();
-        for payload in candidates.iter().cloned() {
-            let store = ecstore.clone();
-            let bucket = bucket.clone();
-            let upload_id = upload.upload_id.clone();
-            tasks.spawn(async move {
-                let mut data = PutObjReader::from_vec(payload.clone());
-                store
-                    .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
-                    .await
-                    .map(|info| (info, payload))
-            });
-        }
+        // Two independent causes can produce a spurious lock-acquire timeout
+        // here, and both must stay covered:
+        // 1. A lost/stolen fast-lock wakeup could strand a waiter until the
+        //    deadline — fixed for real in fast_lock::shard by bounding each
+        //    notification wait (NOTIFY_WAIT_CAP re-polling).
+        // 2. Under the full nextest suite on loaded CI disks, the six
+        //    *legitimately serialized* cross-disk commits can exceed the small
+        //    default acquire timeout (5s) all by themselves — observed on CI
+        //    even with fix 1 in place. Raise the timeout to the production
+        //    default (30s) for the concurrent section so the guard asserts the
+        //    correctness property (exactly one intact generation), not disk
+        //    latency. `#[serial]` keeps the process-wide env override isolated.
+        let results = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("30"))], async {
+            let mut tasks = tokio::task::JoinSet::new();
+            for payload in candidates.iter().cloned() {
+                let store = ecstore.clone();
+                let bucket = bucket.clone();
+                let upload_id = upload.upload_id.clone();
+                tasks.spawn(async move {
+                    let mut data = PutObjReader::from_vec(payload.clone());
+                    store
+                        .put_object_part(&bucket, object, &upload_id, 1, &mut data, &ObjectOptions::default())
+                        .await
+                        .map(|info| (info, payload))
+                });
+            }
 
-        // Every concurrent resend must succeed. The per-uploadId commit lock must
-        // not starve a waiter into a lock-acquire timeout: the shared fast-lock
-        // notify pool could otherwise route this lock's wakeup to a waiter of an
-        // unrelated lock and strand this one until the deadline (fixed in
-        // fast_lock::shard by bounding each notification wait, so a lost/stolen
-        // wakeup degrades to bounded re-polling instead of a hard timeout).
-        let mut results = Vec::new();
-        while let Some(joined) = tasks.join_next().await {
-            let outcome = joined.expect("put_object_part task should not panic");
-            results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
-        }
+            // Every concurrent resend must succeed; the commit lock must never
+            // starve a waiter into a timeout.
+            let mut results = Vec::new();
+            while let Some(joined) = tasks.join_next().await {
+                let outcome = joined.expect("put_object_part task should not panic");
+                results.push(outcome.expect("every concurrent same-part resend must succeed without lock timeout"));
+            }
+            results
+        })
+        .await;
         assert_eq!(results.len(), candidates.len());
 
         // Exactly one generation is visible after the serialized commits, and its
