@@ -39,11 +39,14 @@ use std::{collections::HashMap, sync::Arc};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::error;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, warn};
 
 lazy_static! {
     pub static ref GLOBAL_BUCKET_METADATA_SYS: OnceLock<Arc<RwLock<BucketMetadataSys>>> = OnceLock::new();
 }
+
+const BUCKET_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
     let mut sys = BucketMetadataSys::new(api);
@@ -51,7 +54,11 @@ pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
 
     let sys = Arc::new(RwLock::new(sys));
 
-    GLOBAL_BUCKET_METADATA_SYS.set(sys).unwrap();
+    GLOBAL_BUCKET_METADATA_SYS.set(sys.clone()).unwrap();
+
+    if runtime_sources::setup_is_dist_erasure().await {
+        start_refresh_buckets_metadata_loop(sys);
+    }
 }
 
 pub fn get_global_bucket_metadata_sys() -> Option<Arc<RwLock<BucketMetadataSys>>> {
@@ -83,6 +90,67 @@ pub async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
     let sys = get_bucket_metadata_sys()?;
     let lock = sys.read().await;
     Ok(lock.remove(bucket).await)
+}
+
+fn start_refresh_buckets_metadata_loop(sys: Arc<RwLock<BucketMetadataSys>>) {
+    let Some(cancel_token) = runtime_sources::background_services_cancel_token().cloned() else {
+        warn!("bucket metadata refresh loop skipped because background cancellation token is not initialized");
+        return;
+    };
+
+    tokio::spawn(async move {
+        refresh_buckets_metadata_loop(sys, cancel_token).await;
+    });
+}
+
+async fn refresh_buckets_metadata_loop(sys: Arc<RwLock<BucketMetadataSys>>, cancel_token: CancellationToken) {
+    loop {
+        if !wait_refresh_interval_or_cancel(&cancel_token, BUCKET_METADATA_REFRESH_INTERVAL).await {
+            break;
+        }
+        refresh_buckets_metadata_once(sys.clone()).await;
+    }
+}
+
+async fn wait_refresh_interval_or_cancel(cancel_token: &CancellationToken, interval: Duration) -> bool {
+    tokio::select! {
+        _ = cancel_token.cancelled() => false,
+        _ = sleep(interval) => true,
+    }
+}
+
+async fn refresh_buckets_metadata_once(sys: Arc<RwLock<BucketMetadataSys>>) {
+    let buckets = {
+        let sys = sys.read().await;
+        sys.bucket_names().await
+    };
+    if buckets.is_empty() {
+        return;
+    }
+
+    let count = runtime_sources::endpoint_erasure_set_count()
+        .map(|count| count * 10)
+        .unwrap_or(10)
+        .max(1);
+    let mut failed_buckets = HashSet::new();
+
+    for chunk in buckets.chunks(count) {
+        let sys = sys.read().await;
+        sys.concurrent_load(chunk, &mut failed_buckets).await;
+    }
+
+    if !failed_buckets.is_empty() {
+        warn!(
+            failed_bucket_count = failed_buckets.len(),
+            "bucket metadata refresh loop left buckets queued for retry"
+        );
+    }
+}
+
+async fn sync_bucket_target_sys(bucket: &str, bm: &BucketMetadata) {
+    BucketTargetSys::get()
+        .update_all_targets(bucket, bm.bucket_target_config.as_ref())
+        .await;
 }
 
 pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -295,10 +363,6 @@ impl BucketMetadataSys {
         let mut initialized = self.initialized.write().await;
         *initialized = true;
 
-        if runtime_sources::setup_is_dist_erasure().await {
-            // TODO: refresh_buckets_metadata_loop
-        }
-
         Ok(())
     }
 
@@ -325,18 +389,11 @@ impl BucketMetadataSys {
 
         let results = join_all(futures).await;
 
-        let mut idx = 0;
-
-        let mut mp = self.metadata_map.write().await;
-
-        // TODO: EventNotifier
-        for res in results {
+        for (idx, res) in results.into_iter().enumerate() {
             match res {
                 Ok(res) => {
                     if let Some(bucket) = buckets.get(idx) {
-                        let x = Arc::new(res);
-                        mp.insert(bucket.clone(), x.clone());
-                        BucketTargetSys::get().set(bucket, &x).await;
+                        self.set(bucket.clone(), Arc::new(res)).await;
                     }
                 }
                 Err(e) => {
@@ -346,8 +403,6 @@ impl BucketMetadataSys {
                     }
                 }
             }
-
-            idx += 1;
         }
     }
 
@@ -367,7 +422,9 @@ impl BucketMetadataSys {
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
         if !is_meta_bucketname(&bucket) {
             let mut map = self.metadata_map.write().await;
-            map.insert(bucket, bm);
+            map.insert(bucket.clone(), bm.clone());
+            drop(map);
+            sync_bucket_target_sys(&bucket, &bm).await;
         }
     }
 
@@ -379,7 +436,12 @@ impl BucketMetadataSys {
             return false;
         }
         let mut map = self.metadata_map.write().await;
-        map.remove(bucket).is_some()
+        let removed = map.remove(bucket).is_some();
+        drop(map);
+        if removed {
+            BucketTargetSys::get().delete(bucket).await;
+        }
+        removed
     }
 
     async fn _reset(&mut self) {
@@ -466,6 +528,10 @@ impl BucketMetadataSys {
         Ok(())
     }
 
+    async fn bucket_names(&self) -> Vec<String> {
+        self.metadata_map.read().await.keys().cloned().collect()
+    }
+
     pub async fn get_config_from_disk(&self, bucket: &str) -> Result<BucketMetadata> {
         if is_meta_bucketname(bucket) {
             return Err(Error::other("errInvalidArgument"));
@@ -498,6 +564,8 @@ impl BucketMetadataSys {
 
             let bm = Arc::new(bm);
             map.insert(bucket.to_string(), bm.clone());
+            drop(map);
+            sync_bucket_target_sys(bucket, &bm).await;
 
             Ok((bm, true))
         }
@@ -697,13 +765,9 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_replication_config(&self, bucket: &str) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
-        let (bm, reload) = self.get_config(bucket).await?;
+        let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.replication_config {
-            if reload {
-                // TODO: globalBucketTargetSys
-            }
-            //println!("549 {:?}", config.clone());
             Ok((config.clone(), bm.replication_config_updated_at))
         } else {
             Err(Error::ConfigNotFound)
@@ -711,17 +775,95 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_bucket_targets_config(&self, bucket: &str) -> Result<BucketTargets> {
-        let (bm, reload) = self.get_config(bucket).await?;
+        let (bm, _) = self.get_config(bucket).await?;
 
         if let Some(config) = &bm.bucket_target_config {
-            if reload {
-                // TODO: globalBucketTargetSys
-                //config.
-            }
-
             Ok(config.clone())
         } else {
             Err(Error::ConfigNotFound)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bucket::target::{BucketTarget, BucketTargetType, Credentials};
+    use serial_test::serial;
+    use tokio::time::timeout;
+
+    fn target(bucket: &str, id: &str) -> BucketTarget {
+        BucketTarget {
+            source_bucket: bucket.to_string(),
+            endpoint: format!("{id}.example.com:9000"),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                ..Default::default()
+            }),
+            target_bucket: format!("{bucket}-{id}"),
+            arn: format!("arn:rustfs:replication:us-east-1:{bucket}:{id}"),
+            target_type: BucketTargetType::ReplicationService,
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn metadata_reload_syncs_bucket_target_sys() {
+        let bucket = "metadata-reload-targets";
+        let target_sys = BucketTargetSys::get();
+        target_sys.delete(bucket).await;
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.bucket_target_config = Some(BucketTargets {
+            targets: vec![target(bucket, "fresh")],
+        });
+
+        sync_bucket_target_sys(bucket, &bm).await;
+
+        let targets = target_sys
+            .list_bucket_targets(bucket)
+            .await
+            .expect("target sync should publish bucket targets");
+        assert_eq!(targets.targets.len(), 1);
+        assert_eq!(targets.targets[0].arn, format!("arn:rustfs:replication:us-east-1:{bucket}:fresh"));
+
+        target_sys.delete(bucket).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn metadata_reload_clears_stale_bucket_targets_when_config_is_removed() {
+        let bucket = "metadata-clear-targets";
+        let target_sys = BucketTargetSys::get();
+        target_sys.delete(bucket).await;
+        target_sys
+            .targets_map
+            .write()
+            .await
+            .insert(bucket.to_string(), vec![target(bucket, "stale")]);
+
+        let bm = BucketMetadata::new(bucket);
+        sync_bucket_target_sys(bucket, &bm).await;
+
+        assert!(target_sys.list_bucket_targets(bucket).await.is_err());
+        target_sys.delete(bucket).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_wait_exits_when_cancelled() {
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let should_refresh = timeout(
+            Duration::from_millis(100),
+            wait_refresh_interval_or_cancel(&cancel_token, Duration::from_secs(60)),
+        )
+        .await
+        .expect("cancelled refresh wait should not sleep until the interval");
+
+        assert!(!should_refresh);
     }
 }

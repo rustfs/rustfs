@@ -21,7 +21,7 @@ use crate::data_usage::load_data_usage_cache;
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use rustfs_common::heal_channel::DriveState;
 use rustfs_madmin::{
-    BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties,
+    BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, MemStats, ServerProperties,
 };
 use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
@@ -128,10 +128,22 @@ pub async fn get_local_server_property() -> ServerProperties {
     let addr = runtime_sources::local_node_name().await;
     let mut pool_numbers = HashSet::new();
     let mut network = HashMap::new();
+    let (mem_stats, max_procs, num_cpu) = collect_runtime_server_stats();
 
     let endpoints = match runtime_sources::endpoint_pools() {
         Some(eps) => eps,
-        None => return ServerProperties::default(),
+        None => {
+            return ServerProperties {
+                state: ITEM_INITIALIZING.to_string(),
+                endpoint: addr,
+                uptime: runtime_sources::boot_uptime_secs(),
+                version: get_commit_id(),
+                mem_stats,
+                max_procs,
+                num_cpu,
+                ..Default::default()
+            };
+        }
     };
     for ep in endpoints.as_ref().iter() {
         for endpoint in ep.endpoints.as_ref().iter() {
@@ -154,14 +166,14 @@ pub async fn get_local_server_property() -> ServerProperties {
         }
     }
 
-    // todo: mem collect
-    // let mem_stats =
-
     let mut props = ServerProperties {
         endpoint: addr,
         uptime: runtime_sources::boot_uptime_secs(),
         network,
         version: get_commit_id(),
+        mem_stats,
+        max_procs,
+        num_cpu,
         ..Default::default()
     };
 
@@ -187,6 +199,15 @@ pub async fn get_local_server_property() -> ServerProperties {
     };
 
     props
+}
+
+fn collect_runtime_server_stats() -> (MemStats, u64, u64) {
+    let num_cpu = u64::try_from(num_cpus::get()).unwrap_or(u64::MAX);
+    let max_procs = std::thread::available_parallelism()
+        .map(|parallelism| u64::try_from(parallelism.get()).unwrap_or(u64::MAX))
+        .unwrap_or(num_cpu.max(1));
+
+    (rustfs_madmin::health::collect_mem_stats(), max_procs, num_cpu)
 }
 
 pub async fn get_server_info(get_pools: bool) -> InfoMessage {
@@ -393,7 +414,7 @@ mod tests {
 
     use crate::runtime::sources as runtime_sources;
 
-    use super::get_server_info;
+    use super::{get_local_server_property, get_server_info};
 
     #[serial]
     #[tokio::test]
@@ -402,5 +423,18 @@ mod tests {
         let info = get_server_info(false).await;
 
         assert_eq!(info.deployment_id, expected_deployment_id);
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn local_server_property_includes_runtime_stats_without_endpoint_pools() {
+        let props = get_local_server_property().await;
+
+        assert!(props.num_cpu > 0);
+        assert!(props.max_procs > 0);
+        assert!(
+            props.mem_stats.alloc > 0 || props.mem_stats.total_alloc > 0 || props.mem_stats.heap_alloc > 0,
+            "memory stats should not remain fixed placeholders"
+        );
     }
 }

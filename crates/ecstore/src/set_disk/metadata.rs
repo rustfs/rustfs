@@ -235,7 +235,8 @@ impl SetDisks {
 
     pub(super) fn list_object_parities(parts_metadata: &[FileInfo], errs: &[Option<DiskError>]) -> Vec<i32> {
         let total_shards = parts_metadata.len();
-        let half = total_shards as i32 / 2;
+        let total_shards_i32 = i32::try_from(total_shards).unwrap_or(i32::MAX);
+        let half = total_shards_i32 / 2;
         let mut parities: Vec<i32> = vec![-1; total_shards];
 
         for (index, metadata) in parts_metadata.iter().enumerate() {
@@ -251,11 +252,12 @@ impl SetDisks {
 
             if metadata.deleted || metadata.size == 0 {
                 parities[index] = half;
-            // } else if metadata.transition_status == "TransitionComplete" {
-            // TODO: metadata.transition_status
-            //     parities[index] = total_shards - (total_shards / 2 + 1);
+            } else if metadata.transition_status == TRANSITION_COMPLETE {
+                let majority_metadata_parity = total_shards_i32 - (half + 1);
+                let erasure_parity = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(i32::MAX);
+                parities[index] = majority_metadata_parity.max(erasure_parity);
             } else {
-                parities[index] = metadata.erasure.parity_blocks as i32;
+                parities[index] = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(i32::MAX);
             }
         }
         parities
@@ -502,6 +504,12 @@ impl SetDisks {
         }
     }
 
+    fn file_info_has_encryption_metadata(meta: &FileInfo) -> bool {
+        meta.metadata
+            .keys()
+            .any(|name| http::is_encryption_metadata_key(name) || http::is_sse_header(name))
+    }
+
     fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
         value
             .get(..prefix.len())
@@ -560,6 +568,11 @@ impl SetDisks {
         hasher.update(meta.size.to_le_bytes());
         hasher.update([u8::from(meta.deleted), u8::from(meta.mark_deleted)]);
         hasher.update([u8::from(meta.expire_restored)]);
+        hasher.update([
+            u8::from(meta.is_remote()),
+            u8::from(Self::file_info_has_encryption_metadata(meta)),
+            u8::from(meta.is_compressed()),
+        ]);
         Self::update_hash_optional_time(hasher, meta.mod_time);
         Self::update_hash_str(hasher, &meta.transition_status);
         Self::update_hash_str(hasher, &meta.transition_tier);
@@ -747,14 +760,6 @@ impl SetDisks {
             let mod_valid = mod_time == &meta.mod_time;
 
             if etag_only || mod_valid {
-                if meta.is_remote() {
-                    // TODO:
-                }
-
-                // TODO: IsEncrypted
-
-                // TODO: IsCompressed
-
                 meta_hashes[i] = Some(Self::file_info_quorum_hash(meta));
             } else {
                 debug!(
@@ -1002,6 +1007,104 @@ impl SetDisks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_quorum_test_fileinfo(mod_time: OffsetDateTime, erasure_index: usize) -> FileInfo {
+        let mut fi = FileInfo::new("bucket/object", 2, 2);
+        fi.name = "bucket/object".to_string();
+        fi.size = 8 * 1024 * 1024;
+        fi.mod_time = Some(mod_time);
+        fi.data_dir = Some(Uuid::new_v4());
+        fi.metadata.insert("etag".to_string(), "object-etag".to_string());
+        fi.add_object_part(1, "part-etag".to_string(), 8 * 1024 * 1024, Some(mod_time), 8 * 1024 * 1024, None, None);
+        fi.erasure.index = erasure_index;
+        fi
+    }
+
+    fn transition_metadata_quorum_fileinfo(erasure_index: usize) -> FileInfo {
+        let mut fi = FileInfo::new("bucket/object", 5, 1);
+        fi.name = "bucket/object".to_string();
+        fi.size = 8 * 1024 * 1024;
+        fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        fi.metadata.insert("etag".to_string(), "object-etag".to_string());
+        fi.transition_status = TRANSITION_COMPLETE.to_string();
+        fi.transition_tier = "WARM".to_string();
+        fi.transitioned_objname = "remote/object".to_string();
+        fi.transition_version_id = Some(Uuid::new_v4());
+        fi.erasure.index = erasure_index;
+        fi
+    }
+
+    fn expect_metadata_quorum_error(metas: Vec<FileInfo>, mod_time: OffsetDateTime, message: &str) {
+        let err = SetDisks::find_file_info_in_quorum(&metas, &Some(mod_time), &None, 3).expect_err(message);
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn metadata_quorum_uses_simple_majority_for_transitioned_objects() {
+        let parts_metadata = (1..=6).map(transition_metadata_quorum_fileinfo).collect::<Vec<_>>();
+        let errs = vec![None; parts_metadata.len()];
+
+        let parities = SetDisks::list_object_parities(&parts_metadata, &errs);
+        let quorum = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 1)
+            .expect("transitioned metadata should resolve object quorum");
+
+        assert_eq!(parities, vec![2; 6]);
+        assert_eq!(quorum, (4, 4));
+    }
+
+    #[test]
+    fn find_file_info_in_quorum_rejects_encrypted_plain_metadata_split() {
+        let mod_time = OffsetDateTime::now_utc();
+        let mut encrypted_a = metadata_quorum_test_fileinfo(mod_time, 1);
+        let mut encrypted_b = metadata_quorum_test_fileinfo(mod_time, 2);
+        let plain = metadata_quorum_test_fileinfo(mod_time, 3);
+        encrypted_a
+            .metadata
+            .insert("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string());
+        encrypted_b
+            .metadata
+            .insert("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string());
+
+        expect_metadata_quorum_error(
+            vec![encrypted_a, encrypted_b, plain],
+            mod_time,
+            "mixed encrypted and plain metadata must not reach quorum",
+        );
+    }
+
+    #[test]
+    fn find_file_info_in_quorum_rejects_compressed_plain_metadata_split() {
+        let mod_time = OffsetDateTime::now_utc();
+        let mut compressed_a = metadata_quorum_test_fileinfo(mod_time, 1);
+        let mut compressed_b = metadata_quorum_test_fileinfo(mod_time, 2);
+        let plain = metadata_quorum_test_fileinfo(mod_time, 3);
+        http::insert_str(&mut compressed_a.metadata, http::SUFFIX_COMPRESSION, "lz4".to_string());
+        http::insert_str(&mut compressed_b.metadata, http::SUFFIX_COMPRESSION, "lz4".to_string());
+
+        expect_metadata_quorum_error(
+            vec![compressed_a, compressed_b, plain],
+            mod_time,
+            "mixed compressed and plain metadata must not reach quorum",
+        );
+    }
+
+    #[test]
+    fn find_file_info_in_quorum_rejects_remote_local_metadata_split() {
+        let mod_time = OffsetDateTime::now_utc();
+        let mut remote = metadata_quorum_test_fileinfo(mod_time, 1);
+        let local_a = metadata_quorum_test_fileinfo(mod_time, 2);
+        let local_b = metadata_quorum_test_fileinfo(mod_time, 3);
+        remote.transition_status = TRANSITION_COMPLETE.to_string();
+        remote.transition_tier = "WARM".to_string();
+        remote.transitioned_objname = "remote/object".to_string();
+        remote.transition_version_id = Some(Uuid::new_v4());
+
+        expect_metadata_quorum_error(
+            vec![remote, local_a, local_b],
+            mod_time,
+            "mixed remote and local metadata must not reach quorum",
+        );
+    }
 
     async fn shuffle_test_disks(tempdir: &tempfile::TempDir, count: usize) -> Vec<Option<DiskStore>> {
         let endpoint =
