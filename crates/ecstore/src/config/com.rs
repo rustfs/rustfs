@@ -43,8 +43,8 @@ use rustfs_filemeta::FileInfo;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, instrument, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
@@ -65,6 +65,7 @@ const DEFAULT_CONFIG_RECOVER_ON_CORRUPTION: bool = true;
 const LOG_COMPONENT_CONFIG: &str = "ecstore";
 const LOG_SUBSYSTEM_CONFIG: &str = "config";
 const EVENT_SERVER_CONFIG_DECODE_FAILED: &str = "server_config_decode_failed";
+const EVENT_SERVER_CONFIG_DECRYPT_FAILED: &str = "server_config_decrypt_failed";
 const EVENT_SERVER_CONFIG_READ_FAILED: &str = "server_config_read_failed";
 const EVENT_SERVER_CONFIG_HEAL_RESULT: &str = "server_config_heal_result";
 const EVENT_SERVER_CONFIG_RECOVERED: &str = "server_config_recovered_after_heal";
@@ -81,6 +82,10 @@ fn config_corruption_recovery_enabled() -> bool {
 #[error("server config corrupt: {0}")]
 pub struct ServerConfigCorruptError(pub String);
 
+#[derive(Debug, thiserror::Error)]
+#[error("server config decrypt failed: {0}")]
+struct ServerConfigDecryptError(pub String);
+
 /// Returns true when `err` is a [`ServerConfigCorruptError`] produced by the
 /// server config decode path. Such failures are deterministic: the persisted
 /// blob itself is damaged and re-reading it cannot succeed.
@@ -88,11 +93,42 @@ pub fn is_server_config_corrupt_error(err: &Error) -> bool {
     matches!(err, Error::Io(io_err) if io_err.get_ref().is_some_and(|inner| inner.is::<ServerConfigCorruptError>()))
 }
 
+fn is_server_config_decrypt_error(err: &Error) -> bool {
+    matches!(err, Error::Io(io_err) if io_err.get_ref().is_some_and(|inner| inner.is::<ServerConfigDecryptError>()))
+}
+
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
 pub const COMMA_SEPARATED_LISTS: &[&str] = &[rustfs_config::oidc::OIDC_SCOPES, rustfs_config::oidc::OIDC_OTHER_AUDIENCES];
 
 static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{CONFIG_PREFIX}"));
+
+type ServerConfigDecryptFn = crate::bucket::migration::LegacyBlobDecryptFn;
+
+static SERVER_CONFIG_DECRYPT_FN: LazyLock<RwLock<Option<ServerConfigDecryptFn>>> = LazyLock::new(|| RwLock::new(None));
+
+pub fn register_server_config_decrypt_fn(decrypt_fn: ServerConfigDecryptFn) {
+    match SERVER_CONFIG_DECRYPT_FN.write() {
+        Ok(mut guard) => {
+            *guard = Some(decrypt_fn);
+        }
+        Err(err) => {
+            warn!("register server config decrypt function failed: {err}");
+        }
+    }
+}
+
+fn server_config_decrypt_fn() -> Option<ServerConfigDecryptFn> {
+    SERVER_CONFIG_DECRYPT_FN.read().ok().and_then(|guard| guard.clone())
+}
+
+#[cfg(test)]
+fn replace_server_config_decrypt_fn_for_test(decrypt_fn: Option<ServerConfigDecryptFn>) -> Option<ServerConfigDecryptFn> {
+    SERVER_CONFIG_DECRYPT_FN
+        .write()
+        .ok()
+        .and_then(|mut guard| std::mem::replace(&mut *guard, decrypt_fn))
+}
 
 static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let mut h = HashSet::new();
@@ -1108,6 +1144,10 @@ where
             DeletedObject = DeletedObject,
         >,
 {
+    if let Some(decrypt) = &decrypt_fn {
+        register_server_config_decrypt_fn(decrypt.clone());
+    }
+
     let config_file = get_config_file();
     match api
         .get_object_info(
@@ -1253,7 +1293,6 @@ where
         // Try to read the configuration again
         match read_config_no_lock(api.clone(), &config_file).await {
             Ok(cfg_data) => {
-                // TODO: decrypt
                 let cfg = decode_persisted_server_config(&cfg_data)?;
                 return Ok(cfg.merge());
             }
@@ -1270,17 +1309,47 @@ where
 /// Decode the persisted server config blob, marking decode failures as
 /// deterministic corruption (see [`ServerConfigCorruptError`]).
 fn decode_persisted_server_config(data: &[u8]) -> Result<Config> {
-    decode_server_config_blob(data).map_err(|err| {
-        error!(
-            event = EVENT_SERVER_CONFIG_DECODE_FAILED,
-            component = LOG_COMPONENT_CONFIG,
-            subsystem = LOG_SUBSYSTEM_CONFIG,
-            size = data.len(),
-            error = %err,
-            "persisted server config cannot be decoded, object is corrupt"
-        );
-        Error::other(ServerConfigCorruptError(err.to_string()))
-    })
+    match decode_server_config_blob(data) {
+        Ok(cfg) => Ok(cfg),
+        Err(raw_decode_err) => {
+            let Some(decrypt) = server_config_decrypt_fn() else {
+                error!(
+                    event = EVENT_SERVER_CONFIG_DECODE_FAILED,
+                    component = LOG_COMPONENT_CONFIG,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    size = data.len(),
+                    error = %raw_decode_err,
+                    "persisted server config cannot be decoded, object is corrupt"
+                );
+                return Err(Error::other(ServerConfigCorruptError(raw_decode_err.to_string())));
+            };
+
+            let Some(decrypted) = decrypt(data) else {
+                error!(
+                    event = EVENT_SERVER_CONFIG_DECRYPT_FAILED,
+                    component = LOG_COMPONENT_CONFIG,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    size = data.len(),
+                    error = %raw_decode_err,
+                    "persisted server config cannot be decoded or decrypted"
+                );
+                return Err(Error::other(ServerConfigDecryptError(raw_decode_err.to_string())));
+            };
+
+            decode_server_config_blob(&decrypted).map_err(|err| {
+                error!(
+                    event = EVENT_SERVER_CONFIG_DECODE_FAILED,
+                    component = LOG_COMPONENT_CONFIG,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    size = decrypted.len(),
+                    encrypted_size = data.len(),
+                    error = %err,
+                    "decrypted persisted server config cannot be decoded, object is corrupt"
+                );
+                Error::other(ServerConfigCorruptError(err.to_string()))
+            })
+        }
+    }
 }
 
 /// Startup-only read of the server config with layered recovery:
@@ -1387,10 +1456,9 @@ where
     }
 }
 
-/// Availability failures that a startup retry loop can reasonably wait out:
-/// falling back to a default config would mask them, so they are propagated.
 fn config_read_failure_is_retryable(err: &Error) -> bool {
-    err.is_quorum_error()
+    is_server_config_decrypt_error(err)
+        || err.is_quorum_error()
         || matches!(
             err,
             Error::DiskNotFound | Error::FaultyDisk | Error::FaultyRemoteDisk | Error::TooManyOpenFiles | Error::SlowDown
@@ -2835,7 +2903,7 @@ mod tests {
     use super::{
         ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS, ServerConfigCorruptError, config_read_failure_is_retryable,
         decode_persisted_server_config, fallback_server_config_after_corruption, is_server_config_corrupt_error,
-        read_config_without_migrate_with_recovery,
+        read_config_without_migrate_with_recovery, replace_server_config_decrypt_fn_for_test,
     };
     use rustfs_common::heal_channel::HealOpts;
     use std::sync::Mutex;
@@ -2916,6 +2984,24 @@ mod tests {
                 heal_replacement,
                 heal_calls: AtomicUsize::new(0),
             }
+        }
+    }
+
+    struct ServerConfigDecryptHookGuard {
+        previous: Option<crate::bucket::migration::LegacyBlobDecryptFn>,
+    }
+
+    impl ServerConfigDecryptHookGuard {
+        fn replace(decrypt_fn: crate::bucket::migration::LegacyBlobDecryptFn) -> Self {
+            Self {
+                previous: replace_server_config_decrypt_fn_for_test(Some(decrypt_fn)),
+            }
+        }
+    }
+
+    impl Drop for ServerConfigDecryptHookGuard {
+        fn drop(&mut self) {
+            replace_server_config_decrypt_fn_for_test(self.previous.take());
         }
     }
 
@@ -3036,6 +3122,60 @@ mod tests {
         async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
             panic!("unused in test")
         }
+    }
+
+    fn encrypted_current_server_config_blob() -> Vec<u8> {
+        let mut cfg = Config::new();
+        let kvs = storage_class_kvs_mut(&mut cfg);
+        kvs.insert("standard".to_string(), "EC:4".to_string());
+        kvs.insert("rrs".to_string(), "EC:2".to_string());
+
+        let plain = encode_server_config_blob(&cfg, None).expect("encode current server config");
+        rustfs_crypto::encrypt_data(b"root-secret-key", &plain).expect("encrypt current server config")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_read_config_decrypts_current_server_config_blob() {
+        let store = Arc::new(RecoveryMockStore::new(
+            RecoveryReadState::Blob(encrypted_current_server_config_blob()),
+            None,
+        ));
+        let decrypt_fn: crate::bucket::migration::LegacyBlobDecryptFn =
+            Arc::new(|data: &[u8]| rustfs_crypto::decrypt_data(b"root-secret-key", data).ok());
+        let _decrypt_hook = ServerConfigDecryptHookGuard::replace(decrypt_fn);
+
+        let cfg = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect("encrypted current config should decrypt");
+
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 0, "decrypt should avoid corruption recovery");
+        let kvs = cfg
+            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("decrypted config should preserve storage_class");
+        assert_eq!(kvs.get("standard"), "EC:4");
+        assert_eq!(kvs.get("rrs"), "EC:2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_read_config_decrypt_failure_does_not_fallback_to_default() {
+        let store = Arc::new(RecoveryMockStore::new(
+            RecoveryReadState::Blob(encrypted_current_server_config_blob()),
+            None,
+        ));
+        let decrypt_fn: crate::bucket::migration::LegacyBlobDecryptFn = Arc::new(|_data: &[u8]| None);
+        let _decrypt_hook = ServerConfigDecryptHookGuard::replace(decrypt_fn);
+
+        let err = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect_err("decrypt failure must not fall back to the default config");
+
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal is still attempted before failing");
+        assert!(
+            !is_server_config_corrupt_error(&err),
+            "decrypt failure must not be treated as defaultable corruption"
+        );
     }
 
     #[tokio::test]

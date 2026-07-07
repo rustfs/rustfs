@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_filemeta::FileInfo;
+pub(crate) use rustfs_filemeta::FileInfo;
 use tokio_util::sync::CancellationToken;
 
 use super::replication_error_boundary::Error;
