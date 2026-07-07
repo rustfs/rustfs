@@ -6872,4 +6872,173 @@ mod test {
             }
         }
     }
+
+    /// P1.5 benchmark gate harness (backlog#893): O_DIRECT vs mmap-copy.
+    ///
+    /// Ignored by default; run explicitly in release mode on a Linux box:
+    ///
+    /// ```text
+    /// RUSTFS_BENCH_DIR=/data/rustfs/bench \
+    ///   RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE=true RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD=1 \
+    ///   cargo test --release -p rustfs-ecstore --lib direct_read_bench_gate -- --ignored --nocapture
+    /// ```
+    ///
+    /// Baseline run: same command without the two DIRECT_IO vars. Knobs:
+    /// RUSTFS_BENCH_SHARD_MIB (8), RUSTFS_BENCH_FILE_COUNT (64),
+    /// RUSTFS_BENCH_READS (256). Cold cache is enforced with
+    /// fadvise(DONTNEED) over the dataset between rounds. Every read is
+    /// verified for length; the first four shards are verified byte-for-byte
+    /// before timing starts (correctness before performance).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "benchmark harness, run explicitly in release mode"]
+    async fn direct_read_bench_gate() {
+        use std::time::Instant;
+
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        }
+
+        fn cpu_time_secs() -> f64 {
+            // SAFETY: getrusage with RUSAGE_SELF and a zeroed out-param.
+            #[allow(unsafe_code)]
+            unsafe {
+                let mut ru: libc::rusage = std::mem::zeroed();
+                if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+                    return f64::NAN;
+                }
+                let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+                tv(ru.ru_utime) + tv(ru.ru_stime)
+            }
+        }
+
+        fn drop_dataset_cache(paths: &[PathBuf]) {
+            use rustix::fs::{Advice, fadvise};
+            for p in paths {
+                if let Ok(f) = std::fs::File::open(p) {
+                    let _ = fadvise(&f, 0, None, Advice::DontNeed);
+                }
+            }
+        }
+
+        fn percentile(sorted: &[f64], p: f64) -> f64 {
+            let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+            sorted[idx]
+        }
+
+        fn gen_content(len: usize, seed: u64) -> Bytes {
+            let mut state = seed;
+            let v: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (state >> 33) as u8
+                })
+                .collect();
+            Bytes::from(v)
+        }
+
+        let bench_dir = std::env::var("RUSTFS_BENCH_DIR").expect("set RUSTFS_BENCH_DIR to a directory on the target disk");
+        let shard_mib = env_usize("RUSTFS_BENCH_SHARD_MIB", 8);
+        let file_count = env_usize("RUSTFS_BENCH_FILE_COUNT", 64);
+        let reads = env_usize("RUSTFS_BENCH_READS", 256);
+        let shard_len = shard_mib * 1024 * 1024;
+        const VOLUME: &str = "bench-volume";
+
+        std::fs::create_dir_all(&bench_dir).expect("create bench dir");
+        let endpoint = Endpoint::try_from(bench_dir.as_str()).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let _ = disk.make_volume(VOLUME).await;
+
+        // Populate, skipping shards that already exist with the right size.
+        let mut paths = Vec::with_capacity(file_count);
+        for i in 0..file_count {
+            let name = format!("shard-{i:04}.bin");
+            let abs = disk.get_object_path(VOLUME, &name).expect("path");
+            let need_write = std::fs::metadata(&abs).map(|m| m.len() as usize != shard_len).unwrap_or(true);
+            if need_write {
+                disk.write_all(VOLUME, &name, gen_content(shard_len, 0x9e3779b9 + i as u64))
+                    .await
+                    .expect("populate shard");
+            }
+            paths.push(abs);
+        }
+
+        // Correctness gate before any timing.
+        for i in 0..4.min(file_count) {
+            let name = format!("shard-{i:04}.bin");
+            let got = disk
+                .read_file_mmap_copy(VOLUME, &name, 0, shard_len)
+                .await
+                .expect("verify read");
+            assert_eq!(got, gen_content(shard_len, 0x9e3779b9 + i as u64), "shard {i} content mismatch");
+        }
+
+        let mut idx_state = 0xdeadbeefu64;
+        let mut pick = |n: usize| {
+            idx_state = idx_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((idx_state >> 33) as usize) % n
+        };
+
+        for _ in 0..8 {
+            let name = format!("shard-{:04}.bin", pick(file_count));
+            let _ = disk
+                .read_file_mmap_copy(VOLUME, &name, 0, shard_len)
+                .await
+                .expect("warmup read");
+        }
+        drop_dataset_cache(&paths);
+
+        // Concurrency models the EC GET shape: FuturesUnordered over shard
+        // reads. concurrency=1 keeps the original sequential behavior.
+        let concurrency = env_usize("RUSTFS_BENCH_CONCURRENCY", 1).max(1);
+        let disk = std::sync::Arc::new(disk);
+
+        let mut latencies_us = Vec::with_capacity(reads);
+        let cpu_before = cpu_time_secs();
+        let wall_start = Instant::now();
+        let mut done = 0usize;
+        while done < reads {
+            use futures::StreamExt;
+
+            let batch = concurrency.min(reads - done);
+            let mut tasks = futures::stream::FuturesUnordered::new();
+            for _ in 0..batch {
+                let name = format!("shard-{:04}.bin", pick(file_count));
+                let disk = disk.clone();
+                tasks.push(async move {
+                    let t = Instant::now();
+                    let bytes = disk
+                        .read_file_mmap_copy(VOLUME, &name, 0, shard_len)
+                        .await
+                        .expect("bench read");
+                    assert_eq!(bytes.len(), shard_len);
+                    t.elapsed().as_secs_f64() * 1e6
+                });
+            }
+            while let Some(lat) = tasks.next().await {
+                latencies_us.push(lat);
+            }
+            done += batch;
+            if done % file_count == 0 {
+                drop_dataset_cache(&paths);
+            }
+        }
+        let wall = wall_start.elapsed().as_secs_f64();
+        let cpu = cpu_time_secs() - cpu_before;
+
+        latencies_us.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        let mean = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
+        let direct_enabled = std::env::var(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE).unwrap_or_default();
+
+        println!(
+            "BENCH_RESULT {{\"direct_io_enabled\":\"{direct_enabled}\",\"concurrency\":{concurrency},\"shard_mib\":{shard_mib},\"file_count\":{file_count},\
+\"reads\":{reads},\"p50_us\":{:.1},\"p95_us\":{:.1},\"p99_us\":{:.1},\"mean_us\":{:.1},\"wall_s\":{wall:.3},\
+\"cpu_s\":{cpu:.3},\"throughput_mib_s\":{:.1}}}",
+            percentile(&latencies_us, 0.50),
+            percentile(&latencies_us, 0.95),
+            percentile(&latencies_us, 0.99),
+            mean,
+            (reads * shard_mib) as f64 / wall,
+        );
+    }
 }
