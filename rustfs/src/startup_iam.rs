@@ -168,6 +168,7 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
             }
             Err(err) => {
                 let next_interval = compute_backoff_interval(attempts + 1, initial_interval, max_interval);
+                let hint = iam_bootstrap_failure_hint(&err.to_string());
                 if attempts >= IAM_RETRY_ESCALATION_THRESHOLD {
                     error!(
                         event = EVENT_IAM_BOOTSTRAP_RETRY_FAILED,
@@ -177,6 +178,7 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                         next_retry_secs = next_interval.as_secs(),
                         degraded_duration_secs = degraded_since.elapsed().as_secs(),
                         error = %err,
+                        hint,
                         "IAM bootstrap retry failed; service remains degraded"
                     );
                 } else {
@@ -187,6 +189,7 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                         attempts,
                         next_retry_secs = next_interval.as_secs(),
                         error = %err,
+                        hint,
                         "IAM bootstrap retry failed; service remains degraded"
                     );
                 }
@@ -232,6 +235,23 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                 }
             }
         }
+    }
+}
+
+/// Classifies an IAM bootstrap failure into an actionable operator hint, so
+/// the degraded-retry logs explain *what to do* instead of only echoing the
+/// storage error (rustfs#4304: sequential cold starts left operators
+/// guessing why the node stayed degraded).
+fn iam_bootstrap_failure_hint(err_text: &str) -> &'static str {
+    let lower = err_text.to_lowercase();
+    if lower.contains("quorum") && lower.contains("lock") {
+        "distributed lock quorum unavailable; waiting for peer nodes' lock RPC endpoints to come online"
+    } else if lower.contains("read quorum") || lower.contains("erasure") || lower.contains("quorum") {
+        "storage read quorum not met yet; waiting for enough cluster nodes/disks to come online"
+    } else if lower.contains("not ready") || lower.contains("not found") {
+        "storage metadata not initialized yet; retrying automatically"
+    } else {
+        "retrying automatically; check storage and peer connectivity if this persists"
     }
 }
 
@@ -377,10 +397,40 @@ pub(crate) async fn init_iam_runtime(
 }
 
 #[cfg(test)]
+mod hint_tests {
+    use super::iam_bootstrap_failure_hint;
+
+    /// rustfs#4304: the degraded-retry log must tell the operator what the
+    /// node is waiting on, for each of the observed failure shapes.
+    #[test]
+    fn classifies_observed_bootstrap_failures() {
+        assert!(
+            iam_bootstrap_failure_hint(
+                "load group failed: io error: Failed to acquire read lock: Quorum not reached: required 2, achieved 0"
+            )
+            .contains("lock quorum"),
+            "lock-quorum failures must point at peer lock RPC endpoints"
+        );
+        assert!(
+            iam_bootstrap_failure_hint("load group failed: erasure read quorum").contains("storage read quorum"),
+            "storage-quorum failures must point at missing nodes/disks"
+        );
+        assert!(
+            iam_bootstrap_failure_hint("Storage metadata not ready: probe object not found").contains("not initialized"),
+            "missing-metadata failures must say the store is still initializing"
+        );
+        assert!(
+            iam_bootstrap_failure_hint("some opaque failure").contains("retrying automatically"),
+            "unknown failures must still promise the automatic retry"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, IamBootstrapDisposition,
-        compute_backoff_interval, publish_ready_for_iam_bootstrap_with, run_iam_recovery_loop,
+        compute_backoff_interval, iam_bootstrap_failure_hint, publish_ready_for_iam_bootstrap_with, run_iam_recovery_loop,
     };
     use rustfs_common::{GlobalReadiness, SystemStage};
     use std::io::Error;
