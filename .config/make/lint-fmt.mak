@@ -45,6 +45,11 @@ logging-guardrails-check: ## Check logging guardrails for redaction and noise re
 	@echo "🪵 Checking logging guardrails..."
 	./scripts/check_logging_guardrails.sh
 
+.PHONY: tokio-io-uring-check
+tokio-io-uring-check: ## Check tokio io-uring runtime feature stays removed
+	@echo "🚫 Checking tokio io-uring feature guard..."
+	./scripts/check_no_tokio_io_uring.sh
+
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check
 	@echo "🔨 Running compilation check..."
