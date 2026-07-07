@@ -2555,6 +2555,21 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
     Ok(())
 }
 
+/// Whether the batch-delete path must stat each object under the held lock to
+/// run [`check_object_lock_delete`] (the #4297 protection).
+///
+/// Under S3 semantics retention/legal-hold metadata can only be written to
+/// buckets created with Object Lock enabled (`validate_bucket_object_lock_enabled`
+/// guards every write surface), and default retention only exists with a bucket
+/// lock configuration, so for buckets without Object Lock the per-object stat in
+/// `delete_objects` has no consumer and can be skipped (backlog#929 / HP-8).
+///
+/// Fail closed: when bucket metadata cannot be resolved the check stays on, so
+/// object-lock protection is never skipped because of a metadata lookup miss.
+pub(crate) fn object_lock_delete_check_required(bucket_meta: Option<&crate::bucket::metadata::BucketMetadata>) -> bool {
+    bucket_meta.is_none_or(|meta| meta.object_locking())
+}
+
 async fn check_object_lock_delete(bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
     if set_disk_delete_creates_delete_marker(opts) {
         return Ok(());
@@ -6259,6 +6274,41 @@ mod tests {
         check_object_lock_delete("bucket", "object", &obj_info, &opts)
             .await
             .expect("versioned delete marker creation should not delete the locked version");
+    }
+
+    // backlog#929 (HP-8): the delete_objects per-object stat is gated on the
+    // bucket object-lock configuration. Lock-enabled buckets (either legacy
+    // lock_enabled flag or an enabled ObjectLockConfiguration) and unknown
+    // metadata must keep the #4297 locked-stat path; only buckets that
+    // provably have no Object Lock may skip it.
+    #[test]
+    fn test_object_lock_delete_check_required_skips_plain_buckets() {
+        let bm = crate::bucket::metadata::BucketMetadata::new("plain-bucket");
+        assert!(!object_lock_delete_check_required(Some(&bm)));
+    }
+
+    #[test]
+    fn test_object_lock_delete_check_required_keeps_legacy_lock_enabled_buckets() {
+        let mut bm = crate::bucket::metadata::BucketMetadata::new("legacy-lock-bucket");
+        bm.lock_enabled = true;
+        assert!(object_lock_delete_check_required(Some(&bm)));
+    }
+
+    #[test]
+    fn test_object_lock_delete_check_required_keeps_object_lock_config_buckets() {
+        use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
+
+        let mut bm = crate::bucket::metadata::BucketMetadata::new("lock-config-bucket");
+        bm.object_lock_config = Some(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            ..Default::default()
+        });
+        assert!(object_lock_delete_check_required(Some(&bm)));
+    }
+
+    #[test]
+    fn test_object_lock_delete_check_required_fails_closed_without_metadata() {
+        assert!(object_lock_delete_check_required(None));
     }
 
     #[test]

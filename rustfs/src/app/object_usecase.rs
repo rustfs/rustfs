@@ -2160,6 +2160,39 @@ fn delete_creates_delete_marker(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
+/// Bounded concurrency for the per-object pre-delete stat fanout in
+/// `execute_delete_objects` (backlog#929 / HP-8). Keeps the metadata reads for
+/// a 1000-key batch from serializing while capping the disk fanout pressure.
+const DELETE_OBJECTS_PRE_STAT_CONCURRENCY: usize = 16;
+
+/// backlog#929 (HP-8): whether the pre-delete `get_object_info` for one entry
+/// of a DeleteObjects batch can be skipped without changing behavior.
+///
+/// The stat result feeds four consumers, and each must be provably idle:
+/// - the app-layer object-lock admission check never runs for deletes that
+///   create a delete marker, and non-lock buckets cannot hold retention or
+///   legal-hold metadata (`bucket_lock_enabled == false`);
+/// - the replication delete decision is only consulted when the bucket has
+///   active replication rules for the batch (`replicate_deletes == false`);
+/// - usage accounting for delete-marker creation goes through
+///   `record_bucket_delete_marker_memory` and never reads the object size
+///   (`accounting_creates_delete_marker` is computed from the same versioning
+///   snapshot the accounting branch uses);
+/// - transitioned-object (ILM tier) cleanup journaling is a no-op for
+///   delete-marker creation because no version is removed, so `ObjSweeper`
+///   produces no journal entry regardless of the stat result.
+///
+/// Object-lock enabled buckets always keep the stat, so their delete path is
+/// byte-for-byte the pre-#929 one (see PR #4297).
+fn can_skip_delete_objects_pre_stat(
+    bucket_lock_enabled: bool,
+    replicate_deletes: bool,
+    opts: &ObjectOptions,
+    accounting_creates_delete_marker: bool,
+) -> bool {
+    !bucket_lock_enabled && !replicate_deletes && delete_creates_delete_marker(opts) && accounting_creates_delete_marker
+}
+
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
     let prefix = snowball_meta_value(headers, SNOWBALL_PREFIX_HEADER_KEYS, SNOWBALL_PREFIX_SUFFIX_LOWER)
         .map(|value| normalize_snowball_prefix(&value))
@@ -4858,6 +4891,7 @@ impl DefaultObjectUsecase {
 
         let version_cfg = BucketVersioningSys::get(&bucket).await.unwrap_or_default();
         let bypass_governance = has_bypass_governance_header(&req.headers);
+        let bucket_lock_enabled = bucket_object_locking_enabled(&bucket).await;
 
         #[derive(Default, Clone)]
         struct DeleteResult {
@@ -4867,10 +4901,18 @@ impl DefaultObjectUsecase {
 
         let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
 
-        let mut object_to_delete = Vec::new();
-        let mut object_to_delete_idx = Vec::new();
-        let mut object_sizes = Vec::new();
-        let mut existing_object_infos = Vec::new();
+        struct PreparedDelete {
+            idx: usize,
+            object: ObjectToDelete,
+            opts: ObjectOptions,
+            version_id: Option<String>,
+            skip_stat: bool,
+        }
+
+        // Phase 1 (serial): request-scoped validation and authorization. These
+        // steps mutate the request info between authorization calls, so they
+        // stay sequential; they perform no per-object disk I/O.
+        let mut prepared_deletes: Vec<PreparedDelete> = Vec::with_capacity(delete.objects.len());
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
@@ -4927,7 +4969,7 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
-            let mut object = ObjectToDelete {
+            let object = ObjectToDelete {
                 object_name: obj_id.key.clone(),
                 version_id: version_uuid,
                 ..Default::default()
@@ -4944,57 +4986,140 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
-            let (goi, gerr) = match store.get_object_info(&bucket, &object.object_name, &opts).await {
-                Ok(res) => (res, None),
-                Err(e) => (ObjectInfo::default(), Some(e.to_string())),
-            };
+            // backlog#929 (HP-8): the accounting branch after the store delete
+            // decides delete-marker vs object-delete from this exact snapshot,
+            // so evaluate it here with the same inputs to keep the stat-skip
+            // decision and the accounting path provably consistent.
+            let accounting_creates_delete_marker = object.version_id.is_none()
+                && version_cfg.prefix_enabled(object.object_name.as_str())
+                && !version_cfg.suspended();
+            let skip_stat =
+                can_skip_delete_objects_pre_stat(bucket_lock_enabled, replicate_deletes, &opts, accounting_creates_delete_marker);
 
-            if gerr.is_none()
-                && !delete_creates_delete_marker(&opts)
-                && let Some(block_reason) = check_object_lock_for_deletion(&bucket, &goi, bypass_governance).await
-            {
-                delete_results[idx].error = Some(s3s::dto::Error {
-                    code: Some("AccessDenied".to_string()),
-                    key: Some(obj_id.key.clone()),
-                    message: Some(block_reason.error_message()),
-                    version_id: version_id.clone(),
-                });
+            prepared_deletes.push(PreparedDelete {
+                idx,
+                object,
+                opts,
+                version_id,
+                skip_stat,
+            });
+        }
+
+        struct AdmittedDelete {
+            idx: usize,
+            object: ObjectToDelete,
+            size: i64,
+            existing: Option<ObjectInfo>,
+            blocked: Option<s3s::dto::Error>,
+        }
+
+        // Phase 2 (bounded concurrency, backlog#929 / HP-8): the per-object
+        // pre-delete stat plus the admission checks that consume it. Entries
+        // are independent per key, and `buffered` preserves input order so the
+        // per-key result mapping below is identical to the previous serial
+        // loop. The authoritative object-lock enforcement stays in the
+        // set_disk layer under the held write lock (#4297); the check here is
+        // the same early, advisory rejection as before.
+        let store_ref = &store;
+        let bucket_ref = bucket.as_str();
+        let admitted_deletes: Vec<AdmittedDelete> =
+            futures::stream::iter(prepared_deletes.into_iter().map(|prepared| async move {
+                let PreparedDelete {
+                    idx,
+                    mut object,
+                    opts,
+                    version_id,
+                    skip_stat,
+                } = prepared;
+
+                let (goi, gerr) = if skip_stat {
+                    (ObjectInfo::default(), None)
+                } else {
+                    match store_ref.get_object_info(bucket_ref, &object.object_name, &opts).await {
+                        Ok(res) => (res, None),
+                        Err(e) => (ObjectInfo::default(), Some(e.to_string())),
+                    }
+                };
+
+                if !skip_stat
+                    && gerr.is_none()
+                    && !delete_creates_delete_marker(&opts)
+                    && let Some(block_reason) = check_object_lock_for_deletion(bucket_ref, &goi, bypass_governance).await
+                {
+                    let blocked_key = object.object_name.clone();
+                    return AdmittedDelete {
+                        idx,
+                        object,
+                        size: 0,
+                        existing: None,
+                        blocked: Some(s3s::dto::Error {
+                            code: Some("AccessDenied".to_string()),
+                            key: Some(blocked_key),
+                            message: Some(block_reason.error_message()),
+                            version_id,
+                        }),
+                    };
+                }
+
+                let size = goi.size;
+
+                if is_dir_object(&object.object_name) && object.version_id.is_none() {
+                    object.version_id = Some(Uuid::nil());
+                }
+
+                if replicate_deletes {
+                    let dsc = check_replicate_delete(
+                        bucket_ref,
+                        &ObjectToDelete {
+                            object_name: object.object_name.clone(),
+                            version_id: object.version_id,
+                            ..Default::default()
+                        },
+                        &goi,
+                        &opts,
+                        gerr.clone(),
+                    )
+                    .await;
+                    if dsc.replicate_any() {
+                        if object.version_id.is_some() {
+                            set_object_to_delete_version_purge_status(&mut object, VersionPurgeStatusType::Pending);
+                            object.version_purge_statuses = dsc.pending_status();
+                        } else {
+                            object.delete_marker_replication_status = dsc.pending_status();
+                        }
+                        object.replicate_decision_str = Some(dsc.to_string());
+                    }
+                }
+
+                let existing = (!skip_stat && gerr.is_none()).then_some(goi);
+                AdmittedDelete {
+                    idx,
+                    object,
+                    size,
+                    existing,
+                    blocked: None,
+                }
+            }))
+            .buffered(DELETE_OBJECTS_PRE_STAT_CONCURRENCY)
+            .collect()
+            .await;
+
+        // Phase 3 (serial): apply outcomes in the original request order so
+        // per-key success/failure reporting is unchanged.
+        let mut object_to_delete = Vec::new();
+        let mut object_to_delete_idx = Vec::new();
+        let mut object_sizes = Vec::new();
+        let mut existing_object_infos = Vec::new();
+        for admitted in admitted_deletes {
+            if let Some(err) = admitted.blocked {
+                delete_results[admitted.idx].error = Some(err);
                 continue;
             }
 
-            object_sizes.push(goi.size);
-
-            if is_dir_object(&object.object_name) && object.version_id.is_none() {
-                object.version_id = Some(Uuid::nil());
-            }
-
-            if replicate_deletes {
-                let dsc = check_replicate_delete(
-                    &bucket,
-                    &ObjectToDelete {
-                        object_name: object.object_name.clone(),
-                        version_id: object.version_id,
-                        ..Default::default()
-                    },
-                    &goi,
-                    &opts,
-                    gerr.clone(),
-                )
-                .await;
-                if dsc.replicate_any() {
-                    if object.version_id.is_some() {
-                        set_object_to_delete_version_purge_status(&mut object, VersionPurgeStatusType::Pending);
-                        object.version_purge_statuses = dsc.pending_status();
-                    } else {
-                        object.delete_marker_replication_status = dsc.pending_status();
-                    }
-                    object.replicate_decision_str = Some(dsc.to_string());
-                }
-            }
-
-            object_to_delete_idx.push(idx);
-            object_to_delete.push(object);
-            existing_object_infos.push(gerr.is_none().then_some(goi));
+            object_sizes.push(admitted.size);
+            object_to_delete_idx.push(admitted.idx);
+            object_to_delete.push(admitted.object);
+            existing_object_infos.push(admitted.existing);
         }
 
         let cache_adapter = self.object_data_cache();
@@ -8619,6 +8744,76 @@ mod tests {
 
         assert_eq!(wire_version_id.as_deref(), Some("null"));
         assert_eq!(internal_version_id, Some(Uuid::nil()));
+    }
+
+    // backlog#929 (HP-8): the pre-delete stat may only be skipped when every
+    // consumer of its result is provably idle. Each guard flips one condition
+    // to prove the skip is fenced on all four data dependencies.
+    fn delete_marker_creating_opts() -> ObjectOptions {
+        ObjectOptions {
+            version_id: None,
+            versioned: true,
+            version_suspended: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_skippable_for_delete_marker_on_plain_bucket() {
+        assert!(can_skip_delete_objects_pre_stat(false, false, &delete_marker_creating_opts(), true));
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_kept_for_object_lock_buckets() {
+        assert!(!can_skip_delete_objects_pre_stat(true, false, &delete_marker_creating_opts(), true));
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_kept_when_replication_rules_match() {
+        assert!(!can_skip_delete_objects_pre_stat(false, true, &delete_marker_creating_opts(), true));
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_kept_for_explicit_version_deletes() {
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            versioned: true,
+            version_suspended: false,
+            ..Default::default()
+        };
+        assert!(!can_skip_delete_objects_pre_stat(false, false, &opts, true));
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_kept_for_unversioned_buckets() {
+        // Unversioned deletes remove the current object: usage accounting needs
+        // the object size and ILM tier cleanup needs the transition metadata.
+        let opts = ObjectOptions {
+            version_id: None,
+            versioned: false,
+            version_suspended: false,
+            ..Default::default()
+        };
+        assert!(!can_skip_delete_objects_pre_stat(false, false, &opts, false));
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_kept_for_suspended_versioning() {
+        let opts = ObjectOptions {
+            version_id: None,
+            versioned: true,
+            version_suspended: true,
+            ..Default::default()
+        };
+        assert!(!can_skip_delete_objects_pre_stat(false, false, &opts, false));
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_kept_when_accounting_snapshot_disagrees() {
+        // If the accounting-side versioning snapshot does not also classify the
+        // delete as a delete-marker creation, the stat must stay so usage
+        // accounting keeps its size input.
+        assert!(!can_skip_delete_objects_pre_stat(false, false, &delete_marker_creating_opts(), false));
     }
 
     #[test]
