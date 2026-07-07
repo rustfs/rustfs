@@ -1100,6 +1100,98 @@ where
 mod test {
     use super::*;
 
+    /// Decode a whitespace-tolerant hex fixture into bytes.
+    fn decode_hex(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex fixture"))
+            .collect()
+    }
+
+    /// backlog#580: prove RustFS parses a real MinIO-written bucket `.metadata.bin`
+    /// blob without loss. The fixture is the raw `.metadata.bin` object body
+    /// (4-byte `format|version` header + msgpack) carved from the
+    /// `.minio.sys/buckets/interop/.metadata.bin` object written by MinIO
+    /// `RELEASE.2025-07-23` — see `tests/fixtures/minio/README.md`.
+    #[test]
+    fn parses_real_minio_bucket_metadata_blob_without_loss() {
+        let blob = decode_hex(include_str!("../../tests/fixtures/minio/bucket_metadata.blob.hex"));
+
+        // Same 4-byte format|version header (1|1) and msgpack layout as MinIO.
+        BucketMetadata::check_header(&blob).expect("valid .metadata.bin header");
+        let mut bm = BucketMetadata::unmarshal(&blob[4..]).expect("unmarshal MinIO bucket metadata");
+
+        // Raw config fields survive the msgpack decode (PascalCase MinIO field names).
+        assert_eq!(bm.name, "interop");
+        assert!(!bm.policy_config_json.is_empty(), "policy JSON present");
+        assert!(!bm.lifecycle_config_xml.is_empty(), "lifecycle XML present");
+        assert!(!bm.object_lock_config_xml.is_empty(), "object-lock XML present");
+        assert!(!bm.versioning_config_xml.is_empty(), "versioning XML present");
+        assert!(!bm.tagging_config_xml.is_empty(), "tagging XML present");
+        assert!(!bm.quota_config_json.is_empty(), "quota JSON present");
+
+        // Typed parse of each stored config must succeed. `parse_all_configs`
+        // logs+skips on error, so a None here means a real MinIO-compat parse gap.
+        bm.parse_all_configs().expect("parse_all_configs");
+        assert!(bm.policy_config.is_some(), "policy parsed");
+        assert!(bm.versioning_config.is_some(), "versioning parsed");
+        assert!(bm.object_lock_config.is_some(), "object-lock parsed");
+        assert!(bm.tagging_config.is_some(), "tagging parsed");
+        assert!(bm.quota_config.is_some(), "quota parsed");
+        assert!(
+            bm.lifecycle_config.is_some(),
+            "lifecycle parsed (MinIO writes an <ExpiryUpdatedAt> extension element)"
+        );
+        assert!(bm.notification_config.is_some(), "notification parsed");
+        assert!(bm.sse_config.is_some(), "encryption (SSE) parsed");
+        assert!(bm.replication_config.is_some(), "replication parsed");
+
+        // Object lock is expressed through the parsed config, not the legacy
+        // `LockEnabled` flag (MinIO leaves that false for config-based locks).
+        assert!(bm.object_locking(), "object lock active via parsed config");
+    }
+
+    /// backlog#580: KNOWN GAP (weisd 2026-03-06 "inline_data 前缀不同"). RustFS's
+    /// inline-data extraction does not yet recover the object body from a
+    /// MinIO-written bucket-metadata object: `into_fileinfo(read_data=true).data`
+    /// returns bytes that are not the `.metadata.bin` blob (no `format|version`
+    /// header). Kept as an ignored, documented reproduction until the MinIO
+    /// inline-data framing is handled on the read path.
+    /// backlog#580: prove RustFS reads a MinIO-written **inlined** bucket-metadata
+    /// object end-to-end. MinIO stores inline data as `[bitrot hash][object body]`
+    /// (the "`inline_data` 前缀不同" that weisd flagged on 2026-03-06 is that
+    /// bitrot prefix, not a format incompatibility). Running the raw inline shard
+    /// through RustFS's `BitrotReader` with the default `HighwayHash256S` must
+    /// verify the checksum and yield the exact `.metadata.bin` blob.
+    #[tokio::test]
+    async fn reads_minio_inline_bucket_metadata_via_bitrot() {
+        use crate::erasure::coding::BitrotReader;
+        use rustfs_utils::HashAlgorithm;
+
+        let xlmeta = decode_hex(include_str!("../../tests/fixtures/minio/bucket_metadata_full.xlmeta.hex"));
+        let fm = rustfs_filemeta::FileMeta::load(&xlmeta).expect("parse MinIO xl.meta");
+        let fi = fm
+            .into_fileinfo("interop", ".metadata.bin", "", true, false, false)
+            .expect("into_fileinfo");
+        // The raw inline shard is `[HighwayHash256 (32B)][object body]`.
+        let inline = fi.data.expect("inline shard present");
+        let algo = HashAlgorithm::HighwayHash256S;
+        let body_len = inline.len() - algo.size();
+
+        let mut reader = BitrotReader::new(std::io::Cursor::new(inline.to_vec()), body_len, algo, false);
+        let mut body = vec![0u8; body_len];
+        let read = reader.read(&mut body).await.expect("bitrot verify + read MinIO inline shard");
+        assert_eq!(read, body_len);
+
+        // The verified body is exactly the `.metadata.bin` blob, and it parses.
+        BucketMetadata::check_header(&body).expect("recovered body is a valid .metadata.bin");
+        let mut bm = BucketMetadata::unmarshal(&body[4..]).expect("unmarshal recovered blob");
+        assert_eq!(bm.name, "interop");
+        bm.parse_all_configs().expect("parse recovered configs");
+        assert!(bm.lifecycle_config.is_some());
+    }
+
     #[tokio::test]
     async fn marshal_msg() {
         // write_time(OffsetDateTime::UNIX_EPOCH).unwrap();
