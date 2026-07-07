@@ -54,7 +54,7 @@ use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::OnceLock,
@@ -1721,6 +1721,23 @@ pub(in crate::set_disk) fn should_allow_metadata_early_stop(
         || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing)
 }
 
+/// Final gate for the metadata early-stop fast path.
+///
+/// `caller_allows_early_stop=false` unconditionally forces the full quorum
+/// fanout so read-before-write callers (object tagging) get the complete
+/// online-disk set as their write target; the early-stop subset would only
+/// carry read quorum and fail write quorum (backlog#872 regression).
+pub(in crate::set_disk) fn metadata_early_stop_permitted(
+    caller_allows_early_stop: bool,
+    observe: bool,
+    read_data: bool,
+    version_id: &str,
+    healing: bool,
+    incl_free_versions: bool,
+) -> bool {
+    caller_allows_early_stop && observe && should_allow_metadata_early_stop(read_data, version_id, healing, incl_free_versions)
+}
+
 impl SetDisks {
     pub(in crate::set_disk) async fn read_parts(
         disks: &[Option<DiskStore>],
@@ -1797,6 +1814,7 @@ impl SetDisks {
             healing,
             incl_free_versions,
             false,
+            true,
             0,
         )
         .await?;
@@ -1813,6 +1831,7 @@ impl SetDisks {
         read_data: bool,
         healing: bool,
         incl_free_versions: bool,
+        allow_early_stop: bool,
         default_parity_count: usize,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
         Self::read_all_fileinfo_inner(
@@ -1825,6 +1844,7 @@ impl SetDisks {
             healing,
             incl_free_versions,
             true,
+            allow_early_stop,
             default_parity_count,
         )
         .await
@@ -1841,10 +1861,18 @@ impl SetDisks {
         healing: bool,
         incl_free_versions: bool,
         observe: bool,
+        // When false, the caller opts out of the early-stop fast path even for
+        // otherwise-eligible reads. Read-before-write callers (e.g. object
+        // tagging) must set this so the returned online-disk set reflects the
+        // full quorum fanout rather than the early-stop subset — writing to the
+        // subset would fail write quorum (backlog#872 regression).
+        caller_allows_early_stop: bool,
         default_parity_count: usize,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
-        let early_stop_enabled = observe && (is_get_metadata_early_stop_enabled() || is_version_early_stop_enabled());
-        let allow_early_stop = observe && should_allow_metadata_early_stop(read_data, version_id, healing, incl_free_versions);
+        let early_stop_enabled =
+            caller_allows_early_stop && observe && (is_get_metadata_early_stop_enabled() || is_version_early_stop_enabled());
+        let allow_early_stop =
+            metadata_early_stop_permitted(caller_allows_early_stop, observe, read_data, version_id, healing, incl_free_versions);
         if allow_early_stop {
             return Self::read_all_fileinfo_early_stop(
                 disks,
@@ -3187,6 +3215,163 @@ impl SetDisks {
         }
 
         Ok(true)
+    }
+
+    /// Reclaim orphaned physical data directories under `bucket/object` that no
+    /// live version in the object's `xl.meta` references any longer.
+    ///
+    /// Before #3510, an unversioned overwrite leaked one UUID-named data dir per
+    /// PUT. The write path now cleans up going forward, but pre-existing strays
+    /// stay on disk forever: `heal`'s dangling logic only removes *whole* objects
+    /// whose data is missing, never surplus data dirs of an otherwise-healthy
+    /// object. This closes that gap so the scanner/heal sweep can recover the
+    /// leaked space automatically (issues #3231, #3191).
+    ///
+    /// Safety — fail closed:
+    /// * The set of referenced data dirs is the UNION of `get_data_dirs()` across
+    ///   every online disk's `xl.meta`, so a dir named by *any* replica is kept.
+    /// * If a disk holds the object directory but its `xl.meta` is missing or
+    ///   unparsable, the object is treated as degraded and NOTHING is removed —
+    ///   the unreadable copy could be the only one naming a live data dir, and a
+    ///   heal must run first.
+    /// * Only subdirectories whose names parse as a UUID are ever considered;
+    ///   removal is non-recursive-safe via a recursive delete of the full stray
+    ///   data-dir path only.
+    ///
+    /// Returns the number of stray data directories removed across the set. This
+    /// is best-effort maintenance: individual delete failures are logged and
+    /// skipped rather than propagated.
+    pub(crate) async fn reclaim_orphan_data_dirs(&self, bucket: &str, object: &str) -> disk::error::Result<usize> {
+        let disks = self.get_disks_internal().await;
+
+        // Phase 1 (read-only): build the referenced-data-dir union and record the
+        // physical UUID subdirectories present on each disk. Abort on any degraded
+        // copy so a healable object is never stripped of a referenced data dir.
+        let mut referenced: HashSet<Uuid> = HashSet::new();
+        let mut per_disk_dirs: Vec<(usize, Vec<Uuid>)> = Vec::new();
+        let mut healthy_metas = 0usize;
+
+        for (i, disk) in disks.iter().enumerate() {
+            let Some(disk) = disk else { continue };
+
+            let entries = match disk.list_dir("", bucket, object, 0).await {
+                Ok(entries) => entries,
+                // No object directory on this disk: nothing to reclaim here.
+                Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => continue,
+                Err(err) => return Err(err),
+            };
+
+            // Collect the UUID-named subdirectories: these are the physical data
+            // dirs. Non-directory entries (xl.meta) and non-UUID names are ignored.
+            let mut physical = Vec::new();
+            for entry in &entries {
+                let Some(name) = entry.strip_suffix(SLASH_SEPARATOR) else { continue };
+                if let Ok(uuid) = Uuid::parse_str(name)
+                    && !uuid.is_nil()
+                {
+                    physical.push(uuid);
+                }
+            }
+
+            // Read and parse this replica's metadata. A directory that carries data
+            // dirs but no readable xl.meta is degraded — fail closed.
+            let meta_path = path_join_buf(&[object, STORAGE_FORMAT_FILE]);
+            let buf = match disk.read_metadata(bucket, &meta_path).await {
+                Ok(buf) => buf,
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) => {
+                    if physical.is_empty() {
+                        // Bare directory with no data dirs and no metadata: leave it
+                        // to the orphan-dir / dangling-object heal paths.
+                        continue;
+                    }
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        bucket, object,
+                        "reclaim_orphan_data_dirs: aborting, data dirs present without xl.meta on a disk"
+                    );
+                    return Ok(0);
+                }
+                Err(err) => return Err(err),
+            };
+
+            let meta = match FileMeta::load(&buf) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        bucket, object, error = %err,
+                        "reclaim_orphan_data_dirs: aborting, unparsable xl.meta on a disk"
+                    );
+                    return Ok(0);
+                }
+            };
+
+            match meta.get_data_dirs() {
+                Ok(dirs) => referenced.extend(dirs.into_iter().flatten().filter(|d| !d.is_nil())),
+                Err(err) => {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        bucket, object, error = %err,
+                        "reclaim_orphan_data_dirs: aborting, could not decode data dirs from xl.meta"
+                    );
+                    return Ok(0);
+                }
+            }
+
+            healthy_metas += 1;
+            if !physical.is_empty() {
+                per_disk_dirs.push((i, physical));
+            }
+        }
+
+        // No healthy metadata anywhere: this is not a live object, so surplus dirs
+        // (if any) belong to the dangling-object heal path, not here.
+        if healthy_metas == 0 {
+            return Ok(0);
+        }
+
+        // Phase 2: delete every physical data dir not referenced by the union.
+        let mut removed = 0usize;
+        for (i, physical) in per_disk_dirs {
+            let Some(disk) = disks[i].as_ref() else { continue };
+            for dir in physical {
+                if referenced.contains(&dir) {
+                    continue;
+                }
+                let stray = format!("{object}/{dir}");
+                match disk
+                    .delete(
+                        bucket,
+                        &stray,
+                        DeleteOptions {
+                            recursive: true,
+                            immediate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        removed += 1;
+                        info!(
+                            target: "rustfs_ecstore::set_disk",
+                            bucket, object, data_dir = %dir,
+                            "reclaim_orphan_data_dirs: removed orphaned data directory"
+                        );
+                    }
+                    Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
+                    Err(err) => {
+                        warn!(
+                            target: "rustfs_ecstore::set_disk",
+                            bucket, object, data_dir = %dir, error = %err,
+                            "reclaim_orphan_data_dirs: failed to remove orphaned data directory"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(removed)
     }
 
     pub(in crate::set_disk) async fn check_write_precondition(

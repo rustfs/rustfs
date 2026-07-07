@@ -69,6 +69,12 @@ pub(crate) async fn run_startup_shutdown_sequence(
 ) {
     ctx.cancel();
 
+    // Stop long-lived peer/disk background monitors while the runtime and tracing
+    // subscriber are still alive, so the `tracing::Span` each monitor holds is
+    // dropped here instead of during worker-thread TLS destruction at runtime
+    // teardown (which can panic in the fmt layer's `on_close`; see issue #4264).
+    crate::storage_api::startup::shutdown::shutdown_background_monitors();
+
     info!(
         target: "rustfs::main::handle_shutdown",
         event = EVENT_SHUTDOWN_SIGNAL_RECEIVED,

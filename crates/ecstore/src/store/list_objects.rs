@@ -39,14 +39,15 @@ use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
     FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
-    MetacacheReader, MetadataResolutionParams, is_io_eof, merge_file_meta_versions,
+    MetacacheReader, MetadataResolutionParams, is_io_eof,
 };
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
     ListObjectsGatherObservation, ListObjectsIndexPageObservation,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -4376,7 +4377,7 @@ impl ECStore {
                         continue;
                     }
 
-                    let fvs = match if opts.include_free_versions {
+                    let mut fvs = match if opts.include_free_versions {
                         entry.file_info_versions_with_free_versions(&bucket_clone)
                     } else {
                         entry.file_info_versions(&bucket_clone)
@@ -4395,8 +4396,13 @@ impl ECStore {
                         }
                     };
 
+                    // `FileMeta` keeps versions newest-first (`sort_by_mod_time`
+                    // sorts descending), so ascending emission is the exact
+                    // reverse. Callers such as replication resync walk with the
+                    // default (ascending) order so that re-applied versions
+                    // preserve the original version-stack order.
                     if opts.versions_sort == WalkVersionsSortOrder::Ascending {
-                        //TODO: SORT
+                        fvs.versions.reverse();
                     }
 
                     for fi in fvs.versions.iter() {
@@ -4639,28 +4645,64 @@ async fn gather_results(
     Ok(GatherResultsState::InputClosed)
 }
 
-async fn select_from(
-    rx: &CancellationToken,
-    in_channels: &mut [Receiver<MetaCacheEntry>],
+/// Head entry of one input channel inside the k-way merge.
+///
+/// `cleaned` caches `path::clean(name)` only when it differs from the raw
+/// name, so heap comparisons never allocate (walker-produced names are
+/// already clean in the common case).
+struct MergeHead {
+    entry: MetaCacheEntry,
+    cleaned: Option<String>,
     idx: usize,
-    top: &mut [Option<MetaCacheEntry>],
-    n_done: &mut usize,
-) -> Result<bool> {
-    let entry = tokio::select! {
-        entry = in_channels[idx].recv() => entry,
-        _ = rx.cancelled() => return Ok(false),
-    };
+}
 
-    match entry {
-        Some(entry) => {
-            top[idx] = Some(entry);
-        }
-        None => {
-            top[idx] = None;
-            *n_done += 1;
-        }
+impl MergeHead {
+    fn new(entry: MetaCacheEntry, idx: usize) -> Self {
+        let cleaned = path::clean(&entry.name);
+        let cleaned = if cleaned == entry.name { None } else { Some(cleaned) };
+        Self { entry, cleaned, idx }
     }
-    Ok(true)
+
+    fn sort_key(&self) -> &str {
+        self.cleaned.as_deref().unwrap_or(&self.entry.name)
+    }
+}
+
+impl PartialEq for MergeHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for MergeHead {}
+
+impl PartialOrd for MergeHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Ascending channel index preserves the legacy scan order for equal keys.
+        self.sort_key().cmp(other.sort_key()).then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+enum MergePoll {
+    Entry(Box<MergeHead>),
+    Closed,
+    Cancelled,
+}
+
+async fn poll_merge_head(rx: &CancellationToken, in_channels: &mut [Receiver<MetaCacheEntry>], idx: usize) -> MergePoll {
+    tokio::select! {
+        entry = in_channels[idx].recv() => match entry {
+            Some(entry) => MergePoll::Entry(Box::new(MergeHead::new(entry, idx))),
+            None => MergePoll::Closed,
+        },
+        _ = rx.cancelled() => MergePoll::Cancelled,
+    }
 }
 
 async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEntry>, entry: MetaCacheEntry) -> Result<bool> {
@@ -4707,147 +4749,100 @@ async fn merge_entry_channels(
         }
     }
 
-    let mut top: Vec<Option<MetaCacheEntry>> = vec![None; in_channels.len()];
-    let mut n_done = 0;
-
-    let in_channels_len = in_channels.len();
-
-    for idx in 0..in_channels_len {
-        if !select_from(&rx, &mut in_channels, idx, &mut top, &mut n_done).await? {
-            return Ok(());
+    // K-way merge across per-channel sorted streams via a min-heap keyed by
+    // the path-cleaned entry name: advancing the merge costs O(log channels)
+    // per entry and comparisons are allocation-free (see `MergeHead`).
+    //
+    // Note on same-name resolution: prefix-dir groups collapse into a single
+    // emission and objects shadow same-named prefix dirs. The legacy
+    // `merge_file_meta_versions` block that used to live here was dead code:
+    // it only ran for prefix-dir groups, whose entries have empty metadata,
+    // so `xl_meta()` always failed. Cross-drive version merging happens in
+    // the metadata resolve path (`MetaCacheEntries::resolve`), not here.
+    let mut heap: BinaryHeap<Reverse<Box<MergeHead>>> = BinaryHeap::with_capacity(in_channels.len());
+    for idx in 0..in_channels.len() {
+        match poll_merge_head(&rx, &mut in_channels, idx).await {
+            MergePoll::Entry(head) => heap.push(Reverse(head)),
+            MergePoll::Closed => {}
+            MergePoll::Cancelled => {
+                info!("merge_entry_channels rx.recv() cancel");
+                return Ok(());
+            }
         }
     }
 
     let mut last = String::new();
-    let mut to_merge: Vec<usize> = Vec::new();
-    loop {
-        if n_done == in_channels.len() {
+    let mut group: Vec<Box<MergeHead>> = Vec::new();
+    let mut refill: Vec<usize> = Vec::with_capacity(in_channels.len());
+
+    while let Some(Reverse(first)) = heap.pop() {
+        // Collect every channel head that resolves to the same cleaned key so
+        // the duplicate rules below see the whole same-name group at once.
+        group.clear();
+        refill.clear();
+        refill.push(first.idx);
+        while heap.peek().is_some_and(|Reverse(next)| next.sort_key() == first.sort_key()) {
+            let Some(Reverse(next)) = heap.pop() else { break };
+            refill.push(next.idx);
+            group.push(next);
+        }
+
+        // Legacy same-name resolution rules (heads arrive in ascending
+        // channel order):
+        //  - prefix dir vs prefix dir with the same suffix shape: the first
+        //    head wins and the rest collapse;
+        //  - prefix dir vs object: the object wins;
+        //  - object vs object: the later channel wins;
+        //  - both dirs with different suffix shape: the smaller raw name wins.
+        let mut winner = first;
+        for other in group.drain(..) {
+            let dir_matches = winner.entry.is_dir() && other.entry.is_dir();
+            let suffix_matches = winner.entry.name.ends_with(SLASH_SEPARATOR) == other.entry.name.ends_with(SLASH_SEPARATOR);
+
+            if dir_matches && suffix_matches {
+                continue;
+            }
+
+            if !dir_matches {
+                if other.entry.is_dir() {
+                    continue;
+                }
+                winner = other;
+                continue;
+            }
+
+            if winner.entry.name > other.entry.name {
+                winner = other;
+            }
+        }
+
+        // Gate emission on the same cleaned key the heap orders by, not the raw
+        // name. The heap pops in non-decreasing cleaned order, so comparing the
+        // raw name here could drop a legitimate entry whose cleaned order and
+        // raw order disagree (e.g. redundant slashes or `./` segments).
+        let emit = winner.sort_key() > last.as_str();
+        if emit {
+            last.clear();
+            last.push_str(winner.sort_key());
+        }
+        let MergeHead { entry, .. } = *winner;
+        if emit && !send_or_cancel(&rx, &out_channel, entry).await? {
             return Ok(());
         }
 
-        let mut best = top[0].clone();
-        let mut best_idx = 0;
-        to_merge.clear();
-
-        // Note: `select_from` mutates `top[idx]` during the inner loop, but this is safe
-        // because each borrow from `top[other_idx]` is only used before any later
-        // `select_from` call that can mutate that slot.
-
-        for other_idx in 1..top.len() {
-            if let Some(other_entry) = &top[other_idx] {
-                if let Some(best_entry) = &best {
-                    if path::clean(&best_entry.name) == path::clean(&other_entry.name) {
-                        let dir_matches = best_entry.is_dir() && other_entry.is_dir();
-                        let suffix_matches =
-                            best_entry.name.ends_with(SLASH_SEPARATOR) == other_entry.name.ends_with(SLASH_SEPARATOR);
-
-                        if dir_matches && suffix_matches {
-                            to_merge.push(other_idx);
-                            continue;
-                        }
-
-                        if !dir_matches {
-                            // dir and object has the save name
-                            if other_entry.is_dir() {
-                                if !select_from(&rx, &mut in_channels, other_idx, &mut top, &mut n_done).await? {
-                                    return Ok(());
-                                }
-                                continue;
-                            }
-
-                            to_merge.clear();
-
-                            best = Some(other_entry.clone());
-                            best_idx = other_idx;
-                            continue;
-                        }
-                    }
-
-                    if best_entry.name > other_entry.name {
-                        to_merge.clear();
-                        best = Some(other_entry.clone());
-                        best_idx = other_idx;
-                    }
-                } else {
-                    best = Some(other_entry.clone());
-                    best_idx = other_idx;
+        for &idx in &refill {
+            match poll_merge_head(&rx, &mut in_channels, idx).await {
+                MergePoll::Entry(head) => heap.push(Reverse(head)),
+                MergePoll::Closed => {}
+                MergePoll::Cancelled => {
+                    info!("merge_entry_channels rx.recv() cancel");
+                    return Ok(());
                 }
             }
-        }
-
-        if !to_merge.is_empty() {
-            if let Some(entry) = &best {
-                let mut versions = Vec::with_capacity(to_merge.len() + 1);
-
-                let mut has_xl = { entry.clone().xl_meta().ok() };
-
-                if let Some(x) = &has_xl {
-                    versions.push(x.versions.clone());
-                }
-
-                for &idx in to_merge.iter() {
-                    let has_entry = top[idx].clone();
-
-                    if let Some(entry) = has_entry {
-                        let xl2 = match entry.clone().xl_meta() {
-                            Ok(res) => res,
-                            Err(_) => {
-                                if !select_from(&rx, &mut in_channels, idx, &mut top, &mut n_done).await? {
-                                    return Ok(());
-                                }
-
-                                continue;
-                            }
-                        };
-
-                        versions.push(xl2.versions.clone());
-
-                        if has_xl.is_none() {
-                            if !select_from(&rx, &mut in_channels, best_idx, &mut top, &mut n_done).await? {
-                                return Ok(());
-                            }
-
-                            best_idx = idx;
-                            best = Some(entry.clone());
-                            has_xl = Some(xl2);
-                        } else {
-                            if !select_from(&rx, &mut in_channels, best_idx, &mut top, &mut n_done).await? {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-
-                if let Some(xl) = has_xl.as_mut()
-                    && !versions.is_empty()
-                {
-                    xl.versions = merge_file_meta_versions(read_quorum, true, 0, &versions);
-
-                    if let Ok(meta) = xl.marshal_msg()
-                        && let Some(b) = best.as_mut()
-                    {
-                        b.metadata = meta;
-                        b.cached = Some(xl.clone());
-                    }
-                }
-            }
-
-            to_merge.clear();
-        }
-
-        if let Some(best_entry) = &best
-            && best_entry.name > last
-        {
-            if !send_or_cancel(&rx, &out_channel, best_entry.clone()).await? {
-                return Ok(());
-            }
-            last = best_entry.name.clone();
-        }
-
-        if !select_from(&rx, &mut in_channels, best_idx, &mut top, &mut n_done).await? {
-            return Ok(());
         }
     }
+
+    Ok(())
 }
 
 impl Sets {
@@ -9228,6 +9223,178 @@ mod test {
         handle.await.unwrap().unwrap();
 
         assert_eq!(results, vec!["obj-a", "obj-b"]);
+    }
+
+    #[test]
+    fn walk_ascending_versions_contract_reverses_newest_first_metadata() {
+        // Documents the invariant the walk `versions_sort` handling relies on:
+        // `FileMeta` keeps versions newest-first, so ascending emission is the
+        // exact reverse of `file_info_versions` output.
+        let older = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let newer = time::OffsetDateTime::from_unix_timestamp(1_705_312_500).expect("valid timestamp");
+        let entry =
+            test_object_meta_entry_with_erasure_versions("obj-a", &[(older, "etag-old", 4, 2), (newer, "etag-new", 4, 2)]);
+
+        let fvs = entry.file_info_versions("bucket").expect("versions should parse");
+        assert_eq!(fvs.versions.len(), 2, "both versions should be visible");
+        assert!(
+            fvs.versions[0].mod_time >= fvs.versions[1].mod_time,
+            "file_info_versions must yield newest-first"
+        );
+        assert!(fvs.versions[0].is_latest, "the first (newest) version carries is_latest");
+
+        let mut ascending = fvs.versions;
+        ascending.reverse();
+        assert!(
+            ascending[0].mod_time <= ascending[1].mod_time,
+            "reversing newest-first output must produce ascending mod_time order"
+        );
+        assert!(
+            ascending.last().expect("versions present").is_latest,
+            "ascending emission ends with the latest version"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_merges_interleaved_channels_in_global_order() {
+        let mut txs = Vec::new();
+        let mut rxs = Vec::new();
+        for _ in 0..4 {
+            let (tx, rx) = mpsc::channel(16);
+            txs.push(tx);
+            rxs.push(rx);
+        }
+
+        // Round-robin keys so every channel stays sorted while the global
+        // stream interleaves across all four channels.
+        let names: Vec<String> = (0..24).map(|i| format!("obj-{i:02}")).collect();
+        for (i, name) in names.iter().enumerate() {
+            txs[i % 4].send(test_meta_entry(name)).await.unwrap();
+        }
+        // The same trailing key on three channels must be emitted once.
+        for tx in txs.iter().take(3) {
+            tx.send(test_meta_entry("obj-99")).await.unwrap();
+        }
+        drop(txs);
+
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, rxs, out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+        handle.await.unwrap().unwrap();
+
+        let mut expected = names;
+        expected.push("obj-99".to_owned());
+        assert_eq!(results, expected);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_emits_when_cleaned_order_differs_from_raw_order() {
+        // Regression: `a//c` cleans to `a/c` and `a/b` is already clean. In
+        // cleaned order `a/b` < `a/c`, but raw byte order is the opposite
+        // (`a//c` < `a/b` because '/' < 'b'). The heap pops in cleaned order,
+        // so gating emission on the raw name would drop `a//c` after `a/b` is
+        // emitted. Both distinct keys must survive.
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        tx_a.send(test_meta_entry("a/b")).await.unwrap();
+        drop(tx_a);
+        tx_b.send(test_meta_entry("a//c")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            results,
+            vec!["a/b", "a//c"],
+            "distinct cleaned keys must both be emitted in cleaned order"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_object_wins_over_same_named_prefix_dir() {
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        // `path::clean("a/") == "a"`, so the prefix dir and the object group
+        // under the same key and the object must win.
+        tx_a.send(test_dir_meta_entry("a/")).await.unwrap();
+        drop(tx_a);
+        tx_b.send(test_object_meta_entry("a")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            assert!(entry.is_object(), "the object entry must shadow the same-named prefix dir");
+            results.push(entry.name.clone());
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(results, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_collapses_equivalent_prefix_dirs() {
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        tx_a.send(test_dir_meta_entry("x/")).await.unwrap();
+        drop(tx_a);
+        tx_b.send(test_dir_meta_entry("x/")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(results, vec!["x/"]);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_normalizes_uncleaned_names_before_grouping() {
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        // Both names clean to "a/b"; they must merge into a single emission.
+        tx_a.send(test_meta_entry("a//b")).await.unwrap();
+        drop(tx_a);
+        tx_b.send(test_meta_entry("a/b")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(results, vec!["a/b"]);
     }
 
     #[tokio::test]

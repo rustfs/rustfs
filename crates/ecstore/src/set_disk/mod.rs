@@ -459,13 +459,23 @@ const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 102
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
+// Enabled by default (backlog#872): the early-stop path only engages for
+// requests `should_allow_metadata_early_stop` classifies as safe (metadata-only
+// reads without version_id / healing / free-version needs) and still requires
+// a full read-quorum agreement before stopping. Set the env var to `false` to
+// fall back to full-wait metadata fanout.
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
 
 const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
+
+// --- Multipart Reader-Setup Prefetch Configuration (backlog#870) ---
+
+const ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: &str = "RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH";
+const DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: bool = true;
 
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -677,6 +687,31 @@ fn is_version_early_stop_enabled() -> bool {
             rustfs_utils::get_env_bool(
                 ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
                 DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
+            )
+        })
+    }
+}
+
+/// Check if multipart reads prefetch the next part's bitrot reader setup
+/// while the current part decodes (backlog#870).
+///
+/// **Note**: Cached via `OnceLock` in production. In test builds the env var
+/// is read directly so that `temp_env` overrides take effect.
+fn is_multipart_reader_setup_prefetch_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH,
+            DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH,
+                DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH,
             )
         })
     }
@@ -4487,6 +4522,151 @@ mod tests {
         );
     }
 
+    // Build an `xl.meta` under `object_dir` whose versions reference `data_dirs`
+    // (one Object version per data dir, each with its own version id).
+    async fn write_object_meta_with_data_dirs(object_dir: &std::path::Path, bucket: &str, object: &str, data_dirs: &[Uuid]) {
+        fs::create_dir_all(object_dir).await.expect("object dir should be created");
+        let mut meta = FileMeta::default();
+        for data_dir in data_dirs {
+            let mut fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 1);
+            fi.name = object.to_string();
+            fi.version_id = Some(Uuid::new_v4());
+            fi.data_dir = Some(*data_dir);
+            fi.size = 1;
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            meta.add_version(fi).expect("metadata should accept file info");
+        }
+        let buf = meta.marshal_msg().expect("metadata should encode");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), buf)
+            .await
+            .expect("metadata should be written");
+    }
+
+    // #3231/#3191: a data dir on disk that no version references (a pre-#3510
+    // unversioned-overwrite leak) must be reclaimed, leaving the live one intact.
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_removes_unreferenced_dir() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+
+        let object_dir = root.join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+        fs::write(object_dir.join(live.to_string()).join("part.1"), b"live")
+            .await
+            .expect("live part should be written");
+        fs::create_dir_all(object_dir.join(orphan.to_string()))
+            .await
+            .expect("orphan data dir should be created");
+        fs::write(object_dir.join(orphan.to_string()).join("part.1"), b"stale")
+            .await
+            .expect("orphan part should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("reclaim should succeed");
+
+        assert_eq!(removed, 1, "exactly the unreferenced data dir should be removed");
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+        assert!(!object_dir.join(orphan.to_string()).exists(), "orphaned data dir must be removed");
+        assert!(object_dir.join(STORAGE_FORMAT_FILE).exists(), "metadata must be preserved");
+    }
+
+    // Nothing to reclaim when every physical data dir is still referenced.
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_keeps_referenced_dir() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let live = Uuid::new_v4();
+
+        let object_dir = root.join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        fs::create_dir_all(object_dir.join(live.to_string()))
+            .await
+            .expect("live data dir should be created");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("reclaim should succeed");
+
+        assert_eq!(removed, 0, "no data dir should be removed");
+        assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
+    }
+
+    // Fail closed: a data dir present without a readable xl.meta is degraded, and
+    // must never be removed (a heal has to run first).
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_aborts_when_meta_missing() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let stray = Uuid::new_v4();
+
+        let object_dir = root.join("bucket").join("obj");
+        fs::create_dir_all(object_dir.join(stray.to_string()))
+            .await
+            .expect("data dir should be created");
+        fs::write(object_dir.join(stray.to_string()).join("part.1"), b"data")
+            .await
+            .expect("part should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("reclaim should succeed");
+
+        assert_eq!(removed, 0, "must not remove data dirs when metadata is absent");
+        assert!(
+            object_dir.join(stray.to_string()).exists(),
+            "degraded object's data dir must be preserved"
+        );
+    }
+
+    // Cross-replica union: a data dir referenced by ANOTHER disk's xl.meta must be
+    // kept even where the local replica does not name it.
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_keeps_dir_referenced_by_other_replica() {
+        let (dir0, disk0) = make_single_local_disk().await;
+        let (dir1, disk1) = make_single_local_disk().await;
+        let shared = Uuid::new_v4();
+
+        // disk0: meta references only a different dir, but physically holds `shared`.
+        let other = Uuid::new_v4();
+        let obj0 = dir0.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&obj0, "bucket", "obj", &[other]).await;
+        fs::create_dir_all(obj0.join(other.to_string()))
+            .await
+            .expect("dir should be created");
+        fs::create_dir_all(obj0.join(shared.to_string()))
+            .await
+            .expect("dir should be created");
+
+        // disk1: meta references `shared`.
+        let obj1 = dir1.path().join("bucket").join("obj");
+        write_object_meta_with_data_dirs(&obj1, "bucket", "obj", &[shared]).await;
+        fs::create_dir_all(obj1.join(shared.to_string()))
+            .await
+            .expect("dir should be created");
+
+        let set = make_set_disks_with(vec![Some(disk0), Some(disk1)]).await;
+        let removed = set
+            .reclaim_orphan_data_dirs("bucket", "obj")
+            .await
+            .expect("reclaim should succeed");
+
+        assert_eq!(removed, 0, "a dir referenced by any replica must be kept");
+        assert!(obj0.join(shared.to_string()).exists(), "cross-referenced data dir must survive");
+        assert!(obj0.join(other.to_string()).exists(), "locally referenced data dir must survive");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn test_acquire_dist_delete_object_locks_batch_succeeds_with_two_healthy_lockers() {
@@ -6752,6 +6932,119 @@ mod tests {
             .expect("range read should succeed");
 
         assert_eq!(out, payload[range_offset..range_offset + range_length]);
+    }
+
+    #[tokio::test]
+    async fn multipart_reads_stream_all_parts_with_setup_prefetch() {
+        use tokio::io::AsyncReadExt;
+        use uuid::Uuid;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let bucket = "bucket";
+        let object = "object";
+        // Three parts with distinct fill bytes so cross-part ordering bugs and
+        // prefetch boundary mistakes surface as content mismatches
+        // (backlog#870 exercises the prefetch hit path for parts 2 and 3).
+        let parts: Vec<Vec<u8>> = vec![
+            vec![b'a'; 2 * 1024 * 1024 + 111],
+            vec![b'b'; 1024 * 1024 + 17],
+            vec![b'c'; 3 * 1024 * 1024 + 923],
+        ];
+        let total_size: usize = parts.iter().map(|part| part.len()).sum();
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+
+        let mut fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+        let data_dir = Uuid::new_v4();
+        fi.data_dir = Some(data_dir);
+        fi.size = total_size as i64;
+        for (index, part) in parts.iter().enumerate() {
+            fi.add_object_part(index + 1, String::new(), part.len(), None, part.len() as i64, None, None);
+        }
+
+        let erasure = coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
+
+        for (index, payload) in parts.iter().enumerate() {
+            let part_number = index + 1;
+            let shard_path = format!("{object}/{data_dir}/part.{part_number}");
+            let checksum_info = fi.erasure.get_checksum_info(part_number);
+
+            let mut bitrot_writer = create_bitrot_writer(
+                true,
+                None,
+                bucket,
+                &shard_path,
+                payload.len() as i64,
+                erasure.shard_size(),
+                checksum_info.algorithm.clone(),
+            )
+            .await
+            .expect("bitrot writer should be created");
+
+            for chunk in payload.chunks(erasure.shard_size()) {
+                bitrot_writer.write(chunk).await.expect("payload chunk should be written");
+            }
+
+            let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
+            disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+                .await
+                .expect("encoded shard should be stored");
+        }
+
+        let files = vec![fi.clone()];
+        let disks = vec![Some(disk.clone())];
+        let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
+        let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
+
+        let read_task = tokio::spawn(async move {
+            SetDisks::get_object_with_fileinfo(
+                bucket,
+                object,
+                0,
+                total_size as i64,
+                &mut writer,
+                fi,
+                files,
+                &disks,
+                0,
+                0,
+                true,
+                false,
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+                metrics_size_bucket,
+            )
+            .await
+        });
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("all part bytes should be readable");
+
+        read_task
+            .await
+            .expect("read task should complete")
+            .expect("multipart read should succeed");
+
+        let expected: Vec<u8> = parts.concat();
+        assert_eq!(out.len(), expected.len(), "all parts should be streamed");
+        assert_eq!(out, expected, "part contents and ordering must survive setup prefetch");
     }
 
     #[test]
