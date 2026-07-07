@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,7 @@ use rustfs_filemeta::FileInfo;
 
 pub const DEFAULT_FREE_VERSION_RECOVERY_LIMIT: usize = 1_000;
 const DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT: usize = 10_000;
+const BACKGROUND_WALKDIR_TIMEOUT: Duration = Duration::from_secs(60);
 
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, crate::error::Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
@@ -222,7 +224,8 @@ async fn list_tier_free_versions(
                         limit: walk_scan_limit,
                         marker: object_marker,
                         ..Default::default()
-                    },
+                    }
+                    .with_walkdir_timeouts(BACKGROUND_WALKDIR_TIMEOUT),
                 )
                 .await
             }

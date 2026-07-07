@@ -54,7 +54,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -69,6 +69,10 @@ const MAX_OBJECT_LIST: i32 = 1000;
 // const MAX_PARTS_LIST: i32 = 10000;
 
 const METACACHE_SHARE_PREFIX: bool = false;
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 type ListObjectsInfo = StorageListObjectsInfo<ObjectInfo>;
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
@@ -252,6 +256,8 @@ pub struct ListPathOptions {
     pub set_idx: Option<usize>,
     pub cursor_source: Option<ListSourceMode>,
     pub cursor_generation: Option<String>,
+    pub walkdir_timeout: Option<Duration>,
+    pub walkdir_stall_timeout: Option<Duration>,
 }
 
 const MARKER_TAG_VERSION: &str = "v2";
@@ -2488,6 +2494,8 @@ struct ListingSupplementOptions {
     forward_to: Option<String>,
     per_disk_limit: i32,
     skip_total_timeout: bool,
+    walkdir_timeout: Option<Duration>,
+    walkdir_stall_timeout: Option<Duration>,
 }
 
 struct ListingSupplement {
@@ -2618,6 +2626,8 @@ async fn read_fallback_listing_disk(
                 forward_to: options.forward_to,
                 limit: options.per_disk_limit,
                 skip_total_timeout: options.skip_total_timeout,
+                timeout_ms: options.walkdir_timeout.map(duration_millis),
+                stall_timeout_ms: options.walkdir_stall_timeout.map(duration_millis),
                 ..Default::default()
             },
             &mut wr,
@@ -4224,6 +4234,8 @@ impl ECStore {
                             forward_to: opts.marker.clone(),
                             per_disk_limit: bounded_usize_to_i32(opts.limit),
                             skip_total_timeout: false,
+                            walkdir_timeout: opts.walkdir_timeout,
+                            walkdir_stall_timeout: opts.walkdir_stall_timeout,
                         },
                         fallback_disks.clone(),
                         claim_tracker.clone(),
@@ -4244,6 +4256,8 @@ impl ECStore {
                             forward_to: opts.marker.clone(),
                             min_disks: raw_min_disks,
                             per_disk_limit: bounded_usize_to_i32(opts.limit),
+                            walkdir_timeout: opts.walkdir_timeout,
+                            walkdir_stall_timeout: opts.walkdir_stall_timeout,
                             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                                 Box::pin({
                                     let value = tx1.clone();
@@ -5364,6 +5378,8 @@ impl Sets {
                         forward_to: opts.marker.clone(),
                         per_disk_limit: bounded_usize_to_i32(opts.limit),
                         skip_total_timeout: false,
+                        walkdir_timeout: opts.walkdir_timeout,
+                        walkdir_stall_timeout: opts.walkdir_stall_timeout,
                     },
                     fallback_disks.clone(),
                     claim_tracker.clone(),
@@ -5384,6 +5400,8 @@ impl Sets {
                         forward_to: opts.marker.clone(),
                         min_disks: raw_min_disks,
                         per_disk_limit: bounded_usize_to_i32(opts.limit),
+                        walkdir_timeout: opts.walkdir_timeout,
+                        walkdir_stall_timeout: opts.walkdir_stall_timeout,
                         agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                             Box::pin({
                                 let value = tx1.clone();
@@ -5953,6 +5971,8 @@ impl SetDisks {
                     incl_deleted: true,
                     recursive: true,
                     versioned: true,
+                    walkdir_timeout: opts.walkdir_timeout,
+                    walkdir_stall_timeout: opts.walkdir_stall_timeout,
                     ..Default::default()
                 },
                 entry_tx,
@@ -6215,6 +6235,8 @@ impl SetDisks {
                 forward_to: opts.marker.clone(),
                 per_disk_limit: limit,
                 skip_total_timeout: false,
+                walkdir_timeout: opts.walkdir_timeout,
+                walkdir_stall_timeout: opts.walkdir_stall_timeout,
             },
             fallback_disks.clone(),
             claim_tracker.clone(),
@@ -6235,6 +6257,8 @@ impl SetDisks {
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
                 per_disk_limit: limit,
+                walkdir_timeout: opts.walkdir_timeout,
+                walkdir_stall_timeout: opts.walkdir_stall_timeout,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     Box::pin({
                         let value = tx1.clone();
@@ -6597,6 +6621,8 @@ mod test {
                 forward_to: None,
                 per_disk_limit: 100,
                 skip_total_timeout: true,
+                walkdir_timeout: None,
+                walkdir_stall_timeout: None,
             },
             Arc::new(Vec::new()),
             FallbackClaimTracker::default(),
@@ -6611,6 +6637,8 @@ mod test {
                 forward_to: None,
                 per_disk_limit: 0,
                 skip_total_timeout: false,
+                walkdir_timeout: None,
+                walkdir_stall_timeout: None,
             },
             Arc::new(Vec::new()),
             FallbackClaimTracker::default(),
@@ -6658,6 +6686,8 @@ mod test {
                 forward_to: None,
                 per_disk_limit: 0,
                 skip_total_timeout: false,
+                walkdir_timeout: None,
+                walkdir_stall_timeout: None,
             },
             Arc::new(vec![disk]),
             FallbackClaimTracker::default(),

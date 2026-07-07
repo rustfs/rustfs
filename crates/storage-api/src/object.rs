@@ -14,6 +14,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::replication::{
     ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
@@ -238,6 +239,8 @@ pub struct WalkOptions<Filter> {
     pub versions_sort: WalkVersionsSortOrder,
     pub limit: usize,
     pub include_free_versions: bool,
+    pub walkdir_timeout: Option<Duration>,
+    pub walkdir_stall_timeout: Option<Duration>,
 }
 
 impl<Filter> Default for WalkOptions<Filter> {
@@ -250,7 +253,17 @@ impl<Filter> Default for WalkOptions<Filter> {
             versions_sort: WalkVersionsSortOrder::default(),
             limit: 0,
             include_free_versions: false,
+            walkdir_timeout: None,
+            walkdir_stall_timeout: None,
         }
+    }
+}
+
+impl<Filter> WalkOptions<Filter> {
+    pub fn with_walkdir_timeouts(mut self, timeout: Duration) -> Self {
+        self.walkdir_timeout = Some(timeout);
+        self.walkdir_stall_timeout = Some(timeout);
+        self
     }
 }
 

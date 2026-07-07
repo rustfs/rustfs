@@ -75,6 +75,7 @@ const DATA_SCANNER_COMPACT_LEAST_OBJECT: usize = 500;
 const DATA_SCANNER_COMPACT_AT_CHILDREN: usize = 10000;
 const DATA_SCANNER_COMPACT_AT_FOLDERS: usize = DATA_SCANNER_COMPACT_AT_CHILDREN / 4;
 const DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS: usize = 250_000;
+const SCANNER_LIST_PATH_RAW_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_HEAL_OBJECT_SELECT_PROB: u32 = 1024;
 const ENV_DATA_USAGE_UPDATE_DIR_CYCLES: &str = "RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES";
 const ENV_HEAL_OBJECT_SELECT_PROB: &str = "RUSTFS_HEAL_OBJECT_SELECT_PROB";
@@ -2397,6 +2398,8 @@ impl FolderScanner {
                             recursive: true,
                             report_not_found: true,
                             min_disks: disks_quorum,
+                            walkdir_timeout: Some(SCANNER_LIST_PATH_RAW_TIMEOUT),
+                            walkdir_stall_timeout: Some(SCANNER_LIST_PATH_RAW_TIMEOUT),
                             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                                 let entry_name = entry.name.clone();
                                 let agreed_tx = agreed_tx.clone();

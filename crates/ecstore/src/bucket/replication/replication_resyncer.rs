@@ -84,6 +84,8 @@ use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, trace, warn};
+
+const BACKGROUND_WALKDIR_TIMEOUT: TokioDuration = TokioDuration::from_secs(60);
 use uuid::Uuid;
 
 const EVENT_RESYNC_STATUS_UPDATE_SKIPPED: &str = "replication_resync_status_update_skipped";
@@ -645,7 +647,13 @@ impl ReplicationResyncer {
 
         if let Err(err) = storage
             .clone()
-            .walk(cancellation_token.clone(), &opts.bucket, "", tx.clone(), WalkOptions::default())
+            .walk(
+                cancellation_token.clone(),
+                &opts.bucket,
+                "",
+                tx.clone(),
+                WalkOptions::default().with_walkdir_timeouts(BACKGROUND_WALKDIR_TIMEOUT),
+            )
             .await
         {
             error!(
