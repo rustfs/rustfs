@@ -666,7 +666,7 @@ mod tests {
     }
 
     impl MockExpirationObjectBackend {
-        fn with_metadata_result(result: SwiftResult<Option<HashMap<String, String>>>) -> Self {
+        fn with_metadata_result(result: MetadataResult) -> Self {
             Self {
                 metadata_results: Mutex::new(VecDeque::from([result])),
                 ..Default::default()
