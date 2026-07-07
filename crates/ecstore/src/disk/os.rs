@@ -63,9 +63,33 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Test-only recorder of every directory passed to [`fsync_dir_std`].
+///
+/// Durability regressions are invisible to ordinary behavior tests (the data
+/// is on disk either way), so unit tests assert directly on which directories
+/// were fsynced. Paths are recorded globally; tests must match on paths under
+/// their own unique tempdir to stay robust against parallel test execution.
+#[cfg(test)]
+pub(crate) mod fsync_dir_recorder {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(dir: &Path) {
+        RECORDED.lock().expect("fsync dir recorder poisoned").push(dir.to_path_buf());
+    }
+
+    pub(crate) fn was_fsynced(dir: &Path) -> bool {
+        RECORDED.lock().expect("fsync dir recorder poisoned").iter().any(|p| p == dir)
+    }
+}
+
 /// Fsync a directory so recently created or renamed entries survive power loss.
 /// No-op on non-Unix platforms where directories cannot be opened for syncing.
 pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
+    #[cfg(test)]
+    fsync_dir_recorder::record(dir.as_ref());
     #[cfg(unix)]
     {
         std::fs::File::open(dir.as_ref())?.sync_all()?;
