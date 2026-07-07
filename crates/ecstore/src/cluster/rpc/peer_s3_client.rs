@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{debug, info, warn};
 
 type Client = Arc<Box<dyn PeerS3Client>>;
 
@@ -553,7 +553,7 @@ impl PeerS3Client for LocalPeerS3Client {
             .ok_or(Error::VolumeNotFound)
     }
 
-    async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         let local_disks = self.local_disks_for_pools().await;
         if local_disks.is_empty() {
             return Err(Error::ErasureWriteQuorum);
@@ -562,7 +562,10 @@ impl PeerS3Client for LocalPeerS3Client {
         let mut futures = Vec::with_capacity(local_disks.len());
 
         for disk in local_disks.iter() {
-            futures.push(disk.delete_volume(bucket));
+            // Non-force delete refuses a non-empty bucket (VolumeNotEmpty), which
+            // the recreate loop below turns into BucketNotEmpty; only an explicit
+            // force delete removes recursively (backlog#799 B1).
+            futures.push(disk.delete_volume(bucket, opts.force));
         }
 
         let results = join_all(futures).await;
@@ -690,12 +693,9 @@ impl RemotePeerS3Client {
                         let cancel_clone = cancel_token.clone();
                         let span = Self::recovery_monitor_span(&addr_clone);
 
-                        tokio::spawn(
-                            async move {
-                                Self::monitor_remote_peer_recovery(addr_clone, health_clone, cancel_clone).await;
-                            }
-                            .instrument(span),
-                        );
+                        super::spawn_background_monitor(span, async move {
+                            Self::monitor_remote_peer_recovery(addr_clone, health_clone, cancel_clone).await;
+                        });
                     }
                 }
             }
@@ -799,12 +799,9 @@ impl RemotePeerS3Client {
             let cancel_token = self.cancel_token.clone();
             let addr = self.addr.clone();
             let span = Self::recovery_monitor_span(&addr);
-            tokio::spawn(
-                async move {
-                    Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
-                }
-                .instrument(span),
-            );
+            super::spawn_background_monitor(span, async move {
+                Self::monitor_remote_peer_recovery(addr, health, cancel_token).await;
+            });
         }
     }
 }
@@ -1036,9 +1033,19 @@ pub(crate) async fn heal_bucket_local_on_disks(
             futures.push(async move {
                 match disk {
                     Some(disk) => {
-                        info!("will call delete_volume, volume: {}", bucket);
-                        let _ = disk.delete_volume(&bucket).await;
-                        None
+                        // Non-force: a bucket that still holds object data refuses
+                        // deletion (VolumeNotEmpty) instead of being recursively
+                        // wiped, so a misclassified "dangling" bucket cannot lose
+                        // data (backlog#799 B1). Surface that refusal instead of
+                        // discarding it — it signals the bucket is not dangling.
+                        match disk.delete_volume(&bucket, false).await {
+                            Ok(()) => None,
+                            Err(Error::VolumeNotEmpty) => {
+                                warn!("heal declined to remove non-empty bucket {bucket} (not dangling)");
+                                None
+                            }
+                            Err(e) => Some(e),
+                        }
                     }
                     None => Some(Error::DiskNotFound),
                 }

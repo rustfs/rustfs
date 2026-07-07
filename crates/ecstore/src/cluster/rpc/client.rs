@@ -16,7 +16,9 @@ use crate::cluster::rpc::{TONIC_RPC_PREFIX, gen_signature_headers};
 use crate::disk::error::{DiskError, Error as DiskErrorType};
 use crate::runtime::sources as runtime_sources;
 use http::Method;
-use rustfs_protos::{create_new_channel, proto_gen::node_service::node_service_client::NodeServiceClient};
+use rustfs_protos::{
+    ChannelClass, create_new_channel, get_channel_for_class, proto_gen::node_service::node_service_client::NodeServiceClient,
+};
 use std::{error::Error, io::ErrorKind};
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tracing::debug;
@@ -29,21 +31,38 @@ pub async fn node_service_time_out_client(
     addr: &String,
     interceptor: TonicInterceptor,
 ) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>, Box<dyn Error>> {
-    // Try to get cached channel
-    let cached_channel = runtime_sources::cached_node_channel(addr).await;
+    // Default to the latency-sensitive control channel; bulk `bytes` RPCs opt in via the
+    // `_for_class` variant below (grpc-optimization P1).
+    node_service_time_out_client_for_class(addr, interceptor, ChannelClass::Control).await
+}
 
-    let channel = match cached_channel {
-        Some(channel) => {
-            debug!("Using cached gRPC channel for: {}", addr);
-            channel
-        }
-        None => {
-            // No cached connection, create new one
-            create_new_channel(addr).await?
-        }
+/// Build a `NodeServiceClient` bound to the [`ChannelClass`]-appropriate channel for `addr`.
+///
+/// Bulk `bytes`-carrying RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion) pass
+/// [`ChannelClass::Bulk`] so, when channel isolation is enabled, they are physically isolated
+/// from lock/health RPCs; everything else uses [`ChannelClass::Control`]. When isolation is
+/// disabled the two classes resolve to the same cached channel, i.e. legacy behavior.
+pub async fn node_service_time_out_client_for_class(
+    addr: &String,
+    interceptor: TonicInterceptor,
+    class: ChannelClass,
+) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>, Box<dyn Error>> {
+    let channel = match class {
+        ChannelClass::Control => match runtime_sources::cached_node_channel(addr).await {
+            Some(channel) => {
+                debug!("Using cached gRPC channel for: {}", addr);
+                channel
+            }
+            // No cached connection, create new one.
+            None => create_new_channel(addr).await?,
+        },
+        ChannelClass::Bulk => get_channel_for_class(addr, ChannelClass::Bulk).await?,
     };
 
-    Ok(NodeServiceClient::with_interceptor(channel, interceptor))
+    let max_message_size = rustfs_protos::internode_rpc_max_message_size();
+    Ok(NodeServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size))
 }
 
 pub async fn node_service_time_out_client_no_auth(

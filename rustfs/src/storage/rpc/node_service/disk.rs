@@ -21,7 +21,8 @@ use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
+    INTERNODE_MSGPACK_DIRECTION_REQUEST, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
@@ -29,18 +30,29 @@ use std::io::Cursor;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
-fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &str) -> std::result::Result<T, DiskError> {
+/// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
+/// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
+const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+
+fn decode_msgpack_or_json<T: DeserializeOwned>(
+    binary: &[u8],
+    json: &str,
+    value_name: &'static str,
+) -> std::result::Result<T, DiskError> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
         return T::deserialize(&mut deserializer)
             .map_err(|err| DiskError::other(format!("decode {value_name} msgpack failed: {err}")));
     }
 
+    // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
+    // must read zero across a release window before the redundant JSON fields can be dropped (P2).
+    global_internode_metrics().record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, value_name);
     serde_json::from_str(json).map_err(|err| DiskError::other(format!("decode {value_name} failed: {err}")))
 }
 
 fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::new());
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT));
     value
         .serialize(&mut serializer)
         .map_err(|err| DiskError::other(format!("encode {value_name} msgpack failed: {err}")))?;
@@ -48,11 +60,21 @@ fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::resu
 }
 
 fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::new()).with_struct_map();
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT)).with_struct_map();
     value
         .serialize(&mut serializer)
         .map_err(|err| DiskError::other(format!("encode {value_name} named msgpack failed: {err}")))?;
     Ok(serializer.into_inner())
+}
+
+/// JSON compatibility string for a dual-encoded response field. Returns an empty string when
+/// msgpack-only mode is enabled (grpc-optimization P2-1) so the redundant JSON copy is not sent;
+/// otherwise the legacy JSON encoding. The paired `_bin` (msgpack) field is always sent.
+fn compat_response_json<T: serde::Serialize>(value: &T) -> std::result::Result<String, serde_json::Error> {
+    if rustfs_protos::internode_rpc_msgpack_only() {
+        return Ok(String::new());
+    }
+    serde_json::to_string(value)
 }
 
 fn encode_read_multiple_response_payloads(
@@ -63,7 +85,7 @@ fn encode_read_multiple_response_payloads(
 
     for read_multiple_resp in read_multiple_resps {
         read_multiple_resps_json.push(
-            serde_json::to_string(read_multiple_resp)
+            compat_response_json(read_multiple_resp)
                 .map_err(|err| DiskError::other(format!("encode ReadMultipleResp json failed: {err}")))?,
         );
         read_multiple_resps_bin.push(Bytes::from(encode_msgpack(read_multiple_resp, "ReadMultipleResp")?));
@@ -80,7 +102,7 @@ fn encode_batch_read_version_response_payloads(
 
     for batch_read_version_resp in batch_read_version_resps {
         batch_read_version_resps_json.push(
-            serde_json::to_string(batch_read_version_resp)
+            compat_response_json(batch_read_version_resp)
                 .map_err(|err| DiskError::other(format!("encode BatchReadVersionResp json failed: {err}")))?,
         );
         batch_read_version_resps_bin.push(Bytes::from(encode_msgpack(batch_read_version_resp, "BatchReadVersionResp")?));
@@ -137,7 +159,7 @@ impl NodeService {
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            match disk.delete_volume(&request.volume).await {
+            match disk.delete_volume(&request.volume, request.force).await {
                 Ok(_) => Ok(Response::new(DeleteVolumeResponse {
                     success: true,
                     error: None,
@@ -292,8 +314,9 @@ impl NodeService {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
             let mut versions = Vec::with_capacity(request.versions.len());
-            for version in request.versions.iter() {
-                match serde_json::from_str::<FileInfoVersions>(version) {
+            for (index, version) in request.versions.iter().enumerate() {
+                let version_bin = request.versions_bin.get(index).map(|b| b.as_ref()).unwrap_or(&[]);
+                match decode_msgpack_or_json::<FileInfoVersions>(version_bin, version, "FileInfoVersions") {
                     Ok(version) => versions.push(version),
                     Err(err) => {
                         return Ok(Response::new(DeleteVersionsResponse {
@@ -304,7 +327,7 @@ impl NodeService {
                     }
                 };
             }
-            let opts = match serde_json::from_str::<DeleteOptions>(&request.opts) {
+            let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
                 Ok(opts) => opts,
                 Err(err) => {
                     return Ok(Response::new(DeleteVersionsResponse {
@@ -345,7 +368,7 @@ impl NodeService {
     ) -> Result<Response<DeleteVersionResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
                     return Ok(Response::new(DeleteVersionResponse {
@@ -355,7 +378,7 @@ impl NodeService {
                     }));
                 }
             };
-            let opts = match serde_json::from_str::<DeleteOptions>(&request.opts) {
+            let opts = match decode_msgpack_or_json::<DeleteOptions>(&request.opts_bin, &request.opts, "DeleteOptions") {
                 Ok(opts) => opts,
                 Err(err) => {
                     return Ok(Response::new(DeleteVersionResponse {
@@ -401,7 +424,7 @@ impl NodeService {
         if let Some(disk) = self.find_disk(&request.disk).await {
             match disk.read_xl(&request.volume, &request.path, request.read_data).await {
                 Ok(raw_file_info) => {
-                    let raw_file_info_json = serde_json::to_string(&raw_file_info);
+                    let raw_file_info_json = compat_response_json(&raw_file_info);
                     let raw_file_info_bin = encode_msgpack(&raw_file_info, "RawFileInfo");
                     match (raw_file_info_json, raw_file_info_bin) {
                         (Ok(raw_file_info), Ok(raw_file_info_bin)) => Ok(Response::new(ReadXlResponse {
@@ -463,7 +486,7 @@ impl NodeService {
                 .await
             {
                 Ok(file_info) => {
-                    let file_info_json = serde_json::to_string(&file_info);
+                    let file_info_json = compat_response_json(&file_info);
                     let file_info_bin = encode_msgpack(&file_info, "FileInfo");
                     match (file_info_json, file_info_bin) {
                         (Ok(file_info), Ok(file_info_bin)) => Ok(Response::new(ReadVersionResponse {
@@ -768,7 +791,7 @@ impl NodeService {
                 .await
             {
                 Ok(rename_data_resp) => {
-                    let rename_data_resp_json = serde_json::to_string(&rename_data_resp);
+                    let rename_data_resp_json = compat_response_json(&rename_data_resp);
                     let rename_data_resp_bin = encode_msgpack_named(&rename_data_resp, "RenameDataResp");
                     match (rename_data_resp_json, rename_data_resp_bin) {
                         (Ok(rename_data_resp), Ok(rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {

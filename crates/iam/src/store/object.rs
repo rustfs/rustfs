@@ -147,6 +147,22 @@ fn split_path(s: &str, last_index: bool) -> (&str, &str) {
     }
 }
 
+/// Attempts to decrypt an at-rest IAM config blob using the same key sources as
+/// the IAM load path: the RustFS master keys (`RUSTFS_IAM_MASTER_KEY[_OLD_KEYS]`)
+/// and the MinIO-compatible legacy keys derived from the root credentials
+/// (`secret_key` and `access_key:secret_key`).
+///
+/// Returns the plaintext when a key succeeds. When `data` is already plaintext
+/// JSON it is returned unchanged. Returns `None` if no configured key can decrypt
+/// it, so the caller can fall back to treating `data` as-is.
+///
+/// This is used by the MinIO -> RustFS migration path to decrypt IAM
+/// identity/service-account files that MinIO encrypts at rest before normalizing
+/// and re-persisting them under the RustFS system bucket.
+pub fn try_decrypt_iam_blob(data: &[u8]) -> Option<Vec<u8>> {
+    ObjectStore::decrypt_data_with_source(data).ok().map(|outcome| outcome.plain)
+}
+
 #[derive(Clone)]
 pub struct ObjectStore {
     object_api: Arc<IamStore>,
@@ -354,10 +370,6 @@ impl ObjectStore {
 
     async fn list_iam_config_items(&self, prefix: &str, ctx: CancellationToken, sender: Sender<StringOrErr>) {
         // debug!("list iam config items, prefix: {}", &prefix);
-
-        // TODO: Implement walk, use walk
-
-        // let prefix = format!("{}{}", prefix, item);
 
         let store = self.object_api.clone();
 
@@ -595,42 +607,6 @@ impl ObjectStore {
             Err(e) => Err(e.into()),
         }
     }
-
-    // async fn load_policy(&self, name: &str) -> Result<PolicyDoc> {
-    //     let mut policy = self
-    //         .load_iam_config::<PolicyDoc>(&format!("config/iam/policies/{name}/policy.json"))
-    //         .await?;
-
-    //     // FIXME:
-    //     // if policy.version == 0 {
-    //     //     policy.create_date = object.mod_time;
-    //     //     policy.update_date = object.mod_time;
-    //     // }
-
-    //     Ok(policy)
-    // }
-
-    // async fn load_user_identity(&self, user_type: UserType, name: &str) -> Result<Option<UserIdentity>> {
-    //     let mut user = self
-    //         .load_iam_config::<UserIdentity>(&format!(
-    //             "config/iam/{base}{name}/identity.json",
-    //             base = user_type.prefix(),
-    //             name = name
-    //         ))
-    //         .await?;
-
-    //     if user.credentials.is_expired() {
-    //         return Ok(None);
-    //     }
-
-    //     if user.credentials.access_key.is_empty() {
-    //         user.credentials.access_key = name.to_owned();
-    //     }
-
-    //     // todo, validate session token
-
-    //     Ok(Some(user))
-    // }
 }
 
 #[async_trait::async_trait]
@@ -1313,6 +1289,33 @@ mod tests {
         let encrypted = rustfs_crypto::encrypt_stream_io(root_cred.as_bytes(), plain).expect("encrypt with stream_io");
         let out = ObjectStore::decrypt_data_with_source(&encrypted).expect("decrypt stream_io");
         assert_eq!(out.plain, plain);
+    }
+
+    // Public helper used by the MinIO -> RustFS migration path (see
+    // ecstore::bucket::migration::try_migrate_iam_config).
+    #[test]
+    fn test_try_decrypt_iam_blob_passes_plaintext_through() {
+        let raw = br#"{"Version":1,"policy":"readonly"}"#;
+        let out = super::try_decrypt_iam_blob(raw).expect("plaintext json should pass through");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn test_try_decrypt_iam_blob_decrypts_legacy_secret_encryption() {
+        // Mirrors a MinIO IAM identity file encrypted at rest with the root secret key.
+        let cred = test_cred();
+        let plain = br#"{"accessKey":"ak","secretKey":"sk"}"#;
+        let encrypted = rustfs_crypto::encrypt_data(cred.secret_key.as_bytes(), plain).expect("encrypt with rustfs secret");
+        let out = super::try_decrypt_iam_blob(&encrypted).expect("legacy-encrypted blob should decrypt");
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn test_try_decrypt_iam_blob_returns_none_on_undecryptable() {
+        // A blob that is neither plaintext JSON nor decryptable with any known key
+        // must return None so the migration falls back to the raw bytes (skip).
+        let garbage = [0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05];
+        assert!(super::try_decrypt_iam_blob(&garbage).is_none());
     }
 
     #[test]

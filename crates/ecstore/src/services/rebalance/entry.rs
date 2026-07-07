@@ -356,11 +356,6 @@ impl ECStore {
             "Rebalance bucket entry scan started"
         );
 
-        // TODO: other config
-        // if bucket != RUSTFS_META_BUCKET{
-
-        // }
-
         let pool = clone_arc_by_index(self.pools.as_slice(), pool_index, "invalid rebalance pool index")?;
         let bucket_configs = Arc::new(load_rebalance_bucket_configs(&bucket).await?);
 

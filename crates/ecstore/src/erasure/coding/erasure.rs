@@ -787,6 +787,17 @@ impl Erasure {
     pub fn total_shard_count(&self) -> usize {
         self.data_shards + self.parity_shards
     }
+
+    /// Whether the erasure dimensions are safe for the shard/offset arithmetic.
+    ///
+    /// `block_size` and `data_shards` come straight from on-disk metadata; a
+    /// corrupted or crafted `xl.meta` can carry zero values that would panic the
+    /// `block_size`/`data_shards` divisions in [`Self::shard_size`],
+    /// [`Self::shard_file_size`] and [`Self::shard_file_offset`]. Read paths must
+    /// reject such metadata before performing those divisions.
+    pub fn has_valid_dimensions(&self) -> bool {
+        self.block_size > 0 && self.data_shards > 0
+    }
     // /// Calculate the shard size and total size for a given data size.
     // // Returns (shard_size, total_size) for the given data size
     // fn need_size(&self, data_size: usize) -> (usize, usize) {
@@ -960,6 +971,21 @@ mod tests {
         let owned = erasure.encode_data_owned(data).expect("owned encode should succeed");
 
         assert_eq!(owned, borrowed);
+    }
+
+    #[test]
+    fn has_valid_dimensions_rejects_zero_block_size_or_data_shards() {
+        // Well-formed erasure metadata is accepted.
+        assert!(Erasure::new(4, 2, 64).has_valid_dimensions());
+        assert!(Erasure::new_with_options(6, 4, 1, true).has_valid_dimensions());
+
+        // Corrupted on-disk metadata with a zero block_size or zero data_shards
+        // must be rejected before it reaches the shard/offset divisions.
+        // (parity_shards is kept 0 for the zero-data_shards cases so the
+        // Reed-Solomon encoder is not constructed with an invalid shard count.)
+        assert!(!Erasure::new(4, 2, 0).has_valid_dimensions());
+        assert!(!Erasure::new(0, 0, 64).has_valid_dimensions());
+        assert!(!Erasure::new(0, 0, 0).has_valid_dimensions());
     }
 
     #[test]

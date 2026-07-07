@@ -1902,6 +1902,7 @@ mod tests {
             file_info: "{}".to_string(),
             force_del_marker: false,
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1923,6 +1924,7 @@ mod tests {
             file_info: "invalid json".to_string(),
             force_del_marker: false,
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1944,6 +1946,7 @@ mod tests {
             file_info: "{}".to_string(),
             force_del_marker: false,
             opts: "invalid json".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1963,6 +1966,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["{}".to_string()],
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
@@ -1982,6 +1986,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["invalid json".to_string()],
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
@@ -2001,6 +2006,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["{}".to_string()],
             opts: "invalid json".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
@@ -2055,6 +2061,7 @@ mod tests {
         let request = Request::new(DeleteVolumeRequest {
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
+            force: false,
         });
 
         let response = service.delete_volume(request).await;
@@ -2601,18 +2608,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_bucket_metadata() {
+    async fn test_delete_bucket_metadata_empty_bucket() {
         let service = create_test_node_service();
 
-        let request = Request::new(DeleteBucketMetadataRequest {
-            bucket: "test-bucket".to_string(),
-        });
+        let request = Request::new(DeleteBucketMetadataRequest { bucket: String::new() });
 
         let response = service.delete_bucket_metadata(request).await;
         assert!(response.is_ok());
 
+        // An empty bucket name is rejected before touching the metadata system.
         let delete_response = response.unwrap().into_inner();
-        assert!(delete_response.success); // Currently returns success (todo implementation)
+        assert!(!delete_response.success);
+        assert!(delete_response.error_info.unwrap().contains("bucket name is missing"));
     }
 
     #[tokio::test]

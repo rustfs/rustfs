@@ -52,6 +52,17 @@ type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
+/// Callback used to decrypt an at-rest config blob during MinIO -> RustFS migration.
+///
+/// MinIO encrypts IAM identity/service-account files and the server config at rest
+/// with a key derived from the root credentials. The migration paths live in
+/// `ecstore`, which cannot depend on the IAM crate that owns the decryption keys,
+/// so the caller injects the decryption logic. Given raw bytes read from the
+/// legacy meta bucket, it returns the plaintext when a key succeeds, or `None`
+/// when the blob cannot be decrypted (in which case the raw bytes are used as-is,
+/// preserving the original plaintext-only behavior).
+pub type LegacyBlobDecryptFn = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CompatIamFormat {
     #[serde(default)]
@@ -305,7 +316,7 @@ where
 /// Lists all objects under the IAM prefix in the source, copies each to the target if not present.
 /// Skips objects that already exist in RustFS (idempotent).
 /// If list_objects_v2 on the legacy bucket fails (e.g. format differs), migration is skipped.
-pub async fn try_migrate_iam_config<S>(store: Arc<S>)
+pub async fn try_migrate_iam_config<S>(store: Arc<S>, decrypt_fn: Option<LegacyBlobDecryptFn>)
 where
     S: ListOperations<
             Error = crate::error::Error,
@@ -386,6 +397,13 @@ where
                     continue;
                 }
             };
+            // MinIO encrypts IAM identity/service-account files at rest. Decrypt
+            // before normalizing; fall back to the raw bytes when no key applies
+            // (plaintext blobs, or nothing to decrypt) so existing behavior holds.
+            let data = match &decrypt_fn {
+                Some(decrypt) => decrypt(&data).unwrap_or(data),
+                None => data,
+            };
             let data = match normalize_iam_config_blob(path, &data) {
                 Ok(Some(normalized)) => normalized,
                 Ok(None) => {
@@ -443,6 +461,36 @@ mod tests {
             .and_then(|x| x.as_str())
             .expect("updatedAt should exist as string");
         assert!(updated_at.contains('T'), "updatedAt should be RFC3339-like");
+    }
+
+    #[test]
+    fn test_encrypted_identity_requires_decrypt_before_normalize() {
+        // Reproduces the MinIO drop-in migration gap: an IAM identity file that
+        // MinIO encrypted at rest is NOT valid JSON, so normalize fails outright.
+        // The migration's decrypt callback must run first to recover it.
+        let path = "config/iam/users/alice/identity.json";
+        let plaintext = br#"{"version":1,"credentials":{"accessKey":"alice","secretKey":"alicesecret"}}"#;
+
+        // Simulate MinIO's at-rest encryption of the identity blob.
+        let ciphertext = rustfs_crypto::encrypt_data(b"root-secret-key", plaintext).expect("encrypt identity blob");
+
+        // Without decryption (old behavior): normalize can't parse ciphertext -> Err -> skipped.
+        assert!(
+            normalize_iam_config_blob(path, &ciphertext).is_err(),
+            "ciphertext must not parse as a JSON identity"
+        );
+
+        // With the decrypt callback recovering plaintext first: normalize succeeds.
+        let decrypt_fn: super::LegacyBlobDecryptFn =
+            std::sync::Arc::new(|data: &[u8]| rustfs_crypto::decrypt_data(b"root-secret-key", data).ok());
+        let recovered = decrypt_fn(&ciphertext).expect("callback should decrypt the identity blob");
+        assert_eq!(recovered, plaintext);
+
+        let normalized = normalize_iam_config_blob(path, &recovered)
+            .expect("normalize should succeed on decrypted plaintext")
+            .expect("identity path should be supported");
+        let v: serde_json::Value = serde_json::from_slice(&normalized).expect("output should be valid JSON");
+        assert!(v.get("updatedAt").is_some(), "normalize should backfill updatedAt");
     }
 
     #[test]

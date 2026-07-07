@@ -4648,16 +4648,29 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             let Some(user) = item.iam_user else {
                 return Err(s3_error!(InvalidRequest, "iamUser is required"));
             };
+            if let Some(local) = iam_sys.get_user(&user.access_key).await
+                && is_stale_update(local.update_at.unwrap_or(OffsetDateTime::UNIX_EPOCH), incoming_updated_at)
+            {
+                return Ok(());
+            }
             if user.is_delete_req {
                 iam_sys.delete_user(&user.access_key, true).await.map_err(ApiError::from)?;
             } else {
                 let Some(user_req) = user.user_req else {
                     return Err(s3_error!(InvalidRequest, "userReq is required"));
                 };
-                iam_sys
-                    .create_user(&user.access_key, &user_req)
-                    .await
-                    .map_err(ApiError::from)?;
+                let is_status_only_update = user_req.secret_key.is_empty() && user_req.policy.is_none();
+                if is_status_only_update {
+                    iam_sys
+                        .set_user_status(&user.access_key, user_req.status)
+                        .await
+                        .map_err(ApiError::from)?;
+                } else {
+                    iam_sys
+                        .create_user(&user.access_key, &user_req)
+                        .await
+                        .map_err(ApiError::from)?;
+                }
             }
             Ok(())
         }

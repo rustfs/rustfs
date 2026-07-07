@@ -165,6 +165,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         ),
         admin_route(Method::GET, "/v3/target/arns"),
         admin_route(Method::POST, "/v3/service"),
+        admin_route(Method::POST, "/v3/update"),
         admin_route(Method::GET, "/v3/info"),
         admin_route(Method::GET, "/v3/inspect-data"),
         admin_route(Method::POST, "/v3/inspect-data"),
@@ -244,6 +245,13 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/replicationmetrics"),
         admin_route(Method::PUT, "/v3/set-remote-target"),
         admin_route(Method::DELETE, "/v3/remove-remote-target"),
+        admin_route(Method::POST, "/v3/replication/diff"),
+        admin_route(Method::GET, "/v3/replication/mrf"),
+        admin_route(Method::POST, "/v3/start-job"),
+        admin_route(Method::GET, "/v3/list-jobs"),
+        admin_route(Method::GET, "/v3/status-job"),
+        admin_route(Method::GET, "/v3/describe-job"),
+        admin_route(Method::DELETE, "/v3/cancel-job"),
         admin_route(Method::PUT, "/v3/site-replication/add"),
         admin_route(Method::PUT, "/v3/site-replication/remove"),
         admin_route(Method::GET, "/v3/site-replication/info"),
@@ -266,6 +274,21 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/site-replication/repair"),
         admin_route(Method::GET, "/debug/pprof/profile"),
         admin_route(Method::GET, "/debug/pprof/status"),
+        admin_route(Method::POST, "/v3/profiling/start"),
+        admin_route(Method::GET, "/v3/profiling/download"),
+        admin_route(Method::POST, "/v3/profile"),
+        admin_route(Method::GET, "/v3/trace"),
+        admin_route(Method::GET, "/v3/top/locks"),
+        admin_route(Method::POST, "/v3/force-unlock"),
+        admin_route(Method::GET, "/v3/healthinfo"),
+        admin_route(Method::GET, "/v3/obdinfo"),
+        admin_route(Method::GET, "/v3/log"),
+        admin_route(Method::POST, "/v3/speedtest"),
+        admin_route(Method::POST, "/v3/speedtest/object"),
+        admin_route(Method::POST, "/v3/speedtest/drive"),
+        admin_route(Method::POST, "/v3/speedtest/net"),
+        admin_route(Method::POST, "/v3/speedtest/site"),
+        admin_route(Method::POST, "/v3/speedtest/client/devnull"),
         admin_route(Method::GET, "/debug/tls/status"),
         admin_route(Method::POST, "/v3/kms/create-key"),
         admin_route(Method::POST, "/v3/kms/key/create"),
@@ -295,6 +318,20 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::PUT, "/v3/oidc/config/{provider_id}", "/v3/oidc/config/default"),
         admin_route_sample(Method::DELETE, "/v3/oidc/config/{provider_id}", "/v3/oidc/config/default"),
         admin_route(Method::POST, "/v3/oidc/validate"),
+        // idp_compat (rustfs/backlog#609 #610 #616)
+        admin_route(Method::PUT, "/v3/import-iam-v2"),
+        admin_route_sample(Method::POST, "/v3/revoke-tokens/{user_provider}", "/v3/revoke-tokens/builtin"),
+        admin_route_sample(Method::GET, "/v3/idp-config/{idp_type}", "/v3/idp-config/openid"),
+        admin_route_sample(Method::GET, "/v3/idp-config/{idp_type}/{name}", "/v3/idp-config/openid/default"),
+        admin_route_sample(Method::PUT, "/v3/idp-config/{idp_type}/{name}", "/v3/idp-config/openid/default"),
+        admin_route_sample(Method::POST, "/v3/idp-config/{idp_type}/{name}", "/v3/idp-config/openid/default"),
+        admin_route_sample(Method::DELETE, "/v3/idp-config/{idp_type}/{name}", "/v3/idp-config/openid/default"),
+        admin_route(Method::PUT, "/v3/idp/ldap/add-service-account"),
+        admin_route(Method::GET, "/v3/idp/ldap/list-access-keys"),
+        admin_route(Method::GET, "/v3/idp/ldap/list-access-keys-bulk"),
+        admin_route(Method::GET, "/v3/idp/ldap/policy-entities"),
+        admin_route_sample(Method::POST, "/v3/idp/ldap/policy/{operation}", "/v3/idp/ldap/policy/attach"),
+        admin_route(Method::GET, "/v3/idp/openid/list-access-keys-bulk"),
         table_route(Method::GET, "/config"),
         table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
         table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
@@ -1125,6 +1162,13 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
+    assert_route(&router, Method::POST, &admin_path("/v3/replication/diff"));
+    assert_route(&router, Method::GET, &admin_path("/v3/replication/mrf"));
+    assert_route(&router, Method::POST, &admin_path("/v3/start-job"));
+    assert_route(&router, Method::GET, &admin_path("/v3/list-jobs"));
+    assert_route(&router, Method::GET, &admin_path("/v3/status-job"));
+    assert_route(&router, Method::GET, &admin_path("/v3/describe-job"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/cancel-job"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/add"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/info"));

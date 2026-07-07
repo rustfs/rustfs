@@ -179,16 +179,19 @@ impl BucketOperations for SetDisks {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_bucket(&self, bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
         let disks = self.disk_inventory().await;
         let write_quorum = (disks.len() / 2) + 1;
 
         let mut futures = Vec::with_capacity(disks.len());
         for disk in disks.iter().cloned() {
             let bucket = bucket.to_string();
+            let force = opts.force;
             futures.push(async move {
                 match disk {
-                    Some(disk) => disk.delete_volume(&bucket).await,
+                    // Non-force refuses a non-empty bucket (VolumeNotEmpty); only
+                    // an explicit force delete removes recursively (backlog#799 B1).
+                    Some(disk) => disk.delete_volume(&bucket, force).await,
                     None => Err(DiskError::DiskNotFound),
                 }
             });

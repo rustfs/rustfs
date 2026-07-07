@@ -39,7 +39,6 @@ pub mod bulk;
 pub mod container;
 pub mod cors;
 pub mod dlo;
-pub mod encryption;
 pub mod errors;
 pub mod expiration;
 pub mod expiration_worker;

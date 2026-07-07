@@ -25,6 +25,7 @@ on:
       - '.github/workflows/**'
       - 'scripts/security/check_workflow_pins.sh'
   pull_request:
+    types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
     paths:
       - '**/Cargo.toml'
@@ -40,12 +41,25 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  cancel-closed-pr-runs:
+    name: Cancel Closed PR Runs
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain cancellation run
+        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
+
   security-audit:
     name: Security Audit
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -71,6 +85,7 @@ jobs:
 
   cargo-deny:
     name: Cargo Deny
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -92,6 +107,7 @@ jobs:
 
   workflow-pin-report:
     name: Workflow Pin Report
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -104,7 +120,7 @@ jobs:
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
     permissions:
       contents: read
       pull-requests: write

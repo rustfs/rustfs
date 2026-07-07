@@ -352,7 +352,13 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject).await
+        let result =
+            enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject)
+                .await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self, bucket).await;
+        }
+        result
     }
 }
 
@@ -407,7 +413,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         self.handle_verify_object_integrity(bucket, object, opts).await
     }
 
-    // TODO: review
     #[instrument(skip(self))]
     async fn copy_object(
         &self,
@@ -419,24 +424,36 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        enqueue_transition_after_write(
+        let result = enqueue_transition_after_write(
             self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
                 .await,
             LcEventSrc::S3CopyObject,
         )
-        .await
+        .await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self, dst_bucket).await;
+        }
+        result
     }
 
     #[instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        self.handle_delete_object_version(bucket, object, fi, force_del_marker).await
+        let result = self.handle_delete_object_version(bucket, object, fi, force_del_marker).await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self, bucket).await;
+        }
+        result
     }
 
     #[instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
-        self.handle_delete_object(bucket, object, opts).await
+        let result = self.handle_delete_object(bucket, object, opts).await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self, bucket).await;
+        }
+        result
     }
-    // TODO: review
+
     #[instrument(skip(self))]
     async fn delete_objects(
         &self,
@@ -444,7 +461,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
-        self.handle_delete_objects(bucket, objects, opts).await
+        let result = self.handle_delete_objects(bucket, objects, opts).await;
+        let success_count = result.1.iter().filter(|err| err.is_none()).count();
+        if success_count > 0 {
+            list_objects::observe_list_objects_mutations(self, bucket, success_count).await;
+        }
+        result
     }
 
     #[instrument(skip(self))]
@@ -661,12 +683,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        enqueue_transition_after_write(
-            self.handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+        let result = enqueue_transition_after_write(
+            self.clone()
+                .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await,
             LcEventSrc::S3CompleteMultipartUpload,
         )
-        .await
+        .await;
+        if result.is_ok() {
+            list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;
+        }
+        result
     }
 }
 

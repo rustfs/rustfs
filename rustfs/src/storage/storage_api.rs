@@ -197,8 +197,8 @@ pub(crate) mod rpc_consumer {
             ECStore, Error, FileInfoVersions, LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
             ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt,
             StoragePeerS3ClientExt, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref,
-            get_local_server_property, load_bucket_metadata, reload_transition_tier_config, set_bucket_metadata,
-            validate_batch_read_version_item_count,
+            get_local_server_property, load_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata,
+            set_bucket_metadata, validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -732,7 +732,12 @@ pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {
 }
 
 pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) {
-    ecstore_bucket::migration::try_migrate_iam_config(store).await;
+    // MinIO encrypts IAM identity/service-account files at rest with a key derived
+    // from the root credentials. Inject the IAM crate's decryption so those blobs
+    // are decrypted before normalization instead of being skipped as "incompatible".
+    let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
+        Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
+    ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn)).await;
 }
 
 pub(crate) fn init_ecstore_config() {
@@ -782,6 +787,10 @@ pub(crate) fn shutdown_background_services() {
     ecstore_global::shutdown_background_services();
 }
 
+pub(crate) fn shutdown_background_monitors() {
+    rustfs_ecstore::shutdown_background_monitors();
+}
+
 pub(crate) fn set_global_endpoints(endpoints: Vec<PoolEndpoints>) {
     ecstore_global::set_global_endpoints(endpoints);
 }
@@ -795,7 +804,13 @@ pub(crate) fn set_global_rustfs_port(value: u16) {
 }
 
 pub(crate) async fn try_migrate_server_config(store: Arc<ECStore>) {
-    ecstore_config::try_migrate_server_config(store).await;
+    // MinIO encrypts the server config at rest with a key derived from the root
+    // credentials. Inject the IAM crate's decryption (same key sources as IAM
+    // config) so an encrypted legacy config is decrypted before decoding instead
+    // of being skipped as "incompatible".
+    let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
+        Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
+    ecstore_config::try_migrate_server_config(store, Some(decrypt_fn)).await;
 }
 
 pub(crate) async fn update_erasure_type(setup_type: SetupType) {
@@ -804,7 +819,7 @@ pub(crate) async fn update_erasure_type(setup_type: SetupType) {
 
 pub(crate) trait StorageDiskRpcExt {
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo>;
-    async fn delete_volume(&self, volume: &str) -> DiskResult<()>;
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> DiskResult<()>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>>;
     async fn batch_read_version(&self, req: BatchReadVersionReq) -> DiskResult<Vec<BatchReadVersionResp>>;
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions)
@@ -884,8 +899,8 @@ where
         ecstore_disk::DiskAPI::disk_info(self, opts).await
     }
 
-    async fn delete_volume(&self, volume: &str) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::delete_volume(self, volume).await
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::delete_volume(self, volume, force_delete).await
     }
 
     async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>> {
@@ -1168,6 +1183,10 @@ pub(crate) async fn get_bucket_website_config(bucket: &str) -> Result<(s3s::dto:
 
 pub(crate) async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<()> {
     ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, bm).await
+}
+
+pub(crate) async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
+    ecstore_bucket::metadata_sys::remove_bucket_metadata(bucket).await
 }
 
 pub(crate) async fn update_bucket_metadata_config(

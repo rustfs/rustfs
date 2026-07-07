@@ -148,6 +148,7 @@ opentelemetry_sdk = { workspace = true }
 proptest = "1"
 rcgen.workspace = true
 insta = { workspace = true }
+rustfs-crypto = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }

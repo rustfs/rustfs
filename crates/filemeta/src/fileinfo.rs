@@ -503,9 +503,7 @@ impl FileInfo {
 
     /// Check if replication related fields are equal
     pub fn replication_info_equals(&self, other: &FileInfo) -> bool {
-        self.mark_deleted == other.mark_deleted
-        // TODO: Add replication_state comparison when implemented
-        // && self.replication_state == other.replication_state
+        self.mark_deleted == other.mark_deleted && self.replication_state_internal == other.replication_state_internal
     }
 
     pub fn version_purge_status(&self) -> VersionPurgeStatusType {
@@ -888,5 +886,38 @@ mod tests {
             let result = std::panic::catch_unwind(|| FileInfo::unmarshal(&input));
             prop_assert!(result.is_ok(), "FileInfo::unmarshal panicked for arbitrary input");
         }
+    }
+
+    #[test]
+    fn replication_info_equals_compares_mark_deleted_and_replication_state() {
+        let base = FileInfo::default();
+
+        // Identical (both default) infos are equal.
+        assert!(base.replication_info_equals(&FileInfo::default()));
+
+        // Differing mark_deleted breaks equality.
+        let marked = FileInfo {
+            mark_deleted: true,
+            ..Default::default()
+        };
+        assert!(!base.replication_info_equals(&marked));
+
+        // Differing replication_state_internal breaks equality (regression guard:
+        // this field used to be ignored by replication_info_equals).
+        let with_state = FileInfo {
+            replication_state_internal: Some(ReplicationState {
+                replicate_decision_str: "arn:aws:s3:::dest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!base.replication_info_equals(&with_state));
+
+        // Equal replication states remain equal.
+        let with_state_clone = FileInfo {
+            replication_state_internal: with_state.replication_state_internal.clone(),
+            ..Default::default()
+        };
+        assert!(with_state.replication_info_equals(&with_state_clone));
     }
 }

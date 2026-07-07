@@ -169,6 +169,15 @@ impl LockShard {
 
         let mut retry_count = 0u32;
         const MAX_RETRIES: u32 = 10;
+        // Upper bound for a single notification wait. The notification pool is
+        // shared process-wide (a fixed set of `Notify` slots hashed by lock), so a
+        // wakeup meant for this lock can be consumed by a waiter of a different
+        // lock that hashes to the same slot, and this lock's waiter would then
+        // sleep until the full deadline. Capping each wait turns that lost-wakeup
+        // into bounded re-polling: on cap elapse we loop and re-`try_acquire`,
+        // only returning `Timeout` once the real deadline passes. The notification
+        // still delivers prompt wakeups in the common (no-collision) case.
+        const NOTIFY_WAIT_CAP: Duration = Duration::from_millis(50);
 
         loop {
             // Get or create object state
@@ -217,23 +226,25 @@ impl LockShard {
                 }
             }
 
-            // If we've exhausted quick retries or have little time left, use notification wait
+            // If we've exhausted quick retries or have little time left, use a
+            // notification wait, but bounded by NOTIFY_WAIT_CAP so a lost/stolen
+            // wakeup cannot strand this waiter until the deadline.
+            let wait = remaining.min(NOTIFY_WAIT_CAP);
             let wait_result = match request.mode {
                 LockMode::Shared => {
                     let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Shared);
-                    timeout(remaining, state.optimized_notify.wait_for_read()).await
+                    timeout(wait, state.optimized_notify.wait_for_read()).await
                 }
                 LockMode::Exclusive => {
                     let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Exclusive);
-                    timeout(remaining, state.optimized_notify.wait_for_write()).await
+                    timeout(wait, state.optimized_notify.wait_for_write()).await
                 }
             };
 
-            if wait_result.is_err() {
-                self.metrics.record_timeout();
-                return Err(LockResult::Timeout);
-            }
-
+            // A capped-wait elapse is not a real timeout: loop back and re-try the
+            // acquisition. The deadline check at the top of the loop is the single
+            // source of truth for returning `Timeout`.
+            let _ = wait_result;
             retry_count += 1;
         }
     }
@@ -506,6 +517,87 @@ impl LockShard {
             });
         }
         None
+    }
+
+    /// Enumerate every currently held lock in this shard.
+    ///
+    /// Exclusive locks yield a single entry; shared locks yield one entry per
+    /// distinct owner so administrative "top locks" views can attribute every
+    /// holder. Entries for objects that are tracked but not currently locked
+    /// (e.g. pooled-but-idle state) are skipped.
+    pub fn list_locks(&self) -> Vec<crate::fast_lock::types::ObjectLockInfo> {
+        let objects = self.objects.read();
+        let mut infos = Vec::new();
+        for (key, state) in objects.iter() {
+            let Some(mode) = state.current_mode() else {
+                continue;
+            };
+            let priority = *state.priority.read();
+            match mode {
+                LockMode::Exclusive => {
+                    if let Some(info) = state.current_owner.read().clone() {
+                        let expires_at = info
+                            .acquired_at
+                            .checked_add(info.lock_timeout)
+                            .unwrap_or_else(|| info.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+                        infos.push(crate::fast_lock::types::ObjectLockInfo {
+                            key: key.clone(),
+                            mode,
+                            owner: info.owner,
+                            acquired_at: info.acquired_at,
+                            expires_at,
+                            priority,
+                        });
+                    }
+                }
+                LockMode::Shared => {
+                    for entry in state.shared_owners.read().iter() {
+                        let expires_at = entry
+                            .acquired_at
+                            .checked_add(entry.lock_timeout)
+                            .unwrap_or_else(|| entry.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+                        infos.push(crate::fast_lock::types::ObjectLockInfo {
+                            key: key.clone(),
+                            mode,
+                            owner: entry.owner.clone(),
+                            acquired_at: entry.acquired_at,
+                            expires_at,
+                            priority,
+                        });
+                    }
+                }
+            }
+        }
+        infos
+    }
+
+    /// Force-release every holder of a lock on `key`, regardless of owner.
+    ///
+    /// Returns the number of owners that were released. Used by the admin
+    /// force-unlock path to clear a stuck resource.
+    pub fn force_release_all(&self, key: &ObjectKey) -> usize {
+        let owners_modes: Vec<(Arc<str>, LockMode)> = {
+            let objects = self.objects.read();
+            let Some(state) = objects.get(key) else {
+                return 0;
+            };
+            let mut pairs = Vec::new();
+            if let Some(info) = state.current_owner.read().clone() {
+                pairs.push((info.owner, LockMode::Exclusive));
+            }
+            for entry in state.shared_owners.read().iter() {
+                pairs.push((entry.owner.clone(), LockMode::Shared));
+            }
+            pairs
+        };
+
+        let mut released = 0;
+        for (owner, mode) in owners_modes {
+            if self.release_lock(key, &owner, mode) {
+                released += 1;
+            }
+        }
+        released
     }
 
     /// Get current load factor of the shard

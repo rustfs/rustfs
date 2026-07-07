@@ -195,8 +195,6 @@ impl SimpleQueryDispatcher {
                 {
                     file_format = file_format.with_delimiter(delimiter.as_bytes()[0]);
                 }
-                // TODO waiting for processing @junxiang Mu
-                // if csv.file_header_info.is_some() {}
                 match csv.file_header_info.as_ref() {
                     Some(info) => {
                         if *info == *NONE {

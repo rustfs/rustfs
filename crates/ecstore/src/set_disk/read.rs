@@ -168,6 +168,24 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+        // Read-only callers (GET/HEAD/tag read) may use the metadata early-stop
+        // fast path.
+        self.get_object_fileinfo_gated(bucket, object, opts, read_data, true).await
+    }
+
+    /// Like `get_object_fileinfo`, but `allow_early_stop=false` forces the full
+    /// quorum fanout. Read-before-write callers (object tagging) must use this:
+    /// the returned online-disk set is the write target, and the early-stop
+    /// subset would fail write quorum (backlog#872 regression fix).
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(in crate::set_disk) async fn get_object_fileinfo_gated(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+        allow_early_stop: bool,
+    ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
         let vid = opts.version_id.clone().unwrap_or_default();
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
@@ -221,7 +239,10 @@ impl SetDisks {
 
         let disks = disks.clone();
 
-        // TODO: optimize concurrency and break once enough slots are available
+        // Early-stop for safe metadata reads is handled inside
+        // read_all_fileinfo_observed (see read_all_fileinfo_early_stop in
+        // core/io_primitives.rs); unsafe requests and callers that opt out
+        // (allow_early_stop=false) fall back to full-wait.
         let (parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
             &disks,
             "",
@@ -231,6 +252,7 @@ impl SetDisks {
             read_data,
             false,
             opts.incl_free_versions,
+            allow_early_stop,
             self.default_parity_count,
         )
         .await?;
@@ -516,7 +538,10 @@ impl SetDisks {
     {
         let pipeline_started = Instant::now();
         debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
+        // Owned shuffle (backlog#873): `files` is consumed and its FileInfo
+        // entries move into their shuffled slots, avoiding one deep clone per
+        // disk; the disk handles are Arc clones and stay cheap.
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index_owned(disks.to_vec(), files, &fi);
 
         let total_size = fi.size as usize;
 
@@ -597,7 +622,7 @@ impl SetDisks {
 
         // Erasure params come from on-disk metadata; zero values must fail the read
         // instead of panicking on the block/shard divisions below.
-        if erasure.block_size == 0 || erasure.data_shards == 0 {
+        if !erasure.has_valid_dimensions() {
             return Err(Error::other(format!(
                 "invalid erasure metadata for {bucket}/{object}: block_size={}, data_blocks={}",
                 erasure.block_size, erasure.data_shards
@@ -606,6 +631,17 @@ impl SetDisks {
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
+
+        // Pipeline prefetch (backlog#870): while the current part decodes and
+        // streams out, the next part's bitrot reader setup (file opens +
+        // read-quorum wait across all disks) runs concurrently, so multipart
+        // reads no longer serialize setup latency between parts. Depth is one
+        // part; shared inputs move behind Arc so the prefetch task is 'static.
+        let use_mmap_read = object_mmap_read_enabled();
+        let files = Arc::new(files);
+        let disks = Arc::new(disks);
+        let prefetch_enabled = is_multipart_reader_setup_prefetch_enabled();
+        let mut prefetched: Option<(usize, PrefetchedReaderSetup)> = None;
 
         let mut total_read = 0;
         for current_part in part_indices {
@@ -647,43 +683,98 @@ impl SetDisks {
                 "Streaming multipart part"
             );
 
-            let checksum_info = fi.erasure.get_checksum_info(part_number);
-            let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
-                HashAlgorithm::HighwayHash256SLegacy
-            } else {
-                checksum_info.algorithm
-            };
+            let checksum_algo = multipart_part_checksum_algo(&fi, part_number);
             let read_length = till_offset.saturating_sub(read_offset);
 
-            let use_mmap_read = object_mmap_read_enabled();
-
-            let reader_setup_stage_start = Instant::now();
             let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
-            let reader_setup = create_bitrot_readers_until_quorum_with_preference(
-                &files,
-                &disks,
-                bucket,
-                object,
+            let sync_spec = PartReaderSetupSpec {
                 part_number,
                 read_offset,
                 read_length,
-                erasure.shard_size(),
                 checksum_algo,
-                skip_verify_bitrot,
-                use_mmap_read,
-                erasure.data_shards,
-                erasure.parity_shards,
-                BitrotReaderSetupMode::ReadQuorum,
-                prefer_data_blocks_first_reader_setup,
-                None,
-                Some(BitrotReaderSetupAttribution {
-                    path: metrics_path,
-                    object_class: metrics_object_class,
-                    size_bucket: metrics_size_bucket,
-                }),
-            )
-            .await;
-            let reader_setup_elapsed = reader_setup_stage_start.elapsed();
+            };
+            let mut setup_result = None;
+            // A stale prefetch (part mismatch) is dropped by the failed let
+            // chain, which aborts its task via the guard.
+            if let Some((prefetched_part, handle)) = prefetched.take()
+                && prefetched_part == current_part
+            {
+                setup_result = handle.join().await;
+                if setup_result.is_none() {
+                    warn!(
+                        bucket,
+                        object,
+                        part_index = current_part,
+                        "Multipart reader-setup prefetch task did not complete; retrying synchronously"
+                    );
+                }
+            }
+            let (reader_setup, reader_setup_elapsed) = match setup_result {
+                Some(result) => result,
+                None => {
+                    setup_multipart_part_readers(
+                        &files,
+                        &disks,
+                        bucket,
+                        object,
+                        sync_spec,
+                        erasure.shard_size(),
+                        erasure.data_shards,
+                        erasure.parity_shards,
+                        skip_verify_bitrot,
+                        use_mmap_read,
+                        prefer_data_blocks_first_reader_setup,
+                        metrics_path,
+                        metrics_object_class,
+                        metrics_size_bucket,
+                    )
+                    .await
+                }
+            };
+
+            // Kick off the next part's reader setup before decoding this one
+            // so the disk opens overlap with decode + client writeback
+            // (backlog#870).
+            let remaining_after_current = length - total_read - part_length;
+            if prefetch_enabled && remaining_after_current > 0 && current_part < last_part_index {
+                let next_part = current_part + 1;
+                let next_number = fi.parts[next_part].number;
+                let next_size = fi.parts[next_part].size;
+                let next_length = next_size.min(remaining_after_current);
+                let spec = PartReaderSetupSpec {
+                    part_number: next_number,
+                    read_offset: 0,
+                    read_length: erasure.shard_file_offset(0, next_length, next_size),
+                    checksum_algo: multipart_part_checksum_algo(&fi, next_number),
+                };
+                let files = Arc::clone(&files);
+                let disks = Arc::clone(&disks);
+                let bucket = bucket.to_owned();
+                let object = object.to_owned();
+                let shard_size = erasure.shard_size();
+                let data_shards = erasure.data_shards;
+                let parity_shards = erasure.parity_shards;
+                let handle = tokio::task::spawn(async move {
+                    setup_multipart_part_readers(
+                        &files,
+                        &disks,
+                        &bucket,
+                        &object,
+                        spec,
+                        shard_size,
+                        data_shards,
+                        parity_shards,
+                        skip_verify_bitrot,
+                        use_mmap_read,
+                        prefer_data_blocks_first_reader_setup,
+                        metrics_path,
+                        metrics_object_class,
+                        metrics_size_bucket,
+                    )
+                    .await
+                });
+                prefetched = Some((next_part, PrefetchedReaderSetup::new(handle)));
+            }
             rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
                 metrics_path,
@@ -959,14 +1050,24 @@ impl SetDisks {
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
-
         let erasure = coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
             fi.uses_legacy_checksum,
         );
+
+        // Erasure params come from on-disk metadata; zero values must fail the read
+        // instead of panicking on the block/shard divisions inside the codec
+        // streaming reader below. Mirrors the legacy multipart guard.
+        if !erasure.has_valid_dimensions() {
+            return Err(Error::other(format!(
+                "invalid erasure metadata for {bucket}/{object}: block_size={}, data_blocks={}",
+                erasure.block_size, erasure.data_shards
+            )));
+        }
+
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
         if fi.parts.len() == 1 {
             let part = &fi.parts[0];
@@ -1012,36 +1113,78 @@ impl SetDisks {
             return Err(Error::other("codec streaming multipart part sizes do not match object size"));
         }
 
-        let mut readers = Vec::with_capacity(fi.parts.len());
-        for part in &fi.parts {
-            match Self::build_codec_streaming_part_reader(
-                bucket,
-                object,
-                fi,
-                &files,
-                &disks,
-                &erasure,
-                part.number,
-                0,
-                part.size,
-                part.size,
-                skip_verify_bitrot,
-                metrics_object_class,
-                metrics_size_bucket,
-                false,
-            )
-            .await?
-            {
-                GetCodecStreamingReaderBuildOutcome::Reader(reader) => readers.push(reader),
-                GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
-                    return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
-                }
+        // Lazy multipart construction (backlog#871): only the first part's
+        // shard readers are opened before streaming starts, so TTFB no longer
+        // pays for `parts x disks` file opens and an early client disconnect
+        // never touches the remaining parts. The first part stays eager so the
+        // dominant fallback conditions (missing shards, read quorum) are still
+        // detected before any byte is streamed and the whole request can fall
+        // back to the legacy duplex path.
+        let first_part = &fi.parts[0];
+        let first_reader = match Self::build_codec_streaming_part_reader(
+            bucket,
+            object,
+            fi,
+            &files,
+            &disks,
+            &erasure,
+            first_part.number,
+            0,
+            first_part.size,
+            first_part.size,
+            skip_verify_bitrot,
+            metrics_object_class,
+            metrics_size_bucket,
+            false,
+        )
+        .await?
+        {
+            GetCodecStreamingReaderBuildOutcome::Reader(reader) => reader,
+            GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
+                return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
             }
-        }
+        };
 
-        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(MultipartCodecStreamingReader::new(
-            readers,
-        ))))
+        let remaining_parts: Vec<(usize, usize)> = fi.parts[1..].iter().map(|part| (part.number, part.size)).collect();
+        let total_parts = fi.parts.len();
+        let ctx = Arc::new(LazyCodecPartContext {
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            fi: fi.clone(),
+            files,
+            disks,
+            erasure,
+            skip_verify_bitrot,
+            metrics_object_class,
+            metrics_size_bucket,
+        });
+        let builder: LazyPartBuilder = Box::new(move |remaining_index| {
+            let ctx = Arc::clone(&ctx);
+            let (part_number, part_size) = remaining_parts[remaining_index];
+            tokio::task::spawn(async move {
+                SetDisks::build_codec_streaming_part_reader(
+                    &ctx.bucket,
+                    &ctx.object,
+                    &ctx.fi,
+                    &ctx.files,
+                    &ctx.disks,
+                    &ctx.erasure,
+                    part_number,
+                    0,
+                    part_size,
+                    part_size,
+                    ctx.skip_verify_bitrot,
+                    ctx.metrics_object_class,
+                    ctx.metrics_size_bucket,
+                    false,
+                )
+                .await
+            })
+        });
+
+        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
+            LazyMultipartCodecStreamingReader::new(first_reader, total_parts, builder, get_codec_streaming_metrics_path()),
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1152,6 +1295,243 @@ impl SetDisks {
         Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
             coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
         )))
+    }
+}
+
+/// Per-part parameters for a multipart bitrot reader setup.
+struct PartReaderSetupSpec {
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    checksum_algo: HashAlgorithm,
+}
+
+/// Resolve the bitrot checksum algorithm for one part, honoring the legacy
+/// HighwayHash flag.
+fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgorithm {
+    let checksum_info = fi.erasure.get_checksum_info(part_number);
+    if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+        HashAlgorithm::HighwayHash256SLegacy
+    } else {
+        checksum_info.algorithm
+    }
+}
+
+/// Run one part's bitrot reader setup and measure its wall-clock duration.
+///
+/// Shared by the synchronous path and the prefetch task in
+/// `get_object_with_fileinfo` (backlog#870) so both report the same
+/// stage-duration semantics.
+#[allow(clippy::too_many_arguments)]
+async fn setup_multipart_part_readers(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    spec: PartReaderSetupSpec,
+    shard_size: usize,
+    data_shards: usize,
+    parity_shards: usize,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    prefer_data_blocks_first: bool,
+    metrics_path: &'static str,
+    metrics_object_class: &'static str,
+    metrics_size_bucket: &'static str,
+) -> (BitrotReaderSetup, Duration) {
+    let started = Instant::now();
+    let setup = create_bitrot_readers_until_quorum_with_preference(
+        files,
+        disks,
+        bucket,
+        object,
+        spec.part_number,
+        spec.read_offset,
+        spec.read_length,
+        shard_size,
+        spec.checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        BitrotReaderSetupMode::ReadQuorum,
+        prefer_data_blocks_first,
+        None,
+        Some(BitrotReaderSetupAttribution {
+            path: metrics_path,
+            object_class: metrics_object_class,
+            size_bucket: metrics_size_bucket,
+        }),
+    )
+    .await;
+    (setup, started.elapsed())
+}
+
+/// Guard around an in-flight prefetch of the next part's reader setup
+/// (backlog#870). Dropping the guard without consuming it aborts the task so
+/// error returns and early breaks stop the background disk IO.
+struct PrefetchedReaderSetup(Option<tokio::task::JoinHandle<(BitrotReaderSetup, Duration)>>);
+
+impl PrefetchedReaderSetup {
+    fn new(handle: tokio::task::JoinHandle<(BitrotReaderSetup, Duration)>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Wait for the prefetch to finish; `None` means the task was cancelled
+    /// or panicked and the caller must set up synchronously.
+    async fn join(mut self) -> Option<(BitrotReaderSetup, Duration)> {
+        let handle = self.0.take()?;
+        handle.await.ok()
+    }
+}
+
+impl Drop for PrefetchedReaderSetup {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Owned context for lazily constructing codec streaming part readers after
+/// the first part has started streaming (backlog#871).
+struct LazyCodecPartContext {
+    bucket: String,
+    object: String,
+    fi: FileInfo,
+    files: Vec<FileInfo>,
+    disks: Vec<Option<DiskStore>>,
+    erasure: coding::Erasure,
+    skip_verify_bitrot: bool,
+    metrics_object_class: &'static str,
+    metrics_size_bucket: &'static str,
+}
+
+type LazyPartBuildHandle = tokio::task::JoinHandle<Result<GetCodecStreamingReaderBuildOutcome>>;
+type LazyPartBuilder = Box<dyn FnMut(usize) -> LazyPartBuildHandle + Send + Sync>;
+
+/// Multipart codec streaming reader that constructs part readers on demand.
+///
+/// The first part reader is built eagerly by the caller so the dominant
+/// fallback conditions are detected before any byte is streamed; every
+/// subsequent part is only built once the previous part reaches EOF. If a
+/// later part hits a fallback condition mid-stream, the reader surfaces a read
+/// error instead: data has already been streamed, so switching the whole
+/// request to the legacy path is no longer possible. The next request detects
+/// the condition on its eager first-part setup and falls back cleanly.
+struct LazyMultipartCodecStreamingReader {
+    current: Option<Box<dyn AsyncRead + Unpin + Send + Sync>>,
+    pending: Option<LazyPartBuildHandle>,
+    dispatched_remaining: usize,
+    total_parts: usize,
+    builder: LazyPartBuilder,
+    metrics_path: &'static str,
+}
+
+impl LazyMultipartCodecStreamingReader {
+    fn new(
+        first_reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        total_parts: usize,
+        builder: LazyPartBuilder,
+        metrics_path: &'static str,
+    ) -> Self {
+        Self {
+            current: Some(first_reader),
+            pending: None,
+            dispatched_remaining: 0,
+            total_parts,
+            builder,
+            metrics_path,
+        }
+    }
+}
+
+impl AsyncRead for LazyMultipartCodecStreamingReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let this = self.get_mut();
+        loop {
+            if let Some(reader) = this.current.as_mut() {
+                let filled_before = buf.filled().len();
+                match Pin::new(reader).poll_read(cx, buf) {
+                    Poll::Ready(Ok(())) if buf.filled().len() == filled_before => {
+                        // Part EOF: drop its shard readers before building the
+                        // next part.
+                        this.current = None;
+                    }
+                    result => return result,
+                }
+                continue;
+            }
+
+            if let Some(handle) = this.pending.as_mut() {
+                match Pin::new(handle).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(join_result) => {
+                        this.pending = None;
+                        match join_result {
+                            Ok(Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader))) => {
+                                this.current = Some(reader);
+                            }
+                            Ok(Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason))) => {
+                                // KNOWN LIMITATION (backlog#871 follow-up): once
+                                // earlier parts have streamed we can no longer
+                                // hand the whole request back to the legacy
+                                // duplex path, so a degraded later part surfaces
+                                // as a read error even though legacy per-part
+                                // decode could still reconstruct it. This only
+                                // affects the OPT-IN multipart codec streaming
+                                // path (RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+                                // default off): the first part stays eager so the
+                                // common case where part 1 is already degraded
+                                // still falls back cleanly before any byte ships.
+                                // A proper fix (in-place per-part legacy
+                                // degradation) is tracked as a follow-up.
+                                record_get_object_pipeline_failure_for_path(
+                                    this.metrics_path,
+                                    GET_STAGE_READER_SETUP,
+                                    GetObjectFailureReason::ReadQuorum,
+                                );
+                                warn!(
+                                    metrics_path = this.metrics_path,
+                                    fallback_reason = ?reason,
+                                    state = "codec_streaming_mid_stream_fallback",
+                                    "Lazy multipart part construction hit a fallback condition mid-stream; surfacing read error"
+                                );
+                                return Poll::Ready(Err(std::io::Error::other(format!(
+                                    "codec streaming multipart reader cannot fall back mid-stream: {reason:?}"
+                                ))));
+                            }
+                            Ok(Err(err)) => return Poll::Ready(Err(std::io::Error::other(err))),
+                            Err(join_err) => return Poll::Ready(Err(std::io::Error::other(join_err))),
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if this.dispatched_remaining + 1 < this.total_parts {
+                let handle = (this.builder)(this.dispatched_remaining);
+                this.dispatched_remaining += 1;
+                this.pending = Some(handle);
+                continue;
+            }
+
+            return Poll::Ready(Ok(()));
+        }
+    }
+}
+
+impl Drop for LazyMultipartCodecStreamingReader {
+    fn drop(&mut self) {
+        // Abort an in-flight part construction so an early client disconnect
+        // does not keep opening shard readers in the background.
+        if let Some(handle) = self.pending.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -2135,10 +2515,45 @@ mod tests {
     }
 
     #[test]
-    fn metadata_early_stop_gate_defaults_to_disabled() {
+    fn metadata_early_stop_gate_defaults_to_enabled() {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, None::<&str>, || {
-            assert!(!is_get_metadata_early_stop_enabled());
+            assert!(is_get_metadata_early_stop_enabled());
         });
+    }
+
+    #[test]
+    fn metadata_early_stop_gate_honors_explicit_opt_out() {
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("false"), || {
+            assert!(!is_get_metadata_early_stop_enabled());
+            // With the gate off, even safe metadata-only requests must fall
+            // back to the full-wait fanout.
+            assert!(!should_allow_metadata_early_stop(false, "", false, false));
+        });
+    }
+
+    #[test]
+    fn metadata_early_stop_permitted_respects_caller_opt_out() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+            ],
+            || {
+                // Read-before-write callers (object tagging) pass
+                // caller_allows_early_stop=false and must never early-stop, even
+                // for an otherwise-eligible safe metadata-only read. The
+                // early-stop subset would fail write quorum (backlog#872).
+                assert!(!metadata_early_stop_permitted(false, true, false, "", false, false));
+                assert!(!metadata_early_stop_permitted(false, true, false, "version-id", false, false));
+                // With the caller allowing it and every other condition safe,
+                // the fast path is permitted.
+                assert!(metadata_early_stop_permitted(true, true, false, "", false, false));
+                // observe=false (non-observed fanout) also disables early-stop.
+                assert!(!metadata_early_stop_permitted(true, false, false, "", false, false));
+                // Data reads are never eligible regardless of caller opt-in.
+                assert!(!metadata_early_stop_permitted(true, true, true, "", false, false));
+            },
+        );
     }
 
     #[test]
@@ -2297,6 +2712,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codec_streaming_reader_rejects_zero_block_size_metadata() {
+        // Corrupted on-disk metadata: valid data/parity blocks but block_size == 0.
+        // The codec streaming entry must reject this and return an error instead of
+        // panicking on the block_size division inside the reader (mirrors the legacy
+        // multipart guard). The guard fires before any disk access, so empty disk /
+        // parts-metadata slices are sufficient.
+        let mut fi = codec_streaming_test_fileinfo(1024, 1);
+        fi.erasure.block_size = 0;
+
+        let result = SetDisks::get_object_decode_reader_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &fi,
+            &[],
+            &[],
+            0,
+            0,
+            false,
+            "test-object-class",
+            "test-size-bucket",
+            false,
+        )
+        .await;
+
+        assert!(result.is_err(), "zero block_size metadata must be rejected, not panic");
+    }
+
+    #[tokio::test]
     async fn multipart_codec_streaming_reader_reads_parts_in_order() {
         let readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>> = vec![
             Box::new(Cursor::new(b"hello ".to_vec())),
@@ -2418,6 +2861,86 @@ mod tests {
         }
 
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    fn lazy_test_builder(
+        parts: Vec<&'static [u8]>,
+        builds: Arc<AtomicUsize>,
+    ) -> Box<dyn FnMut(usize) -> LazyPartBuildHandle + Send + Sync> {
+        Box::new(move |remaining_index| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            let data = parts[remaining_index];
+            tokio::task::spawn(
+                async move { Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(Cursor::new(data.to_vec())))) },
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn lazy_multipart_codec_streaming_reader_reads_parts_in_order() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builder = lazy_test_builder(vec![b"multi", b"part"], Arc::clone(&builds));
+        let mut reader =
+            LazyMultipartCodecStreamingReader::new(Box::new(Cursor::new(b"hello ".to_vec())), 3, builder, "codec_streaming");
+
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("lazy multipart reader should stream all parts");
+
+        assert_eq!(output, b"hello multipart");
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "both remaining parts should be built exactly once");
+    }
+
+    #[tokio::test]
+    async fn lazy_multipart_codec_streaming_reader_defers_construction_until_needed() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builder = lazy_test_builder(vec![b"never"], Arc::clone(&builds));
+        {
+            let mut reader =
+                LazyMultipartCodecStreamingReader::new(Box::new(Cursor::new(b"abcdef".to_vec())), 2, builder, "codec_streaming");
+
+            let mut first = [0u8; 6];
+            reader
+                .read_exact(&mut first)
+                .await
+                .expect("first part should satisfy the read");
+            assert_eq!(&first, b"abcdef");
+        }
+
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "dropping the reader before crossing the part boundary must not build later parts"
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_multipart_codec_streaming_reader_surfaces_mid_stream_fallback_as_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_clone = Arc::clone(&builds);
+        let builder: Box<dyn FnMut(usize) -> LazyPartBuildHandle + Send + Sync> = Box::new(move |_| {
+            builds_clone.fetch_add(1, Ordering::SeqCst);
+            tokio::task::spawn(async move {
+                Ok(GetCodecStreamingReaderBuildOutcome::Fallback(GetCodecStreamingFallbackReason::Multipart))
+            })
+        });
+        let mut reader =
+            LazyMultipartCodecStreamingReader::new(Box::new(Cursor::new(b"first".to_vec())), 2, builder, "codec_streaming");
+
+        let mut output = Vec::new();
+        let err = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("mid-stream fallback must surface as a read error");
+
+        assert_eq!(output, b"first", "bytes streamed before the fallback stay intact");
+        assert!(
+            err.to_string().contains("cannot fall back mid-stream"),
+            "error should explain the mid-stream fallback: {err}"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
     fn inline_reader_setup_fileinfo(data: Option<&'static [u8]>) -> FileInfo {

@@ -33,9 +33,9 @@ mod console_test;
 mod route_registration_test;
 
 use handlers::{
-    audit, bucket_meta, cluster_snapshot, config_admin, extensions, heal, health, kms, module_switch, object_zip_download, oidc,
-    plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler, rebalance,
-    replication as replication_handler, scanner, site_replication, sts, system, table_catalog, tier, tls_debug, user,
+    audit, batch_job, bucket_meta, cluster_snapshot, config_admin, diagnostics, extensions, heal, health, idp_compat, kms,
+    module_switch, object_zip_download, oidc, plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler,
+    rebalance, replication as replication_handler, scanner, site_replication, sts, system, table_catalog, tier, tls_debug, user,
 };
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
@@ -79,11 +79,14 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
     plugins_instances::register_plugin_instance_route(r)?;
 
     replication_handler::register_replication_route(r)?;
+    batch_job::register_batch_job_route(r)?;
     site_replication::register_site_replication_route(r)?;
     profile_admin::register_profiling_route(r)?;
+    diagnostics::register_diagnostics_route(r)?;
     tls_debug::register_tls_debug_route(r)?;
     kms::register_kms_route(r)?;
     oidc::register_oidc_route(r)?;
+    idp_compat::register_idp_compat_route(r)?;
     table_catalog::register_table_catalog_route(r)?;
 
     Ok(())

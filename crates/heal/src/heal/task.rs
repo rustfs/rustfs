@@ -450,6 +450,7 @@ impl HealTask {
 
     fn is_no_heal_required_error(err: &Error) -> bool {
         match err {
+            Error::Storage(EcstoreError::NoHealRequired) | Error::Disk(DiskError::NoHealRequired) => true,
             Error::Other(message) => matches!(message.as_str(), "No heal required" | "No healing is required"),
             _ => matches!(err.to_string().as_str(), "No heal required" | "No healing is required"),
         }
@@ -2400,7 +2401,7 @@ mod tests {
         async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
             let no_heal_required = *self.format_no_heal_required.lock().unwrap();
             if no_heal_required {
-                Ok((HealResultItem::default(), Some(Error::other("No heal required"))))
+                Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::NoHealRequired))))
             } else {
                 Ok((HealResultItem::default(), None))
             }

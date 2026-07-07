@@ -1785,14 +1785,7 @@ impl LocalDisk {
         DiskMetrics::default()
     }
 
-    async fn bitrot_verify(
-        &self,
-        part_path: &PathBuf,
-        part_size: usize,
-        algo: HashAlgorithm,
-        sum: &[u8],
-        shard_size: usize,
-    ) -> Result<()> {
+    async fn bitrot_verify(&self, part_path: &PathBuf, part_size: usize, algo: HashAlgorithm, shard_size: usize) -> Result<()> {
         let retry_count = bitrot_size_mismatch_retry_count();
         let retry_delay = bitrot_size_mismatch_retry_delay();
 
@@ -1801,16 +1794,7 @@ impl LocalDisk {
             let meta = file.metadata().await.map_err(to_file_error)?;
             let file_size = meta.len() as usize;
 
-            match bitrot_verify(
-                Box::new(file),
-                file_size,
-                part_size,
-                algo.clone(),
-                Bytes::copy_from_slice(sum),
-                shard_size,
-            )
-            .await
-            {
+            match bitrot_verify(Box::new(file), file_size, part_size, algo.clone(), shard_size).await {
                 Ok(()) => return Ok(()),
                 Err(err) if attempt < retry_count && is_bitrot_size_mismatch_error(&err) => {
                     info!(
@@ -2622,7 +2606,6 @@ impl DiskAPI for LocalDisk {
                     &part_path,
                     erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
-                    &checksum_info.hash,
                     erasure.shard_size(),
                 )
                 .await
@@ -3886,10 +3869,29 @@ impl DiskAPI for LocalDisk {
                     && let Some(dst_parent) = dst.parent()
                 {
                     let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
-                    if let Some(old_parent) = old_path.parent() {
+                    let old_parent = old_path.parent().map(|p| p.to_path_buf());
+                    if let Some(ref old_parent) = old_parent {
                         std::fs::create_dir_all(old_parent)?;
                     }
-                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
+                    // This rollback backup is the sole restore source for a later
+                    // undo_write when the set-level write quorum fails. Persist it as
+                    // durably as the new xl.meta written above (and as the non-inline
+                    // branch does): a bare std::fs::write leaves both the bytes and the
+                    // new directory entry in the page cache, so a crash before a
+                    // rollback could restore a lost or truncated backup.
+                    let mut backup = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&old_path)
+                        .map_err(to_file_error)?;
+                    std::io::Write::write_all(&mut backup, buf).map_err(to_file_error)?;
+                    if sync {
+                        backup.sync_data().map_err(to_file_error)?;
+                        if let Some(ref old_parent) = old_parent {
+                            os::fsync_dir_std(old_parent).map_err(to_file_error)?;
+                        }
+                    }
                 }
 
                 match std::fs::rename(&src, &dst) {
@@ -4381,12 +4383,23 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
-        // TODO: avoid recursive deletion; return errVolumeNotEmpty when files remain
+        // Non-force is non-recursive: `remove_dir` (rmdir) fails atomically with
+        // `DirectoryNotEmpty` -> VolumeNotEmpty if the bucket still holds any
+        // object data, so a misclassified "dangling" bucket on the heal path
+        // (or a non-force S3 DeleteBucket on a populated bucket) can never be
+        // recursively wiped. Only an explicit `force_delete` (e.g. S3 force
+        // bucket delete) removes recursively. Mirrors MinIO's
+        // xlStorage.DeleteVol (Remove vs RemoveAll). (backlog#799 B1)
+        let res = if force_delete {
+            fs::remove_dir_all(&p).await
+        } else {
+            fs::remove_dir(&p).await
+        };
 
-        if let Err(err) = fs::remove_dir_all(&p).await {
+        if let Err(err) = res {
             let e: DiskError = to_volume_error(err).into();
             if e != DiskError::VolumeNotFound {
                 return Err(e);
@@ -4587,11 +4600,12 @@ mod test {
         ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
 
         let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let old_meta = test_meta(old_fi);
         let dst_object_dir = dir.path().join(bucket).join(object);
         fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
             .await
             .expect("old data dir should be created");
-        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), &old_meta)
             .await
             .expect("old metadata should be written");
 
@@ -4607,11 +4621,15 @@ mod test {
             .expect("inline rename_data should commit");
 
         assert_eq!(resp.old_data_dir, Some(old_data_dir));
-        assert!(
-            dst_object_dir
-                .join(old_data_dir.to_string())
-                .join(STORAGE_FORMAT_FILE_BACKUP)
-                .exists()
+        let backup_path = dst_object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        assert!(backup_path.exists());
+        // The rollback backup must contain the previous metadata bytes verbatim so
+        // that undo_write can restore the prior committed object; guards the inline
+        // backup write against truncation/corruption regressions.
+        assert_eq!(
+            fs::read(&backup_path).await.expect("backup should be readable"),
+            old_meta,
+            "inline rollback backup must contain the previous metadata bytes verbatim"
         );
         assert!(
             !dst_object_dir
@@ -5779,7 +5797,7 @@ mod test {
 
         disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
-        disk.delete_volume("a").await.expect("operation should succeed");
+        disk.delete_volume("a", true).await.expect("operation should succeed");
 
         let _ = fs::remove_dir_all(&p).await;
     }
@@ -5888,7 +5906,48 @@ mod test {
             .expect("operation should succeed");
 
         // Clean up
-        disk.delete_volume("test-volume").await.expect("operation should succeed");
+        disk.delete_volume("test-volume", true)
+            .await
+            .expect("operation should succeed");
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn delete_volume_non_force_refuses_non_empty_bucket() {
+        // backlog#799 B1: a non-force delete_volume must refuse a bucket that
+        // still holds object data (VolumeNotEmpty) and leave it intact, so a
+        // misclassified "dangling" bucket cannot be recursively wiped. Only an
+        // explicit force delete removes it recursively.
+        let test_dir = "./test_b1_delete_volume_guard";
+        let _ = fs::remove_dir_all(&test_dir).await;
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        disk.make_volume("b1-bucket").await.expect("operation should succeed");
+        let data: Vec<u8> = vec![1, 2, 3];
+        disk.write_all("b1-bucket", "obj.dat", data.clone().into())
+            .await
+            .expect("operation should succeed");
+
+        // Non-force must refuse and preserve the data.
+        let err = disk
+            .delete_volume("b1-bucket", false)
+            .await
+            .expect_err("non-empty bucket must be refused");
+        assert!(matches!(err, DiskError::VolumeNotEmpty), "expected VolumeNotEmpty, got {err:?}");
+        assert!(
+            disk.stat_volume("b1-bucket").await.is_ok(),
+            "bucket must still exist after a refused non-force delete"
+        );
+        assert_eq!(disk.read_all("b1-bucket", "obj.dat").await.expect("data preserved"), data);
+
+        // Force removes it recursively.
+        disk.delete_volume("b1-bucket", true)
+            .await
+            .expect("force delete removes non-empty");
+        assert!(disk.stat_volume("b1-bucket").await.is_err(), "bucket must be gone after force delete");
+
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
@@ -5916,7 +5975,7 @@ mod test {
 
         // Test deleting volumes
         for vol in &volumes {
-            disk.delete_volume(vol).await.expect("operation should succeed");
+            disk.delete_volume(vol, true).await.expect("operation should succeed");
         }
 
         // Clean up the test directory

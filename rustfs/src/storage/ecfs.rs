@@ -21,6 +21,7 @@ use super::{
     update_bucket_metadata_config,
 };
 use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
+use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
@@ -38,6 +39,7 @@ use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rustfs_io_metrics::record_s3_op;
+use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
@@ -76,6 +78,7 @@ impl Default for FS {
 impl FS {
     pub fn new() -> Self {
         rustfs_io_metrics::init_s3_metrics();
+        rustfs_io_metrics::init_list_objects_metrics();
         Self {}
     }
 
@@ -1325,8 +1328,10 @@ impl S3 for FS {
         };
 
         let data = serialize(&input_cfg).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
+        let object_lock_config =
+            String::from_utf8(data.clone()).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
 
-        update_bucket_metadata_config(&bucket, OBJECT_LOCK_CONFIG, data)
+        let updated_at = update_bucket_metadata_config(&bucket, OBJECT_LOCK_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
 
@@ -1343,6 +1348,27 @@ impl S3 for FS {
             update_bucket_metadata_config(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
                 .await
                 .map_err(ApiError::from)?;
+        }
+
+        if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
+            bucket: bucket.clone(),
+            r#type: "object-lock-config".to_string(),
+            object_lock_config: Some(object_lock_config),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "put_object_lock_configuration",
+                bucket = %bucket,
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "storage object lock state"
+            );
         }
 
         rustfs_scanner::record_dirty_usage_bucket(&bucket);

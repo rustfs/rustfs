@@ -460,6 +460,30 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         drop(writers); // drop writers to close all files
 
         let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
+
+        // Serialize only the commit (rename_part), not the whole upload. Each
+        // concurrent stream writes to its own unique temp dir (see `tmp_part`
+        // above), so the encode/stream phase never conflicts and must stay
+        // lock-free — holding a lock across it would serialize slow re-transmits
+        // of the same part and defeat the S3 "last finisher wins" semantics
+        // (it also caused UploadPart lock-acquire timeouts). The mixed-generation
+        // hazard is confined to rename_part, where two temp parts are moved
+        // cross-disk onto the SAME final part_path: interleaving there can leave
+        // shards from two generations, each individually bitrot-valid, that only
+        // surface as silent corruption at read time (backlog#853). A write lock
+        // scoped to the uploadId namespace makes each commit atomic across disks,
+        // so the last committer wins consistently. Mirrors MinIO's per-uploadID
+        // NS lock; distinct from the object lock held by complete_multipart_upload
+        // (disjoint namespaces, no lock-ordering cycle).
+        let _upload_commit_guard = if opts.no_lock {
+            None
+        } else {
+            Some(
+                self.acquire_write_lock_diag("put_object_part_commit", RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
+                    .await?,
+            )
+        };
+
         let _ = self
             .rename_part(
                 &disks,
@@ -478,6 +502,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 }),
             )
             .await?;
+
+        drop(_upload_commit_guard);
 
         let ret: PartInfo = PartInfo {
             etag: Some(etag.clone()),
@@ -1180,8 +1206,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
                 checksum_combined.extend_from_slice(cs.raw.as_slice());
             }
-
-            // TODO: check min part size
 
             object_size += ext_part.size;
             object_actual_size += ext_part.actual_size;

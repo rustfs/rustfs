@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
 use std::io::IoSlice;
@@ -91,6 +90,23 @@ where
                 break;
             }
             data_len += n;
+        }
+
+        // A short read (EOF before the caller-sized buffer is filled) means a
+        // truncated/incomplete shard. Return an error so the caller drops this
+        // reader from the stripe and reconstruction from parity engages, instead
+        // of silently returning fewer bytes and shifting every downstream byte
+        // (backlog#799 B2). This is deliberately BEFORE and independent of the
+        // bitrot hash check so it also fires under skip_verify /
+        // HashAlgorithm::None / parity=0, where there is no hash to catch it. The
+        // caller sizes `out` to exactly the expected shard length for the current
+        // stripe, so "buffer full" == "shard complete".
+        if data_len < out.len() {
+            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, data_len, out.len());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("short shard read: got {data_len} of {} bytes", out.len()),
+            ));
         }
 
         if hash_size > 0 && !self.skip_verify {
@@ -221,7 +237,6 @@ pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     want_size: usize,
     part_size: usize,
     algo: HashAlgorithm,
-    _want: Bytes, // FIXME: useless parameter?
     mut shard_size: usize,
 ) -> std::io::Result<()> {
     let mut hash_buf = vec![0; algo.size()];
@@ -517,7 +532,12 @@ mod tests {
         let mut out = Vec::new();
         let mut n = 0;
         while n < data_size {
-            let mut buf = vec![0u8; shard_size];
+            // Size the buffer to the expected shard length for this stripe (the
+            // last stripe is legitimately shorter); BitrotReader now requires the
+            // buffer to be filled exactly, matching how the decode/heal paths size
+            // per-stripe shard buffers (backlog#799 B2).
+            let this_size = shard_size.min(data_size - n);
+            let mut buf = vec![0u8; this_size];
             let m = bitrot_reader.read(&mut buf).await.unwrap();
             assert_eq!(&buf[..m], &data[n..n + m]);
 
@@ -552,7 +572,8 @@ mod tests {
         let mut idx = 0;
         let mut n = 0;
         while n < data_size {
-            let mut buf = vec![0u8; shard_size];
+            let this_size = shard_size.min(data_size - n);
+            let mut buf = vec![0u8; this_size];
             let res = bitrot_reader.read(&mut buf).await;
 
             if idx == count - 1 {
@@ -593,7 +614,12 @@ mod tests {
         let mut out = Vec::new();
         let mut n = 0;
         while n < data_size {
-            let mut buf = vec![0u8; shard_size];
+            // Size the buffer to the expected shard length for this stripe (the
+            // last stripe is legitimately shorter); BitrotReader now requires the
+            // buffer to be filled exactly, matching how the decode/heal paths size
+            // per-stripe shard buffers (backlog#799 B2).
+            let this_size = shard_size.min(data_size - n);
+            let mut buf = vec![0u8; this_size];
             let m = bitrot_reader.read(&mut buf).await.unwrap();
             assert_eq!(&buf[..m], &data[n..n + m]);
             out.extend_from_slice(&buf[..m]);
@@ -601,6 +627,40 @@ mod tests {
         }
         assert_eq!(n, data_size);
         assert_eq!(data, &out[..]);
+    }
+
+    #[tokio::test]
+    async fn bitrot_read_short_shard_errors_even_when_skip_verify() {
+        // A truncated shard (fewer bytes than the caller's expected-size buffer)
+        // must be an error, not a silent Ok(short) — including on the skip-verify
+        // / no-hash paths where there is no bitrot hash to catch it. This is the
+        // core B2 fix (backlog#799): a short read is a shard error so the decoder
+        // drops it and reconstructs from parity instead of shifting downstream
+        // bytes.
+        let shard_size = 16usize;
+        for (algo, skip_verify) in [
+            (HashAlgorithm::None, true),
+            (HashAlgorithm::None, false),
+            (HashAlgorithm::HighwayHash256, true),
+        ] {
+            let label = format!("{algo:?}");
+            let writer = Cursor::new(Vec::<u8>::new());
+            let mut w = BitrotWriter::new(writer, shard_size, algo.clone());
+            w.write(&[7u8; 16]).await.unwrap();
+            let written = w.into_inner().into_inner();
+            // Drop the last 4 data bytes so the shard is truncated.
+            let truncated = written[..written.len() - 4].to_vec();
+
+            let mut r = BitrotReader::new(Cursor::new(truncated), shard_size, algo, skip_verify);
+            let mut out = vec![0u8; shard_size];
+            let res = r.read(&mut out).await;
+            assert!(res.is_err(), "short shard must error (algo={label}, skip_verify={skip_verify})");
+            assert_eq!(
+                res.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "short shard must be UnexpectedEof (algo={label}, skip_verify={skip_verify})"
+            );
+        }
     }
 
     #[tokio::test]

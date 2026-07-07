@@ -21,7 +21,7 @@ use super::replication_filemeta_boundary::{
 };
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
-use super::replication_object_config::ReplicationConfig;
+use super::replication_object_config::{ReplicationConfig, check_replicate_delete};
 use super::replication_queue_boundary::{
     DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState,
     ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
@@ -39,9 +39,10 @@ use super::replication_resyncer::{
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
-    ObjectInfo, ObjectOptions, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
+    ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
 };
 use super::replication_target_boundary::ReplicationTargetStore;
+use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use lazy_static::lazy_static;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
@@ -617,12 +618,56 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         // Reconstruct a heal delete and re-queue it.  We do NOT call
                         // get_object_info here because the delete-marker or version may
                         // already be absent from the local store — that is expected.
+                        //
+                        // The MRF entry does not persist the replication decision and the
+                        // source object is gone, so re-derive the decision from the live
+                        // bucket config (mirroring get_heal_replicate_object_info) and set
+                        // it on the reconstructed delete. Without this the decision string
+                        // is empty and the delete replicates to zero targets — a silent
+                        // no-op that leaves replicas diverged (backlog#858 / #799 B9).
+                        let versioned = ReplicationVersioningStore::prefix_enabled(&entry.bucket, &entry.object).await;
+                        let oi = ObjectInfo {
+                            bucket: entry.bucket.clone(),
+                            name: entry.object.clone(),
+                            version_id: entry.version_id,
+                            delete_marker: entry.delete_marker,
+                            ..Default::default()
+                        };
+                        let dsc = check_replicate_delete(
+                            &entry.bucket,
+                            &ObjectToDelete {
+                                object_name: entry.object.clone(),
+                                version_id: entry.version_id,
+                                ..Default::default()
+                            },
+                            &oi,
+                            &ObjectOptions {
+                                versioned,
+                                ..Default::default()
+                            },
+                            None,
+                        )
+                        .await;
+                        let mut rstate = oi.replication_state();
+                        rstate.replicate_decision_str = dsc.to_string();
+
+                        // Restore the original delete-marker mtime persisted with the entry so
+                        // the replica keeps the source timestamp. Old MRF files lack this field
+                        // (delete_marker_mtime = None) — fall back to None so the replica is
+                        // stamped with the current time, preserving pre-#867 behaviour
+                        // (backlog#867).
+                        let delete_marker_mtime = entry
+                            .delete_marker_mtime
+                            .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok());
+
                         let dv = DeletedObjectReplicationInfo {
                             delete_object: ReplicationDeletedObject {
                                 object_name: entry.object.clone(),
                                 version_id: entry.version_id,
                                 delete_marker_version_id: entry.delete_marker_version_id,
                                 delete_marker: entry.delete_marker,
+                                delete_marker_mtime,
+                                replication_state: Some(rstate),
                                 ..Default::default()
                             },
                             bucket: entry.bucket.clone(),
@@ -693,9 +738,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Starts the MRF persister — ongoing background task.
     ///
     /// Drains `mrf_save_rx` (entries that overflowed the normal worker channels) and
-    /// writes them to the on-disk MRF file every 10 seconds or when 1 000 entries
-    /// accumulate.  The file is overwritten (not appended) on each flush so it always
-    /// reflects the current pending backlog.
+    /// writes them to the on-disk MRF file every 10 seconds or when 1 000 new
+    /// entries accumulate.  Each flush rewrites the whole cumulative backlog so no
+    /// previously-persisted (and not-yet-replayed) entry is lost; the file is only
+    /// consumed and cleared at startup.
     async fn start_mrf_persister(&self) {
         let Some(mut rx) = self.mrf_save_rx.lock().await.take() else {
             return;
@@ -703,7 +749,19 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let storage = self.storage.clone();
 
         let handle = tokio::spawn(async move {
+            // The on-disk MRF file is a restart-recovery backstop: entries are
+            // only replayed (and the file cleared) at startup, never during the
+            // run. So the file must hold the *cumulative* set of overflow entries
+            // written this run. `pending` is therefore kept cumulative and the
+            // whole set is rewritten on each flush — clearing it after a flush
+            // let the next flush overwrite the file and drop everything written
+            // earlier (backlog#859 / #799 B10). Bounded by `MRF_PENDING_CAP` so a
+            // sustained failure storm can't grow it without limit.
+            const MRF_PENDING_CAP: usize = 200_000;
             let mut pending: Vec<MrfReplicateEntry> = Vec::new();
+            let mut flushed_len = 0usize;
+            let mut dirty = false;
+            let mut capped = false;
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -711,22 +769,41 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 tokio::select! {
                     entry = rx.recv() => match entry {
                         Some(e) => {
+                            if pending.len() >= MRF_PENDING_CAP {
+                                if !capped {
+                                    capped = true;
+                                    warn!(
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_REPLICATION,
+                                        cap = MRF_PENDING_CAP,
+                                        "MRF pending backlog hit cap — dropping further recovery entries for this run"
+                                    );
+                                }
+                                continue;
+                            }
                             pending.push(e);
-                            if pending.len() >= 1000 && flush_mrf_to_disk(&pending, &storage).await {
-                                pending.clear();
+                            dirty = true;
+                            // Flush eagerly once enough new entries have accumulated
+                            // since the last write (measured against the flushed
+                            // set, not the absolute length, so a large backlog is
+                            // not rewritten on every single add).
+                            if pending.len() - flushed_len >= 1000 && flush_mrf_to_disk(&pending, &storage).await {
+                                flushed_len = pending.len();
+                                dirty = false;
                             }
                         }
                         None => {
                             // Channel closed (pool shutting down) — final flush.
-                            if !pending.is_empty() {
+                            if dirty {
                                 flush_mrf_to_disk(&pending, &storage).await;
                             }
                             break;
                         }
                     },
                     _ = interval.tick() => {
-                        if !pending.is_empty() && flush_mrf_to_disk(&pending, &storage).await {
-                            pending.clear();
+                        if dirty && flush_mrf_to_disk(&pending, &storage).await {
+                            flushed_len = pending.len();
+                            dirty = false;
                         }
                     }
                 }
@@ -1442,6 +1519,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
         let second = MrfReplicateEntry {
             object: "second".to_string(),
@@ -1497,6 +1575,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -1517,6 +1596,9 @@ mod tests {
     #[test]
     fn mrf_entry_delete_marker_roundtrip() {
         let dm_vid = Uuid::new_v4();
+        // A specific, non-now() nanosecond timestamp: replay must preserve this exact value
+        // instead of stamping the replica with the current time (backlog#867).
+        let mtime_nanos = 1_705_312_200_123_456_789i64;
         let entry = MrfReplicateEntry {
             bucket: "del-bucket".to_string(),
             object: "key".to_string(),
@@ -1526,6 +1608,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: Some(dm_vid),
             delete_marker: true,
+            delete_marker_mtime: Some(mtime_nanos),
         };
 
         let encoded = encode_mrf_file(std::slice::from_ref(&entry)).expect("encode");
@@ -1539,6 +1622,11 @@ mod tests {
         assert_eq!(got.op, MrfOpKind::Delete);
         assert_eq!(got.delete_marker_version_id, Some(dm_vid));
         assert!(got.delete_marker);
+        assert_eq!(
+            got.delete_marker_mtime,
+            Some(mtime_nanos),
+            "delete-marker mtime must survive the MRF disk round-trip"
+        );
     }
 
     #[test]
@@ -1553,6 +1641,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
 
         let encoded = encode_mrf_file(&[entry]).expect("encode");
@@ -1580,6 +1669,7 @@ mod tests {
                 op: MrfOpKind::Object,
                 delete_marker_version_id: None,
                 delete_marker: false,
+                delete_marker_mtime: None,
             },
             MrfReplicateEntry {
                 bucket: "b".to_string(),
@@ -1590,6 +1680,7 @@ mod tests {
                 op: MrfOpKind::Delete,
                 delete_marker_version_id: Some(del_dm_vid),
                 delete_marker: true,
+                delete_marker_mtime: None,
             },
         ];
 
@@ -1618,6 +1709,7 @@ mod tests {
             op: MrfOpKind::Object,
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
         assert_eq!(obj_entry.op, MrfOpKind::Object);
 
@@ -1631,6 +1723,7 @@ mod tests {
             op: MrfOpKind::Delete,
             delete_marker_version_id: Some(Uuid::new_v4()),
             delete_marker: true,
+            delete_marker_mtime: None,
         };
         assert_eq!(del_entry.op, MrfOpKind::Delete);
 
@@ -1645,6 +1738,7 @@ mod tests {
             op: MrfOpKind::default(),
             delete_marker_version_id: None,
             delete_marker: false,
+            delete_marker_mtime: None,
         };
         assert_eq!(legacy_entry.op, MrfOpKind::Object, "legacy default must be Object");
     }
@@ -1691,5 +1785,8 @@ mod tests {
         assert_eq!(entry.op, MrfOpKind::Object, "missing op key must default to Object");
         assert!(!entry.delete_marker);
         assert_eq!(entry.delete_marker_version_id, None);
+        // The "deleteMarkerMtime" key was absent in old files — #[serde(default)] must fill in
+        // None so replay falls back to the current time (backlog#867 backward compatibility).
+        assert_eq!(entry.delete_marker_mtime, None, "missing deleteMarkerMtime key must default to None");
     }
 }

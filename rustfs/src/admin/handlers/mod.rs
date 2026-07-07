@@ -15,15 +15,18 @@
 pub mod account_info;
 pub mod audit;
 mod audit_runtime_config;
+pub mod batch_job;
 pub mod bucket_meta;
 pub mod cluster_snapshot;
 pub mod config_admin;
+pub mod diagnostics;
 pub mod event;
 pub mod extensions;
 pub mod group;
 pub mod heal;
 pub mod health;
 pub(crate) mod iam_error;
+pub mod idp_compat;
 pub mod is_admin;
 pub mod kms;
 pub mod kms_dynamic;

@@ -290,6 +290,28 @@ impl FastObjectLockManager {
         shard.get_lock_info(key)
     }
 
+    /// Enumerate every currently held lock across all shards.
+    ///
+    /// Powers the admin "top locks" view. Order is shard-then-insertion and is
+    /// not otherwise stable across calls.
+    pub fn list_locks(&self) -> Vec<crate::fast_lock::types::ObjectLockInfo> {
+        let mut infos = Vec::new();
+        for shard in &self.shards {
+            infos.extend(shard.list_locks());
+        }
+        infos
+    }
+
+    /// Force-release every holder of the lock on `key`.
+    ///
+    /// Returns the number of owners released (0 if the resource was not locked).
+    /// This bypasses guard tracking and is intended only for administrative
+    /// recovery of a stuck resource.
+    pub fn force_unlock(&self, key: &crate::fast_lock::types::ObjectKey) -> usize {
+        let shard = self.get_shard(key);
+        shard.force_release_all(key)
+    }
+
     /// Get aggregated metrics
     pub fn get_metrics(&self) -> crate::fast_lock::metrics::AggregatedMetrics {
         let shard_metrics: Vec<_> = self.shards.iter().map(|shard| shard.metrics().snapshot()).collect();
@@ -467,6 +489,7 @@ impl LockManager for FastObjectLockManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fast_lock::types::LockMode;
 
     fn make_request(manager: &FastObjectLockManager, shard_id: usize, suffix: usize) -> ObjectLockRequest {
         let mut candidate = 0usize;
@@ -504,6 +527,59 @@ mod tests {
         assert_eq!(shard_groups[0].1.len(), 2);
         assert_eq!(shard_groups[1].1.len(), 1);
         assert_eq!(shard_groups[2].1.len(), 2);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_locks_reports_held_locks() {
+        let manager = FastObjectLockManager::new();
+        let write_key = ObjectKey::new("bucket", "write-object");
+        let read_key = ObjectKey::new("bucket", "read-object");
+
+        let _write_guard = manager
+            .acquire_write_lock(write_key.clone(), "writer")
+            .await
+            .expect("write lock should acquire");
+        let _read_guard = manager
+            .acquire_read_lock(read_key.clone(), "reader")
+            .await
+            .expect("read lock should acquire");
+
+        let mut locks = manager.list_locks();
+        locks.sort_by(|a, b| a.key.object.cmp(&b.key.object));
+        assert_eq!(locks.len(), 2);
+
+        let read = locks.iter().find(|l| l.key == read_key).expect("read lock listed");
+        assert_eq!(read.mode, LockMode::Shared);
+        assert_eq!(read.owner.as_ref(), "reader");
+
+        let write = locks.iter().find(|l| l.key == write_key).expect("write lock listed");
+        assert_eq!(write.mode, LockMode::Exclusive);
+        assert_eq!(write.owner.as_ref(), "writer");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_force_unlock_releases_stuck_lock() {
+        let manager = FastObjectLockManager::new();
+        let key = ObjectKey::new("bucket", "stuck-object");
+
+        let guard = manager
+            .acquire_write_lock(key.clone(), "owner")
+            .await
+            .expect("write lock should acquire");
+        // Leak the guard so it cannot release on drop, mimicking a stuck lock.
+        std::mem::forget(guard);
+        assert_eq!(manager.total_lock_count(), 1);
+
+        let released = manager.force_unlock(&key);
+        assert_eq!(released, 1);
+        assert!(manager.list_locks().is_empty());
+
+        // Force-unlocking an already-clear resource is a no-op.
+        assert_eq!(manager.force_unlock(&key), 0);
 
         manager.shutdown().await;
     }

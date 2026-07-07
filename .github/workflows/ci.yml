@@ -35,6 +35,7 @@ on:
       - ".github/workflows/audit.yml"
       - ".github/workflows/performance.yml"
   pull_request:
+    types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
     paths-ignore:
       - "**.md"
@@ -63,7 +64,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -72,8 +73,17 @@ env:
 
 jobs:
 
+  cancel-closed-pr-runs:
+    name: Cancel Closed PR Runs
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain cancellation run
+        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
+
   skip-check:
     name: Skip Duplicate Actions
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     permissions:
       actions: write
       contents: read
@@ -132,6 +142,9 @@ jobs:
 
       - name: Check architecture migration rules
         run: ./scripts/check_architecture_migration_rules.sh
+
+      - name: Check tokio io-uring feature guard
+        run: ./scripts/check_no_tokio_io_uring.sh
 
   test-and-lint:
     name: Test and Lint

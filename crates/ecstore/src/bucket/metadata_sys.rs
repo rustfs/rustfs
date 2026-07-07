@@ -74,6 +74,17 @@ pub async fn set_bucket_metadata(bucket: String, bm: BucketMetadata) -> Result<(
     Ok(())
 }
 
+/// Drop a bucket's cached metadata from the in-memory map.
+///
+/// This is the counterpart to [`set_bucket_metadata`] and is invoked when a
+/// bucket is deleted so peers stop serving stale cached configuration for it.
+/// Returns `true` if an entry was present.
+pub async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
+    let sys = get_bucket_metadata_sys()?;
+    let lock = sys.read().await;
+    Ok(lock.remove(bucket).await)
+}
+
 pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
     let sys = get_bucket_metadata_sys()?;
     let lock = sys.read().await;
@@ -295,7 +306,6 @@ impl BucketMetadataSys {
         let mut futures = Vec::new();
 
         for bucket in buckets.iter() {
-            // TODO: HealBucket
             let api = self.api.clone();
             let bucket = bucket.clone();
             futures.push(async move {
@@ -319,14 +329,13 @@ impl BucketMetadataSys {
 
         let mut mp = self.metadata_map.write().await;
 
-        // TODO:EventNotifier,BucketTargetSys
+        // TODO: EventNotifier
         for res in results {
             match res {
                 Ok(res) => {
                     if let Some(bucket) = buckets.get(idx) {
                         let x = Arc::new(res);
                         mp.insert(bucket.clone(), x.clone());
-                        // TODO:EventNotifier,BucketTargetSys
                         BucketTargetSys::get().set(bucket, &x).await;
                     }
                 }
@@ -360,6 +369,17 @@ impl BucketMetadataSys {
             let mut map = self.metadata_map.write().await;
             map.insert(bucket, bm);
         }
+    }
+
+    /// Remove a bucket's cached metadata from the in-memory map.
+    ///
+    /// Returns `true` if an entry was present. Reserved meta buckets are ignored.
+    pub async fn remove(&self, bucket: &str) -> bool {
+        if is_meta_bucketname(bucket) {
+            return false;
+        }
+        let mut map = self.metadata_map.write().await;
+        map.remove(bucket).is_some()
     }
 
     async fn _reset(&mut self) {

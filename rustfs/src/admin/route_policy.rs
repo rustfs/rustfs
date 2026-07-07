@@ -21,6 +21,7 @@ const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
 const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
 const ATTACH_POLICY: AdminActionRef = AdminActionRef::new("AttachPolicyAdminAction");
 const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminAction");
+const CONSOLE_LOG: AdminActionRef = AdminActionRef::new("ConsoleLogAdminAction");
 const COMMIT_TABLE: AdminActionRef = AdminActionRef::new("CommitTableAction");
 const CREATE_POLICY: AdminActionRef = AdminActionRef::new("CreatePolicyAdminAction");
 const CREATE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("CreateServiceAccountAdminAction");
@@ -34,6 +35,7 @@ const ENABLE_GROUP: AdminActionRef = AdminActionRef::new("EnableGroupAdminAction
 const ENABLE_USER: AdminActionRef = AdminActionRef::new("EnableUserAdminAction");
 const EXPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ExportBucketMetadataAction");
 const EXPORT_IAM: AdminActionRef = AdminActionRef::new("ExportIAMAction");
+const FORCE_UNLOCK: AdminActionRef = AdminActionRef::new("ForceUnlockAdminAction");
 const GET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("GetBucketTargetAction");
 const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
 const GET_METRICS: AdminActionRef = AdminActionRef::new("GetMetricsAction");
@@ -48,6 +50,7 @@ const GET_TABLE_METADATA: AdminActionRef = AdminActionRef::new("GetTableMetadata
 const GET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("GetTableMetadataLocationAction");
 const GET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("GetTableNamespaceAction");
 const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
+const HEALTH_INFO: AdminActionRef = AdminActionRef::new("HealthInfoAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
 const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
@@ -65,9 +68,11 @@ const LIST_USERS: AdminActionRef = AdminActionRef::new("ListUsersAdminAction");
 const PROFILING: AdminActionRef = AdminActionRef::new("ProfilingAdminAction");
 const REBALANCE: AdminActionRef = AdminActionRef::new("RebalanceAdminAction");
 const REGISTER_TABLE: AdminActionRef = AdminActionRef::new("RegisterTableAction");
+const REMOVE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("RemoveServiceAccountAdminAction");
 const REMOVE_USER_FROM_GROUP: AdminActionRef = AdminActionRef::new("RemoveUserFromGroupAdminAction");
 const RUN_TABLE_MAINTENANCE: AdminActionRef = AdminActionRef::new("RunTableMaintenanceAction");
 const SERVER_INFO: AdminActionRef = AdminActionRef::new("ServerInfoAdminAction");
+const SERVER_UPDATE: AdminActionRef = AdminActionRef::new("ServerUpdateAdminAction");
 const SET_BUCKET_QUOTA: AdminActionRef = AdminActionRef::new("SetBucketQuotaAdminAction");
 const SET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("SetBucketTargetAction");
 const SET_TABLE: AdminActionRef = AdminActionRef::new("SetTableAction");
@@ -82,6 +87,14 @@ const SITE_REPLICATION_OPERATION: AdminActionRef = AdminActionRef::new("SiteRepl
 const SITE_REPLICATION_REMOVE: AdminActionRef = AdminActionRef::new("SiteReplicationRemoveAction");
 const SITE_REPLICATION_RESYNC: AdminActionRef = AdminActionRef::new("SiteReplicationResyncAction");
 const STORAGE_INFO: AdminActionRef = AdminActionRef::new("StorageInfoAdminAction");
+// MinIO admin compat: batch jobs and replication diff.
+const START_BATCH_JOB: AdminActionRef = AdminActionRef::new("StartBatchJobAction");
+const LIST_BATCH_JOBS: AdminActionRef = AdminActionRef::new("ListBatchJobsAction");
+const DESCRIBE_BATCH_JOB: AdminActionRef = AdminActionRef::new("DescribeBatchJobAction");
+const CANCEL_BATCH_JOB: AdminActionRef = AdminActionRef::new("CancelBatchJobAction");
+const REPLICATION_DIFF: AdminActionRef = AdminActionRef::new("ReplicationDiff");
+const TOP_LOCKS: AdminActionRef = AdminActionRef::new("TopLocksAdminAction");
+const TRACE: AdminActionRef = AdminActionRef::new("TraceAdminAction");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeferredRoutePolicyReason {
@@ -164,6 +177,55 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/export-iam", EXPORT_IAM, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/import-iam", IMPORT_IAM, RouteRiskLevel::High),
+    admin(HttpMethod::Put, "/rustfs/admin/v3/import-iam-v2", IMPORT_IAM, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/revoke-tokens/{user_provider}",
+        REMOVE_SERVICE_ACCOUNT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp-config/{idp_type}",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/idp/ldap/add-service-account",
+        CREATE_SERVICE_ACCOUNT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/idp/ldap/policy/{operation}",
+        ATTACH_POLICY,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/list-canned-policies",
@@ -539,6 +601,36 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/profile", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/status", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/tls/status", PROFILING, RouteRiskLevel::High),
+    // MinIO-compatible diagnostics: lock inspection / force-unlock, health/OBD info,
+    // console log, and the speedtest harness family.
+    admin(HttpMethod::Get, "/rustfs/admin/v3/top/locks", TOP_LOCKS, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/force-unlock", FORCE_UNLOCK, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/healthinfo", HEALTH_INFO, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/obdinfo", HEALTH_INFO, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/log", CONSOLE_LOG, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest", HEALTH_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest/object", HEALTH_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest/drive", HEALTH_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest/net", HEALTH_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest/site", HEALTH_INFO, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/speedtest/client/devnull",
+        HEALTH_INFO,
+        RouteRiskLevel::High,
+    ),
+    // MinIO-compatible profiling / trace endpoints.
+    admin(HttpMethod::Post, "/rustfs/admin/v3/profiling/start", PROFILING, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/profiling/download",
+        PROFILING,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/profile", PROFILING, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/trace", TRACE, RouteRiskLevel::Sensitive),
+    // MinIO-compatible service control: binary update.
+    admin(HttpMethod::Post, "/rustfs/admin/v3/update", SERVER_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/create-key", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/key/create", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(
@@ -1172,6 +1264,35 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         COMMIT_TABLE,
         RouteRiskLevel::High,
     ),
+    // MinIO admin compat: batch job lifecycle (backlog#613).
+    admin(HttpMethod::Post, "/rustfs/admin/v3/start-job", START_BATCH_JOB, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/list-jobs", LIST_BATCH_JOBS, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/status-job",
+        DESCRIBE_BATCH_JOB,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/describe-job",
+        DESCRIBE_BATCH_JOB,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Delete, "/rustfs/admin/v3/cancel-job", CANCEL_BATCH_JOB, RouteRiskLevel::High),
+    // MinIO admin compat: replication diff / MRF inspection (backlog#611).
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/replication/diff",
+        REPLICATION_DIFF,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/replication/mrf",
+        GET_REPLICATION_METRICS,
+        RouteRiskLevel::Sensitive,
+    ),
 ];
 
 pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
@@ -1224,6 +1345,26 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     deferred(
         HttpMethod::Get,
         "/rustfs/admin/v3/idp/builtin/policy-entities",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/policy-entities",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/list-access-keys",
+        DeferredRoutePolicyReason::ContextualAuthorization,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/list-access-keys-bulk",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/openid/list-access-keys-bulk",
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(HttpMethod::Post, "/rustfs/admin/v3/service", DeferredRoutePolicyReason::NotImplemented),

@@ -42,6 +42,13 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
             op: MrfOpKind::Delete,
             delete_marker_version_id: self.delete_object.delete_marker_version_id,
             delete_marker: self.delete_object.delete_marker,
+            // Persist the original delete-marker mtime as Unix nanoseconds so replay after a
+            // restart stamps the replica with the source timestamp rather than the replay time
+            // (backlog#867). None when unknown; replay then falls back to the current time.
+            delete_marker_mtime: self
+                .delete_object
+                .delete_marker_mtime
+                .and_then(|t| i64::try_from(t.unix_timestamp_nanos()).ok()),
         }
     }
 
@@ -92,6 +99,7 @@ mod tests {
     fn deleted_object_replication_info_encodes_delete_mrf_entry() {
         let version_id = Uuid::new_v4();
         let delete_marker_version_id = Uuid::new_v4();
+        let mtime = time::OffsetDateTime::from_unix_timestamp_nanos(1_705_312_200_123_456_789).expect("valid mtime");
         let info = DeletedObjectReplicationInfo {
             bucket: "bucket".to_string(),
             op_type: ReplicationType::Delete,
@@ -100,6 +108,7 @@ mod tests {
                 version_id: Some(version_id),
                 delete_marker_version_id: Some(delete_marker_version_id),
                 delete_marker: true,
+                delete_marker_mtime: Some(mtime),
                 ..Default::default()
             },
             ..Default::default()
@@ -113,7 +122,32 @@ mod tests {
         assert_eq!(entry.delete_marker_version_id, Some(delete_marker_version_id));
         assert_eq!(entry.op, MrfOpKind::Delete);
         assert!(entry.delete_marker);
+        // The original mtime must be persisted (as Unix nanos) so replay keeps the source
+        // timestamp instead of stamping the replica with the replay time (backlog#867).
+        assert_eq!(
+            entry.delete_marker_mtime,
+            Some(mtime.unix_timestamp_nanos() as i64),
+            "delete-marker mtime must be persisted in the MRF entry"
+        );
         assert_eq!(info.get_object(), "object");
+    }
+
+    #[test]
+    fn deleted_object_replication_info_without_mtime_yields_none() {
+        // Absent source mtime must persist as None so replay falls back to the current time,
+        // preserving pre-#867 behaviour.
+        let info = DeletedObjectReplicationInfo {
+            bucket: "bucket".to_string(),
+            delete_object: DeletedObject {
+                object_name: "object".to_string(),
+                delete_marker: true,
+                delete_marker_mtime: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(info.to_mrf_entry().delete_marker_mtime, None);
     }
 
     #[test]

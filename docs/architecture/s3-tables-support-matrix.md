@@ -117,6 +117,7 @@ catalog extension.
 | Strong backing migration contract | Supported as a contract | Diagnostics publish object-backed manifest state, recoverable commit-log WAL state, target backing type, replay requirements, and blockers. |
 | Durable backing migration dry-run | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` and the `/_iceberg/v1` alias inspect object-backed catalog inventory, commit recovery blockers, idempotency indexes, warehouse prefix index readiness, recommended actions, and rollback configuration without mutating catalog state. |
 | Disaster recovery rehearsal | Manual/live harness | `failure_coverage.py --print-disaster-recovery-rehearsal` generates an operator runbook covering catalog export, diagnostics, safe recovery repair, rollback/import, durable backing migration dry-run, post-recovery loadTable, and table data-plane policy probes. |
+| Scale and fault rehearsal | Manual/live harness | `failure_coverage.py --print-scale-fault-rehearsal` generates an opt-in runbook for concurrent writer stress, maintenance scheduler lease recovery, durable backing cutover preflight, recovery/rollback/import under load, and post-run evidence capture. |
 | Strong KV/WAL backing cutover | Preview / controlled | Operators can explicitly select durable strong backing with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong`. Run the migration dry-run first and keep the object-backed catalog available for rollback. Object-only advanced operations fail closed in durable strong mode. |
 | Single active writer region | Supported policy | Diagnostics publish single-active-writer semantics and read-only replica limits. |
 | Active-active multi-region writes | Not claimed | A table must not accept independent concurrent writers in multiple active regions. |
@@ -225,6 +226,15 @@ python3 scripts/table-catalog/failure_coverage.py \
   --table events \
   --table-warehouse-location s3://rustfs-s3table-smoke/tables/table-id \
   --print-disaster-recovery-rehearsal
+python3 scripts/table-catalog/failure_coverage.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --table-warehouse-location s3://rustfs-s3table-smoke/tables/table-id \
+  --writer-count 8 \
+  --maintenance-worker-count 2 \
+  --iteration-count 50 \
+  --print-scale-fault-rehearsal
 ```
 
 ## Release Claim Guidance
@@ -237,8 +247,8 @@ Acceptable wording:
 > with PyIceberg smoke coverage, table-aware S3 data-plane policy checks,
 > controlled maintenance, catalog recovery diagnostics, manual conformance
 > input for Spark, Trino, DuckDB, Databend, and Snowflake, production-failure
-> probe harnesses, disaster-recovery rehearsal probes, and a machine-readable
-> production operations evidence guide.
+> probe harnesses, disaster-recovery and scale/fault rehearsal probes, and a
+> machine-readable production operations evidence guide.
 
 Do not claim:
 

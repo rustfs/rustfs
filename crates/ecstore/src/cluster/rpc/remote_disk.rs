@@ -14,6 +14,7 @@
 
 use crate::cluster::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
+    node_service_time_out_client_for_class, node_service_time_out_client_no_auth,
 };
 use crate::cluster::rpc::internode_data_transport::{
     InternodeDataTransport, ReadStreamRequest, WalkDirStreamRequest, WriteStreamRequest,
@@ -39,6 +40,7 @@ use bytes::Bytes;
 use futures::lock::Mutex;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
@@ -66,7 +68,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, service::interceptor::InterceptedService, transport::Channel};
-use tracing::{Instrument, debug, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +79,8 @@ enum FailureHealthAction {
 
 const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+/// Base backoff for idempotent read-only RPC retries (grpc-optimization P3-3); doubles per attempt.
+const REMOTE_DISK_READ_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
 const ENV_RUSTFS_METADATA_BATCH_READ: &str = "RUSTFS_METADATA_BATCH_READ";
 const LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC: &str = "RUSTFS_BATCH_METADATA_RPC";
 const BATCH_METADATA_RPC_OFF: &str = "off";
@@ -184,6 +188,78 @@ pub struct RemoteDisk {
     data_transport: Arc<dyn InternodeDataTransport>,
 }
 
+// ── Connection lifecycle (grpc-optimization P3) ──
+
+/// Whether to prewarm the internode control channel in the background at construction (default off).
+fn internode_prewarm_enabled() -> bool {
+    rustfs_utils::get_env_bool(rustfs_config::ENV_INTERNODE_PREWARM, rustfs_config::DEFAULT_INTERNODE_PREWARM)
+}
+
+/// Whether to fast-fail RPCs to peers already marked offline (default off).
+fn internode_offline_bypass_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_OFFLINE_BYPASS,
+        rustfs_config::DEFAULT_INTERNODE_OFFLINE_BYPASS,
+    )
+}
+
+/// Re-probe interval for the offline bypass (>= 1s).
+fn internode_offline_reprobe_interval() -> Duration {
+    Duration::from_secs(
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_INTERNODE_OFFLINE_REPROBE_SECS,
+            rustfs_config::DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS,
+        )
+        .max(1),
+    )
+}
+
+/// If the offline bypass is enabled and `addr` is marked offline, return a reason string to
+/// fast-fail with instead of paying the connect timeout (grpc-optimization P3-2). Self-healing:
+/// one request per re-probe interval is let through so the peer can recover. Shared by the data
+/// path (`remote_disk`) and the lock path (`remote_locker`).
+pub(crate) fn internode_offline_bypass_reason(addr: &str) -> Option<String> {
+    if internode_offline_bypass_enabled()
+        && rustfs_io_metrics::internode_metrics::cluster_peer_should_bypass(addr, internode_offline_reprobe_interval())
+    {
+        return Some(format!("internode peer {addr} offline; fast-fail bypass (P3)"));
+    }
+    None
+}
+
+/// Number of extra attempts for idempotent read-only control-plane RPCs on transient network
+/// failures (grpc-optimization P3-3). `0` (default) disables retries. Write/lock RPCs never retry.
+fn internode_idempotent_read_retries() -> usize {
+    rustfs_utils::get_env_usize(
+        rustfs_config::ENV_INTERNODE_IDEMPOTENT_READ_RETRIES,
+        rustfs_config::DEFAULT_INTERNODE_IDEMPOTENT_READ_RETRIES,
+    )
+}
+
+/// Peers for which a control-channel prewarm has already been triggered, to dedup the N remote
+/// disks that map to a single peer address.
+static PREWARMED_PEERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Best-effort background prewarm of a peer's control channel (grpc-optimization P3-1). Deduped per
+/// peer; a dial failure just falls through to the existing lazy connect and recovery monitor.
+fn spawn_control_channel_prewarm(addr: String) {
+    {
+        let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
+            return;
+        };
+        if !prewarmed.insert(addr.clone()) {
+            return;
+        }
+    }
+    tokio::spawn(async move {
+        match node_service_time_out_client_no_auth(&addr).await {
+            Ok(_) => debug!(addr = %addr, "internode control channel prewarmed"),
+            Err(err) => debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)"),
+        }
+    });
+}
+
 impl RemoteDisk {
     fn recovery_monitor_span(addr: &str, endpoint: &Endpoint) -> tracing::Span {
         tracing::info_span!(
@@ -230,6 +306,12 @@ impl RemoteDisk {
             data_transport,
         };
         record_drive_runtime_state(ep, RuntimeDriveHealthState::Online);
+
+        // P3-1: move the connect cost off the first RPC by prewarming the control channel in the
+        // background. Deduped per peer, best-effort, opt-in.
+        if internode_prewarm_enabled() {
+            spawn_control_channel_prewarm(disk.addr.clone());
+        }
 
         Ok(disk)
     }
@@ -311,12 +393,9 @@ impl RemoteDisk {
         let health = Arc::clone(&self.health);
         let cancel_token = self.cancel_token.clone();
         let span = Self::recovery_monitor_span(&addr, &endpoint);
-        tokio::spawn(
-            async move {
-                Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
-            }
-            .instrument(span),
-        );
+        super::spawn_background_monitor(span, async move {
+            Self::monitor_remote_disk_recovery(addr, endpoint, health, cancel_token).await;
+        });
     }
 
     #[cfg(test)]
@@ -325,21 +404,18 @@ impl RemoteDisk {
         let endpoint = self.endpoint.clone();
         let addr = self.addr.clone();
         let span = Self::recovery_monitor_span(&addr, &endpoint);
-        tokio::spawn(
-            async move {
-                warn!(
-                    event = EVENT_REMOTE_DISK_HEALTH,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-                    endpoint = %endpoint,
-                    addr,
-                    state = "probe",
-                    "remote disk recovery monitor log probe"
-                );
-                let _ = tx.send(());
-            }
-            .instrument(span),
-        );
+        super::spawn_background_monitor(span, async move {
+            warn!(
+                event = EVENT_REMOTE_DISK_HEALTH,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                endpoint = %endpoint,
+                addr,
+                state = "probe",
+                "remote disk recovery monitor log probe"
+            );
+            let _ = tx.send(());
+        });
         rx
     }
 
@@ -396,12 +472,9 @@ impl RemoteDisk {
             let cancel_clone = cancel_token.clone();
             let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
 
-            tokio::spawn(
-                async move {
-                    Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-                }
-                .instrument(span),
-            );
+            super::spawn_background_monitor(span, async move {
+                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
+            });
         }
 
         loop {
@@ -462,12 +535,9 @@ impl RemoteDisk {
                         let cancel_clone = cancel_token.clone();
                         let span = Self::recovery_monitor_span(&addr_clone, &endpoint_clone);
 
-                        tokio::spawn(
-                            async move {
-                                Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
-                            }
-                            .instrument(span),
-                        );
+                        super::spawn_background_monitor(span, async move {
+                            Self::monitor_remote_disk_recovery(addr_clone, endpoint_clone, health_clone, cancel_clone).await;
+                        });
                     }
                 }
             }
@@ -611,6 +681,49 @@ impl RemoteDisk {
         Fut: std::future::Future<Output = Result<T>>,
     {
         self.execute_with_timeout_for_op("unknown", operation, timeout_duration).await
+    }
+
+    /// Execute an **idempotent, read-only/reentrant** RPC with a bounded number of retries on
+    /// transient network failures, with exponential backoff (grpc-optimization P3-3). Retries
+    /// default to 0 (disabled). MUST NOT be used for write/lock RPCs — those must never auto-retry
+    /// (quorum/idempotency safety). The `operation` closure is re-invoked per attempt, so it must be
+    /// `Fn` (rebuild the request from borrowed inputs, do not move captured state out).
+    async fn execute_read_with_retry<T, F, Fut>(&self, op: &'static str, operation: F, timeout_duration: Duration) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let max_retries = internode_idempotent_read_retries();
+        let mut attempt = 0usize;
+        loop {
+            // Only the final attempt marks the disk faulty / evicts the channel. Earlier retries
+            // ignore the failure, so a transient error cannot flip the disk into a faulty
+            // short-circuit (which would defeat the retry) or over-count failures.
+            let health_action = if attempt >= max_retries {
+                FailureHealthAction::MarkFailure
+            } else {
+                FailureHealthAction::IgnoreFailure
+            };
+            match self
+                .execute_with_timeout_for_op_and_health_action(op, &operation, timeout_duration, health_action)
+                .await
+            {
+                Err(err) if attempt < max_retries && is_network_like_disk_error(&err) => {
+                    attempt += 1;
+                    let backoff = REMOTE_DISK_READ_RETRY_BASE_BACKOFF
+                        .saturating_mul(1u32 << u32::try_from(attempt - 1).unwrap_or(4).min(4));
+                    debug!(
+                        endpoint = %self.endpoint,
+                        addr = %self.addr,
+                        op,
+                        attempt,
+                        "retrying idempotent read-only RPC after transient network error"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                other => return other,
+            }
+        }
     }
 
     async fn execute_with_timeout_for_op<T, F, Fut>(
@@ -804,10 +917,39 @@ impl RemoteDisk {
         }
     }
 
+    /// P3-2 offline bypass: when enabled and this peer is marked offline, fast-fail instead of
+    /// paying the connect timeout, so the erasure layer proceeds on quorum sooner. This does not
+    /// change quorum. Self-healing — one request per re-probe interval is let through so the peer
+    /// recovers even without a background monitor. The recovery monitor's own probe path calls the
+    /// client directly and is unaffected.
+    fn offline_bypass_error(&self) -> Option<Error> {
+        internode_offline_bypass_reason(&self.addr).map(Error::other)
+    }
+
     async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        if let Some(err) = self.offline_bypass_error() {
+            return Err(err);
+        }
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+    }
+
+    /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion).
+    /// Routes onto the isolated bulk channel pool so large transfers cannot head-of-line block
+    /// lock/health RPCs (grpc-optimization P1). Falls back to the control channel when isolation
+    /// is disabled.
+    async fn get_bulk_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        if let Some(err) = self.offline_bypass_error() {
+            return Err(err);
+        }
+        node_service_time_out_client_for_class(
+            &self.addr,
+            TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+            ChannelClass::Bulk,
+        )
+        .await
+        .map_err(|err| Error::other(format!("can not get client, err: {err}")))
     }
 
     async fn disk_ref(&self) -> String {
@@ -817,25 +959,54 @@ impl RemoteDisk {
     }
 }
 
+/// Initial capacity hint (bytes) for msgpack encode buffers, sized to cover a typical single-
+/// version `FileInfo` without repeated growth reallocations. Larger payloads still grow as needed.
+const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
+
 fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::new());
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT));
     value.serialize(&mut serializer)?;
     Ok(serializer.into_inner())
+}
+
+/// JSON compatibility string for a dual-encoded (`_bin` + text) request field. Returns an empty
+/// string when msgpack-only mode is enabled (grpc-optimization P2-1) so the redundant JSON copy is
+/// not sent; otherwise the legacy JSON encoding. Only use for fields whose peer decodes `_bin`
+/// first — the paired `_bin` (msgpack) field must always be sent alongside.
+fn compat_json<T: Serialize>(value: &T) -> Result<String> {
+    if rustfs_protos::internode_rpc_msgpack_only() {
+        return Ok(String::new());
+    }
+    Ok(serde_json::to_string(value)?)
 }
 
 fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = rmp_serde::Serializer::new(Vec::new()).with_struct_map();
+    let mut serializer = rmp_serde::Serializer::new(Vec::with_capacity(MSGPACK_ENCODE_CAPACITY_HINT)).with_struct_map();
     value.serialize(&mut serializer)?;
     Ok(serializer.into_inner())
 }
 
-fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Result<T> {
+fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str, value_name: &'static str) -> Result<T> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
         return T::deserialize(&mut deserializer).map_err(Error::from);
     }
 
+    // The msgpack payload was absent, so fall back to the JSON compatibility field. This branch
+    // must read zero across a release window before the redundant JSON fields can be dropped (P2).
+    crate::cluster::rpc::runtime_sources::record_response_json_fallback(value_name);
     serde_json::from_str(json).map_err(Error::from)
+}
+
+/// Aggregate encoded size (bytes) of a `ReadMultiple` response, preferring the msgpack payloads
+/// and falling back to the JSON compatibility strings. Used to size the RPC for the payload
+/// histogram / large-payload alerting (grpc-optimization P0 instrumentation).
+fn read_multiple_response_payload_len(response: &ReadMultipleResponse) -> usize {
+    if !response.read_multiple_resps_bin.is_empty() {
+        response.read_multiple_resps_bin.iter().map(|buf| buf.len()).sum()
+    } else {
+        response.read_multiple_resps.iter().map(|item| item.len()).sum()
+    }
 }
 
 fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint: &Endpoint) -> Result<Vec<ReadMultipleResp>> {
@@ -858,7 +1029,7 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
 
         let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps_bin.len());
         for (index, buf) in response.read_multiple_resps_bin.iter().enumerate() {
-            let resp = decode_msgpack_or_json::<ReadMultipleResp>(buf, "").map_err(|err| {
+            let resp = decode_msgpack_or_json::<ReadMultipleResp>(buf, "", "ReadMultipleResp").map_err(|err| {
                 Error::other(format!("decode ReadMultipleResp msgpack item {index} from {endpoint} failed: {err}"))
             })?;
             read_multiple_resps.push(resp);
@@ -866,6 +1037,10 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
         return Ok(read_multiple_resps);
     }
 
+    // No msgpack payloads present: the whole list fell back to the JSON compatibility field (P2).
+    if !response.read_multiple_resps.is_empty() {
+        crate::cluster::rpc::runtime_sources::record_response_json_fallback("ReadMultipleResp");
+    }
     let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps.len());
     for (index, json_str) in response.read_multiple_resps.iter().enumerate() {
         let resp = serde_json::from_str::<ReadMultipleResp>(json_str)
@@ -899,7 +1074,7 @@ fn decode_batch_read_version_response_items(
 
         let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps_bin.len());
         for (index, buf) in response.batch_read_version_resps_bin.iter().enumerate() {
-            let resp = decode_msgpack_or_json::<BatchReadVersionResp>(buf, "").map_err(|err| {
+            let resp = decode_msgpack_or_json::<BatchReadVersionResp>(buf, "", "BatchReadVersionResp").map_err(|err| {
                 Error::other(format!("decode BatchReadVersionResp msgpack item {index} from {endpoint} failed: {err}"))
             })?;
             batch_read_version_resps.push(resp);
@@ -907,6 +1082,10 @@ fn decode_batch_read_version_response_items(
         return Ok(batch_read_version_resps);
     }
 
+    // No msgpack payloads present: the whole list fell back to the JSON compatibility field (P2).
+    if !response.batch_read_version_resps.is_empty() {
+        crate::cluster::rpc::runtime_sources::record_response_json_fallback("BatchReadVersionResp");
+    }
     let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps.len());
     for (index, json_str) in response.batch_read_version_resps.iter().enumerate() {
         let resp = serde_json::from_str::<BatchReadVersionResp>(json_str).map_err(|err| {
@@ -918,7 +1097,6 @@ fn decode_batch_read_version_response_items(
     Ok(batch_read_version_resps)
 }
 
-// TODO: all api need to handle errors
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
     #[tracing::instrument(skip(self))]
@@ -1149,7 +1327,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         debug!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
@@ -1170,6 +1348,7 @@ impl DiskAPI for RemoteDisk {
                 let request = Request::new(DeleteVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
+                    force: force_delete,
                 });
 
                 let response = client.delete_volume(request).await?.into_inner();
@@ -1184,56 +1363,6 @@ impl DiskAPI for RemoteDisk {
         )
         .await
     }
-
-    // // FIXME: TODO: use writer
-    // #[tracing::instrument(skip(self, wr))]
-    // async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
-    //     let now = std::time::SystemTime::now();
-    //     info!("walk_dir {}/{}/{:?}", self.endpoint.to_string(), opts.bucket, opts.filter_prefix);
-    //     let mut wr = wr;
-    //     let mut out = MetacacheWriter::new(&mut wr);
-    //     let mut buf = Vec::new();
-    //     opts.serialize(&mut Serializer::new(&mut buf))?;
-    //     let mut client = node_service_time_out_client(&self.addr)
-    //         .await
-    //         .map_err(|err| Error::other(format!("can not get client, err: {}", err)))?;
-    //     let request = Request::new(WalkDirRequest {
-    //         disk: self.endpoint.to_string(),
-    //         walk_dir_options: buf.into(),
-    //     });
-    //     let mut response = client.walk_dir(request).await?.into_inner();
-
-    //     loop {
-    //         match response.next().await {
-    //             Some(Ok(resp)) => {
-    //                 if !resp.success {
-    //                     if let Some(err) = resp.error_info {
-    //                         if err == "Unexpected EOF" {
-    //                             return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, err)));
-    //                         } else {
-    //                             return Err(Error::other(err));
-    //                         }
-    //                     }
-
-    //                     return Err(Error::other("unknown error"));
-    //                 }
-    //                 let entry = serde_json::from_str::<MetaCacheEntry>(&resp.meta_cache_entry)
-    //                     .map_err(|_| Error::other(format!("Unexpected response: {:?}", response)))?;
-    //                 out.write_obj(&entry).await?;
-    //             }
-    //             None => break,
-    //             _ => return Err(Error::other(format!("Unexpected response: {:?}", response))),
-    //         }
-    //     }
-
-    //     info!(
-    //         "walk_dir {}/{:?} done {:?}",
-    //         opts.bucket,
-    //         opts.filter_prefix,
-    //         now.elapsed().unwrap_or_default()
-    //     );
-    //     Ok(())
-    // }
 
     #[tracing::instrument(skip(self))]
     async fn delete_version(
@@ -1258,6 +1387,10 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
+                // `_bin` support for DeleteVersion is new (grpc-optimization P2); always dual-write
+                // JSON + msgpack until its fallback counter has read zero across a release window.
+                let file_info_bin = encode_msgpack(&fi)?;
+                let opts_bin = encode_msgpack(&opts)?;
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
@@ -1272,6 +1405,8 @@ impl DiskAPI for RemoteDisk {
                     file_info,
                     force_del_marker,
                     opts,
+                    file_info_bin: file_info_bin.into(),
+                    opts_bin: opts_bin.into(),
                 });
 
                 let response = client.delete_version(request).await?.into_inner();
@@ -1307,6 +1442,18 @@ impl DiskAPI for RemoteDisk {
             return vec![Some(DiskError::FaultyDisk); versions.len()];
         }
 
+        // `_bin` support for DeleteVersions is new (grpc-optimization P2); always dual-write JSON +
+        // msgpack until its fallback counter has read zero across a release window.
+        let opts_bin = match encode_msgpack(&opts) {
+            Ok(opts_bin) => opts_bin,
+            Err(err) => {
+                let mut errors = Vec::with_capacity(versions.len());
+                for _ in 0..versions.len() {
+                    errors.push(Some(Error::other(err.to_string())));
+                }
+                return errors;
+            }
+        };
         let opts = match serde_json::to_string(&opts) {
             Ok(opts) => opts,
             Err(err) => {
@@ -1318,9 +1465,20 @@ impl DiskAPI for RemoteDisk {
             }
         };
         let mut versions_str = Vec::with_capacity(versions.len());
+        let mut versions_bin = Vec::with_capacity(versions.len());
         for file_info_versions in versions.iter() {
             versions_str.push(match serde_json::to_string(file_info_versions) {
                 Ok(versions_str) => versions_str,
+                Err(err) => {
+                    let mut errors = Vec::with_capacity(versions.len());
+                    for _ in 0..versions.len() {
+                        errors.push(Some(Error::other(err.to_string())));
+                    }
+                    return errors;
+                }
+            });
+            versions_bin.push(match encode_msgpack(file_info_versions) {
+                Ok(versions_bin) => Bytes::from(versions_bin),
                 Err(err) => {
                     let mut errors = Vec::with_capacity(versions.len());
                     for _ in 0..versions.len() {
@@ -1346,6 +1504,8 @@ impl DiskAPI for RemoteDisk {
             volume: volume.to_string(),
             versions: versions_str,
             opts,
+            versions_bin,
+            opts_bin: opts_bin.into(),
         });
 
         // TODO: use Error not string
@@ -1447,7 +1607,7 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let file_info = serde_json::to_string(&fi)?;
+        let file_info = compat_json(&fi)?;
         let file_info_bin = encode_msgpack(&fi)?;
 
         self.execute_with_timeout_for_op(
@@ -1520,8 +1680,8 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let file_info = serde_json::to_string(&fi)?;
-        let opts_str = serde_json::to_string(&opts)?;
+        let file_info = compat_json(&fi)?;
+        let opts_str = compat_json(&opts)?;
         let file_info_bin = encode_msgpack(&fi)?;
         let opts_bin = encode_msgpack(opts)?;
 
@@ -1577,7 +1737,7 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let opts_str = serde_json::to_string(opts)?;
+        let opts_str = compat_json(opts)?;
         let opts_bin = encode_msgpack(opts)?;
 
         self.execute_with_timeout(
@@ -1602,7 +1762,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info)?;
+                let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info, "FileInfo")?;
 
                 Ok(file_info)
             },
@@ -1633,7 +1793,7 @@ impl DiskAPI for RemoteDisk {
             state = "started",
             "Remote disk RPC started"
         );
-        let batch_read_version_req = serde_json::to_string(&req)?;
+        let batch_read_version_req = compat_json(&req)?;
         let batch_read_version_req_bin = encode_msgpack(&req)?;
 
         let batch_result = self
@@ -1642,7 +1802,7 @@ impl DiskAPI for RemoteDisk {
                 move || async move {
                     let disk = self.disk_ref().await;
                     let mut client = self
-                        .get_client()
+                        .get_bulk_client()
                         .await
                         .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                     let request = Request::new(BatchReadVersionRequest {
@@ -1739,7 +1899,8 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let raw_file_info = decode_msgpack_or_json::<RawFileInfo>(&response.raw_file_info_bin, &response.raw_file_info)?;
+                let raw_file_info =
+                    decode_msgpack_or_json::<RawFileInfo>(&response.raw_file_info_bin, &response.raw_file_info, "RawFileInfo")?;
 
                 Ok(raw_file_info)
             },
@@ -1774,7 +1935,7 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout_for_op(
             "rename_data",
             || async {
-                let file_info = serde_json::to_string(&fi)?;
+                let file_info = compat_json(&fi)?;
                 let file_info_bin = encode_msgpack_named(&fi)?;
                 let mut client = self
                     .get_client()
@@ -1796,8 +1957,11 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let rename_data_resp =
-                    decode_msgpack_or_json::<RenameDataResp>(&response.rename_data_resp_bin, &response.rename_data_resp)?;
+                let rename_data_resp = decode_msgpack_or_json::<RenameDataResp>(
+                    &response.rename_data_resp_bin,
+                    &response.rename_data_resp,
+                    "RenameDataResp",
+                )?;
 
                 Ok(rename_data_resp)
             },
@@ -2292,11 +2456,11 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let read_multiple_req = serde_json::to_string(&req)?;
+                let read_multiple_req = compat_json(&req)?;
                 let read_multiple_req_bin = encode_msgpack(&req)?;
                 let disk = self.disk_ref().await;
                 let mut client = self
-                    .get_client()
+                    .get_bulk_client()
                     .await
                     .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
                 let request = Request::new(ReadMultipleRequest {
@@ -2310,6 +2474,10 @@ impl DiskAPI for RemoteDisk {
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
                 }
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_multiple_recv_bytes(
+                    read_multiple_response_payload_len(&response),
+                );
 
                 let read_multiple_resps = decode_read_multiple_response_items(response, &self.endpoint)?;
 
@@ -2339,7 +2507,7 @@ impl DiskAPI for RemoteDisk {
             || async {
                 let data_len = data.len();
                 let disk = self.disk_ref().await;
-                let mut client = self.get_client().await.map_err(|err| {
+                let mut client = self.get_bulk_client().await.map_err(|err| {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
@@ -2390,7 +2558,7 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let disk = self.disk_ref().await;
-                let mut client = self.get_client().await.map_err(|err| {
+                let mut client = self.get_bulk_client().await.map_err(|err| {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
@@ -2424,7 +2592,8 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
-        self.execute_with_timeout_for_op(
+        // disk_info is idempotent/read-only, so it is eligible for the P3-3 bounded retry.
+        self.execute_read_with_retry(
             "disk_info",
             || async {
                 let opts = serde_json::to_string(&opts)?;
@@ -2699,6 +2868,45 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].file, "json");
         assert_eq!(decoded[0].data, b"fallback");
+    }
+
+    #[test]
+    fn read_multiple_response_payload_len_prefers_msgpack_and_falls_back_to_json() {
+        let bin_a = encode_msgpack(&sample_read_multiple_resp("a", b"binary")).expect("msgpack should encode");
+        let bin_b = encode_msgpack(&sample_read_multiple_resp("b", b"more")).expect("msgpack should encode");
+        let json = serde_json::to_string(&sample_read_multiple_resp("j", b"fallback")).expect("json should encode");
+
+        // When msgpack bins are present, the length is their aggregate size (JSON strings ignored).
+        let with_bin = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![json.clone()],
+            read_multiple_resps_bin: vec![bin_a.clone().into(), bin_b.clone().into()],
+            error: None,
+        };
+        assert_eq!(read_multiple_response_payload_len(&with_bin), bin_a.len() + bin_b.len());
+
+        // With no msgpack bins, the JSON compatibility strings are summed instead.
+        let json_only = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![json.clone()],
+            read_multiple_resps_bin: Vec::new(),
+            error: None,
+        };
+        assert_eq!(read_multiple_response_payload_len(&json_only), json.len());
+
+        // An empty response has zero payload.
+        assert_eq!(read_multiple_response_payload_len(&ReadMultipleResponse::default()), 0);
+    }
+
+    #[test]
+    fn compat_json_dual_writes_by_default() {
+        // msgpack-only defaults off, so compat_json returns the JSON encoding (dual-write). The
+        // empty-string (msgpack-only) path is exercised via the env flag in integration, not here,
+        // to keep this test independent of process-global env state.
+        let resp = sample_read_multiple_resp("file", b"data");
+        let json = compat_json(&resp).expect("compat_json should encode");
+        assert!(!json.is_empty());
+        assert_eq!(json, serde_json::to_string(&resp).expect("json should encode"));
     }
 
     #[test]
