@@ -33,8 +33,10 @@ workspace = true
 [features]
 default = []
 rio-v2 = ["dep:rustfs-rio-v2"]
+hotpath = ["dep:hotpath", "hotpath/hotpath", "rustfs-filemeta/hotpath", "rustfs-rio/hotpath"]
 
 [dependencies]
+hotpath = { workspace = true, optional = true }
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true

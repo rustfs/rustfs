@@ -602,6 +602,7 @@ impl<R> ParallelReader<R>
 where
     R: AsyncRead + Unpin + Send + Sync,
 {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn read(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
         // On the reconstruction-verifying GET path, read every live shard reader
         // in lockstep so all readers advance one block per stripe and stay
@@ -1262,6 +1263,7 @@ where
 }
 
 impl Erasure {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn decode<W, R>(
         &self,
         writer: &mut W,

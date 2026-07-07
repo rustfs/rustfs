@@ -120,6 +120,7 @@ impl SetDisks {
             .await;
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn read_version_optimized(
         &self,
         bucket: &str,
@@ -161,6 +162,7 @@ impl SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn get_object_fileinfo(
         &self,
         bucket: &str,
@@ -319,6 +321,7 @@ impl SetDisks {
         Ok((fi, parts_metadata, op_online_disks))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn get_object_info_and_quorum(
         &self,
         bucket: &str,
@@ -515,6 +518,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn get_object_with_fileinfo<W>(
         // &self,
         bucket: &str,
@@ -1037,6 +1041,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn get_object_decode_reader_with_fileinfo(
         bucket: &str,
         object: &str,
@@ -1188,6 +1193,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn build_codec_streaming_part_reader(
         bucket: &str,
         object: &str,
@@ -1323,6 +1329,7 @@ fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgori
 /// `get_object_with_fileinfo` (backlog#870) so both report the same
 /// stage-duration semantics.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn setup_multipart_part_readers(
     files: &[FileInfo],
     disks: &[Option<DiskStore>],

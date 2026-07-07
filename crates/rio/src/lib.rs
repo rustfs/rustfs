@@ -15,6 +15,26 @@
 // Default encryption block size - aligned with system default read buffer size (1MB)
 pub const DEFAULT_ENCRYPTION_BLOCK_SIZE: usize = 1024 * 1024;
 
+/// Feature-gated wrapper around `hotpath::measure_block!` for expression
+/// positions (e.g. inside `poll_read`) where an attribute cannot be used.
+/// With the `hotpath` feature off it expands to the body unchanged, so the
+/// default build carries zero profiling overhead and no hotpath dependency.
+#[cfg(feature = "hotpath")]
+#[macro_export]
+macro_rules! hp_measure_block {
+    ($label:expr, $body:expr) => {
+        ::hotpath::measure_block!($label, $body)
+    };
+}
+
+#[cfg(not(feature = "hotpath"))]
+#[macro_export]
+macro_rules! hp_measure_block {
+    ($label:expr, $body:expr) => {
+        $body
+    };
+}
+
 macro_rules! delegate_reader_capabilities_generic {
     ($name:ident<$inner_ty:ident>, $inner:ident) => {
         impl<$inner_ty> crate::EtagResolvable for $name<$inner_ty>

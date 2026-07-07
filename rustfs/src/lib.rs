@@ -50,6 +50,25 @@
 //! tests where you start one server in a background task, run all your
 //! tests, and then shut it down.
 
+/// Scope-based hotpath measurement for `#[async_trait]` methods, where
+/// `#[hotpath::measure]` would only time the boxed-future construction.
+/// The guard records wall time from this statement until the enclosing
+/// (desugared) async block completes, including early returns via `?`.
+/// With the `hotpath` feature off it expands to nothing.
+#[cfg(feature = "hotpath")]
+#[macro_export]
+macro_rules! hp_guard {
+    ($label:expr) => {
+        let _hotpath_scope_guard = ::hotpath::functions::build_measurement_guard_sync($label, false);
+    };
+}
+
+#[cfg(not(feature = "hotpath"))]
+#[macro_export]
+macro_rules! hp_guard {
+    ($label:expr) => {};
+}
+
 pub mod admin;
 pub mod allocator_reclaim;
 pub mod app;
