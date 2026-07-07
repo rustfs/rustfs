@@ -518,7 +518,10 @@ impl SetDisks {
     {
         let pipeline_started = Instant::now();
         debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
+        // Owned shuffle (backlog#873): `files` is consumed and its FileInfo
+        // entries move into their shuffled slots, avoiding one deep clone per
+        // disk; the disk handles are Arc clones and stay cheap.
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index_owned(disks.to_vec(), files, &fi);
 
         let total_size = fi.size as usize;
 
@@ -671,19 +674,20 @@ impl SetDisks {
                 checksum_algo,
             };
             let mut setup_result = None;
-            if let Some((prefetched_part, handle)) = prefetched.take() {
-                if prefetched_part == current_part {
-                    setup_result = handle.join().await;
-                    if setup_result.is_none() {
-                        warn!(
-                            bucket,
-                            object,
-                            part_index = current_part,
-                            "Multipart reader-setup prefetch task did not complete; retrying synchronously"
-                        );
-                    }
+            // A stale prefetch (part mismatch) is dropped by the failed let
+            // chain, which aborts its task via the guard.
+            if let Some((prefetched_part, handle)) = prefetched.take()
+                && prefetched_part == current_part
+            {
+                setup_result = handle.join().await;
+                if setup_result.is_none() {
+                    warn!(
+                        bucket,
+                        object,
+                        part_index = current_part,
+                        "Multipart reader-setup prefetch task did not complete; retrying synchronously"
+                    );
                 }
-                // A stale prefetch guard is dropped here, aborting its task.
             }
             let (reader_setup, reader_setup_elapsed) = match setup_result {
                 Some(result) => result,
