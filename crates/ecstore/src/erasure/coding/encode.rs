@@ -709,15 +709,109 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct FailingWriteWriter;
+
+    impl AsyncWrite for FailingWriteWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("injected write failure")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ShortWriteWriter;
+
+    impl AsyncWrite for ShortWriteWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len().saturating_sub(1)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ShutdownFailWriter {
+        buffered: Vec<u8>,
+    }
+
+    impl AsyncWrite for ShutdownFailWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.buffered.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("injected shutdown failure")))
+        }
+    }
+
+    fn bitrot_writer<W>(writer: W, shard_size: usize) -> BitrotWriterWrapper
+    where
+        W: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        BitrotWriterWrapper::new(CustomWriter::new_tokio_writer(writer), shard_size, HashAlgorithm::HighwayHash256S)
+    }
+
+    #[tokio::test]
+    async fn multi_writer_short_write_fails_before_shutdown() {
+        let mut writers = vec![Some(bitrot_writer(ShortWriteWriter, 16))];
+        let err = {
+            let mut writer = MultiWriter::new(&mut writers, 1);
+            writer
+                .write(vec![Bytes::from_static(b"short-write payload")])
+                .await
+                .expect_err("short writes must fail the shard writer")
+        };
+
+        assert!(err.to_string().contains("Failed to write data"));
+        assert!(writers[0].is_none(), "short-write shard must be removed before commit");
+    }
+
+    #[tokio::test]
+    async fn drain_queued_inflight_bytes_consumes_pending_blocks() {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(vec![Bytes::from_static(b"queued")]).await.unwrap();
+        drop(tx);
+
+        drain_queued_inflight_bytes(&mut rx).await;
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_queued_batched_inflight_bytes_consumes_pending_batches() {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(vec![vec![Bytes::from_static(b"queued")]]).await.unwrap();
+        drop(tx);
+
+        drain_queued_batched_inflight_bytes(&mut rx).await;
+
+        assert!(rx.recv().await.is_none());
+    }
+
     #[tokio::test]
     async fn encode_shutdowns_writers_after_small_shards() {
         let committed = Arc::new(Mutex::new(Vec::new()));
         let writer = DeferredCommitWriter::new(committed.clone());
-        let mut writers = vec![Some(BitrotWriterWrapper::new(
-            CustomWriter::new_tokio_writer(writer),
-            16,
-            HashAlgorithm::HighwayHash256S,
-        ))];
+        let mut writers = vec![Some(bitrot_writer(writer, 16))];
 
         let erasure = Arc::new(Erasure::new(1, 0, 16));
         let reader = tokio::io::BufReader::new(Cursor::new(b"small payload".to_vec()));
@@ -725,6 +819,87 @@ mod tests {
 
         assert_eq!(written, b"small payload".len());
         assert!(!committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encode_streaming_write_quorum_failure_aborts_and_reports_error() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let mut writers = vec![
+            Some(bitrot_writer(DeferredCommitWriter::new(committed.clone()), BLOCK_SIZE / DATA_SHARDS)),
+            Some(bitrot_writer(FailingWriteWriter, BLOCK_SIZE / DATA_SHARDS)),
+            None,
+            None,
+        ];
+
+        let payload = vec![3u8; BLOCK_SIZE * 8];
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload));
+        let err = erasure
+            .encode(reader, &mut writers, DATA_SHARDS)
+            .await
+            .expect_err("streaming encode must fail when write quorum is unavailable");
+
+        assert!(err.to_string().contains("Failed to write data"));
+    }
+
+    #[tokio::test]
+    async fn encode_inline_small_write_quorum_failure_does_not_commit_partial_data() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let mut writers = vec![
+            Some(bitrot_writer(DeferredCommitWriter::new(committed.clone()), BLOCK_SIZE / DATA_SHARDS)),
+            Some(bitrot_writer(FailingWriteWriter, BLOCK_SIZE / DATA_SHARDS)),
+            None,
+            None,
+        ];
+
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(b"write quorum failure payload".to_vec()));
+        let err = erasure
+            .encode_inline_small(reader, &mut writers, DATA_SHARDS)
+            .await
+            .expect_err("write quorum failure must fail the inline encode");
+
+        assert!(err.to_string().contains("Failed to write data"));
+        assert!(
+            committed.lock().expect("committed buffer should be lockable").is_empty(),
+            "successful writer must not be committed when write quorum fails before shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn encode_inline_small_shutdown_quorum_failure_is_reported() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let mut writers = vec![
+            Some(bitrot_writer(DeferredCommitWriter::new(committed.clone()), BLOCK_SIZE / DATA_SHARDS)),
+            Some(bitrot_writer(ShutdownFailWriter::default(), BLOCK_SIZE / DATA_SHARDS)),
+            Some(bitrot_writer(ShutdownFailWriter::default(), BLOCK_SIZE / DATA_SHARDS)),
+            Some(bitrot_writer(ShutdownFailWriter::default(), BLOCK_SIZE / DATA_SHARDS)),
+        ];
+
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(b"shutdown quorum failure payload".to_vec()));
+        let err = erasure
+            .encode_inline_small(reader, &mut writers, DATA_SHARDS)
+            .await
+            .expect_err("shutdown quorum failure must fail the inline encode");
+
+        assert!(err.to_string().contains("Failed to shutdown writers"));
+        assert!(
+            !committed.lock().expect("committed buffer should be lockable").is_empty(),
+            "the successful writer should have committed before shutdown quorum failure was reported"
+        );
     }
 
     #[tokio::test]
@@ -773,17 +948,85 @@ mod tests {
     async fn encode_works_on_current_thread_runtime() {
         let committed = Arc::new(Mutex::new(Vec::new()));
         let writer = DeferredCommitWriter::new(committed);
-        let mut writers = vec![Some(BitrotWriterWrapper::new(
-            CustomWriter::new_tokio_writer(writer),
-            16,
-            HashAlgorithm::HighwayHash256S,
-        ))];
+        let mut writers = vec![Some(bitrot_writer(writer, 16))];
 
         let erasure = Arc::new(Erasure::new(1, 0, 16));
         let reader = tokio::io::BufReader::new(Cursor::new(b"current-thread payload".to_vec()));
         let (_reader, written) = erasure.encode(reader, &mut writers, 1).await.unwrap();
 
         assert_eq!(written, b"current-thread payload".len());
+    }
+
+    #[tokio::test]
+    async fn encode_batched_writes_full_and_tail_batches() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 32;
+
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+            .iter()
+            .map(|c| Some(bitrot_writer(DeferredCommitWriter::new(c.clone()), BLOCK_SIZE / DATA_SHARDS)))
+            .collect();
+
+        let payload = vec![7u8; BLOCK_SIZE * 5 + 3];
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
+        let (_reader, total) = erasure
+            .encode_batched(reader, &mut writers, DATA_SHARDS)
+            .await
+            .expect("batched encode should write full and tail batches");
+
+        assert_eq!(total, payload.len());
+        for (index, committed) in committed.iter().enumerate() {
+            assert!(
+                !committed.lock().expect("committed buffer should be lockable").is_empty(),
+                "shard {index} should receive committed batched data"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn encode_batched_write_quorum_failure_aborts_and_reports_error() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 32;
+
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let mut writers = vec![
+            Some(bitrot_writer(DeferredCommitWriter::new(committed.clone()), BLOCK_SIZE / DATA_SHARDS)),
+            Some(bitrot_writer(FailingWriteWriter, BLOCK_SIZE / DATA_SHARDS)),
+            None,
+            None,
+        ];
+
+        let payload = vec![9u8; BLOCK_SIZE * 8];
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload));
+        let err = erasure
+            .encode_batched(reader, &mut writers, DATA_SHARDS)
+            .await
+            .expect_err("batched encode must fail when write quorum is unavailable");
+
+        assert!(err.to_string().contains("Failed to write data"));
+    }
+
+    #[tokio::test]
+    async fn encode_batched_rejects_zero_block_size() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed);
+        let mut writers = vec![Some(bitrot_writer(writer, 16))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 0));
+        let reader = tokio::io::BufReader::new(Cursor::new(b"payload".to_vec()));
+        let err = erasure
+            .encode_batched(reader, &mut writers, 1)
+            .await
+            .expect_err("zero block size must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("block_size"));
     }
 
     /// encode_inline_small: empty reader returns (reader, 0) without writing to any shard.

@@ -117,6 +117,52 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_simd::encode_to_string(Sha256::digest(bytes), hex_simd::AsciiCase::Lower)
 }
 
+async fn load_fixture_reader_input(case_id: &str) -> (ObjectInfo, Vec<u8>, String) {
+    let case_dir = require_fixture_case(case_id);
+    let manifest: ManifestRecord = read_json(&case_dir.join("manifest.json"));
+    let expected_sha256 = read_plaintext_sha256(&case_dir);
+    let file_info = load_file_info(&case_dir, &manifest);
+    let encrypted = encrypted_fixture_bytes(&case_dir, &manifest, &file_info).await;
+    let object_info = load_object_info(&file_info, &manifest);
+
+    (object_info, encrypted, expected_sha256)
+}
+
+async fn read_fixture_plaintext(encrypted: Vec<u8>, object_info: ObjectInfo, kms_key_b64: String) -> Result<Vec<u8>, String> {
+    let object_size = object_info.size;
+
+    async_with_vars(
+        [
+            ("__RUSTFS_SSE_SIMPLE_CMK", Some(kms_key_b64)),
+            ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
+        ],
+        async move {
+            let (mut reader, offset, length) = GetObjectReader::new(
+                Box::new(Cursor::new(encrypted)),
+                None,
+                &object_info,
+                &ObjectOptions::default(),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .map_err(|err| format!("construct GetObjectReader from MinIO raw fixture: {err:?}"))?;
+
+            if offset != 0 || length != object_size {
+                return Err(format!("unexpected fixture range offset={offset} length={length} size={object_size}"));
+            }
+
+            let mut plaintext = Vec::new();
+            reader
+                .read_to_end(&mut plaintext)
+                .await
+                .map_err(|err| format!("read plaintext from MinIO raw fixture: {err}"))?;
+
+            Ok(plaintext)
+        },
+    )
+    .await
+}
+
 async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, file_info: &FileInfo) -> Vec<u8> {
     let mut disks = Vec::with_capacity(file_info.erasure.distribution.len());
     for disk_number in 1..=file_info.erasure.distribution.len() {
@@ -204,43 +250,44 @@ async fn reads_minio_generated_sse_kms_multipart_fixture() {
     assert_fixture_round_trip("sse-kms-multipart-8m", 8 * 1024 * 1024).await;
 }
 
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data and a local static KMS key"]
+async fn rejects_minio_generated_sse_s3_fixture_with_wrong_kms_key() {
+    let (object_info, encrypted, _) = load_fixture_reader_input("sse-s3-multipart-8m").await;
+    let wrong_key_b64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_string();
+
+    let result = read_fixture_plaintext(encrypted, object_info, wrong_key_b64).await;
+
+    assert!(result.is_err(), "wrong KMS key must fail closed");
+}
+
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data and a local static KMS key"]
+async fn rejects_minio_generated_sse_s3_fixture_with_truncated_ciphertext() {
+    let (object_info, mut encrypted, expected_sha256) = load_fixture_reader_input("sse-s3-multipart-8m").await;
+    encrypted.truncate(encrypted.len() / 2);
+
+    let result = read_fixture_plaintext(encrypted, object_info, minio_static_kms_key_b64()).await;
+
+    if let Ok(plaintext) = result {
+        assert_ne!(
+            sha256_hex(&plaintext),
+            expected_sha256,
+            "truncated ciphertext must not restore the original plaintext"
+        );
+    }
+}
+
 async fn assert_fixture_round_trip(case_id: &str, expected_size: i64) {
-    let case_dir = require_fixture_case(case_id);
-    let manifest: ManifestRecord = read_json(&case_dir.join("manifest.json"));
-    let expected_sha256 = read_plaintext_sha256(&case_dir);
-    let file_info = load_file_info(&case_dir, &manifest);
-    let encrypted = encrypted_fixture_bytes(&case_dir, &manifest, &file_info).await;
-    let object_info = load_object_info(&file_info, &manifest);
+    let (object_info, encrypted, expected_sha256) = load_fixture_reader_input(case_id).await;
+    let object_size = object_info.size;
     let kms_key_b64 = minio_static_kms_key_b64();
 
-    async_with_vars(
-        [
-            ("__RUSTFS_SSE_SIMPLE_CMK", Some(kms_key_b64)),
-            ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
-        ],
-        async {
-            let (mut reader, offset, length) = GetObjectReader::new(
-                Box::new(Cursor::new(encrypted)),
-                None,
-                &object_info,
-                &ObjectOptions::default(),
-                &http::HeaderMap::new(),
-            )
-            .await
-            .expect("construct GetObjectReader from MinIO raw fixture");
+    let plaintext = read_fixture_plaintext(encrypted, object_info, kms_key_b64)
+        .await
+        .expect("fixture must restore with the configured KMS key");
 
-            let mut plaintext = Vec::new();
-            reader
-                .read_to_end(&mut plaintext)
-                .await
-                .expect("read plaintext from MinIO raw fixture");
-
-            assert_eq!(offset, 0);
-            assert_eq!(length, object_info.size);
-            assert_eq!(reader.object_info.size, expected_size);
-            assert_eq!(plaintext.len(), expected_size as usize);
-            assert_eq!(sha256_hex(&plaintext), expected_sha256);
-        },
-    )
-    .await;
+    assert_eq!(object_size, expected_size);
+    assert_eq!(plaintext.len(), expected_size as usize);
+    assert_eq!(sha256_hex(&plaintext), expected_sha256);
 }

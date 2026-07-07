@@ -1057,6 +1057,80 @@ mod tests {
     }
 
     #[test]
+    fn decode_data_rejects_missing_data_above_parity_budget() {
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(3, 2, 64, uses_legacy);
+            let data = b"read restore must fail when too many data shards are gone";
+            let encoded = erasure.encode_data(data).expect("encode should succeed");
+            let mut shards = optional_shards(&encoded);
+            shards[0] = None;
+            shards[1] = None;
+            shards[2] = None;
+
+            let err = erasure
+                .decode_data(&mut shards)
+                .expect_err("decode_data must fail when missing data shards exceed parity");
+
+            assert!(!err.to_string().is_empty());
+            assert!(shards.iter().take(erasure.data_shards).any(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn decode_data_and_parity_rejects_wrong_shard_count() {
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(4, 2, 128, uses_legacy);
+            let data = b"wrong shard count should not be accepted as a restored object";
+            let encoded = erasure.encode_data(data).expect("encode should succeed");
+            let mut shards = optional_shards(&encoded);
+            let _ = shards.pop();
+
+            let err = erasure
+                .decode_data_and_parity(&mut shards)
+                .expect_err("decode_data_and_parity must reject wrong shard count");
+
+            assert!(!err.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn decode_data_with_verification_rejects_corrupt_surplus_parity() {
+        let erasure = Erasure::new(3, 2, 128);
+        let data = b"verified reads must fail closed on stale surplus parity";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let mut shards = optional_shards(&encoded);
+        shards[1] = None;
+        shards[erasure.data_shards].as_mut().expect("parity shard should be present")[0] ^= 0x7d;
+
+        let err = erasure
+            .decode_data_with_reconstruction_verification(&mut shards)
+            .expect_err("verified decode must reject inconsistent parity");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn verify_data_and_parity_rejects_missing_and_mismatched_shards() {
+        let erasure = Erasure::new(4, 2, 128);
+        let data = b"verification must reject incomplete or malformed shard sets";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+        let mut shards = optional_shards(&encoded);
+
+        shards[0] = None;
+        let missing = erasure
+            .verify_data_and_parity(&shards)
+            .expect_err("verification must reject missing shards");
+        assert!(missing.to_string().contains("missing shard"));
+
+        let mut mismatched = optional_shards(&encoded);
+        let _ = mismatched[0].as_mut().expect("data shard should be present").pop();
+        let mismatch = erasure
+            .verify_data_and_parity(&mismatched)
+            .expect_err("verification must reject mismatched shard lengths");
+        assert!(mismatch.to_string().contains("inconsistent shard length"));
+    }
+
+    #[test]
     fn decode_data_and_parity_leaves_complete_shards_unchanged() {
         let erasure = Erasure::new(4, 2, 128);
         let data = b"complete shards should not be changed";
