@@ -1339,7 +1339,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         debug!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
@@ -1360,6 +1360,7 @@ impl DiskAPI for RemoteDisk {
                 let request = Request::new(DeleteVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
+                    force: force_delete,
                 });
 
                 let response = client.delete_volume(request).await?.into_inner();

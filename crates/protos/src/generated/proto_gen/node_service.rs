@@ -650,6 +650,8 @@ pub struct DeleteVolumeRequest {
     pub disk: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub volume: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub force: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteVolumeResponse {

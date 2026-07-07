@@ -1212,8 +1212,8 @@ impl DiskAPI for LocalDiskWrapper {
             .await
     }
 
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.delete_volume(volume).await }, Duration::ZERO)
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
+        self.track_disk_health(|| async { self.disk.delete_volume(volume, force_delete).await }, Duration::ZERO)
             .await
     }
 
