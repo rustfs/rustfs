@@ -40,6 +40,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        crate::hp_guard!("SetDisks::get_object_reader");
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         // Check if lock optimization is enabled for reads that are fully materialized in memory.
         let lock_optimization_enabled = is_lock_optimization_enabled();
@@ -550,6 +551,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
     #[tracing::instrument(skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        crate::hp_guard!("SetDisks::put_object");
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let disks = self.get_disks_internal().await;
@@ -1705,6 +1707,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        crate::hp_guard!("SetDisks::get_object_info");
         // Acquire a shared read-lock to protect consistency during info fetch
         let _read_lock_guard = if !opts.no_lock {
             Some(self.acquire_read_lock_diag("get_object_info", bucket, object).await?)

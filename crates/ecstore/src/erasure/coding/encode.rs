@@ -368,6 +368,7 @@ impl Erasure {
         Ok((reader, total))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn encode<R>(
         self: Arc<Self>,
         mut reader: R,
@@ -510,6 +511,7 @@ impl Erasure {
         Ok((reader, total))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn encode_batched<R>(
         self: Arc<Self>,
         mut reader: R,
@@ -637,6 +639,7 @@ impl Erasure {
 
     /// Fast path for small inline objects: skip tokio::spawn + mpsc channel.
     /// Reads all data, encodes directly, writes shards sequentially.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn encode_inline_small<R>(
         self: Arc<Self>,
         reader: R,
@@ -651,6 +654,7 @@ impl Erasure {
 
     /// Fast path for single-block non-inline objects: avoids the producer/consumer
     /// pipeline in `encode()` while keeping the same writer/quorum/shutdown semantics.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn encode_single_block_non_inline<R>(
         self: Arc<Self>,
         reader: R,
