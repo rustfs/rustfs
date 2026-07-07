@@ -41,6 +41,7 @@ const MSGPACK_FIXEXT4: u8 = 0xd6;
 const MSGPACK_FIXEXT8: u8 = 0xd7;
 const MSGPACK_TIME_EXT_LEGACY: i8 = 5;
 const MSGPACK_TIME_EXT_OFFICIAL: i8 = -1;
+const MSGPACK_TIME_LEN: u8 = 12;
 
 fn read_msgp_string<R: std::io::Read>(rd: &mut R) -> Result<String> {
     let len = rmp::decode::read_str_len(rd)? as usize;
@@ -51,6 +52,18 @@ fn read_msgp_string<R: std::io::Read>(rd: &mut R) -> Result<String> {
 fn read_msgp_bin<R: std::io::Read>(rd: &mut R) -> Result<Vec<u8>> {
     let len = rmp::decode::read_bin_len(rd)? as usize;
     read_exact_vec(rd, len)
+}
+
+/// Writes an `OffsetDateTime` as the ext8 / legacy (type 5, 12-byte
+/// seconds+nanos) msgpack time encoding used by the V1 (Legacy) object body.
+/// `read_msgp_time` decodes exactly this shape via `MSGPACK_TIME_EXT_LEGACY`.
+fn write_msgp_time<W: std::io::Write>(wr: &mut W, t: OffsetDateTime) -> Result<()> {
+    wr.write_all(&[MSGPACK_EXT8, MSGPACK_TIME_LEN, MSGPACK_TIME_EXT_LEGACY as u8])?;
+    let mut buf = [0u8; MSGPACK_TIME_LEN as usize];
+    buf[0..8].copy_from_slice(&t.unix_timestamp().to_be_bytes());
+    buf[8..12].copy_from_slice(&t.nanosecond().to_be_bytes());
+    wr.write_all(&buf)?;
+    Ok(())
 }
 
 fn deserialize_legacy_uuid_bytes<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
@@ -560,8 +573,11 @@ impl FileMetaVersion {
     }
 
     pub fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
-        // Variable map size: omit V2Obj/DelObj when None
+        // Variable map size: omit V1Obj/V2Obj/DelObj when None
         let mut map_len: u32 = 2; // "Type" + "v"
+        if self.legacy_object.is_some() {
+            map_len += 1;
+        }
         if self.object.is_some() {
             map_len += 1;
         }
@@ -574,6 +590,13 @@ impl FileMetaVersion {
         // Type
         rmp::encode::write_str(wr, "Type")?;
         rmp::encode::write_uint(wr, self.version_type.to_u8() as u64)?;
+
+        // V1Obj — legacy body must round-trip; dropping it silently corrupted
+        // Legacy versions on re-encode (backlog#799 B18).
+        if let Some(ref legacy) = self.legacy_object {
+            rmp::encode::write_str(wr, "V1Obj")?;
+            legacy.encode_to(wr)?;
+        }
 
         // V2Obj
         if let Some(ref obj) = self.object {
@@ -1318,6 +1341,46 @@ impl MetaObjectV1 {
         Ok(())
     }
 
+    /// Symmetric encoder for the V1 (Legacy) object body. Kept field-for-field
+    /// consistent with `decode_from` so a Legacy version round-trips through
+    /// `FileMetaVersion::encode_to` without losing its body (backlog#799 B18).
+    fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        rmp::encode::write_map_len(wr, 8)?;
+
+        rmp::encode::write_str(wr, "Version")?;
+        rmp::encode::write_str(wr, &self.version)?;
+
+        rmp::encode::write_str(wr, "Format")?;
+        rmp::encode::write_str(wr, &self.format)?;
+
+        rmp::encode::write_str(wr, "Stat")?;
+        self.stat.encode_to(wr)?;
+
+        rmp::encode::write_str(wr, "Erasure")?;
+        self.erasure.encode_to(wr)?;
+
+        rmp::encode::write_str(wr, "Meta")?;
+        rmp::encode::write_map_len(wr, self.meta.len() as u32)?;
+        for (k, v) in &self.meta {
+            rmp::encode::write_str(wr, k)?;
+            rmp::encode::write_str(wr, v)?;
+        }
+
+        rmp::encode::write_str(wr, "Parts")?;
+        rmp::encode::write_array_len(wr, self.parts.len() as u32)?;
+        for part in &self.parts {
+            part.encode_to(wr)?;
+        }
+
+        rmp::encode::write_str(wr, "VersionID")?;
+        rmp::encode::write_str(wr, &self.version_id)?;
+
+        rmp::encode::write_str(wr, "DataDir")?;
+        rmp::encode::write_str(wr, &self.data_dir)?;
+
+        Ok(())
+    }
+
     fn get_signature(&self) -> [u8; 4] {
         let mut hasher = xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED);
         hasher.update(self.version.as_bytes());
@@ -1400,6 +1463,35 @@ impl MetaObjectV1Stat {
 
         Ok(())
     }
+
+    fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        // `ModTime` is only written when present, mirroring `decode_from` (which
+        // sets it only when the field exists) so a `None` mod_time stays absent
+        // rather than round-tripping to `Some(UNIX_EPOCH)`.
+        let map_len: u32 = if self.mod_time.is_some() { 5 } else { 4 };
+        rmp::encode::write_map_len(wr, map_len)?;
+
+        rmp::encode::write_str(wr, "Size")?;
+        rmp::encode::write_sint(wr, self.size)?;
+
+        if let Some(mod_time) = self.mod_time {
+            rmp::encode::write_str(wr, "ModTime")?;
+            write_msgp_time(wr, mod_time)?;
+        }
+
+        rmp::encode::write_str(wr, "Name")?;
+        rmp::encode::write_str(wr, &self.name)?;
+
+        rmp::encode::write_str(wr, "Dir")?;
+        rmp::encode::write_bool(wr, self.dir)?;
+
+        rmp::encode::write_str(wr, "Mode")?;
+        // `Mode` decodes with the strict `read_u32`, which only accepts the U32
+        // marker — a narrower `write_uint` marker would fail to round-trip.
+        rmp::encode::write_u32(wr, self.mode)?;
+
+        Ok(())
+    }
 }
 
 impl MetaObjectV1Erasure {
@@ -1440,6 +1532,39 @@ impl MetaObjectV1Erasure {
 
         Ok(())
     }
+
+    fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        rmp::encode::write_map_len(wr, 7)?;
+
+        rmp::encode::write_str(wr, "Algorithm")?;
+        rmp::encode::write_str(wr, &self.algorithm)?;
+
+        rmp::encode::write_str(wr, "DataBlocks")?;
+        rmp::encode::write_sint(wr, self.data_blocks as i64)?;
+
+        rmp::encode::write_str(wr, "ParityBlocks")?;
+        rmp::encode::write_sint(wr, self.parity_blocks as i64)?;
+
+        rmp::encode::write_str(wr, "BlockSize")?;
+        rmp::encode::write_sint(wr, self.block_size as i64)?;
+
+        rmp::encode::write_str(wr, "Index")?;
+        rmp::encode::write_sint(wr, self.index as i64)?;
+
+        rmp::encode::write_str(wr, "Distribution")?;
+        rmp::encode::write_array_len(wr, self.distribution.len() as u32)?;
+        for v in &self.distribution {
+            rmp::encode::write_sint(wr, *v as i64)?;
+        }
+
+        rmp::encode::write_str(wr, "Checksums")?;
+        rmp::encode::write_array_len(wr, self.checksums.len() as u32)?;
+        for checksum in &self.checksums {
+            checksum.encode_to(wr)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl MetaObjectV1ChecksumInfo {
@@ -1457,6 +1582,21 @@ impl MetaObjectV1ChecksumInfo {
                 _ => skip_msgp_value(rd)?,
             }
         }
+
+        Ok(())
+    }
+
+    fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        rmp::encode::write_map_len(wr, 3)?;
+
+        rmp::encode::write_str(wr, "PartNumber")?;
+        rmp::encode::write_sint(wr, self.part_number as i64)?;
+
+        rmp::encode::write_str(wr, "Algorithm")?;
+        rmp::encode::write_str(wr, &self.algorithm)?;
+
+        rmp::encode::write_str(wr, "Hash")?;
+        rmp::encode::write_bin(wr, &self.hash)?;
 
         Ok(())
     }
@@ -1488,6 +1628,63 @@ impl MetaObjectV1Part {
                 "err" => self.error = Some(read_msgp_string(rd)?),
                 _ => skip_msgp_value(rd)?,
             }
+        }
+
+        Ok(())
+    }
+
+    fn encode_to<W: std::io::Write>(&self, wr: &mut W) -> Result<()> {
+        // Non-optional scalars are always written; optional fields only when
+        // present, so a decoded part round-trips (absent stays absent).
+        let mut map_len: u32 = 4; // e, n, s, as
+        if self.mod_time.is_some() {
+            map_len += 1;
+        }
+        if self.index.is_some() {
+            map_len += 1;
+        }
+        if self.checksums.is_some() {
+            map_len += 1;
+        }
+        if self.error.is_some() {
+            map_len += 1;
+        }
+        rmp::encode::write_map_len(wr, map_len)?;
+
+        rmp::encode::write_str(wr, "e")?;
+        rmp::encode::write_str(wr, &self.etag)?;
+
+        rmp::encode::write_str(wr, "n")?;
+        rmp::encode::write_sint(wr, self.number as i64)?;
+
+        rmp::encode::write_str(wr, "s")?;
+        rmp::encode::write_sint(wr, self.size as i64)?;
+
+        rmp::encode::write_str(wr, "as")?;
+        rmp::encode::write_sint(wr, self.actual_size)?;
+
+        if let Some(mt) = self.mod_time {
+            rmp::encode::write_str(wr, "mt")?;
+            write_msgp_time(wr, mt)?;
+        }
+
+        if let Some(ref index) = self.index {
+            rmp::encode::write_str(wr, "i")?;
+            rmp::encode::write_bin(wr, index)?;
+        }
+
+        if let Some(ref checksums) = self.checksums {
+            rmp::encode::write_str(wr, "crc")?;
+            rmp::encode::write_map_len(wr, checksums.len() as u32)?;
+            for (k, v) in checksums {
+                rmp::encode::write_str(wr, k)?;
+                rmp::encode::write_str(wr, v)?;
+            }
+        }
+
+        if let Some(ref err) = self.error {
+            rmp::encode::write_str(wr, "err")?;
+            rmp::encode::write_str(wr, err)?;
         }
 
         Ok(())
@@ -3676,5 +3873,98 @@ mod tests {
             ts,
             "lookup must find the round-tripped reset status"
         );
+    }
+
+    /// Regression for backlog#799 B18: a Legacy (V1Obj) version must survive an
+    /// encode/decode round trip. `encode_to` used to omit the `V1Obj` field
+    /// entirely, silently dropping the whole legacy body on re-marshal.
+    #[test]
+    fn legacy_version_body_round_trips_through_encode() {
+        let mut meta = HashMap::new();
+        meta.insert("content-type".to_string(), "application/octet-stream".to_string());
+
+        let mut crc = HashMap::new();
+        crc.insert("crc32c".to_string(), "deadbeef".to_string());
+
+        let legacy = MetaObjectV1 {
+            version: "1.0.1".to_string(),
+            format: "xl".to_string(),
+            stat: MetaObjectV1Stat {
+                size: 4096,
+                mod_time: Some(
+                    OffsetDateTime::from_unix_timestamp(1_700_000_123)
+                        .unwrap()
+                        .replace_nanosecond(456)
+                        .unwrap(),
+                ),
+                name: "obj".to_string(),
+                dir: false,
+                mode: 0o644,
+            },
+            erasure: MetaObjectV1Erasure {
+                algorithm: "klauspost/reedsolomon/vandermonde".to_string(),
+                data_blocks: 4,
+                parity_blocks: 2,
+                block_size: 10 << 20,
+                index: 1,
+                distribution: vec![1, 2, 3, 4, 5, 6],
+                checksums: vec![MetaObjectV1ChecksumInfo {
+                    part_number: 1,
+                    algorithm: "highwayhash256S".to_string(),
+                    hash: vec![0xaa, 0xbb, 0xcc, 0xdd],
+                }],
+            },
+            meta,
+            parts: vec![MetaObjectV1Part {
+                etag: "etag-1".to_string(),
+                number: 1,
+                size: 4096,
+                actual_size: 4096,
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap()),
+                index: Some(Bytes::from_static(&[1, 2, 3])),
+                checksums: Some(crc),
+                error: None,
+            }],
+            version_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            data_dir: "11111111-1111-1111-1111-111111111111".to_string(),
+        };
+
+        let version = FileMetaVersion {
+            version_type: VersionType::Legacy,
+            legacy_object: Some(legacy.clone()),
+            ..Default::default()
+        };
+
+        let buf = version.marshal_msg().expect("marshal must succeed");
+        let mut decoded = FileMetaVersion::default();
+        decoded.unmarshal_msg(&buf).expect("unmarshal must succeed");
+
+        assert_eq!(decoded.version_type, VersionType::Legacy);
+        let decoded_legacy = decoded.legacy_object.expect("legacy body must survive round trip");
+        assert_eq!(decoded_legacy, legacy, "legacy body must be byte-for-byte preserved");
+    }
+
+    /// A `None` `Stat.ModTime` must stay `None` across encode/decode — the
+    /// encoder writes the field only when present, mirroring the decoder, so it
+    /// never silently becomes `Some(UNIX_EPOCH)` (backlog#799 B18 hardening).
+    #[test]
+    fn legacy_stat_none_mod_time_round_trips_as_none() {
+        let stat = MetaObjectV1Stat {
+            size: 10,
+            mod_time: None,
+            name: "n".to_string(),
+            dir: true,
+            mode: 0o755,
+        };
+
+        let mut buf = Vec::new();
+        stat.encode_to(&mut buf).expect("encode must succeed");
+        let mut decoded = MetaObjectV1Stat::default();
+        decoded
+            .decode_from(&mut std::io::Cursor::new(&buf))
+            .expect("decode must succeed");
+
+        assert_eq!(decoded, stat);
+        assert!(decoded.mod_time.is_none(), "absent mod_time must not become Some(UNIX_EPOCH)");
     }
 }
