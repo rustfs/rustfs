@@ -3103,6 +3103,18 @@ fn local_disk_scan_lock_key(bucket: &str, base_dir: &str, filter_prefix: Option<
     (bucket.to_owned(), prefix)
 }
 
+fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
+    if meta.versions.len() > 10 {
+        return None;
+    }
+
+    let mut signature = Vec::with_capacity(meta.versions.len() * 16);
+    for version in meta.versions.iter() {
+        signature.extend_from_slice(version.header.version_id.unwrap_or_default().as_bytes());
+    }
+    Some(signature)
+}
+
 fn is_root_path(path: impl AsRef<Path>) -> bool {
     path.as_ref().components().count() == 1 && path.as_ref().has_root()
 }
@@ -4121,6 +4133,7 @@ impl DiskAPI for LocalDisk {
                 let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
             }
             xlmeta.add_version(fi)?;
+            let version_signature = rename_data_versions_signature(&xlmeta);
             let new_dst_buf = xlmeta.marshal_msg()?;
 
             let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
@@ -4249,7 +4262,7 @@ impl DiskAPI for LocalDisk {
 
             Ok(RenameDataResp {
                 old_data_dir: has_old_data_dir,
-                sign: None,
+                sign: version_signature,
             })
         } else {
             // Inline: merge read + parse + write + rename into single spawn_blocking
@@ -4261,7 +4274,7 @@ impl DiskAPI for LocalDisk {
                 None
             };
 
-            let (old_data_dir, _dst_buf) = tokio::task::spawn_blocking(move || {
+            let (old_data_dir, version_signature) = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -4283,6 +4296,7 @@ impl DiskAPI for LocalDisk {
                     let _ = xlmeta.data.remove_two(version_id, *d);
                 }
                 xlmeta.add_version(fi)?;
+                let version_signature = rename_data_versions_signature(&xlmeta);
                 let new_buf = xlmeta.marshal_msg()?;
 
                 // Write new xl.meta + rename
@@ -4347,7 +4361,7 @@ impl DiskAPI for LocalDisk {
                     os::fsync_dir_std(dst_parent)?;
                 }
 
-                Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
+                Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>), std::io::Error>((old_data_dir, version_signature))
             })
             .await
             .map_err(DiskError::from)??;
@@ -4361,7 +4375,7 @@ impl DiskAPI for LocalDisk {
 
             Ok(RenameDataResp {
                 old_data_dir,
-                sign: None,
+                sign: version_signature,
             })
         }
     }
@@ -5079,6 +5093,7 @@ mod test {
             .expect("rename_data should commit");
 
         assert_eq!(resp.old_data_dir, Some(old_data_dir));
+        assert_eq!(resp.sign, Some(version_id.as_bytes().to_vec()));
         assert!(
             dst_object_dir
                 .join(old_data_dir.to_string())
@@ -5286,6 +5301,7 @@ mod test {
             .expect("inline rename_data should commit");
 
         assert_eq!(resp.old_data_dir, Some(old_data_dir));
+        assert_eq!(resp.sign, Some(version_id.as_bytes().to_vec()));
         let backup_path = dst_object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
         assert!(backup_path.exists());
         // The rollback backup must contain the previous metadata bytes verbatim so
