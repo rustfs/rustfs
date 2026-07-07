@@ -2396,6 +2396,13 @@ enum OrphanDirScan {
     Missing,
 }
 
+fn rename_data_versions_key(versions: &[u8]) -> Option<[u8; 8]> {
+    let prefix = versions.get(..8)?;
+    let mut key = [0; 8];
+    key.copy_from_slice(prefix);
+    Some(key)
+}
+
 impl SetDisks {
     pub(in crate::set_disk) fn default_read_quorum(&self) -> usize {
         self.set_drive_count - self.default_parity_count
@@ -2567,10 +2574,8 @@ impl SetDisks {
             return Err(ret_err);
         }
 
-        let versions = None;
-        // TODO: reduceCommonVersions
-
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
+        let versions = Self::select_rename_data_versions(&disk_versions, &errs, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
@@ -2590,6 +2595,63 @@ impl SetDisks {
         };
 
         Ok((online_disks, versions, data_dir, cleanup_disks))
+    }
+
+    pub(in crate::set_disk) fn reduce_common_versions(disk_versions: &[Option<Vec<u8>>], write_quorum: usize) -> Option<Vec<u8>> {
+        let mut versions_count = HashMap::new();
+
+        for versions in disk_versions.iter().flatten() {
+            if let Some(key) = rename_data_versions_key(versions) {
+                *versions_count.entry(key).or_insert(0usize) += 1;
+            }
+        }
+
+        let (common_versions, max_count) = versions_count
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .unwrap_or(([0; 8], 0));
+
+        if max_count < write_quorum {
+            return None;
+        }
+
+        disk_versions
+            .iter()
+            .flatten()
+            .find(|versions| rename_data_versions_key(versions).is_some_and(|key| key == common_versions))
+            .cloned()
+    }
+
+    pub(in crate::set_disk) fn select_rename_data_versions(
+        disk_versions: &[Option<Vec<u8>>],
+        errs: &[Option<DiskError>],
+        write_quorum: usize,
+    ) -> Option<Vec<u8>> {
+        let mut versions = Self::reduce_common_versions(disk_versions, write_quorum);
+        for (dversions, err) in disk_versions.iter().zip(errs.iter()) {
+            if err.is_some() {
+                continue;
+            }
+            let Some(dversions) = dversions.as_ref().filter(|versions| !versions.is_empty()) else {
+                continue;
+            };
+
+            match versions.as_ref() {
+                Some(current_versions) if dversions != current_versions => {
+                    if dversions.len() > current_versions.len() {
+                        versions = Some(dversions.clone());
+                    }
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    versions = Some(dversions.clone());
+                    break;
+                }
+            }
+        }
+
+        versions
     }
 
     #[allow(dead_code)]
