@@ -8,7 +8,9 @@ pub(crate) mod admin {
 }
 
 pub(crate) mod bucket {
-    pub(crate) use rustfs_storage_api::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+    pub(crate) use rustfs_storage_api::{
+        BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
+    };
 }
 
 pub(crate) mod error {

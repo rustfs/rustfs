@@ -58,6 +58,38 @@ pub enum StorageError {
     CorruptedBackend,
     #[error("Too many open files")]
     TooManyOpenFiles,
+    #[error("maximum versions exceeded, please delete few versions to proceed")]
+    MaxVersionsExceeded,
+    #[error("inconsistent drive found")]
+    InconsistentDisk,
+    #[error("drive does not support O_DIRECT")]
+    UnsupportedDisk,
+    #[error("disk not a dir")]
+    DiskNotDir,
+    #[error("drive still did not complete the request")]
+    DiskOngoingReq,
+    #[error("path not found")]
+    PathNotFound,
+    #[error("bit-rot hash algorithm is invalid")]
+    BitrotHashAlgoInvalid,
+    #[error("Rename across devices not allowed, please fix your backend configuration")]
+    CrossDeviceLink,
+    #[error("less data available than what was requested")]
+    LessData,
+    #[error("more data was sent than what was advertised")]
+    MoreData,
+    #[error("outdated XL meta")]
+    OutdatedXLMeta,
+    #[error("part missing or corrupt")]
+    PartMissingOrCorrupt,
+    #[error("short write")]
+    ShortWrite,
+    #[error("source stalled")]
+    SourceStalled,
+    #[error("timeout")]
+    Timeout,
+    #[error("invalid path")]
+    InvalidPath,
 
     #[error("Volume not found")]
     VolumeNotFound,
@@ -233,17 +265,17 @@ impl From<DiskError> for StorageError {
     fn from(e: DiskError) -> Self {
         match e {
             DiskError::Io(io_error) => StorageError::Io(io_error),
-            // DiskError::MaxVersionsExceeded => todo!(),
+            DiskError::MaxVersionsExceeded => StorageError::MaxVersionsExceeded,
             DiskError::Unexpected => StorageError::Unexpected,
             DiskError::CorruptedFormat => StorageError::CorruptedFormat,
             DiskError::CorruptedBackend => StorageError::CorruptedBackend,
             DiskError::UnformattedDisk => StorageError::UnformattedDisk,
-            // DiskError::InconsistentDisk => StorageError::InconsistentDisk,
-            // DiskError::UnsupportedDisk => StorageError::UnsupportedDisk,
+            DiskError::InconsistentDisk => StorageError::InconsistentDisk,
+            DiskError::UnsupportedDisk => StorageError::UnsupportedDisk,
             DiskError::DiskFull => StorageError::DiskFull,
-            // DiskError::DiskNotDir => StorageError::DiskNotDir,
+            DiskError::DiskNotDir => StorageError::DiskNotDir,
             DiskError::DiskNotFound => StorageError::DiskNotFound,
-            // DiskError::DiskOngoingReq => StorageError::DiskOngoingReq,
+            DiskError::DiskOngoingReq => StorageError::DiskOngoingReq,
             DiskError::DriveIsRoot => StorageError::DriveIsRoot,
             DiskError::FaultyRemoteDisk => StorageError::FaultyRemoteDisk,
             DiskError::FaultyDisk => StorageError::FaultyDisk,
@@ -254,23 +286,26 @@ impl From<DiskError> for StorageError {
             DiskError::FileNameTooLong => StorageError::FileNameTooLong,
             DiskError::VolumeExists => StorageError::VolumeExists,
             DiskError::IsNotRegular => StorageError::IsNotRegular,
-            // DiskError::PathNotFound => StorageError::PathNotFound,
+            DiskError::PathNotFound => StorageError::PathNotFound,
             DiskError::VolumeNotFound => StorageError::VolumeNotFound,
             DiskError::VolumeNotEmpty => StorageError::VolumeNotEmpty,
             DiskError::VolumeAccessDenied => StorageError::VolumeAccessDenied,
             DiskError::FileAccessDenied => StorageError::FileAccessDenied,
             DiskError::FileCorrupt => StorageError::FileCorrupt,
-            // DiskError::BitrotHashAlgoInvalid => StorageError::BitrotHashAlgoInvalid,
-            // DiskError::CrossDeviceLink => StorageError::CrossDeviceLink,
-            // DiskError::LessData => StorageError::LessData,
-            // DiskError::MoreData => StorageError::MoreData,
-            // DiskError::OutdatedXLMeta => StorageError::OutdatedXLMeta,
-            // DiskError::PartMissingOrCorrupt => StorageError::PartMissingOrCorrupt,
+            DiskError::BitrotHashAlgoInvalid => StorageError::BitrotHashAlgoInvalid,
+            DiskError::CrossDeviceLink => StorageError::CrossDeviceLink,
+            DiskError::LessData => StorageError::LessData,
+            DiskError::MoreData => StorageError::MoreData,
+            DiskError::OutdatedXLMeta => StorageError::OutdatedXLMeta,
+            DiskError::PartMissingOrCorrupt => StorageError::PartMissingOrCorrupt,
             DiskError::NoHealRequired => StorageError::NoHealRequired,
             DiskError::MethodNotAllowed => StorageError::MethodNotAllowed,
             DiskError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
             DiskError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
-            _ => StorageError::Io(std::io::Error::other(e)),
+            DiskError::ShortWrite => StorageError::ShortWrite,
+            DiskError::SourceStalled => StorageError::SourceStalled,
+            DiskError::Timeout => StorageError::Timeout,
+            DiskError::InvalidPath => StorageError::InvalidPath,
         }
     }
 }
@@ -286,6 +321,22 @@ impl From<StorageError> for DiskError {
             StorageError::MethodNotAllowed => DiskError::MethodNotAllowed,
             StorageError::StorageFull => DiskError::DiskFull,
             StorageError::SlowDown => DiskError::TooManyOpenFiles,
+            StorageError::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
+            StorageError::InconsistentDisk => DiskError::InconsistentDisk,
+            StorageError::UnsupportedDisk => DiskError::UnsupportedDisk,
+            StorageError::DiskNotDir => DiskError::DiskNotDir,
+            StorageError::DiskOngoingReq => DiskError::DiskOngoingReq,
+            StorageError::PathNotFound => DiskError::PathNotFound,
+            StorageError::BitrotHashAlgoInvalid => DiskError::BitrotHashAlgoInvalid,
+            StorageError::CrossDeviceLink => DiskError::CrossDeviceLink,
+            StorageError::LessData => DiskError::LessData,
+            StorageError::MoreData => DiskError::MoreData,
+            StorageError::OutdatedXLMeta => DiskError::OutdatedXLMeta,
+            StorageError::PartMissingOrCorrupt => DiskError::PartMissingOrCorrupt,
+            StorageError::ShortWrite => DiskError::ShortWrite,
+            StorageError::SourceStalled => DiskError::SourceStalled,
+            StorageError::Timeout => DiskError::Timeout,
+            StorageError::InvalidPath => DiskError::InvalidPath,
             StorageError::ErasureReadQuorum => DiskError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => DiskError::ErasureWriteQuorum,
             StorageError::TooManyOpenFiles => DiskError::TooManyOpenFiles,
@@ -402,6 +453,22 @@ impl Clone for StorageError {
             StorageError::CorruptedBackend => StorageError::CorruptedBackend,
             StorageError::UnformattedDisk => StorageError::UnformattedDisk,
             StorageError::DiskNotFound => StorageError::DiskNotFound,
+            StorageError::MaxVersionsExceeded => StorageError::MaxVersionsExceeded,
+            StorageError::InconsistentDisk => StorageError::InconsistentDisk,
+            StorageError::UnsupportedDisk => StorageError::UnsupportedDisk,
+            StorageError::DiskNotDir => StorageError::DiskNotDir,
+            StorageError::DiskOngoingReq => StorageError::DiskOngoingReq,
+            StorageError::PathNotFound => StorageError::PathNotFound,
+            StorageError::BitrotHashAlgoInvalid => StorageError::BitrotHashAlgoInvalid,
+            StorageError::CrossDeviceLink => StorageError::CrossDeviceLink,
+            StorageError::LessData => StorageError::LessData,
+            StorageError::MoreData => StorageError::MoreData,
+            StorageError::OutdatedXLMeta => StorageError::OutdatedXLMeta,
+            StorageError::PartMissingOrCorrupt => StorageError::PartMissingOrCorrupt,
+            StorageError::ShortWrite => StorageError::ShortWrite,
+            StorageError::SourceStalled => StorageError::SourceStalled,
+            StorageError::Timeout => StorageError::Timeout,
+            StorageError::InvalidPath => StorageError::InvalidPath,
             StorageError::DriveIsRoot => StorageError::DriveIsRoot,
             StorageError::FaultyRemoteDisk => StorageError::FaultyRemoteDisk,
             StorageError::DiskAccessDenied => StorageError::DiskAccessDenied,
@@ -491,6 +558,22 @@ impl StorageError {
             StorageError::CorruptedBackend => StorageErrorCode::CorruptedBackend,
             StorageError::UnformattedDisk => StorageErrorCode::UnformattedDisk,
             StorageError::DiskNotFound => StorageErrorCode::DiskNotFound,
+            StorageError::MaxVersionsExceeded => StorageErrorCode::MaxVersionsExceeded,
+            StorageError::InconsistentDisk => StorageErrorCode::InconsistentDisk,
+            StorageError::UnsupportedDisk => StorageErrorCode::UnsupportedDisk,
+            StorageError::DiskNotDir => StorageErrorCode::DiskNotDir,
+            StorageError::DiskOngoingReq => StorageErrorCode::DiskOngoingReq,
+            StorageError::PathNotFound => StorageErrorCode::PathNotFound,
+            StorageError::BitrotHashAlgoInvalid => StorageErrorCode::BitrotHashAlgoInvalid,
+            StorageError::CrossDeviceLink => StorageErrorCode::CrossDeviceLink,
+            StorageError::LessData => StorageErrorCode::LessData,
+            StorageError::MoreData => StorageErrorCode::MoreData,
+            StorageError::OutdatedXLMeta => StorageErrorCode::OutdatedXLMeta,
+            StorageError::PartMissingOrCorrupt => StorageErrorCode::PartMissingOrCorrupt,
+            StorageError::ShortWrite => StorageErrorCode::ShortWrite,
+            StorageError::SourceStalled => StorageErrorCode::SourceStalled,
+            StorageError::Timeout => StorageErrorCode::Timeout,
+            StorageError::InvalidPath => StorageErrorCode::InvalidPath,
             StorageError::DriveIsRoot => StorageErrorCode::DriveIsRoot,
             StorageError::FaultyRemoteDisk => StorageErrorCode::FaultyRemoteDisk,
             StorageError::DiskAccessDenied => StorageErrorCode::DiskAccessDenied,
@@ -564,6 +647,22 @@ impl StorageError {
             StorageErrorCode::CorruptedBackend => Some(StorageError::CorruptedBackend),
             StorageErrorCode::UnformattedDisk => Some(StorageError::UnformattedDisk),
             StorageErrorCode::DiskNotFound => Some(StorageError::DiskNotFound),
+            StorageErrorCode::MaxVersionsExceeded => Some(StorageError::MaxVersionsExceeded),
+            StorageErrorCode::InconsistentDisk => Some(StorageError::InconsistentDisk),
+            StorageErrorCode::UnsupportedDisk => Some(StorageError::UnsupportedDisk),
+            StorageErrorCode::DiskNotDir => Some(StorageError::DiskNotDir),
+            StorageErrorCode::DiskOngoingReq => Some(StorageError::DiskOngoingReq),
+            StorageErrorCode::PathNotFound => Some(StorageError::PathNotFound),
+            StorageErrorCode::BitrotHashAlgoInvalid => Some(StorageError::BitrotHashAlgoInvalid),
+            StorageErrorCode::CrossDeviceLink => Some(StorageError::CrossDeviceLink),
+            StorageErrorCode::LessData => Some(StorageError::LessData),
+            StorageErrorCode::MoreData => Some(StorageError::MoreData),
+            StorageErrorCode::OutdatedXLMeta => Some(StorageError::OutdatedXLMeta),
+            StorageErrorCode::PartMissingOrCorrupt => Some(StorageError::PartMissingOrCorrupt),
+            StorageErrorCode::ShortWrite => Some(StorageError::ShortWrite),
+            StorageErrorCode::SourceStalled => Some(StorageError::SourceStalled),
+            StorageErrorCode::Timeout => Some(StorageError::Timeout),
+            StorageErrorCode::InvalidPath => Some(StorageError::InvalidPath),
             StorageErrorCode::DriveIsRoot => Some(StorageError::DriveIsRoot),
             StorageErrorCode::FaultyRemoteDisk => Some(StorageError::FaultyRemoteDisk),
             StorageErrorCode::DiskAccessDenied => Some(StorageError::DiskAccessDenied),
@@ -1173,6 +1272,68 @@ mod tests {
         let file_not_found = DiskError::FileNotFound;
         let storage_error: StorageError = file_not_found.into();
         assert_eq!(storage_error, StorageError::FileNotFound);
+    }
+
+    #[test]
+    fn test_disk_error_specific_variants_do_not_degrade_to_io() {
+        let cases = vec![
+            (DiskError::MaxVersionsExceeded, StorageError::MaxVersionsExceeded),
+            (DiskError::InconsistentDisk, StorageError::InconsistentDisk),
+            (DiskError::UnsupportedDisk, StorageError::UnsupportedDisk),
+            (DiskError::DiskNotDir, StorageError::DiskNotDir),
+            (DiskError::DiskOngoingReq, StorageError::DiskOngoingReq),
+            (DiskError::PathNotFound, StorageError::PathNotFound),
+            (DiskError::BitrotHashAlgoInvalid, StorageError::BitrotHashAlgoInvalid),
+            (DiskError::CrossDeviceLink, StorageError::CrossDeviceLink),
+            (DiskError::LessData, StorageError::LessData),
+            (DiskError::MoreData, StorageError::MoreData),
+            (DiskError::OutdatedXLMeta, StorageError::OutdatedXLMeta),
+            (DiskError::PartMissingOrCorrupt, StorageError::PartMissingOrCorrupt),
+            (DiskError::ShortWrite, StorageError::ShortWrite),
+            (DiskError::SourceStalled, StorageError::SourceStalled),
+            (DiskError::Timeout, StorageError::Timeout),
+            (DiskError::InvalidPath, StorageError::InvalidPath),
+        ];
+
+        for (disk_error, expected_storage_error) in cases {
+            let storage_error: StorageError = disk_error.into();
+
+            assert!(
+                !matches!(&storage_error, StorageError::Io(_)),
+                "expected {expected_storage_error:?}, got generic Io"
+            );
+            assert_eq!(storage_error, expected_storage_error);
+        }
+    }
+
+    #[test]
+    fn test_storage_error_disk_preservation_codes_roundtrip() {
+        let errors = vec![
+            StorageError::MaxVersionsExceeded,
+            StorageError::InconsistentDisk,
+            StorageError::UnsupportedDisk,
+            StorageError::DiskNotDir,
+            StorageError::DiskOngoingReq,
+            StorageError::PathNotFound,
+            StorageError::BitrotHashAlgoInvalid,
+            StorageError::CrossDeviceLink,
+            StorageError::LessData,
+            StorageError::MoreData,
+            StorageError::OutdatedXLMeta,
+            StorageError::PartMissingOrCorrupt,
+            StorageError::ShortWrite,
+            StorageError::SourceStalled,
+            StorageError::Timeout,
+            StorageError::InvalidPath,
+        ];
+
+        for original_error in errors {
+            let code = original_error.to_u32();
+            let recovered_error =
+                StorageError::from_u32(code).unwrap_or_else(|| panic!("failed to recover error from code: {code:#x}"));
+
+            assert_eq!(std::mem::discriminant(&original_error), std::mem::discriminant(&recovered_error));
+        }
     }
 
     #[test]

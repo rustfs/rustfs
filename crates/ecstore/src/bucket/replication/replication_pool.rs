@@ -19,6 +19,7 @@ use super::replication_filemeta_boundary::{
     ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replication_statuses_map,
     version_purge_statuses_map,
 };
+use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_object_config::{ReplicationConfig, check_replicate_delete};
@@ -1028,10 +1029,40 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         buckets: &[String],
         _cancellation_token: CancellationToken,
     ) -> Result<(), EcstoreError> {
-        // TODO: add leader_lock
-        // Make sure only one node running resync on the cluster
-        // Note: Leader lock implementation would be needed here
-        // let _lock_guard = global_leader_lock.get_lock().await?;
+        let load_resync_lock = match self
+            .storage
+            .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), "replication/resync/load-resync.lock")
+            .await
+        {
+            Ok(lock) => lock,
+            Err(err) => {
+                warn!(
+                    event = EVENT_REPLICATION_RESYNC_LOAD_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    error = ?err,
+                    reason = "leader_lock_create_failed",
+                    "Skipped replication resync metadata load"
+                );
+                return Ok(());
+            }
+        };
+        let _load_resync_guard = match load_resync_lock
+            .get_write_lock(ReplicationLockTiming::acquire_timeout())
+            .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                debug!(
+                    event = EVENT_REPLICATION_RESYNC_LOAD_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    reason = "leader_lock_held_by_another_node",
+                    "Another node is already loading replication resync metadata"
+                );
+                return Ok(());
+            }
+        };
 
         let mut recovered_statuses = Vec::new();
         let mut restart_opts = Vec::new();
@@ -1492,9 +1523,328 @@ async fn queue_replicate_deletes(batch: ReplicationHealResyncDeletes) -> Replica
 
 #[cfg(test)]
 mod tests {
-    use super::super::replication_resync_boundary::{decode_mrf_file, encode_mrf_file};
+    use super::super::replication_resync_boundary::{decode_mrf_file, encode_mrf_file, encode_resync_file};
+    use super::super::replication_storage_boundary::{
+        DeletedObject, FileInfo, GetObjectReader, HTTPRangeSpec, ListOperations, ObjectIO, ObjectOperations, PutObjReader,
+        StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageNamespaceLocking, StorageObjectInfoOrErr, WalkOptions,
+    };
     use super::*;
+    use std::fmt::{Debug, Formatter};
+    use std::io::Cursor;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
     use uuid::Uuid;
+
+    type TestListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+    type TestListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+    type TestObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, EcstoreError>;
+
+    struct LoadResyncSharedState {
+        data: Vec<u8>,
+        lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+        first_read_started: Notify,
+        read_count: AtomicUsize,
+    }
+
+    struct LoadResyncNodeStore {
+        owner: String,
+        shared: Arc<LoadResyncSharedState>,
+    }
+
+    impl LoadResyncNodeStore {
+        fn new(owner: &str, shared: Arc<LoadResyncSharedState>) -> Self {
+            Self {
+                owner: owner.to_string(),
+                shared,
+            }
+        }
+    }
+
+    impl Debug for LoadResyncNodeStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("LoadResyncNodeStore").field("owner", &self.owner).finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for LoadResyncNodeStore {
+        type Error = EcstoreError;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            _bucket: &str,
+            object: &str,
+            _range: Option<Self::RangeSpec>,
+            _h: Self::HeaderMap,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::GetObjectReader, Self::Error> {
+            if object != ReplicationMetadataStore::bucket_resync_file_path("load-resync-lock") {
+                return Err(EcstoreError::FileNotFound);
+            }
+
+            let read_index = self.shared.read_count.fetch_add(1, Ordering::SeqCst);
+            if read_index == 0 {
+                self.shared.first_read_started.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+            }
+
+            let data = self.shared.data.clone();
+            Ok(Self::GetObjectReader {
+                stream: Box::new(Cursor::new(data.clone())),
+                object_info: ObjectInfo {
+                    size: data.len() as i64,
+                    actual_size: data.len() as i64,
+                    ..Default::default()
+                },
+                buffered_body: None,
+            })
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut Self::PutObjectReader,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            Ok(ObjectInfo::default())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectOperations for LoadResyncNodeStore {
+        type Error = EcstoreError;
+        type ObjectInfo = ObjectInfo;
+        type ObjectOptions = ObjectOptions;
+        type FileInfo = FileInfo;
+        type ObjectToDelete = ObjectToDelete;
+        type DeletedObject = DeletedObject;
+
+        async fn get_object_info(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn verify_object_integrity(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<(), Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn copy_object(
+            &self,
+            _src_bucket: &str,
+            _src_object: &str,
+            _dst_bucket: &str,
+            _dst_object: &str,
+            _src_info: &mut Self::ObjectInfo,
+            _src_opts: &Self::ObjectOptions,
+            _dst_opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn delete_object_version(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _fi: &Self::FileInfo,
+            _force_del_marker: bool,
+        ) -> Result<(), Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn delete_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn delete_objects(
+            &self,
+            _bucket: &str,
+            _objects: Vec<Self::ObjectToDelete>,
+            _opts: Self::ObjectOptions,
+        ) -> (Vec<Self::DeletedObject>, Vec<Option<Self::Error>>) {
+            (Vec::new(), vec![Some(EcstoreError::NotImplemented)])
+        }
+
+        async fn put_object_metadata(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn get_object_tags(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<String, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn put_object_tags(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _tags: &str,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn delete_object_tags(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<Self::ObjectInfo, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn add_partial(&self, _bucket: &str, _object: &str, _version_id: &str) -> Result<(), Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn transition_object(&self, _bucket: &str, _object: &str, _opts: &Self::ObjectOptions) -> Result<(), Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn restore_transitioned_object(
+            self: Arc<Self>,
+            _bucket: &str,
+            _object: &str,
+            _opts: &Self::ObjectOptions,
+        ) -> Result<(), Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ListOperations for LoadResyncNodeStore {
+        type Error = EcstoreError;
+        type ListObjectsV2Info = TestListObjectsV2Info;
+        type ListObjectVersionsInfo = TestListObjectVersionsInfo;
+        type ObjectInfoOrErr = TestObjectInfoOrErr;
+        type WalkOptions = WalkOptions;
+        type WalkCancellation = CancellationToken;
+        type WalkResultSender = Sender<TestObjectInfoOrErr>;
+
+        async fn list_objects_v2(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+            _fetch_owner: bool,
+            _start_after: Option<String>,
+            _incl_deleted: bool,
+        ) -> Result<Self::ListObjectsV2Info, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn list_object_versions(
+            self: Arc<Self>,
+            _bucket: &str,
+            _prefix: &str,
+            _marker: Option<String>,
+            _version_marker: Option<String>,
+            _delimiter: Option<String>,
+            _max_keys: i32,
+        ) -> Result<Self::ListObjectVersionsInfo, Self::Error> {
+            Err(EcstoreError::NotImplemented)
+        }
+
+        async fn walk(
+            self: Arc<Self>,
+            _rx: Self::WalkCancellation,
+            _bucket: &str,
+            _prefix: &str,
+            _result: Self::WalkResultSender,
+            _opts: Self::WalkOptions,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageNamespaceLocking for LoadResyncNodeStore {
+        type Error = EcstoreError;
+        type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
+
+        async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<Self::NamespaceLock, Self::Error> {
+            let lock =
+                rustfs_lock::NamespaceLock::with_local_manager("load-resync-test".to_string(), self.shared.lock_manager.clone());
+            Ok(rustfs_lock::NamespaceLockWrapper::new(
+                lock,
+                rustfs_lock::ObjectKey::new(bucket.to_string(), object.to_string()),
+                self.owner.clone(),
+            ))
+        }
+    }
+
+    async fn new_test_replication_pool(storage: Arc<LoadResyncNodeStore>) -> Arc<ReplicationPool<LoadResyncNodeStore>> {
+        let (mrf_replica_tx, mrf_replica_rx) = mpsc::channel(1);
+        let (mrf_save_tx, mrf_save_rx) = mpsc::channel(1);
+        let (mrf_worker_kill_tx, _) = mpsc::channel(1);
+        let (mrf_stop_tx, _) = mpsc::channel(1);
+
+        Arc::new(ReplicationPool {
+            active_workers: Arc::new(AtomicI32::new(0)),
+            active_lrg_workers: Arc::new(AtomicI32::new(0)),
+            active_mrf_workers: Arc::new(AtomicI32::new(0)),
+            storage,
+            priority: RwLock::new(ReplicationPoolOpts::default().priority),
+            max_workers: RwLock::new(WORKER_MAX_LIMIT),
+            max_l_workers: RwLock::new(LARGE_WORKER_COUNT),
+            stats: Arc::new(ReplicationStats::new()),
+            workers: RwLock::new(Vec::new()),
+            lrg_workers: RwLock::new(Vec::new()),
+            mrf_replica_tx,
+            mrf_replica_rx: Arc::new(Mutex::new(mrf_replica_rx)),
+            mrf_save_tx,
+            mrf_save_rx: Mutex::new(Some(mrf_save_rx)),
+            mrf_worker_kill_tx,
+            mrf_stop_tx,
+            mrf_worker_size: AtomicI32::new(0),
+            task_handles: Mutex::new(Vec::new()),
+            resyncer: Arc::new(ReplicationResyncer::new().await),
+        })
+    }
+
+    fn load_resync_test_metadata() -> Vec<u8> {
+        let mut status = BucketReplicationResyncStatus::new();
+        status.targets_map.insert(
+            "arn:test".to_string(),
+            TargetReplicationResyncStatus {
+                bucket: "load-resync-lock".to_string(),
+                resync_status: ResyncStatusType::ResyncCompleted,
+                ..Default::default()
+            },
+        );
+        encode_resync_file(&status).expect("test resync metadata should encode")
+    }
 
     #[test]
     fn replication_queue_admission_combines_target_results() {
@@ -1559,6 +1909,57 @@ mod tests {
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
         assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
+    }
+
+    #[tokio::test]
+    async fn load_resync_leader_lock_allows_only_one_startup_recovery() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            let shared = Arc::new(LoadResyncSharedState {
+                data: load_resync_test_metadata(),
+                lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
+                first_read_started: Notify::new(),
+                read_count: AtomicUsize::new(0),
+            });
+            let leader_pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+            let skipped_pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-b", shared.clone()))).await;
+
+            let leader = leader_pool.clone();
+            let leader_task = tokio::spawn(async move {
+                let buckets = vec!["load-resync-lock".to_string()];
+                leader.load_resync(&buckets, CancellationToken::new()).await
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), shared.first_read_started.notified())
+                .await
+                .expect("leader should start reading persisted resync metadata");
+
+            let buckets = vec!["load-resync-lock".to_string()];
+            skipped_pool
+                .clone()
+                .load_resync(&buckets, CancellationToken::new())
+                .await
+                .expect("contended load_resync should skip without failing startup");
+
+            leader_task
+                .await
+                .expect("leader load_resync task should not panic")
+                .expect("leader load_resync should succeed");
+
+            assert_eq!(
+                shared.read_count.load(Ordering::SeqCst),
+                1,
+                "only the leader node should read persisted resync metadata"
+            );
+            assert!(
+                leader_pool.resyncer.status_map.read().await.contains_key("load-resync-lock"),
+                "leader node should recover persisted resync status"
+            );
+            assert!(
+                skipped_pool.resyncer.status_map.read().await.is_empty(),
+                "node that does not hold the leader lock must not populate status_map"
+            );
+        })
+        .await;
     }
 
     // ── MrfReplicateEntry encode/decode roundtrips ────────────────────────────
