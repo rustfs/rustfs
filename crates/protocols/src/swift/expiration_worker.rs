@@ -656,9 +656,11 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    type MetadataResult = SwiftResult<Option<HashMap<String, String>>>;
+
     #[derive(Default)]
     struct MockExpirationObjectBackend {
-        metadata_results: Mutex<VecDeque<SwiftResult<Option<HashMap<String, String>>>>>,
+        metadata_results: Mutex<VecDeque<MetadataResult>>,
         delete_results: Mutex<VecDeque<SwiftResult<()>>>,
         deleted_objects: Mutex<Vec<(String, String, String)>>,
     }
