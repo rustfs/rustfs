@@ -186,6 +186,7 @@ impl ECStore {
     }
 
     #[instrument(skip(self, data))]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn handle_put_object_part(
         &self,
         bucket: &str,
