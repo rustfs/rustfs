@@ -71,6 +71,35 @@ pub trait Store: Clone + Send + Sync + 'static {
     ) -> Result<()>;
 
     async fn load_all(&self, cache: &Cache) -> Result<()>;
+
+    // Lock-free variants used by the cross-node notification handlers.
+    //
+    // Notification-path cache refreshes are asynchronous, best-effort, and
+    // already tolerate stale values (the periodic reload converges them), so
+    // they must not depend on the node-counted namespace-lock quorum — the
+    // same rationale as the lock-free bootstrap `load_all` (rustfs#4304;
+    // MinIO's readConfig takes no distributed lock either). The defaults
+    // forward to the locked variants so existing `Store` implementations
+    // (including test mocks) keep their behavior; `ObjectStore` overrides
+    // them with lock-free reads.
+    async fn load_user_no_lock(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+        self.load_user(name, user_type, m).await
+    }
+    async fn load_group_no_lock(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+        self.load_group(name, m).await
+    }
+    async fn load_policy_doc_no_lock(&self, name: &str, m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+        self.load_policy_doc(name, m).await
+    }
+    async fn load_mapped_policy_no_lock(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        m: &mut HashMap<String, MappedPolicy>,
+    ) -> Result<()> {
+        self.load_mapped_policy(name, user_type, is_group, m).await
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]

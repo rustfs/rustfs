@@ -1847,7 +1847,7 @@ where
 
     pub async fn group_notification_handler(&self, group: &str) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_group(group, &mut m).await {
+        if let Err(err) = self.api.load_group_no_lock(group, &mut m).await {
             if !is_err_no_such_group(&err) {
                 return Err(err);
             }
@@ -1876,7 +1876,7 @@ where
 
     pub async fn policy_notification_handler(&self, policy: &str) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_policy_doc(policy, &mut m).await {
+        if let Err(err) = self.api.load_policy_doc_no_lock(policy, &mut m).await {
             if !is_err_no_such_policy(&err) {
                 return Err(err);
             }
@@ -1927,7 +1927,7 @@ where
 
     pub async fn policy_mapping_notification_handler(&self, name: &str, user_type: UserType, is_group: bool) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_mapped_policy(name, user_type, is_group, &mut m).await {
+        if let Err(err) = self.api.load_mapped_policy_no_lock(name, user_type, is_group, &mut m).await {
             if !is_err_no_such_policy(&err) {
                 return Err(err);
             }
@@ -1963,7 +1963,7 @@ where
     }
     pub async fn user_notification_handler(&self, name: &str, user_type: UserType) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_user(name, user_type, &mut m).await {
+        if let Err(err) = self.api.load_user_no_lock(name, user_type, &mut m).await {
             if !is_err_no_such_user(&err) {
                 return Err(err);
             }
@@ -2028,7 +2028,7 @@ where
                 let mut policies = HashMap::new();
                 if let Err(err) = self
                     .api
-                    .load_mapped_policy(&parent_user, user_type, false, &mut policies)
+                    .load_mapped_policy_no_lock(&parent_user, user_type, false, &mut policies)
                     .await
                 {
                     if !is_err_no_such_policy(&err) {
@@ -2040,7 +2040,11 @@ where
             }
             UserType::Reg => {
                 let mut policies = HashMap::new();
-                if let Err(err) = self.api.load_mapped_policy(name, user_type, false, &mut policies).await {
+                if let Err(err) = self
+                    .api
+                    .load_mapped_policy_no_lock(name, user_type, false, &mut policies)
+                    .await
+                {
                     if !is_err_no_such_policy(&err) {
                         return Err(err);
                     }
@@ -2063,7 +2067,7 @@ where
                     let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
-                        .load_mapped_policy(&parent_user, UserType::Reg, false, &mut policies)
+                        .load_mapped_policy_no_lock(&parent_user, UserType::Reg, false, &mut policies)
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
@@ -2076,7 +2080,7 @@ where
                     let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
-                        .load_mapped_policy(&parent_user, UserType::Sts, false, &mut policies)
+                        .load_mapped_policy_no_lock(&parent_user, UserType::Sts, false, &mut policies)
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
