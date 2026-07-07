@@ -49,6 +49,12 @@ pub fn is_root_access_key(access_key: &str) -> bool {
     root_credentials::is_root_access_key(access_key)
 }
 
+/// Decrypts an at-rest IAM config blob using the same key sources as the IAM load
+/// path (RustFS master keys and MinIO-compatible legacy keys derived from the root
+/// credentials). Used by the MinIO -> RustFS migration path. See
+/// [`store::object::try_decrypt_iam_blob`].
+pub use store::object::try_decrypt_iam_blob;
+
 pub(crate) struct IamNotificationPeerErr {
     pub(crate) err: Option<IamEcstoreError>,
 }

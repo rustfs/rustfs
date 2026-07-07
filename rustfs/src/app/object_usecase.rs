@@ -109,7 +109,7 @@ use crate::error::ApiError;
 use crate::server::convert_ecstore_object_info;
 use crate::table_catalog;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
 use metrics::{counter, histogram};
@@ -145,6 +145,7 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_zip::{ArchiveLimits, CompressionFormat};
+use s3s::StdError;
 use s3s::dto::{
     CacheControl, Checksum, ChecksumAlgorithm, ChecksumType, ContentDisposition, ContentEncoding, ContentLanguage, ContentType,
     CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
@@ -156,7 +157,7 @@ use s3s::dto::{
     StreamingBlob, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
-use s3s::stream::{ByteStream, RemainingLength};
+use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
@@ -214,6 +215,7 @@ const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
 const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
 const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
+const EVENT_PUT_OBJECT_BODY_READ_STALLED: &str = "put_object_body_read_stalled";
 const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
 const GET_OBJECT_STAGE_REQUEST_INGRESS_TO_CONTEXT: &str = "request_ingress_to_context";
 const GET_OBJECT_STAGE_OUTPUT_STRATEGY: &str = "output_strategy";
@@ -975,6 +977,154 @@ impl<R> Drop for GetObjectStreamingReader<R> {
             "GetObject streaming body dropped before expected length"
         );
     }
+}
+
+/// Resolve the S3 request-body inter-chunk read timeout from the environment.
+///
+/// Returns `Duration::ZERO` when disabled (`RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT=0`),
+/// in which case [`guard_put_object_body_read_timeout`] passes the body through
+/// untouched.
+fn put_object_body_read_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
+        rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
+    ))
+}
+
+/// A [`ByteStream`] decorator that aborts a request body whose peer stops
+/// sending bytes without closing the connection.
+///
+/// A well-behaved short body ends with EOF and is rejected promptly by the
+/// eager/streaming readers. The failure this guards against is different: a
+/// reverse proxy or CDN forwards a *partial* body and then goes silent while
+/// holding the connection open, so the inner stream neither yields more bytes
+/// nor reports EOF. Without a bound, RustFS would wait forever for bytes that
+/// never arrive and the client eventually sees a hang/abort with no server-side
+/// explanation (issue #3076).
+///
+/// The timer resets on every chunk, so slow-but-progressing uploads are not
+/// penalized; it only fires after `timeout` of complete silence. On timeout the
+/// stall is logged with the received/expected byte counts and the read fails
+/// with an `ErrorKind::TimedOut` error instead of hanging.
+///
+/// `remaining_length` and `size_hint` are forwarded from the inner stream so
+/// wrapping is transparent to length/content handling downstream.
+struct RequestBodyReadTimeout {
+    inner: DynByteStream,
+    timeout: Duration,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    received: u64,
+    expected: Option<u64>,
+    bucket: String,
+    key: String,
+    request_id: String,
+    timed_out: bool,
+}
+
+impl Stream for RequestBodyReadTimeout {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        // Once we have surfaced a stall error, treat the stream as terminated so
+        // we never poll the abandoned inner stream again.
+        if this.timed_out {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.timer = None;
+                this.received = this.received.saturating_add(chunk.len() as u64);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(other) => {
+                this.timer = None;
+                Poll::Ready(other)
+            }
+            Poll::Pending => {
+                if this.timeout.is_zero() {
+                    return Poll::Pending;
+                }
+
+                if this.timer.is_none() {
+                    this.timer = Some(Box::pin(tokio::time::sleep(this.timeout)));
+                }
+
+                if let Some(timer) = this.timer.as_mut()
+                    && std::future::Future::poll(timer.as_mut(), cx).is_ready()
+                {
+                    this.timer = None;
+                    this.timed_out = true;
+                    let expected_display = this.expected.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string());
+                    warn!(
+                        target: "rustfs::app::object_usecase",
+                        event = EVENT_PUT_OBJECT_BODY_READ_STALLED,
+                        component = LOG_COMPONENT_APP,
+                        subsystem = LOG_SUBSYSTEM_OBJECT,
+                        request_id = %this.request_id,
+                        bucket = %this.bucket,
+                        key = %this.key,
+                        received_bytes = this.received,
+                        expected_bytes = %expected_display,
+                        timeout_secs = this.timeout.as_secs(),
+                        state = "stall_timeout",
+                        "PutObject request body read stalled; aborting. A proxy/CDN likely forwarded a partial body without closing the connection."
+                    );
+                    return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "request body read stalled: received {} of {} bytes, no data for {}s",
+                            this.received,
+                            expected_display,
+                            this.timeout.as_secs()
+                        ),
+                    )) as StdError)));
+                }
+
+                Poll::Pending
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ByteStream for RequestBodyReadTimeout {
+    fn remaining_length(&self) -> RemainingLength {
+        self.inner.remaining_length()
+    }
+}
+
+/// Wrap an incoming request body with [`RequestBodyReadTimeout`] unless the
+/// feature is disabled (`timeout == 0`), in which case the body is returned
+/// untouched. `remaining_length` is preserved via [`StreamingBlob::new`].
+fn guard_put_object_body_read_timeout(
+    body: StreamingBlob,
+    bucket: &str,
+    key: &str,
+    request_id: &str,
+    expected: Option<i64>,
+    timeout: Duration,
+) -> StreamingBlob {
+    if timeout.is_zero() {
+        return body;
+    }
+
+    StreamingBlob::new(RequestBodyReadTimeout {
+        inner: body.into(),
+        timeout,
+        timer: None,
+        received: 0,
+        expected: expected.and_then(|v| u64::try_from(v).ok()),
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        request_id: request_id.to_string(),
+        timed_out: false,
+    })
 }
 
 impl<R> ExtractArchiveEtagReader<R> {
@@ -3156,6 +3306,18 @@ impl DefaultObjectUsecase {
         }
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
+
+        // Guard against a proxy/CDN that forwards a partial body then goes silent
+        // without closing the connection: bound the inter-chunk wait so the read
+        // fails (with a diagnostic log) instead of hanging forever (issue #3076).
+        let body = {
+            let request_id = req
+                .extensions
+                .get::<request_context::RequestContext>()
+                .map(|ctx| ctx.request_id.clone())
+                .unwrap_or_default();
+            guard_put_object_body_read_timeout(body, &bucket, &key, &request_id, content_length, put_object_body_read_timeout())
+        };
 
         let decoded_content_length = decoded_content_length_from_headers(&req.headers)?;
         let mut size = match (request_uses_aws_chunked(&req.headers), decoded_content_length, content_length) {
@@ -6755,6 +6917,64 @@ mod tests {
             .expect_err("stalled reader should return an error");
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn put_object_body_read_timeout_guard_aborts_on_stall() {
+        // Inner stream never yields and never reports EOF (a proxy that forwarded
+        // a partial body then went silent while holding the connection open).
+        let inner = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
+        let mut guarded = guard_put_object_body_read_timeout(
+            inner,
+            "test-bucket",
+            "stalled-object",
+            "req-1",
+            Some(1024),
+            Duration::from_millis(1),
+        );
+
+        let err = guarded
+            .next()
+            .await
+            .expect("guard should yield a stall error")
+            .expect_err("stalled body should return an error");
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("stall error should wrap an io::Error");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut);
+
+        // After a stall the guard terminates the stream instead of re-polling the
+        // abandoned inner stream.
+        assert!(guarded.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn put_object_body_read_timeout_guard_preserves_length_and_passes_through() {
+        let body = StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"hello world")));
+        assert_eq!(body.remaining_length().exact(), Some(11));
+
+        let mut guarded =
+            guard_put_object_body_read_timeout(body, "test-bucket", "ok-object", "req-2", Some(11), Duration::from_secs(60));
+        // remaining_length must be forwarded, not reset to unknown.
+        assert_eq!(guarded.remaining_length().exact(), Some(11));
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = guarded.next().await {
+            collected.extend_from_slice(&chunk.expect("chunk should read"));
+        }
+        assert_eq!(collected, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn put_object_body_read_timeout_guard_disabled_passthrough() {
+        let body = StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"data")));
+        let mut guarded = guard_put_object_body_read_timeout(body, "test-bucket", "ok-object", "req-3", Some(4), Duration::ZERO);
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = guarded.next().await {
+            collected.extend_from_slice(&chunk.expect("chunk should read"));
+        }
+        assert_eq!(collected, b"data");
     }
 
     #[tokio::test]

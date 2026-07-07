@@ -169,6 +169,15 @@ impl LockShard {
 
         let mut retry_count = 0u32;
         const MAX_RETRIES: u32 = 10;
+        // Upper bound for a single notification wait. The notification pool is
+        // shared process-wide (a fixed set of `Notify` slots hashed by lock), so a
+        // wakeup meant for this lock can be consumed by a waiter of a different
+        // lock that hashes to the same slot, and this lock's waiter would then
+        // sleep until the full deadline. Capping each wait turns that lost-wakeup
+        // into bounded re-polling: on cap elapse we loop and re-`try_acquire`,
+        // only returning `Timeout` once the real deadline passes. The notification
+        // still delivers prompt wakeups in the common (no-collision) case.
+        const NOTIFY_WAIT_CAP: Duration = Duration::from_millis(50);
 
         loop {
             // Get or create object state
@@ -217,23 +226,25 @@ impl LockShard {
                 }
             }
 
-            // If we've exhausted quick retries or have little time left, use notification wait
+            // If we've exhausted quick retries or have little time left, use a
+            // notification wait, but bounded by NOTIFY_WAIT_CAP so a lost/stolen
+            // wakeup cannot strand this waiter until the deadline.
+            let wait = remaining.min(NOTIFY_WAIT_CAP);
             let wait_result = match request.mode {
                 LockMode::Shared => {
                     let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Shared);
-                    timeout(remaining, state.optimized_notify.wait_for_read()).await
+                    timeout(wait, state.optimized_notify.wait_for_read()).await
                 }
                 LockMode::Exclusive => {
                     let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Exclusive);
-                    timeout(remaining, state.optimized_notify.wait_for_write()).await
+                    timeout(wait, state.optimized_notify.wait_for_write()).await
                 }
             };
 
-            if wait_result.is_err() {
-                self.metrics.record_timeout();
-                return Err(LockResult::Timeout);
-            }
-
+            // A capped-wait elapse is not a real timeout: loop back and re-try the
+            // acquisition. The deadline check at the top of the loop is the single
+            // source of truth for returning `Timeout`.
+            let _ = wait_result;
             retry_count += 1;
         }
     }
