@@ -233,12 +233,18 @@ const ENV_RUSTFS_OBJECT_MMAP_READ_METHOD: &str = "RUSTFS_OBJECT_MMAP_READ_METHOD
 const RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY: &str = "mmap_copy";
 const RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY: &str = "direct_read_copy";
 
-/// Fsync writes and commit-point renames so acknowledged data survives power loss.
-/// Disabling trades durability for latency: data acknowledged with 200 OK may only
-/// live in the page cache and be lost on a whole-node power failure.
+/// Legacy binary switch for commit-point durability (fsync writes and renames).
+/// Kept for compatibility: `true` maps to the `strict` durability mode (the
+/// default), `false` keeps its historical semantics of disabling every fsync
+/// on this disk, system-critical metadata included. Superseded by
+/// `RUSTFS_DURABILITY_MODE`, which takes precedence when both are set.
 /// Default: true.
 const ENV_RUSTFS_DRIVE_SYNC_ENABLE: &str = "RUSTFS_DRIVE_SYNC_ENABLE";
 const DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE: bool = true;
+
+/// Durability tier for object data-path writes: `strict` (default) | `relaxed` | `none`.
+/// See docs/operations/durability-modes.md for the power-loss guarantee matrix.
+const ENV_RUSTFS_DURABILITY_MODE: &str = "RUSTFS_DURABILITY_MODE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalReadCopyMethod {
@@ -251,9 +257,202 @@ fn is_direct_io_read_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE)
 }
 
-/// Check if durable (fsync) writes are enabled.
-pub(crate) fn drive_sync_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE)
+const EVENT_DISK_LOCAL_DURABILITY_MODE: &str = "disk_local_durability_mode";
+
+/// Process-wide durability tier for commit-point fsync work on the local disk.
+///
+/// `Strict` is the default and preserves the historical (fully synced) write
+/// path bit for bit. The other tiers are opt-in and only relax the object
+/// data path; writes committing into system-critical namespaces stay pinned
+/// to `Strict` (see [`effective_durability`]), except under `LegacyOff`,
+/// which keeps the exact historical semantics of
+/// `RUSTFS_DRIVE_SYNC_ENABLE=false` (no fsync anywhere, system metadata
+/// included) so existing deployments keep their behavior unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DurabilityMode {
+    /// Every commit point is fsynced: shard/part contents, xl.meta contents,
+    /// rollback backups, and the directory entries of commit renames.
+    Strict,
+    /// Object payload bytes (erasure shard files, multipart part files) are
+    /// still fdatasynced before the commit rename, but metadata commits
+    /// (xl.meta contents, rollback backups, directory entries) are left to
+    /// the page cache. Aligned with MinIO's default durability posture.
+    Relaxed,
+    /// No fsync on the object data path at all. System-critical namespaces
+    /// are still pinned to `Strict`.
+    None,
+    /// Historical semantics of `RUSTFS_DRIVE_SYNC_ENABLE=false`: no fsync
+    /// anywhere, without the system-critical pinning. Only reachable through
+    /// the legacy switch; not exposed by `RUSTFS_DURABILITY_MODE`.
+    LegacyOff,
+}
+
+impl DurabilityMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "strict" => Some(Self::Strict),
+            "relaxed" => Some(Self::Relaxed),
+            "none" => Some(Self::None),
+            _ => Option::None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Relaxed => "relaxed",
+            Self::None => "none",
+            Self::LegacyOff => "legacy-off",
+        }
+    }
+
+    /// Whether object payload bytes (erasure shard files, multipart part
+    /// files) must be fdatasynced at commit points.
+    fn syncs_data_shards(self) -> bool {
+        matches!(self, Self::Strict | Self::Relaxed)
+    }
+
+    /// Whether metadata commits must be fsynced: xl.meta contents, rollback
+    /// backups, and the directory entries created by commit renames.
+    fn syncs_commit_metadata(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+/// Pure resolution of the durability mode from configuration values.
+///
+/// `RUSTFS_DURABILITY_MODE` wins when set to a valid value; otherwise the
+/// legacy `RUSTFS_DRIVE_SYNC_ENABLE` switch keeps its historical mapping
+/// (`true` -> strict, `false` -> the old full-off semantics). The default is
+/// strict.
+fn resolve_durability_mode(mode_env: Option<String>, legacy_drive_sync_enabled: bool) -> DurabilityMode {
+    if let Some(raw) = mode_env {
+        if let Some(mode) = DurabilityMode::parse(&raw) {
+            return mode;
+        }
+        warn!(
+            event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            value = %raw,
+            "Invalid RUSTFS_DURABILITY_MODE value; expected strict|relaxed|none, falling back to the legacy drive-sync switch"
+        );
+    }
+    if legacy_drive_sync_enabled {
+        DurabilityMode::Strict
+    } else {
+        DurabilityMode::LegacyOff
+    }
+}
+
+/// The configured durability mode, resolved from the environment once per
+/// process and cached (the previous binary switch re-read the environment on
+/// every call, i.e. a dozen times per PUT, and could even flip mid-operation).
+pub(crate) fn durability_mode() -> DurabilityMode {
+    #[cfg(test)]
+    if let Some(mode) = durability_mode_override::get() {
+        return mode;
+    }
+    static MODE: OnceLock<DurabilityMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = resolve_durability_mode(
+            rustfs_utils::get_env_opt_str(ENV_RUSTFS_DURABILITY_MODE),
+            rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
+        );
+        info!(
+            event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            mode = mode.as_str(),
+            "Storage durability mode resolved"
+        );
+        mode
+    })
+}
+
+/// Test-only override for [`durability_mode`].
+///
+/// The production value is resolved from the environment once per process, so
+/// tests exercising non-default tiers need a process-level override hook.
+/// Setting an override serializes callers on a mutex so a relaxed-tier test
+/// can never leak its mode into a parallel strict-tier test.
+#[cfg(test)]
+pub(crate) mod durability_mode_override {
+    use super::DurabilityMode;
+    use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
+
+    static OVERRIDE: RwLock<Option<DurabilityMode>> = RwLock::new(None);
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn get() -> Option<DurabilityMode> {
+        *OVERRIDE.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holds the override (and the serialization lock) until dropped.
+    pub(crate) struct OverrideGuard {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    pub(crate) fn set(mode: DurabilityMode) -> OverrideGuard {
+        let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = Some(mode);
+        OverrideGuard { _serial: serial }
+    }
+}
+
+/// Whether `volume` stages in-flight user object data (`.rustfs.sys/tmp`,
+/// `.rustfs.sys/multipart`, and their subtrees). These namespaces follow the
+/// configured durability mode: their contents commit into user buckets and
+/// are exactly the writes the relaxed tiers exist for.
+fn is_scratch_volume(volume: &str) -> bool {
+    for scratch in [super::RUSTFS_META_TMP_BUCKET, super::RUSTFS_META_MULTIPART_BUCKET] {
+        if volume == scratch || volume.strip_prefix(scratch).is_some_and(|rest| rest.starts_with('/')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether writes committing into `volume` carry system-critical state:
+/// format.json, IAM and cluster config, bucket metadata, and everything else
+/// under `.rustfs.sys` (or `.minio.sys` during migration) outside the scratch
+/// namespaces. Losing these can take out the whole deployment and they are
+/// far off the object hot path, so they never follow a relaxed tier.
+fn is_system_critical_volume(volume: &str) -> bool {
+    if is_scratch_volume(volume) {
+        return false;
+    }
+    for meta in [super::RUSTFS_META_BUCKET, super::MIGRATING_META_BUCKET] {
+        if volume == meta || volume.strip_prefix(meta).is_some_and(|rest| rest.starts_with('/')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Effective durability for writes that commit into `volume`.
+///
+/// System-critical volumes are pinned to `Strict` regardless of the
+/// configured tier. The legacy full-off switch keeps its historical
+/// semantics and is never pinned.
+pub(crate) fn effective_durability(volume: &str) -> DurabilityMode {
+    let mode = durability_mode();
+    match mode {
+        DurabilityMode::Strict | DurabilityMode::LegacyOff => mode,
+        DurabilityMode::Relaxed | DurabilityMode::None => {
+            if is_system_critical_volume(volume) {
+                DurabilityMode::Strict
+            } else {
+                mode
+            }
+        }
+    }
 }
 
 /// Get the O_DIRECT read threshold size.
@@ -2484,18 +2683,25 @@ impl LocalDisk {
         let tmp_volume_dir = self.get_bucket_path(super::RUSTFS_META_TMP_BUCKET)?;
         let tmp_file_path = self.get_object_path(super::RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
+        let durability = effective_durability(volume);
+
         // The tmp file is renamed to its final location right below, so only
         // its contents must be durable here (SyncMode::FileOnly): the rename
         // drops the tmp directory entry, and the destination parent directory
-        // is fsynced after the rename.
-        let tmp_sync = if sync { SyncMode::FileOnly } else { SyncMode::None };
+        // is fsynced after the rename. Both are metadata commits, so relaxed
+        // tiers skip them.
+        let tmp_sync = if sync && durability.syncs_commit_metadata() {
+            SyncMode::FileOnly
+        } else {
+            SyncMode::None
+        };
         self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), tmp_sync, &tmp_volume_dir)
             .await?;
 
         rename_all(tmp_file_path, &file_path, volume_dir).await?;
 
         if sync
-            && drive_sync_enabled()
+            && durability.syncs_commit_metadata()
             && let Some(parent) = file_path.parent()
         {
             os::fsync_dir(parent).await.map_err(to_file_error)?;
@@ -2515,8 +2721,14 @@ impl LocalDisk {
 
         // Files written here (format.json, ...) stay where they land — no
         // rename follows — so the new directory entry must be fsynced too.
-        self.write_all_private(volume, path, data, SyncMode::FileAndDir, &volume_dir)
-            .await?;
+        // System-critical volumes are pinned to strict by effective_durability;
+        // only the legacy full-off switch (historical semantics) skips this.
+        let sync = if effective_durability(volume).syncs_commit_metadata() {
+            SyncMode::FileAndDir
+        } else {
+            SyncMode::None
+        };
+        self.write_all_private(volume, path, data, sync, &volume_dir).await?;
 
         Ok(())
     }
@@ -2532,7 +2744,9 @@ impl LocalDisk {
 
         Ok(())
     }
-    // write_all_internal do write file
+    // write_all_internal do write file.
+    // Executes the given SyncMode verbatim: durability policy (tier gating,
+    // system-critical pinning) is resolved by callers via effective_durability.
     async fn write_all_internal(
         &self,
         file_path: &Path,
@@ -2545,8 +2759,6 @@ impl LocalDisk {
         } else {
             skip_parent
         };
-
-        let sync = if drive_sync_enabled() { sync } else { SyncMode::None };
 
         match data {
             InternalBuf::Ref(buf) => {
@@ -3754,9 +3966,10 @@ impl DiskAPI for LocalDisk {
         }
 
         // UploadPart is acknowledged once this rename lands, so the part data and
-        // its directory entry must be durable before we return.
-        let sync = drive_sync_enabled();
-        if sync && !src_is_dir {
+        // its directory entry must be durable before we return. Relaxed keeps the
+        // part payload fdatasync but leaves the directory entry to the page cache.
+        let durability = effective_durability(dst_volume);
+        if durability.syncs_data_shards() && !src_is_dir {
             let src = src_file_path.clone();
             tokio::task::spawn_blocking(move || std::fs::File::open(&src)?.sync_data())
                 .await
@@ -3766,7 +3979,9 @@ impl DiskAPI for LocalDisk {
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
 
-        if sync && let Some(parent) = dst_file_path.parent() {
+        if durability.syncs_commit_metadata()
+            && let Some(parent) = dst_file_path.parent()
+        {
             os::fsync_dir(parent).await.map_err(to_file_error)?;
         }
 
@@ -4099,6 +4314,14 @@ impl DiskAPI for LocalDisk {
 
         let no_inline = fi.data.is_none() && fi.size > 0;
 
+        // Resolved once for the whole commit so a concurrent configuration
+        // change can never leave a single rename_data half-synced. The tier is
+        // keyed on the destination volume: user data staged in scratch
+        // namespaces follows the configured tier, while commits into
+        // system-critical namespaces (IAM, config, bucket metadata) stay
+        // pinned to strict.
+        let durability = effective_durability(dst_volume);
+
         if no_inline {
             // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
             let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
@@ -4141,12 +4364,18 @@ impl DiskAPI for LocalDisk {
             // point below, so only its contents must be durable before the
             // rename (SyncMode::FileOnly); the dst parent directory is fsynced
             // after the commit rename, and a crash before the rename means the
-            // PUT was never acknowledged.
+            // PUT was never acknowledged. A metadata commit: relaxed tiers
+            // leave it to the page cache.
+            let tmp_meta_sync = if durability.syncs_commit_metadata() {
+                SyncMode::FileOnly
+            } else {
+                SyncMode::None
+            };
             self.write_all_private(
                 src_volume,
                 &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE),
                 new_dst_buf.into(),
-                SyncMode::FileOnly,
+                tmp_meta_sync,
                 src_file_parent,
             )
             .await?;
@@ -4156,7 +4385,8 @@ impl DiskAPI for LocalDisk {
             // page cache. Multipart parts were already synced during rename_part, so
             // their fdatasync here is a cheap no-op. A missing source dir is left for
             // the rename below to report through the existing rollback path.
-            if drive_sync_enabled()
+            // Payload durability: kept by both strict and relaxed.
+            if durability.syncs_data_shards()
                 && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
                 && let Err(err) = os::sync_dir_files(src_data_path).await
                 && err.kind() != ErrorKind::NotFound
@@ -4196,8 +4426,15 @@ impl DiskAPI for LocalDisk {
             }
 
             // The rollback backup stays where it is written (no rename) and is
-            // the sole restore source for a later undo_write, so it keeps
-            // SyncMode::FileAndDir: contents and directory entry both durable.
+            // the sole restore source for a later undo_write, so under strict
+            // it keeps SyncMode::FileAndDir: contents and directory entry both
+            // durable. It is part of the metadata commit machinery, so relaxed
+            // tiers leave it to the page cache like the xl.meta it mirrors.
+            let backup_sync = if durability.syncs_commit_metadata() {
+                SyncMode::FileAndDir
+            } else {
+                SyncMode::None
+            };
             if let Some(old_data_dir) = has_old_data_dir
                 && let Some(dst_buf) = has_dst_buf.as_ref()
                 && let Err(err) = self
@@ -4205,7 +4442,7 @@ impl DiskAPI for LocalDisk {
                         dst_volume,
                         &format!("{}/{}/{}", &dst_path, &old_data_dir, STORAGE_FORMAT_FILE_BACKUP),
                         dst_buf.clone().into(),
-                        SyncMode::FileAndDir,
+                        backup_sync,
                         &skip_parent,
                     )
                     .await
@@ -4242,8 +4479,9 @@ impl DiskAPI for LocalDisk {
             }
 
             // Persist the directory entries for both the data dir and xl.meta renames;
-            // without this the commit itself can vanish on power loss.
-            if drive_sync_enabled()
+            // without this the commit itself can vanish on power loss. Relaxed tiers
+            // accept that window (documented in docs/operations/durability-modes.md).
+            if durability.syncs_commit_metadata()
                 && let Some(parent) = dst_file_path.parent()
                 && let Err(err) = os::fsync_dir(parent).await
             {
@@ -4299,11 +4537,15 @@ impl DiskAPI for LocalDisk {
                 let version_signature = rename_data_versions_signature(&xlmeta);
                 let new_buf = xlmeta.marshal_msg()?;
 
-                // Write new xl.meta + rename
+                // Write new xl.meta + rename. Inline objects carry their data
+                // inside xl.meta, so this whole sequence is a metadata commit:
+                // relaxed tiers do no per-object fsync here at all (aligned
+                // with MinIO's default), trading a documented power-loss
+                // window for latency.
                 if let Some(parent) = src.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let sync = drive_sync_enabled();
+                let sync = durability.syncs_commit_metadata();
                 let mut f = std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -5109,14 +5351,15 @@ mod test {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_write_all_meta_skips_tmp_parent_dir_fsync_but_fsyncs_dst_parent() {
         use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
 
         let dir = tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-
-        assert!(drive_sync_enabled(), "test requires the default drive-sync configuration");
 
         let bucket = "sync-meta-bucket";
         ensure_test_volume(&disk, bucket).await;
@@ -5150,14 +5393,15 @@ mod test {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_write_all_public_still_fsyncs_parent_dir() {
         use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
 
         let dir = tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-
-        assert!(drive_sync_enabled(), "test requires the default drive-sync configuration");
 
         let bucket = "sync-public-bucket";
         ensure_test_volume(&disk, bucket).await;
@@ -5177,14 +5421,15 @@ mod test {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_rename_data_non_inline_skips_tmp_parent_dir_fsync() {
         use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
 
         let dir = tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-
-        assert!(drive_sync_enabled(), "test requires the default drive-sync configuration");
 
         let bucket = "sync-rename-bucket";
         let object = "dir/object";
@@ -5259,6 +5504,311 @@ mod test {
         assert!(
             os::fsync_dir_recorder::was_fsynced(&backup_parent),
             "old-metadata rollback backup must keep fsyncing its parent dir"
+        );
+    }
+
+    #[test]
+    fn test_resolve_durability_mode_mapping() {
+        // Default: nothing set -> strict (current main behavior).
+        assert_eq!(resolve_durability_mode(None, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE), DurabilityMode::Strict);
+        // Legacy switch compatibility mapping.
+        assert_eq!(resolve_durability_mode(None, true), DurabilityMode::Strict);
+        assert_eq!(resolve_durability_mode(None, false), DurabilityMode::LegacyOff);
+        // Explicit mode wins over the legacy switch.
+        assert_eq!(resolve_durability_mode(Some("strict".into()), false), DurabilityMode::Strict);
+        assert_eq!(resolve_durability_mode(Some("relaxed".into()), true), DurabilityMode::Relaxed);
+        assert_eq!(resolve_durability_mode(Some("none".into()), true), DurabilityMode::None);
+        // Case- and whitespace-tolerant.
+        assert_eq!(resolve_durability_mode(Some(" RELAXED ".into()), true), DurabilityMode::Relaxed);
+        // Invalid values fall back to the legacy switch, then the default.
+        assert_eq!(resolve_durability_mode(Some("bogus".into()), true), DurabilityMode::Strict);
+        assert_eq!(resolve_durability_mode(Some("bogus".into()), false), DurabilityMode::LegacyOff);
+        assert_eq!(resolve_durability_mode(Some(String::new()), true), DurabilityMode::Strict);
+    }
+
+    #[test]
+    fn test_durability_mode_sync_gates() {
+        // Strict = current main behavior: every commit point synced.
+        assert!(DurabilityMode::Strict.syncs_data_shards());
+        assert!(DurabilityMode::Strict.syncs_commit_metadata());
+        // Relaxed keeps payload durability, drops metadata-commit fsyncs.
+        assert!(DurabilityMode::Relaxed.syncs_data_shards());
+        assert!(!DurabilityMode::Relaxed.syncs_commit_metadata());
+        // None and the legacy full-off switch sync nothing on the data path.
+        assert!(!DurabilityMode::None.syncs_data_shards());
+        assert!(!DurabilityMode::None.syncs_commit_metadata());
+        assert!(!DurabilityMode::LegacyOff.syncs_data_shards());
+        assert!(!DurabilityMode::LegacyOff.syncs_commit_metadata());
+    }
+
+    #[test]
+    fn test_system_critical_volume_classification() {
+        // System namespaces are pinned.
+        assert!(is_system_critical_volume(RUSTFS_META_BUCKET));
+        assert!(is_system_critical_volume(&format!("{RUSTFS_META_BUCKET}/buckets")));
+        assert!(is_system_critical_volume(&format!("{RUSTFS_META_BUCKET}/config")));
+        assert!(is_system_critical_volume(super::super::MIGRATING_META_BUCKET));
+        // Scratch namespaces stage user object data and follow the tier.
+        assert!(!is_system_critical_volume(RUSTFS_META_TMP_BUCKET));
+        assert!(!is_system_critical_volume(RUSTFS_META_TMP_DELETED_BUCKET));
+        assert!(!is_system_critical_volume(super::super::RUSTFS_META_MULTIPART_BUCKET));
+        // User buckets follow the tier; similarly-prefixed names are not meta.
+        assert!(!is_system_critical_volume("my-bucket"));
+        assert!(!is_system_critical_volume(".rustfs.sys-lookalike"));
+    }
+
+    #[test]
+    fn test_effective_durability_pins_system_volumes() {
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+            assert_eq!(effective_durability("user-bucket"), DurabilityMode::Relaxed);
+            assert_eq!(effective_durability(super::super::RUSTFS_META_MULTIPART_BUCKET), DurabilityMode::Relaxed);
+            assert_eq!(effective_durability(RUSTFS_META_TMP_BUCKET), DurabilityMode::Relaxed);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+        }
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::None);
+            assert_eq!(effective_durability("user-bucket"), DurabilityMode::None);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+        }
+        {
+            // The legacy full-off switch keeps its historical semantics:
+            // nothing is pinned, not even system-critical namespaces.
+            let _mode = durability_mode_override::set(DurabilityMode::LegacyOff);
+            assert_eq!(effective_durability("user-bucket"), DurabilityMode::LegacyOff);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::LegacyOff);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_meta_relaxed_skips_dst_parent_dir_fsync() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "relaxed-meta-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let meta_path = format!("dir/object/{STORAGE_FORMAT_FILE}");
+        disk.write_all_meta(bucket, &meta_path, b"payload", true)
+            .await
+            .expect("write_all_meta should succeed");
+
+        let dst_file_path = disk.get_object_path(bucket, &meta_path).expect("dst path should resolve");
+        assert_eq!(
+            tokio::fs::read(&dst_file_path).await.expect("xl.meta should exist"),
+            b"payload",
+            "relaxed mode must not change what gets written, only what gets fsynced"
+        );
+
+        let dst_parent = dst_file_path.parent().expect("dst file should have a parent").to_path_buf();
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&dst_parent),
+            "relaxed mode must skip the metadata-commit dir fsync on user volumes"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_public_relaxed_pins_system_volume() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let user_bucket = "relaxed-public-bucket";
+        ensure_test_volume(&disk, user_bucket).await;
+
+        // User volume: the direct write follows the relaxed tier.
+        disk.write_all(user_bucket, "config/settings.json", Bytes::from_static(b"payload"))
+            .await
+            .expect("write_all should succeed");
+        let user_parent = disk
+            .get_object_path(user_bucket, "config/settings.json")
+            .expect("file path should resolve")
+            .parent()
+            .expect("file should have a parent")
+            .to_path_buf();
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&user_parent),
+            "relaxed mode must skip the dir fsync for direct writes into user volumes"
+        );
+
+        // System-critical volume: pinned to strict regardless of the tier.
+        disk.write_all(RUSTFS_META_BUCKET, "buckets/test/bucket-metadata", Bytes::from_static(b"payload"))
+            .await
+            .expect("write_all should succeed");
+        let meta_parent = disk
+            .get_object_path(RUSTFS_META_BUCKET, "buckets/test/bucket-metadata")
+            .expect("meta path should resolve")
+            .parent()
+            .expect("meta file should have a parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&meta_parent),
+            "system-critical writes must stay fully synced under relaxed mode"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_relaxed_keeps_shard_sync_skips_commit_fsyncs() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "relaxed-rename-bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-relaxed-write";
+        let version_id = Uuid::parse_str("77777777-7777-7777-7777-777777777777").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("88888888-8888-8888-8888-888888888888").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let dst_object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let resp = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit");
+        assert_eq!(resp.old_data_dir, Some(old_data_dir), "relaxed mode must not change commit semantics");
+
+        // Compare against root-resolved paths: the recorder stores the paths
+        // the disk actually fsyncs, which go through the canonicalized root.
+        let resolved_tmp_data_dir = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{new_data_dir}"))
+            .expect("tmp data dir path should resolve");
+        let resolved_dst_object_dir = disk.get_object_path(bucket, object).expect("dst object dir should resolve");
+
+        // Payload durability is kept: sync_dir_files fdatasyncs the shard
+        // files and fsyncs the staged data dir before the commit rename.
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&resolved_tmp_data_dir),
+            "relaxed mode must keep the shard-data sync before the commit rename"
+        );
+
+        // Metadata-commit fsyncs are skipped: neither the destination parent
+        // dir nor the rollback backup parent dir is fsynced.
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_dst_object_dir),
+            "relaxed mode must skip the commit-rename dir fsync"
+        );
+        let resolved_backup_parent = resolved_dst_object_dir.join(old_data_dir.to_string());
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_backup_parent),
+            "relaxed mode must skip the rollback-backup dir fsync"
+        );
+        assert!(
+            dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .exists(),
+            "the rollback backup itself must still be written"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_legacy_off_skips_all_fsyncs() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::LegacyOff);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "legacy-off-bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-legacy-write";
+        let version_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("version id should parse");
+        let new_data_dir = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit");
+
+        // Historical RUSTFS_DRIVE_SYNC_ENABLE=false semantics: no fsync at
+        // all, not even the shard-data sync relaxed keeps. Assertions use the
+        // root-resolved paths the disk actually passes to fsync.
+        let resolved_tmp_data_dir = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{new_data_dir}"))
+            .expect("tmp data dir path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_tmp_data_dir),
+            "legacy-off must not sync staged shard data"
+        );
+        let resolved_dst_object_dir = disk.get_object_path(bucket, object).expect("dst object dir should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_dst_object_dir),
+            "legacy-off must not fsync the commit-rename dir"
+        );
+
+        // And system-critical volumes are NOT pinned: the old full-off
+        // behavior is preserved bit for bit for existing deployments.
+        disk.write_all(RUSTFS_META_BUCKET, "buckets/legacy/bucket-metadata", Bytes::from_static(b"payload"))
+            .await
+            .expect("write_all should succeed");
+        let meta_parent = disk
+            .get_object_path(RUSTFS_META_BUCKET, "buckets/legacy/bucket-metadata")
+            .expect("meta path should resolve")
+            .parent()
+            .expect("meta file should have a parent")
+            .to_path_buf();
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&meta_parent),
+            "legacy-off keeps the historical semantics: system metadata is not synced either"
         );
     }
 
