@@ -51,6 +51,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::{Error as IoError, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -81,6 +83,8 @@ const EVENT_DISK_LOCAL_BACKGROUND_CLEANUP: &str = "disk_local_background_cleanup
 const EVENT_DISK_LOCAL_SCAN_FAILED: &str = "disk_local_scan_failed";
 const EVENT_DISK_LOCAL_RENAME_REJECTED: &str = "disk_local_rename_rejected";
 const EVENT_DISK_LOCAL_READ_VERSION_FALLBACK: &str = "disk_local_read_version_fallback";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
@@ -267,6 +271,155 @@ fn local_read_copy_method() -> LocalReadCopyMethod {
         RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY => LocalReadCopyMethod::DirectReadCopy,
         _ => LocalReadCopyMethod::MmapCopy,
     }
+}
+
+/// Runtime state for the true O_DIRECT read path (Linux only).
+///
+/// `supported` starts true and latches false on the first EINVAL/EOPNOTSUPP
+/// from an O_DIRECT open/read (tmpfs, overlayfs, and 9p commonly reject the
+/// flag); the path then permanently falls back to the buffered read methods
+/// for this disk. `align` caches the DIO alignment probed from the backing
+/// filesystem. O_DIRECT errors must never surface to callers: EINVAL maps to
+/// `FileNotFound` in `to_file_error`, which would masquerade as a missing
+/// shard and trigger spurious EC rebuilds.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct DirectIoReadState {
+    supported: AtomicBool,
+    align: OnceLock<usize>,
+    fallback_logged: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl DirectIoReadState {
+    fn new() -> Self {
+        Self {
+            supported: AtomicBool::new(true),
+            align: OnceLock::new(),
+            fallback_logged: AtomicBool::new(false),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const DEFAULT_DIRECT_IO_ALIGN: usize = 4096;
+
+/// Probe the DIO alignment requirement for the file's filesystem via
+/// statx STATX_DIOALIGN (kernel >= 6.1). Falls back to 4096, a safe upper
+/// bound for 512e/4Kn devices, when the kernel or filesystem does not
+/// report it.
+#[cfg(target_os = "linux")]
+fn probe_direct_io_align(file: &std::fs::File) -> usize {
+    use rustix::fs::{AtFlags, StatxFlags};
+
+    match rustix::fs::statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::DIOALIGN) {
+        Ok(stx) => {
+            if StatxFlags::from_bits_retain(stx.stx_mask).contains(StatxFlags::DIOALIGN) {
+                let align = stx.stx_dio_mem_align.max(stx.stx_dio_offset_align) as usize;
+                if align.is_power_of_two() && align >= 512 {
+                    return align;
+                }
+            }
+            DEFAULT_DIRECT_IO_ALIGN
+        }
+        Err(_) => DEFAULT_DIRECT_IO_ALIGN,
+    }
+}
+
+/// Heap buffer with explicit alignment for O_DIRECT reads.
+#[cfg(target_os = "linux")]
+struct AlignedBuf {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    layout: std::alloc::Layout,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+impl AlignedBuf {
+    fn new(len: usize, align: usize) -> std::io::Result<Self> {
+        debug_assert!(len > 0, "AlignedBuf must not be zero-sized");
+        let layout = std::alloc::Layout::from_size_align(len, align)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: `layout` has non-zero size (callers guarantee len > 0) and a
+        // valid power-of-two alignment enforced by Layout::from_size_align.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = std::ptr::NonNull::new(ptr).ok_or(std::io::ErrorKind::OutOfMemory)?;
+        Ok(Self { ptr, len, layout })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is a live allocation of exactly `len` bytes owned by
+        // self, initialized to zero at allocation and only written via
+        // `as_mut_slice`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as in `as_slice`, plus `&mut self` guarantees exclusivity.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`layout` come from the successful alloc_zeroed in new().
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_direct_io_unsupported(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EINVAL) | Some(libc::EOPNOTSUPP))
+}
+
+/// True O_DIRECT positioned read: open with O_DIRECT, read the aligned
+/// superset range into an aligned bounce buffer, then slice out the exact
+/// logical range. Alignment padding never leaks to callers — BitrotReader
+/// reads exact shard_size and would flag padded output as corruption.
+///
+/// Short reads are legal for O_DIRECT; the loop stops at EOF (res == 0).
+/// A read that ends before covering the logical range is an error (the
+/// caller has already validated `offset + length <= file size`, so this
+/// only happens on concurrent truncation) and makes the caller fall back
+/// to the buffered path.
+#[cfg(target_os = "linux")]
+fn pread_direct_aligned(file_path: &Path, offset: u64, length: usize, state: &DirectIoReadState) -> std::io::Result<Bytes> {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
+        .open(file_path)?;
+
+    let align = *state.align.get_or_init(|| probe_direct_io_align(&file));
+    let align_u64 = align as u64;
+
+    let aligned_offset = offset - (offset % align_u64);
+    let logical_start =
+        usize::try_from(offset - aligned_offset).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let logical_end = logical_start.checked_add(length).ok_or(std::io::ErrorKind::InvalidInput)?;
+    let aligned_len = logical_end.checked_add(align - 1).ok_or(std::io::ErrorKind::InvalidInput)? / align * align;
+
+    let mut buf = AlignedBuf::new(aligned_len, align)?;
+
+    let mut filled = 0usize;
+    while filled < aligned_len {
+        // `filled` stays a multiple of `align` except possibly at EOF, so
+        // both the buffer address and the file offset remain aligned.
+        let n = file.read_at(&mut buf.as_mut_slice()[filled..], aligned_offset + filled as u64)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    if filled < logical_end {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short O_DIRECT read"));
+    }
+
+    Ok(Bytes::copy_from_slice(&buf.as_slice()[logical_start..logical_end]))
 }
 
 #[cfg(unix)]
@@ -716,11 +869,17 @@ pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
 #[derive(Debug)]
 pub(crate) struct StdBackend {
     root: PathBuf,
+    #[cfg(target_os = "linux")]
+    direct_io: Arc<DirectIoReadState>,
 }
 
 impl StdBackend {
     pub(crate) fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            #[cfg(target_os = "linux")]
+            direct_io: Arc::new(DirectIoReadState::new()),
+        }
     }
 
     async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
@@ -792,6 +951,7 @@ impl LocalIoBackend for StdBackend {
                 mmap_copy_fault_delta: MmapPageFaultDelta,
                 direct_read_copy_fault_delta: MmapPageFaultDelta,
                 blocking_task_duration: StdDuration,
+                used_direct_io: bool,
             }
 
             enum MmapCopyReadError {
@@ -813,6 +973,10 @@ impl LocalIoBackend for StdBackend {
             let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
             let should_populate_mmap_read = should_populate_mmap_read(length);
             let read_copy_method = local_read_copy_method();
+            #[cfg(target_os = "linux")]
+            let direct_io_eligible = is_direct_io_read_enabled() && length > 0 && length >= get_direct_io_read_threshold();
+            #[cfg(target_os = "linux")]
+            let direct_io_state = self.direct_io.clone();
             let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
             let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
             let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
@@ -860,64 +1024,106 @@ impl LocalIoBackend for StdBackend {
                 let mut _reclaim_offset = offset_u64;
                 let mut _reclaim_len = length;
 
-                let bytes = match read_copy_method {
-                    LocalReadCopyMethod::MmapCopy => {
-                        // mmap offsets on Unix must be page-size aligned. Align the
-                        // mapping down to the nearest page boundary, then slice out the
-                        // originally requested logical range.
-                        let page_size = mmap_page_size()?;
-                        let aligned_offset = offset_u64 - (offset_u64 % page_size);
-                        let logical_offset =
-                            usize::try_from(offset_u64 - aligned_offset).map_err(|_| DiskError::other("mmap offset overflow"))?;
-                        let map_len = logical_offset
-                            .checked_add(length)
-                            .ok_or_else(|| DiskError::other("mmap length overflow"))?;
-                        _reclaim_offset = aligned_offset;
-                        _reclaim_len = map_len;
-
-                        // SAFETY: The file is opened as read-only, and we're mapping a region
-                        // that we've already verified exists and is within file bounds. The
-                        // file offset passed to mmap is page-size aligned as required on Unix.
-                        let mmap_map_start = metrics_enabled.then(StdInstant::now);
-                        let mmap_map_faults_before = read_mmap_page_fault_counts(metrics_enabled);
-                        let mut mmap_options = MmapOptions::new();
-                        mmap_options.offset(aligned_offset).len(map_len);
-                        if should_populate_mmap_read {
-                            mmap_options.populate();
+                #[cfg(target_os = "linux")]
+                let mut direct_io_bytes: Option<Bytes> = None;
+                #[cfg(not(target_os = "linux"))]
+                let direct_io_bytes: Option<Bytes> = None;
+                #[cfg(target_os = "linux")]
+                if direct_io_eligible && direct_io_state.supported.load(Ordering::Relaxed) {
+                    let direct_start = metrics_enabled.then(StdInstant::now);
+                    let direct_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                    match pread_direct_aligned(&file_path, offset_u64, length, &direct_io_state) {
+                        Ok(bytes) => {
+                            let direct_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                            direct_read_copy_duration = direct_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                            direct_read_copy_fault_delta = mmap_page_fault_delta(direct_faults_before, direct_faults_after);
+                            direct_io_bytes = Some(bytes);
                         }
-                        let mmap = unsafe { mmap_options.map(&file) }.map_err(DiskError::other)?;
-                        let mmap_map_faults_after = read_mmap_page_fault_counts(metrics_enabled);
-                        mmap_map_duration = mmap_map_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-                        mmap_map_fault_delta = mmap_page_fault_delta(mmap_map_faults_before, mmap_map_faults_after);
-
-                        // Copy only the requested logical range into a Bytes buffer. This
-                        // avoids undefined behavior from treating OS-managed mmap memory as
-                        // allocator-managed Vec storage, at the cost of an extra copy.
-                        let end = logical_offset
-                            .checked_add(length)
-                            .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
-                        let mmap_copy_start = metrics_enabled.then(StdInstant::now);
-                        let mmap_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
-                        let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
-                        let mmap_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
-                        mmap_copy_duration = mmap_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-                        mmap_copy_fault_delta = mmap_page_fault_delta(mmap_copy_faults_before, mmap_copy_faults_after);
-                        bytes
+                        Err(err) => {
+                            // Never surface O_DIRECT errors: EINVAL maps to
+                            // FileNotFound in to_file_error and would trigger a
+                            // spurious EC rebuild. Latch off on unsupported
+                            // filesystems; otherwise retry buffered this once.
+                            if is_direct_io_unsupported(&err) {
+                                direct_io_state.supported.store(false, Ordering::Relaxed);
+                            }
+                            if !direct_io_state.fallback_logged.swap(true, Ordering::Relaxed) {
+                                warn!(
+                                    event = EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                    path = %file_path.display(),
+                                    error = ?err,
+                                    "O_DIRECT read unavailable; falling back to buffered reads"
+                                );
+                            }
+                        }
                     }
-                    LocalReadCopyMethod::DirectReadCopy => {
-                        use std::io::{Read as _, Seek as _};
+                }
 
-                        let direct_read_copy_start = metrics_enabled.then(StdInstant::now);
-                        let direct_read_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
-                        file.seek(SeekFrom::Start(offset_u64)).map_err(DiskError::from)?;
-                        let mut buffer = vec![0; length];
-                        file.read_exact(&mut buffer).map_err(DiskError::from)?;
-                        let direct_read_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
-                        direct_read_copy_duration =
-                            direct_read_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-                        direct_read_copy_fault_delta =
-                            mmap_page_fault_delta(direct_read_copy_faults_before, direct_read_copy_faults_after);
-                        Bytes::from(buffer)
+                let used_direct_io = direct_io_bytes.is_some();
+                let bytes = if let Some(bytes) = direct_io_bytes {
+                    bytes
+                } else {
+                    match read_copy_method {
+                        LocalReadCopyMethod::MmapCopy => {
+                            // mmap offsets on Unix must be page-size aligned. Align the
+                            // mapping down to the nearest page boundary, then slice out the
+                            // originally requested logical range.
+                            let page_size = mmap_page_size()?;
+                            let aligned_offset = offset_u64 - (offset_u64 % page_size);
+                            let logical_offset = usize::try_from(offset_u64 - aligned_offset)
+                                .map_err(|_| DiskError::other("mmap offset overflow"))?;
+                            let map_len = logical_offset
+                                .checked_add(length)
+                                .ok_or_else(|| DiskError::other("mmap length overflow"))?;
+                            _reclaim_offset = aligned_offset;
+                            _reclaim_len = map_len;
+
+                            // SAFETY: The file is opened as read-only, and we're mapping a region
+                            // that we've already verified exists and is within file bounds. The
+                            // file offset passed to mmap is page-size aligned as required on Unix.
+                            let mmap_map_start = metrics_enabled.then(StdInstant::now);
+                            let mmap_map_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                            let mut mmap_options = MmapOptions::new();
+                            mmap_options.offset(aligned_offset).len(map_len);
+                            if should_populate_mmap_read {
+                                mmap_options.populate();
+                            }
+                            let mmap = unsafe { mmap_options.map(&file) }.map_err(DiskError::other)?;
+                            let mmap_map_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                            mmap_map_duration = mmap_map_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                            mmap_map_fault_delta = mmap_page_fault_delta(mmap_map_faults_before, mmap_map_faults_after);
+
+                            // Copy only the requested logical range into a Bytes buffer. This
+                            // avoids undefined behavior from treating OS-managed mmap memory as
+                            // allocator-managed Vec storage, at the cost of an extra copy.
+                            let end = logical_offset
+                                .checked_add(length)
+                                .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                            let mmap_copy_start = metrics_enabled.then(StdInstant::now);
+                            let mmap_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                            let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
+                            let mmap_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                            mmap_copy_duration = mmap_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                            mmap_copy_fault_delta = mmap_page_fault_delta(mmap_copy_faults_before, mmap_copy_faults_after);
+                            bytes
+                        }
+                        LocalReadCopyMethod::DirectReadCopy => {
+                            use std::io::{Read as _, Seek as _};
+
+                            let direct_read_copy_start = metrics_enabled.then(StdInstant::now);
+                            let direct_read_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                            file.seek(SeekFrom::Start(offset_u64)).map_err(DiskError::from)?;
+                            let mut buffer = vec![0; length];
+                            file.read_exact(&mut buffer).map_err(DiskError::from)?;
+                            let direct_read_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                            direct_read_copy_duration =
+                                direct_read_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                            direct_read_copy_fault_delta =
+                                mmap_page_fault_delta(direct_read_copy_faults_before, direct_read_copy_faults_after);
+                            Bytes::from(buffer)
+                        }
                     }
                 };
 
@@ -951,6 +1157,7 @@ impl LocalIoBackend for StdBackend {
                     mmap_copy_fault_delta,
                     direct_read_copy_fault_delta,
                     blocking_task_duration,
+                    used_direct_io,
                 })
             })
             .await
@@ -1010,32 +1217,49 @@ impl LocalIoBackend for StdBackend {
                     metrics.file_open_stage,
                     read_result.file_open_duration.as_secs_f64(),
                 );
-                match read_copy_method {
-                    LocalReadCopyMethod::MmapCopy => {
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            metrics.path,
-                            metrics.mmap_map_stage,
-                            read_result.mmap_map_duration.as_secs_f64(),
-                        );
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            metrics.path,
-                            metrics.mmap_copy_stage,
-                            read_result.mmap_copy_duration.as_secs_f64(),
-                        );
-                        record_mmap_page_fault_delta(metrics.path, metrics.mmap_map_stage, read_result.mmap_map_fault_delta);
-                        record_mmap_page_fault_delta(metrics.path, metrics.mmap_copy_stage, read_result.mmap_copy_fault_delta);
-                    }
-                    LocalReadCopyMethod::DirectReadCopy => {
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            metrics.path,
-                            metrics.direct_read_copy_stage,
-                            read_result.direct_read_copy_duration.as_secs_f64(),
-                        );
-                        record_direct_read_page_fault_delta(
-                            metrics.path,
-                            metrics.direct_read_copy_stage,
-                            read_result.direct_read_copy_fault_delta,
-                        );
+                if read_result.used_direct_io {
+                    rustfs_io_metrics::record_get_object_stage_duration(
+                        metrics.path,
+                        metrics.direct_read_copy_stage,
+                        read_result.direct_read_copy_duration.as_secs_f64(),
+                    );
+                    record_direct_read_page_fault_delta(
+                        metrics.path,
+                        metrics.direct_read_copy_stage,
+                        read_result.direct_read_copy_fault_delta,
+                    );
+                } else {
+                    match read_copy_method {
+                        LocalReadCopyMethod::MmapCopy => {
+                            rustfs_io_metrics::record_get_object_stage_duration(
+                                metrics.path,
+                                metrics.mmap_map_stage,
+                                read_result.mmap_map_duration.as_secs_f64(),
+                            );
+                            rustfs_io_metrics::record_get_object_stage_duration(
+                                metrics.path,
+                                metrics.mmap_copy_stage,
+                                read_result.mmap_copy_duration.as_secs_f64(),
+                            );
+                            record_mmap_page_fault_delta(metrics.path, metrics.mmap_map_stage, read_result.mmap_map_fault_delta);
+                            record_mmap_page_fault_delta(
+                                metrics.path,
+                                metrics.mmap_copy_stage,
+                                read_result.mmap_copy_fault_delta,
+                            );
+                        }
+                        LocalReadCopyMethod::DirectReadCopy => {
+                            rustfs_io_metrics::record_get_object_stage_duration(
+                                metrics.path,
+                                metrics.direct_read_copy_stage,
+                                read_result.direct_read_copy_duration.as_secs_f64(),
+                            );
+                            record_direct_read_page_fault_delta(
+                                metrics.path,
+                                metrics.direct_read_copy_stage,
+                                read_result.direct_read_copy_fault_delta,
+                            );
+                        }
                     }
                 }
             }
@@ -6563,5 +6787,89 @@ mod test {
         let mut all = Vec::new();
         full.read_to_end(&mut all).await.expect("operation should succeed");
         assert_eq!(Bytes::from(all), content, "open_full_read mismatch");
+    }
+
+    /// The O_DIRECT read path must return the same bytes as the buffered
+    /// path for unaligned shard sizes and ranges, and must silently fall
+    /// back (never error) on filesystems that reject O_DIRECT (e.g. tmpfs).
+    /// Both legs are covered regardless of which filesystem backs tempdir.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_io_read_matches_buffered_path_or_falls_back() {
+        use tempfile::tempdir;
+
+        // Unaligned on purpose: 3 blocks + 7 bytes.
+        const FILE_LEN: usize = 4096 * 3 + 7;
+
+        let mut state = 0x2545f4914f6cdd1du64;
+        let content: Vec<u8> = (0..FILE_LEN)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let content = Bytes::from(content);
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+        disk.make_volume("test-volume").await.expect("operation should succeed");
+        disk.write_all("test-volume", "shard.bin", content.clone())
+            .await
+            .expect("operation should succeed");
+
+        let ranges = [
+            (0usize, FILE_LEN),
+            (0, 4096),
+            (4095, 4098),
+            (4096 * 2, 4096 + 7),
+            (FILE_LEN - 7, 7),
+        ];
+
+        for (offset, length) in ranges {
+            let expected = content.slice(offset..offset + length);
+            // Threshold 1 forces every non-empty read through the O_DIRECT attempt.
+            let got = temp_env::async_with_vars(
+                [
+                    (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true")),
+                    (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("1")),
+                ],
+                async {
+                    disk.read_file_mmap_copy("test-volume", "shard.bin", offset, length)
+                        .await
+                        .expect("O_DIRECT-eligible read must succeed (direct or fallback)")
+                },
+            )
+            .await;
+            assert_eq!(got, expected, "direct-io read mismatch at offset={offset} length={length}");
+        }
+    }
+
+    /// pread_direct_aligned must never leak alignment padding: the returned
+    /// buffer is exactly the requested logical range.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pread_direct_aligned_exact_range_or_unsupported() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("operation should succeed");
+        let file_path = dir.path().join("blob.bin");
+        let content: Vec<u8> = (0..4096 * 2 + 13).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&file_path)
+            .and_then(|mut f| f.write_all(&content))
+            .expect("operation should succeed");
+
+        let state = DirectIoReadState::new();
+        match pread_direct_aligned(&file_path, 4090, 100, &state) {
+            Ok(bytes) => {
+                assert_eq!(&bytes[..], &content[4090..4190], "padding must not leak");
+            }
+            Err(err) => {
+                assert!(
+                    is_direct_io_unsupported(&err),
+                    "only unsupported-filesystem errors are acceptable here: {err}"
+                );
+            }
+        }
     }
 }
