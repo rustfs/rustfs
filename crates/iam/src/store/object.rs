@@ -95,6 +95,37 @@ fn get_mapped_policy_path(name: &str, user_type: UserType, is_group: bool) -> St
     }
 }
 
+/// Lock semantics for IAM config reads.
+///
+/// Bootstrap/snapshot loads (`load_all`) must not require distributed
+/// namespace locks: lock quorum is counted over cluster nodes, so during a
+/// sequential restart the peers are unreachable and every locked read fails
+/// with `QuorumNotReached` even though the storage read quorum is already
+/// satisfiable (rustfs#4304). This mirrors the startup contract established
+/// for pool metadata in rustfs#4056. Config objects are atomic whole-object
+/// writes, so a lock-free read only ever observes an old or a new value;
+/// staleness is bounded by the periodic IAM reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadMode {
+    /// On-line load on behalf of a live request: takes namespace locks.
+    Locked,
+    /// Bulk snapshot load during bootstrap/reload: bypasses namespace locks.
+    BootstrapNoLock,
+}
+
+impl LoadMode {
+    fn no_lock(self) -> bool {
+        matches!(self, LoadMode::BootstrapNoLock)
+    }
+
+    fn read_opts(self) -> IamObjectOptions {
+        IamObjectOptions {
+            no_lock: self.no_lock(),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct StringOrErr {
     pub item: Option<String>,
@@ -343,9 +374,13 @@ impl ObjectStore {
         Self::prepare_data_for_storage(data)
     }
 
-    async fn load_iamconfig_bytes_with_metadata(&self, path: impl AsRef<str> + Send) -> Result<(Vec<u8>, IamObjectInfo)> {
+    async fn load_iamconfig_bytes_with_metadata(
+        &self,
+        path: impl AsRef<str> + Send,
+        mode: LoadMode,
+    ) -> Result<(Vec<u8>, IamObjectInfo)> {
         let path_ref = path.as_ref();
-        let (data, obj) = read_iam_config_with_metadata(self.object_api.clone(), path_ref, &IamObjectOptions::default()).await?;
+        let (data, obj) = read_iam_config_with_metadata(self.object_api.clone(), path_ref, &mode.read_opts()).await?;
         let outcome = Self::decrypt_data_with_source(&data)?;
         self.maybe_schedule_lazy_rewrite(path_ref, &outcome, &obj);
 
@@ -456,13 +491,13 @@ impl ObjectStore {
         Ok(res)
     }
 
-    async fn load_policy_doc_concurrent(&self, names: &[String]) -> Result<Vec<PolicyDoc>> {
+    async fn load_policy_doc_concurrent(&self, names: &[String], mode: LoadMode) -> Result<Vec<PolicyDoc>> {
         let mut futures = Vec::with_capacity(names.len());
 
         for name in names {
             let policy_name = rustfs_utils::path::dir(name);
             futures.push(async move {
-                match self.load_policy(&policy_name).await {
+                match self.load_policy_with(&policy_name, mode).await {
                     Ok(p) => Ok(p),
                     Err(err) => {
                         if !is_err_no_such_policy(&err) {
@@ -488,13 +523,13 @@ impl ObjectStore {
         Ok(policies)
     }
 
-    async fn load_user_concurrent(&self, names: &[String], user_type: UserType) -> Result<Vec<UserIdentity>> {
+    async fn load_user_concurrent(&self, names: &[String], user_type: UserType, mode: LoadMode) -> Result<Vec<UserIdentity>> {
         let mut futures = Vec::with_capacity(names.len());
 
         for name in names {
             let user_name = rustfs_utils::path::dir(name);
             futures.push(async move {
-                match self.load_user_identity(&user_name, user_type).await {
+                match self.load_user_identity_with(&user_name, user_type, mode).await {
                     Ok(res) => Ok(res),
                     Err(err) => {
                         if !is_err_no_such_user(&err) {
@@ -519,9 +554,155 @@ impl ObjectStore {
         Ok(users)
     }
 
-    async fn load_mapped_policy_internal(&self, name: &str, user_type: UserType, is_group: bool) -> Result<MappedPolicy> {
+    /// Parameterized core of [`Store::load_iam_config`]. `LoadMode::BootstrapNoLock`
+    /// keeps the bootstrap snapshot load free of namespace locks (rustfs#4304).
+    async fn load_iam_config_with<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send, mode: LoadMode) -> Result<Item> {
+        let path_ref = path.as_ref();
+        let (data, obj) = read_iam_config_with_metadata(self.object_api.clone(), path_ref, &mode.read_opts()).await?;
+
+        let outcome = match Self::decrypt_data_with_source(&data) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(path = %path_ref, error = %err, "IAM config decrypt failed; keeping file");
+                // keep the config file when decrypt failed - do not delete
+                return Err(Error::ConfigNotFound);
+            }
+        };
+
+        self.maybe_schedule_lazy_rewrite(path_ref, &outcome, &obj);
+
+        Ok(serde_json::from_slice(&outcome.plain)?)
+    }
+
+    /// Parameterized core of [`Store::load_user_identity`].
+    async fn load_user_identity_with(&self, name: &str, user_type: UserType, mode: LoadMode) -> Result<UserIdentity> {
+        let mut u: UserIdentity = self
+            .load_iam_config_with(get_user_identity_path(name, user_type), mode)
+            .await
+            .map_err(|err| {
+                if is_err_config_not_found(&err) {
+                    warn!(name, user_type = ?user_type, "IAM user identity missing");
+                    Error::NoSuchUser(name.to_owned())
+                } else {
+                    warn!(name, user_type = ?user_type, error = ?err, "IAM user identity load failed");
+                    err
+                }
+            })?;
+
+        if u.credentials.is_expired() {
+            let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
+            let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
+            warn!(name, user_type = ?user_type, "IAM user identity expired and was removed");
+            return Err(Error::NoSuchUser(name.to_owned()));
+        }
+
+        if u.credentials.access_key.is_empty() {
+            u.credentials.access_key = name.to_owned();
+        }
+
+        if !u.credentials.session_token.is_empty() {
+            let claims_result = if user_type == UserType::Svc && u.credentials.expiration.is_none() {
+                extract_jwt_claims_allow_missing_exp(&u)
+            } else {
+                extract_jwt_claims(&u)
+            };
+
+            match claims_result {
+                Ok(claims) => {
+                    u.credentials.claims = Some(claims);
+                }
+                Err(err) => {
+                    if u.credentials.is_temp() {
+                        let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
+                        let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
+                    }
+                    warn!(name, user_type = ?user_type, error = ?err, "IAM JWT claim extraction failed");
+                    return Err(Error::NoSuchUser(name.to_owned()));
+                }
+            }
+        }
+
+        Ok(u)
+    }
+
+    /// Parameterized core of [`Store::load_user`].
+    async fn load_user_with(
+        &self,
+        name: &str,
+        user_type: UserType,
+        m: &mut HashMap<String, UserIdentity>,
+        mode: LoadMode,
+    ) -> Result<()> {
+        self.load_user_identity_with(name, user_type, mode).await.map(|u| {
+            m.insert(name.to_owned(), u);
+        })
+    }
+
+    /// Parameterized core of [`Store::load_group`].
+    async fn load_group_with(&self, name: &str, m: &mut HashMap<String, GroupInfo>, mode: LoadMode) -> Result<()> {
+        let u: GroupInfo = self
+            .load_iam_config_with(get_group_info_path(name), mode)
+            .await
+            .map_err(|err| {
+                if is_err_config_not_found(&err) {
+                    Error::NoSuchGroup(name.to_string())
+                } else {
+                    err
+                }
+            })?;
+
+        m.insert(name.to_owned(), u);
+        Ok(())
+    }
+
+    /// Parameterized core of [`Store::load_policy`].
+    async fn load_policy_with(&self, name: &str, mode: LoadMode) -> Result<PolicyDoc> {
+        let (data, obj) = self
+            .load_iamconfig_bytes_with_metadata(get_policy_doc_path(name), mode)
+            .await
+            .map_err(|err| {
+                if is_err_config_not_found(&err) {
+                    Error::NoSuchPolicy
+                } else {
+                    err
+                }
+            })?;
+
+        let mut info = PolicyDoc::try_from(data)?;
+
+        if info.version == 0 {
+            info.create_date = obj.mod_time;
+            info.update_date = obj.mod_time;
+        }
+
+        Ok(info)
+    }
+
+    /// Parameterized core of [`Store::load_mapped_policy`].
+    async fn load_mapped_policy_with(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        m: &mut HashMap<String, MappedPolicy>,
+        mode: LoadMode,
+    ) -> Result<()> {
+        let info = self.load_mapped_policy_internal(name, user_type, is_group, mode).await?;
+
+        m.insert(name.to_owned(), info);
+
+        Ok(())
+    }
+
+    async fn load_mapped_policy_internal(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        mode: LoadMode,
+    ) -> Result<MappedPolicy> {
         let info: MappedPolicy = self
-            .load_iam_config(get_mapped_policy_path(name, user_type, is_group))
+            .load_iam_config_with(get_mapped_policy_path(name, user_type, is_group), mode)
             .await
             .map_err(|err| {
                 if is_err_config_not_found(&err) {
@@ -539,13 +720,14 @@ impl ObjectStore {
         names: &[String],
         user_type: UserType,
         is_group: bool,
+        mode: LoadMode,
     ) -> Result<Vec<MappedPolicy>> {
         let mut futures = Vec::with_capacity(names.len());
 
         for name in names {
             let policy_name = name.trim_end_matches(".json");
             futures.push(async move {
-                match self.load_mapped_policy_internal(policy_name, user_type, is_group).await {
+                match self.load_mapped_policy_internal(policy_name, user_type, is_group, mode).await {
                     Ok(p) => Ok(p),
                     Err(err) => {
                         if !is_err_no_such_policy(&err) {
@@ -599,21 +781,7 @@ impl Store for ObjectStore {
         false
     }
     async fn load_iam_config<Item: DeserializeOwned>(&self, path: impl AsRef<str> + Send) -> Result<Item> {
-        let path_ref = path.as_ref();
-        let (data, obj) = read_iam_config_with_metadata(self.object_api.clone(), path_ref, &IamObjectOptions::default()).await?;
-
-        let outcome = match Self::decrypt_data_with_source(&data) {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(path = %path_ref, error = %err, "IAM config decrypt failed; keeping file");
-                // keep the config file when decrypt failed - do not delete
-                return Err(Error::ConfigNotFound);
-            }
-        };
-
-        self.maybe_schedule_lazy_rewrite(path_ref, &outcome, &obj);
-
-        Ok(serde_json::from_slice(&outcome.plain)?)
+        self.load_iam_config_with(path, LoadMode::Locked).await
     }
     /// Saves IAM configuration with a retry mechanism on failure.
     ///
@@ -696,58 +864,10 @@ impl Store for ObjectStore {
         Ok(())
     }
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity> {
-        let mut u: UserIdentity = self
-            .load_iam_config(get_user_identity_path(name, user_type))
-            .await
-            .map_err(|err| {
-                if is_err_config_not_found(&err) {
-                    warn!(name, user_type = ?user_type, "IAM user identity missing");
-                    Error::NoSuchUser(name.to_owned())
-                } else {
-                    warn!(name, user_type = ?user_type, error = ?err, "IAM user identity load failed");
-                    err
-                }
-            })?;
-
-        if u.credentials.is_expired() {
-            let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
-            let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
-            warn!(name, user_type = ?user_type, "IAM user identity expired and was removed");
-            return Err(Error::NoSuchUser(name.to_owned()));
-        }
-
-        if u.credentials.access_key.is_empty() {
-            u.credentials.access_key = name.to_owned();
-        }
-
-        if !u.credentials.session_token.is_empty() {
-            let claims_result = if user_type == UserType::Svc && u.credentials.expiration.is_none() {
-                extract_jwt_claims_allow_missing_exp(&u)
-            } else {
-                extract_jwt_claims(&u)
-            };
-
-            match claims_result {
-                Ok(claims) => {
-                    u.credentials.claims = Some(claims);
-                }
-                Err(err) => {
-                    if u.credentials.is_temp() {
-                        let _ = self.delete_iam_config(get_user_identity_path(name, user_type)).await;
-                        let _ = self.delete_iam_config(get_mapped_policy_path(name, user_type, false)).await;
-                    }
-                    warn!(name, user_type = ?user_type, error = ?err, "IAM JWT claim extraction failed");
-                    return Err(Error::NoSuchUser(name.to_owned()));
-                }
-            }
-        }
-
-        Ok(u)
+        self.load_user_identity_with(name, user_type, LoadMode::Locked).await
     }
     async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
-        self.load_user_identity(name, user_type).await.map(|u| {
-            m.insert(name.to_owned(), u);
-        })
+        self.load_user_with(name, user_type, m, LoadMode::Locked).await
     }
     async fn load_users(&self, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
         let base_prefix = match user_type {
@@ -807,16 +927,7 @@ impl Store for ObjectStore {
         Ok(())
     }
     async fn load_group(&self, name: &str, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
-        let u: GroupInfo = self.load_iam_config(get_group_info_path(name)).await.map_err(|err| {
-            if is_err_config_not_found(&err) {
-                Error::NoSuchGroup(name.to_string())
-            } else {
-                err
-            }
-        })?;
-
-        m.insert(name.to_owned(), u);
-        Ok(())
+        self.load_group_with(name, m, LoadMode::Locked).await
     }
     async fn load_groups(&self, m: &mut HashMap<String, GroupInfo>) -> Result<()> {
         let ctx = CancellationToken::new();
@@ -859,25 +970,7 @@ impl Store for ObjectStore {
         Ok(())
     }
     async fn load_policy(&self, name: &str) -> Result<PolicyDoc> {
-        let (data, obj) = self
-            .load_iamconfig_bytes_with_metadata(get_policy_doc_path(name))
-            .await
-            .map_err(|err| {
-                if is_err_config_not_found(&err) {
-                    Error::NoSuchPolicy
-                } else {
-                    err
-                }
-            })?;
-
-        let mut info = PolicyDoc::try_from(data)?;
-
-        if info.version == 0 {
-            info.create_date = obj.mod_time;
-            info.update_date = obj.mod_time;
-        }
-
-        Ok(info)
+        self.load_policy_with(name, LoadMode::Locked).await
     }
 
     async fn load_policy_doc(&self, name: &str, m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
@@ -939,11 +1032,8 @@ impl Store for ObjectStore {
         is_group: bool,
         m: &mut HashMap<String, MappedPolicy>,
     ) -> Result<()> {
-        let info = self.load_mapped_policy_internal(name, user_type, is_group).await?;
-
-        m.insert(name.to_owned(), info);
-
-        Ok(())
+        self.load_mapped_policy_with(name, user_type, is_group, m, LoadMode::Locked)
+            .await
     }
     async fn load_mapped_policies(
         &self,
@@ -985,6 +1075,11 @@ impl Store for ObjectStore {
     }
 
     async fn load_all(&self, cache: &Cache) -> Result<()> {
+        // Bulk snapshot load: must stay free of namespace locks so IAM
+        // bootstrap only depends on the storage read quorum, never on the
+        // node-counted lock quorum (rustfs#4304; startup contract rustfs#4056).
+        const LOAD_ALL_MODE: LoadMode = LoadMode::BootstrapNoLock;
+
         let cache_snapshot = cache.snapshot();
         let listed_config_items = self.list_all_iamconfig_items().await?;
 
@@ -995,7 +1090,7 @@ impl Store for ObjectStore {
 
             loop {
                 if policies_list.len() < 32 {
-                    let policy_docs = self.load_policy_doc_concurrent(&policies_list).await?;
+                    let policy_docs = self.load_policy_doc_concurrent(&policies_list, LOAD_ALL_MODE).await?;
 
                     for (idx, p) in policy_docs.into_iter().enumerate() {
                         if p.policy.version.is_empty() {
@@ -1011,7 +1106,7 @@ impl Store for ObjectStore {
                     break;
                 }
 
-                let policy_docs = self.load_policy_doc_concurrent(&policies_list).await?;
+                let policy_docs = self.load_policy_doc_concurrent(&policies_list, LOAD_ALL_MODE).await?;
 
                 for (idx, p) in policy_docs.into_iter().enumerate() {
                     if p.policy.version.is_empty() {
@@ -1035,7 +1130,9 @@ impl Store for ObjectStore {
 
             loop {
                 if item_name_list.len() < 32 {
-                    let items = self.load_user_concurrent(&item_name_list, UserType::Reg).await?;
+                    let items = self
+                        .load_user_concurrent(&item_name_list, UserType::Reg, LOAD_ALL_MODE)
+                        .await?;
 
                     for (idx, p) in items.into_iter().enumerate() {
                         if p.credentials.access_key.is_empty() {
@@ -1049,7 +1146,9 @@ impl Store for ObjectStore {
                     break;
                 }
 
-                let items = self.load_user_concurrent(&item_name_list, UserType::Reg).await?;
+                let items = self
+                    .load_user_concurrent(&item_name_list, UserType::Reg, LOAD_ALL_MODE)
+                    .await?;
 
                 for (idx, p) in items.into_iter().enumerate() {
                     if p.credentials.access_key.is_empty() {
@@ -1073,7 +1172,7 @@ impl Store for ObjectStore {
             for item in item_name_list.iter() {
                 let name = rustfs_utils::path::dir(item);
                 debug!(group = %name, "IAM group loaded");
-                if let Err(err) = self.load_group(&name, &mut items_cache).await {
+                if let Err(err) = self.load_group_with(&name, &mut items_cache, LOAD_ALL_MODE).await {
                     return Err(Error::other(format!("load group failed: {err}")));
                 };
             }
@@ -1091,7 +1190,7 @@ impl Store for ObjectStore {
             loop {
                 if item_name_list.len() < 32 {
                     let items = self
-                        .load_mapped_policy_concurrent(&item_name_list, UserType::Reg, false)
+                        .load_mapped_policy_concurrent(&item_name_list, UserType::Reg, false, LOAD_ALL_MODE)
                         .await?;
 
                     for (idx, p) in items.into_iter().enumerate() {
@@ -1107,7 +1206,7 @@ impl Store for ObjectStore {
                 }
 
                 let items = self
-                    .load_mapped_policy_concurrent(&item_name_list, UserType::Reg, false)
+                    .load_mapped_policy_concurrent(&item_name_list, UserType::Reg, false, LOAD_ALL_MODE)
                     .await?;
 
                 for (idx, p) in items.into_iter().enumerate() {
@@ -1135,7 +1234,9 @@ impl Store for ObjectStore {
                 let name = item.trim_end_matches(".json");
 
                 debug!(group = %name, "IAM group policy loaded");
-                if let Err(err) = self.load_mapped_policy(name, UserType::Reg, true, &mut items_cache).await
+                if let Err(err) = self
+                    .load_mapped_policy_with(name, UserType::Reg, true, &mut items_cache, LOAD_ALL_MODE)
+                    .await
                     && !is_err_no_such_policy(&err)
                 {
                     return Err(Error::other(format!("load group policy failed: {err}")));
@@ -1154,7 +1255,9 @@ impl Store for ObjectStore {
             for item in item_name_list.iter() {
                 let name = rustfs_utils::path::dir(item);
                 debug!(user = %name, "IAM service user loaded");
-                if let Err(err) = self.load_user(&name, UserType::Svc, &mut items_cache).await
+                if let Err(err) = self
+                    .load_user_with(&name, UserType::Svc, &mut items_cache, LOAD_ALL_MODE)
+                    .await
                     && !is_err_no_such_user(&err)
                 {
                     return Err(Error::other(format!("load svc user failed: {err}")));
@@ -1166,7 +1269,7 @@ impl Store for ObjectStore {
                 if !user_items_cache.contains_key(&parent) {
                     debug!(user = %parent, "IAM STS parent policy loaded");
                     if let Err(err) = self
-                        .load_mapped_policy(&parent, UserType::Sts, false, &mut sts_policies_cache)
+                        .load_mapped_policy_with(&parent, UserType::Sts, false, &mut sts_policies_cache, LOAD_ALL_MODE)
                         .await
                         && !is_err_no_such_policy(&err)
                     {
@@ -1187,7 +1290,10 @@ impl Store for ObjectStore {
 
                 let name = rustfs_utils::path::dir(item);
                 debug!(user = %name, "IAM STS user loaded");
-                if let Err(err) = self.load_user(&name, UserType::Sts, &mut sts_items_cache).await {
+                if let Err(err) = self
+                    .load_user_with(&name, UserType::Sts, &mut sts_items_cache, LOAD_ALL_MODE)
+                    .await
+                {
                     debug!(user = %name, error = %err, "IAM STS user load failed");
                 };
             }
@@ -1199,7 +1305,7 @@ impl Store for ObjectStore {
                 let name = item.trim_end_matches(".json");
                 debug!(user = %name, "IAM STS user policy loaded");
                 if let Err(err) = self
-                    .load_mapped_policy(name, UserType::Sts, false, &mut sts_policies_cache)
+                    .load_mapped_policy_with(name, UserType::Sts, false, &mut sts_policies_cache, LOAD_ALL_MODE)
                     .await
                 {
                     debug!(user = %name, error = %err, "IAM STS user policy load failed");
@@ -1234,11 +1340,28 @@ impl Store for ObjectStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecryptSource, ObjectStore};
+    use super::{DecryptSource, LoadMode, ObjectStore};
     use crate::keyring;
     use rustfs_credentials::{Credentials, init_global_action_credentials};
     use serial_test::serial;
     use temp_env::with_vars;
+
+    /// rustfs#4304 / startup contract rustfs#4056: the bulk snapshot load
+    /// (`load_all`) must never depend on the node-counted namespace lock
+    /// quorum, so its reads have to carry `no_lock = true` down to the
+    /// storage layer.
+    #[test]
+    fn test_bootstrap_load_mode_bypasses_namespace_locks() {
+        assert!(LoadMode::BootstrapNoLock.no_lock());
+        assert!(LoadMode::BootstrapNoLock.read_opts().no_lock);
+    }
+
+    /// On-line single-object loads keep the locked read semantics.
+    #[test]
+    fn test_locked_load_mode_keeps_namespace_locks() {
+        assert!(!LoadMode::Locked.no_lock());
+        assert!(!LoadMode::Locked.read_opts().no_lock);
+    }
 
     fn test_cred() -> Credentials {
         if let Some(cred) = crate::root_credentials::credentials() {
