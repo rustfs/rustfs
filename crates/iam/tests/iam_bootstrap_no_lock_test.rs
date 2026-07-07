@@ -29,10 +29,11 @@
 //! plain storage reads keep working. The old (locked) `load_group` path must
 //! fail and the lock-free `load_all` path must succeed.
 
-use rustfs_ecstore::api::disk::endpoint::Endpoint;
-use rustfs_ecstore::api::global::update_erasure_type;
-use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints, SetupType};
-use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
+mod ecstore_test_compat;
+
+use ecstore_test_compat::fixture::{
+    ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, SetupType, init_local_disks, update_erasure_type,
+};
 use rustfs_iam::cache::Cache;
 use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::store::{GroupInfo, Store};
