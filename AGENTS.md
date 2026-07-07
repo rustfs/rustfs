@@ -108,6 +108,10 @@ Do not open a PR with code changes when the required checks fail.
 - Include verification commands in the PR description.
 - When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
 - Do not include the literal sequence `\n` in any GitHub issue, pull request, or discussion comment.
+- Do not hard-wrap prose in PR/issue/discussion bodies; write each paragraph as a
+  single line and let it reflow. GitHub renders single newlines inside a paragraph
+  as line breaks, so mid-sentence wrapping shows up as ugly breaks. Only break lines
+  for list items, code blocks, and deliberate separators.
 - After fixing code review comments or CI findings, always mark corresponding review
   comments/threads as resolved before returning to the user.
 - In handling review comments, confirm the underlying issue before changing code.
