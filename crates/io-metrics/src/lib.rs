@@ -157,8 +157,9 @@ pub use lock_metrics::{
 };
 
 pub use process_lock_metrics::{
-    ProcessLockSnapshot, ProcessPlatformSnapshot, record_read_lock_held_acquire, record_read_lock_held_release,
-    record_write_lock_held_acquire, record_write_lock_held_release, snapshot_process_lock_counts,
+    ProcessLockEventSnapshot, ProcessLockSnapshot, ProcessPlatformSnapshot, record_lock_reclaimed,
+    record_lock_refresh_quorum_lost, record_read_lock_held_acquire, record_read_lock_held_release,
+    record_write_lock_held_acquire, record_write_lock_held_release, snapshot_process_lock_counts, snapshot_process_lock_events,
     snapshot_process_platform_stats,
 };
 pub use s3_api_metrics::{init_s3_metrics, record_s3_op};
