@@ -191,8 +191,6 @@ mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
-# io-uring is Linux-only. Scope the feature to Linux targets.
-tokio = { workspace = true, features = ["io-uring"] }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
