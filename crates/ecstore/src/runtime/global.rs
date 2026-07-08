@@ -18,7 +18,6 @@ use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
     layout::endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
-    services::event_notification::EventNotifier,
     services::tier::tier::TierConfigMgr,
     store::ECStore,
 };
@@ -59,7 +58,6 @@ lazy_static! {
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_ROOT_DISK_THRESHOLD: RwLock<u64> = RwLock::new(0);
     pub static ref GLOBAL_LIFECYCLE_SYS: Arc<LifecycleSys> = LifecycleSys::new();
-    pub static ref GLOBAL_EVENT_NOTIFIER: Arc<RwLock<EventNotifier>> = EventNotifier::new();
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
     pub static ref GLOBAL_LOCAL_NODE_NAME_FALLBACK: String = "127.0.0.1:9000".to_string();
     pub static ref GLOBAL_LOCAL_NODE_NAME_HEX_FALLBACK: String =

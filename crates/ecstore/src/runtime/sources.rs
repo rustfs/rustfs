@@ -32,8 +32,8 @@ use crate::{
     error::Result,
     layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
-        GLOBAL_BOOT_TIME, GLOBAL_EVENT_NOTIFIER, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
-        GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD, TypeLocalDiskSetDrives,
+        GLOBAL_BOOT_TIME, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
+        GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD, TypeLocalDiskSetDrives,
         get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
         get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
         global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local,
@@ -399,7 +399,7 @@ pub fn transition_state_handle() -> Arc<TransitionState> {
 }
 
 pub(crate) fn event_notifier_handle() -> Arc<RwLock<EventNotifier>> {
-    GLOBAL_EVENT_NOTIFIER.clone()
+    crate::runtime::global::current_ctx().event_notifier()
 }
 
 pub(crate) async fn local_disk_by_path(path: &str) -> Option<DiskStore> {
