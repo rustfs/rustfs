@@ -1535,6 +1535,12 @@ impl ScannerIODisk for Disk {
 
         let lock_config = object_lock_config_for_scanner_item(&item).await;
 
+        // Count every version this object contributes to the scan, independent
+        // of any lifecycle configuration, so scan-coverage metrics stay honest
+        // on clusters without ILM rules. Recorded before `apply_actions` moves
+        // `object_infos`.
+        global_metrics().record_scanner_versions_scanned(object_infos.len() as u64);
+
         item.apply_actions(object_infos, lock_config, &mut size_summary).await;
 
         if !free_version_infos.is_empty() {

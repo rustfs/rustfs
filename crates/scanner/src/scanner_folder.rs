@@ -821,6 +821,14 @@ impl ScannerItem {
                 return;
             }
         };
+
+        // Every version handed to the evaluator counts as an ILM-checked
+        // version, whether or not a rule matched (NoneAction included). This is
+        // reached only for buckets with lifecycle rules; it feeds
+        // rustfs_ilm_versions_scanned_total via the Lifecycle source's checked
+        // counter.
+        global_metrics().record_scanner_source_checked(ScannerWorkSource::Lifecycle, object_opts.len() as u64);
+
         let mut to_delete_objs: Vec<ObjectToDelete> = Vec::new();
         let mut noncurrent_events: Vec<Event> = Vec::new();
         let mut noncurrent_accounting: Vec<PendingScannerAccounting<'_>> = Vec::new();

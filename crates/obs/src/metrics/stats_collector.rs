@@ -990,7 +990,12 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let completed_cycles = metrics.life_time_ops.get("scan_cycle").copied().unwrap_or_default();
     let directories_scanned = metrics.life_time_ops.get("scan_folder").copied().unwrap_or_default();
     let objects_scanned = metrics.life_time_ops.get("scan_object").copied().unwrap_or_default();
-    let versions_scanned = scanner_lifecycle_checked_versions(&metrics);
+    // Real scan coverage: every version the scanner walked, independent of ILM
+    // rules. The ILM-checked subset (`scanner_lifecycle_checked_versions`) still
+    // feeds the ILM collector's versions_scanned, but the scanner collector must
+    // report the total scanned versions — otherwise clusters without lifecycle
+    // rules report zero here while objects_scanned keeps climbing.
+    let versions_scanned = metrics.versions_scanned;
     let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
     let last_activity_seconds = now.signed_duration_since(reference_time).num_seconds().max(0) as u64;
     let active_paths = metrics.active_scan_paths as u64;

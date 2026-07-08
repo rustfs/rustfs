@@ -750,6 +750,11 @@ pub struct Metrics {
     last_scan_cycle_duration_millis: AtomicU64,
     last_scan_cycle_objects_scanned: AtomicU64,
     last_scan_cycle_directories_scanned: AtomicU64,
+    /// Lifetime count of object versions walked by the data scanner, counted
+    /// for every version regardless of whether any lifecycle rule applies.
+    /// This is the honest source for `rustfs_scanner_versions_scanned_total`;
+    /// ILM-checked versions are tracked separately on the `Lifecycle` source.
+    lifetime_versions_scanned: AtomicU64,
     last_scan_cycle_bucket_drive_scans: AtomicU64,
     last_scan_cycle_bucket_drive_failures: AtomicU64,
     last_scan_cycle_yield_events: AtomicU64,
@@ -1106,6 +1111,9 @@ pub struct ScannerMetricsReport {
     pub oldest_active_path_age_seconds: u64,
     pub life_time_ops: HashMap<String, u64>,
     pub life_time_ilm: HashMap<String, u64>,
+    /// Lifetime object versions scanned, independent of ILM configuration.
+    #[serde(default)]
+    pub versions_scanned: u64,
     pub last_minute: ScannerLastMinute,
     pub active_paths: Vec<String>,
     pub current_scan_mode: String,
@@ -1704,6 +1712,7 @@ impl Metrics {
             last_scan_cycle_duration_millis: AtomicU64::new(0),
             last_scan_cycle_objects_scanned: AtomicU64::new(0),
             last_scan_cycle_directories_scanned: AtomicU64::new(0),
+            lifetime_versions_scanned: AtomicU64::new(0),
             last_scan_cycle_bucket_drive_scans: AtomicU64::new(0),
             last_scan_cycle_bucket_drive_failures: AtomicU64::new(0),
             last_scan_cycle_yield_events: AtomicU64::new(0),
@@ -2110,6 +2119,17 @@ impl Metrics {
 
     pub fn record_scanner_source_checked(&self, source: ScannerWorkSource, count: u64) {
         self.record_scanner_source_work(source, ScannerSourceWorkUpdate::checked(count));
+    }
+
+    /// Record `count` object versions walked by the data scanner.
+    ///
+    /// Every version the scanner visits is counted here, independent of
+    /// lifecycle configuration, so `rustfs_scanner_versions_scanned_total`
+    /// reflects real scan coverage even on clusters with no ILM rules. ILM
+    /// evaluation coverage is recorded separately via the `Lifecycle` source's
+    /// `checked` counter and surfaces as `rustfs_ilm_versions_scanned_total`.
+    pub fn record_scanner_versions_scanned(&self, count: u64) {
+        self.lifetime_versions_scanned.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_scanner_source_queued(&self, source: ScannerWorkSource, count: u64) {
@@ -2695,6 +2715,7 @@ impl Metrics {
             .map(|(disk, state)| format!("{disk}/{}", state.path))
             .collect();
         m.current_scan_mode = self.current_scan_mode().as_str().to_string();
+        m.versions_scanned = self.lifetime_versions_scanned.load(Ordering::Relaxed);
         m.leader_lock_state = self.scanner_leader_lock_state.read().await.clone();
         m.leader_lock_held_by_this_process = self.scanner_leader_lock_held.load(Ordering::Relaxed);
         m.leader_lock_last_error = self.scanner_leader_lock_last_error.read().await.clone();
@@ -3052,6 +3073,50 @@ mod tests {
         assert_eq!(report.current_disk_scan_concurrency_limit, 0);
         assert_eq!(report.current_disk_bucket_scans_queued, 0);
         assert_eq!(report.current_disk_bucket_scans_active, 0);
+    }
+
+    #[tokio::test]
+    async fn report_counts_scanned_versions_independent_of_lifecycle() {
+        let metrics = Metrics::new();
+
+        // No ILM configuration touched: scanned versions must still accrue so
+        // rustfs_scanner_versions_scanned_total reflects real coverage.
+        metrics.record_scanner_versions_scanned(3);
+        metrics.record_scanner_versions_scanned(5);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.versions_scanned, 8);
+        // ILM-checked versions live on the Lifecycle source and stay zero when
+        // no lifecycle evaluation ran.
+        let lifecycle_checked = report
+            .source_work
+            .iter()
+            .find(|s| s.source == "lifecycle")
+            .map(|s| s.checked)
+            .unwrap_or_default();
+        assert_eq!(lifecycle_checked, 0);
+    }
+
+    #[tokio::test]
+    async fn report_tracks_lifecycle_checked_versions_separately() {
+        let metrics = Metrics::new();
+
+        // Simulate the scanner walking versions and, on a lifecycle-configured
+        // bucket, handing a subset to the ILM evaluator.
+        metrics.record_scanner_versions_scanned(10);
+        metrics.record_scanner_source_checked(ScannerWorkSource::Lifecycle, 4);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.versions_scanned, 10, "total scanned versions independent of ILM");
+        let lifecycle_checked = report
+            .source_work
+            .iter()
+            .find(|s| s.source == "lifecycle")
+            .map(|s| s.checked)
+            .unwrap_or_default();
+        assert_eq!(lifecycle_checked, 4, "ILM-checked versions tracked on the Lifecycle source");
     }
 
     #[tokio::test]
