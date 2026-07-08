@@ -609,26 +609,22 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
                 free_bytes: disk.available_space,
                 capacity_observation_state,
                 capacity_observation_age_seconds,
-                used_inodes: 0,
-                free_inodes: 0,
-                total_inodes: 0,
-                timeout_errors_total: 0,
-                io_errors_total: 0,
-                availability_errors_total: 0,
-                waiting_io: 0,
-                api_latency_micros: 0,
+                used_inodes: None,
+                free_inodes: None,
+                total_inodes: None,
+                timeout_errors_total: None,
+                io_errors_total: None,
+                availability_errors_total: None,
+                waiting_io: None,
+                api_latency_micros: None,
                 health: if is_online { 1 } else { 0 },
-                reads_per_sec: 0.0,
-                reads_kb_per_sec: 0.0,
-                reads_await: 0.0,
-                writes_per_sec: 0.0,
-                writes_kb_per_sec: 0.0,
-                writes_await: 0.0,
-                perc_util: if disk.total_space > 0 {
-                    (disk.used_space as f64 / disk.total_space as f64) * 100.0
-                } else {
-                    0.0
-                },
+                reads_per_sec: None,
+                reads_kb_per_sec: None,
+                reads_await: None,
+                writes_per_sec: None,
+                writes_kb_per_sec: None,
+                writes_await: None,
+                perc_util: None,
             }
         })
         .collect();
