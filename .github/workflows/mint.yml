@@ -50,8 +50,9 @@ on:
         required: false
         default: "minio/mint:edge"
   schedule:
-    # Weekly, after the Sunday s3-tests full sweep.
-    - cron: "0 4 * * 0"
+    # Weekly, after the Sunday s3-tests full sweep (starts 02:00 UTC, up to
+    # 3h) has finished, so the two never contend for the same runner pool.
+    - cron: "0 6 * * 0"
 
 env:
   S3_ACCESS_KEY: rustfsadmin

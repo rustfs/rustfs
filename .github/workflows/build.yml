@@ -21,6 +21,11 @@
 # 2. Upload binaries to OSS storage
 # 3. Trigger docker.yml to build and push images using the uploaded binaries
 #
+# Platform scope:
+# - Pushes to main (development builds) build the Linux targets only — they
+#   feed the dev download channel and Docker dev images. Tags, the weekly
+#   schedule and manual dispatch build the full platform matrix.
+#
 # Manual Parameters:
 # - build_docker: Build and push Docker images (default: true)
 # - platforms: Comma-separated platform IDs or 'all' (default: all)
@@ -46,7 +51,7 @@ on:
       - ".gitignore"
       - ".dockerignore"
   schedule:
-    - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
+    - cron: "0 1 * * 0" # Weekly on Sunday 01:00 UTC (staggered after the ci.yml midnight cron)
   workflow_dispatch:
     inputs:
       build_docker:
@@ -87,8 +92,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          fetch-depth: 0
 
       - name: Determine build strategy
         id: check
@@ -125,8 +128,7 @@ jobs:
             version="dev-${short_sha}"
             echo "🛠️  Development build detected"
           elif [[ "${{ github.event_name }}" == "schedule" ]] || \
-               [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
-               [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
+               [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             # Scheduled or manual build
             should_build=true
             build_type="development"
@@ -150,6 +152,7 @@ jobs:
   # Build RustFS binaries
   prepare-platform-matrix:
     name: Prepare Platform Matrix
+    needs: build-check
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -165,6 +168,18 @@ jobs:
           selected="$(echo "${selected}" | tr -d '[:space:]')"
           if [[ -z "${selected}" ]]; then
             selected="all"
+          fi
+
+          # Per-merge development builds only feed the dev download channel
+          # and the Docker dev images, which consume the Linux binaries; at
+          # the usual merge cadence most per-merge builds are cancelled by the
+          # next merge anyway. macOS and Windows stay covered by tag builds,
+          # the weekly scheduled build and manual dispatch.
+          if [[ "${selected}" == "all" \
+            && "${{ github.event_name }}" == "push" \
+            && "${{ needs.build-check.outputs.build_type }}" == "development" ]]; then
+            selected="linux-x86_64-musl,linux-aarch64-musl,linux-x86_64-gnu,linux-aarch64-gnu"
+            echo "Development (main push) build: restricting to Linux targets"
           fi
 
           all='{"include":[
@@ -783,12 +798,6 @@ jobs:
             sha512sum *.zip > SHA512SUMS
           fi
 
-          # Create signature placeholder files
-          for file in *.zip; do
-            echo "# Signature for $file" > "${file}.asc"
-            echo "# GPG signature will be added in future versions" >> "${file}.asc"
-          done
-
           cd ..
           python3 scripts/security/generate_release_supply_chain_assets.py \
             --asset-dir ./release-assets \
@@ -826,11 +835,12 @@ jobs:
 
           echo "✅ All assets uploaded successfully"
 
-  # Update latest.json for stable releases only
+  # Update latest.json for stable releases only: prerelease tags (alpha/beta/
+  # rc) must never overwrite the stable version pointer.
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type == 'release'
     runs-on: ubuntu-latest
     steps:
       - name: Update latest.json

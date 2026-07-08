@@ -46,6 +46,13 @@ permissions:
   contents: read
   pull-requests: write
 
+# Per-PR: a new push cancels the previous (up to 90-minute) A/B run instead of
+# stacking them. Nightly schedule and manual dispatch get a unique group and
+# always run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -53,11 +60,14 @@ env:
 jobs:
   warp-ab:
     name: Warp A/B budget gate
-    # Opt-in on PRs: only run when the `perf-ab` label is present. Always run on
-    # schedule / manual dispatch.
+    # Opt-in on PRs: only run when the `perf-ab` label is present, and for
+    # `labeled` events only when the label being added is `perf-ab` itself —
+    # adding an unrelated label to an opted-in PR must not re-run the gate.
+    # Always run on schedule / manual dispatch.
     if: >-
       github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'perf-ab')
+      (contains(github.event.pull_request.labels.*.name, 'perf-ab') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf-ab'))
     runs-on: sm-standard-2
     timeout-minutes: 90
     steps:
