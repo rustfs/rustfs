@@ -51,6 +51,7 @@
 
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
+use super::expiration_worker::{track_object_expiration, untrack_object_expiration};
 use super::storage_api::object::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use super::{SwiftError, SwiftResult, resolve_swift_object_store_handle};
 use axum::http::HeaderMap;
@@ -65,6 +66,7 @@ pub use super::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, Swift
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";
 const EVENT_SWIFT_OBJECT_STORAGE_STATE: &str = "swift_object_storage_state";
+const SWIFT_DELETE_AT_METADATA: &str = "x-delete-at";
 
 /// Maximum number of metadata headers allowed per object (Swift standard)
 const MAX_METADATA_COUNT: usize = 90;
@@ -264,6 +266,20 @@ fn validate_metadata(metadata: &HashMap<String, String>) -> SwiftResult<()> {
     Ok(())
 }
 
+fn metadata_delete_at(metadata: &HashMap<String, String>) -> Option<u64> {
+    metadata
+        .get(SWIFT_DELETE_AT_METADATA)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+async fn update_object_expiration_tracking(account: &str, container: &str, object: &str, delete_at: Option<u64>) {
+    if let Some(delete_at) = delete_at {
+        track_object_expiration(account, container, object, delete_at).await;
+    } else {
+        untrack_object_expiration(account, container, object).await;
+    }
+}
+
 /// Sanitize storage layer errors for client responses
 ///
 /// Logs detailed error server-side while returning generic message to client.
@@ -344,9 +360,10 @@ where
     }
 
     // 7. Extract and validate expiration headers (X-Delete-At / X-Delete-After)
-    if let Some(delete_at) = super::expiration::extract_expiration(headers)? {
+    let delete_at = super::expiration::extract_expiration(headers)?;
+    if let Some(delete_at) = delete_at {
         super::expiration::validate_expiration(delete_at)?;
-        user_metadata.insert("x-delete-at".to_string(), delete_at.to_string());
+        user_metadata.insert(SWIFT_DELETE_AT_METADATA.to_string(), delete_at.to_string());
     }
 
     // 8. Extract symlink target if creating a symlink
@@ -418,6 +435,8 @@ where
         .await
         .map_err(|e| sanitize_storage_error("Object upload", e))?;
 
+    update_object_expiration_tracking(account, container, object, delete_at).await;
+
     // 17. Return ETag (MD5 hash in hex format)
     Ok(obj_info.etag.unwrap_or_default())
 }
@@ -461,6 +480,7 @@ where
 
     // Validate metadata limits
     validate_metadata(metadata)?;
+    let delete_at = metadata_delete_at(metadata);
 
     // Get storage layer
     let Some(store) = resolve_swift_object_store_handle() else {
@@ -500,6 +520,8 @@ where
         .put_object(&bucket, &s3_key, &mut put_reader, &opts)
         .await
         .map_err(|e| sanitize_storage_error("Object upload", e))?;
+
+    update_object_expiration_tracking(account, container, object, delete_at).await;
 
     // Return ETag
     Ok(obj_info.etag.unwrap_or_default())
@@ -675,7 +697,10 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
     // 7. Delete object from storage
     // Swift DELETE is idempotent - returns success even if object doesn't exist
     match store.delete_object(&bucket, &s3_key, opts).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            untrack_object_expiration(account, container, object).await;
+            Ok(())
+        }
         Err(e) => {
             let err_str = e.to_string();
             // Only fail if the container (bucket) doesn't exist
@@ -683,6 +708,7 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
                 Err(SwiftError::NotFound(format!("Container '{}' not found", container)))
             } else if err_str.contains("Object not found") || err_str.contains("does not exist") {
                 // Object already gone - this is success for idempotent DELETE
+                untrack_object_expiration(account, container, object).await;
                 Ok(())
             } else {
                 Err(sanitize_storage_error("Object deletion", e))
@@ -769,6 +795,12 @@ pub async fn update_object_metadata(
         new_metadata.insert("content-type".to_string(), ct_str.to_string());
     }
 
+    let delete_at = super::expiration::extract_expiration(headers)?;
+    if let Some(delete_at) = delete_at {
+        super::expiration::validate_expiration(delete_at)?;
+        new_metadata.insert(SWIFT_DELETE_AT_METADATA.to_string(), delete_at.to_string());
+    }
+
     // 10. Validate metadata limits
     validate_metadata(&new_metadata)?;
 
@@ -786,6 +818,8 @@ pub async fn update_object_metadata(
         .put_object_metadata(&bucket, &s3_key, &update_opts)
         .await
         .map_err(|e| sanitize_storage_error("Metadata update", e))?;
+
+    update_object_expiration_tracking(account, container, object, delete_at).await;
 
     Ok(())
 }
@@ -1199,6 +1233,22 @@ mod tests {
         // But ".." in a filename should be allowed
         assert!(ObjectKeyMapper::validate_object_name("file..txt").is_ok());
         assert!(ObjectKeyMapper::validate_object_name("my..file.txt").is_ok());
+    }
+
+    #[test]
+    fn test_metadata_delete_at_parses_valid_timestamp() {
+        let mut metadata = HashMap::new();
+        metadata.insert(SWIFT_DELETE_AT_METADATA.to_string(), "1740000000".to_string());
+
+        assert_eq!(metadata_delete_at(&metadata), Some(1740000000));
+    }
+
+    #[test]
+    fn test_metadata_delete_at_ignores_invalid_timestamp() {
+        let mut metadata = HashMap::new();
+        metadata.insert(SWIFT_DELETE_AT_METADATA.to_string(), "invalid".to_string());
+
+        assert_eq!(metadata_delete_at(&metadata), None);
     }
 
     #[test]
