@@ -117,27 +117,19 @@ impl ConcurrencyConfig {
         let mut config = Self::default();
 
         // Read from environment if available
-        if let Ok(val) = std::env::var("RUSTFS_TIMEOUT_DEFAULT")
-            && let Ok(secs) = val.parse::<u64>()
-        {
+        if let Some(secs) = parse_env::<u64>("RUSTFS_TIMEOUT_DEFAULT") {
             config.timeout_policy.default_timeout = Duration::from_secs(secs);
         }
 
-        if let Ok(val) = std::env::var("RUSTFS_TIMEOUT_MAX")
-            && let Ok(secs) = val.parse::<u64>()
-        {
+        if let Some(secs) = parse_env::<u64>("RUSTFS_TIMEOUT_MAX") {
             config.timeout_policy.max_timeout = Duration::from_secs(secs);
         }
 
-        if let Ok(val) = std::env::var("RUSTFS_BACKPRESSURE_BUFFER_SIZE")
-            && let Ok(size) = val.parse::<usize>()
-        {
+        if let Some(size) = parse_env::<usize>("RUSTFS_BACKPRESSURE_BUFFER_SIZE") {
             config.backpressure_policy.buffer_size = size;
         }
 
-        if let Ok(val) = std::env::var("RUSTFS_IO_BUFFER_SIZE")
-            && let Ok(size) = val.parse::<usize>()
-        {
+        if let Some(size) = parse_env::<usize>("RUSTFS_IO_BUFFER_SIZE") {
             config.scheduler_policy.base_buffer_size = size;
         }
 
@@ -146,6 +138,9 @@ impl ConcurrencyConfig {
 
     /// Validate configuration
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.timeout_policy.default_timeout.is_zero() || self.timeout_policy.max_timeout.is_zero() {
+            return Err(ConfigError::InvalidTimeout("timeouts must be > 0".to_string()));
+        }
         if self.timeout_policy.default_timeout > self.timeout_policy.max_timeout {
             return Err(ConfigError::InvalidTimeout("default_timeout cannot exceed max_timeout".to_string()));
         }
@@ -153,6 +148,10 @@ impl ConcurrencyConfig {
             return Err(ConfigError::InvalidTimeout("min_timeout cannot exceed max_timeout".to_string()));
         }
 
+        // A zero-capacity pipe (duplex(0)) never accepts writes, hanging producers forever.
+        if self.backpressure_policy.buffer_size == 0 {
+            return Err(ConfigError::InvalidBackpressure("buffer_size must be > 0".to_string()));
+        }
         if self.backpressure_policy.high_watermark <= self.backpressure_policy.low_watermark
             || self.backpressure_policy.high_watermark > 100
         {
@@ -161,13 +160,34 @@ impl ConcurrencyConfig {
             ));
         }
 
+        if self.scheduler_policy.base_buffer_size == 0 {
+            return Err(ConfigError::InvalidScheduler("base_buffer_size must be > 0".to_string()));
+        }
         if self.scheduler_policy.base_buffer_size > self.scheduler_policy.max_buffer_size {
             return Err(ConfigError::InvalidScheduler(
                 "base_buffer_size cannot exceed max_buffer_size".to_string(),
             ));
         }
+        // Ensure the derived io-core config also holds its invariants.
+        self.scheduler_policy
+            .to_core_config()
+            .validate()
+            .map_err(|e| ConfigError::InvalidScheduler(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+/// Parse an environment variable, logging a warning instead of silently
+/// falling back to the default when the value is set but unparsable.
+fn parse_env<T: std::str::FromStr>(name: &str) -> Option<T> {
+    let val = std::env::var(name).ok()?;
+    match val.parse() {
+        Ok(parsed) => Some(parsed),
+        Err(_) => {
+            tracing::warn!(env_var = name, value = %val, "ignoring unparsable environment variable");
+            None
+        }
     }
 }
 
@@ -229,6 +249,69 @@ mod tests {
             config.validate().is_err(),
             "validate() should return an error when min_timeout > max_timeout"
         );
+    }
+
+    #[test]
+    fn test_zero_backpressure_buffer_size_rejected() {
+        let config = ConcurrencyConfig {
+            backpressure_policy: PipeBackpressurePolicy {
+                buffer_size: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            matches!(config.validate(), Err(ConfigError::InvalidBackpressure(_))),
+            "validate() must reject buffer_size=0 (duplex(0) hangs all writes)"
+        );
+    }
+
+    #[test]
+    fn test_zero_timeouts_rejected() {
+        let config = ConcurrencyConfig {
+            timeout_policy: TimeoutManagerPolicy {
+                default_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidTimeout(_))));
+
+        let config = ConcurrencyConfig {
+            timeout_policy: TimeoutManagerPolicy {
+                max_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidTimeout(_))));
+    }
+
+    #[test]
+    fn test_zero_scheduler_base_buffer_size_rejected() {
+        let config = ConcurrencyConfig {
+            scheduler_policy: SchedulerPolicy {
+                base_buffer_size: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidScheduler(_))));
+    }
+
+    #[test]
+    fn test_small_max_buffer_size_passes_core_validation() {
+        // max_buffer_size below the io-core default min_buffer_size (4KB) must
+        // still yield a valid core config (min lowered by to_core_config).
+        let config = ConcurrencyConfig {
+            scheduler_policy: SchedulerPolicy {
+                base_buffer_size: 1024,
+                max_buffer_size: 2048,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

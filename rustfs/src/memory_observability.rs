@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use rustfs_io_metrics::{
-    AllocatorMemoryObservation, record_allocator_memory_observation, record_cgroup_memory_split, record_cpu_usage,
-    record_memory_usage, record_process_memory_split, snapshot_process_resource_and_system,
+    AllocatorMemoryObservation, ProcessSampler, record_allocator_memory_observation, record_cgroup_memory_split,
+    record_cpu_usage, record_memory_usage, record_process_memory_split,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -22,7 +22,7 @@ use std::collections::HashMap;
 #[cfg(not(target_os = "windows"))]
 use std::ffi::CStr;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use sysinfo::System;
 use tokio_util::sync::CancellationToken;
@@ -368,9 +368,10 @@ pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> Memo
     )
 }
 
-async fn record_memory_snapshot() {
-    match tokio::task::spawn_blocking(|| {
-        let (resource, process) = snapshot_process_resource_and_system();
+async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
+    match tokio::task::spawn_blocking(move || {
+        let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (resource, process) = sampler.snapshot_resource_and_system();
         let total_memory = refresh_total_memory();
         let cgroup = read_cgroup_memory_snapshot();
         let allocator = read_allocator_memory_snapshot();
@@ -407,6 +408,7 @@ async fn record_memory_snapshot() {
 pub fn init_memory_observability(ctx: CancellationToken) {
     let interval_secs = configured_memory_observability_interval_secs();
     let interval = Duration::from_secs(interval_secs.max(1));
+    let process_sampler = Arc::new(Mutex::new(ProcessSampler::new()));
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -419,7 +421,7 @@ pub fn init_memory_observability(ctx: CancellationToken) {
                     break;
                 }
                 _ = ticker.tick() => {
-                    record_memory_snapshot().await;
+                    record_memory_snapshot(Arc::clone(&process_sampler)).await;
                 }
             }
         }

@@ -123,12 +123,16 @@ impl OpsProfilerRegistry {
     }
 
     pub fn authorize_read(&self, request: OpsProfilerReadRequest<'_>) -> OpsProfilerAccessDecision {
-        if !self.registrations.contains_key(request.backend) {
-            return OpsProfilerAccessDecision::DenyUnknownBackend;
-        }
-
+        // Authorize before probing the registry: checking existence first would
+        // let an unauthorized caller distinguish a registered backend
+        // (DenyMissingAdminAction) from an unknown one (DenyUnknownBackend),
+        // leaking registry contents.
         if !request.admin_action_authorized {
             return OpsProfilerAccessDecision::DenyMissingAdminAction;
+        }
+
+        if !self.registrations.contains_key(request.backend) {
+            return OpsProfilerAccessDecision::DenyUnknownBackend;
         }
 
         if request.capability != OPS_PROFILER_CAPABILITY {
@@ -204,6 +208,30 @@ mod tests {
             }),
             OpsProfilerAccessDecision::DenyMissingAdminAction
         );
+    }
+
+    #[test]
+    fn unauthorized_read_does_not_leak_backend_existence() {
+        let mut registry = OpsProfilerRegistry::new();
+        registry
+            .register_schema(&builtin_ops_profiler_extension_schema(), &builtin_ops_profiler_contract())
+            .expect("builtin ops profiler contract should register");
+
+        // A registered backend and an unknown backend must be indistinguishable
+        // to an unauthorized caller: both deny on authorization, not existence.
+        let registered = registry.authorize_read(OpsProfilerReadRequest {
+            backend: "cpu_pprof",
+            capability: OPS_PROFILER_CAPABILITY,
+            admin_action_authorized: false,
+        });
+        let unknown = registry.authorize_read(OpsProfilerReadRequest {
+            backend: "does_not_exist",
+            capability: OPS_PROFILER_CAPABILITY,
+            admin_action_authorized: false,
+        });
+
+        assert_eq!(registered, OpsProfilerAccessDecision::DenyMissingAdminAction);
+        assert_eq!(unknown, OpsProfilerAccessDecision::DenyMissingAdminAction);
     }
 
     #[test]

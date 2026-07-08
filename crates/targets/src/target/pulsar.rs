@@ -29,12 +29,16 @@ use crate::{
     },
 };
 use async_trait::async_trait;
+// Use parking_lot's Mutex for the synchronous client/TLS state guards: it does
+// not poison on panic, so a panic while a guard is held cannot cascade into
+// `.unwrap()` panics on every later access (backlog#983).
+use parking_lot::Mutex;
 use pulsar::{Authentication, Producer, Pulsar, TokioExecutor};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, instrument};
 use url::Url;
@@ -208,8 +212,8 @@ where
         Box::new(PulsarTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
-            client: Mutex::new(self.client.lock().unwrap().clone()),
-            tls_state: Mutex::new(self.tls_state.lock().unwrap().clone()),
+            client: Mutex::new(self.client.lock().clone()),
+            tls_state: Mutex::new(self.tls_state.lock().clone()),
             tls_adapter: self.tls_adapter.clone(),
             producer: AsyncMutex::new(None),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
@@ -247,12 +251,12 @@ where
     }
 
     fn clear_cached_client_connection(&self) {
-        self.client.lock().unwrap().take();
+        self.client.lock().take();
     }
 
     fn clear_cached_client(&self) {
         self.clear_cached_client_connection();
-        self.tls_state.lock().unwrap().reset();
+        self.tls_state.lock().reset();
     }
 
     async fn get_or_connect_client(&self) -> Result<Pulsar<TokioExecutor>, TargetError> {
@@ -261,28 +265,28 @@ where
         if let Some(adapter) = &self.tls_adapter {
             let material = adapter.current_material();
             {
-                let mut guard = self.client.lock().unwrap();
+                let mut guard = self.client.lock();
                 *guard = Some((*material).clone());
             }
         } else {
             let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "").await?;
             let tls_changed = {
-                let tls_state_guard = self.tls_state.lock().unwrap();
+                let tls_state_guard = self.tls_state.lock();
                 tls_state_guard.needs_update(&next_fingerprint)
             };
             if tls_changed {
                 self.clear_cached_client_connection();
-                self.tls_state.lock().unwrap().refresh(next_fingerprint);
+                self.tls_state.lock().refresh(next_fingerprint);
             }
         }
 
-        if let Some(client) = self.client.lock().unwrap().clone() {
+        if let Some(client) = self.client.lock().clone() {
             return Ok(client);
         }
 
         let client = connect_pulsar(&self.args).await?;
         self.connected.store(true, Ordering::SeqCst);
-        let mut guard = self.client.lock().unwrap();
+        let mut guard = self.client.lock();
         let shared = guard.get_or_insert_with(|| client.clone()).clone();
         Ok(shared)
     }
@@ -363,7 +367,7 @@ where
     ) -> Result<(), TargetError> {
         // Pulsar client is Clone, so we clone from the Arc and store it.
         {
-            let mut guard = self.client.lock().unwrap();
+            let mut guard = self.client.lock();
             *guard = Some((*material).clone());
         }
         // Producer is bound to the old client; clear it so next send rebuilds.

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::manifest::{
-    TargetPluginDistributionManifest, TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginMarketplaceManifest,
-    TargetPluginPackaging, TargetPluginRuntimeTransport,
+    SUPPORTED_PLUGIN_API_COMPATIBILITY_VERSION, TargetPluginDistributionManifest, TargetPluginExternalRuntimeContract,
+    TargetPluginManifest, TargetPluginMarketplaceManifest, TargetPluginPackaging,
 };
 use crate::runtime::sidecar::{SidecarRuntimePolicy, SidecarRuntimeSafetyChecks};
 use crate::runtime::sidecar_protocol::SIDECAR_RUNTIME_PROTOCOL_VERSION;
@@ -288,11 +288,24 @@ pub fn plan_external_target_plugin_action(
     host_target_triple: &str,
 ) -> Result<TargetPluginExternalActionDecision, TargetPluginExternalActionError> {
     validate_external_action_subject(manifest)?;
-    validate_external_action_gate(gate)?;
 
+    // The external-plugin flow master switch gates every action.
+    if !gate.enabled {
+        return Err(TargetPluginExternalActionError::ExternalFlowDisabled);
+    }
+
+    // Gate split: the circuit breaker and runtime-activation checks only guard
+    // the *activating* actions (Install/Enable). Disable and Rollback are
+    // break-glass remediation and must stay available precisely when the
+    // breaker is open — otherwise a failing plugin can never be stopped or
+    // rolled back.
     match action {
-        TargetPluginExternalAction::Install => plan_external_install(manifest, action, gate, host_target_triple),
+        TargetPluginExternalAction::Install => {
+            validate_external_activation_gate(gate)?;
+            plan_external_install(manifest, action, installation, gate, host_target_triple)
+        }
         TargetPluginExternalAction::Enable => {
+            validate_external_activation_gate(gate)?;
             require_installed(manifest.plugin_id, installation)?;
             Ok(TargetPluginExternalActionDecision {
                 action,
@@ -355,9 +368,10 @@ pub fn validate_external_plugin_installation(
         return Err(format!("provider {} is not allowed by install policy", manifest.provider));
     }
 
-    if runtime_contract.transport == TargetPluginRuntimeTransport::Grpc
-        && runtime_contract.protocol_version != SIDECAR_RUNTIME_PROTOCOL_VERSION
-    {
+    // Enforce the sidecar runtime protocol version for *every* external
+    // transport. Gating this behind a specific transport let an external
+    // plugin skip the check simply by declaring a different transport.
+    if runtime_contract.protocol_version != SIDECAR_RUNTIME_PROTOCOL_VERSION {
         return Err(format!(
             "sidecar runtime protocol mismatch: expected {}, got {}",
             SIDECAR_RUNTIME_PROTOCOL_VERSION, runtime_contract.protocol_version
@@ -378,11 +392,10 @@ pub fn validate_external_plugin_installation(
                 artifact.artifact_id, artifact.download_uri
             ));
         }
-        let host = parsed_uri
-            .host_str()
+        let authority = uri_host_authority(&parsed_uri)
             .ok_or_else(|| format!("artifact {} download uri has no host", artifact.artifact_id))?;
-        if !policy.allowed_download_hosts.iter().any(|allowed| allowed == host) {
-            return Err(format!("artifact {} download host {} is not allowed", artifact.artifact_id, host));
+        if !policy.allowed_download_hosts.iter().any(|allowed| allowed == &authority) {
+            return Err(format!("artifact {} download host {} is not allowed", artifact.artifact_id, authority));
         }
         if artifact.size_bytes == 0 {
             return Err(format!("artifact {} must declare a non-zero size", artifact.artifact_id));
@@ -418,10 +431,9 @@ fn validate_external_action_subject(manifest: &TargetPluginMarketplaceManifest) 
     Ok(())
 }
 
-fn validate_external_action_gate(gate: &TargetPluginExternalFlowGate) -> Result<(), TargetPluginExternalActionError> {
-    if !gate.enabled {
-        return Err(TargetPluginExternalActionError::ExternalFlowDisabled);
-    }
+/// Activation gate for Install/Enable only: circuit breaker plus runtime policy
+/// activation. Callers must have already checked `gate.enabled`.
+fn validate_external_activation_gate(gate: &TargetPluginExternalFlowGate) -> Result<(), TargetPluginExternalActionError> {
     if !gate.circuit_breaker_closed {
         return Err(TargetPluginExternalActionError::CircuitBreakerOpen);
     }
@@ -435,9 +447,21 @@ fn validate_external_action_gate(gate: &TargetPluginExternalFlowGate) -> Result<
 fn plan_external_install(
     manifest: &TargetPluginMarketplaceManifest,
     action: TargetPluginExternalAction,
+    installation: &TargetPluginInstallation,
     gate: &TargetPluginExternalFlowGate,
     host_target_triple: &str,
 ) -> Result<TargetPluginExternalActionDecision, TargetPluginExternalActionError> {
+    // The plugin API compatibility version is validated at planning time so an
+    // artifact built against an unsupported contract can never be installed.
+    if manifest.api_compatibility_version != SUPPORTED_PLUGIN_API_COMPATIBILITY_VERSION {
+        return Err(TargetPluginExternalActionError::InstallPolicyDenied {
+            reason: format!(
+                "plugin api compatibility version mismatch: expected {}, got {}",
+                SUPPORTED_PLUGIN_API_COMPATIBILITY_VERSION, manifest.api_compatibility_version
+            ),
+        });
+    }
+
     let install_manifest = TargetPluginManifest {
         plugin_id: manifest.plugin_id,
         display_name: manifest.display_name,
@@ -468,10 +492,20 @@ fn plan_external_install(
             target_triple: host_target_triple.to_string(),
         })?;
 
+    let mut new_installation =
+        external_target_plugin_installation(manifest.version, artifact.digest_sha256, artifact.artifact_id, None);
+    // Preserve the currently installed revision as `previous_revision` so a
+    // later Rollback can restore it. Dropping it would make rollback a no-op.
+    if installation.install_state == TargetPluginInstallState::Installed
+        && let Some(current) = installation.current_revision.clone()
+    {
+        new_installation.previous_revision = Some(current);
+    }
+
     Ok(TargetPluginExternalActionDecision {
         action,
         plugin_id: manifest.plugin_id.to_string(),
-        installation: external_target_plugin_installation(manifest.version, artifact.digest_sha256, artifact.artifact_id, None),
+        installation: new_installation,
         operational_state: TargetPluginOperationalState {
             install_state: TargetPluginInstallState::Installed,
             enable_state: TargetPluginEnableState::Disabled,
@@ -529,14 +563,23 @@ fn validate_artifact_uri(label: &str, artifact_id: &str, uri: &str, policy: &Tar
     if policy.require_https && parsed_uri.scheme() != "https" {
         return Err(format!("artifact {artifact_id} must use https {label} uri, got {uri}"));
     }
-    let host = parsed_uri
-        .host_str()
-        .ok_or_else(|| format!("artifact {artifact_id} {label} uri has no host"))?;
-    if !policy.allowed_download_hosts.iter().any(|allowed| allowed == host) {
-        return Err(format!("artifact {artifact_id} {label} host {host} is not allowed"));
+    let authority = uri_host_authority(&parsed_uri).ok_or_else(|| format!("artifact {artifact_id} {label} uri has no host"))?;
+    if !policy.allowed_download_hosts.iter().any(|allowed| allowed == &authority) {
+        return Err(format!("artifact {artifact_id} {label} host {authority} is not allowed"));
     }
 
     Ok(())
+}
+
+/// Returns the host authority used for allowlist matching. When the URI carries
+/// an explicit port the port is part of the authority, so that an allowlisted
+/// `host` never implicitly authorizes a different `host:port`. A default-port
+/// URI (`port()` is `None`) matches a bare `host` entry.
+fn uri_host_authority(parsed_uri: &Url) -> Option<String> {
+    parsed_uri.host_str().map(|host| match parsed_uri.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1132,6 +1175,227 @@ mod tests {
         assert_eq!(
             result.as_ref().map_err(String::as_str),
             Err("artifact sidecar-linux-amd64 must declare a provenance uri")
+        );
+    }
+
+    #[test]
+    fn install_carries_forward_previous_revision_for_rollback() {
+        let example = example_external_webhook_plugin();
+        let gate = verified_gate_with_example_host();
+
+        let existing_revision = TargetPluginRevision {
+            version: "0.9.0".to_string(),
+            digest_sha256: Some("old-digest".to_string()),
+            source: "external".to_string(),
+            installed_at: Some("2026-05-13T10:00:00Z".to_string()),
+            artifact_id: Some("sidecar-linux-amd64-old".to_string()),
+        };
+        let existing = TargetPluginInstallation {
+            install_state: TargetPluginInstallState::Installed,
+            current_revision: Some(existing_revision.clone()),
+            previous_revision: None,
+            validation_error: None,
+        };
+
+        let install = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Install,
+            &existing,
+            &gate,
+            TEST_HOST_TRIPLE,
+        )
+        .expect("install over an existing revision should plan");
+
+        // The freshly installed revision becomes current; the prior revision is
+        // preserved so a later Rollback can restore it.
+        assert_eq!(install.installation.current_revision.as_ref().map(|r| r.version.as_str()), Some("1.0.0"));
+        assert_eq!(install.installation.previous_revision, Some(existing_revision));
+    }
+
+    #[test]
+    fn disable_is_allowed_while_circuit_breaker_is_open() {
+        let example = example_external_webhook_plugin();
+        let mut gate = verified_gate_with_example_host();
+        gate.circuit_breaker_closed = false;
+
+        let disable = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Disable,
+            &example.installation,
+            &gate,
+            TEST_HOST_TRIPLE,
+        )
+        .expect("disable must remain available while the breaker is open");
+
+        assert_eq!(disable.operational_state.enable_state, TargetPluginEnableState::Disabled);
+        assert_eq!(disable.operational_state.runtime_state, TargetPluginRuntimeState::Offline);
+    }
+
+    #[test]
+    fn rollback_is_allowed_while_circuit_breaker_is_open() {
+        let example = example_external_webhook_plugin();
+        let mut gate = verified_gate_with_example_host();
+        gate.circuit_breaker_closed = false;
+
+        let current = TargetPluginRevision {
+            version: "2.0.0".to_string(),
+            digest_sha256: Some("new-digest".to_string()),
+            source: "external".to_string(),
+            installed_at: Some("2026-05-13T12:05:00Z".to_string()),
+            artifact_id: Some("sidecar-linux-amd64-v2".to_string()),
+        };
+        let previous = TargetPluginRevision {
+            version: "1.9.0".to_string(),
+            digest_sha256: Some("old-digest".to_string()),
+            source: "external".to_string(),
+            installed_at: Some("2026-05-13T11:55:00Z".to_string()),
+            artifact_id: Some("sidecar-linux-amd64-v1".to_string()),
+        };
+
+        let rollback = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Rollback,
+            &TargetPluginInstallation {
+                install_state: TargetPluginInstallState::Installed,
+                current_revision: Some(current.clone()),
+                previous_revision: Some(previous.clone()),
+                validation_error: None,
+            },
+            &gate,
+            TEST_HOST_TRIPLE,
+        )
+        .expect("rollback must remain available while the breaker is open");
+
+        assert_eq!(rollback.installation.current_revision, Some(previous));
+        assert_eq!(rollback.installation.previous_revision, Some(current));
+    }
+
+    #[test]
+    fn install_is_still_blocked_by_open_circuit_breaker() {
+        let example = example_external_webhook_plugin();
+        let mut gate = verified_gate_with_example_host();
+        gate.circuit_breaker_closed = false;
+
+        let result = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Install,
+            &TargetPluginInstallation {
+                install_state: TargetPluginInstallState::NotInstalled,
+                current_revision: None,
+                previous_revision: None,
+                validation_error: None,
+            },
+            &gate,
+            TEST_HOST_TRIPLE,
+        );
+
+        assert_eq!(result, Err(TargetPluginExternalActionError::CircuitBreakerOpen));
+    }
+
+    #[test]
+    fn external_install_rejects_api_compatibility_mismatch() {
+        let mut example = example_external_webhook_plugin();
+        example.manifest.api_compatibility_version = "rustfs.target-plugin.v0";
+        let gate = verified_gate_with_example_host();
+
+        let result = plan_external_target_plugin_action(
+            &example.manifest,
+            TargetPluginExternalAction::Install,
+            &TargetPluginInstallation {
+                install_state: TargetPluginInstallState::NotInstalled,
+                current_revision: None,
+                previous_revision: None,
+                validation_error: None,
+            },
+            &gate,
+            TEST_HOST_TRIPLE,
+        );
+
+        assert_eq!(
+            result,
+            Err(TargetPluginExternalActionError::InstallPolicyDenied {
+                reason:
+                    "plugin api compatibility version mismatch: expected rustfs.target-plugin.v1, got rustfs.target-plugin.v0"
+                        .to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn external_install_enforces_protocol_version_for_non_grpc_transport() {
+        let manifest = TargetPluginManifest {
+            plugin_id: "external:webhook-sidecar",
+            display_name: "Webhook Sidecar",
+            provider: "rustfs-labs",
+            version: "1.0.0",
+            target_type: "webhook",
+            supported_domains: &[],
+            secret_fields: &[],
+        };
+
+        // A non-gRPC transport must not be able to skip the protocol check.
+        let result = validate_external_plugin_installation(
+            &manifest,
+            &TargetPluginExternalRuntimeContract {
+                protocol_version: "rustfs.target-runtime.v0",
+                transport: TargetPluginRuntimeTransport::WasmHost,
+            },
+            Some(TargetPluginDistributionManifest {
+                artifacts: &[TargetPluginArtifactManifest {
+                    artifact_id: "sidecar-linux-amd64",
+                    target_triple: "x86_64-unknown-linux-gnu",
+                    download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
+                    digest_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
+                    provenance_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.intoto.jsonl",
+                    size_bytes: 8192,
+                }],
+            }),
+            &policy_allowing_example_host(),
+        );
+
+        assert_eq!(
+            result.as_ref().map_err(String::as_str),
+            Err("sidecar runtime protocol mismatch: expected rustfs.target-runtime.v1, got rustfs.target-runtime.v0")
+        );
+    }
+
+    #[test]
+    fn download_host_allowlist_distinguishes_explicit_port() {
+        let manifest = TargetPluginManifest {
+            plugin_id: "external:webhook-sidecar",
+            display_name: "Webhook Sidecar",
+            provider: "rustfs-labs",
+            version: "1.0.0",
+            target_type: "webhook",
+            supported_domains: &[],
+            secret_fields: &[],
+        };
+        // Allowlist authorizes the bare host (default port), but the artifact is
+        // served from an explicit non-default port — it must not match.
+        let result = validate_external_plugin_installation(
+            &manifest,
+            &TargetPluginExternalRuntimeContract {
+                protocol_version: crate::SIDECAR_RUNTIME_PROTOCOL_VERSION,
+                transport: TargetPluginRuntimeTransport::Grpc,
+            },
+            Some(TargetPluginDistributionManifest {
+                artifacts: &[TargetPluginArtifactManifest {
+                    artifact_id: "sidecar-linux-amd64",
+                    target_triple: "x86_64-unknown-linux-gnu",
+                    download_uri: "https://plugins.example.test:8443/webhook-sidecar.tar.zst",
+                    digest_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    signature_uri: "https://plugins.example.test:8443/webhook-sidecar.tar.zst.sig",
+                    provenance_uri: "https://plugins.example.test:8443/webhook-sidecar.tar.zst.intoto.jsonl",
+                    size_bytes: 8192,
+                }],
+            }),
+            &policy_allowing_example_host(),
+        );
+
+        assert_eq!(
+            result.as_ref().map_err(String::as_str),
+            Err("artifact sidecar-linux-amd64 download host plugins.example.test:8443 is not allowed")
         );
     }
 }

@@ -51,6 +51,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, instrument, warn};
 use url::Url;
 
+/// Upper bound on how long a single publish and its publisher-confirm may block
+/// before being treated as a timeout (backlog#980).
+const AMQP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 pub struct AMQPArgs {
     pub enable: bool,
@@ -238,8 +242,40 @@ fn build_publish_properties(args: &AMQPArgs) -> BasicProperties {
     properties
 }
 
+/// Returns true for AMQP broker protocol errors that indicate a permanent,
+/// non-connectivity condition (e.g. the exchange/queue does not exist, access is
+/// refused, or a precondition failed). These must not be treated as transient
+/// connectivity errors, otherwise a misconfigured target triggers an endless
+/// reconnect storm instead of surfacing a delivery failure (backlog#973).
+fn is_permanent_amqp_protocol_error(err: &lapin::Error) -> bool {
+    use lapin::protocol::{AMQPErrorKind, AMQPHardError, AMQPSoftError};
+    if let LapinErrorKind::ProtocolError(amqp_err) = err.kind() {
+        return match amqp_err.kind() {
+            // 404 NOT_FOUND (missing exchange/queue), 403 ACCESS_REFUSED,
+            // 406 PRECONDITION_FAILED.
+            AMQPErrorKind::Soft(soft) => {
+                matches!(
+                    soft,
+                    AMQPSoftError::NOTFOUND | AMQPSoftError::ACCESSREFUSED | AMQPSoftError::PRECONDITIONFAILED
+                )
+            }
+            // 530 NOT_ALLOWED, 540 NOT_IMPLEMENTED, 402 INVALID_PATH.
+            AMQPErrorKind::Hard(hard) => {
+                matches!(
+                    hard,
+                    AMQPHardError::NOTALLOWED | AMQPHardError::NOTIMPLEMENTED | AMQPHardError::INVALIDPATH
+                )
+            }
+        };
+    }
+    false
+}
+
 fn map_lapin_error(err: lapin::Error, context: &str) -> TargetError {
     let message = format!("{context}: {err}");
+    if is_permanent_amqp_protocol_error(&err) {
+        return TargetError::Request(message);
+    }
     match err.kind() {
         LapinErrorKind::IOError(io_err) if io_err.kind() == std::io::ErrorKind::TimedOut => TargetError::Timeout(message),
         LapinErrorKind::IOError(_)
@@ -332,6 +368,18 @@ where
     #[instrument(skip(args), fields(target_id_as_string = %id))]
     pub fn new(id: String, args: AMQPArgs) -> Result<Self, TargetError> {
         args.validate()?;
+        if args.enable && !args.mandatory {
+            // With mandatory=false the broker silently discards messages that
+            // route to no queue, and the publish is still confirmed as success.
+            // Warn so operators expecting reliable delivery know unroutable
+            // events are dropped without a trace (backlog#980).
+            warn!(
+                target_id = %id,
+                exchange = %args.exchange,
+                routing_key = %args.routing_key,
+                "AMQP target has mandatory=false: messages that route to no queue are silently dropped. Set mandatory=true for reliable delivery."
+            );
+        }
         let target_id = TargetID::new(id, ChannelTargetType::Amqp.as_str().to_string());
         let queue_store = open_target_queue_store(
             &args.queue_dir,
@@ -417,9 +465,11 @@ where
 
     async fn send_body(&self, body: &[u8]) -> Result<(), TargetError> {
         let connection = self.get_or_connect().await?;
-        let publish = connection
-            .channel
-            .basic_publish(
+        // Bound the publish and publisher-confirm waits so a stuck broker cannot
+        // block the send path indefinitely (backlog#980).
+        let publish = match tokio::time::timeout(
+            AMQP_PUBLISH_TIMEOUT,
+            connection.channel.basic_publish(
                 self.args.exchange.clone().into(),
                 self.args.routing_key.clone().into(),
                 BasicPublishOptions {
@@ -428,14 +478,30 @@ where
                 },
                 body,
                 build_publish_properties(&self.args),
-            )
-            .await;
+            ),
+        )
+        .await
+        {
+            Ok(publish) => publish,
+            Err(_) => {
+                self.clear_connection();
+                return Err(TargetError::Timeout("AMQP publish timed out".to_string()));
+            }
+        };
 
-        let confirm = match publish {
-            Ok(confirm) => confirm.await,
+        let confirm_future = match publish {
+            Ok(confirm) => confirm,
             Err(err) => {
                 self.clear_connection();
                 return Err(map_lapin_error(err, "Failed to publish AMQP message"));
+            }
+        };
+
+        let confirm = match tokio::time::timeout(AMQP_PUBLISH_TIMEOUT, confirm_future).await {
+            Ok(confirm) => confirm,
+            Err(_) => {
+                self.clear_connection();
+                return Err(TargetError::Timeout("AMQP publisher confirm timed out".to_string()));
             }
         };
 
@@ -506,6 +572,11 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
+        // A disabled target is never active; avoid opening a connection for it
+        // (backlog#980).
+        if !self.args.enable {
+            return Ok(false);
+        }
         let connection = self.get_or_connect().await?;
         Ok(connection.connection.status().connected() && connection.channel.status().connected())
     }
@@ -540,12 +611,14 @@ where
 
     async fn close(&self) -> Result<(), TargetError> {
         let connection = self.connection.lock().take();
-        if let Some(connection) = connection {
-            connection
-                .connection
-                .close(200, "OK".into())
-                .await
-                .map_err(|e| map_lapin_error(e, "Failed to close AMQP connection"))?;
+        // Capture any close failure but still run the remaining cleanup so a
+        // failed broker close does not leave stale TLS/adapter state behind
+        // (backlog#980).
+        let mut close_result = Ok(());
+        if let Some(connection) = connection
+            && let Err(e) = connection.connection.close(200, "OK".into()).await
+        {
+            close_result = Err(map_lapin_error(e, "Failed to close AMQP connection"));
         }
         self.tls_state.lock().reset();
         // If a TLS reload adapter is attached, reset its error tracking
@@ -554,7 +627,7 @@ where
             *adapter.runtime_state().last_error.write() = None;
         }
         info!(target_id = %self.id, "AMQP target closed");
-        Ok(())
+        close_result
     }
 
     fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
@@ -750,6 +823,27 @@ mod tests {
             .expect_err("queue replay should fail without broker");
 
         assert_connect_failure(&err);
+    }
+
+    #[test]
+    fn permanent_amqp_protocol_errors_are_not_connectivity_errors() {
+        use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPHardError, AMQPSoftError};
+
+        let make = |kind: AMQPErrorKind| lapin::Error::from(LapinErrorKind::ProtocolError(AMQPError::new(kind, "boom".into())));
+
+        // 404 (missing exchange/queue) is permanent: it must be a request-level
+        // error so a misconfigured target does not reconnect-storm (backlog#973).
+        let not_found = make(AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND));
+        assert!(is_permanent_amqp_protocol_error(&not_found));
+        assert!(matches!(map_lapin_error(not_found, "publish"), TargetError::Request(_)));
+
+        assert!(is_permanent_amqp_protocol_error(&make(AMQPErrorKind::Soft(AMQPSoftError::ACCESSREFUSED))));
+        assert!(is_permanent_amqp_protocol_error(&make(AMQPErrorKind::Hard(AMQPHardError::NOTALLOWED))));
+
+        // A transient soft error (broker resource locked) is not treated as permanent.
+        assert!(!is_permanent_amqp_protocol_error(&make(AMQPErrorKind::Soft(
+            AMQPSoftError::RESOURCELOCKED
+        ))));
     }
 
     #[test]

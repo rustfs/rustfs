@@ -21,6 +21,7 @@
 
 use crate::MetricType;
 use crate::metrics::report::PrometheusMetric;
+use crate::telemetry::dial9::runtime_stats_snapshot;
 use rustfs_config::{DEFAULT_RUNTIME_DIAL9_ENABLED, ENV_RUNTIME_DIAL9_ENABLED};
 use rustfs_utils::get_env_bool;
 
@@ -123,6 +124,19 @@ pub fn collect_dial9_metrics(stats: &Dial9Stats) -> Vec<PrometheusMetric> {
     ]);
 
     metrics
+}
+
+/// Collect dial9 metrics from the current runtime snapshot.
+pub fn collect_current_dial9_metrics() -> Vec<PrometheusMetric> {
+    let snapshot = runtime_stats_snapshot();
+    let stats = Dial9Stats {
+        errors_total: snapshot.errors_total,
+        disk_usage_bytes: snapshot.disk_usage_bytes,
+        active_sessions: snapshot.active_sessions,
+        ..Dial9Stats::default()
+    };
+
+    collect_dial9_metrics(&stats)
 }
 
 /// Check if dial9 telemetry is enabled via environment variable.

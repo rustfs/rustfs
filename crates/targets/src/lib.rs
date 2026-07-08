@@ -54,9 +54,10 @@ pub use control_plane::{
 pub use domain::TargetDomain;
 pub use error::{StoreError, TargetError};
 pub use manifest::{
-    TargetPluginArtifactManifest, TargetPluginDistributionManifest, TargetPluginEntrypointKind,
-    TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginMarketplaceManifest, TargetPluginPackaging,
-    TargetPluginRuntimeTransport, builtin_target_marketplace_manifest, installable_target_marketplace_manifest,
+    SUPPORTED_PLUGIN_API_COMPATIBILITY_VERSION, TargetPluginArtifactManifest, TargetPluginDistributionManifest,
+    TargetPluginEntrypointKind, TargetPluginExternalRuntimeContract, TargetPluginManifest, TargetPluginMarketplaceManifest,
+    TargetPluginPackaging, TargetPluginRuntimeTransport, builtin_target_marketplace_manifest,
+    installable_target_marketplace_manifest,
 };
 pub use net::*;
 pub use plugin::{
@@ -75,7 +76,7 @@ pub use runtime::{
     ops_profiler::{
         OpsProfilerAccessDecision, OpsProfilerReadRequest, OpsProfilerRegistration, OpsProfilerRegistry, OpsProfilerRegistryError,
     },
-    s3_hooks::{S3HookContext, S3HookDecision, S3HookRegistration, S3HookRegistry, S3HookRegistryError},
+    s3_hooks::{S3HookContext, S3HookDecision, S3HookDispatchOutcome, S3HookRegistration, S3HookRegistry, S3HookRegistryError},
     sidecar::{SidecarPluginRuntime, SidecarRuntimePolicy, SidecarRuntimePolicyError, SidecarRuntimeSafetyChecks},
     sidecar_protocol::{SIDECAR_RUNTIME_PROTOCOL_VERSION, SidecarHandshake, SidecarPluginCapability},
     start_replay_worker,
