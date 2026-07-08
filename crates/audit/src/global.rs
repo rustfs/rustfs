@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{AuditEntry, AuditResult, AuditSystem, system::AuditTargetMetricSnapshot};
+use crate::{AuditEntry, AuditError, AuditResult, AuditSystem, system::AuditTargetMetricSnapshot};
 use rustfs_config::server_config::Config;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, trace};
@@ -78,10 +78,27 @@ pub async fn resume_audit_system() -> AuditResult<()> {
 
 /// Dispatch an audit log entry to all targets
 pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
-    if let Some(system) = audit_system() {
-        if system.is_running().await {
-            system.dispatch(entry).await
-        } else {
+    let Some(system) = audit_system() else {
+        debug!(
+            event = EVENT_AUDIT_ENTRY_DROPPED,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_GLOBAL,
+            reason = "system_not_initialized",
+            "Dropped audit entry"
+        );
+        return Ok(());
+    };
+
+    // Single state read (backlog#984): the previous code checked `is_running()`
+    // and then called `dispatch()`, which re-read the state. Between the two
+    // reads the system could transition (e.g. Running -> Stopping) and
+    // `dispatch()` would return an error the caller never expected. Let
+    // `dispatch()` be the single authority on the current state and interpret
+    // its "not accepting" errors as a deliberate skip, while still surfacing
+    // real delivery failures (backlog#962).
+    match system.dispatch(entry).await {
+        Ok(()) => Ok(()),
+        Err(AuditError::NotInitialized(_)) | Err(AuditError::Paused) => {
             trace!(
                 event = EVENT_AUDIT_ENTRY_DROPPED,
                 component = LOG_COMPONENT_AUDIT,
@@ -91,15 +108,7 @@ pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
             );
             Ok(())
         }
-    } else {
-        debug!(
-            event = EVENT_AUDIT_ENTRY_DROPPED,
-            component = LOG_COMPONENT_AUDIT,
-            subsystem = LOG_SUBSYSTEM_GLOBAL,
-            reason = "system_not_initialized",
-            "Dropped audit entry"
-        );
-        Ok(())
+        Err(e) => Err(e),
     }
 }
 

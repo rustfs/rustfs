@@ -35,6 +35,9 @@ pub enum AuditError {
     #[error("System already initialized")]
     AlreadyInitialized,
 
+    #[error("Audit system is paused; entry was not accepted")]
+    Paused,
+
     #[error("Storage not available: {0}")]
     StorageNotAvailable(String),
 
