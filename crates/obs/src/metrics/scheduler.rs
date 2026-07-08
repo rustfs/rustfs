@@ -93,7 +93,7 @@ use crate::metrics::stats_collector::{
     collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
     collect_compression_cluster_stats, collect_disk_and_system_drive_stats, collect_erasure_set_stats,
     collect_host_network_stats, collect_iam_stats, collect_ilm_metric_stats, collect_internode_network_stats,
-    collect_process_metric_bundle, collect_replication_stats, collect_scanner_metric_stats,
+    collect_process_metric_bundle_with, collect_replication_stats, collect_scanner_metric_stats,
     collect_system_cpu_and_memory_stats_with,
 };
 use futures_util::FutureExt;
