@@ -333,6 +333,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/bucket-durability/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/bucket-durability/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/bucket-durability/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/rustfs/admin/export-bucket-metadata",
         EXPORT_BUCKET_METADATA,

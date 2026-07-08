@@ -288,7 +288,7 @@ pub(crate) enum DurabilityMode {
 }
 
 impl DurabilityMode {
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "strict" => Some(Self::Strict),
             "relaxed" => Some(Self::Relaxed),
@@ -406,6 +406,96 @@ pub(crate) mod durability_mode_override {
     }
 }
 
+/// Per-bucket durability overrides (HP-5 phase 2, rustfs/backlog#938).
+///
+/// The disk layer never loads bucket metadata itself: the bucket metadata
+/// subsystem publishes the parsed override here whenever a bucket's cached
+/// metadata is set, refreshed, or removed, so this registry follows exactly
+/// the existing bucket-metadata cache invalidation semantics (immediate on
+/// the node applying a config change, peer reload notification plus the
+/// periodic refresh loop elsewhere). Lookups sit on the commit hot path, so
+/// the empty-registry case (no bucket overrides configured anywhere — the
+/// default) is a single relaxed atomic load and the phase 1 behavior is
+/// preserved bit for bit.
+pub(crate) mod bucket_durability {
+    use super::{
+        DurabilityMode, EVENT_DISK_LOCAL_DURABILITY_MODE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_DISK_LOCAL, is_scratch_volume,
+        is_system_critical_volume,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{OnceLock, PoisonError, RwLock};
+    use tracing::{info, warn};
+
+    static OVERRIDES: OnceLock<RwLock<HashMap<String, DurabilityMode>>> = OnceLock::new();
+    /// Fast-path gate: false means "no override registered anywhere", which
+    /// keeps default deployments off the map lookup entirely.
+    static NON_EMPTY: AtomicBool = AtomicBool::new(false);
+
+    fn overrides() -> &'static RwLock<HashMap<String, DurabilityMode>> {
+        OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    /// Publish (or clear, with `None`) the durability override for `bucket`.
+    ///
+    /// System namespaces can never carry an override: they are pinned to
+    /// `strict` by [`super::effective_durability`], and any attempt to
+    /// register one is rejected here as defense in depth.
+    pub(crate) fn set(bucket: &str, mode: Option<DurabilityMode>) {
+        if bucket.is_empty() {
+            return;
+        }
+        if is_system_critical_volume(bucket) || is_scratch_volume(bucket) {
+            if mode.is_some() {
+                warn!(
+                    event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    bucket = %bucket,
+                    "Rejected per-bucket durability override for a system namespace; it stays pinned to strict"
+                );
+            }
+            return;
+        }
+        // The legacy full-off switch is process-wide only and deliberately
+        // unreachable per bucket (`DurabilityMode::parse` never returns it).
+        let mode = mode.filter(|m| *m != DurabilityMode::LegacyOff);
+
+        let mut map = overrides().write().unwrap_or_else(PoisonError::into_inner);
+        let changed = match mode {
+            Some(mode) => map.insert(bucket.to_string(), mode) != Some(mode),
+            None => map.remove(bucket).is_some(),
+        };
+        NON_EMPTY.store(!map.is_empty(), Ordering::Release);
+        drop(map);
+
+        if changed {
+            info!(
+                event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                bucket = %bucket,
+                mode = mode.map_or("inherit", |m| m.as_str()),
+                "Per-bucket durability override updated"
+            );
+        }
+    }
+
+    /// The override registered for `volume`, if any. `volume` is the commit
+    /// destination, so user buckets resolve by name while scratch and system
+    /// namespaces never match (they are refused by [`set`]).
+    pub(crate) fn lookup(volume: &str) -> Option<DurabilityMode> {
+        if !NON_EMPTY.load(Ordering::Acquire) {
+            return None;
+        }
+        overrides()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(volume)
+            .copied()
+    }
+}
+
 /// Whether `volume` stages in-flight user object data (`.rustfs.sys/tmp`,
 /// `.rustfs.sys/multipart`, and their subtrees). These namespaces follow the
 /// configured durability mode: their contents commit into user buckets and
@@ -438,21 +528,21 @@ fn is_system_critical_volume(volume: &str) -> bool {
 
 /// Effective durability for writes that commit into `volume`.
 ///
-/// System-critical volumes are pinned to `Strict` regardless of the
-/// configured tier. The legacy full-off switch keeps its historical
-/// semantics and is never pinned.
+/// Resolution order: system-critical volumes are pinned to `Strict`
+/// regardless of any configuration; otherwise a per-bucket override
+/// (published by the bucket metadata subsystem, see [`bucket_durability`])
+/// wins over the process-wide mode; otherwise the process-wide mode applies.
+/// The legacy full-off switch keeps its historical semantics: it is never
+/// pinned and per-bucket overrides do not apply under it.
 pub(crate) fn effective_durability(volume: &str) -> DurabilityMode {
-    let mode = durability_mode();
-    match mode {
-        DurabilityMode::Strict | DurabilityMode::LegacyOff => mode,
-        DurabilityMode::Relaxed | DurabilityMode::None => {
-            if is_system_critical_volume(volume) {
-                DurabilityMode::Strict
-            } else {
-                mode
-            }
-        }
+    let global = durability_mode();
+    if global == DurabilityMode::LegacyOff {
+        return global;
     }
+    if is_system_critical_volume(volume) {
+        return DurabilityMode::Strict;
+    }
+    bucket_durability::lookup(volume).unwrap_or(global)
 }
 
 /// Get the O_DIRECT read threshold size.
@@ -5592,6 +5682,150 @@ mod test {
             assert_eq!(effective_durability("user-bucket"), DurabilityMode::LegacyOff);
             assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::LegacyOff);
         }
+    }
+
+    /// Removes the bucket's durability override when dropped so a test can
+    /// never leak its override into another test's lookup.
+    struct BucketOverrideGuard(&'static str);
+
+    impl BucketOverrideGuard {
+        fn set(bucket: &'static str, mode: DurabilityMode) -> Self {
+            bucket_durability::set(bucket, Some(mode));
+            Self(bucket)
+        }
+    }
+
+    impl Drop for BucketOverrideGuard {
+        fn drop(&mut self) {
+            bucket_durability::set(self.0, None);
+        }
+    }
+
+    #[test]
+    fn test_effective_durability_bucket_override() {
+        // Global strict + per-bucket relaxed: only the named bucket drops.
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Strict);
+            let _guard = BucketOverrideGuard::set("hp5b-override-relaxed", DurabilityMode::Relaxed);
+            assert_eq!(effective_durability("hp5b-override-relaxed"), DurabilityMode::Relaxed);
+            assert_eq!(effective_durability("hp5b-other-bucket"), DurabilityMode::Strict);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+        }
+        // Override cleared: the bucket follows the global mode again (a new
+        // PUT after a config change resolves the new tier).
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Strict);
+            assert_eq!(effective_durability("hp5b-override-relaxed"), DurabilityMode::Strict);
+        }
+        // Global relaxed + per-bucket strict: overrides can raise durability.
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+            let _guard = BucketOverrideGuard::set("hp5b-override-strict", DurabilityMode::Strict);
+            assert_eq!(effective_durability("hp5b-override-strict"), DurabilityMode::Strict);
+            assert_eq!(effective_durability("hp5b-other-bucket"), DurabilityMode::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_bucket_durability_refuses_system_namespaces() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+
+        // System-critical and scratch namespaces can never carry an override.
+        bucket_durability::set(RUSTFS_META_BUCKET, Some(DurabilityMode::Relaxed));
+        bucket_durability::set(&format!("{RUSTFS_META_BUCKET}/buckets"), Some(DurabilityMode::None));
+        bucket_durability::set(RUSTFS_META_TMP_BUCKET, Some(DurabilityMode::Relaxed));
+        bucket_durability::set(super::super::RUSTFS_META_MULTIPART_BUCKET, Some(DurabilityMode::Relaxed));
+        bucket_durability::set("", Some(DurabilityMode::Relaxed));
+
+        assert_eq!(bucket_durability::lookup(RUSTFS_META_BUCKET), Option::None);
+        assert_eq!(bucket_durability::lookup(RUSTFS_META_TMP_BUCKET), Option::None);
+        assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+
+        // The legacy full-off tier is process-wide only: registering it per
+        // bucket is dropped, not stored.
+        bucket_durability::set("hp5b-legacy-refused", Some(DurabilityMode::LegacyOff));
+        assert_eq!(bucket_durability::lookup("hp5b-legacy-refused"), Option::None);
+    }
+
+    #[test]
+    fn test_effective_durability_legacy_off_ignores_bucket_overrides() {
+        let _mode = durability_mode_override::set(DurabilityMode::LegacyOff);
+        let _guard = BucketOverrideGuard::set("hp5b-legacy-bucket", DurabilityMode::Strict);
+        // The legacy switch keeps its historical semantics bit for bit.
+        assert_eq!(effective_durability("hp5b-legacy-bucket"), DurabilityMode::LegacyOff);
+    }
+
+    /// HP-5b behavior regression: with the global mode at strict (the
+    /// default), a bucket override to relaxed must skip the metadata-commit
+    /// dir fsync for that bucket only, and clearing the override must restore
+    /// the strict behavior for the next write.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_meta_bucket_override_relaxed_then_cleared() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let overridden = "hp5b-relaxed-write-bucket";
+        let untouched = "hp5b-strict-write-bucket";
+        ensure_test_volume(&disk, overridden).await;
+        ensure_test_volume(&disk, untouched).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let meta_path = format!("dir/object/{STORAGE_FORMAT_FILE}");
+
+        {
+            let _guard = BucketOverrideGuard::set("hp5b-relaxed-write-bucket", DurabilityMode::Relaxed);
+
+            disk.write_all_meta(overridden, &meta_path, b"payload", true)
+                .await
+                .expect("write_all_meta should succeed");
+            let overridden_parent = disk
+                .get_object_path(overridden, &meta_path)
+                .expect("dst path should resolve")
+                .parent()
+                .expect("dst file should have a parent")
+                .to_path_buf();
+            assert!(
+                !os::fsync_dir_recorder::was_fsynced(&overridden_parent),
+                "bucket override to relaxed must skip the metadata-commit dir fsync"
+            );
+
+            // A bucket without an override keeps the strict default.
+            disk.write_all_meta(untouched, &meta_path, b"payload", true)
+                .await
+                .expect("write_all_meta should succeed");
+            let untouched_parent = disk
+                .get_object_path(untouched, &meta_path)
+                .expect("dst path should resolve")
+                .parent()
+                .expect("dst file should have a parent")
+                .to_path_buf();
+            assert!(
+                os::fsync_dir_recorder::was_fsynced(&untouched_parent),
+                "buckets without an override must keep the strict commit fsyncs"
+            );
+        }
+
+        // Override cleared (guard dropped): the next write is strict again.
+        let second_meta_path = format!("dir/object-after-clear/{STORAGE_FORMAT_FILE}");
+        disk.write_all_meta(overridden, &second_meta_path, b"payload", true)
+            .await
+            .expect("write_all_meta should succeed");
+        let after_clear_parent = disk
+            .get_object_path(overridden, &second_meta_path)
+            .expect("dst path should resolve")
+            .parent()
+            .expect("dst file should have a parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&after_clear_parent),
+            "clearing the override must restore strict fsyncs for new writes"
+        );
     }
 
     #[tokio::test]

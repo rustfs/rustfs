@@ -153,6 +153,26 @@ async fn sync_bucket_target_sys(bucket: &str, bm: &BucketMetadata) {
         .await;
 }
 
+/// Publish the bucket's durability override (or its absence) to the disk
+/// layer registry consulted by `effective_durability`.
+///
+/// Called from every path that installs a bucket's metadata into the cache
+/// (initial load, config update, peer reload notification, refresh loop,
+/// lazy load), so the override propagates with exactly the bucket-metadata
+/// cache invalidation semantics and never through a channel of its own.
+fn sync_bucket_durability(bucket: &str, bm: &BucketMetadata) {
+    let mode = bm
+        .durability_config()
+        .and_then(|cfg| cfg.normalized_mode())
+        .and_then(|mode| crate::disk::local::DurabilityMode::parse(&mode));
+    crate::disk::local::bucket_durability::set(bucket, mode);
+}
+
+/// Drop a bucket's durability override when its metadata leaves the cache.
+fn clear_bucket_durability(bucket: &str) {
+    crate::disk::local::bucket_durability::set(bucket, None);
+}
+
 pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
     let sys = get_bucket_metadata_sys()?;
     let lock = sys.read().await;
@@ -194,6 +214,20 @@ pub async fn get_bucket_acl_config(bucket: &str) -> Result<(String, OffsetDateTi
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
     bucket_meta_sys.get_bucket_acl_config(bucket).await
+}
+
+/// The bucket's durability override config (if any) with its update time.
+///
+/// `Ok((None, ..))` means the bucket has no override and follows the global
+/// durability mode.
+pub async fn get_durability_config(
+    bucket: &str,
+) -> Result<(Option<crate::bucket::durability::BucketDurabilityConfig>, OffsetDateTime)> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    let (bm, _) = bucket_meta_sys.get_config(bucket).await?;
+    Ok((bm.durability_config(), bm.durability_config_updated_at))
 }
 
 pub async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
@@ -425,6 +459,7 @@ impl BucketMetadataSys {
             map.insert(bucket.clone(), bm.clone());
             drop(map);
             sync_bucket_target_sys(&bucket, &bm).await;
+            sync_bucket_durability(&bucket, &bm);
         }
     }
 
@@ -440,6 +475,7 @@ impl BucketMetadataSys {
         drop(map);
         if removed {
             BucketTargetSys::get().delete(bucket).await;
+            clear_bucket_durability(bucket);
         }
         removed
     }
@@ -566,6 +602,7 @@ impl BucketMetadataSys {
             map.insert(bucket.to_string(), bm.clone());
             drop(map);
             sync_bucket_target_sys(bucket, &bm).await;
+            sync_bucket_durability(bucket, &bm);
 
             Ok((bm, true))
         }
@@ -850,6 +887,40 @@ mod tests {
 
         assert!(target_sys.list_bucket_targets(bucket).await.is_err());
         target_sys.delete(bucket).await;
+    }
+
+    /// HP-5b (rustfs/backlog#938): installing bucket metadata publishes the
+    /// durability override to the disk-layer registry, and clearing the
+    /// config (or an invalid payload) withdraws it.
+    #[test]
+    fn metadata_sync_publishes_and_clears_durability_override() {
+        use crate::disk::local::{DurabilityMode, bucket_durability};
+
+        let bucket = "metadata-sync-durability";
+
+        let mut bm = BucketMetadata::new(bucket);
+        bm.durability_config_json = br#"{"mode":"relaxed"}"#.to_vec();
+        sync_bucket_durability(bucket, &bm);
+        assert_eq!(bucket_durability::lookup(bucket), Some(DurabilityMode::Relaxed));
+
+        // Metadata without the config entry clears the override.
+        let bm = BucketMetadata::new(bucket);
+        sync_bucket_durability(bucket, &bm);
+        assert_eq!(bucket_durability::lookup(bucket), None);
+
+        // Invalid payloads degrade to "no override", never to a tier.
+        let mut bm = BucketMetadata::new(bucket);
+        bm.durability_config_json = br#"{"mode":"bogus"}"#.to_vec();
+        sync_bucket_durability(bucket, &bm);
+        assert_eq!(bucket_durability::lookup(bucket), None);
+
+        // Cache removal clears the override too.
+        let mut bm = BucketMetadata::new(bucket);
+        bm.durability_config_json = br#"{"mode":"none"}"#.to_vec();
+        sync_bucket_durability(bucket, &bm);
+        assert_eq!(bucket_durability::lookup(bucket), Some(DurabilityMode::None));
+        clear_bucket_durability(bucket);
+        assert_eq!(bucket_durability::lookup(bucket), None);
     }
 
     #[tokio::test]

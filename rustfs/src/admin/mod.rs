@@ -33,9 +33,10 @@ mod console_test;
 mod route_registration_test;
 
 use handlers::{
-    audit, batch_job, bucket_meta, cluster_snapshot, config_admin, diagnostics, extensions, heal, health, idp_compat, kms,
-    module_switch, object_zip_download, oidc, plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler,
-    rebalance, replication as replication_handler, scanner, site_replication, sts, system, table_catalog, tier, tls_debug, user,
+    audit, batch_job, bucket_meta, cluster_snapshot, config_admin, diagnostics, durability as durability_handler, extensions,
+    heal, health, idp_compat, kms, module_switch, object_zip_download, oidc, plugins_catalog, plugins_instances, pools,
+    profile_admin, quota as quota_handler, rebalance, replication as replication_handler, scanner, site_replication, sts, system,
+    table_catalog, tier, tls_debug, user,
 };
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
@@ -67,6 +68,7 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
     tier::register_tier_route(r)?;
 
     quota_handler::register_quota_route(r)?;
+    durability_handler::register_durability_route(r)?;
     bucket_meta::register_bucket_meta_route(r)?;
     config_admin::register_config_route(r)?;
     scanner::register_scanner_route(r)?;

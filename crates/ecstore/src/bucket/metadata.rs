@@ -246,6 +246,7 @@ pub const BUCKET_REQUEST_PAYMENT_CONFIG: &str = "request-payment.xml";
 pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
+pub const BUCKET_DURABILITY_CONFIG: &str = "durability.json";
 pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
 pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
 pub const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str = "table-buckets";
@@ -294,6 +295,7 @@ pub struct BucketMetadata {
     pub public_access_block_config_xml: Vec<u8>,
     pub bucket_acl_config_json: Vec<u8>,
     pub table_bucket_config_json: Vec<u8>,
+    pub durability_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -314,6 +316,7 @@ pub struct BucketMetadata {
     pub public_access_block_config_updated_at: OffsetDateTime,
     pub bucket_acl_config_updated_at: OffsetDateTime,
     pub table_bucket_config_updated_at: OffsetDateTime,
+    pub durability_config_updated_at: OffsetDateTime,
 
     pub new_field_updated_at: OffsetDateTime,
 
@@ -362,6 +365,7 @@ impl Default for BucketMetadata {
             public_access_block_config_xml: Default::default(),
             bucket_acl_config_json: Default::default(),
             table_bucket_config_json: Default::default(),
+            durability_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -381,6 +385,7 @@ impl Default for BucketMetadata {
             public_access_block_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_acl_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             table_bucket_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            durability_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -428,6 +433,32 @@ impl BucketMetadata {
 
     pub fn table_bucket_enabled(&self) -> bool {
         !self.table_bucket_config_json.is_empty()
+    }
+
+    /// Parsed per-bucket durability override, if a valid one is stored.
+    ///
+    /// Absent/empty/unparsable payloads all mean "no override" (the bucket
+    /// follows the global durability mode); a parse failure is logged so a
+    /// corrupted entry cannot silently change fsync behavior.
+    pub fn durability_config(&self) -> Option<super::durability::BucketDurabilityConfig> {
+        if self.durability_config_json.is_empty() {
+            return None;
+        }
+        match serde_json::from_slice(&self.durability_config_json) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                tracing::warn!(
+                    event = "bucket_metadata_parse_failed",
+                    component = "ecstore",
+                    subsystem = "bucket_metadata",
+                    bucket = %self.name,
+                    config = "durability",
+                    error = %e,
+                    "Failed to parse bucket metadata config"
+                );
+                None
+            }
+        }
     }
 
     /// Decode from msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
@@ -481,6 +512,7 @@ impl BucketMetadata {
                 }
                 "BucketAclConfigJSON" | "BucketAclConfigJson" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
                 "TableBucketConfigJSON" | "TableBucketConfigJson" => self.table_bucket_config_json = read_msgp_bin(rd)?,
+                "DurabilityConfigJSON" | "DurabilityConfigJson" => self.durability_config_json = read_msgp_bin(rd)?,
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
@@ -489,6 +521,7 @@ impl BucketMetadata {
                 "PublicAccessBlockConfigUpdatedAt" => self.public_access_block_config_updated_at = read_msgp_time_value(rd)?,
                 "BucketAclConfigUpdatedAt" => self.bucket_acl_config_updated_at = read_msgp_time_value(rd)?,
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
+                "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -501,8 +534,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (16)
-        let map_len: u32 = 41;
+        // Map size: MinIO fields (25) + RustFS extensions (18)
+        let map_len: u32 = 43;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -559,6 +592,7 @@ impl BucketMetadata {
         write_bin_field(wr, "PublicAccessBlockConfigXML", &self.public_access_block_config_xml)?;
         write_bin_field(wr, "BucketAclConfigJSON", &self.bucket_acl_config_json)?;
         write_bin_field(wr, "TableBucketConfigJSON", &self.table_bucket_config_json)?;
+        write_bin_field(wr, "DurabilityConfigJSON", &self.durability_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
         rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
@@ -575,6 +609,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.bucket_acl_config_updated_at)?;
         rmp::encode::write_str(wr, "TableBucketConfigUpdatedAt")?;
         write_msgp_time(wr, self.table_bucket_config_updated_at)?;
+        rmp::encode::write_str(wr, "DurabilityConfigUpdatedAt")?;
+        write_msgp_time(wr, self.durability_config_updated_at)?;
 
         Ok(())
     }
@@ -673,6 +709,9 @@ impl BucketMetadata {
         if self.table_bucket_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.table_bucket_config_updated_at = self.created
         }
+        if self.durability_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.durability_config_updated_at = self.created
+        }
     }
 
     pub fn update_config(&mut self, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
@@ -753,6 +792,10 @@ impl BucketMetadata {
             BUCKET_TABLE_CONFIG => {
                 self.table_bucket_config_json = data;
                 self.table_bucket_config_updated_at = updated;
+            }
+            BUCKET_DURABILITY_CONFIG => {
+                self.durability_config_json = data;
+                self.durability_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
@@ -1424,6 +1467,35 @@ mod test {
 
         bm.update_config(BUCKET_TABLE_CONFIG, Vec::new()).unwrap();
         assert!(!bm.table_bucket_enabled());
+    }
+
+    /// HP-5b (rustfs/backlog#938): the durability override is a RustFS
+    /// extension entry and must survive an encode/decode round trip.
+    #[test]
+    fn durability_config_round_trips_and_tracks_updates() {
+        let mut bm = BucketMetadata::new("durability-bucket");
+        assert!(bm.durability_config().is_none(), "fresh metadata carries no override");
+
+        bm.update_config(BUCKET_DURABILITY_CONFIG, br#"{"mode":"relaxed"}"#.to_vec())
+            .unwrap();
+        assert_ne!(bm.durability_config_updated_at, OffsetDateTime::UNIX_EPOCH);
+
+        let buf = bm.marshal_msg().unwrap();
+        let back = BucketMetadata::unmarshal(&buf).unwrap();
+        assert_eq!(back.durability_config_json, bm.durability_config_json);
+        assert_eq!(
+            back.durability_config_updated_at.unix_timestamp(),
+            bm.durability_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(back.durability_config().and_then(|c| c.normalized_mode()).as_deref(), Some("relaxed"));
+
+        // Clearing the entry removes the override.
+        bm.update_config(BUCKET_DURABILITY_CONFIG, Vec::new()).unwrap();
+        assert!(bm.durability_config().is_none());
+
+        // Corrupted payloads must degrade to "no override", never to a tier.
+        bm.durability_config_json = b"not-json".to_vec();
+        assert!(bm.durability_config().is_none());
     }
 
     /// After policy deletion (policy_config_json cleared), parse_policy_config sets policy_config to None.

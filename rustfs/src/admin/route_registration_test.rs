@@ -199,6 +199,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::DELETE, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
         admin_route_sample(Method::GET, "/v3/quota-stats/{bucket}", "/v3/quota-stats/test-bucket"),
         admin_route_sample(Method::POST, "/v3/quota-check/{bucket}", "/v3/quota-check/test-bucket"),
+        admin_route_sample(Method::PUT, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route(Method::GET, "/export-bucket-metadata"),
         admin_route(Method::GET, "/v3/export-bucket-metadata"),
         admin_route(Method::PUT, "/import-bucket-metadata"),
@@ -1155,6 +1158,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/get-bucket-quota"));
     assert_route(&router, Method::PUT, &admin_path("/v3/quota/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/quota-stats/test-bucket"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/bucket-durability/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/bucket-durability/test-bucket"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-durability/test-bucket"));
 
     assert_route(&router, Method::GET, &admin_path("/export-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));

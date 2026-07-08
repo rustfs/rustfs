@@ -17,6 +17,7 @@
 
 pub mod bandwidth;
 pub mod bucket_target_sys;
+pub mod durability;
 pub mod error;
 pub mod lifecycle;
 pub mod metadata;
