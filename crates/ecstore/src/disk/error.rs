@@ -273,7 +273,7 @@ impl DiskError {
 impl From<rustfs_filemeta::Error> for DiskError {
     fn from(e: rustfs_filemeta::Error) -> Self {
         match e {
-            rustfs_filemeta::Error::Io(e) => DiskError::other(e),
+            rustfs_filemeta::Error::Io(e) => DiskError::Io(e),
             rustfs_filemeta::Error::FileNotFound => DiskError::FileNotFound,
             rustfs_filemeta::Error::FileVersionNotFound => DiskError::FileVersionNotFound,
             rustfs_filemeta::Error::FileCorrupt => DiskError::FileCorrupt,
