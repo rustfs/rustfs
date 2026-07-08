@@ -4,10 +4,7 @@ use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
-use crate::storage_api_contracts::{
-    object::{ObjectIO, ObjectOperations as _},
-    range::HTTPRangeSpec,
-};
+use crate::storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec};
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
 use rustfs_utils::path::encode_dir_object;
@@ -64,8 +61,6 @@ pub(crate) trait MigrationBackend: Send + Sync {
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader>;
 
-    async fn delete_object_for_migration(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo>;
-
     async fn move_remote_version_for_migration(
         &self,
         bucket: &str,
@@ -88,10 +83,6 @@ impl MigrationBackend for SetDisks {
         self.get_object_reader(bucket, object, range, h, opts).await
     }
 
-    async fn delete_object_for_migration(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
-        self.delete_object(bucket, object, opts).await
-    }
-
     async fn move_remote_version_for_migration(
         &self,
         bucket: &str,
@@ -104,7 +95,7 @@ impl MigrationBackend for SetDisks {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn migrate_entry_version<Backend, F, Fut>(
+pub(crate) async fn migrate_entry_version<Backend, F, Fut, D, DFut>(
     set: &Backend,
     bucket: String,
     pool_index: usize,
@@ -113,11 +104,14 @@ pub(crate) async fn migrate_entry_version<Backend, F, Fut>(
     max_attempts: usize,
     ignore_data_usage_cache: bool,
     transfer: F,
+    delete_marker: D,
 ) -> MigrationVersionResult
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
+    D: FnMut(String, String, ObjectOptions) -> DFut + Send,
+    DFut: Future<Output = Result<ObjectInfo>> + Send,
 {
     migrate_entry_version_with_retry_wait(
         set,
@@ -128,13 +122,14 @@ where
         max_attempts,
         ignore_data_usage_cache,
         transfer,
+        delete_marker,
         sleep_rebalance_migration_retry,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, W, WFut>(
+pub(super) async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, D, DFut, W, WFut>(
     set: &Backend,
     bucket: String,
     pool_index: usize,
@@ -143,12 +138,15 @@ pub(super) async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, W, WF
     max_attempts: usize,
     ignore_data_usage_cache: bool,
     mut transfer: F,
+    mut delete_marker: D,
     mut wait_retry: W,
 ) -> MigrationVersionResult
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
     Fut: Future<Output = Result<()>> + Send,
+    D: FnMut(String, String, ObjectOptions) -> DFut + Send,
+    DFut: Future<Output = Result<ObjectInfo>> + Send,
     W: FnMut(Duration) -> WFut + Send,
     WFut: Future<Output = ()> + Send,
 {
@@ -207,9 +205,16 @@ where
     }
 
     if version.deleted {
-        if let Err(err) = set
-            .delete_object_for_migration(&bucket, &version.name, rebalance_delete_marker_opts(version, version_id, pool_index))
-            .await
+        // Delete markers must be routed through the store layer (ECStore::delete_object /
+        // handle_delete_object), which honours data_movement/src_pool_idx/delete_marker and
+        // writes the marker to the cross-pool target. Writing via the source SetDisks would
+        // silently rewrite the marker back onto the source set and lose it during cleanup.
+        if let Err(err) = delete_marker(
+            bucket.clone(),
+            version.name.clone(),
+            rebalance_delete_marker_opts(version, version_id, pool_index),
+        )
+        .await
         {
             if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {

@@ -33,8 +33,9 @@ use crate::core::pools::ListCallback;
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
 use crate::error::{Error, Result};
-use crate::object_api::GetObjectReader;
+use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::set_disk::SetDisks;
+use crate::storage_api_contracts::object::ObjectOperations as _;
 use crate::store::ECStore;
 use rustfs_filemeta::MetaCacheEntry;
 use std::sync::Arc;
@@ -109,6 +110,7 @@ impl ECStore {
 
         let mut rebalanced: usize = 0;
         let mut expired: usize = 0;
+        let mut cleanup_preflight_allowed_missing = Vec::new();
         let mut stats_updates = Vec::with_capacity(fivs.versions.len());
         for version in fivs.versions.iter() {
             if crate::core::pools::should_skip_lifecycle_for_data_movement(
@@ -123,6 +125,10 @@ impl ECStore {
             .await?
             {
                 expired += 1;
+                // The lifecycle expiry above physically deleted this version from the source set.
+                // Record its identity so the source-cleanup preflight tolerates its absence,
+                // mirroring decommission; otherwise the entry can never be cleaned up.
+                cleanup_preflight_allowed_missing.push(data_movement::source_cleanup_version_identity(version));
                 debug!(
                     event = EVENT_REBALANCE_ENTRY,
                     component = LOG_COMPONENT_ECSTORE,
@@ -159,6 +165,12 @@ impl ECStore {
                 let store = self.clone();
                 async move { store.rebalance_object(src_pool_idx, bucket, rd).await }
             };
+            // Route delete-marker migration through the store layer so it lands on the
+            // cross-pool target (excluding the source pool), not back onto the source set.
+            let mut delete_marker = |bucket: String, object: String, opts: ObjectOptions| {
+                let store = self.clone();
+                async move { store.delete_object(&bucket, &object, opts).await }
+            };
             let result = migrate_entry_version(
                 set.as_ref(),
                 bucket.clone(),
@@ -168,6 +180,7 @@ impl ECStore {
                 rebalance_max_attempts(),
                 should_ignore_rebalance_data_usage_cache(bucket.as_str()),
                 &mut transfer,
+                &mut delete_marker,
             )
             .await;
 
@@ -255,14 +268,14 @@ impl ECStore {
             entry.name.as_str(),
         )?;
 
-        if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len()) {
+        if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len(), expired) {
             let cleanup_warning = resolve_rebalance_entry_cleanup_delete_result(
                 data_movement::cleanup_source_entry_if_unchanged(
                     set.clone(),
                     bucket.as_str(),
                     entry.name.as_str(),
                     &fivs,
-                    &[],
+                    &cleanup_preflight_allowed_missing,
                     "rebalance",
                 )
                 .await,
@@ -310,6 +323,20 @@ impl ECStore {
                     "Deleted rebalance source entry"
                 );
             }
+        } else if rebalanced != fivs.versions.len() || expired > 0 {
+            warn!(
+                event = EVENT_REBALANCE_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REBALANCE,
+                pool_index,
+                bucket = %bucket,
+                object = %entry.name,
+                rebalanced,
+                total_versions = fivs.versions.len(),
+                expired,
+                state = "source_retained",
+                "Rebalance source object retained"
+            );
         }
 
         Ok(RebalanceEntryOutcome::Completed)
