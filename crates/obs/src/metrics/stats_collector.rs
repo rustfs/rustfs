@@ -35,7 +35,7 @@ use crate::metrics::{
 };
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::global_metrics;
+use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use std::{collections::HashMap, sync::Arc};
@@ -109,6 +109,15 @@ async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreRes
 
 fn resolve_obs_object_store_handle() -> Option<Arc<ObsStore>> {
     obs_resolve_object_store_handle()
+}
+
+fn scanner_lifecycle_checked_versions(metrics: &ScannerMetricsReport) -> u64 {
+    metrics
+        .source_work
+        .iter()
+        .find(|source| source.source == "lifecycle")
+        .map(|source| source.checked)
+        .unwrap_or_default()
 }
 
 fn obs_total_usable_capacity_bytes(storage_info: &ObsStorageInfo) -> u64 {
@@ -919,7 +928,7 @@ pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, 
 pub async fn collect_ilm_metric_stats() -> Option<IlmStats> {
     let ilm = obs_ilm_runtime_snapshot().await;
     let metrics = global_metrics().report().await;
-    let versions_scanned = metrics.life_time_ilm.values().copied().sum();
+    let versions_scanned = scanner_lifecycle_checked_versions(&metrics);
 
     Some(IlmStats {
         expiry_pending_tasks: ilm.expiry_pending_tasks,
@@ -958,7 +967,7 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     let completed_cycles = metrics.life_time_ops.get("scan_cycle").copied().unwrap_or_default();
     let directories_scanned = metrics.life_time_ops.get("scan_folder").copied().unwrap_or_default();
     let objects_scanned = metrics.life_time_ops.get("scan_object").copied().unwrap_or_default();
-    let versions_scanned = metrics.life_time_ilm.values().copied().sum();
+    let versions_scanned = scanner_lifecycle_checked_versions(&metrics);
     let reference_time = metrics.cycles_completed_at.last().copied().unwrap_or(metrics.current_started);
     let last_activity_seconds = now.signed_duration_since(reference_time).num_seconds().max(0) as u64;
     let active_paths = metrics.active_scan_paths as u64;
@@ -1076,6 +1085,7 @@ pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterSta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_common::metrics::ScannerSourceWorkSnapshot;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::thread;
@@ -1222,6 +1232,42 @@ mod tests {
         let life_time_ops = HashMap::new();
 
         assert_eq!(scanner_bucket_scans_started(&life_time_ops, 5), 5);
+    }
+
+    #[test]
+    fn scanner_lifecycle_checked_versions_uses_lifecycle_checked_source_work() {
+        let report = ScannerMetricsReport {
+            source_work: vec![
+                ScannerSourceWorkSnapshot {
+                    source: "usage".to_string(),
+                    checked: 11,
+                    ..Default::default()
+                },
+                ScannerSourceWorkSnapshot {
+                    source: "lifecycle".to_string(),
+                    checked: 37,
+                    ..Default::default()
+                },
+            ],
+            life_time_ilm: HashMap::from([("TransitionAction".to_string(), 5), ("DeleteAction".to_string(), 7)]),
+            ..Default::default()
+        };
+
+        assert_eq!(scanner_lifecycle_checked_versions(&report), 37);
+    }
+
+    #[test]
+    fn scanner_lifecycle_checked_versions_defaults_to_zero_when_lifecycle_missing() {
+        let report = ScannerMetricsReport {
+            source_work: vec![ScannerSourceWorkSnapshot {
+                source: "usage".to_string(),
+                checked: 11,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(scanner_lifecycle_checked_versions(&report), 0);
     }
 
     #[test]
