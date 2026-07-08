@@ -121,8 +121,7 @@ impl OperationHelper {
             .filter(|value| !value.is_empty())
             .unwrap_or(path_bucket);
 
-        let bucket_label = if bucket.is_empty() { "*" } else { &bucket };
-        record_s3_op(op, bucket_label);
+        record_s3_op(op);
 
         // Fast path: when both chains are disabled, avoid all request parsing/builder work.
         if !audit_enabled && !notify_enabled {

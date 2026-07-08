@@ -9337,6 +9337,7 @@ version = "1.0.0-beta.8"
 dependencies = [
  "criterion",
  "metrics",
+ "metrics-util",
  "num_cpus",
  "rustfs-s3-ops",
  "sysinfo",
