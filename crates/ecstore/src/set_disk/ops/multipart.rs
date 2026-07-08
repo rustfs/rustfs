@@ -128,6 +128,25 @@ fn reduce_quorum_part_numbers(object_parts: Vec<Vec<String>>, read_quorum: usize
     part_numbers
 }
 
+/// Applies the `max_uploads` page cap to an already marker-offset, sorted slice
+/// of multipart uploads.
+///
+/// At most `max_uploads` entries are returned. When more uploads remain beyond
+/// the page, the first overflow element acts purely as a truncation probe: it is
+/// never returned, but flips `is_truncated` to `true` and yields a
+/// `next_upload_id_marker` pointing at the last returned upload so the caller can
+/// resume paging.
+fn paginate_upload_page(remaining: &[MultipartInfo], max_uploads: usize) -> (Vec<MultipartInfo>, bool, Option<String>) {
+    let is_truncated = remaining.len() > max_uploads;
+    let page: Vec<MultipartInfo> = remaining.iter().take(max_uploads).cloned().collect();
+    let next_upload_id_marker = if is_truncated {
+        page.last().map(|upload| upload.upload_id.clone())
+    } else {
+        None
+    };
+    (page, is_truncated, next_upload_id_marker)
+}
+
 impl SetDisks {
     async fn acquire_multipart_upload_read_lock(
         &self,
@@ -804,27 +823,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
-        let mut ret_uploads = Vec::new();
-        let mut next_upload_id_marker = None;
-        while upload_idx < uploads.len() {
-            if ret_uploads.len() >= max_uploads {
-                break;
-            }
-
-            ret_uploads.push(uploads[upload_idx].clone());
-            next_upload_id_marker = Some(uploads[upload_idx].upload_id.clone());
-            upload_idx += 1;
-        }
-
-        // Truncated iff there are still unconsumed uploads left after this page.
-        // `upload_idx` tracks the position in the full (post-marker) list, so it
-        // stays correct even when a marker skipped entries before the page start,
-        // unlike comparing the page length against the total.
-        let is_truncated = upload_idx < uploads.len();
-
-        if !is_truncated {
-            next_upload_id_marker = None;
-        }
+        // `upload_idx` is the post-marker offset, so `uploads[upload_idx..]` is the
+        // page candidate. The helper applies the `max_uploads` cap, using the first
+        // overflow element only as a truncation probe (never returned).
+        let (ret_uploads, is_truncated, next_upload_id_marker) = paginate_upload_page(&uploads[upload_idx..], max_uploads);
 
         Ok(ListMultipartsInfo {
             key_marker: key_marker.to_owned(),
@@ -1919,5 +1921,67 @@ mod tests {
 
         assert!(matches!(err, StorageError::InvalidUploadID(bucket, object, upload_id)
             if bucket == "bucket" && object == "object" && upload_id == "upload-id"));
+    }
+
+    fn test_multipart_upload(object: &str, upload_id: &str) -> MultipartInfo {
+        MultipartInfo {
+            bucket: "bucket".to_string(),
+            object: object.to_string(),
+            upload_id: upload_id.to_string(),
+            initiated: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn paginate_upload_page_caps_at_max_uploads_and_probes_truncation() {
+        // max_uploads = N (3) with N + 1 (4) uploads must return exactly N,
+        // report truncation, and expose the last returned id as the next marker.
+        let uploads: Vec<MultipartInfo> = (0..4).map(|i| test_multipart_upload("obj", &format!("u{i}"))).collect();
+
+        let (page, is_truncated, next_upload_id_marker) = paginate_upload_page(&uploads, 3);
+
+        assert_eq!(page.len(), 3);
+        assert!(is_truncated);
+        assert_eq!(next_upload_id_marker.as_deref(), Some("u2"));
+        // The overflow element `u3` is only a truncation probe and must not leak
+        // into the returned page.
+        assert!(page.iter().all(|upload| upload.upload_id != "u3"));
+    }
+
+    #[test]
+    fn paginate_upload_page_reports_complete_when_within_cap() {
+        let uploads: Vec<MultipartInfo> = (0..3).map(|i| test_multipart_upload("obj", &format!("u{i}"))).collect();
+
+        let (page, is_truncated, next_upload_id_marker) = paginate_upload_page(&uploads, 3);
+
+        assert_eq!(page.len(), 3);
+        assert!(!is_truncated);
+        assert!(next_upload_id_marker.is_none());
+    }
+
+    #[test]
+    fn paginate_upload_page_marker_resumes_without_loss() {
+        let uploads: Vec<MultipartInfo> = (0..4).map(|i| test_multipart_upload("obj", &format!("u{i}"))).collect();
+
+        // First page stops at the cap and hands back `u2` as the resume marker.
+        let (first, first_truncated, first_marker) = paginate_upload_page(&uploads, 3);
+        assert!(first_truncated);
+        assert_eq!(first_marker.as_deref(), Some("u2"));
+
+        // The caller applies the marker offset (drops through `u2`) and pages the
+        // remainder; the final upload must appear exactly once.
+        let resume_offset = uploads
+            .iter()
+            .position(|u| u.upload_id == "u2")
+            .expect("marker must be present")
+            + 1;
+        let (second, second_truncated, _) = paginate_upload_page(&uploads[resume_offset..], 3);
+        assert!(!second_truncated);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].upload_id, "u3");
+
+        let paged: Vec<&str> = first.iter().chain(second.iter()).map(|u| u.upload_id.as_str()).collect();
+        assert_eq!(paged, vec!["u0", "u1", "u2", "u3"]);
     }
 }
