@@ -813,6 +813,24 @@ pub struct WalkDirOptions {
     // Skip the wrapper-level total timeout for long streaming walks.
     #[serde(default)]
     pub skip_total_timeout: bool,
+
+    // Override the wrapper-level total timeout for long background walks.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+
+    // Override the remote stream stall timeout for long background walks.
+    #[serde(default)]
+    pub stall_timeout_ms: Option<u64>,
+}
+
+impl WalkDirOptions {
+    pub fn timeout_duration(&self) -> Option<std::time::Duration> {
+        self.timeout_ms.map(std::time::Duration::from_millis)
+    }
+
+    pub fn stall_timeout_duration(&self) -> Option<std::time::Duration> {
+        self.stall_timeout_ms.map(std::time::Duration::from_millis)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1046,6 +1064,8 @@ mod tests {
             limit: 100,
             disk_id: "disk-123".to_string(),
             skip_total_timeout: false,
+            timeout_ms: Some(10_000),
+            stall_timeout_ms: Some(20_000),
         };
 
         assert_eq!(opts.bucket, "test-bucket");
@@ -1058,6 +1078,8 @@ mod tests {
         assert_eq!(opts.limit, 100);
         assert_eq!(opts.disk_id, "disk-123");
         assert!(!opts.skip_total_timeout);
+        assert_eq!(opts.timeout_duration(), Some(std::time::Duration::from_secs(10)));
+        assert_eq!(opts.stall_timeout_duration(), Some(std::time::Duration::from_secs(20)));
     }
 
     /// Test DeleteOptions structure

@@ -2018,14 +2018,14 @@ impl DiskAPI for RemoteDisk {
 
         let disk = self.disk_ref().await;
         let body = serde_json::to_vec(&opts)?;
-        let stall_timeout = get_drive_walkdir_stall_timeout();
+        let stall_timeout = opts.stall_timeout_duration().unwrap_or_else(get_drive_walkdir_stall_timeout);
         let bucket = opts.bucket.clone();
         let base_dir = opts.base_dir.clone();
         let disk_for_log = disk.clone();
         let timeout_duration = if opts.skip_total_timeout {
             Duration::ZERO
         } else {
-            get_drive_walkdir_timeout()
+            opts.timeout_duration().unwrap_or_else(get_drive_walkdir_timeout)
         };
 
         self.execute_with_timeout_for_op_and_health_action(
@@ -3766,6 +3766,34 @@ mod tests {
                     serde_json::from_slice(&request.body).expect("walk_dir request body should deserialize");
                 assert!(sent_opts.skip_total_timeout);
                 assert_eq!(request.stall_timeout, Some(get_drive_walkdir_stall_timeout()));
+            }
+            other => panic!("expected walk-dir transport call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_walk_dir_uses_per_request_stall_timeout() {
+        let transport = RecordingInternodeDataTransport::default();
+        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let opts = WalkDirOptions {
+            bucket: "bucket".to_string(),
+            base_dir: "prefix".to_string(),
+            recursive: true,
+            stall_timeout_ms: Some(60_000),
+            ..Default::default()
+        };
+        let mut writer = Vec::new();
+
+        remote_disk
+            .walk_dir(opts, &mut writer)
+            .await
+            .expect("walk_dir should be sent through configured data transport");
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedTransportCall::WalkDir(request) => {
+                assert_eq!(request.stall_timeout, Some(Duration::from_secs(60)));
             }
             other => panic!("expected walk-dir transport call, got {other:?}"),
         }

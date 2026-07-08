@@ -1221,7 +1221,7 @@ impl DiskAPI for LocalDiskWrapper {
         let timeout_duration = if opts.skip_total_timeout {
             Duration::ZERO
         } else {
-            get_drive_walkdir_timeout()
+            opts.timeout_duration().unwrap_or_else(get_drive_walkdir_timeout)
         };
 
         self.track_disk_health_with_op_and_timeout_action(
@@ -1546,6 +1546,52 @@ mod tests {
     }
 
     #[test]
+    fn drive_walkdir_timeout_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, || {
+                    assert_eq!(
+                        get_drive_walkdir_timeout(),
+                        Duration::from_secs(rustfs_config::DEFAULT_DRIVE_WALKDIR_TIMEOUT_SECS)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_stall_timeout_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, || {
+                    assert_eq!(
+                        get_drive_walkdir_stall_timeout(),
+                        Duration::from_secs(rustfs_config::DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_timeout_prefers_canonical_over_legacy() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("11"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                assert_eq!(get_drive_walkdir_timeout(), Duration::from_secs(11));
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_stall_timeout_prefers_canonical_over_legacy() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, Some("13"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                assert_eq!(get_drive_walkdir_stall_timeout(), Duration::from_secs(13));
+            });
+        });
+    }
+
+    #[test]
     fn object_disk_read_timeout_uses_default_when_unset() {
         temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, || {
             temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
@@ -1789,6 +1835,50 @@ mod tests {
                 .await;
 
             assert_eq!(result.expect_err("walk_dir should time out"), DiskError::Timeout);
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!wrapper.health.is_faulty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn walk_dir_uses_per_request_timeout_before_env_default() {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("60"))], async {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            let bucket = "test-bucket";
+            let object = "test-object";
+
+            wrapper.make_volume(bucket).await.expect("bucket should be created");
+
+            let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+            file_info.volume = bucket.to_string();
+            file_info.name = object.to_string();
+            file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+            file_info.erasure.index = 1;
+
+            wrapper
+                .write_metadata("", bucket, object, file_info)
+                .await
+                .expect("object metadata should be written");
+
+            let mut writer = PendingWriter;
+            let result = wrapper
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        timeout_ms: Some(10),
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await;
+
+            assert_eq!(result.expect_err("walk_dir should use per-request timeout"), DiskError::Timeout);
             assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
             assert!(!wrapper.health.is_faulty());
         })

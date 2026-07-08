@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::storage_api::object_store::{
-    HTTPPreconditions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
+    HTTPPreconditions, ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
 };
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
@@ -65,6 +65,7 @@ type IamObjectOptions = <IamStore as ObjectOperations>::ObjectOptions;
 const IAM_IDENTITY_FILE: &str = "identity.json";
 const IAM_POLICY_FILE: &str = "policy.json";
 const IAM_GROUP_MEMBERS_FILE: &str = "members.json";
+const BACKGROUND_WALKDIR_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn get_user_identity_path(user: &str, user_type: UserType) -> String {
     let base_path: &str = match user_type {
@@ -414,10 +415,9 @@ impl ObjectStore {
         let path = prefix.to_owned();
         let sender_on_error = sender.clone();
         tokio::spawn(async move {
-            if let Err(err) = store
-                .walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, Default::default())
-                .await
-            {
+            let walk_opts =
+                <IamStore as ListOperations>::WalkOptions::default().with_walkdir_timeouts(BACKGROUND_WALKDIR_TIMEOUT);
+            if let Err(err) = store.walk(ctx.clone(), Self::BUCKET_NAME, &path, tx, walk_opts).await {
                 let reason = classify_iam_system_path_failure_reason(&err);
                 record_system_path_failure("iam_config", "walk", reason);
                 error!(

@@ -91,6 +91,10 @@ async fn take_fallback_candidate<T>(fallback_items: &Arc<TokioMutex<VecDeque<T>>
     fallback_items.lock().await.pop_front()
 }
 
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) enum TestReaderBehavior {
@@ -117,6 +121,8 @@ pub struct ListPathRawOptions {
     pub report_not_found: bool,
     pub per_disk_limit: i32,
     pub skip_walkdir_total_timeout: bool,
+    pub walkdir_timeout: Option<Duration>,
+    pub walkdir_stall_timeout: Option<Duration>,
     pub agreed: Option<AgreedFn>,
     pub partial: Option<PartialFn>,
     pub finished: Option<FinishedFn>,
@@ -146,6 +152,8 @@ impl Clone for ListPathRawOptions {
             report_not_found: self.report_not_found,
             per_disk_limit: self.per_disk_limit,
             skip_walkdir_total_timeout: self.skip_walkdir_total_timeout,
+            walkdir_timeout: self.walkdir_timeout,
+            walkdir_stall_timeout: self.walkdir_stall_timeout,
             #[cfg(test)]
             test_reader_behaviors: self.test_reader_behaviors.clone(),
             #[cfg(test)]
@@ -259,6 +267,8 @@ async fn list_path_raw_inner(
                 forward_to: opts_clone.forward_to.clone(),
                 limit: opts_clone.per_disk_limit,
                 skip_total_timeout: opts_clone.skip_walkdir_total_timeout,
+                timeout_ms: opts_clone.walkdir_timeout.map(duration_millis),
+                stall_timeout_ms: opts_clone.walkdir_stall_timeout.map(duration_millis),
                 ..Default::default()
             };
 
@@ -419,6 +429,8 @@ async fn list_path_raw_inner(
                             forward_to: opts_clone.forward_to.clone(),
                             limit: opts_clone.per_disk_limit,
                             skip_total_timeout: opts_clone.skip_walkdir_total_timeout,
+                            timeout_ms: opts_clone.walkdir_timeout.map(duration_millis),
+                            stall_timeout_ms: opts_clone.walkdir_stall_timeout.map(duration_millis),
                             ..Default::default()
                         },
                         &mut wr,
@@ -485,10 +497,19 @@ async fn list_path_raw_inner(
     }
 
     let revjob = spawn(async move {
-        #[cfg(test)]
-        let peek_timeout = opts.peek_timeout.unwrap_or_else(get_drive_walkdir_stall_timeout);
-        #[cfg(not(test))]
-        let peek_timeout = get_drive_walkdir_stall_timeout();
+        let peek_timeout = opts
+            .walkdir_stall_timeout
+            .or({
+                #[cfg(test)]
+                {
+                    opts.peek_timeout
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            })
+            .unwrap_or_else(get_drive_walkdir_stall_timeout);
         let mut errs: Vec<Option<DiskError>> = Vec::with_capacity(readers.len());
         for _ in 0..readers.len() {
             errs.push(None);
