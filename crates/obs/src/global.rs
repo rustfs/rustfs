@@ -22,7 +22,7 @@ const LOG_SUBSYSTEM_GLOBAL: &str = "global";
 const EVENT_OBS_GLOBAL_STATE: &str = "obs_global_state";
 
 /// Global guard for OpenTelemetry tracing
-static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
+static GLOBAL_GUARD: OnceCell<Arc<Mutex<Option<OtelGuard>>>> = OnceCell::const_new();
 
 /// Flag indicating if observability metric is enabled
 pub(crate) static OBSERVABILITY_METRIC_ENABLED: OnceCell<bool> = OnceCell::const_new();
@@ -158,13 +158,15 @@ pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
         state = "guard_initializing",
         "obs global state changed"
     );
-    GLOBAL_GUARD.set(Arc::new(Mutex::new(guard))).map_err(GlobalError::SetError)
+    GLOBAL_GUARD
+        .set(Arc::new(Mutex::new(Some(guard))))
+        .map_err(GlobalError::SetError)
 }
 
 /// Get the global guard for OtelGuard
 ///
 /// # Returns
-/// * `Ok(Arc<Mutex<OtelGuard>>)` if guard exists
+/// * `Ok(Arc<Mutex<Option<OtelGuard>>>>)` if guard exists
 /// * `Err(GuardError)` if guard not initialized
 ///
 /// # Example
@@ -178,8 +180,21 @@ pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
 /// #    Ok(())
 /// # }
 /// ```
-pub fn get_global_guard() -> Result<Arc<Mutex<OtelGuard>>, GlobalError> {
+pub fn get_global_guard() -> Result<Arc<Mutex<Option<OtelGuard>>>, GlobalError> {
     GLOBAL_GUARD.get().cloned().ok_or(GlobalError::NotInitialized)
+}
+
+/// Explicitly drop the global guard so telemetry providers can flush before exit.
+pub fn shutdown_global_guard() -> Result<(), GlobalError> {
+    let guard_handle = get_global_guard()?;
+    let guard = {
+        let mut slot = guard_handle
+            .lock()
+            .map_err(|_| GlobalError::GuardPoisoned("global observability guard"))?;
+        slot.take()
+    };
+    drop(guard);
+    Ok(())
 }
 
 #[cfg(test)]
