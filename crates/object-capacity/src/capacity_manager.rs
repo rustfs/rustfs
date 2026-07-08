@@ -50,6 +50,7 @@ const EVENT_CAPACITY_REFRESH_CACHE_UPDATED: &str = "capacity_refresh_cache_updat
 const EVENT_CAPACITY_REFRESH_WRITE_RECORDED: &str = "capacity_refresh_write_recorded";
 const EVENT_CAPACITY_REFRESH_DEBOUNCE_STATE: &str = "capacity_refresh_debounce_state";
 const EVENT_CAPACITY_REFRESH_PANIC: &str = "capacity_refresh_panic";
+const EVENT_CAPACITY_REFRESH_JOINER_TIMEOUT: &str = "capacity_refresh_joiner_timeout";
 const EVENT_CAPACITY_REFRESH_CANCELLED: &str = "capacity_refresh_cancelled";
 const EVENT_CAPACITY_REFRESH_RUNTIME_SUMMARY: &str = "capacity_refresh_runtime_summary";
 const EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED: &str = "capacity_refresh_interval_clamped";
@@ -438,6 +439,14 @@ impl DataSource {
 
 const WRITE_WINDOW_SECS: u64 = 60;
 const WRITE_WINDOW_BUCKETS: usize = WRITE_WINDOW_SECS as usize;
+
+/// Upper bound on how long a joiner waits for the in-flight refresh leader.
+///
+/// A healthy full refresh finishes well within this (each disk scan is capped
+/// by the outer wall-clock budget); the bound only exists so admin queries
+/// return a clear error instead of hanging until process restart if the
+/// leader wedges in a way the guards don't cover (backlog#1017).
+const REFRESH_JOINER_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct WriteBucket {
@@ -927,11 +936,25 @@ impl HybridCapacityManager {
 
         if let Some(mut result_rx) = maybe_rx {
             // Wait until the leader publishes Some(result). Because we subscribed before
-            // releasing the mutex, we cannot miss the notification.
-            if result_rx.wait_for(|v| v.is_some()).await.is_err() {
+            // releasing the mutex, we cannot miss the notification. The wait is bounded so
+            // a wedged leader degrades admin queries into a clear error, never a hang.
+            match tokio::time::timeout(REFRESH_JOINER_WAIT_TIMEOUT, result_rx.wait_for(|v| v.is_some())).await {
+                Err(_) => {
+                    warn!(
+                        event = EVENT_CAPACITY_REFRESH_JOINER_TIMEOUT,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_REFRESH,
+                        result = "timeout",
+                        source = source.as_metric_label(),
+                        waited_ms = REFRESH_JOINER_WAIT_TIMEOUT.as_millis() as u64,
+                        "capacity refresh joiner timed out waiting for the leader"
+                    );
+                    return Err("timed out waiting for the in-flight capacity refresh to publish a result".to_string());
+                }
                 // The leader's sender was dropped (e.g. due to a panic) without publishing
                 // a result. Surface a clear error rather than silently returning the default.
-                return Err("capacity refresh leader exited without publishing a result".to_string());
+                Ok(Err(_)) => return Err("capacity refresh leader exited without publishing a result".to_string()),
+                Ok(Ok(_)) => {}
             }
             return result_rx
                 .borrow()
@@ -1894,6 +1917,34 @@ mod tests {
         assert_eq!(cached.total_used, 100);
         assert!(cached.degraded);
         assert!(!manager.can_refresh_dirty_subset().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_refresh_or_join_joiner_times_out_when_leader_wedges() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+
+        // A leader that never publishes (models a refresh wedged beyond what
+        // the drop/panic guards cover).
+        let leader_manager = manager.clone();
+        let leader = tokio::spawn(async move {
+            leader_manager
+                .refresh_or_join(DataSource::Scheduled, || async {
+                    futures::future::pending::<Result<CapacityUpdate, String>>().await
+                })
+                .await
+        });
+        // Let the leader claim the singleflight slot before joining.
+        tokio::task::yield_now().await;
+
+        // Paused time auto-advances past REFRESH_JOINER_WAIT_TIMEOUT: the
+        // joiner must surface a clear error instead of hanging forever.
+        let err = manager
+            .refresh_or_join(DataSource::RealTime, || async { Ok(CapacityUpdate::exact(1, 0)) })
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "unexpected joiner error: {err}");
+        leader.abort();
     }
 
     #[tokio::test]
