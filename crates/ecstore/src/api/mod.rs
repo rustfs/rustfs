@@ -387,6 +387,7 @@ pub mod store_list {
 }
 
 pub mod storage {
+    pub use crate::store::HealWalkVersion;
     pub use crate::store::{
         ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_lock_clients,
         prewarm_local_disk_id_map,

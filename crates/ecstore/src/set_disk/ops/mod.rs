@@ -19,6 +19,7 @@
 
 pub(crate) mod bucket;
 pub(crate) mod heal;
+pub(crate) mod heal_walk;
 pub(crate) mod list;
 pub(crate) mod locking;
 pub(crate) mod multipart;

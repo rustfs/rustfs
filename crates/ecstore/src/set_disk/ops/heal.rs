@@ -29,6 +29,23 @@ impl SetDisks {
         version_id: &str,
         opts: &HealOpts,
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
+        // `allow_meta_regen` is true on the first pass: a version whose data shards
+        // physically survive (>= data_blocks) but whose xl.meta fell below
+        // read-quorum is RESCUED (missing xl.meta regenerated) rather than
+        // dangling-deleted. The re-drive after a rescue sets it false so the
+        // regeneration can happen at most once (no unbounded recursion).
+        Box::pin(self.heal_object_with_regen(bucket, object, version_id, opts, true)).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn heal_object_with_regen(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        opts: &HealOpts,
+        allow_meta_regen: bool,
+    ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
         info!(?opts, "Starting heal_object");
 
         let disks = self.get_disks_internal().await;
@@ -211,6 +228,22 @@ impl SetDisks {
                                     break;
                                 }
                             }
+                        }
+
+                        // DATA-SAFETY GUARD (backlog#920, decision 1): before any
+                        // dangling delete, if the version's DATA shards physically
+                        // survive on >= data_blocks disks it is RECONSTRUCTABLE.
+                        // Regenerate the missing xl.meta from a surviving valid
+                        // FileInfo and re-drive the heal instead of destroying a
+                        // recoverable version. Torn writes (< data_blocks data
+                        // shards) fall through to the existing dangling behavior.
+                        if cannot_heal
+                            && allow_meta_regen
+                            && self
+                                .try_regenerate_recoverable_meta(bucket, object, &parts_metadata, &errs, &disks)
+                                .await?
+                        {
+                            return Box::pin(self.heal_object_with_regen(bucket, object, version_id, opts, false)).await;
                         }
 
                         if cannot_heal {
@@ -644,6 +677,19 @@ impl SetDisks {
                 }
             }
             Err(err) => {
+                // DATA-SAFETY GUARD (backlog#920, decision 1): meta quorum failed,
+                // but the version's DATA may still physically survive on enough
+                // disks (xl.meta lost on > parity disks while part files remain).
+                // Rescue it by regenerating the missing xl.meta and re-driving heal
+                // instead of dangling-deleting a reconstructable version.
+                if allow_meta_regen
+                    && self
+                        .try_regenerate_recoverable_meta(bucket, object, &parts_metadata, &errs, &disks)
+                        .await?
+                {
+                    return Box::pin(self.heal_object_with_regen(bucket, object, version_id, opts, false)).await;
+                }
+
                 let data_errs_by_part = HashMap::new();
                 match self
                     .delete_if_dangling(
@@ -675,6 +721,131 @@ impl SetDisks {
                 }
             }
         }
+    }
+
+    /// backlog#920 (decision 1): rescue a version that meta-quorum logic would
+    /// otherwise dangling-DELETE, when its DATA is still reconstructable.
+    ///
+    /// Returns `Ok(true)` if the version was rescued (missing xl.meta regenerated
+    /// on at least one disk, so a re-driven heal can reconstruct it), `Ok(false)`
+    /// to fall through to the existing dangling-delete behavior.
+    ///
+    /// Recoverability is computed by physically probing part files across ALL
+    /// disks in the set with `check_parts` — including disks whose xl.meta is
+    /// absent (a lost xl.meta does not lose the sibling `part.*` data). If at
+    /// least `data_blocks` disks hold every part of a surviving valid FileInfo,
+    /// the object is EC-reconstructable, so we regenerate that FileInfo's xl.meta
+    /// on every disk whose metadata is absent (via `write_metadata`, which merges
+    /// into any existing xl.meta). Delete markers, remote/transitioned versions,
+    /// and genuine torn writes (< `data_blocks` surviving data shards) are NOT
+    /// rescued — they keep the current dangling-delete-after-grace behavior, so no
+    /// regression on those paths.
+    async fn try_regenerate_recoverable_meta(
+        &self,
+        bucket: &str,
+        object: &str,
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        disks: &[Option<DiskStore>],
+    ) -> disk::error::Result<bool> {
+        // A surviving valid, non-deleted, non-remote data FileInfo to rebuild from.
+        let Some(surviving) = parts_metadata
+            .iter()
+            .find(|fi| fi.is_valid() && !fi.deleted && !fi.is_remote())
+            .cloned()
+        else {
+            return Ok(false);
+        };
+
+        // Without a data_dir + parts there is no data to prove recoverable.
+        if surviving.data_dir.is_none() || surviving.parts.is_empty() {
+            return Ok(false);
+        }
+        let data_blocks = surviving.erasure.data_blocks;
+        if data_blocks == 0 {
+            return Ok(false);
+        }
+
+        // Physically probe part presence on EVERY online disk using the surviving
+        // FileInfo's data_dir/parts. `check_parts` stats `object/<data_dir>/part.N`
+        // directly, so it counts disks that still hold the data even if their
+        // xl.meta was deleted.
+        let mut available = 0usize;
+        for disk in disks.iter().flatten() {
+            if let Ok(resp) = disk.check_parts(bucket, object, &surviving).await
+                && !resp.results.is_empty()
+                && resp.results.iter().all(|r| *r == CHECK_PART_SUCCESS)
+            {
+                available += 1;
+            }
+        }
+
+        // Torn write: fewer than data_blocks surviving data shards is genuinely
+        // unrecoverable — preserve the current dangling behavior (no resurrection).
+        if available < data_blocks {
+            debug!(
+                bucket,
+                object,
+                available,
+                data_blocks,
+                "heal_object: version not reconstructable (torn write), keeping dangling behavior"
+            );
+            return Ok(false);
+        }
+
+        // Reconstructable: regenerate the surviving xl.meta on every disk whose
+        // metadata is absent so the version regains read-quorum. Each disk gets its
+        // OWN shard index: the disk at physical position `index` holds shard
+        // `distribution[index]` (mirrors `shuffle_disks` + the write path's
+        // `erasure.index = shuffled_pos + 1`). Copying the surviving disk's index
+        // verbatim would write an inconsistent xl.meta that the re-heal then treats
+        // as corrupt.
+        let distribution = &surviving.erasure.distribution;
+        let mut wrote = 0usize;
+        for (index, disk) in disks.iter().enumerate() {
+            let Some(disk) = disk else { continue };
+            let meta_absent = matches!(
+                errs.get(index).and_then(Option::as_ref),
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+            ) || !parts_metadata.get(index).map(FileInfo::is_valid).unwrap_or(false);
+            if !meta_absent {
+                continue;
+            }
+            // Without a known shard index for this position we cannot write a
+            // consistent xl.meta; leave it for the normal heal to reconstruct.
+            let Some(&shard_index) = distribution.get(index) else {
+                continue;
+            };
+            let mut regen = surviving.clone();
+            regen.fresh = false; // merge into any existing xl.meta on the disk
+            regen.erasure.index = shard_index;
+            match disk.write_metadata("", bucket, object, regen).await {
+                Ok(()) => wrote += 1,
+                Err(e) => {
+                    warn!(
+                        bucket,
+                        object,
+                        disk_index = index,
+                        error = %e,
+                        "heal_object: failed to regenerate recoverable xl.meta on disk"
+                    );
+                }
+            }
+        }
+
+        if wrote == 0 {
+            return Ok(false);
+        }
+
+        info!(
+            bucket,
+            object,
+            available,
+            data_blocks,
+            regenerated_meta_disks = wrote,
+            "heal_object: rescued reconstructable sub-quorum version by regenerating xl.meta"
+        );
+        Ok(true)
     }
 
     pub(in crate::set_disk) async fn heal_object_dir_locked(

@@ -343,6 +343,32 @@ impl MetaCacheEntries {
         self.resolve_inner(params, true)
     }
 
+    /// Resolve the cross-disk UNION of every version present on ANY disk slot.
+    ///
+    /// This mirrors MinIO's global heal enumeration (cmd/global-heal.go
+    /// `healErasureSet` -> `listPathRaw` with `objQuorum = 1` feeding
+    /// `mergeEntries`/`mergeXLV2Versions`): at quorum 1 the merge is forced
+    /// strict and returns the union of all per-disk version streams, so a version
+    /// that survives on FEWER than read-quorum disks is still surfaced for
+    /// healing. Read-quorum resolution (`resolve` with `obj_quorum >= 2`) would
+    /// silently drop such a sub-quorum version, which is exactly the durability
+    /// gap this enumerator closes (backlog#920).
+    ///
+    /// `bucket` is only used to tag the merged entry; `strict:false` lets the
+    /// non-strict header reconciliation collapse equal-but-differently-signed
+    /// replicas of the SAME version id while still retaining genuinely distinct
+    /// version ids.
+    pub fn resolve_union(&self, bucket: &str) -> Option<MetaCacheEntry> {
+        self.resolve(MetadataResolutionParams {
+            dir_quorum: 1,
+            obj_quorum: 1,
+            requested_versions: 0,
+            bucket: bucket.to_string(),
+            strict: false,
+            candidates: Vec::new(),
+        })
+    }
+
     fn resolve_inner(&self, mut params: MetadataResolutionParams, enforce_write_quorum: bool) -> Option<MetaCacheEntry> {
         if self.0.is_empty() {
             debug!(
@@ -1478,6 +1504,92 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    /// Build an entry holding a single object version with an explicit version id
+    /// and mod_time, so a set of these can model DISJOINT per-disk version sets.
+    fn metacache_entry_single_version(version_u128: u128, mod_time: OffsetDateTime, etag: &str) -> MetaCacheEntry {
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), etag.to_string());
+
+        let mut fi = FileInfo::new("object", 4, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.version_id = Some(Uuid::from_u128(version_u128));
+        fi.versioned = true;
+        fi.size = 1;
+        fi.mod_time = Some(mod_time);
+        fi.metadata = metadata;
+
+        let mut meta = FileMeta::new();
+        meta.add_version(fi).expect("test file metadata should accept object version");
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    /// backlog#920: `resolve_union` surfaces a version present on a SINGLE slot
+    /// among four, while `resolve` at read-quorum (obj_quorum=2) drops it. This
+    /// documents the exact sub-quorum durability gap the disk-walk closes.
+    #[test]
+    fn resolve_union_surfaces_single_disk_version() {
+        let t0 = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let t1 = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+
+        // Slot 0 carries a UNIQUE version (0xBEEF) present nowhere else; the other
+        // three slots agree on a shared version (0xCAFE). Read-quorum sees only
+        // the shared one; union must see BOTH.
+        let unique = metacache_entry_single_version(0xBEEF, t1, "unique-etag");
+        let shared_a = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+        let shared_b = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+        let shared_c = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+
+        let entries = || {
+            MetaCacheEntries(vec![
+                Some(unique.clone()),
+                Some(shared_a.clone()),
+                Some(shared_b.clone()),
+                Some(shared_c.clone()),
+            ])
+        };
+
+        let union = entries().resolve_union("bucket").expect("union must resolve an entry");
+        let union_meta = union.cached.expect("union entry keeps cached metadata");
+        let union_ids: std::collections::HashSet<Option<Uuid>> =
+            union_meta.versions.iter().map(|v| v.header.version_id).collect();
+        assert!(
+            union_ids.contains(&Some(Uuid::from_u128(0xBEEF))),
+            "union must surface the single-slot version: {union_ids:?}"
+        );
+        assert!(
+            union_ids.contains(&Some(Uuid::from_u128(0xCAFE))),
+            "union must also keep the shared version: {union_ids:?}"
+        );
+
+        // Read-quorum resolution (obj_quorum=2) drops the single-slot version.
+        let read_quorum = entries()
+            .resolve(MetadataResolutionParams {
+                obj_quorum: 2,
+                dir_quorum: 2,
+                strict: false,
+                ..Default::default()
+            })
+            .expect("read-quorum must still resolve the shared version");
+        let rq_meta = read_quorum.cached.expect("read-quorum entry keeps cached metadata");
+        let rq_ids: std::collections::HashSet<Option<Uuid>> = rq_meta.versions.iter().map(|v| v.header.version_id).collect();
+        assert!(
+            !rq_ids.contains(&Some(Uuid::from_u128(0xBEEF))),
+            "read-quorum must DROP the single-slot version (the gap): {rq_ids:?}"
+        );
+        assert!(
+            rq_ids.contains(&Some(Uuid::from_u128(0xCAFE))),
+            "read-quorum must keep the shared version: {rq_ids:?}"
+        );
     }
 
     #[test]

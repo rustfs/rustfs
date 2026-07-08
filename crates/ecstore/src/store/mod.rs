@@ -150,6 +150,8 @@ const MAX_UPLOADS_LIST: usize = 10000;
 
 mod bucket;
 mod heal;
+mod heal_walk;
+pub use heal_walk::HealWalkVersion;
 mod init;
 pub(crate) mod init_format;
 mod list;

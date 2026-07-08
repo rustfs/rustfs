@@ -4018,6 +4018,69 @@ mod tests {
         assert_eq!(merged, vec![valid]);
     }
 
+    /// Build a single distinct Object version header for the union tests.
+    fn union_version(version_u128: u128, mod_unix: i64) -> FileMetaShallowVersion {
+        FileMetaShallowVersion {
+            header: FileMetaVersionHeader {
+                version_id: Some(Uuid::from_u128(version_u128)),
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(mod_unix).expect("valid timestamp")),
+                signature: [0x11, 0x22, 0x33, 0x44],
+                version_type: VersionType::Object,
+                flags: 0,
+                ec_n: 4,
+                ec_m: 2,
+            },
+            meta: Vec::new(),
+        }
+    }
+
+    /// backlog#920: quorum==1 (union) must surface EVERY version present on ANY
+    /// per-disk stream, even when the per-disk version sets are fully DISJOINT
+    /// (a version living on a single disk). This is the enumeration guarantee the
+    /// sub-quorum disk-walk depends on.
+    #[test]
+    fn merge_union_quorum1_yields_full_union_over_disjoint_disks() {
+        let a = union_version(0xA, 1_705_312_300);
+        let b = union_version(0xB, 1_705_312_200);
+        let c = union_version(0xC, 1_705_312_100);
+
+        // Three disks, each holding exactly ONE distinct version (disjoint sets).
+        let disks = [vec![a], vec![b], vec![c]];
+        let merged = merge_file_meta_versions(1, true, 0, &disks);
+
+        let ids: std::collections::HashSet<Option<Uuid>> = merged.iter().map(|v| v.header.version_id).collect();
+        assert_eq!(merged.len(), 3, "union must retain all three disjoint versions: {merged:?}");
+        assert!(ids.contains(&Some(Uuid::from_u128(0xA))));
+        assert!(ids.contains(&Some(Uuid::from_u128(0xB))));
+        assert!(ids.contains(&Some(Uuid::from_u128(0xC))));
+
+        // Contrast: read-quorum (2) over the same disjoint streams surfaces NONE,
+        // because no version reaches two agreeing disks. This is the exact gap.
+        let read_quorum = merge_file_meta_versions(2, true, 0, &disks);
+        assert!(
+            read_quorum.is_empty(),
+            "read-quorum merge must drop every sub-quorum version, got {read_quorum:?}"
+        );
+    }
+
+    /// The equal-modTime / distinct-versionId retain-and-advance branch: two
+    /// versions sharing a mod_time but with different ids must BOTH survive the
+    /// union merge (they are not collapsed as duplicates).
+    #[test]
+    fn merge_union_quorum1_retains_equal_modtime_distinct_version_ids() {
+        let same_time = 1_705_312_300;
+        let a = union_version(0xAA, same_time);
+        let b = union_version(0xBB, same_time);
+
+        let disks = [vec![a], vec![b]];
+        let merged = merge_file_meta_versions(1, true, 0, &disks);
+
+        let ids: std::collections::HashSet<Option<Uuid>> = merged.iter().map(|v| v.header.version_id).collect();
+        assert_eq!(merged.len(), 2, "equal-modTime distinct-id versions must both survive: {merged:?}");
+        assert!(ids.contains(&Some(Uuid::from_u128(0xAA))));
+        assert!(ids.contains(&Some(Uuid::from_u128(0xBB))));
+    }
+
     #[test]
     fn meta_object_init_free_version_rejects_invalid_tier_free_version_id() {
         let mut sys = HashMap::new();
