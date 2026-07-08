@@ -9536,7 +9536,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "wildmatch",
 ]
 
 [[package]]
@@ -12453,15 +12452,6 @@ name = "widestring"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
-
-[[package]]
-name = "wildmatch"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29333c3ea1ba8b17211763463ff24ee84e41c78224c16b001cd907e663a38c68"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "winapi"
