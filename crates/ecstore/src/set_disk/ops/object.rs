@@ -1335,7 +1335,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
-        if dist_erasure {
+        if opts.no_lock {
+            locked_objects = unique_objects;
+        } else if dist_erasure {
             (failed_map, locked_objects, dist_batch_lock_ids) = self.acquire_dist_delete_object_locks_batch(&batch).await;
         } else {
             let batch_result = self.local_lock_manager.acquire_locks_batch(batch).await;
@@ -2614,5 +2616,45 @@ mod delete_objects_lock_gating_tests {
             .get_object_info(bucket, "plain", &ObjectOptions::default())
             .await
             .expect_err("plain object must be deleted");
+    }
+
+    #[tokio::test]
+    async fn delete_objects_honors_no_lock_when_outer_write_lock_is_held() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "batch-no-lock-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, "obj-a").await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock(bucket, "obj-a")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let objects = vec![ObjectToDelete {
+            object_name: "obj-a".to_string(),
+            ..Default::default()
+        }];
+
+        let (deleted, errs) = tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.delete_objects(
+                bucket,
+                objects,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("no_lock batch delete path must not wait for the outer lock");
+
+        assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
+        assert!(deleted[0].found, "existing object must still be deleted");
     }
 }
