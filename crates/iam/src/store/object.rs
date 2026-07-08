@@ -1130,39 +1130,22 @@ impl Store for ObjectStore {
         let mut policy_docs_cache = CacheEntity::new(get_default_policyes());
 
         if let Some(policies_list) = listed_config_items.get(POLICIES_LIST_KEY) {
-            let mut policies_list = policies_list.clone();
-
-            loop {
-                if policies_list.len() < 32 {
-                    let policy_docs = self.load_policy_doc_concurrent(&policies_list, LOAD_ALL_MODE).await?;
-
-                    for (idx, p) in policy_docs.into_iter().enumerate() {
-                        if p.policy.version.is_empty() {
-                            continue;
-                        }
-
-                        let policy_name = rustfs_utils::path::dir(&policies_list[idx]);
-
-                        debug!(policy = %policy_name, "IAM policy loaded");
-
-                        policy_docs_cache.insert(policy_name, p);
-                    }
-                    break;
-                }
-
-                let policy_docs = self.load_policy_doc_concurrent(&policies_list, LOAD_ALL_MODE).await?;
+            // Load in fixed-size chunks so each policy is fetched exactly once.
+            // The previous split_off loop re-passed the full remaining list to
+            // load_policy_doc_concurrent every iteration — an O(n^2) redundant
+            // load (backlog#806).
+            for chunk in policies_list.chunks(32) {
+                let policy_docs = self.load_policy_doc_concurrent(chunk, LOAD_ALL_MODE).await?;
 
                 for (idx, p) in policy_docs.into_iter().enumerate() {
                     if p.policy.version.is_empty() {
                         continue;
                     }
 
-                    let policy_name = rustfs_utils::path::dir(&policies_list[idx]);
+                    let policy_name = rustfs_utils::path::dir(&chunk[idx]);
                     debug!(policy = %policy_name, "IAM policy loaded");
                     policy_docs_cache.insert(policy_name, p);
                 }
-
-                policies_list = policies_list.split_off(32);
             }
         }
 
@@ -1170,41 +1153,20 @@ impl Store for ObjectStore {
 
         // users
         if let Some(item_name_list) = listed_config_items.get(USERS_LIST_KEY) {
-            let mut item_name_list = item_name_list.clone();
-
-            loop {
-                if item_name_list.len() < 32 {
-                    let items = self
-                        .load_user_concurrent(&item_name_list, UserType::Reg, LOAD_ALL_MODE)
-                        .await?;
-
-                    for (idx, p) in items.into_iter().enumerate() {
-                        if p.credentials.access_key.is_empty() {
-                            continue;
-                        }
-
-                        let name = rustfs_utils::path::dir(&item_name_list[idx]);
-                        debug!(user = %name, "IAM regular user loaded");
-                        user_items_cache.insert(name, p);
-                    }
-                    break;
-                }
-
-                let items = self
-                    .load_user_concurrent(&item_name_list, UserType::Reg, LOAD_ALL_MODE)
-                    .await?;
+            // Load in fixed-size chunks so each user is fetched exactly once
+            // (backlog#806 — the split_off loop was O(n^2)).
+            for chunk in item_name_list.chunks(32) {
+                let items = self.load_user_concurrent(chunk, UserType::Reg, LOAD_ALL_MODE).await?;
 
                 for (idx, p) in items.into_iter().enumerate() {
                     if p.credentials.access_key.is_empty() {
                         continue;
                     }
 
-                    let name = rustfs_utils::path::dir(&item_name_list[idx]);
+                    let name = rustfs_utils::path::dir(&chunk[idx]);
                     debug!(user = %name, "IAM regular user loaded");
                     user_items_cache.insert(name, p);
                 }
-
-                item_name_list = item_name_list.split_off(32);
             }
         }
 
@@ -1227,30 +1189,13 @@ impl Store for ObjectStore {
         // user policies
         let mut user_policies_cache = None;
         if let Some(item_name_list) = listed_config_items.get(POLICY_DB_USERS_LIST_KEY) {
-            let mut item_name_list = item_name_list.clone();
-
             let mut items_cache = CacheEntity::default();
 
-            loop {
-                if item_name_list.len() < 32 {
-                    let items = self
-                        .load_mapped_policy_concurrent(&item_name_list, UserType::Reg, false, LOAD_ALL_MODE)
-                        .await?;
-
-                    for (idx, p) in items.into_iter().enumerate() {
-                        if p.policies.is_empty() {
-                            continue;
-                        }
-
-                        let name = item_name_list[idx].trim_end_matches(".json").to_owned();
-                        debug!(user = %name, "IAM user policy loaded");
-                        items_cache.insert(name, p);
-                    }
-                    break;
-                }
-
+            // Load in fixed-size chunks so each mapping is fetched exactly once
+            // (backlog#806 — the split_off loop was O(n^2)).
+            for chunk in item_name_list.chunks(32) {
                 let items = self
-                    .load_mapped_policy_concurrent(&item_name_list, UserType::Reg, false, LOAD_ALL_MODE)
+                    .load_mapped_policy_concurrent(chunk, UserType::Reg, false, LOAD_ALL_MODE)
                     .await?;
 
                 for (idx, p) in items.into_iter().enumerate() {
@@ -1258,12 +1203,10 @@ impl Store for ObjectStore {
                         continue;
                     }
 
-                    let name = item_name_list[idx].trim_end_matches(".json").to_owned();
+                    let name = chunk[idx].trim_end_matches(".json").to_owned();
                     debug!(user = %name, "IAM user policy loaded");
                     items_cache.insert(name, p);
                 }
-
-                item_name_list = item_name_list.split_off(32);
             }
 
             user_policies_cache = Some(items_cache);
