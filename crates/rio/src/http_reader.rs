@@ -30,6 +30,7 @@ use std::net::IpAddr;
 use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -268,6 +269,11 @@ struct InternodeHttpClientTuning {
     http2_initial_connection_window_size: Option<u32>,
     http2_adaptive_window: bool,
     proxy_mode: InternodeHttpProxyMode,
+    /// True when the operator explicitly configured any HTTP/2 tuning knob
+    /// (a window size, the keepalive timeout, or a non-default tuning profile).
+    /// Used to warn once when that tuning is inert because the internode
+    /// connection negotiated HTTP/1.1 over plaintext (backlog#805-C3).
+    h2_tuning_explicit: bool,
 }
 
 fn internode_http_client_tuning() -> InternodeHttpClientTuning {
@@ -281,7 +287,7 @@ impl InternodeHttpClientTuning {
     fn from_env() -> Self {
         let profile =
             parse_internode_http_tuning_profile(get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_TUNING_PROFILE).as_deref());
-        Self::from_values(
+        let mut tuning = Self::from_values(
             profile,
             get_env_opt_usize(rustfs_config::ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST),
             get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS),
@@ -292,7 +298,14 @@ impl InternodeHttpClientTuning {
                 profile.default_http2_adaptive_window(),
             ),
             get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROXY).as_deref(),
-        )
+        );
+        // The keepalive timeout env is read in build_http_client, not passed to
+        // from_values; fold it into the explicit-tuning signal here so the
+        // inert-h2 warning also fires when only the keepalive knob is set.
+        if get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS).is_some() {
+            tuning.h2_tuning_explicit = true;
+        }
+        tuning
     }
 
     fn from_values(
@@ -304,6 +317,11 @@ impl InternodeHttpClientTuning {
         http2_adaptive_window: bool,
         proxy_mode: Option<&str>,
     ) -> Self {
+        // Explicit h2 tuning = an operator-set window size (raw arg, before the
+        // profile fallback) or a non-default (non-Legacy) tuning profile. The
+        // keepalive-env contribution is OR-ed in by from_env.
+        let h2_tuning_explicit =
+            stream_window_size.is_some() || connection_window_size.is_some() || profile != InternodeHttpTuningProfile::Legacy;
         Self {
             profile,
             pool_max_idle_per_host: pool_max_idle_per_host.or_else(|| profile.default_pool_max_idle_per_host()),
@@ -316,6 +334,7 @@ impl InternodeHttpClientTuning {
             ),
             http2_adaptive_window,
             proxy_mode: parse_internode_http_proxy_mode(proxy_mode, profile),
+            h2_tuning_explicit,
         }
     }
 }
@@ -385,6 +404,16 @@ fn clamp_http2_window(value: Option<u64>) -> Option<u32> {
     u32::try_from(value).ok()
 }
 
+/// Applies internode HTTP client tuning (connection pool + HTTP/2 window
+/// sizes) to a reqwest client builder.
+///
+/// IMPORTANT (backlog#805-C3): the HTTP/2 window and keepalive settings only
+/// take effect when the internode connection actually negotiates HTTP/2, which
+/// happens via TLS-ALPN. Over plaintext internode transport the connection is
+/// HTTP/1.1 and every `http2_*` knob here (and the keepalive settings in
+/// `build_http_client`) is silently inert. Enable internode TLS to use them.
+/// `should_warn_h2_inert` emits a one-time warning when explicitly-configured
+/// h2 tuning is observed to be inert on a live connection.
 fn apply_http_client_tuning(mut builder: reqwest::ClientBuilder, tuning: InternodeHttpClientTuning) -> reqwest::ClientBuilder {
     if let Some(pool_max_idle_per_host) = tuning.pool_max_idle_per_host {
         builder = builder.pool_max_idle_per_host(pool_max_idle_per_host);
@@ -702,6 +731,7 @@ impl HttpReader {
         })?;
 
         record_internode_http_version(track_internode_metrics, internode_operation, http_version_metric_label(resp.version()));
+        maybe_warn_h2_inert(resp.version());
         if resp.status().is_success().not() {
             record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
@@ -922,6 +952,7 @@ impl HttpWriter {
                         internode_operation,
                         http_version_metric_label(resp.version()),
                     );
+                    maybe_warn_h2_inert(resp.version());
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
                         record_internode_error(track_internode_metrics, internode_operation);
@@ -1081,6 +1112,36 @@ fn record_internode_http_version(track: bool, operation: Option<&'static str>, h
 
     if let Some(operation) = operation {
         crate::http_runtime_sources::record_http_version(operation, http_version);
+    }
+}
+
+/// Set once the inert-HTTP/2-tuning warning has been emitted, so it fires at
+/// most once for the process lifetime (backlog#805-C3).
+static H2_INERT_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Pure predicate deciding whether to warn that configured HTTP/2 tuning is
+/// inert. Warn only when the negotiated protocol is not HTTP/2, the operator
+/// explicitly configured h2 tuning, and we have not warned before. HTTP/2 for
+/// internode is negotiated via TLS-ALPN; over plaintext the connection is
+/// HTTP/1.1 and the h2 window/keepalive knobs are silently ignored.
+fn should_warn_h2_inert(negotiated_is_http2: bool, h2_tuning_explicit: bool, already_warned: bool) -> bool {
+    !negotiated_is_http2 && h2_tuning_explicit && !already_warned
+}
+
+/// Emit a single process-lifetime warning if explicitly-configured HTTP/2
+/// tuning is inert because the observed internode connection negotiated a
+/// non-HTTP/2 protocol (i.e. HTTP/1.1 over plaintext). See backlog#805-C3.
+fn maybe_warn_h2_inert(negotiated_version: Version) {
+    let negotiated_is_http2 = negotiated_version == Version::HTTP_2;
+    let tuning = internode_http_client_tuning();
+    if should_warn_h2_inert(negotiated_is_http2, tuning.h2_tuning_explicit, H2_INERT_WARNED.load(Ordering::Relaxed))
+        && H2_INERT_WARNED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            "internode connection negotiated HTTP/1.1 while HTTP/2 tuning is configured; the HTTP/2 window/keepalive settings apply only over internode TLS (h2 is negotiated via ALPN) — enable internode TLS to use them."
+        );
     }
 }
 
@@ -1803,5 +1864,60 @@ mod tests {
         assert!(should_disable_proxy_for_url("http://192.168.1.10:9000/stream", balanced));
         assert!(!should_disable_proxy_for_url("http://127.0.0.1:9000/stream", system_proxy));
         assert!(should_disable_proxy_for_url("http://example.com/stream", no_proxy));
+    }
+
+    // backlog#805-C3: warn once when configured HTTP/2 tuning is inert over
+    // plaintext internode (HTTP/1.1) transport.
+
+    #[test]
+    fn should_warn_h2_inert_truth_table() {
+        // HTTP/1.1 + explicit tuning + not yet warned -> warn.
+        assert!(should_warn_h2_inert(false, true, false));
+        // Negotiated HTTP/2 -> tuning is actually active, never warn.
+        assert!(!should_warn_h2_inert(true, true, false));
+        // No explicit tuning -> nothing to warn about.
+        assert!(!should_warn_h2_inert(false, false, false));
+        // Already warned -> never warn again (Once semantics).
+        assert!(!should_warn_h2_inert(false, true, true));
+        // HTTP/2 and already warned combinations stay false too.
+        assert!(!should_warn_h2_inert(true, false, false));
+        assert!(!should_warn_h2_inert(true, true, true));
+    }
+
+    #[test]
+    fn h2_tuning_explicit_reflects_windows_and_profile() {
+        // Legacy profile with no explicit windows -> not explicit.
+        let legacy =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Legacy, None, None, None, None, false, None);
+        assert!(!legacy.h2_tuning_explicit);
+
+        // Explicit stream window on the Legacy profile -> explicit.
+        let explicit_stream = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            Some(1024 * 1024),
+            None,
+            false,
+            None,
+        );
+        assert!(explicit_stream.h2_tuning_explicit);
+
+        // Explicit connection window on the Legacy profile -> explicit.
+        let explicit_conn = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            None,
+            Some(4 * 1024 * 1024),
+            false,
+            None,
+        );
+        assert!(explicit_conn.h2_tuning_explicit);
+
+        // A non-default (Balanced) profile implies explicit h2 tuning.
+        let balanced =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Balanced, None, None, None, None, false, None);
+        assert!(balanced.h2_tuning_explicit);
     }
 }

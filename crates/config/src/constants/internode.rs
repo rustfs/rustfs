@@ -194,6 +194,12 @@ pub const ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST: &str = "RUSTFS_INTERNODE_HT
 pub const ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS";
 
 /// Internode HTTP/2 initial stream window size in bytes.
+///
+/// NOTE (backlog#805-C3): all `RUSTFS_INTERNODE_HTTP2_*` tuning (window sizes,
+/// adaptive window, keepalive timeout) only takes effect when the internode
+/// connection actually negotiates HTTP/2, which happens via TLS-ALPN. Over
+/// plaintext internode transport the connection is HTTP/1.1 and these settings
+/// are silently inert — enable internode TLS to use them.
 pub const ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE";
 
 /// Internode HTTP/2 initial connection window size in bytes.
