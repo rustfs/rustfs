@@ -78,6 +78,10 @@ static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
 
 const ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED: &str = "managed SSE replication requires target encryption support";
 
+pub(crate) fn replication_object_is_ssec_encrypted(user_defined: &HashMap<String, String>) -> bool {
+    rustfs_replication::is_ssec_encrypted(user_defined)
+}
+
 pub(crate) struct ReplicationTargetStore;
 
 impl ReplicationTargetStore {
@@ -99,7 +103,7 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
     use rustfs_utils::http::{AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT};
 
     let mut meta = HashMap::new();
-    let is_ssec = rustfs_replication::is_ssec_encrypted(&object_info.user_defined);
+    let is_ssec = replication_object_is_ssec_encrypted(&object_info.user_defined);
 
     for (key, value) in object_info.user_defined.iter() {
         let has_valid_sse_header = valid_sse_replication_header(key).is_some();

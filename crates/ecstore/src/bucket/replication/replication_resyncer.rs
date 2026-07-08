@@ -48,8 +48,8 @@ use super::replication_storage_boundary::{
 use super::replication_target_boundary::{
     PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_action_for_target_head,
     replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
-    replication_force_delete_remove_options, replication_put_object_header_size, replication_put_object_options,
-    replication_target_head_is_newer_null_version,
+    replication_force_delete_remove_options, replication_object_is_ssec_encrypted, replication_put_object_header_size,
+    replication_put_object_options, replication_target_head_is_newer_null_version,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -995,7 +995,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         target_statuses,
         target_purge_statuses,
         replication_timestamp: None,
-        ssec: rustfs_replication::is_ssec_encrypted(&user_defined),
+        ssec: replication_object_is_ssec_encrypted(&user_defined),
         user_tags: (*oi.user_tags).clone(),
         checksum: oi.checksum.clone(),
         retry_count: 0,

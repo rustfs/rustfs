@@ -42,7 +42,7 @@ use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{
     ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
 };
-use super::replication_target_boundary::ReplicationTargetStore;
+use super::replication_target_boundary::{ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use lazy_static::lazy_static;
@@ -1354,7 +1354,7 @@ fn replicate_object_info_from_object_info(
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
     let asz = oi.get_actual_size().unwrap_or_default();
-    let ssec = rustfs_replication::is_ssec_encrypted(&oi.user_defined);
+    let ssec = replication_object_is_ssec_encrypted(&oi.user_defined);
     let checksum = if ssec { oi.checksum.clone() } else { None };
 
     ReplicateObjectInfo {
