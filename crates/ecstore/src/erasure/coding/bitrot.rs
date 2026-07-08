@@ -836,7 +836,7 @@ mod tests {
     async fn hashed_read_truncated_within_hash_is_unexpected_eof() {
         // Truncation that lands inside the leading hash (not the data) must still
         // surface as UnexpectedEof, so the stripe drops this reader and rebuilds
-        // from parity instead of hanging or mis-splitting (backlog#799 B2).
+        // from parity instead of hanging or splitting it wrong (backlog#799 B2).
         let shard_size = 32usize;
         let block = encode_one_block(&vec![3u8; shard_size], shard_size, HashAlgorithm::HighwayHash256).await;
         let hash_size = HashAlgorithm::HighwayHash256.size();
