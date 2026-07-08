@@ -562,7 +562,10 @@ async fn stream_replay_worker<E>(
             // partial batch carries across scans, and `store.list()` keeps
             // returning not-yet-delivered keys, so without this guard the same
             // key would be enqueued repeatedly.
-            if batch_keys.iter().any(|pending: &Key| pending.to_key_string() == key.to_key_string()) {
+            if batch_keys
+                .iter()
+                .any(|pending: &Key| pending.to_key_string() == key.to_key_string())
+            {
                 continue;
             }
 
