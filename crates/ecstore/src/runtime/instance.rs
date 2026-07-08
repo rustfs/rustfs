@@ -41,13 +41,14 @@
 
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState};
+use crate::bucket::replication::{DynReplicationPool, ReplicationStats};
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
 
 /// Runtime state owned by a single `ECStore` instance.
@@ -114,6 +115,16 @@ pub struct InstanceContext {
     /// [`InstanceContext::init_bucket_monitor`]); read as `None` until then.
     /// Replaces the process-global bucket-monitor static.
     bucket_monitor: OnceLock<Arc<Monitor>>,
+    /// This instance's background replication stats (Phase 5 Slice 11, backlog#939).
+    ///
+    /// Async set-once (workers are spawned during init); read as `None` until
+    /// `init_background_replication` runs. Replaces the process-global static.
+    replication_stats: OnceCell<Arc<ReplicationStats>>,
+    /// This instance's background replication pool (Phase 5 Slice 11, backlog#939).
+    ///
+    /// Async set-once, built with the live storage during init. Replaces the
+    /// process-global static.
+    replication_pool: OnceCell<Arc<DynReplicationPool>>,
 }
 
 impl InstanceContext {
@@ -141,6 +152,8 @@ impl InstanceContext {
             expiry_state: OnceLock::new(),
             transition_state: OnceLock::new(),
             bucket_monitor: OnceLock::new(),
+            replication_stats: OnceCell::new(),
+            replication_pool: OnceCell::new(),
         }
     }
 
@@ -230,6 +243,33 @@ impl InstanceContext {
         self.bucket_monitor.get().cloned()
     }
 
+    /// This instance's background replication stats, if initialized.
+    pub fn replication_stats(&self) -> Option<Arc<ReplicationStats>> {
+        self.replication_stats.get().cloned()
+    }
+
+    /// This instance's background replication pool, if initialized.
+    pub fn replication_pool(&self) -> Option<Arc<DynReplicationPool>> {
+        self.replication_pool.get().cloned()
+    }
+
+    /// Whether background replication has been initialized for this instance.
+    pub fn replication_initialized(&self) -> bool {
+        self.replication_stats.get().is_some() && self.replication_pool.get().is_some()
+    }
+
+    /// The replication stats cell, for the async `init_background_replication`
+    /// owner to `get_or_init`. Exposed to the replication module only.
+    pub(crate) fn replication_stats_cell(&self) -> &OnceCell<Arc<ReplicationStats>> {
+        &self.replication_stats
+    }
+
+    /// The replication pool cell, for the async `init_background_replication`
+    /// owner to `get_or_init`. Exposed to the replication module only.
+    pub(crate) fn replication_pool_cell(&self) -> &OnceCell<Arc<DynReplicationPool>> {
+        &self.replication_pool
+    }
+
     /// Update this instance's erasure setup type.
     pub async fn update_erasure_type(&self, setup_type: SetupType) {
         *self.erasure_kind.write().await = setup_type;
@@ -276,6 +316,8 @@ impl std::fmt::Debug for InstanceContext {
             .field("expiry_state_set", &self.expiry_state.get().is_some())
             .field("transition_state_set", &self.transition_state.get().is_some())
             .field("bucket_monitor_set", &self.bucket_monitor.get().is_some())
+            .field("replication_stats_set", &self.replication_stats.get().is_some())
+            .field("replication_pool_set", &self.replication_pool.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -564,5 +606,27 @@ mod tests {
 
         let ctx_b = InstanceContext::new();
         assert!(ctx_b.bucket_monitor().is_none(), "a fresh instance has its own uninitialized monitor");
+    }
+
+    // Replication state is None until initialized, and independent per instance.
+    // (The real async init spawns workers and needs live storage; here we only
+    // exercise the read side and cross-instance isolation.)
+    #[tokio::test]
+    async fn replication_state_is_isolated() {
+        let ctx_a = InstanceContext::new();
+        assert!(ctx_a.replication_stats().is_none());
+        assert!(ctx_a.replication_pool().is_none());
+        assert!(!ctx_a.replication_initialized());
+
+        ctx_a.replication_stats_cell().set(Arc::new(ReplicationStats::new())).ok();
+        assert!(ctx_a.replication_stats().is_some());
+        // The pool is still unset, so replication is not fully initialized.
+        assert!(!ctx_a.replication_initialized());
+
+        let ctx_b = InstanceContext::new();
+        assert!(
+            ctx_b.replication_stats().is_none(),
+            "a distinct instance has independent replication state"
+        );
     }
 }
