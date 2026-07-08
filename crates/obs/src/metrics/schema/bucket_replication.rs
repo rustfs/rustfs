@@ -28,6 +28,11 @@ pub const RANGE_L: &str = "range";
 
 const PROXIED_PUT_REQUESTS_TOTAL: &str = "proxied_put_requests_total";
 const PROXIED_PUT_REQUESTS_FAILURES: &str = "proxied_put_requests_failures";
+const RESYNC_STARTED_TOTAL: &str = "resync_started_total";
+const RESYNC_COMPLETED_TOTAL: &str = "resync_completed_total";
+const RESYNC_FAILED_TOTAL: &str = "resync_failed_total";
+const RESYNC_CANCELED_TOTAL: &str = "resync_canceled_total";
+const RESYNC_DURATION_MS_TOTAL: &str = "resync_duration_ms_total";
 
 pub static BUCKET_REPL_LAST_HR_FAILED_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
@@ -186,6 +191,51 @@ pub static BUCKET_REPL_SENT_COUNT_MD: LazyLock<MetricDescriptor> = LazyLock::new
     new_counter_md(
         MetricName::SentCount,
         "Total number of objects replicated to the target",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_RESYNC_STARTED_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(RESYNC_STARTED_TOTAL),
+        "Total number of bucket replication resync runs started",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(RESYNC_COMPLETED_TOTAL),
+        "Total number of bucket replication resync runs completed",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_RESYNC_FAILED_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(RESYNC_FAILED_TOTAL),
+        "Total number of bucket replication resync runs failed",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(RESYNC_CANCELED_TOTAL),
+        "Total number of bucket replication resync runs canceled",
+        &[BUCKET_L],
+        subsystems::BUCKET_REPLICATION,
+    )
+});
+
+pub static BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(RESYNC_DURATION_MS_TOTAL),
+        "Total elapsed time of finished bucket replication resync runs in milliseconds",
         &[BUCKET_L],
         subsystems::BUCKET_REPLICATION,
     )

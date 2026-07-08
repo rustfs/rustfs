@@ -13,9 +13,46 @@
 // limitations under the License.
 
 use super::*;
+use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
 
+fn map_multipart_namespace_lock_error(
+    bucket: &str,
+    object: &str,
+    mode: &'static str,
+    err: rustfs_lock::LockError,
+) -> StorageError {
+    match err {
+        rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required,
+            achieved,
+        },
+        other => StorageError::Lock(other),
+    }
+}
+
 impl ECStore {
+    async fn acquire_list_parts_read_lock(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<Option<rustfs_lock::NamespaceLockGuard>> {
+        if opts.no_lock {
+            return Ok(None);
+        }
+
+        let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
+        ns_lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .map(Some)
+            .map_err(|err| map_multipart_namespace_lock_error(bucket, object, "read", err))
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_list_object_parts(
         &self,
@@ -28,7 +65,7 @@ impl ECStore {
     ) -> Result<ListPartsInfo> {
         check_list_parts_args(bucket, object, upload_id)?;
 
-        // TODO: nslock
+        let _object_lock_guard = self.acquire_list_parts_read_lock(bucket, object, opts).await?;
 
         if self.single_pool() {
             return self.pools[0]
@@ -339,5 +376,112 @@ impl ECStore {
         }
 
         Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{
+        endpoints::{Endpoints, PoolEndpoints},
+        format::FormatV3,
+    };
+    use std::time::Duration;
+
+    async fn new_multipart_lock_test_store() -> ECStore {
+        let format = FormatV3::new(1, 2);
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data0").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data1").expect("second endpoint should parse"),
+        ];
+        let pool_endpoints = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "multipart-list-parts-lock-test".to_string(),
+            platform: "test".to_string(),
+        };
+        let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints.clone()]);
+        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1)
+            .await
+            .expect("test sets should be created with empty disks");
+
+        ECStore {
+            id: Uuid::new_v4(),
+            disk_map: HashMap::new(),
+            pools: vec![sets],
+            peer_sys: S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_parts_read_lock_blocks_object_writer_until_released() {
+        let store = new_multipart_lock_test_store().await;
+        let read_guard = store
+            .acquire_list_parts_read_lock("bucket", "object", &ObjectOptions::default())
+            .await
+            .expect("list parts read lock should be acquired")
+            .expect("default options should acquire a read lock");
+
+        let object_lock = store
+            .handle_new_ns_lock("bucket", "object")
+            .await
+            .expect("object namespace lock should be created");
+        let err = object_lock
+            .get_write_lock(Duration::from_millis(20))
+            .await
+            .expect_err("list parts read lock should block object writers");
+        assert!(matches!(err, rustfs_lock::LockError::Timeout { .. }));
+
+        drop(read_guard);
+        object_lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("object writer should proceed after list parts releases the read lock");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_parts_read_lock_respects_no_lock() {
+        let store = new_multipart_lock_test_store().await;
+        let object_lock = store
+            .handle_new_ns_lock("bucket", "object")
+            .await
+            .expect("object namespace lock should be created");
+        let _writer = object_lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let result = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            store
+                .acquire_list_parts_read_lock("bucket", "object", &ObjectOptions::default())
+                .await
+        })
+        .await;
+        let err = match result {
+            Ok(_) => panic!("list parts read lock must wait behind an object writer"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, StorageError::Lock(rustfs_lock::LockError::Timeout { .. })));
+
+        let no_lock_guard = store
+            .acquire_list_parts_read_lock(
+                "bucket",
+                "object",
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("no_lock list parts path should not acquire an object lock");
+        assert!(no_lock_guard.is_none());
     }
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::BucketLifecycleConfiguration;
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -304,6 +304,8 @@ pub struct DataUsageCacheInfo {
     pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
     #[serde(default)]
     pub pending_heals: Vec<PendingScannerHeal>,
+    #[serde(default)]
+    pub object_lock: Option<Arc<ObjectLockConfiguration>>,
 }
 
 /// Data usage cache
@@ -1272,6 +1274,7 @@ mod tests {
         assert_eq!(decoded.next_cycle, 7);
         assert!(decoded.scan_resume_after.is_none());
         assert!(decoded.scan_checkpoint.is_none());
+        assert!(decoded.object_lock.is_none());
         assert!(decoded.pending_heals.is_empty());
     }
 

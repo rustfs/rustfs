@@ -81,6 +81,7 @@ use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_reader_from_bytes, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
 use crate::object_api::get_object_body_cache_hook;
+use crate::runtime::instance::{InstanceContext, bootstrap_ctx};
 use crate::runtime::sources as runtime_sources;
 use crate::services::batch_processor::AsyncBatchProcessor;
 use crate::storage_api_contracts::{
@@ -253,6 +254,13 @@ impl ObjectLockDiagGuard {
             mode,
             acquired_at: Instant::now(),
         }
+    }
+
+    /// Whether the underlying namespace lock's heartbeat has observed a
+    /// refresh-quorum loss (backlog#899 Phase 2). Callers fence their commit
+    /// point on this so a stale lock holder does not race a double-write.
+    fn is_lock_lost(&self) -> bool {
+        self.guard.is_lock_lost()
     }
 }
 
@@ -1564,6 +1572,12 @@ pub struct SetDisks {
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     pub lockers: Vec<Arc<dyn LockClient>>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+    /// Per-instance runtime context (Phase 5, backlog#939).
+    ///
+    /// The leaf of the object-graph ctx plumbing (ECStore → Sets → SetDisks).
+    /// Slice 3 sources `local_lock_manager` from this context to give each
+    /// instance its own lock namespace.
+    ctx: Arc<InstanceContext>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1709,6 +1723,10 @@ impl SetDisks {
         format: FormatV3,
         lockers: Vec<Arc<dyn LockClient>>,
     ) -> Arc<Self> {
+        // Single-instance sources the process bootstrap context (the one the
+        // owning ECStore adopts). Slice 8 threads a per-instance context in for
+        // true multi-instance.
+        let ctx = bootstrap_ctx();
         Arc::new(SetDisks {
             locker_owner,
             disks,
@@ -1724,8 +1742,24 @@ impl SetDisks {
                 .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)
                 .build(),
             lockers,
-            local_lock_manager: runtime_sources::global_lock_manager(),
+            // Sourced from the instance context so each instance owns its lock
+            // namespace (Phase 5 Slice 3). Single-instance: ctx aliases the
+            // process lock-manager singleton, so this is unchanged.
+            local_lock_manager: ctx.lock_manager(),
+            ctx,
         })
+    }
+
+    /// This set's per-instance runtime context (Phase 5, backlog#939).
+    #[allow(dead_code)] // Read by tests; consumed by later slices.
+    pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
+        &self.ctx
+    }
+
+    /// The lock manager this set actually uses (test-only; Phase 5 Slice 3).
+    #[cfg(test)]
+    pub(crate) fn local_lock_manager_for_test(&self) -> &Arc<rustfs_lock::GlobalLockManager> {
+        &self.local_lock_manager
     }
 
     // async fn cached_disk_health(&self, index: usize) -> Option<bool> {

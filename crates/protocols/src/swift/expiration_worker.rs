@@ -54,7 +54,7 @@ use super::storage_api::object::ObjectOperations as _;
 use super::{SwiftError, SwiftObjectOptions, SwiftResult, resolve_swift_object_store_handle};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::time::interval;
@@ -69,12 +69,40 @@ const EVENT_SWIFT_EXPIRATION_DELETE_STATE: &str = "swift_expiration_delete_state
 const EVENT_SWIFT_EXPIRATION_SCAN_STATE: &str = "swift_expiration_scan_state";
 const SWIFT_DELETE_AT_METADATA: &str = "x-delete-at";
 
+static GLOBAL_EXPIRATION_WORKER: OnceLock<Arc<ExpirationWorker>> = OnceLock::new();
+
+fn global_expiration_worker() -> Arc<ExpirationWorker> {
+    Arc::clone(GLOBAL_EXPIRATION_WORKER.get_or_init(|| Arc::new(ExpirationWorker::new(ExpirationWorkerConfig::default()))))
+}
+
+pub async fn track_object_expiration(account: &str, container: &str, object: &str, expires_at: u64) {
+    let worker = global_expiration_worker();
+    worker.track_object(account, container, object, expires_at).await;
+    worker.ensure_started().await;
+}
+
+pub async fn untrack_object_expiration(account: &str, container: &str, object: &str) {
+    if let Some(worker) = GLOBAL_EXPIRATION_WORKER.get() {
+        worker.untrack_object(account, container, object).await;
+    }
+}
+
 #[async_trait::async_trait]
 trait ExpirationObjectBackend: Send + Sync {
+    async fn expiring_objects(&self) -> SwiftResult<Vec<ExpirationCandidate>>;
+
     async fn object_metadata(&self, account: &str, container: &str, object: &str)
     -> SwiftResult<Option<HashMap<String, String>>>;
 
     async fn delete_object(&self, account: &str, container: &str, object: &str) -> SwiftResult<()>;
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ExpirationCandidate {
+    account: String,
+    container: String,
+    object: String,
+    expires_at: u64,
 }
 
 #[derive(Debug, Default)]
@@ -82,6 +110,10 @@ struct SwiftStorageExpirationBackend;
 
 #[async_trait::async_trait]
 impl ExpirationObjectBackend for SwiftStorageExpirationBackend {
+    async fn expiring_objects(&self) -> SwiftResult<Vec<ExpirationCandidate>> {
+        Ok(Vec::new())
+    }
+
     async fn object_metadata(
         &self,
         account: &str,
@@ -312,6 +344,14 @@ impl ExpirationWorker {
                 }
             }
         });
+    }
+
+    pub async fn ensure_started(&self) {
+        if *self.running.read().await {
+            return;
+        }
+
+        self.start().await;
     }
 
     /// Stop the background worker
@@ -623,6 +663,14 @@ impl ExpirationWorker {
     /// This is used for initial population or recovery after restart.
     /// In production, objects should be tracked incrementally via track_object().
     pub async fn scan_all_objects(&self) -> SwiftResult<()> {
+        self.scan_all_objects_with_backend(&SwiftStorageExpirationBackend).await?;
+        Ok(())
+    }
+
+    async fn scan_all_objects_with_backend<B>(&self, backend: &B) -> SwiftResult<usize>
+    where
+        B: ExpirationObjectBackend + ?Sized,
+    {
         info!(
             event = EVENT_SWIFT_EXPIRATION_SCAN_STATE,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -633,20 +681,33 @@ impl ExpirationWorker {
             "swift expiration scan state changed"
         );
 
-        // TODO: This would integrate with the storage layer to list all objects
-        // For each object with X-Delete-At metadata, call track_object()
+        let mut tracked_count = 0;
+        for candidate in backend.expiring_objects().await? {
+            let path = format!("{}/{}/{}", candidate.account, candidate.container, candidate.object);
+            if !self.should_handle_object(&path) {
+                continue;
+            }
 
-        // Placeholder implementation
-        warn!(
+            self.track_object(&candidate.account, &candidate.container, &candidate.object, candidate.expires_at)
+                .await;
+            tracked_count += 1;
+        }
+
+        let queue_size = self.priority_queue.read().await.len();
+        self.metrics.write().await.queue_size = queue_size;
+
+        info!(
             event = EVENT_SWIFT_EXPIRATION_SCAN_STATE,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_SWIFT_EXPIRATION,
-            result = "unimplemented",
+            state = "completed",
             worker_id = self.config.worker_id,
+            tracked_count,
+            queue_size,
             "swift expiration scan state changed"
         );
 
-        Ok(())
+        Ok(tracked_count)
     }
 }
 
@@ -661,6 +722,7 @@ mod tests {
     #[derive(Default)]
     #[allow(clippy::type_complexity)]
     struct MockExpirationObjectBackend {
+        expiring_objects: Mutex<Vec<ExpirationCandidate>>,
         metadata_results: Mutex<VecDeque<MetadataResult>>,
         delete_results: Mutex<VecDeque<SwiftResult<()>>>,
         deleted_objects: Mutex<Vec<(String, String, String)>>,
@@ -670,6 +732,13 @@ mod tests {
         fn with_metadata_result(result: MetadataResult) -> Self {
             Self {
                 metadata_results: Mutex::new(VecDeque::from([result])),
+                ..Default::default()
+            }
+        }
+
+        fn with_expiring_objects(objects: Vec<ExpirationCandidate>) -> Self {
+            Self {
+                expiring_objects: Mutex::new(objects),
                 ..Default::default()
             }
         }
@@ -692,6 +761,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExpirationObjectBackend for MockExpirationObjectBackend {
+        async fn expiring_objects(&self) -> SwiftResult<Vec<ExpirationCandidate>> {
+            let objects = match self.expiring_objects.lock() {
+                Ok(objects) => objects,
+                Err(err) => err.into_inner(),
+            };
+            Ok(objects.clone())
+        }
+
         async fn object_metadata(
             &self,
             _account: &str,
@@ -885,6 +962,37 @@ mod tests {
         // Check metrics
         let metrics = worker.get_metrics().await;
         assert_eq!(metrics.queue_size, 2);
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_objects_tracks_backend_candidates() {
+        let worker = ExpirationWorker::new(ExpirationWorkerConfig::default());
+        let backend = MockExpirationObjectBackend::with_expiring_objects(vec![
+            ExpirationCandidate {
+                account: "AUTH_test".to_string(),
+                container: "container".to_string(),
+                object: "object-a".to_string(),
+                expires_at: 1000,
+            },
+            ExpirationCandidate {
+                account: "AUTH_test".to_string(),
+                container: "container".to_string(),
+                object: "object-b".to_string(),
+                expires_at: 2000,
+            },
+        ]);
+
+        let tracked = match worker.scan_all_objects_with_backend(&backend).await {
+            Ok(tracked) => tracked,
+            Err(err) => {
+                assert!(false, "scan candidates should be tracked: {err}");
+                0
+            }
+        };
+
+        assert_eq!(tracked, 2);
+        assert_eq!(worker.priority_queue.read().await.len(), 2);
+        assert_eq!(worker.get_metrics().await.queue_size, 2);
     }
 
     #[tokio::test]

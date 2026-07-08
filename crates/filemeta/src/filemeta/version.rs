@@ -1328,7 +1328,8 @@ impl MetaObjectV1 {
         data_blocks > 0
             && data_blocks >= parity_blocks
             && self.erasure.index > 0
-            && self.erasure.distribution.len() == data_blocks + parity_blocks
+            && self.erasure.index <= data_blocks + parity_blocks
+            && crate::fileinfo::is_valid_distribution(&self.erasure.distribution, data_blocks + parity_blocks)
     }
 
     fn decode_from<R: std::io::Read>(&mut self, rd: &mut R) -> Result<()> {
