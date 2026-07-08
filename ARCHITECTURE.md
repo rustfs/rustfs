@@ -141,7 +141,7 @@ Depth 8 — TOP:
 | `io-metrics` | 4.5K | I/O operation metrics and counters |
 | `rio` | 6.9K | Composable reader chain (encrypt → compress → hash → limit) |
 | `object-io` | 2.4K | High-level object read/write using rio + ecstore |
-| `concurrency` | 1.8K | Concurrency control wrappers over io-core |
+| `concurrency` | 0.8K | Shared concurrency contract types: workload admission snapshots, worker-slot pool, policy types (runtime control lives in `rustfs/src/storage`) |
 
 **Storage Engine:**
 
