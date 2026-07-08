@@ -83,8 +83,15 @@ pub fn record_capacity_scope(token: Uuid, scope: CapacityScope) {
         enforce_hard_limit(&mut entries, CAPACITY_SCOPE_REGISTRY_HARD_LIMIT);
     }
     if let Some(entry) = entries.get_mut(&token) {
-        merge_capacity_scopes(&mut entry.scope, scope);
-        entry.recorded_at = now;
+        // An expired entry would already be discarded by take_capacity_scope;
+        // merging into it (and refreshing recorded_at) would resurrect stale
+        // disks. Replace it with the fresh scope instead (backlog#1022 #35).
+        if now.duration_since(entry.recorded_at) > CAPACITY_SCOPE_TTL {
+            *entry = CapacityScopeEntry { scope, recorded_at: now };
+        } else {
+            merge_capacity_scopes(&mut entry.scope, scope);
+            entry.recorded_at = now;
+        }
     } else {
         entries.insert(token, CapacityScopeEntry { scope, recorded_at: now });
     }
@@ -154,6 +161,41 @@ mod tests {
             panic!("poison global dirty scope registry");
         })
         .join();
+    }
+
+    #[test]
+    fn record_capacity_scope_replaces_expired_entry_instead_of_merging() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        clear_capacity_scope_registry_for_test();
+        let token = Uuid::new_v4();
+        let stale_disk = CapacityScopeDisk {
+            endpoint: "node-old".to_string(),
+            drive_path: "/tmp/disk-old".to_string(),
+        };
+        let fresh_disk = CapacityScopeDisk {
+            endpoint: "node-new".to_string(),
+            drive_path: "/tmp/disk-new".to_string(),
+        };
+
+        record_capacity_scope(token, CapacityScope { disks: vec![stale_disk] });
+        // Backdate the entry beyond the TTL: take_capacity_scope would drop
+        // it, so a new record for the same token must not resurrect it.
+        capacity_scope_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&token)
+            .expect("entry must exist")
+            .recorded_at = Instant::now() - CAPACITY_SCOPE_TTL - Duration::from_secs(1);
+
+        record_capacity_scope(
+            token,
+            CapacityScope {
+                disks: vec![fresh_disk.clone()],
+            },
+        );
+
+        assert_eq!(take_capacity_scope(token), Some(CapacityScope { disks: vec![fresh_disk] }));
+        clear_capacity_scope_registry_for_test();
     }
 
     #[test]

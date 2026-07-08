@@ -37,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
@@ -445,6 +445,11 @@ const WRITE_WINDOW_BUCKETS: usize = WRITE_WINDOW_SECS as usize;
 /// leader wedges in a way the guards don't cover (backlog#1017).
 const REFRESH_JOINER_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Upper bound for background refresh/metrics intervals: 30 days. Far beyond
+/// any sane configuration, but small enough that `Instant + Duration` can
+/// never overflow.
+const MAX_BACKGROUND_INTERVAL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 #[derive(Clone, Copy, Debug, Default)]
 struct WriteBucket {
     second: u64,
@@ -460,14 +465,24 @@ pub struct WriteRecord {
     pub write_count: usize,
     /// Fixed-size time buckets for the recent write window.
     write_buckets: [WriteBucket; WRITE_WINDOW_BUCKETS],
+    /// Monotonic origin for bucket keys. Wall-clock keys made an NTP step
+    /// backwards mark recent buckets as "future" and silently suppress
+    /// write-triggered refreshes until the clock catches up (backlog#1022 S32).
+    epoch: Instant,
 }
 
 impl WriteRecord {
-    fn current_unix_second() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs()
+    fn new() -> Self {
+        Self {
+            last_write_time: None,
+            write_count: 0,
+            write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
+            epoch: Instant::now(),
+        }
+    }
+
+    fn monotonic_second(&self) -> u64 {
+        self.epoch.elapsed().as_secs()
     }
 
     fn recent_write_count(&self, now_second: u64) -> usize {
@@ -481,7 +496,7 @@ impl WriteRecord {
     }
 
     fn record_write(&mut self, now: Instant) -> usize {
-        let now_second = Self::current_unix_second();
+        let now_second = self.monotonic_second();
         let bucket_idx = (now_second % WRITE_WINDOW_BUCKETS as u64) as usize;
         let bucket = &mut self.write_buckets[bucket_idx];
 
@@ -665,11 +680,7 @@ impl HybridCapacityManager {
     pub fn new(config: HybridStrategyConfig) -> Self {
         Self {
             cache: Arc::new(RwLock::new(None)),
-            write_record: Arc::new(RwLock::new(WriteRecord {
-                last_write_time: None,
-                write_count: 0,
-                write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
-            })),
+            write_record: Arc::new(RwLock::new(WriteRecord::new())),
             dirty_disks: Arc::new(RwLock::new(HashMap::new())),
             disk_cache: Arc::new(RwLock::new(HashMap::new())),
             disk_cache_complete: Arc::new(RwLock::new(false)),
@@ -863,7 +874,7 @@ impl HybridCapacityManager {
             }
 
             let write_record = self.write_record.read().await;
-            let write_frequency = write_record.recent_write_count(WriteRecord::current_unix_second());
+            let write_frequency = write_record.recent_write_count(write_record.monotonic_second());
             if write_frequency <= self.config.write_frequency_threshold {
                 return false;
             }
@@ -913,7 +924,7 @@ impl HybridCapacityManager {
     #[allow(dead_code)]
     pub async fn get_write_frequency(&self) -> usize {
         let record = self.write_record.read().await;
-        record.recent_write_count(WriteRecord::current_unix_second())
+        record.recent_write_count(record.monotonic_second())
     }
 
     /// Snapshot the currently dirty disks recorded from write-side scope propagation.
@@ -1209,6 +1220,28 @@ pub fn create_isolated_manager(config: HybridStrategyConfig) -> Arc<HybridCapaci
 }
 
 /// Start background update task
+/// Clamp a background interval into [1s, 30 days].
+///
+/// Zero panics tokio::time::interval; absurd values (e.g. u64::MAX seconds)
+/// overflow `Instant + Duration` and panic the spawned task, silently killing
+/// scheduled refreshes and runtime metrics (backlog#1022 S33).
+fn clamp_background_interval(value: Duration, env_var: &'static str) -> Duration {
+    let clamped = value.clamp(Duration::from_secs(1), MAX_BACKGROUND_INTERVAL);
+    if clamped != value {
+        warn!(
+            event = EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            result = "clamped",
+            env_var,
+            configured_secs = value.as_secs(),
+            effective_secs = clamped.as_secs(),
+            "capacity refresh interval clamped"
+        );
+    }
+    clamped
+}
+
 pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     let manager = get_capacity_manager();
     let manager_for_refresh = manager.clone();
@@ -1216,35 +1249,8 @@ pub async fn start_background_task(disks: Vec<CapacityDiskRef>) {
     let mut refresh_interval = manager.get_config().scheduled_update_interval;
     let mut metrics_interval = manager.get_config().metrics_interval;
 
-    // Prevent panic in tokio::time::interval when misconfigured to 0
-    if refresh_interval.is_zero() {
-        warn!(
-            event = EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED,
-            component = LOG_COMPONENT_CAPACITY,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            result = "clamped",
-            env_var = ENV_CAPACITY_SCHEDULED_INTERVAL,
-            configured_secs = 0,
-            effective_secs = 1,
-            reason = "zero_interval",
-            "capacity refresh interval clamped"
-        );
-        refresh_interval = Duration::from_secs(1);
-    }
-    if metrics_interval.is_zero() {
-        warn!(
-            event = EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED,
-            component = LOG_COMPONENT_CAPACITY,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            result = "clamped",
-            env_var = ENV_CAPACITY_METRICS_INTERVAL,
-            configured_secs = 0,
-            effective_secs = 1,
-            reason = "zero_interval",
-            "capacity refresh interval clamped"
-        );
-        metrics_interval = Duration::from_secs(1);
-    }
+    refresh_interval = clamp_background_interval(refresh_interval, ENV_CAPACITY_SCHEDULED_INTERVAL);
+    metrics_interval = clamp_background_interval(metrics_interval, ENV_CAPACITY_METRICS_INTERVAL);
 
     tokio::spawn(async move {
         let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + refresh_interval, refresh_interval);
@@ -1437,12 +1443,33 @@ mod tests {
     }
 
     #[test]
+    fn test_clamp_background_interval_bounds() {
+        // Zero panics tokio interval; u64::MAX seconds overflows Instant +
+        // Duration and used to panic the spawned background task.
+        assert_eq!(
+            clamp_background_interval(Duration::ZERO, ENV_CAPACITY_SCHEDULED_INTERVAL),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            clamp_background_interval(Duration::from_secs(u64::MAX), ENV_CAPACITY_SCHEDULED_INTERVAL),
+            MAX_BACKGROUND_INTERVAL
+        );
+        assert_eq!(
+            clamp_background_interval(Duration::from_secs(120), ENV_CAPACITY_SCHEDULED_INTERVAL),
+            Duration::from_secs(120)
+        );
+        // The cap itself must be safely addable to a tokio Instant.
+        let _ = tokio::time::Instant::now() + MAX_BACKGROUND_INTERVAL;
+    }
+
+    #[test]
     #[serial]
     fn test_recent_write_count_ignores_future_buckets() {
         let mut record = WriteRecord {
             last_write_time: None,
             write_count: 1,
             write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
+            epoch: Instant::now(),
         };
 
         record.write_buckets[0] = WriteBucket { second: 120, count: 3 };
