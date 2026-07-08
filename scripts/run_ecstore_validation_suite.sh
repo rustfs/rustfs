@@ -192,7 +192,13 @@ run_core_unit_steps() {
 	  run_step "ecstore-rename-rollback" \
 	    cargo test -p rustfs-ecstore --lib set_disk::tests::test_rename_data_quorum_failure_rolls_back_destination_object
 	  run_step "ecstore-disk-local-lib" cargo test -p rustfs-ecstore --lib disk::local
-  run_step "ecstore-lib-all" cargo test -p rustfs-ecstore --lib -- --test-threads=1
+  run_step "ecstore-global-bucket-migration" \
+    cargo test -p rustfs-ecstore --lib bucket::migration::tests::migrates_real_minio_bucket_metadata_end_to_end -- --exact
+  run_step "ecstore-global-delete-lock-gating" \
+    cargo test -p rustfs-ecstore --lib set_disk::ops::object::delete_objects_lock_gating_tests::delete_objects_blocks_locked_object_and_deletes_the_rest -- --exact
+  run_step "ecstore-lib-all" cargo test -p rustfs-ecstore --lib -- --test-threads=1 \
+    --skip bucket::migration::tests::migrates_real_minio_bucket_metadata_end_to_end \
+    --skip set_disk::ops::object::delete_objects_lock_gating_tests::delete_objects_blocks_locked_object_and_deletes_the_rest
 }
 
 run_quick_e2e_steps() {
@@ -436,7 +442,11 @@ run_coverage() {
   local lcov_path="$coverage_dir/lcov.info"
   local coverage_summary="$coverage_dir/summary.tsv"
   local coverage_files="$coverage_dir/files.tsv"
-  local cmd=(cargo llvm-cov -p rustfs-ecstore --lib --lcov --output-path "$lcov_path" -- --test-threads=1)
+  local cmd=(
+    cargo llvm-cov -p rustfs-ecstore --lib --lcov --output-path "$lcov_path" -- --test-threads=1
+    --skip bucket::migration::tests::migrates_real_minio_bucket_metadata_end_to_end
+    --skip set_disk::ops::object::delete_objects_lock_gating_tests::delete_objects_blocks_locked_object_and_deletes_the_rest
+  )
   local root
   root="$(pwd)"
   mkdir -p "$coverage_dir"

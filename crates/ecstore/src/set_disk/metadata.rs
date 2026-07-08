@@ -1087,6 +1087,85 @@ mod tests {
     }
 
     #[test]
+    fn metadata_quorum_covers_etag_fallback_and_object_quorum_failures() {
+        let mut parts_metadata = (1..=3)
+            .map(|index| {
+                let mut fi = metadata_quorum_test_fileinfo(OffsetDateTime::now_utc(), index);
+                fi.mod_time = None;
+                fi
+            })
+            .collect::<Vec<_>>();
+        parts_metadata[2]
+            .metadata
+            .insert("etag".to_string(), "minority-etag".to_string());
+        let errs = vec![None; parts_metadata.len()];
+        let disks = vec![None; parts_metadata.len()];
+
+        let (_online, mod_time, etag) = SetDisks::list_online_disks(&disks, &parts_metadata, &errs, 2);
+        assert!(mod_time.is_none());
+        assert_eq!(etag.as_deref(), Some("object-etag"));
+
+        let zero_parity = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 0)
+            .expect("zero default parity should require all metadata shards");
+        assert_eq!(zero_parity, (3, 3));
+
+        let invalid = vec![FileInfo::default(); 4];
+        let err = SetDisks::object_quorum_from_meta(&invalid, &vec![None; 4], 2)
+            .expect_err("invalid metadata without a common parity must fail closed");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn fileinfo_quorum_hash_includes_optional_checksums_and_ignores_replication_noise() {
+        let mod_time = OffsetDateTime::now_utc();
+        let mut left = metadata_quorum_test_fileinfo(mod_time, 1);
+        left.mode = Some(0o640);
+        left.written_by_version = Some(42);
+        left.checksum = Some(Bytes::from_static(b"object-checksum"));
+        left.parts[0].index = Some(Bytes::from_static(b"part-index"));
+        left.parts[0].error = Some("repair-pending".to_string());
+        left.parts[0].checksums = Some(HashMap::from([
+            ("sha256".to_string(), "left".to_string()),
+            ("crc32".to_string(), "right".to_string()),
+        ]));
+        left.metadata.insert(
+            format!("{}{}", http::RUSTFS_INTERNAL_PREFIX, http::SUFFIX_REPLICATION_STATUS),
+            "replica-a".to_string(),
+        );
+
+        let mut right = left.clone();
+        right.parts[0].checksums = Some(HashMap::from([
+            ("crc32".to_string(), "right".to_string()),
+            ("sha256".to_string(), "left".to_string()),
+        ]));
+        right.metadata.insert(
+            format!("{}{}", http::MINIO_INTERNAL_PREFIX, http::SUFFIX_REPLICATION_STATUS),
+            "replica-b".to_string(),
+        );
+        assert_eq!(
+            SetDisks::file_info_quorum_hash(&left),
+            SetDisks::file_info_quorum_hash(&right),
+            "checksum map ordering and replication metadata must not split quorum identity"
+        );
+
+        right.parts[0]
+            .checksums
+            .as_mut()
+            .expect("checksums should exist")
+            .insert("sha256".to_string(), "changed".to_string());
+        assert_ne!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+    }
+
+    #[test]
+    fn quorum_helpers_reject_zero_quorum_and_shuffle_check_parts_by_distribution() {
+        let err = SetDisks::find_file_info_in_quorum(&[], &None, &None, 0).expect_err("zero quorum cannot select metadata");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+
+        assert_eq!(SetDisks::shuffle_check_parts(&[2, 1, 0], &[]), vec![2, 1, 0]);
+        assert_eq!(SetDisks::shuffle_check_parts(&[2, 1, 0], &[3, 1, 2]), vec![1, 0, 2]);
+    }
+
+    #[test]
     fn metadata_quorum_uses_simple_majority_for_transitioned_objects() {
         let parts_metadata = (1..=6).map(transition_metadata_quorum_fileinfo).collect::<Vec<_>>();
         let errs = vec![None; parts_metadata.len()];
@@ -1273,5 +1352,24 @@ mod tests {
         assert_eq!(d2.len(), disks.len());
         let (d3, _) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
         assert_eq!(d3.len(), slots);
+    }
+
+    #[tokio::test]
+    async fn shuffle_variants_skip_missing_disks_and_invalid_metadata() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let (fi, mut parts) = shuffle_fixture(true);
+        let mut disks = shuffle_test_disks(&tempdir, parts.len()).await;
+        disks[0] = None;
+        parts[1] = FileInfo::default();
+
+        let (by_index_disks, by_index_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
+        assert!(
+            by_index_disks.iter().filter(|disk| disk.is_some()).count() <= disks.iter().filter(|disk| disk.is_some()).count()
+        );
+        assert!(by_index_parts.iter().any(|part| !part.is_valid()));
+
+        let (fallback_disks, fallback_parts) = SetDisks::shuffle_disks_and_parts_metadata(&disks, &parts, &fi);
+        assert!(fallback_disks.iter().any(Option::is_none));
+        assert!(fallback_parts.iter().any(|part| !part.is_valid()));
     }
 }

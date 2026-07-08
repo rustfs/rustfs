@@ -241,6 +241,18 @@ mod tests {
     }
 
     #[test]
+    fn shard_read_cost_reports_all_labels_and_remote_classification() {
+        assert_eq!(ShardReadCost::Local.as_str(), GET_SHARD_READ_COST_LOCAL);
+        assert_eq!(ShardReadCost::SameNode.as_str(), GET_SHARD_READ_COST_SAME_NODE);
+        assert_eq!(ShardReadCost::Remote.as_str(), GET_SHARD_READ_COST_REMOTE);
+        assert_eq!(ShardReadCost::Unknown.as_str(), GET_SHARD_READ_COST_UNKNOWN);
+
+        assert!(ShardReadCost::Remote.is_remote());
+        assert!(!ShardReadCost::Local.is_remote());
+        assert!(!ShardReadCost::Unknown.is_low_cost());
+    }
+
+    #[test]
     fn stripe_read_state_reports_complete_data_shards_without_parity() {
         let state = StripeReadState::from_parts(vec![Some(vec![1]), Some(vec![2]), None], Vec::new(), 2);
 

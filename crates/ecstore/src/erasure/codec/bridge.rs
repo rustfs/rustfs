@@ -660,6 +660,76 @@ mod tests {
     }
 
     #[test]
+    fn rustfs_codec_decode_engine_rebuilds_missing_parity_for_source_verification() {
+        let erasure = Erasure::new(2, 3, 32);
+        let encoded = erasure
+            .encode_data(&(0u8..64u8).collect::<Vec<_>>())
+            .expect("test stripe should encode");
+        let mut shards = encoded.into_iter().map(|shard| Some(shard.to_vec())).collect::<Vec<_>>();
+        shards[0] = None;
+        let missing_parity_index = erasure.data_shards + erasure.parity_shards - 1;
+        shards[missing_parity_index] = None;
+
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let mut workspace = engine
+            .prepare_workspace(erasure.shard_size())
+            .expect("workspace should be prepared");
+        let outcome = engine
+            .reconstruct_into(&mut shards, &mut workspace)
+            .expect("missing data plus missing parity should be recoverable");
+
+        assert_eq!(outcome, GET_RECONSTRUCT_OUTCOME_RUSTFS_CALLED);
+        assert!(shards[0].is_some());
+        assert!(shards[missing_parity_index].is_some());
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_rejects_invalid_empty_payload_shape() {
+        let erasure = Erasure::new(2, 2, 16);
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let mut workspace = engine.prepare_workspace(0).expect("workspace should be prepared");
+        let mut shards = vec![Some(Vec::new()), None, Some(Vec::new())];
+
+        let err = engine
+            .reconstruct_into(&mut shards, &mut workspace)
+            .expect_err("invalid empty payload shard count must fail closed");
+
+        assert!(err.to_string().contains("invalid shard count"));
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_skips_empty_payload_when_enough_empty_sources_exist() {
+        let erasure = Erasure::new(3, 2, 16);
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let mut workspace = engine.prepare_workspace(0).expect("workspace should be prepared");
+        let mut shards = vec![Some(Vec::new()), None, Some(Vec::new()), Some(Vec::new()), None];
+
+        let outcome = engine
+            .reconstruct_into(&mut shards, &mut workspace)
+            .expect("empty payload should be restored without codec allocation");
+
+        assert_eq!(outcome, GET_RECONSTRUCT_OUTCOME_SKIP_EMPTY_PAYLOAD);
+        assert_eq!(shards[1], Some(Vec::new()));
+        assert!(!engine.codec_is_initialized());
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_returns_called_without_parity_codec() {
+        let erasure = Erasure::new(2, 0, 16);
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
+        let mut shards = vec![None, Some(vec![2, 2, 2, 2])];
+
+        let outcome = engine
+            .reconstruct_into(&mut shards, &mut workspace)
+            .expect("zero parity engine should not allocate codec");
+
+        assert_eq!(outcome, GET_RECONSTRUCT_OUTCOME_RUSTFS_CALLED);
+        assert!(shards[0].is_none());
+        assert!(!engine.codec_is_initialized());
+    }
+
+    #[test]
     fn rustfs_codec_decode_engine_recovers_empty_data_shard() {
         let erasure = Erasure::new(4, 2, 16);
         let mut shards = encoded_shards(&erasure, b"");
@@ -673,6 +743,34 @@ mod tests {
     }
 
     #[test]
+    fn codec_streaming_decode_engine_dispatches_to_legacy_workspace_and_rejects_mismatch() {
+        let erasure = Erasure::new(2, 2, 16);
+        let mut shards = encoded_shards(&erasure, b"legacy enum dispatch");
+        shards[0] = None;
+
+        let engine = CodecStreamingDecodeEngine::legacy(erasure);
+        assert_eq!(engine.data_shards(), 2);
+        assert_eq!(engine.parity_shards(), 2);
+        assert_eq!(engine.block_size(), 16);
+        assert_eq!(engine.engine_name(), GET_CODEC_STREAMING_ENGINE_LEGACY);
+        assert!(!engine.supports_progressive_decode());
+        assert!(!engine.supports_aligned_shards());
+
+        let mut workspace = engine.prepare_workspace(8).expect("workspace should be prepared");
+        assert_eq!(workspace.shard_len(), 8);
+        engine
+            .reconstruct_into(&mut shards, &mut workspace)
+            .expect("legacy enum engine should dispatch reconstruction");
+        assert!(shards.iter().take(engine.data_shards()).all(Option::is_some));
+
+        let rustfs = CodecStreamingDecodeEngine::rustfs(&Erasure::new(2, 2, 16)).expect("engine should be created");
+        let err = rustfs
+            .reconstruct_into(&mut shards, &mut workspace)
+            .expect_err("engine/workspace variant mismatch must fail");
+        assert!(err.to_string().contains("engine/workspace mismatch"));
+    }
+
+    #[test]
     fn codec_streaming_decode_engine_dispatches_to_rustfs_workspace() {
         let erasure = Erasure::new(4, 2, 16);
         let mut shards = encoded_shards(&erasure, b"dispatch keeps rustfs engine byte-identical");
@@ -680,6 +778,9 @@ mod tests {
 
         let engine = CodecStreamingDecodeEngine::rustfs(&erasure).expect("engine should be created");
         let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
+        if let CodecStreamingDecodeWorkspace::Rustfs(workspace) = &workspace {
+            assert_eq!(<RustfsCodecDecodeWorkspace as DecodeWorkspace>::shard_len(workspace), 4);
+        }
         engine
             .reconstruct_into(&mut shards, &mut workspace)
             .expect("enum engine should dispatch reconstruction");

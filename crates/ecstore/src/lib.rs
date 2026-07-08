@@ -85,3 +85,6 @@ mod rio_tests {
         assert_eq!(crate::io_support::rio::backend_name(), expected);
     }
 }
+
+#[cfg(test)]
+mod ecstore_validation_blackbox;

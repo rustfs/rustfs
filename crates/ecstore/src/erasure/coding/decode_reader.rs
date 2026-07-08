@@ -789,7 +789,7 @@ fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usi
 
 fn reserve_output_capacity(output: &mut Vec<u8>, target_capacity: usize) {
     if output.capacity() < target_capacity {
-        output.reserve(target_capacity - output.capacity());
+        output.reserve(target_capacity.saturating_sub(output.len()));
     }
 }
 
@@ -822,14 +822,14 @@ fn emit_data_shards_into(
 mod tests {
     use super::*;
     use crate::erasure::codec::bridge::{
-        CodecStreamingDecodeEngine, ErasureDecodeEngine, LegacyEcDecodeEngine, RustfsCodecDecodeEngine,
+        CodecStreamingDecodeEngine, DecodeWorkspace, ErasureDecodeEngine, LegacyEcDecodeEngine, RustfsCodecDecodeEngine,
     };
     use crate::erasure::coding::decode::ParallelReader;
     use crate::erasure::coding::{BitrotReader, BitrotWriter, Erasure};
     use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
     use rustfs_utils::HashAlgorithm;
     use std::collections::VecDeque;
-    use std::future::pending;
+    use std::future::{pending, poll_fn};
     use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -853,6 +853,42 @@ mod tests {
 
     struct BlockingSourceDropGuard {
         dropped: Arc<AtomicUsize>,
+    }
+
+    enum PollStep {
+        Data(Vec<u8>),
+        Empty,
+        Error,
+        Pending,
+    }
+
+    struct ScriptedAsyncReader {
+        steps: VecDeque<PollStep>,
+    }
+
+    impl ScriptedAsyncReader {
+        fn new(steps: Vec<PollStep>) -> Self {
+            Self { steps: steps.into() }
+        }
+    }
+
+    impl AsyncRead for ScriptedAsyncReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match self.steps.pop_front() {
+                Some(PollStep::Data(data)) => {
+                    let copy_len = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..copy_len]);
+                    Poll::Ready(Ok(()))
+                }
+                Some(PollStep::Empty) => Poll::Ready(Ok(())),
+                Some(PollStep::Error) => Poll::Ready(Err(io::Error::other("scripted read failure"))),
+                Some(PollStep::Pending) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                None => Poll::Ready(Ok(())),
+            }
+        }
     }
 
     impl Drop for BlockingSourceDropGuard {
@@ -882,6 +918,62 @@ mod tests {
             self.started.notify_one();
             pending::<()>().await;
             StripeReadState::new(Vec::new(), self.read_quorum)
+        }
+    }
+
+    #[derive(Clone)]
+    struct NoopDecodeEngine {
+        data_shards: usize,
+        block_size: usize,
+    }
+
+    struct NoopDecodeWorkspace {
+        shard_len: usize,
+    }
+
+    impl DecodeWorkspace for NoopDecodeWorkspace {
+        fn shard_len(&self) -> usize {
+            self.shard_len
+        }
+    }
+
+    impl ErasureDecodeEngine for NoopDecodeEngine {
+        type Workspace = NoopDecodeWorkspace;
+
+        fn data_shards(&self) -> usize {
+            self.data_shards
+        }
+
+        fn parity_shards(&self) -> usize {
+            0
+        }
+
+        fn block_size(&self) -> usize {
+            self.block_size
+        }
+
+        fn engine_name(&self) -> &'static str {
+            "noop"
+        }
+
+        fn supports_progressive_decode(&self) -> bool {
+            false
+        }
+
+        fn supports_aligned_shards(&self) -> bool {
+            false
+        }
+
+        fn prepare_workspace(&self, shard_len: usize) -> io::Result<Self::Workspace> {
+            Ok(NoopDecodeWorkspace { shard_len })
+        }
+
+        fn reconstruct_into(
+            &self,
+            _shards: &mut [Option<Vec<u8>>],
+            _workspace: &mut Self::Workspace,
+        ) -> io::Result<&'static str> {
+            Ok("noop_called")
         }
     }
 
@@ -999,6 +1091,309 @@ mod tests {
     }
 
     #[test]
+    fn erasure_decode_reader_rejects_invalid_engine_shape() {
+        let source = VecStripeSource {
+            stripes: VecDeque::new(),
+            read_quorum: 1,
+            read_count: None,
+        };
+        let err = match ErasureDecodeReader::new(
+            source,
+            NoopDecodeEngine {
+                data_shards: 0,
+                block_size: 16,
+            },
+            1,
+        ) {
+            Ok(_) => panic!("zero data shard engine must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        let source = VecStripeSource {
+            stripes: VecDeque::new(),
+            read_quorum: 1,
+            read_count: None,
+        };
+        let err = match ErasureDecodeReader::new_with_metrics_path(
+            source,
+            NoopDecodeEngine {
+                data_shards: 1,
+                block_size: 0,
+            },
+            1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+        ) {
+            Ok(_) => panic!("zero block size engine must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn erasure_decode_reader_reusable_buffer_bounds_and_missing_worker_parts_fail_closed() {
+        let erasure = Erasure::new(2, 1, 16);
+        let source = source_from_data(&erasure, b"fill worker missing fields", &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+
+        reader.push_reusable_output_buf(Vec::new());
+        assert!(reader.reusable_output_bufs.is_empty());
+        for _ in 0..reader.max_reusable_output_bufs() + 2 {
+            reader.push_reusable_output_buf(Vec::with_capacity(8));
+        }
+        assert_eq!(reader.reusable_output_bufs.len(), reader.max_reusable_output_bufs());
+
+        reader.source = None;
+        let err = match reader.fill_worker_tx() {
+            Ok(_) => panic!("missing source must fail closed"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+
+        let source = source_from_data(&erasure, b"fill worker missing engine", &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        reader.engine = None;
+        let err = match reader.fill_worker_tx() {
+            Ok(_) => panic!("missing engine must fail closed"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+        assert!(reader.source.is_some());
+
+        let source = source_from_data(&erasure, b"fill worker missing workspace", &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        reader.workspace = None;
+        let err = match reader.fill_worker_tx() {
+            Ok(_) => panic!("missing workspace must fail closed"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+        assert!(reader.source.is_some());
+        assert!(reader.engine.is_some());
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_poll_fill_result_rejects_cancelled_and_empty_fill() {
+        let erasure = Erasure::new(2, 1, 16);
+        let source = source_from_data(&erasure, b"cancelled fill", &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let (_sender, receiver) = oneshot::channel();
+        drop(_sender);
+        reader.fill = Some(receiver);
+
+        let err = poll_fn(|cx| reader.poll_fill_result(cx))
+            .await
+            .expect_err("cancelled fill result must fail");
+        assert_eq!(err.kind(), ErrorKind::Other);
+
+        let source = source_from_data(&erasure, b"empty fill", &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let (sender, receiver) = oneshot::channel();
+        assert!(
+            sender
+                .send(FillResult {
+                    result: Ok(Some(Vec::new())),
+                    queued_buffers: VecDeque::new(),
+                    reusable_buffers: Vec::new(),
+                    deferred_error: None,
+                })
+                .is_ok(),
+            "test fill result should send"
+        );
+        reader.fill = Some(receiver);
+
+        let err = poll_fn(|cx| reader.poll_fill_result(cx))
+            .await
+            .expect_err("empty buffer with remaining bytes must fail");
+        assert_eq!(err.kind(), ErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_poll_fill_result_fails_when_request_queue_is_full() {
+        let erasure = Erasure::new(2, 1, 16);
+        let source = source_from_data(&erasure, b"queue full", &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let (tx, rx) = mpsc::channel(1);
+        let (response, _receiver) = oneshot::channel();
+        assert!(
+            tx.try_send(FillRequest {
+                remaining: 1,
+                reusable_buffers: Vec::new(),
+                response,
+            })
+            .is_ok(),
+            "test fill request should occupy the bounded queue"
+        );
+        reader.worker = Some(FillWorker {
+            tx,
+            task: tokio::spawn(async move {
+                pending::<()>().await;
+                drop(rx);
+            }),
+        });
+        reader.reusable_output_bufs.push(Vec::with_capacity(8));
+
+        let err = poll_fn(|cx| reader.poll_fill_result(cx))
+            .await
+            .expect_err("full fill request queue must fail closed");
+
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+        assert_eq!(reader.reusable_output_bufs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_prefetch_queues_fill_when_output_is_not_drained() {
+        let erasure = Erasure::new(2, 1, 16);
+        let source = source_from_data(&erasure, b"queued prefetch", &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            4,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::DualInFlight,
+        )
+        .expect("reader should be constructed");
+        let (sender, receiver) = oneshot::channel();
+        assert!(
+            sender
+                .send(FillResult {
+                    result: Ok(Some(vec![3, 5, 8])),
+                    queued_buffers: VecDeque::new(),
+                    reusable_buffers: Vec::new(),
+                    deferred_error: None,
+                })
+                .is_ok(),
+            "ready fill result should send"
+        );
+        reader.fill = Some(receiver);
+        reader.output_buf = vec![1, 2];
+        reader.output_pos = 1;
+
+        poll_fn(|cx| reader.poll_prefetch(cx))
+            .await
+            .expect("ready prefetch should be queued while output remains");
+
+        assert_eq!(reader.output_buf, vec![1, 2]);
+        assert_eq!(reader.output_pos, 1);
+        assert_eq!(reader.prefetched_bufs.pop_front(), Some(vec![3, 5, 8]));
+
+        reader.prefetched_bufs.push_back(vec![3, 5, 8]);
+        reader.output_pos = reader.output_buf.len();
+        let mut output = [0u8; 3];
+        reader
+            .read_exact(&mut output)
+            .await
+            .expect("queued prefetch should become reader output after the old buffer drains");
+        assert_eq!(output, [3, 5, 8]);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_prefetch_defers_error_until_output_drains() {
+        let erasure = Erasure::new(2, 1, 16);
+        let source = source_from_data(&erasure, b"deferred prefetch error", &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            4,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::DualInFlight,
+        )
+        .expect("reader should be constructed");
+        let (sender, receiver) = oneshot::channel();
+        assert!(
+            sender
+                .send(FillResult {
+                    result: Err(io::Error::new(ErrorKind::UnexpectedEof, "deferred fill error")),
+                    queued_buffers: VecDeque::new(),
+                    reusable_buffers: Vec::new(),
+                    deferred_error: None,
+                })
+                .is_ok(),
+            "ready fill error should send"
+        );
+        reader.fill = Some(receiver);
+        reader.output_buf = vec![1, 2];
+        reader.output_pos = 1;
+
+        poll_fn(|cx| reader.poll_prefetch(cx))
+            .await
+            .expect("prefetch error should be deferred while output remains");
+
+        assert_eq!(
+            reader
+                .prefetch_error
+                .as_ref()
+                .expect("prefetch error should be retained")
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn noop_decode_engine_test_methods_report_static_shape() {
+        let engine = NoopDecodeEngine {
+            data_shards: 3,
+            block_size: 96,
+        };
+        let workspace = engine.prepare_workspace(32).expect("workspace should be created");
+
+        assert_eq!(workspace.shard_len(), 32);
+        assert_eq!(engine.parity_shards(), 0);
+        assert!(!engine.supports_progressive_decode());
+        assert!(!engine.supports_aligned_shards());
+    }
+
+    #[test]
     #[serial_test::serial]
     fn erasure_decode_reader_caches_stage_metrics_enabled_at_construction() {
         let erasure = Erasure::new(4, 2, 32);
@@ -1031,6 +1426,102 @@ mod tests {
         assert!(reader.stage_metrics_enabled);
 
         rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn erasure_decode_reader_records_metrics_while_copying_output() {
+        let erasure = Erasure::new(4, 2, 16);
+        let data = (0..48u8).collect::<Vec<_>>();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+
+        let mut source = source_from_data(&erasure, &data, &[]);
+        source.read_count = Some(Arc::clone(&read_count));
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::DualInFlight,
+        )
+        .expect("reader should be constructed");
+        assert!(reader.stage_metrics_enabled);
+
+        let mut first = [0u8; 1];
+        let read = reader
+            .read(&mut first)
+            .await
+            .expect("metrics-enabled reader should produce first byte");
+        timeout(Duration::from_secs(1), async {
+            while read_count.load(Ordering::SeqCst) < 3 {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("metrics-enabled dual inflight reader should prefetch future stripes");
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+        assert_eq!(read, 1);
+        assert_eq!(first[0], data[0]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sync_erasure_decode_reader_records_metric_poll_outcomes() {
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let mut reader = SyncErasureDecodeReader::new_with_metrics_path(
+            ScriptedAsyncReader::new(vec![
+                PollStep::Pending,
+                PollStep::Data(vec![3, 5]),
+                PollStep::Empty,
+                PollStep::Error,
+            ]),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+        );
+        assert!(reader.stage_metrics_enabled);
+        let mut output = [0u8; 4];
+
+        let read = reader
+            .read(&mut output)
+            .await
+            .expect("pending reader should wake and then return data");
+        assert_eq!(read, 2);
+        assert_eq!(&output[..read], &[3, 5]);
+
+        let read = reader.read(&mut output).await.expect("empty ready poll should return EOF");
+        assert_eq!(read, 0);
+
+        let err = reader
+            .read(&mut output)
+            .await
+            .expect_err("scripted read error should surface");
+        assert_eq!(err.kind(), ErrorKind::Other);
+        rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sync_erasure_decode_reader_fails_closed_on_poisoned_lock() {
+        let mut reader = SyncErasureDecodeReader::new(Cursor::new(vec![1u8]));
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = reader.inner.lock().expect("lock should be acquired before poison");
+            panic!("poison sync reader lock");
+        }));
+        std::panic::set_hook(previous_hook);
+        assert!(poison_result.is_err(), "test setup should poison the reader lock");
+        let mut output = [0u8; 1];
+
+        let err = reader
+            .read(&mut output)
+            .await
+            .expect_err("poisoned sync reader lock must fail closed");
+
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.to_string().contains("lock poisoned"));
     }
 
     #[tokio::test]
@@ -1187,6 +1678,84 @@ mod tests {
 
         assert_eq!(single, data);
         assert_eq!(single, dual);
+    }
+
+    #[tokio::test]
+    async fn run_fill_request_dual_inflight_returns_deferred_eof_and_decode_errors() {
+        let erasure = Erasure::new(4, 2, 16);
+        let first = (0..16u8).collect::<Vec<_>>();
+        let first_state = source_from_data(&erasure, &first, &[])
+            .stripes
+            .pop_front()
+            .expect("first stripe should exist");
+        let mut source = VecStripeSource {
+            stripes: VecDeque::from([first_state, StripeReadState::new(Vec::new(), erasure.data_shards)]),
+            read_quorum: erasure.data_shards,
+            read_count: None,
+        };
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut workspace = engine
+            .prepare_workspace(erasure.shard_size())
+            .expect("workspace should be prepared");
+
+        let result = run_fill_request(FillRequestWork {
+            source: &mut source,
+            engine: &engine,
+            workspace: &mut workspace,
+            fill_policy: FillPolicy::DualInFlight,
+            metrics_path: GET_OBJECT_PATH_CODEC_STREAMING,
+            stage_metrics_enabled: false,
+            remaining: first.len() + 1,
+            reusable_buffers: vec![Vec::new(), Vec::new()],
+        })
+        .await;
+
+        assert_eq!(result.result.as_ref().expect("first stripe should decode").as_deref(), Some(&first[..]));
+        assert_eq!(
+            result
+                .deferred_error
+                .as_ref()
+                .expect("second empty stripe should defer LessData")
+                .kind(),
+            ErrorKind::Other
+        );
+
+        let first_state = source_from_data(&erasure, &first, &[])
+            .stripes
+            .pop_front()
+            .expect("first stripe should exist");
+        let mut source = VecStripeSource {
+            stripes: VecDeque::from([
+                first_state,
+                StripeReadState::new(vec![ShardSlot::data(0, vec![1])], erasure.data_shards),
+            ]),
+            read_quorum: erasure.data_shards,
+            read_count: None,
+        };
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
+
+        let result = run_fill_request(FillRequestWork {
+            source: &mut source,
+            engine: &engine,
+            workspace: &mut workspace,
+            fill_policy: FillPolicy::DualInFlight,
+            metrics_path: GET_OBJECT_PATH_CODEC_STREAMING,
+            stage_metrics_enabled: false,
+            remaining: first.len() + 1,
+            reusable_buffers: vec![Vec::new(), Vec::new()],
+        })
+        .await;
+
+        assert!(result.result.expect("first stripe should decode").is_some());
+        assert_eq!(
+            result
+                .deferred_error
+                .as_ref()
+                .expect("second quorum failure should be deferred")
+                .kind(),
+            ErrorKind::Other
+        );
     }
 
     #[tokio::test]
@@ -1472,6 +2041,45 @@ mod tests {
         let output = emit_data_shards(&state, 3, 6, 5).expect("out-of-order data slots should emit by shard index");
 
         assert_eq!(output, b"abcde");
+    }
+
+    #[test]
+    fn decode_stripe_into_rejects_missing_reconstructed_data_shards() {
+        let engine = NoopDecodeEngine {
+            data_shards: 2,
+            block_size: 8,
+        };
+        let mut workspace = engine.prepare_workspace(4).expect("workspace should be prepared");
+        let mut output = Vec::with_capacity(1);
+        let short_state = StripeReadState::new(vec![ShardSlot::data(0, vec![1, 2, 3, 4])], 1);
+
+        let err = decode_stripe_into(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            false,
+            &engine,
+            &mut workspace,
+            short_state,
+            8,
+            &mut output,
+        )
+        .expect_err("decoded stripe shorter than data shard count must fail");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+
+        let missing_state = StripeReadState::from_parts(vec![None, Some(vec![5, 6, 7, 8])], Vec::new(), 1);
+        let err = decode_stripe_into(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            false,
+            &engine,
+            &mut workspace,
+            missing_state,
+            8,
+            &mut output,
+        )
+        .expect_err("missing reconstructed data shard must fail");
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+
+        reserve_output_capacity(&mut output, 32);
+        assert!(output.capacity() >= 32);
     }
 
     #[tokio::test]

@@ -1641,6 +1641,21 @@ mod metadata_cache_tests {
         .await
     }
 
+    async fn new_read_version_test_disk(bucket: &str) -> (tempfile::TempDir, DiskStore) {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            crate::layout::endpoint::Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let local_disk = crate::disk::local::LocalDisk::new(&endpoint, false)
+            .await
+            .expect("local disk should open");
+        let disk: DiskStore = Arc::new(crate::disk::Disk::Local(Box::new(crate::disk::disk_store::LocalDiskWrapper::new(
+            Arc::new(local_disk),
+            false,
+        ))));
+        disk.make_volume(bucket).await.expect("bucket volume should be created");
+        (dir, disk)
+    }
+
     #[test]
     #[serial]
     fn get_object_metadata_cache_capacity_uses_default_and_env_override() {
@@ -1665,6 +1680,249 @@ mod metadata_cache_tests {
         fi.erasure.index = 1;
         fi.metadata.insert("etag".to_string(), "etag-1".to_string());
         fi
+    }
+
+    #[tokio::test]
+    async fn get_object_with_fileinfo_rejects_invalid_ranges_before_reader_setup() {
+        let bucket = "bucket";
+        let object = "object";
+
+        let mut output = Vec::new();
+        let err = SetDisks::get_object_with_fileinfo(
+            bucket,
+            object,
+            2,
+            1,
+            &mut output,
+            valid_test_fileinfo(object),
+            Vec::new(),
+            &[],
+            0,
+            0,
+            false,
+            false,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect_err("offset beyond object size must fail before reader setup");
+        assert!(err.to_string().contains("offset out of range"));
+
+        let mut overflow = valid_test_fileinfo(object);
+        overflow.size = -1;
+        let err = SetDisks::get_object_with_fileinfo(
+            bucket,
+            object,
+            usize::MAX,
+            1,
+            &mut output,
+            overflow,
+            Vec::new(),
+            &[],
+            0,
+            0,
+            false,
+            false,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect_err("offset plus length overflow must fail before reader setup");
+        assert!(err.to_string().contains("offset out of range"));
+
+        let err = SetDisks::get_object_with_fileinfo(
+            bucket,
+            object,
+            1,
+            1,
+            &mut output,
+            valid_test_fileinfo(object),
+            Vec::new(),
+            &[],
+            0,
+            0,
+            false,
+            false,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect_err("end offset beyond object size must fail before reader setup");
+        assert!(err.to_string().contains("offset out of range"));
+
+        let mut invalid_erasure = valid_test_fileinfo(object);
+        invalid_erasure.erasure.block_size = 0;
+        let err = SetDisks::get_object_with_fileinfo(
+            bucket,
+            object,
+            0,
+            1,
+            &mut output,
+            invalid_erasure,
+            Vec::new(),
+            &[],
+            0,
+            0,
+            false,
+            false,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect_err("invalid erasure metadata must fail before reader setup");
+        assert!(err.to_string().contains("invalid erasure metadata"));
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_object_with_fileinfo_fails_closed_without_read_quorum() {
+        let bucket = "bucket";
+        let object = "object";
+        let mut fi = valid_test_fileinfo(object);
+        fi.erasure.block_size = 1;
+        fi.erasure.distribution = vec![1, 2, 3, 4];
+        fi.parts.push(ObjectPartInfo {
+            number: 1,
+            size: 1,
+            actual_size: 1,
+            ..Default::default()
+        });
+
+        let mut output = Vec::new();
+        let err = SetDisks::get_object_with_fileinfo(
+            bucket,
+            object,
+            0,
+            1,
+            &mut output,
+            fi,
+            Vec::new(),
+            &[],
+            0,
+            0,
+            false,
+            false,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect_err("object read must fail closed when no shards can be read");
+
+        let err = err.to_string().to_ascii_lowercase();
+        assert!(!err.is_empty(), "read should fail with a concrete error");
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_version_optimized_reads_local_metadata_and_fails_closed_without_quorum() {
+        let bucket = "read-version-optimized-bucket";
+        let object = "object";
+        let (_dir, disk) = new_read_version_test_disk(bucket).await;
+        let mut fi = valid_test_fileinfo(object);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        disk.write_metadata(bucket, bucket, object, fi.clone())
+            .await
+            .expect("metadata should be written before optimized read");
+
+        let set = SetDisks::new(
+            "read-version-optimized-test".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk)])),
+            1,
+            0,
+            0,
+            0,
+            Vec::new(),
+            FormatV3::new(1, 1),
+            Vec::new(),
+        )
+        .await;
+
+        let versions = set
+            .read_version_optimized(bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("single readable disk should satisfy optimized read quorum");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].name, object);
+        assert_eq!(versions[0].metadata.get("etag").map(String::as_str), Some("etag-1"));
+
+        let missing_quorum = new_metadata_cache_test_set()
+            .await
+            .read_version_optimized(bucket, object, "", &ReadOptions::default())
+            .await
+            .expect_err("empty disk set must fail closed");
+        assert!(
+            missing_quorum.to_string().to_ascii_lowercase().contains("file"),
+            "optimized read failure should map to file-not-found style error: {missing_quorum}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_info_and_quorum_maps_delete_marker_and_purge_states() {
+        let bucket = "get-object-info-marker-bucket";
+        let (_dir, disk) = new_read_version_test_disk(bucket).await;
+        let set = SetDisks::new(
+            "get-object-info-marker-test".to_string(),
+            Arc::new(RwLock::new(vec![Some(disk.clone())])),
+            1,
+            0,
+            0,
+            0,
+            Vec::new(),
+            FormatV3::new(1, 1),
+            Vec::new(),
+        )
+        .await;
+
+        let latest_marker = FileInfo {
+            volume: bucket.to_string(),
+            name: "latest-delete-marker".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        disk.write_metadata(bucket, bucket, "latest-delete-marker", latest_marker)
+            .await
+            .expect("latest marker metadata should be written");
+        let (_, _, latest_err) = set
+            .get_object_info_and_quorum(bucket, "latest-delete-marker", &ObjectOptions::default())
+            .await;
+        assert!(
+            matches!(latest_err, Some(StorageError::ObjectNotFound(_, _))),
+            "latest delete marker should hide the object, got {latest_err:?}"
+        );
+
+        let marker_version = Uuid::new_v4();
+        let version_marker = FileInfo {
+            volume: bucket.to_string(),
+            name: "version-delete-marker".to_string(),
+            version_id: Some(marker_version),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        disk.write_metadata(bucket, bucket, "version-delete-marker", version_marker)
+            .await
+            .expect("version marker metadata should be written");
+        let (_, _, version_err) = set
+            .get_object_info_and_quorum(
+                bucket,
+                "version-delete-marker",
+                &ObjectOptions {
+                    version_id: Some(marker_version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(version_err, Some(StorageError::MethodNotAllowed)),
+            "explicit delete marker read should be method-not-allowed, got {version_err:?}"
+        );
     }
 
     #[test]
@@ -2054,6 +2312,26 @@ mod tests {
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+
+    async fn local_test_disks(count: usize, bucket: &str) -> (Vec<tempfile::TempDir>, Vec<Option<crate::disk::DiskStore>>) {
+        let mut dirs = Vec::with_capacity(count);
+        let mut disks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint = crate::layout::endpoint::Endpoint::try_from(dir.path().to_string_lossy().as_ref())
+                .expect("endpoint should parse");
+            let local_disk = crate::disk::local::LocalDisk::new(&endpoint, false)
+                .await
+                .expect("local disk should open");
+            let disk: crate::disk::DiskStore = Arc::new(crate::disk::Disk::Local(Box::new(
+                crate::disk::disk_store::LocalDiskWrapper::new(Arc::new(local_disk), false),
+            )));
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+            dirs.push(dir);
+            disks.push(Some(disk));
+        }
+        (dirs, disks)
+    }
 
     #[test]
     fn shard_read_cost_for_endpoint_maps_topology_classes() {
@@ -2773,6 +3051,299 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codec_streaming_fileinfo_rejects_invalid_size_and_multipart_mismatch() {
+        let mut single_part = codec_streaming_test_fileinfo(8, 1);
+        single_part.size = -1;
+        let invalid_size = SetDisks::get_object_decode_reader_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &single_part,
+            &[],
+            &[],
+            0,
+            0,
+            false,
+            "test-object-class",
+            "test-size-bucket",
+            false,
+        )
+        .await;
+        assert!(invalid_size.is_err(), "negative object size must reject before reader construction");
+
+        let mut multipart = codec_streaming_test_fileinfo(17, 2);
+        multipart.parts[0].size = 8;
+        multipart.parts[1].size = 8;
+        let mismatch = temp_env::async_with_vars([(ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true"))], async {
+            SetDisks::get_object_decode_reader_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                &multipart,
+                &[],
+                &[],
+                0,
+                0,
+                false,
+                "test-object-class",
+                "test-size-bucket",
+                false,
+            )
+            .await
+        })
+        .await;
+        assert!(mismatch.is_err(), "multipart part sizes must match object size");
+    }
+
+    #[tokio::test]
+    async fn codec_streaming_fileinfo_reports_multipart_fallbacks_at_entry() {
+        let multipart = codec_streaming_test_fileinfo(16, 2);
+
+        let disabled = temp_env::async_with_vars([(ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("false"))], async {
+            SetDisks::get_object_decode_reader_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                &multipart,
+                &[],
+                &[],
+                0,
+                0,
+                false,
+                "test-object-class",
+                "test-size-bucket",
+                false,
+            )
+            .await
+        })
+        .await
+        .expect("multipart disabled should return a structured fallback");
+        assert!(matches!(
+            disabled,
+            GetCodecStreamingReaderBuildOutcome::Fallback(GetCodecStreamingFallbackReason::Multipart)
+        ));
+
+        let part_limit = temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS, Some("1")),
+            ],
+            async {
+                SetDisks::get_object_decode_reader_with_fileinfo(
+                    CODEC_STREAMING_TEST_BUCKET,
+                    CODEC_STREAMING_TEST_OBJECT,
+                    &multipart,
+                    &[],
+                    &[],
+                    0,
+                    0,
+                    false,
+                    "test-object-class",
+                    "test-size-bucket",
+                    false,
+                )
+                .await
+            },
+        )
+        .await
+        .expect("multipart part limit should return a structured fallback");
+        assert!(matches!(
+            part_limit,
+            GetCodecStreamingReaderBuildOutcome::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit)
+        ));
+    }
+
+    #[tokio::test]
+    async fn codec_streaming_fileinfo_builds_lazy_multipart_reader_from_inline_shards() {
+        let part_data = b"abcdefgh";
+        let erasure = coding::Erasure::new(4, 2, part_data.len());
+        let mut fi = codec_streaming_test_fileinfo(16, 2);
+        fi.erasure.block_size = part_data.len();
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        for part in &mut fi.parts {
+            part.size = part_data.len();
+            part.actual_size = i64::try_from(part_data.len()).expect("test part size should fit i64");
+        }
+        let files = codec_streaming_inline_files(&erasure, part_data).await;
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            crate::layout::endpoint::Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let local_disk = crate::disk::local::LocalDisk::new(&endpoint, false)
+            .await
+            .expect("local disk should open");
+        let disk: crate::disk::DiskStore = Arc::new(crate::disk::Disk::Local(Box::new(
+            crate::disk::disk_store::LocalDiskWrapper::new(Arc::new(local_disk), false),
+        )));
+        let disks = vec![Some(disk); files.len()];
+
+        let outcome = temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS, Some("4")),
+            ],
+            async {
+                SetDisks::get_object_decode_reader_with_fileinfo(
+                    CODEC_STREAMING_TEST_BUCKET,
+                    CODEC_STREAMING_TEST_OBJECT,
+                    &fi,
+                    &files,
+                    &disks,
+                    0,
+                    0,
+                    false,
+                    "test-object-class",
+                    "test-size-bucket",
+                    false,
+                )
+                .await
+            },
+        )
+        .await
+        .expect("lazy multipart reader should be constructed");
+
+        let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) = outcome else {
+            panic!("expected lazy multipart reader");
+        };
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .await
+            .expect("lazy multipart reader should restore both parts");
+        assert_eq!(body, [part_data.as_slice(), part_data.as_slice()].concat());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn codec_streaming_fileinfo_builds_single_part_reader_from_inline_shards() {
+        let part_data = b"abcdefgh";
+        let erasure = coding::Erasure::new(4, 2, part_data.len());
+        let mut fi = codec_streaming_test_fileinfo(part_data.len() as i64, 1);
+        fi.erasure.block_size = part_data.len();
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        fi.parts[0].size = part_data.len();
+        fi.parts[0].actual_size = i64::try_from(part_data.len()).expect("test part size should fit i64");
+        let files = codec_streaming_inline_files(&erasure, part_data).await;
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            crate::layout::endpoint::Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let local_disk = crate::disk::local::LocalDisk::new(&endpoint, false)
+            .await
+            .expect("local disk should open");
+        let disk: crate::disk::DiskStore = Arc::new(crate::disk::Disk::Local(Box::new(
+            crate::disk::disk_store::LocalDiskWrapper::new(Arc::new(local_disk), false),
+        )));
+        let disks = vec![Some(disk); files.len()];
+
+        let outcome = temp_env::async_with_vars([("RUSTFS_SHARD_LOCALITY_SCHEDULING", Some("on"))], async {
+            SetDisks::get_object_decode_reader_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                &fi,
+                &files,
+                &disks,
+                0,
+                0,
+                false,
+                "test-object-class",
+                "test-size-bucket",
+                false,
+            )
+            .await
+        })
+        .await
+        .expect("single part reader should be constructed");
+
+        let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) = outcome else {
+            panic!("expected single part reader");
+        };
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .await
+            .expect("single part codec reader should restore payload");
+        assert_eq!(body, part_data);
+    }
+
+    #[tokio::test]
+    async fn get_object_with_fileinfo_restores_missing_inline_data_shard_and_submits_repair() {
+        let part_data = b"abcdefgh";
+        let erasure = coding::Erasure::new(4, 2, part_data.len());
+        let mut fi = codec_streaming_test_fileinfo(part_data.len() as i64, 1);
+        fi.erasure.block_size = part_data.len();
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        fi.parts[0].size = part_data.len();
+        fi.parts[0].actual_size = i64::try_from(part_data.len()).expect("test part size should fit i64");
+
+        let mut files = codec_streaming_inline_files(&erasure, part_data).await;
+        files[0].data = None;
+        let (_dirs, disks) = local_test_disks(files.len(), CODEC_STREAMING_TEST_BUCKET).await;
+
+        let mut output = Vec::new();
+        SetDisks::get_object_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            0,
+            part_data.len() as i64,
+            &mut output,
+            fi,
+            files,
+            &disks,
+            0,
+            0,
+            false,
+            false,
+            GET_OBJECT_PATH_SET_DISK,
+            "test-object-class",
+            "test-size-bucket",
+        )
+        .await
+        .expect("missing data shard should be reconstructed from parity");
+
+        assert_eq!(output, part_data);
+    }
+
+    #[tokio::test]
+    async fn codec_streaming_part_reader_rejects_oversized_part_and_missing_quorum() {
+        let erasure = coding::Erasure::new(4, 2, 8);
+        let fi = codec_streaming_test_fileinfo(8, 1);
+
+        let oversized = SetDisks::build_codec_streaming_part_reader(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &fi,
+            &[],
+            &[],
+            &erasure,
+            1,
+            0,
+            9,
+            8,
+            false,
+            "test-object-class",
+            "test-size-bucket",
+            false,
+        )
+        .await;
+        assert!(oversized.is_err(), "part_length > part_size must be rejected");
+
+        let missing_quorum = SetDisks::build_codec_streaming_part_reader(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &fi,
+            &[],
+            &[],
+            &erasure,
+            1,
+            0,
+            8,
+            8,
+            false,
+            "test-object-class",
+            "test-size-bucket",
+            false,
+        )
+        .await;
+        assert!(missing_quorum.is_err(), "reader setup must fail closed when no shard can answer");
+    }
+
+    #[tokio::test]
     async fn multipart_codec_streaming_reader_reads_parts_in_order() {
         let readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>> = vec![
             Box::new(Cursor::new(b"hello ".to_vec())),
@@ -3188,6 +3759,29 @@ mod tests {
         let mut decoded = Vec::new();
         reader.read_to_end(&mut decoded).await?;
         Ok(decoded)
+    }
+
+    async fn codec_streaming_inline_files(erasure: &coding::Erasure, part_data: &'static [u8]) -> Vec<FileInfo> {
+        let shards = erasure.encode_data(part_data).expect("test part should encode");
+        let distribution = (1..=erasure.total_shard_count()).collect::<Vec<_>>();
+        let mut files = Vec::with_capacity(shards.len());
+
+        for shard in shards {
+            let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), erasure.shard_size(), HashAlgorithm::HighwayHash256S);
+            writer.write(&shard).await.expect("test shard should write with bitrot hash");
+
+            let mut fi = FileInfo::new(CODEC_STREAMING_TEST_OBJECT, erasure.data_shards, erasure.parity_shards);
+            fi.volume = CODEC_STREAMING_TEST_BUCKET.to_string();
+            fi.name = CODEC_STREAMING_TEST_OBJECT.to_string();
+            fi.size = i64::try_from(part_data.len()).expect("test part size should fit i64");
+            fi.erasure.block_size = erasure.block_size;
+            fi.erasure.index = files.len() + 1;
+            fi.erasure.distribution = distribution.clone();
+            fi.data = Some(Bytes::from(writer.into_inner().into_inner()));
+            files.push(fi);
+        }
+
+        files
     }
 
     #[tokio::test]

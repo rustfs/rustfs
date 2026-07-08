@@ -533,10 +533,9 @@ impl BitrotWriterWrapper {
 
 #[cfg(test)]
 mod tests {
-
-    use super::BitrotReader;
-    use super::BitrotWriter;
-    use super::bitrot_shard_file_size;
+    use super::{
+        BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, bitrot_shard_file_size, bitrot_verify, write_all_vectored,
+    };
     use rustfs_utils::HashAlgorithm;
     use std::io::{Cursor, IoSlice};
     use std::sync::{
@@ -544,7 +543,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::task::{Context, Poll};
-    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     #[derive(Default)]
     struct VectoredCountingWriter {
@@ -607,6 +606,78 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct LimitedVectoredWriter {
+        max_write: usize,
+        writes: Vec<u8>,
+    }
+
+    impl AsyncWrite for LimitedVectoredWriter {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            let len = buf.len().min(self.max_write);
+            self.writes.extend_from_slice(&buf[..len]);
+            Poll::Ready(Ok(len))
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut remaining = self.max_write;
+            let mut written = 0;
+            for buf in bufs {
+                if remaining == 0 {
+                    break;
+                }
+                let len = buf.len().min(remaining);
+                self.writes.extend_from_slice(&buf[..len]);
+                remaining -= len;
+                written += len;
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_test_writers_cover_fallback_flush_and_shutdown_paths() {
+        let mut counting = VectoredCountingWriter::default();
+        assert!(counting.is_write_vectored());
+        let err = counting
+            .write(b"plain write")
+            .await
+            .expect_err("plain writes should be rejected by vectored-only test writer");
+        assert_eq!(err.to_string(), "poll_write should not be used");
+        counting.flush().await.expect("flush should succeed");
+        counting.shutdown().await.expect("shutdown should succeed");
+
+        let mut limited = LimitedVectoredWriter {
+            max_write: 2,
+            writes: Vec::new(),
+        };
+        assert!(limited.is_write_vectored());
+        let written = limited
+            .write(b"plain")
+            .await
+            .expect("limited writer should accept partial plain write");
+        assert_eq!(written, 2);
+        assert_eq!(limited.writes, b"pl");
+        limited.flush().await.expect("flush should succeed");
+        limited.shutdown().await.expect("shutdown should succeed");
+    }
+
     #[tokio::test]
     async fn test_bitrot_read_write_ok() {
         let data = b"hello world! this is a test shard.";
@@ -645,6 +716,94 @@ mod tests {
 
         assert_eq!(n, data_size);
         assert_eq!(data, &out[..]);
+    }
+
+    #[tokio::test]
+    async fn bitrot_verify_accepts_valid_shard_file_and_rejects_size_or_hash_mismatch() {
+        let data = b"bitrot verify covers every shard";
+        let shard_size = 8;
+        let algo = HashAlgorithm::HighwayHash256S;
+        let writer = Cursor::new(Vec::new());
+        let mut bitrot_writer = BitrotWriter::new(writer, shard_size, algo.clone());
+        for chunk in data.chunks(shard_size) {
+            bitrot_writer.write(chunk).await.unwrap();
+        }
+        let written = bitrot_writer.into_inner().into_inner();
+
+        bitrot_verify(Cursor::new(written.clone()), written.len(), data.len(), algo.clone(), shard_size)
+            .await
+            .expect("valid bitrot shard file should verify");
+
+        let err = bitrot_verify(Cursor::new(written.clone()), written.len() - 1, data.len(), algo.clone(), shard_size)
+            .await
+            .expect_err("wrong file size must be rejected before reading data");
+        assert!(err.to_string().contains("size mismatch"));
+
+        let mut corrupt = written;
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0x80;
+        let err = bitrot_verify(
+            Cursor::new(corrupt),
+            super::bitrot_shard_file_size(data.len(), shard_size, algo.clone()),
+            data.len(),
+            algo,
+            shard_size,
+        )
+        .await
+        .expect_err("hash mismatch must reject corrupted data");
+        assert!(err.to_string().contains("hash mismatch"));
+    }
+
+    #[tokio::test]
+    async fn write_all_vectored_retries_partial_hash_and_data_writes_and_rejects_zero_write() {
+        let mut writer = LimitedVectoredWriter {
+            max_write: 2,
+            writes: Vec::new(),
+        };
+
+        write_all_vectored(&mut writer, b"hash", b"payload").await.unwrap();
+        assert_eq!(writer.writes, b"hashpayload");
+
+        let mut zero_writer = LimitedVectoredWriter {
+            max_write: 0,
+            writes: Vec::new(),
+        };
+        let err = write_all_vectored(&mut zero_writer, b"hash", b"payload")
+            .await
+            .expect_err("zero-byte vectored writes must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_rejects_output_buffers_larger_than_shard_size() {
+        let mut reader = BitrotReader::new(Cursor::new(Vec::<u8>::new()), 4, HashAlgorithm::None, false);
+        let mut out = [0u8; 5];
+        let err = reader
+            .read(&mut out)
+            .await
+            .expect_err("oversized output buffers must be rejected before reading");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("exceeds shard size"));
+    }
+
+    #[tokio::test]
+    async fn custom_writer_other_forwards_io_and_wrapper_reports_non_inline_state() {
+        let writer = CountingWriter::default();
+        let mut custom = CustomWriter::new_tokio_writer(writer);
+        assert!(custom.get_inline_data().is_none());
+        assert!(!custom.is_write_vectored());
+        custom.write_all(b"abc").await.unwrap();
+        custom.flush().await.unwrap();
+        custom.shutdown().await.unwrap();
+        assert!(custom.into_inline_data().is_none());
+
+        let other = BitrotWriterWrapper::new(CustomWriter::new_tokio_writer(CountingWriter::default()), 8, HashAlgorithm::None);
+        assert!(format!("{other:?}").contains("Other"));
+        assert!(other.into_inline_data().is_none());
+
+        let inline = BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), 8, HashAlgorithm::None);
+        assert!(format!("{inline:?}").contains("InlineBuffer"));
     }
 
     #[tokio::test]

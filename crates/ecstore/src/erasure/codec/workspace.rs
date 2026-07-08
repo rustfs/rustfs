@@ -102,4 +102,17 @@ mod tests {
         assert_eq!(buf.len(), 4);
         assert_eq!(pool.buffers.len(), 4);
     }
+
+    #[test]
+    fn workspace_reports_shard_len_and_pool_reserves_when_reused_slot_is_too_small() {
+        let workspace = RustfsCodecDecodeWorkspace::new(37);
+        assert_eq!(workspace.shard_len(), 37);
+
+        let mut pool = ShardBufferPool::new(1);
+        pool.put(0, Vec::with_capacity(2));
+        let grown = pool.take(0, 8);
+
+        assert_eq!(grown.len(), 8);
+        assert!(grown.capacity() >= 8);
+    }
 }

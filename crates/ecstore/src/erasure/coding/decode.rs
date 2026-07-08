@@ -755,12 +755,6 @@ where
         self.buffers.ensure_slots(num_readers);
 
         let mut retire_readers = Vec::new();
-        let mut unavailable_data_sources = self
-            .readers
-            .iter()
-            .take(self.data_shards)
-            .map(|reader| reader.is_none())
-            .collect::<Vec<_>>();
         if num_readers >= self.data_shards {
             let mut reader_iter = ReaderLaunchIter::new(&mut self.readers, read_costs, locality_preference_enabled);
             let mut sets = FuturesUnordered::new();
@@ -808,8 +802,6 @@ where
             let mut first_shard_recorded = false;
             let mut pending = sets.len();
             let mut scheduled_all = false;
-            let verification_success_target = self.total_shards.min(self.data_shards + 1);
-            let parity_shards = self.total_shards.saturating_sub(self.data_shards);
             loop {
                 let item = if !scheduled_all {
                     match shard_read_hedge_delay(self.read_timeout) {
@@ -888,9 +880,6 @@ where
                     result,
                     should_retire,
                 );
-                if self.verify_reconstruction && i < self.data_shards && result_is_err {
-                    unavailable_data_sources[i] = true;
-                }
                 if result_is_err {
                     failed += 1;
                     if let Some((next_i, next_reader)) = reader_iter.next() {
@@ -929,73 +918,11 @@ where
                     }
                 }
 
-                let mut missing_data_sources = unavailable_data_sources.iter().filter(|missing| **missing).count();
-                if self.verify_reconstruction && success >= self.data_shards {
-                    for (idx, active) in active_readers.iter().take(self.data_shards).enumerate() {
-                        if *active && !unavailable_data_sources[idx] {
-                            missing_data_sources += 1;
-                        }
-                    }
-                }
-
-                let needs_reconstruction_verification = self.verify_reconstruction
-                    && verification_success_target > self.data_shards
-                    && missing_data_sources > 0
-                    && missing_data_sources < parity_shards;
-
-                let target_success = if needs_reconstruction_verification {
-                    verification_success_target
-                } else {
-                    self.data_shards
-                };
-
-                while success + pending < target_success {
-                    if let Some((next_i, next_reader)) = reader_iter.next() {
-                        let has_reader = next_reader.is_some();
-                        let recycled_buf = if has_reader {
-                            Some(self.buffers.take(next_i, shard_size))
-                        } else {
-                            None
-                        };
-                        let next_read_cost = read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
-                        record_scheduled_read_cost(
-                            next_read_cost,
-                            locality_preference_enabled,
-                            low_cost_available,
-                            self.data_shards,
-                            true,
-                            &mut local_preferred,
-                            &mut remote_scheduled,
-                            &mut fallback_to_remote,
-                        );
-                        scheduled += 1;
-                        active_readers[next_i] = has_reader;
-                        pending += 1;
-                        sets.push(read_shard(
-                            next_i,
-                            next_read_cost,
-                            next_reader,
-                            recycled_buf,
-                            shard_size,
-                            self.data_shards,
-                            self.read_timeout,
-                            self.metrics_path,
-                        ));
-                    } else {
-                        scheduled_all = true;
-                        break;
-                    }
-                }
-
-                if success >= target_success {
+                if success >= self.data_shards {
                     break;
                 }
 
-                if success >= self.data_shards && (!needs_reconstruction_verification || success + pending < target_success) {
-                    break;
-                }
-
-                if success + pending < target_success {
+                if success + pending < self.data_shards {
                     break;
                 }
             }
@@ -1869,6 +1796,7 @@ mod tests {
         erasure::coding::{BitrotReader, BitrotWriter},
     };
     use rustfs_utils::HashAlgorithm;
+    use std::future::Future;
     use std::io::Cursor;
     use std::pin::Pin;
     use std::sync::{
@@ -1877,6 +1805,7 @@ mod tests {
     };
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
+    use tokio::time::{Instant as TokioInstant, Sleep};
 
     type BoxedShardReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 
@@ -1949,8 +1878,16 @@ mod tests {
 
     enum TestShardReader {
         Ready(Cursor<Vec<u8>>),
+        ReadyAt {
+            cursor: Cursor<Vec<u8>>,
+            ready_at: TokioInstant,
+            sleep: Option<Pin<Box<Sleep>>>,
+        },
         Pending,
-        PartialThenPending { data: Vec<u8>, emitted: bool },
+        PartialThenPending {
+            data: Vec<u8>,
+            emitted: bool,
+        },
         TimedOut,
     }
 
@@ -1958,6 +1895,15 @@ mod tests {
         fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
             match &mut *self {
                 TestShardReader::Ready(cursor) => Pin::new(cursor).poll_read(cx, buf),
+                TestShardReader::ReadyAt { cursor, ready_at, sleep } => {
+                    if TokioInstant::now() < *ready_at {
+                        let sleeper = sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(*ready_at)));
+                        if sleeper.as_mut().poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
+                    }
+                    Pin::new(cursor).poll_read(cx, buf)
+                }
                 TestShardReader::Pending => {
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -1976,6 +1922,49 @@ mod tests {
                 TestShardReader::TimedOut => Poll::Ready(Err(io::Error::new(ErrorKind::TimedOut, "test shard read timed out"))),
             }
         }
+    }
+
+    struct FailingEmitWriter;
+
+    impl AsyncWrite for FailingEmitWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "injected emit failure")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn parallel_reader_constructor_variants_preserve_read_cost_and_verification_flags() {
+        let erasure = Erasure::new(2, 1, 64);
+        let readers = vec![None, None, None];
+        let read_costs = vec![ShardReadCost::Local, ShardReadCost::Remote, ShardReadCost::Unknown];
+
+        let reader: ParallelReader<Cursor<Vec<u8>>> =
+            ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
+                readers,
+                erasure.clone(),
+                64,
+                17,
+                Some("constructor-test"),
+                read_costs.clone(),
+            );
+
+        assert_eq!(reader.offset, reader.shard_size);
+        assert_eq!(reader.read_costs, read_costs);
+        assert!(reader.verify_reconstruction);
+
+        let defaulted: ParallelReader<Cursor<Vec<u8>>> =
+            ParallelReader::new_with_metrics_path_and_reconstruction_verification(vec![None, None, None], erasure, 0, 64, None);
+
+        assert_eq!(defaulted.read_costs, vec![ShardReadCost::Unknown; 3]);
+        assert!(defaulted.verify_reconstruction);
     }
 
     #[tokio::test]
@@ -2009,6 +1998,111 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_data_blocks_rejects_offset_length_overflow() {
+        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let mut out = Vec::new();
+
+        let err = write_data_blocks(&mut out, &blocks, 1, usize::MAX, 1).await.unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_data_blocks_rejects_missing_data_shard_even_when_total_bytes_are_available() {
+        let blocks = vec![None, Some(vec![1, 2, 3, 4])];
+        let mut out = Vec::new();
+
+        let err = write_data_blocks(&mut out, &blocks, 2, 0, 1).await.unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_data_blocks_propagates_writer_emit_failure() {
+        let blocks = vec![Some(vec![1, 2, 3, 4])];
+        let mut writer = FailingEmitWriter;
+
+        let err = write_data_blocks(&mut writer, &blocks, 1, 0, 4)
+            .await
+            .expect_err("writer failure must fail the decoded emit path");
+
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+        assert_eq!(err.to_string(), "injected emit failure");
+    }
+
+    #[tokio::test]
+    async fn test_erasure_decode_rejects_reader_count_and_range_overflow() {
+        let erasure = Erasure::new(2, 1, 64);
+        let mut output = Vec::new();
+
+        let (written, err) = erasure
+            .decode(&mut output, Vec::<Option<BitrotReader<Cursor<Vec<u8>>>>>::new(), 0, 1, 1)
+            .await;
+        assert_eq!(written, 0);
+        assert_eq!(err.expect("reader count mismatch should fail").kind(), ErrorKind::InvalidInput);
+
+        let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = vec![None, None, None];
+        let (written, err) = erasure.decode(&mut output, readers, usize::MAX, 1, usize::MAX).await;
+        assert_eq!(written, 0);
+        assert_eq!(err.expect("offset overflow should fail").kind(), ErrorKind::InvalidInput);
+
+        let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = vec![None, None, None];
+        let (written, err) = erasure.decode(&mut output, readers, 2, 8, 9).await;
+        assert_eq!(written, 0);
+        assert_eq!(err.expect("range beyond total length should fail").kind(), ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn test_erasure_decode_with_read_costs_restores_missing_data_shard_range() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let data: Vec<u8> = (0..BLOCK_SIZE as u8).collect();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let encoded = erasure.encode_data(&data).expect("encode should succeed");
+        let readers = vec![
+            None,
+            Some(BitrotReader::new(
+                Cursor::new(encoded[1].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(
+                Cursor::new(encoded[DATA_SHARDS].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(
+                Cursor::new(encoded[DATA_SHARDS + 1].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+        ];
+        let read_costs = vec![
+            ShardReadCost::Local,
+            ShardReadCost::SameNode,
+            ShardReadCost::Remote,
+            ShardReadCost::Unknown,
+        ];
+
+        let mut output = Vec::new();
+        let (written, err) = erasure
+            .decode_with_read_costs(&mut output, readers, 5, 37, data.len(), read_costs)
+            .await;
+
+        assert!(err.is_none(), "missing data shard should reconstruct with parity: {err:?}");
+        assert_eq!(written, 37);
+        assert_eq!(output, data[5..42]);
     }
 
     /// Regression for upstream issue #2716: ranged GETs going through
@@ -3009,6 +3103,58 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn parallel_reader_records_metrics_for_observe_and_locality_policy_modes() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        for (mode, expected_data_slots) in [("off", vec![0, 1, 2, 3]), ("on", vec![2, 3, 4, 5])] {
+            temp_env::async_with_vars(
+                [
+                    (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some(mode)),
+                    (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+                ],
+                async {
+                    rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+                    let hash_algo = HashAlgorithm::HighwayHash256;
+                    let readers =
+                        make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[], &[]).await;
+                    let read_costs = vec![
+                        ShardReadCost::Remote,
+                        ShardReadCost::Remote,
+                        ShardReadCost::Local,
+                        ShardReadCost::SameNode,
+                        ShardReadCost::Local,
+                        ShardReadCost::SameNode,
+                    ];
+                    let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+                    let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
+                        readers,
+                        erasure,
+                        0,
+                        NUM_SHARDS * BLOCK_SIZE,
+                        Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
+                        read_costs,
+                    );
+
+                    let (bufs, errs) = parallel_reader.read().await;
+
+                    assert_eq!(parallel_reader.metrics_path, Some(GET_OBJECT_PATH_LEGACY_DUPLEX));
+                    assert!(errs.iter().all(Option::is_none));
+                    for index in expected_data_slots {
+                        assert_eq!(bufs[index].as_deref(), Some(&[(index % 256) as u8; SHARD_SIZE][..]));
+                    }
+                    rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+                },
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn test_parallel_reader_local_first_avoids_remote_when_local_quorum_exists() {
         temp_env::async_with_vars(
             [
@@ -3343,6 +3489,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_parallel_reader_schedules_extra_parity_for_reconstruction_verification() {
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            None,
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![3_u8; SHARD_SIZE])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader =
+            ParallelReader::new_with_metrics_path_and_reconstruction_verification(readers, erasure, 0, BLOCK_SIZE, None);
+
+        let (bufs, errs) = parallel_reader.read().await;
+
+        assert!(errs[0].is_none() || matches!(&errs[0], Some(DiskError::FileNotFound)));
+        assert!(bufs[0].is_none());
+        assert_eq!(3, bufs.iter().filter(|buf| buf.is_some()).count());
+        assert!(bufs[1].is_some());
+        assert!(bufs[2].is_some());
+        assert!(bufs[3].is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_parallel_reader_records_metrics_for_success_missing_error_and_timeout() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(TestShardReader::TimedOut, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+            None,
+        ];
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            erasure,
+            0,
+            NUM_SHARDS * BLOCK_SIZE,
+            Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
+            vec![
+                ShardReadCost::Local,
+                ShardReadCost::SameNode,
+                ShardReadCost::Remote,
+                ShardReadCost::Unknown,
+            ],
+            Duration::from_millis(20),
+            false,
+        );
+
+        let started = std::time::Instant::now();
+        let (bufs, errs) = parallel_reader.read().await;
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(parallel_reader.metrics_path, Some(GET_OBJECT_PATH_LEGACY_DUPLEX));
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(matches!(&errs[1], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(matches!(&errs[3], Some(Error::FileNotFound)));
+        assert_eq!(bufs[2].as_deref(), Some(&[2_u8; SHARD_SIZE][..]));
+    }
+
+    #[tokio::test]
     async fn test_parallel_reader_uses_parity_without_waiting_for_pending_shard() {
         const NUM_SHARDS: usize = 1;
         const BLOCK_SIZE: usize = 64;
@@ -3381,6 +3622,39 @@ mod tests {
         assert!(bufs[1].is_some());
         assert!(bufs[2].is_some());
         assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
+    #[tokio::test]
+    async fn test_parallel_reader_drains_completed_shards_after_quorum() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 3;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let ready_at = TokioInstant::now() + Duration::from_millis(250);
+        let readers = (0..DATA_SHARDS + PARITY_SHARDS)
+            .map(|index| {
+                Some(BitrotReader::new(
+                    TestShardReader::ReadyAt {
+                        cursor: Cursor::new(vec![index as u8; SHARD_SIZE * NUM_SHARDS]),
+                        ready_at,
+                        sleep: None,
+                    },
+                    SHARD_SIZE,
+                    HashAlgorithm::None,
+                    false,
+                ))
+            })
+            .collect();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader =
+            ParallelReader::new_with_read_timeout(readers, erasure, 0, NUM_SHARDS * BLOCK_SIZE, Duration::from_secs(2));
+
+        let (bufs, errs) = parallel_reader.read().await;
+
+        assert!(errs.iter().all(Option::is_none));
+        assert!(bufs.iter().filter(|buf| buf.is_some()).count() >= DATA_SHARDS);
     }
 
     #[tokio::test]
@@ -3484,6 +3758,19 @@ mod tests {
         assert_eq!(shard_read_hedge_delay(Duration::ZERO), None);
         assert_eq!(shard_read_hedge_delay(Duration::from_millis(50)), Some(Duration::from_millis(50)));
         assert_eq!(shard_read_hedge_delay(Duration::from_secs(60)), Some(Duration::from_millis(100)));
+
+        temp_env::with_var(ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, None::<&str>, || {
+            assert_eq!(get_decode_stripe_prefetch_count(), DEFAULT_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT);
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("3"), || {
+            assert_eq!(get_decode_stripe_prefetch_count(), 3);
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, None::<&str>, || {
+            assert_eq!(is_bitrot_decode_overlap_enabled(), DEFAULT_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE);
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("true"), || {
+            assert!(is_bitrot_decode_overlap_enabled());
+        });
     }
 
     async fn create_reader(
