@@ -51,15 +51,39 @@ pub(crate) struct InstanceContext {
     /// `is_erasure`/`is_dist_erasure`/`is_erasure_sd` booleans are derived from
     /// this value rather than stored independently.
     erasure_kind: RwLock<SetupType>,
+    /// Per-instance local lock manager (issue #939, Slice3). `SetDisks` reads
+    /// this off `self.ctx` so two ECStore instances get *separate* lock
+    /// namespaces instead of colliding on one process-global manager. The
+    /// bootstrap context deliberately holds the process-global manager (see
+    /// [`bootstrap_ctx`]) so single-instance locking is byte-for-byte unchanged.
+    local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
 }
 
 impl InstanceContext {
     /// Fresh context in the pre-startup default state — equivalent to the old
     /// three booleans all initialized to `false` (`SetupType::Unknown`).
+    ///
+    /// Mints its **own** lock manager, so a context built this way is fully
+    /// isolated from the process-global one. Production goes through
+    /// [`bootstrap_ctx`], which adopts the global manager instead.
     pub(crate) fn new() -> Self {
+        Self::with_lock_manager(Arc::new(rustfs_lock::GlobalLockManager::new()))
+    }
+
+    /// Build a context around a specific lock manager. Lets [`bootstrap_ctx`]
+    /// adopt the process-global manager while [`new`](Self::new) mints an
+    /// isolated one.
+    fn with_lock_manager(local_lock_manager: Arc<rustfs_lock::GlobalLockManager>) -> Self {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
+            local_lock_manager,
         }
+    }
+
+    /// This instance's local lock manager. `SetDisks::new` stores the result so
+    /// the set layer locks within this instance's namespace.
+    pub(crate) fn local_lock_manager(&self) -> Arc<rustfs_lock::GlobalLockManager> {
+        self.local_lock_manager.clone()
     }
 
     /// True when the deployment is erasure-coded — single-node multi-drive
@@ -107,8 +131,15 @@ impl Default for InstanceContext {
 static BOOTSTRAP_CTX: OnceLock<Arc<InstanceContext>> = OnceLock::new();
 
 /// Get (initializing on first call) the process bootstrap context.
+///
+/// Adopts the process-global lock manager (`rustfs_lock::get_global_lock_manager`)
+/// rather than minting a fresh one, so `SetDisks` built for the single process
+/// instance lock in exactly the same namespace as every other direct caller of
+/// `get_global_lock_manager()` — byte-for-byte unchanged locking behavior.
 pub(crate) fn bootstrap_ctx() -> Arc<InstanceContext> {
-    BOOTSTRAP_CTX.get_or_init(|| Arc::new(InstanceContext::new())).clone()
+    BOOTSTRAP_CTX
+        .get_or_init(|| Arc::new(InstanceContext::with_lock_manager(rustfs_lock::get_global_lock_manager())))
+        .clone()
 }
 
 #[cfg(test)]
@@ -156,8 +187,8 @@ mod tests {
         assert!(!ctx.is_erasure_sd().await);
     }
 
-    #[test]
-    fn bootstrap_ctx_is_stable_singleton() {
+    #[tokio::test]
+    async fn bootstrap_ctx_is_stable_singleton() {
         let a = bootstrap_ctx();
         let b = bootstrap_ctx();
         assert!(Arc::ptr_eq(&a, &b), "bootstrap_ctx must return the same Arc");
@@ -174,5 +205,33 @@ mod tests {
         assert!(!a.is_erasure_sd().await);
         assert!(b.is_erasure_sd().await);
         assert!(!b.is_dist_erasure().await);
+    }
+
+    /// Slice3: the bootstrap context must reuse the process-global lock manager,
+    /// so single-instance locking is unchanged (other direct callers of
+    /// `get_global_lock_manager()` lock in the same namespace as `SetDisks`).
+    #[tokio::test]
+    async fn bootstrap_ctx_adopts_global_lock_manager() {
+        let ctx = bootstrap_ctx();
+        assert!(
+            Arc::ptr_eq(&ctx.local_lock_manager(), &rustfs_lock::get_global_lock_manager()),
+            "bootstrap ctx must reuse the process-global lock manager"
+        );
+    }
+
+    /// Slice3: a freshly-minted context gets its OWN lock manager — the seam
+    /// that gives a second instance an isolated lock namespace.
+    #[tokio::test]
+    async fn fresh_context_has_isolated_lock_manager() {
+        let a = InstanceContext::new();
+        let b = InstanceContext::new();
+        assert!(
+            !Arc::ptr_eq(&a.local_lock_manager(), &b.local_lock_manager()),
+            "two fresh contexts must have distinct lock managers"
+        );
+        assert!(
+            !Arc::ptr_eq(&a.local_lock_manager(), &rustfs_lock::get_global_lock_manager()),
+            "a fresh context must not share the process-global lock manager"
+        );
     }
 }

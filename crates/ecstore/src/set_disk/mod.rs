@@ -1730,7 +1730,7 @@ impl SetDisks {
                 .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)
                 .build(),
             lockers,
-            local_lock_manager: runtime_sources::global_lock_manager(),
+            local_lock_manager: ctx.local_lock_manager(),
             ctx,
         })
     }
@@ -3682,6 +3682,42 @@ mod tests {
             crate::runtime::instance::bootstrap_ctx(),
         )
         .await
+    }
+
+    /// Slice3: a `SetDisks` built from an isolated instance context locks in that
+    /// instance's namespace — its `local_lock_manager` is the ctx's manager, not
+    /// the process-global one two instances would otherwise collide on.
+    #[tokio::test]
+    async fn set_disks_lock_manager_is_instance_scoped() {
+        use crate::runtime::instance::InstanceContext;
+
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data").expect("second endpoint should parse"),
+        ];
+        let ctx = Arc::new(InstanceContext::new());
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![None, None])),
+            2,
+            1,
+            0,
+            0,
+            endpoints,
+            FormatV3::new(1, 2),
+            Vec::new(),
+            ctx.clone(),
+        )
+        .await;
+
+        assert!(
+            Arc::ptr_eq(&set_disks.local_lock_manager, &ctx.local_lock_manager()),
+            "SetDisks must adopt its ctx's lock manager"
+        );
+        assert!(
+            !Arc::ptr_eq(&set_disks.local_lock_manager, &rustfs_lock::get_global_lock_manager()),
+            "an isolated instance must not share the process-global lock manager"
+        );
     }
 
     struct SetupTypeGuard {
