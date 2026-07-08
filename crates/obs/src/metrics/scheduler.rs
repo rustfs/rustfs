@@ -1048,6 +1048,19 @@ pub fn init_metrics_runtime(token: CancellationToken) {
             }
         };
 
+        #[cfg(feature = "gpu")]
+        let gpu_collector = current_pid.and_then(|pid| {
+            use crate::metrics::collectors::GpuCollector;
+
+            match GpuCollector::new(pid) {
+                Ok(collector) => Some(collector),
+                Err(e) => {
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collector_init_failed", error = %e, "metrics runtime state changed");
+                    None
+                }
+            }
+        });
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -1070,20 +1083,15 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
 
                         #[cfg(feature = "gpu")]
-                        if let Some(pid) = current_pid {
-                            use crate::metrics::collectors::{GpuCollector, collect_gpu_metrics};
+                        if let Some(collector) = gpu_collector.as_ref() {
+                            use crate::metrics::collectors::collect_gpu_metrics;
 
-                            match GpuCollector::new(pid) {
-                                Ok(collector) => match collector.collect() {
-                                    Ok(gpu_stats) => {
-                                        metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
-                                    }
-                                    Err(e) => {
-                                        warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collect_failed", error = %e, "metrics runtime state changed");
-                                    }
-                                },
+                            match collector.collect() {
+                                Ok(gpu_stats) => {
+                                    metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
+                                }
                                 Err(e) => {
-                                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collector_init_failed", error = %e, "metrics runtime state changed");
+                                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collect_failed", error = %e, "metrics runtime state changed");
                                 }
                             }
                         }
