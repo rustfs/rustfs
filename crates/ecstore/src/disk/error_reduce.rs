@@ -82,6 +82,14 @@ pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, 
         .max_by(|(_, c1), (_, c2)| c1.cmp(c2))
         .unwrap_or((nil_error, 0));
 
+    // Guard against the empty/all-ignored case: when there is no real error and
+    // no nil value, the seeded placeholder `nil_error` must not leak out as the
+    // dominant error. Return the `None` sentinel so callers (e.g. write-quorum
+    // failure summaries and their metric labels) treat it as "no dominant error".
+    if best_count == 0 && nil_count == 0 {
+        return (0, None);
+    }
+
     // Compare nil errors with the top non-nil error and prefer the nil error
     if nil_count > best_count || (nil_count == best_count && nil_count > 0) {
         (nil_count, None)
@@ -279,6 +287,45 @@ mod tests {
 
         assert_eq!(summary.retryable_failures, 2);
         assert_eq!(summary.dominant_error_label, "connection_reset");
+    }
+
+    #[test]
+    fn test_reduce_errs_all_ignored_returns_none() {
+        // All disks return an ignored error (e.g. every disk offline): err_counts
+        // ends up empty and nil_count == 0. The synthetic "nil" placeholder must
+        // not leak; the function must return the (0, None) sentinel.
+        let errors = vec![
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+        ];
+        let (count, err) = reduce_errs(&errors, OBJECT_OP_IGNORED_ERRS);
+        assert_eq!(count, 0);
+        assert_eq!(err, None);
+    }
+
+    #[test]
+    fn test_reduce_errs_empty_slice_returns_none() {
+        // Empty slice: no errors and no nil values -> (0, None), not the placeholder.
+        let errors: Vec<Option<Error>> = vec![];
+        let ignored: Vec<Error> = vec![];
+        let (count, err) = reduce_errs(&errors, &ignored);
+        assert_eq!(count, 0);
+        assert_eq!(err, None);
+    }
+
+    #[test]
+    fn test_build_write_quorum_failure_summary_all_ignored_is_nil_dominated() {
+        // All disks offline (all DiskNotFound). The dominant error must be None and
+        // the label must be "nil_dominated" rather than falling back to "other_error".
+        let errors = vec![
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+        ];
+        let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 2);
+        assert_eq!(summary.dominant_error, None);
+        assert_eq!(summary.dominant_error_label, "nil_dominated");
     }
 
     #[test]
