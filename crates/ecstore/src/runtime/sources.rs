@@ -21,7 +21,7 @@ use std::{
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
 use crate::{
-    bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, GLOBAL_EXPIRY_STATE, GLOBAL_TRANSITION_STATE, TransitionState},
+    bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState},
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
     bucket::replication::{
         DynReplicationPool, ReplicationStats,
@@ -391,11 +391,11 @@ pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
 }
 
 pub fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
-    GLOBAL_EXPIRY_STATE.clone()
+    crate::runtime::global::current_ctx().expiry_state()
 }
 
 pub fn transition_state_handle() -> Arc<TransitionState> {
-    GLOBAL_TRANSITION_STATE.clone()
+    crate::runtime::global::current_ctx().transition_state()
 }
 
 pub(crate) fn event_notifier_handle() -> Arc<RwLock<EventNotifier>> {

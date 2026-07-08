@@ -51,7 +51,6 @@ use crate::store::ECStore;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
-use lazy_static::lazy_static;
 use rustfs_common::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
@@ -119,17 +118,15 @@ const DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL: StdDuration = StdDuration::from_se
 const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
 
-lazy_static! {
-    pub static ref GLOBAL_EXPIRY_STATE: Arc<RwLock<ExpiryState>> = ExpiryState::new();
-    pub static ref GLOBAL_TRANSITION_STATE: Arc<TransitionState> = TransitionState::new();
-}
-
+// Phase 5 (backlog#939): lifecycle expiry/transition state moved into the
+// per-instance `InstanceContext`; these owner helpers forward to the current
+// instance's context (lazily materialized, shared for single-instance).
 pub fn get_global_expiry_state() -> Arc<RwLock<ExpiryState>> {
-    GLOBAL_EXPIRY_STATE.clone()
+    crate::runtime::global::current_ctx().expiry_state()
 }
 
 pub fn get_global_transition_state() -> Arc<TransitionState> {
-    GLOBAL_TRANSITION_STATE.clone()
+    crate::runtime::global::current_ctx().transition_state()
 }
 
 fn resolve_transition_worker_count() -> (i64, i64, i64) {
