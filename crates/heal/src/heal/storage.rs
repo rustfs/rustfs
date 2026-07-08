@@ -14,8 +14,11 @@
 
 use crate::{Error, Result};
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
@@ -44,9 +47,156 @@ pub(crate) fn next_heal_listing_token(
         return Ok(None);
     }
 
-    next_token.map(Some).ok_or_else(|| Error::TaskExecutionFailed {
-        message: format!("Object listing for {bucket}/{prefix} was truncated without continuation token"),
-    })
+    match next_token {
+        Some(token) => Ok(Some(token)),
+        None => {
+            // A version listing legitimately reports the final page as truncated
+            // when the last object's versions land exactly on the page boundary
+            // yet the backend has nothing further to yield. Treat a missing
+            // continuation token as end-of-listing rather than a hard error so
+            // the heal pass terminates cleanly instead of failing the bucket.
+            warn!(
+                target: "rustfs::heal::storage",
+                event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
+                operation = "next_heal_listing_token",
+                bucket,
+                prefix,
+                state = "truncated_without_token",
+                "Heal storage object listing truncated without continuation token; treating as end of listing"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Opaque continuation token payload for heal version listing. Encodes the
+/// `(marker, version_marker)` pair that `list_object_versions` needs to resume.
+#[derive(Debug, Serialize, Deserialize)]
+struct HealTokenPayload {
+    /// object key marker
+    #[serde(rename = "m")]
+    m: Option<String>,
+    /// version-id marker
+    #[serde(rename = "v")]
+    v: Option<String>,
+}
+
+const HEAL_TOKEN_PREFIX: &str = "v1:";
+
+/// Encode a `(marker, version_marker)` pair into an opaque heal continuation
+/// token. The token is `"v1:" + base64url_nopad(json)`.
+///
+/// Invariant: `list_object_versions` returns `NotImplemented` for
+/// `(None, Some(_))`, so callers must never produce that pair. This is checked
+/// with a `debug_assert!`.
+pub(crate) fn encode_heal_token(marker: Option<&str>, version_marker: Option<&str>) -> String {
+    debug_assert!(
+        !(marker.is_none() && version_marker.is_some()),
+        "encode_heal_token must never be called with (None, Some(_))"
+    );
+
+    let payload = HealTokenPayload {
+        m: marker.map(str::to_string),
+        v: version_marker.map(str::to_string),
+    };
+    // serde_json of a simple two-Option struct cannot fail; fall back to an
+    // empty object rather than panicking if it somehow does.
+    let json = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    format!("{HEAL_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
+}
+
+/// Decode an opaque heal continuation token back into `(marker, version_marker)`.
+///
+/// TOTAL function: an empty token, a missing `"v1:"` prefix, invalid base64, or
+/// invalid JSON all decode to `(None, None)` (start from the beginning). A
+/// decoded `(None, Some(_))` is coerced to `(None, None)` to preserve the
+/// `list_object_versions` invariant.
+pub(crate) fn decode_heal_token(token: &str) -> (Option<String>, Option<String>) {
+    if token.is_empty() {
+        return (None, None);
+    }
+
+    let Some(encoded) = token.strip_prefix(HEAL_TOKEN_PREFIX) else {
+        warn!(
+            target: "rustfs::heal::storage",
+            event = EVENT_HEAL_STORAGE_ADMIN_OP,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_STORAGE,
+            operation = "decode_heal_token",
+            state = "missing_prefix",
+            "Heal continuation token missing version prefix; restarting listing"
+        );
+        return (None, None);
+    };
+
+    let bytes = match URL_SAFE_NO_PAD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                target: "rustfs::heal::storage",
+                event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
+                operation = "decode_heal_token",
+                state = "bad_base64",
+                error = %e,
+                "Heal continuation token has invalid base64; restarting listing"
+            );
+            return (None, None);
+        }
+    };
+
+    let payload: HealTokenPayload = match serde_json::from_slice(&bytes) {
+        Ok(payload) => payload,
+        Err(e) => {
+            warn!(
+                target: "rustfs::heal::storage",
+                event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
+                operation = "decode_heal_token",
+                state = "bad_json",
+                error = %e,
+                "Heal continuation token has invalid payload; restarting listing"
+            );
+            return (None, None);
+        }
+    };
+
+    // Preserve the list_object_versions invariant: (None, Some(_)) is illegal.
+    if payload.m.is_none() && payload.v.is_some() {
+        warn!(
+            target: "rustfs::heal::storage",
+            event = EVENT_HEAL_STORAGE_ADMIN_OP,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_STORAGE,
+            operation = "decode_heal_token",
+            state = "illegal_version_only_marker",
+            "Heal continuation token had a version marker without an object marker; restarting listing"
+        );
+        return (None, None);
+    }
+
+    (payload.m, payload.v)
+}
+
+/// A single object version to heal.
+///
+/// `is_delete_marker` is OBSERVABILITY-ONLY (metrics / logging / e2e
+/// assertions); it MUST NOT gate healing logic. Whether the delete-marker path
+/// or the data path is taken is decided internally in `ops/heal.rs` from
+/// `latest_meta.deleted`. `version_id` is normalized (nil/absent UUID => `None`)
+/// at the single construction point in `list_objects_for_heal_page`.
+#[derive(Debug, Clone)]
+pub struct HealListItem {
+    /// object key
+    pub name: String,
+    /// normalized version id (`None` when the version is nil/absent)
+    pub version_id: Option<String>,
+    /// whether this version is a delete marker (observability only)
+    pub is_delete_marker: bool,
 }
 
 /// Disk status for heal operations
@@ -132,20 +282,21 @@ pub trait HealStorageAPI: Send + Sync {
     /// Heal format using ecstore
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
 
-    /// List objects for healing (returns all objects, may use significant memory for large buckets)
+    /// List object versions for healing (returns all versions, may use significant memory for large buckets)
     ///
-    /// WARNING: This method loads all objects into memory at once. For buckets with many objects,
-    /// consider using `list_objects_for_heal_page` instead to process objects in pages.
-    async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<String>>;
+    /// WARNING: This method loads all object versions into memory at once. For buckets with many
+    /// objects/versions, consider using `list_objects_for_heal_page` instead to process versions in pages.
+    async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<HealListItem>>;
 
-    /// List objects for healing with pagination (returns one page and continuation token)
-    /// Returns (objects, next_continuation_token, is_truncated)
+    /// List object versions for healing with pagination (returns one page and continuation token)
+    /// Returns (versions, next_continuation_token, is_truncated). The continuation token is an
+    /// opaque composite `(marker, version_marker)` value — see `encode_heal_token`/`decode_heal_token`.
     async fn list_objects_for_heal_page(
         &self,
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
-    ) -> Result<(Vec<String>, Option<String>, bool)>;
+    ) -> Result<(Vec<HealListItem>, Option<String>, bool)>;
 
     /// Get disk for resume functionality
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore>;
@@ -1063,7 +1214,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         }
     }
 
-    async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    async fn list_objects_for_heal(&self, bucket: &str, prefix: &str) -> Result<Vec<HealListItem>> {
         debug!(
             target: "rustfs::heal::storage",
             event = EVENT_HEAL_STORAGE_ADMIN_OP,
@@ -1084,10 +1235,10 @@ impl HealStorageAPI for ECStoreHealStorage {
             bucket,
             prefix,
             state = "memory_heavy",
-            "Heal storage object listing loads all objects into memory"
+            "Heal storage version listing loads all versions into memory (footprint is per-version, not per-object)"
         );
 
-        let mut all_objects = Vec::new();
+        let mut all_objects: Vec<HealListItem> = Vec::new();
         let mut continuation_token: Option<String> = None;
 
         loop {
@@ -1102,6 +1253,9 @@ impl HealStorageAPI for ECStoreHealStorage {
             }
 
             continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
+            if continuation_token.is_none() {
+                break;
+            }
         }
 
         debug!(
@@ -1124,7 +1278,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         bucket: &str,
         prefix: &str,
         continuation_token: Option<&str>,
-    ) -> Result<(Vec<String>, Option<String>, bool)> {
+    ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
         debug!(
             target: "rustfs::heal::storage",
             event = EVENT_HEAL_STORAGE_ADMIN_OP,
@@ -1139,13 +1293,17 @@ impl HealStorageAPI for ECStoreHealStorage {
         );
 
         const MAX_KEYS: i32 = 1000;
-        let continuation_token_opt = continuation_token.map(|s| s.to_string());
+        // Decode the opaque composite token into the (marker, version_marker)
+        // pair that list_object_versions consumes. Malformed tokens restart the
+        // listing from the beginning (decode_heal_token is total).
+        let (marker, version_marker) = decode_heal_token(continuation_token.unwrap_or(""));
 
-        // Use list_objects_v2 to get objects with pagination
+        // Enumerate EVERY version (not just the latest) so old versions and
+        // delete-marker-latest objects are healed too.
         let list_info = match self
             .ecstore
             .clone()
-            .list_objects_v2(bucket, prefix, continuation_token_opt, None, MAX_KEYS, false, None, false)
+            .list_object_versions(bucket, prefix, marker, version_marker, None, MAX_KEYS)
             .await
         {
             Ok(info) => info,
@@ -1166,9 +1324,27 @@ impl HealStorageAPI for ECStoreHealStorage {
             }
         };
 
-        // Collect objects from this page
-        let page_objects: Vec<String> = list_info.objects.into_iter().map(|obj| obj.name).collect();
+        // Collect versions from this page. version_id is normalized to Option<String>
+        // here at the single construction point: nil/absent UUID => None.
+        let page_objects: Vec<HealListItem> = list_info
+            .objects
+            .into_iter()
+            .map(|obj| HealListItem {
+                name: obj.name,
+                version_id: obj.version_id.filter(|u| !u.is_nil()).map(|u| u.to_string()),
+                is_delete_marker: obj.delete_marker,
+            })
+            .collect();
         let page_count = page_objects.len();
+
+        let next_token = if list_info.is_truncated {
+            Some(encode_heal_token(
+                list_info.next_marker.as_deref(),
+                list_info.next_version_idmarker.as_deref(),
+            ))
+        } else {
+            None
+        };
 
         debug!(
             target: "rustfs::heal::storage",
@@ -1176,15 +1352,15 @@ impl HealStorageAPI for ECStoreHealStorage {
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_STORAGE,
             operation = "list_objects_for_heal_page",
-                        bucket,
-                        prefix,
-                        object_count = page_count,
-                        is_truncated = list_info.is_truncated,
-                        state = "page_loaded",
-                        "Heal storage object listing page loaded"
+            bucket,
+            prefix,
+            version_count = page_count,
+            is_truncated = list_info.is_truncated,
+            state = "page_loaded",
+            "Heal storage version listing page loaded"
         );
 
-        Ok((page_objects, list_info.next_continuation_token, list_info.is_truncated))
+        Ok((page_objects, next_token, list_info.is_truncated))
     }
 
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore> {
@@ -1234,7 +1410,11 @@ impl HealStorageAPI for ECStoreHealStorage {
 #[cfg(test)]
 mod tests {
     use super::super::StorageError;
-    use super::{is_transient_object_exists_error, is_transient_object_exists_message, next_heal_listing_token};
+    use super::{
+        decode_heal_token, encode_heal_token, is_transient_object_exists_error, is_transient_object_exists_message,
+        next_heal_listing_token,
+    };
+    use base64::Engine as _;
 
     #[test]
     fn next_heal_listing_token_returns_none_for_complete_page() {
@@ -1254,11 +1434,51 @@ mod tests {
     }
 
     #[test]
-    fn next_heal_listing_token_fails_for_truncated_page_without_token() {
-        let err = next_heal_listing_token("bucket", "prefix", None, true).expect_err("truncated page without token must fail");
+    fn next_heal_listing_token_treats_truncated_page_without_token_as_end() {
+        // A version listing can report the final page as truncated with no
+        // continuation token; that must terminate the scan cleanly, not error.
+        assert_eq!(
+            next_heal_listing_token("bucket", "prefix", None, true).expect("truncated without token ends listing"),
+            None
+        );
+    }
 
-        assert!(matches!(err, super::Error::TaskExecutionFailed { .. }));
-        assert!(err.to_string().contains("truncated without continuation token"));
+    #[test]
+    fn test_heal_token_roundtrip() {
+        let token = encode_heal_token(Some("obj/key"), Some("v-123"));
+        assert!(token.starts_with("v1:"));
+        assert_eq!(decode_heal_token(&token), (Some("obj/key".to_string()), Some("v-123".to_string())));
+
+        // marker only (no version marker) round-trips.
+        let token = encode_heal_token(Some("obj/key"), None);
+        assert_eq!(decode_heal_token(&token), (Some("obj/key".to_string()), None));
+
+        // (None, None) round-trips.
+        let token = encode_heal_token(None, None);
+        assert_eq!(decode_heal_token(&token), (None, None));
+    }
+
+    #[test]
+    fn test_heal_token_malformed_resets_to_start() {
+        // empty, wrong prefix, bad base64, and bad json all reset to (None, None).
+        assert_eq!(decode_heal_token(""), (None, None));
+        assert_eq!(decode_heal_token("no-prefix-here"), (None, None));
+        assert_eq!(decode_heal_token("v1:!!!not-base64!!!"), (None, None));
+        // valid base64 of non-JSON bytes.
+        let bad_json = format!("v1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json"));
+        assert_eq!(decode_heal_token(&bad_json), (None, None));
+        // a raw v2-style list_objects_v2 token (no "v1:" prefix) resets cleanly.
+        assert_eq!(decode_heal_token("some-opaque-legacy-token"), (None, None));
+    }
+
+    #[test]
+    fn test_heal_token_none_and_marker_only() {
+        // A decoded payload must NEVER yield (None, Some(_)) because
+        // list_object_versions returns NotImplemented for that pairing.
+        // Craft a token whose JSON encodes (None, Some) directly and confirm coercion.
+        let json = br#"{"m":null,"v":"orphan-version"}"#;
+        let token = format!("v1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json));
+        assert_eq!(decode_heal_token(&token), (None, None), "version-only marker must coerce to (None, None)");
     }
 
     #[test]

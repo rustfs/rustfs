@@ -1315,8 +1315,9 @@ impl HealTask {
                 )
                 .await?;
 
-            for object in objects {
+            for item in objects {
                 self.check_control_flags().await?;
+                let object = item.name.as_str();
                 scanned += 1;
                 {
                     let mut progress = self.progress.write().await;
@@ -1324,109 +1325,95 @@ impl HealTask {
                     progress.update_progress(scanned, healed, failed, bytes);
                 }
 
-                match self.await_with_control(self.storage.object_exists(bucket, &object)).await {
-                    Ok(false) => {
+                // Heal each enumerated version directly. There is no latest-only
+                // existence gate: genuine absence surfaces through heal_object's
+                // not-found result and is handled below.
+                match self
+                    .await_with_control(
+                        self.storage
+                            .heal_object(bucket, object, item.version_id.as_deref(), &heal_opts),
+                    )
+                    .await
+                {
+                    Ok((result, None)) => {
                         healed += 1;
+                        bytes = bytes.saturating_add(result.object_size as u64);
+                        self.record_result_item(result).await;
                     }
-                    Ok(true) => match self
-                        .await_with_control(self.storage.heal_object(bucket, &object, None, &heal_opts))
-                        .await
-                    {
-                        Ok((result, None)) => {
+                    Ok((_, Some(err))) => {
+                        if is_missing_object_dir_heal_result(object, &err) {
                             healed += 1;
-                            bytes = bytes.saturating_add(result.object_size as u64);
-                            self.record_result_item(result).await;
+                            debug!(
+                                target: "rustfs::heal::task",
+                                event = EVENT_HEAL_BUCKET_RESULT,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_TASK,
+                                task_id = %self.id,
+                                bucket,
+                                object = %object,
+                                result = "object_dir_not_found_skipped",
+                                "Heal bucket object-dir candidate skipped after not-found result"
+                            );
+                            continue;
                         }
-                        Ok((_, Some(err))) => {
-                            if is_missing_object_dir_heal_result(&object, &err) {
-                                healed += 1;
-                                debug!(
-                                    target: "rustfs::heal::task",
-                                    event = EVENT_HEAL_BUCKET_RESULT,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_TASK,
-                                    task_id = %self.id,
-                                    bucket,
-                                    object = %object,
-                                    result = "object_dir_not_found_skipped",
-                                    "Heal bucket object-dir candidate skipped after not-found result"
-                                );
-                                continue;
-                            }
-                            if Self::should_skip_data_usage_cache_heal_error(bucket, &object, &err) {
-                                warn!(
-                                    target: "rustfs::heal::task",
-                                    event = EVENT_HEAL_BUCKET_RESULT,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_TASK,
-                                    task_id = %self.id,
-                                    bucket,
-                                    object = %object,
-                                    result = "transient_skip",
-                                    error = %err,
-                                    "Heal bucket object repair skipped due to transient error"
-                                );
-                            } else {
-                                failed += 1;
-                                warn!(
-                                    target: "rustfs::heal::task",
-                                    event = EVENT_HEAL_BUCKET_RESULT,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_TASK,
-                                    task_id = %self.id,
-                                    bucket,
-                                    object = %object,
-                                    result = "object_failed",
-                                    error = %err,
-                                    "Heal bucket object repair failed"
-                                );
-                            }
+                        if Self::should_skip_data_usage_cache_heal_error(bucket, object, &err) {
+                            warn!(
+                                target: "rustfs::heal::task",
+                                event = EVENT_HEAL_BUCKET_RESULT,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_TASK,
+                                task_id = %self.id,
+                                bucket,
+                                object = %object,
+                                result = "transient_skip",
+                                error = %err,
+                                "Heal bucket object repair skipped due to transient error"
+                            );
+                        } else {
+                            failed += 1;
+                            warn!(
+                                target: "rustfs::heal::task",
+                                event = EVENT_HEAL_BUCKET_RESULT,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_TASK,
+                                task_id = %self.id,
+                                bucket,
+                                object = %object,
+                                result = "object_failed",
+                                error = %err,
+                                "Heal bucket object repair failed"
+                            );
                         }
-                        Err(err) => {
-                            if Self::should_skip_data_usage_cache_heal_error(bucket, &object, &err) {
-                                warn!(
-                                    target: "rustfs::heal::task",
-                                    event = EVENT_HEAL_BUCKET_RESULT,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_TASK,
-                                    task_id = %self.id,
-                                    bucket,
-                                    object = %object,
-                                    result = "transient_skip",
-                                    error = %err,
-                                    "Heal bucket object repair skipped due to transient error"
-                                );
-                            } else {
-                                failed += 1;
-                                warn!(
-                                    target: "rustfs::heal::task",
-                                    event = EVENT_HEAL_BUCKET_RESULT,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_TASK,
-                                    task_id = %self.id,
-                                    bucket,
-                                    object = %object,
-                                    result = "object_failed",
-                                    error = %err,
-                                    "Heal bucket object repair failed"
-                                );
-                            }
-                        }
-                    },
+                    }
                     Err(err) => {
-                        failed += 1;
-                        warn!(
-                            target: "rustfs::heal::task",
-                            event = EVENT_HEAL_BUCKET_RESULT,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_TASK,
-                            task_id = %self.id,
-                            bucket,
-                            object = %object,
-                            result = "precheck_failed",
-                            error = %err,
-                            "Heal bucket object precheck failed"
-                        );
+                        if Self::should_skip_data_usage_cache_heal_error(bucket, object, &err) {
+                            warn!(
+                                target: "rustfs::heal::task",
+                                event = EVENT_HEAL_BUCKET_RESULT,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_TASK,
+                                task_id = %self.id,
+                                bucket,
+                                object = %object,
+                                result = "transient_skip",
+                                error = %err,
+                                "Heal bucket object repair skipped due to transient error"
+                            );
+                        } else {
+                            failed += 1;
+                            warn!(
+                                target: "rustfs::heal::task",
+                                event = EVENT_HEAL_BUCKET_RESULT,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_TASK,
+                                task_id = %self.id,
+                                bucket,
+                                object = %object,
+                                result = "object_failed",
+                                error = %err,
+                                "Heal bucket object repair failed"
+                            );
+                        }
                     }
                 }
 
@@ -1441,6 +1428,10 @@ impl HealTask {
             }
 
             continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
+            if continuation_token.is_none() {
+                // Truncated but no continuation token: end of listing.
+                break;
+            }
         }
 
         if failed > 0 {
@@ -2230,7 +2221,7 @@ impl std::fmt::Debug for HealTask {
 mod tests {
     use super::super::{DiskStore, Endpoint};
     use super::*;
-    use crate::heal::storage::{DiskStatus, HealObjectInfo};
+    use crate::heal::storage::{DiskStatus, HealListItem, HealObjectInfo};
     use rustfs_madmin::heal_commands::HealResultItem;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -2252,6 +2243,15 @@ mod tests {
         listed_prefixes: Mutex<Vec<String>>,
         truncate_without_token: Mutex<bool>,
         include_object_dir_candidate: Mutex<bool>,
+    }
+
+    /// Build a latest, non-delete-marker heal list item with no version id.
+    fn heal_item(name: &str) -> HealListItem {
+        HealListItem {
+            name: name.to_string(),
+            version_id: None,
+            is_delete_marker: false,
+        }
     }
 
     enum MockHealObjectOutcome {
@@ -2407,8 +2407,8 @@ mod tests {
             }
         }
 
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>> {
-            Ok(vec!["object-a".to_string(), "object-b".to_string()])
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<HealListItem>> {
+            Ok(vec![heal_item("object-a"), heal_item("object-b")])
         }
 
         async fn list_objects_for_heal_page(
@@ -2416,10 +2416,10 @@ mod tests {
             bucket: &str,
             prefix: &str,
             continuation_token: Option<&str>,
-        ) -> Result<(Vec<String>, Option<String>, bool)> {
+        ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
             self.listed_prefixes.lock().unwrap().push(prefix.to_string());
             if *self.truncate_without_token.lock().unwrap() {
-                return Ok((vec!["object-a".to_string()], None, true));
+                return Ok((vec![heal_item("object-a")], None, true));
             }
 
             let mut listed = self.listed.lock().unwrap();
@@ -2427,15 +2427,15 @@ mod tests {
                 *listed = true;
                 let objects = if bucket == RUSTFS_META_BUCKET {
                     vec![
-                        format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}"),
-                        format!("{BUCKET_META_PREFIX}/bucket-metadata.bin"),
+                        heal_item(&format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}")),
+                        heal_item(&format!("{BUCKET_META_PREFIX}/bucket-metadata.bin")),
                     ]
                 } else if prefix == "logs/" {
-                    vec!["logs/object-a".to_string(), "logs/object-b".to_string()]
+                    vec![heal_item("logs/object-a"), heal_item("logs/object-b")]
                 } else if *self.include_object_dir_candidate.lock().unwrap() {
-                    vec!["object-a".to_string(), "object-dir/".to_string(), "object-b".to_string()]
+                    vec![heal_item("object-a"), heal_item("object-dir/"), heal_item("object-b")]
                 } else {
-                    vec!["object-a".to_string(), "object-b".to_string()]
+                    vec![heal_item("object-a"), heal_item("object-b")]
                 };
                 Ok((objects, None, false))
             } else {
@@ -2514,7 +2514,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recursive_bucket_heal_fails_when_listing_lacks_continuation_token() {
+    async fn test_recursive_bucket_heal_treats_missing_continuation_token_as_end() {
+        // A version listing can report the final page as truncated with no
+        // continuation token. That is treated as end-of-listing (not an error),
+        // so the returned page is healed and the pass terminates cleanly instead
+        // of erroring or looping forever.
         let storage = Arc::new(MockStorage {
             truncate_without_token: Mutex::new(true),
             ..Default::default()
@@ -2532,17 +2536,14 @@ mod tests {
         );
         let task = HealTask::from_request(request, storage.clone());
 
-        let err = task
-            .heal_bucket("bucket-a")
+        task.heal_bucket("bucket-a")
             .await
-            .expect_err("recursive bucket heal must fail on incomplete pagination state");
+            .expect("truncated-without-token must terminate cleanly, not loop or error");
 
-        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
-        assert!(err.to_string().contains("truncated without continuation token"));
         assert_eq!(
             storage.healed_objects.lock().unwrap().as_slice(),
             ["object-a".to_string()],
-            "the already returned page may be processed, but the task must not report success"
+            "the returned page is healed exactly once and the scan ends"
         );
     }
 

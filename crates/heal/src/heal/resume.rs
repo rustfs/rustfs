@@ -34,6 +34,25 @@ const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 
+/// Current on-disk schema version for `ResumeState`. Snapshots written by an
+/// older schema (which tracked latest-only object names and a positional
+/// cursor) are incompatible with the per-version resume cursor, so they are
+/// discarded on load and the scan restarts from the beginning.
+const CURRENT_RESUME_SCHEMA: u32 = 2;
+/// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
+/// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
+/// to the new `compose_key` identities, so a stale checkpoint is discarded.
+const CURRENT_CHECKPOINT_SCHEMA: u32 = 2;
+
+/// Build the canonical, provably-injective dedup identity for an object
+/// version. Length-prefixing the object key makes the encoding injective: no
+/// two distinct `(object, version_id)` pairs can collide, even for adversarial
+/// keys containing `:` or embedded null bytes. This is the single source of
+/// truth for per-version dedup across the heal loop and the checkpoint sets.
+pub fn compose_key(object: &str, version_id: Option<&str>) -> String {
+    format!("{}:{}{}", object.len(), object, version_id.unwrap_or(""))
+}
+
 /// Persistence throttle for per-object bookkeeping: flush after this many
 /// buffered mutations or once the interval elapses, whichever comes first.
 /// Object heal is idempotent, so a crash re-heals at most one throttle window.
@@ -76,6 +95,13 @@ fn path_to_str(path: &Path) -> Result<&str> {
 /// resume state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeState {
+    /// on-disk schema version; absent in legacy snapshots (defaults to 0)
+    #[serde(default)]
+    pub schema_version: u32,
+    /// authoritative opaque `(marker, version_marker)` continuation token for
+    /// the version listing. `None` means "start from the beginning".
+    #[serde(default)]
+    pub resume_cursor: Option<String>,
     /// task id
     pub task_id: String,
     /// task type
@@ -118,6 +144,8 @@ pub struct ResumeState {
 impl ResumeState {
     pub fn new(task_id: String, task_type: String, set_disk_id: String, buckets: Vec<String>) -> Self {
         Self {
+            schema_version: CURRENT_RESUME_SCHEMA,
+            resume_cursor: None,
             task_id,
             task_type,
             set_disk_id,
@@ -153,6 +181,18 @@ impl ResumeState {
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
+    /// Read the authoritative version-listing continuation cursor.
+    pub fn resume_cursor(&self) -> Option<String> {
+        self.resume_cursor.clone()
+    }
+
+    /// Persist the authoritative version-listing continuation cursor. `None`
+    /// resets the scan to the beginning of the current bucket.
+    pub fn set_resume_cursor(&mut self, cursor: Option<String>) {
+        self.resume_cursor = cursor;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
     pub fn complete_bucket(&mut self, bucket: &str) {
         if !self.completed_buckets.contains(&bucket.to_string()) {
             self.completed_buckets.push(bucket.to_string());
@@ -178,6 +218,9 @@ impl ResumeState {
         self.failed_objects = 0;
         self.skipped_objects = 0;
         self.completed = false;
+        // A retry re-scans every bucket from the beginning, so the version
+        // cursor must be cleared too — otherwise the retry would resume mid-scan.
+        self.resume_cursor = None;
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
@@ -252,9 +295,33 @@ impl ResumeManager {
     /// load resume state from disk
     pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
         let state_data = Self::read_state_file(&disk, task_id).await?;
-        let state: ResumeState = serde_json::from_slice(&state_data).map_err(|e| Error::TaskExecutionFailed {
+        let mut state: ResumeState = serde_json::from_slice(&state_data).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to deserialize resume state: {e}"),
         })?;
+
+        // A snapshot written by an older schema tracked a latest-only positional
+        // cursor that is meaningless under per-version resume. Discard the stale
+        // progress so the scan restarts cleanly, then stamp the current schema.
+        if state.schema_version < CURRENT_RESUME_SCHEMA {
+            warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_RESUME_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                task_id,
+                found_schema = state.schema_version,
+                current_schema = CURRENT_RESUME_SCHEMA,
+                state = "schema_discarded",
+                "Heal resume state schema is stale; discarding cursor and progress"
+            );
+            state.resume_cursor = None;
+            state.processed_objects = 0;
+            state.successful_objects = 0;
+            state.failed_objects = 0;
+            state.skipped_objects = 0;
+            state.completed = false;
+            state.schema_version = CURRENT_RESUME_SCHEMA;
+        }
 
         Ok(Self {
             disk,
@@ -310,6 +377,21 @@ impl ResumeManager {
             throttle.mark_saved();
         }
         result
+    }
+
+    /// Read the authoritative version-listing continuation cursor.
+    pub async fn resume_cursor(&self) -> Option<String> {
+        self.state.read().await.resume_cursor()
+    }
+
+    /// Persist the authoritative version-listing continuation cursor. This is
+    /// written unthrottled (once per completed page) so a crash always resumes
+    /// from a real page boundary.
+    pub async fn set_resume_cursor(&self, cursor: Option<String>) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.set_resume_cursor(cursor);
+        drop(state);
+        self.save_state().await
     }
 
     /// complete bucket
@@ -450,6 +532,9 @@ impl ResumeManager {
 /// resume checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeCheckpoint {
+    /// on-disk schema version; absent in legacy snapshots (defaults to 0)
+    #[serde(default)]
+    pub schema_version: u32,
     /// task id
     pub task_id: String,
     /// checkpoint time
@@ -472,6 +557,7 @@ pub struct ResumeCheckpoint {
 impl ResumeCheckpoint {
     pub fn new(task_id: String) -> Self {
         Self {
+            schema_version: CURRENT_CHECKPOINT_SCHEMA,
             task_id,
             checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             current_bucket_index: 0,
@@ -555,9 +641,33 @@ impl CheckpointManager {
     /// load checkpoint from disk
     pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
         let checkpoint_data = Self::read_checkpoint_file(&disk, task_id).await?;
-        let checkpoint: ResumeCheckpoint = serde_json::from_slice(&checkpoint_data).map_err(|e| Error::TaskExecutionFailed {
-            message: format!("Failed to deserialize checkpoint: {e}"),
-        })?;
+        let mut checkpoint: ResumeCheckpoint =
+            serde_json::from_slice(&checkpoint_data).map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to deserialize checkpoint: {e}"),
+            })?;
+
+        // A checkpoint from an older schema stored latest-only dedup identities
+        // that are not comparable to the new per-version `compose_key`
+        // identities. Discard the stale sets and position, then stamp the
+        // current schema so the scan restarts cleanly.
+        if checkpoint.schema_version < CURRENT_CHECKPOINT_SCHEMA {
+            warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_CHECKPOINT_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                task_id,
+                found_schema = checkpoint.schema_version,
+                current_schema = CURRENT_CHECKPOINT_SCHEMA,
+                state = "schema_discarded",
+                "Heal checkpoint schema is stale; discarding dedup sets and position"
+            );
+            checkpoint.processed_objects.clear();
+            checkpoint.failed_objects.clear();
+            checkpoint.skipped_objects.clear();
+            checkpoint.current_object_index = 0;
+            checkpoint.schema_version = CURRENT_CHECKPOINT_SCHEMA;
+        }
 
         Ok(Self {
             disk,
@@ -955,6 +1065,139 @@ mod tests {
         assert_eq!(checkpoint.processed_objects.len(), 2);
         assert!(checkpoint.processed_objects.contains("a"));
         assert!(checkpoint.skipped_objects.contains("c"));
+    }
+
+    #[test]
+    fn test_compose_key_injective_with_adversarial_keys() {
+        // Length-prefixing must keep the encoding injective even when keys
+        // contain the delimiter, embedded nulls, or look like a composed key.
+        assert_ne!(compose_key("a\0b", None), compose_key("a", Some("b")));
+        assert_ne!(compose_key("3:xy", None), compose_key("x", Some("y")));
+        assert_ne!(compose_key("a:b", None), compose_key("a", Some("b")));
+        assert_ne!(compose_key("", Some("x")), compose_key("x", None));
+        // Identical inputs must produce identical keys (stable identity).
+        assert_eq!(compose_key("obj", Some("v1")), compose_key("obj", Some("v1")));
+    }
+
+    #[test]
+    fn test_composite_key_dedup_distinguishes_versions() {
+        // Two versions of the same object must be distinct dedup identities, and
+        // the delete-marker/nil (None) version must not collide with a real one.
+        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
+        checkpoint.add_processed_object(compose_key("obj", Some("v1")));
+        checkpoint.add_processed_object(compose_key("obj", Some("v2")));
+        checkpoint.add_processed_object(compose_key("obj", None));
+        assert_eq!(checkpoint.processed_objects.len(), 3);
+        assert!(checkpoint.processed_objects.contains(&compose_key("obj", Some("v1"))));
+        assert!(checkpoint.processed_objects.contains(&compose_key("obj", Some("v2"))));
+        assert!(checkpoint.processed_objects.contains(&compose_key("obj", None)));
+        // A different object with the same version id is still distinct.
+        assert!(!checkpoint.processed_objects.contains(&compose_key("other", Some("v1"))));
+    }
+
+    #[tokio::test]
+    async fn test_resumestate_schema_v0_discarded_on_load() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let disk_path = temp_dir.path().join("test_disk");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
+        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
+
+        // Legacy snapshot: no schema_version, a stale positional cursor and progress.
+        let legacy = r#"{
+            "task_id": "old-task",
+            "task_type": "erasure_set",
+            "set_disk_id": "pool_0_set_0",
+            "start_time": 1700000000,
+            "last_update": 1700000000,
+            "completed": true,
+            "total_objects": 100,
+            "processed_objects": 50,
+            "successful_objects": 40,
+            "failed_objects": 10,
+            "skipped_objects": 0,
+            "current_bucket": null,
+            "current_object": null,
+            "completed_buckets": ["b1"],
+            "pending_buckets": [],
+            "error_message": null,
+            "retry_count": 1,
+            "max_retries": 3,
+            "resume_cursor": "v1:stale-token"
+        }"#;
+        let file_path = format!("{BUCKET_META_PREFIX}/old-task_{RESUME_STATE_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
+            .await
+            .unwrap();
+
+        let manager = ResumeManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
+        let state = manager.get_state().await;
+        assert_eq!(state.schema_version, CURRENT_RESUME_SCHEMA, "schema must be stamped current");
+        assert_eq!(state.resume_cursor, None, "stale cursor must be cleared");
+        assert_eq!(state.processed_objects, 0);
+        assert_eq!(state.successful_objects, 0);
+        assert_eq!(state.failed_objects, 0);
+        assert!(!state.completed);
+        temp_dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_schema_v0_discarded_on_load() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let disk_path = temp_dir.path().join("test_disk");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
+        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
+
+        // Legacy checkpoint: no schema_version, stale position and dedup sets.
+        let legacy = r#"{
+            "task_id": "old-task",
+            "checkpoint_time": 1700000000,
+            "current_bucket_index": 2,
+            "current_object_index": 500,
+            "processed_objects": ["a", "b"],
+            "failed_objects": ["c"],
+            "skipped_objects": ["d"]
+        }"#;
+        let file_path = format!("{BUCKET_META_PREFIX}/old-task_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
+            .await
+            .unwrap();
+
+        let manager = CheckpointManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
+        let checkpoint = manager.get_checkpoint().await;
+        assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA, "schema must be stamped current");
+        assert_eq!(checkpoint.current_object_index, 0, "stale position must be reset");
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
+        temp_dir.close().unwrap();
     }
 
     #[test]
