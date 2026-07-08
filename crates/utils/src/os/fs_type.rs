@@ -14,16 +14,8 @@
 
 /// Returns the filesystem type of the underlying mounted filesystem.
 ///
-/// TODO: Verify these less common magic values against stable Linux headers or
-/// filesystem documentation before adding them:
-///
-/// "137d" => "EXT",
-/// "4244" => "HFS",
-/// "5346544e" => "NTFS",
-/// "61756673" => "AUFS",
-/// "ef51" => "EXT2OLD",
-/// "2fc12fc1" => "zfs",
-/// "53464846" => "wslfs",
+/// The table follows Linux `include/uapi/linux/magic.h`; filesystem magic
+/// values without a stable Linux uapi source stay `UNKNOWN`.
 #[allow(dead_code)]
 pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
     // Magic numbers for various filesystems.
@@ -36,6 +28,7 @@ pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
         0x4d44 => "MSDOS",
         0x6969 => "NFS",
         0xEF53 => "EXT4",
+        0xabba1974 => "XENFS",
         0xf15f => "ecryptfs",
         0x794c7630 => "overlayfs",
         0x52654973 => "REISERFS",
@@ -76,8 +69,34 @@ pub(crate) fn get_fs_type(fs_type: u64) -> &'static str {
         0xFE534D42 => "SMB2",
         0x27e0eb => "CGROUP",
         0x63677270 => "CGROUP2",
+        0x7655821 => "RDTGROUP",
         0x74726163 => "TRACEFS",
         0x01021997 => "V9FS",
+        0x62646576 => "BDEVFS",
+        0x64646178 => "DAXFS",
+        0x42494e4d => "BINFMTFS",
+        0x1cd1 => "DEVPTS",
+        0x6c6f6f70 => "BINDERFS",
+        0x0BAD1DEA => "FUTEXFS",
+        0x50495045 => "PIPEFS",
+        0x9fa0 => "PROC",
+        0x534F434B => "SOCKFS",
+        0x62656572 => "SYSFS",
+        0x9fa2 => "USBDEVICE",
+        0x11307854 => "MTD_INODE_FS",
+        0x09041934 => "ANON_INODE_FS",
+        0x73727279 => "BTRFS_TEST",
+        0x6e736673 => "NSFS",
+        0xcafe4a11 => "BPF",
+        0x5a3c69f0 => "AAFS",
+        0x5a4f4653 => "ZONEFS",
+        0x15013346 => "UDF",
+        0x444d4142 => "DMA_BUF",
+        0x454d444d => "DEVMEM",
+        0x5345434d => "SECRETMEM",
+        0x50494446 => "PIDFS",
+        0x474d454d => "GUEST_MEMFD",
+        0x4E554C4C => "NULLFS",
         0xca451a4e => "BCACHEFS",
         _ => "UNKNOWN",
     }
@@ -141,5 +160,36 @@ mod tests {
         assert_eq!(get_fs_type(0x74726163), "TRACEFS");
         assert_eq!(get_fs_type(0x01021997), "V9FS");
         assert_eq!(get_fs_type(0xca451a4e), "BCACHEFS");
+    }
+
+    #[test]
+    fn map_remaining_linux_uapi_filesystem_magic_numbers() {
+        assert_eq!(get_fs_type(0xabba1974), "XENFS");
+        assert_eq!(get_fs_type(0x7655821), "RDTGROUP");
+        assert_eq!(get_fs_type(0x62646576), "BDEVFS");
+        assert_eq!(get_fs_type(0x64646178), "DAXFS");
+        assert_eq!(get_fs_type(0x42494e4d), "BINFMTFS");
+        assert_eq!(get_fs_type(0x1cd1), "DEVPTS");
+        assert_eq!(get_fs_type(0x6c6f6f70), "BINDERFS");
+        assert_eq!(get_fs_type(0x0BAD1DEA), "FUTEXFS");
+        assert_eq!(get_fs_type(0x50495045), "PIPEFS");
+        assert_eq!(get_fs_type(0x9fa0), "PROC");
+        assert_eq!(get_fs_type(0x534F434B), "SOCKFS");
+        assert_eq!(get_fs_type(0x62656572), "SYSFS");
+        assert_eq!(get_fs_type(0x9fa2), "USBDEVICE");
+        assert_eq!(get_fs_type(0x11307854), "MTD_INODE_FS");
+        assert_eq!(get_fs_type(0x09041934), "ANON_INODE_FS");
+        assert_eq!(get_fs_type(0x73727279), "BTRFS_TEST");
+        assert_eq!(get_fs_type(0x6e736673), "NSFS");
+        assert_eq!(get_fs_type(0xcafe4a11), "BPF");
+        assert_eq!(get_fs_type(0x5a3c69f0), "AAFS");
+        assert_eq!(get_fs_type(0x5a4f4653), "ZONEFS");
+        assert_eq!(get_fs_type(0x15013346), "UDF");
+        assert_eq!(get_fs_type(0x444d4142), "DMA_BUF");
+        assert_eq!(get_fs_type(0x454d444d), "DEVMEM");
+        assert_eq!(get_fs_type(0x5345434d), "SECRETMEM");
+        assert_eq!(get_fs_type(0x50494446), "PIDFS");
+        assert_eq!(get_fs_type(0x474d454d), "GUEST_MEMFD");
+        assert_eq!(get_fs_type(0x4E554C4C), "NULLFS");
     }
 }
