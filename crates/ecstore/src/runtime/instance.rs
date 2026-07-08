@@ -39,6 +39,7 @@
 //! startup writes and post-construction reads hit the same cell and
 //! single-instance behavior is byte-for-byte unchanged.
 
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState};
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
@@ -96,6 +97,16 @@ pub struct InstanceContext {
     /// Lazily materialized like the tier config manager; holds the instance's
     /// notification target list. Replaces the eager process static.
     event_notifier: OnceLock<Arc<RwLock<EventNotifier>>>,
+    /// This instance's lifecycle expiry state (Phase 5 Slice 9, backlog#939).
+    ///
+    /// Lazily materialized; holds the instance's expiry worker channels/stats.
+    /// Replaces the eager process static.
+    expiry_state: OnceLock<Arc<RwLock<ExpiryState>>>,
+    /// This instance's lifecycle transition state (Phase 5 Slice 9, backlog#939).
+    ///
+    /// Lazily materialized; holds the instance's transition workers/stats.
+    /// Replaces the eager process static.
+    transition_state: OnceLock<Arc<TransitionState>>,
 }
 
 impl InstanceContext {
@@ -120,6 +131,8 @@ impl InstanceContext {
             endpoints: OnceLock::new(),
             tier_config_mgr: OnceLock::new(),
             event_notifier: OnceLock::new(),
+            expiry_state: OnceLock::new(),
+            transition_state: OnceLock::new(),
         }
     }
 
@@ -185,6 +198,18 @@ impl InstanceContext {
         self.event_notifier.get_or_init(EventNotifier::new).clone()
     }
 
+    /// This instance's lifecycle expiry state, materializing it on first
+    /// access. Shared for the lifetime of the instance.
+    pub fn expiry_state(&self) -> Arc<RwLock<ExpiryState>> {
+        self.expiry_state.get_or_init(ExpiryState::new).clone()
+    }
+
+    /// This instance's lifecycle transition state, materializing it on first
+    /// access. Shared for the lifetime of the instance.
+    pub fn transition_state(&self) -> Arc<TransitionState> {
+        self.transition_state.get_or_init(TransitionState::new).clone()
+    }
+
     /// Update this instance's erasure setup type.
     pub async fn update_erasure_type(&self, setup_type: SetupType) {
         *self.erasure_kind.write().await = setup_type;
@@ -228,6 +253,8 @@ impl std::fmt::Debug for InstanceContext {
             .field("endpoints", &self.endpoints)
             .field("tier_config_mgr_set", &self.tier_config_mgr.get().is_some())
             .field("event_notifier_set", &self.event_notifier.get().is_some())
+            .field("expiry_state_set", &self.expiry_state.get().is_some())
+            .field("transition_state_set", &self.transition_state.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -488,5 +515,19 @@ mod tests {
             !Arc::ptr_eq(&ctx_a.event_notifier(), &ctx_b.event_notifier()),
             "fresh contexts must not share an event notifier"
         );
+    }
+
+    // Lifecycle expiry/transition state are each stable within an instance and
+    // distinct across instances.
+    #[tokio::test]
+    async fn lifecycle_state_is_stable_within_and_distinct_across_instances() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+
+        assert!(Arc::ptr_eq(&ctx_a.expiry_state(), &ctx_a.expiry_state()));
+        assert!(Arc::ptr_eq(&ctx_a.transition_state(), &ctx_a.transition_state()));
+
+        assert!(!Arc::ptr_eq(&ctx_a.expiry_state(), &ctx_b.expiry_state()));
+        assert!(!Arc::ptr_eq(&ctx_a.transition_state(), &ctx_b.transition_state()));
     }
 }
