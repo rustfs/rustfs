@@ -96,6 +96,10 @@ impl ReplicationTargetStore {
     pub(crate) async fn target_is_offline(target_client: &TargetClient) -> bool {
         BucketTargetSys::get().is_offline(&target_client.to_url()).await
     }
+
+    pub(crate) async fn mark_target_offline(target_client: &TargetClient) {
+        BucketTargetSys::get().mark_offline(&target_client.to_url()).await
+    }
 }
 
 pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
