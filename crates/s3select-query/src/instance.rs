@@ -33,6 +33,8 @@ use crate::{
     sql::{optimizer::CascadeOptimizerBuilder, parser::DefaultParser},
 };
 
+const ENV_RUSTFS_S3SELECT_TARGET_PARTITIONS: &str = "RUSTFS_S3SELECT_TARGET_PARTITIONS";
+
 #[derive(Builder)]
 pub struct RustFSms<D: QueryDispatcher> {
     // query dispatcher & query execution
@@ -77,14 +79,32 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct S3SelectRuntimeConfig {
+    target_partitions: usize,
+}
+
+impl S3SelectRuntimeConfig {
+    fn from_env() -> Self {
+        Self {
+            target_partitions: target_partitions_from_env_value(
+                std::env::var(ENV_RUSTFS_S3SELECT_TARGET_PARTITIONS).ok().as_deref(),
+            ),
+        }
+    }
+}
+
+fn target_partitions_from_env_value(value: Option<&str>) -> usize {
+    value.and_then(|value| value.parse::<usize>().ok()).unwrap_or(0)
+}
+
 pub async fn make_rustfsms(input: Arc<SelectObjectContentInput>, is_test: bool) -> QueryResult<impl DatabaseManagerSystem> {
     // init Function Manager, we can define some UDF if need
     let func_manager = SimpleFunctionMetadataManager::default();
-    // TODO session config need load global system config
-    let session_factory = Arc::new(SessionCtxFactory { is_test });
+    let runtime_config = S3SelectRuntimeConfig::from_env();
+    let session_factory = Arc::new(SessionCtxFactory::new(is_test).with_target_partitions(runtime_config.target_partitions));
     let parser = Arc::new(DefaultParser::default());
     let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
-    // TODO wrap, and num_threads configurable
     let scheduler = Arc::new(LocalScheduler {});
 
     let query_execution_factory = Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler));
@@ -115,8 +135,8 @@ pub async fn make_rustfsms_with_components(
     query_execution_factory: Arc<SqlQueryExecutionFactory>,
     default_table_provider: Arc<BaseTableProvider>,
 ) -> QueryResult<impl DatabaseManagerSystem> {
-    // TODO session config need load global system config
-    let session_factory = Arc::new(SessionCtxFactory { is_test });
+    let runtime_config = S3SelectRuntimeConfig::from_env();
+    let session_factory = Arc::new(SessionCtxFactory::new(is_test).with_target_partitions(runtime_config.target_partitions));
 
     let query_dispatcher = SimpleQueryDispatcherBuilder::default()
         .with_input(input)
@@ -146,6 +166,21 @@ mod tests {
     };
 
     use crate::get_global_db;
+
+    use super::{S3SelectRuntimeConfig, target_partitions_from_env_value};
+
+    #[test]
+    fn parses_target_partitions_from_env_value() {
+        assert_eq!(target_partitions_from_env_value(Some("4")), 4);
+        assert_eq!(target_partitions_from_env_value(Some("0")), 0);
+        assert_eq!(target_partitions_from_env_value(Some("not-a-number")), 0);
+        assert_eq!(target_partitions_from_env_value(None), 0);
+    }
+
+    #[test]
+    fn default_runtime_config_uses_datafusion_default_partitions() {
+        assert_eq!(S3SelectRuntimeConfig::default().target_partitions, 0);
+    }
 
     #[tokio::test]
     #[ignore]
