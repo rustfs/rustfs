@@ -133,6 +133,75 @@ mod tests {
         env.stop_server();
     }
 
+    /// Test that a plain object and a same-named prefix coexist in a delimiter listing.
+    ///
+    /// Bug Reference: backlog#1042 (follow-up to backlog#880).
+    /// A plain object `a` (no trailing slash) and a sibling object `a/b` under the
+    /// same-named prefix must BOTH surface when listing with delimiter "/": `a` as a
+    /// Content and `a/` as a CommonPrefix (S3 delimiter semantics). On single-disk /
+    /// consistent deployments the source scan classifies `a` as an object and, before
+    /// the fix, never emitted the prefix `a/`, silently dropping the CommonPrefix.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_object_and_same_named_prefix_coexist() {
+        init_logging();
+        info!("Starting test: object `a` and prefix `a/` must coexist under delimiter");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-list-object-prefix-coexist";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        // Plain object `a` (no trailing slash) — must land in Contents.
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("a")
+            .body(ByteStream::from_static(b"top"))
+            .send()
+            .await
+            .expect("Failed to create object `a`");
+        // Sibling object under the same-named prefix — makes `a/` a CommonPrefix.
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("a/b")
+            .body(ByteStream::from_static(b"child"))
+            .send()
+            .await
+            .expect("Failed to create object `a/b`");
+
+        let result = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .delimiter("/")
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        let keys: Vec<String> = result
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(ToOwned::to_owned))
+            .collect();
+        let prefixes: Vec<String> = result
+            .common_prefixes()
+            .iter()
+            .filter_map(|p| p.prefix().map(ToOwned::to_owned))
+            .collect();
+        info!("Contents: {:?}, CommonPrefixes: {:?}", keys, prefixes);
+
+        assert!(keys.iter().any(|k| k == "a"), "object `a` must appear in Contents, got {keys:?}");
+        assert!(
+            prefixes.iter().any(|p| p == "a/"),
+            "prefix `a/` must appear in CommonPrefixes, got {prefixes:?}"
+        );
+
+        env.stop_server();
+    }
+
     /// Test ensuring that ListObjectsV2 returns unique keys when an explicit directory marker
     /// exists under the requested prefix and delimiter is not provided.
     ///
