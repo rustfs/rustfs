@@ -18,7 +18,6 @@ use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
     NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
 };
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::macros::offset;
@@ -697,41 +696,23 @@ impl Lifecycle for BucketLifecycleConfiguration {
         }
 
         if !events.is_empty() {
-            events.sort_by(|a, b| {
-                if now.unix_timestamp() > a.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                    && now.unix_timestamp() > b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                    || a.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                        == b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                {
-                    match a.action {
-                        IlmAction::DeleteAllVersionsAction
-                        | IlmAction::DelMarkerDeleteAllVersionsAction
-                        | IlmAction::DeleteAction
-                        | IlmAction::DeleteVersionAction => {
-                            return Ordering::Less;
-                        }
-                        _ => (),
-                    }
-                    match b.action {
-                        IlmAction::DeleteAllVersionsAction
-                        | IlmAction::DelMarkerDeleteAllVersionsAction
-                        | IlmAction::DeleteAction
-                        | IlmAction::DeleteVersionAction => {
-                            return Ordering::Greater;
-                        }
-                        _ => (),
-                    }
-                    return Ordering::Less;
-                }
-
-                if a.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                    < b.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp()
-                {
-                    return Ordering::Less;
-                }
-                Ordering::Greater
-            });
-            return events[0].clone();
+            // Select the winning event using a strict total order (MinIO semantics):
+            // the earliest `due` wins, and ties break toward delete-type actions. A
+            // missing `due` is treated as UNIX_EPOCH. This replaces a hand-written
+            // `sort_by` comparator that was not a strict weak ordering (it could return
+            // `Ordering::Less` for both `(a, b)` and `(b, a)`), which panics on the
+            // repository toolchain and did not deterministically pick the earliest event.
+            let event = events
+                .iter()
+                .min_by_key(|event| {
+                    (
+                        event.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp(),
+                        ilm_action_priority_rank(&event.action),
+                    )
+                })
+                .cloned()
+                .unwrap_or_default();
+            return event;
         }
 
         Event::default()
@@ -923,6 +904,21 @@ pub struct ObjectOpts {
 impl ObjectOpts {
     pub fn expired_object_deletemarker(&self) -> bool {
         self.delete_marker && self.is_latest && self.num_versions == 1
+    }
+}
+
+/// Total-order rank for lifecycle actions used to break `due` ties.
+///
+/// Delete-type actions rank before every other action so that, when two events
+/// share the same `due`, a delete wins (MinIO semantics). The concrete numeric
+/// values only matter relative to each other.
+fn ilm_action_priority_rank(action: &IlmAction) -> u8 {
+    match action {
+        IlmAction::DeleteAllVersionsAction
+        | IlmAction::DelMarkerDeleteAllVersionsAction
+        | IlmAction::DeleteAction
+        | IlmAction::DeleteVersionAction => 0,
+        _ => 1,
     }
 }
 
@@ -1749,6 +1745,120 @@ mod tests {
         assert_eq!(event.rule_id, "transition-date");
         assert_eq!(event.storage_class, "WARM");
         assert_eq!(event.due, Some(transition_date));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_selects_earliest_due_among_multiple_past_due_events() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        // Two enabled rules both yield a past-due DeleteAction and a third yields a
+        // past-due TransitionAction. The rule with the shortest expiration (earliest
+        // `due`) must win deterministically.
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![
+                LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    expiration: Some(LifecycleExpiration {
+                        days: Some(5),
+                        ..Default::default()
+                    }),
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    filter: None,
+                    id: Some("delete-late".to_string()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                },
+                LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    expiration: Some(LifecycleExpiration {
+                        days: Some(1),
+                        ..Default::default()
+                    }),
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    filter: None,
+                    id: Some("delete-early".to_string()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                },
+                LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    filter: None,
+                    id: Some("transition-mid".to_string()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: Some(vec![Transition {
+                        days: Some(3),
+                        date: None,
+                        storage_class: Some(TransitionStorageClass::from_static("COLDTIER")),
+                    }]),
+                },
+            ],
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            transition_status: "".to_string(),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&opts, base_time + Duration::days(10), 0).await;
+
+        assert_eq!(event.action, IlmAction::DeleteAction);
+        assert_eq!(event.rule_id, "delete-early");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_does_not_panic_on_many_equal_due_events() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        // Many enabled rules that all yield a DeleteAction with an identical `due`.
+        // The previous hand-written comparator was not a strict weak ordering and
+        // panicked on the repository toolchain; the total-order selection must not
+        // panic and must return a deterministic winner (the first rule).
+        let rules: Vec<LifecycleRule> = (0..25)
+            .map(|i| LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some(format!("rule-{i:02}")),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            })
+            .collect();
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules,
+        };
+
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&opts, base_time + Duration::days(10), 0).await;
+
+        assert_eq!(event.action, IlmAction::DeleteAction);
+        assert_eq!(event.rule_id, "rule-00");
     }
 
     #[tokio::test]
