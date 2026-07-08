@@ -771,16 +771,20 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let mut ret_uploads = Vec::new();
         let mut next_upload_id_marker = None;
         while upload_idx < uploads.len() {
+            if ret_uploads.len() >= max_uploads {
+                break;
+            }
+
             ret_uploads.push(uploads[upload_idx].clone());
             next_upload_id_marker = Some(uploads[upload_idx].upload_id.clone());
             upload_idx += 1;
-
-            if ret_uploads.len() > max_uploads {
-                break;
-            }
         }
 
-        let is_truncated = ret_uploads.len() < uploads.len();
+        // Truncated iff there are still unconsumed uploads left after this page.
+        // `upload_idx` tracks the position in the full (post-marker) list, so it
+        // stays correct even when a marker skipped entries before the page start,
+        // unlike comparing the page length against the total.
+        let is_truncated = upload_idx < uploads.len();
 
         if !is_truncated {
             next_upload_id_marker = None;
@@ -1586,6 +1590,88 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "failed multipart upload part must not leave tmp shards behind, leftovers: {leftovers:?}, err: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_multipart_uploads_caps_each_page_at_max_uploads_and_paginates_cleanly() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-list-cap-bucket";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        // Start more in-progress uploads on the same object than a single page holds.
+        let total = 5usize;
+        let mut created = HashSet::new();
+        for _ in 0..total {
+            let res = set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("multipart upload should be created");
+            assert!(created.insert(res.upload_id), "each upload id must be unique");
+        }
+
+        // A single page must never return more than max_uploads entries.
+        let max_uploads = 2usize;
+        let page = set_disks
+            .list_multipart_uploads(bucket, object, None, None, None, max_uploads)
+            .await
+            .expect("list should succeed");
+        assert_eq!(
+            page.uploads.len(),
+            max_uploads,
+            "page must return exactly max_uploads uploads, not max_uploads + 1"
+        );
+        assert!(page.is_truncated, "uploads remain, so the page must be truncated");
+        assert_eq!(
+            page.next_upload_id_marker.as_ref(),
+            page.uploads.last().map(|u| &u.upload_id),
+            "next marker must point at the last returned upload, not one past it"
+        );
+
+        // Exact boundary: max_uploads == total must not falsely report truncation.
+        let exact = set_disks
+            .list_multipart_uploads(bucket, object, None, None, None, total)
+            .await
+            .expect("list should succeed");
+        assert_eq!(exact.uploads.len(), total, "exact boundary must return every upload");
+        assert!(!exact.is_truncated, "exact boundary must not be marked truncated");
+        assert!(
+            exact.next_upload_id_marker.is_none(),
+            "a non-truncated listing must not carry a next marker"
+        );
+
+        // Paginating one upload at a time must enumerate every upload exactly once,
+        // with no gaps and no duplicates, and terminate.
+        let mut seen = HashSet::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let page = set_disks
+                .list_multipart_uploads(bucket, object, None, marker.clone(), None, 1)
+                .await
+                .expect("list should succeed");
+            assert!(page.uploads.len() <= 1, "max_uploads=1 must never return more than one upload");
+            for upload in &page.uploads {
+                assert!(
+                    seen.insert(upload.upload_id.clone()),
+                    "upload {} was returned more than once across pages",
+                    upload.upload_id
+                );
+            }
+            pages += 1;
+            assert!(pages <= total + 1, "pagination failed to terminate");
+            if !page.is_truncated {
+                break;
+            }
+            marker = page.next_upload_id_marker.clone();
+            assert!(marker.is_some(), "a truncated page must carry a next marker to continue");
+        }
+        assert_eq!(
+            seen, created,
+            "single-upload pagination must enumerate every upload with no loss or duplication"
         );
     }
 
