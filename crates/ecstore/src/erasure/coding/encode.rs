@@ -336,7 +336,14 @@ impl Erasure {
         };
 
         let (res, returned_buf) = match tokio::runtime::Handle::current().runtime_flavor() {
-            RuntimeFlavor::MultiThread => tokio::task::block_in_place(encode_once),
+            // EC encode is a short CPU burst (~110µs per 1MiB block, p99 ~542µs).
+            // On the multi-threaded runtime block_in_place parked the worker and
+            // churned the scheduler for a cost comparable to the encode itself
+            // (rustfs/backlog#932); at this duration a direct inline call is
+            // cheaper and equally correct. CurrentThread (and any other flavor)
+            // keep spawn_blocking so the sole executor thread is never blocked
+            // and block_in_place's multi-thread-only requirement is respected.
+            RuntimeFlavor::MultiThread => encode_once(),
             RuntimeFlavor::CurrentThread => tokio::task::spawn_blocking(encode_once)
                 .await
                 .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?,
@@ -354,7 +361,10 @@ impl Erasure {
         let encode_once = move || self.encode_data_bytes_mut(encode_buf, len);
 
         let res = match tokio::runtime::Handle::current().runtime_flavor() {
-            RuntimeFlavor::MultiThread => tokio::task::block_in_place(encode_once),
+            // Same rationale as encode_block: inline the short EC burst on the
+            // multi-threaded runtime instead of parking a worker via
+            // block_in_place; keep spawn_blocking on single-threaded flavors.
+            RuntimeFlavor::MultiThread => encode_once(),
             RuntimeFlavor::CurrentThread => tokio::task::spawn_blocking(encode_once)
                 .await
                 .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?,
@@ -1023,6 +1033,59 @@ mod tests {
         let (_reader, written) = erasure.encode(reader, &mut writers, 1).await.unwrap();
 
         assert_eq!(written, b"current-thread payload".len());
+    }
+
+    // Covers the RuntimeFlavor::MultiThread arm of encode_block /
+    // encode_block_bytes_mut, which runs the EC compute inline instead of via
+    // block_in_place (rustfs/backlog#932). The other tests default to the
+    // current-thread runtime and only exercise the spawn_blocking arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn encode_works_on_multi_thread_runtime() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 32;
+
+        let payload = vec![9u8; BLOCK_SIZE * 3 + 7];
+
+        // Streaming encode() drives encode_block (Vec ingest).
+        let streamed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut streamed_writers: Vec<Option<BitrotWriterWrapper>> = streamed
+            .iter()
+            .map(|c| Some(bitrot_writer(DeferredCommitWriter::new(c.clone()), BLOCK_SIZE / DATA_SHARDS)))
+            .collect();
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let (_r, streamed_total) = erasure
+            .clone()
+            .encode(
+                tokio::io::BufReader::new(Cursor::new(payload.clone())),
+                &mut streamed_writers,
+                DATA_SHARDS,
+            )
+            .await
+            .expect("streaming encode should succeed on the multi-threaded runtime");
+        assert_eq!(streamed_total, payload.len());
+
+        // Batched encode() drives encode_block_bytes_mut (BytesMut ingest).
+        let batched: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut batched_writers: Vec<Option<BitrotWriterWrapper>> = batched
+            .iter()
+            .map(|c| Some(bitrot_writer(DeferredCommitWriter::new(c.clone()), BLOCK_SIZE / DATA_SHARDS)))
+            .collect();
+        let (_r2, batched_total) = erasure
+            .encode_batched(tokio::io::BufReader::new(Cursor::new(payload.clone())), &mut batched_writers, DATA_SHARDS)
+            .await
+            .expect("batched encode should succeed on the multi-threaded runtime");
+        assert_eq!(batched_total, payload.len());
+
+        // Both ingest paths must produce identical shard bytes regardless of the
+        // runtime flavor / dispatch strategy.
+        for (index, (a, b)) in streamed.iter().zip(batched.iter()).enumerate() {
+            let a = a.lock().expect("streamed shard lockable").clone();
+            let b = b.lock().expect("batched shard lockable").clone();
+            assert!(!a.is_empty(), "shard {index} should receive committed data");
+            assert_eq!(a, b, "shard {index} must match between streaming and batched encode");
+        }
     }
 
     #[tokio::test]
