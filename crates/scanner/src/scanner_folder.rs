@@ -669,6 +669,7 @@ pub struct ScannerItem {
     pub object_name: String,
     pub file_type: FileType,
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+    pub object_lock: Option<Arc<ObjectLockConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
     pub heal_enabled: bool,
     pub heal_bitrot: bool,
@@ -1801,6 +1802,7 @@ impl FolderScanner {
             } else {
                 None
             };
+            let active_object_lock = self.old_cache.info.object_lock.clone();
 
             self.sleeper.sleep_folder().await;
 
@@ -2023,6 +2025,7 @@ impl FolderScanner {
                     prefix: rustfs_utils::path::dir(&prefix),
                     object_name: file_name,
                     lifecycle: active_life_cycle.clone(),
+                    object_lock: active_object_lock.clone(),
                     replication: active_replication.clone(),
                     heal_enabled,
                     heal_bitrot: self.scan_mode == HealScanMode::Deep,
@@ -2987,6 +2990,7 @@ mod tests {
             object_name: "xl.meta".to_string(),
             file_type,
             lifecycle: None,
+            object_lock: None,
             replication: None,
             heal_enabled: false,
             heal_bitrot: false,
@@ -3017,6 +3021,7 @@ mod tests {
             object_name: "xl.meta".to_string(),
             file_type,
             lifecycle: None,
+            object_lock: None,
             replication: None,
             heal_enabled: false,
             heal_bitrot: false,
@@ -3994,6 +3999,7 @@ mod tests {
             object_name: "object".to_string(),
             file_type,
             lifecycle: None,
+            object_lock: None,
             replication: None,
             heal_enabled: true,
             heal_bitrot: true,
