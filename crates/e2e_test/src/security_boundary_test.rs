@@ -78,7 +78,7 @@ async fn test_large_xml_body_rejection() -> Result<(), Box<dyn Error + Send + Sy
     let _ = client.delete_bucket().bucket(&bucket_name).send().await;
 
     assert!(result.is_err(), "Server must reject an oversized tagging payload, but it was accepted");
-    let err = result.err().expect("checked is_err above");
+    let err = result.expect_err("checked is_err above");
     let code = err.as_service_error().and_then(|e| e.code());
     assert_eq!(
         code,
