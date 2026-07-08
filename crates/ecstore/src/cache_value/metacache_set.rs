@@ -21,6 +21,7 @@ use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_e
 use std::{
     collections::{HashSet, VecDeque},
     future::Future,
+    io::ErrorKind,
     pin::Pin,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -85,6 +86,12 @@ async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>
 
 fn is_missing_path_error(err: &DiskError) -> bool {
     matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
+}
+
+fn is_tolerated_producer_completion_error(err: &DiskError) -> bool {
+    matches!(err, DiskError::DiskOngoingReq)
+        || err.is_metacache_output_stream_closed()
+        || err.contains_io_error_kind(ErrorKind::BrokenPipe)
 }
 
 async fn take_fallback_candidate<T>(fallback_items: &Arc<TokioMutex<VecDeque<T>>>) -> Option<T> {
@@ -815,7 +822,15 @@ async fn list_path_raw_inner(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                if err.is_metacache_output_stream_closed() {
+                if is_tolerated_producer_completion_error(&err) {
+                    debug!(
+                        event = EVENT_METACACHE_LISTING,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_METACACHE,
+                        state = "producer_tolerated_after_merge",
+                        error = ?err,
+                        "Metacache producer stopped after merge completed"
+                    );
                     continue;
                 }
                 if is_missing_path_error(&err) {
@@ -916,6 +931,19 @@ mod tests {
         assert!(!is_missing_path_error(&DiskError::Timeout));
         assert!(!is_missing_path_error(&DiskError::DiskNotFound));
         assert!(!is_missing_path_error(&DiskError::FileAccessDenied));
+    }
+
+    #[test]
+    fn tolerated_producer_completion_error_classification_excludes_actionable_failures() {
+        assert!(is_tolerated_producer_completion_error(&DiskError::DiskOngoingReq));
+        assert!(is_tolerated_producer_completion_error(&DiskError::metacache_output_stream_closed()));
+        assert!(is_tolerated_producer_completion_error(&DiskError::Io(std::io::Error::new(
+            ErrorKind::BrokenPipe,
+            "reader closed after merge",
+        ))));
+        assert!(!is_tolerated_producer_completion_error(&DiskError::Timeout));
+        assert!(!is_tolerated_producer_completion_error(&DiskError::DiskNotFound));
+        assert!(!is_tolerated_producer_completion_error(&DiskError::FileAccessDenied));
     }
 
     #[tokio::test]
@@ -1157,6 +1185,26 @@ mod tests {
         )
         .await
         .expect("closed metacache output after quorum EOF should not fail listing");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_tolerates_concurrent_scan_after_quorum_eof() {
+        let result = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Eof,
+                    TestReaderBehavior::Eof,
+                    TestReaderBehavior::ProducerError(DiskError::DiskOngoingReq),
+                ],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "concurrent scan after quorum EOF should not fail listing");
     }
 
     #[tokio::test]
