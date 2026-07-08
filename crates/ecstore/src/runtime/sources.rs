@@ -32,13 +32,13 @@ use crate::{
     error::Result,
     layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
-        GLOBAL_BOOT_TIME, GLOBAL_EVENT_NOTIFIER, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
-        GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_TIER_CONFIG_MGR,
-        TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
-        get_global_endpoints, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region,
-        get_global_tier_config_mgr, global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd,
-        is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id, set_global_lock_client,
-        set_global_lock_clients, set_object_layer, update_erasure_type,
+        GLOBAL_BOOT_TIME, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
+        GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD, TypeLocalDiskSetDrives,
+        get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
+        get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
+        global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local,
+        resolve_object_store_handle, set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer,
+        update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::event_notification::EventNotifier,
@@ -387,7 +387,7 @@ pub(crate) fn local_disk_set_drives_handle() -> Arc<RwLock<TypeLocalDiskSetDrive
 }
 
 pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
-    GLOBAL_TIER_CONFIG_MGR.clone()
+    get_global_tier_config_mgr()
 }
 
 pub fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
@@ -399,7 +399,7 @@ pub fn transition_state_handle() -> Arc<TransitionState> {
 }
 
 pub(crate) fn event_notifier_handle() -> Arc<RwLock<EventNotifier>> {
-    GLOBAL_EVENT_NOTIFIER.clone()
+    crate::runtime::global::current_ctx().event_notifier()
 }
 
 pub(crate) async fn local_disk_by_path(path: &str) -> Option<DiskStore> {
@@ -521,7 +521,7 @@ pub(crate) async fn initialize_local_disk_maps(endpoint_pools: EndpointServerPoo
 }
 
 pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
-    GLOBAL_TIER_CONFIG_MGR.write().await.init(store).await
+    get_global_tier_config_mgr().write().await.init(store).await
 }
 
 #[cfg(test)]

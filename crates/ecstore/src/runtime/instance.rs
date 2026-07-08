@@ -39,18 +39,20 @@
 //! startup writes and post-construction reads hit the same cell and
 //! single-instance behavior is byte-for-byte unchanged.
 
-use crate::layout::endpoints::SetupType;
+use crate::layout::endpoints::{EndpointServerPools, SetupType};
+use crate::services::event_notification::EventNotifier;
+use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Runtime state owned by a single `ECStore` instance.
 ///
 /// This is intentionally minimal in the first migration slice; subsequent
 /// slices move additional identity/runtime state (topology, disk registry,
 /// service handles, cancellation token) into this struct.
-#[derive(Debug)]
 pub struct InstanceContext {
     /// The deployment's erasure setup type.
     ///
@@ -72,6 +74,28 @@ pub struct InstanceContext {
     /// Write-once like the process global it replaces: startup sets it exactly
     /// once and a duplicate write fails fast (see [`InstanceContext::set_region`]).
     region: OnceLock<Region>,
+    /// This instance's deployment id (Phase 5 Slice 5, backlog#939).
+    ///
+    /// Write-once identity, mirrored by `ECStore::id` (both come from the same
+    /// startup value). Replaces the process-global deployment-id static.
+    deployment_id: OnceLock<Uuid>,
+    /// This instance's endpoint topology (Phase 5 Slice 6, backlog#939).
+    ///
+    /// Write-once: storage startup publishes the server pools exactly once.
+    /// Replaces the process-global endpoints static.
+    endpoints: OnceLock<EndpointServerPools>,
+    /// This instance's tier configuration manager (Phase 5 Slice 7, backlog#939).
+    ///
+    /// Lazily materialized on first access so `InstanceContext::new()` stays
+    /// cheap: single-instance creates one shared manager on first use — exactly
+    /// the "create-once, then share" semantics of the eager process static it
+    /// replaces — while a genuinely independent instance gets its own.
+    tier_config_mgr: OnceLock<Arc<RwLock<TierConfigMgr>>>,
+    /// This instance's event notifier (Phase 5 Slice 8, backlog#939).
+    ///
+    /// Lazily materialized like the tier config manager; holds the instance's
+    /// notification target list. Replaces the eager process static.
+    event_notifier: OnceLock<Arc<RwLock<EventNotifier>>>,
 }
 
 impl InstanceContext {
@@ -92,6 +116,10 @@ impl InstanceContext {
             erasure_kind: RwLock::new(SetupType::Unknown),
             lock_manager,
             region: OnceLock::new(),
+            deployment_id: OnceLock::new(),
+            endpoints: OnceLock::new(),
+            tier_config_mgr: OnceLock::new(),
+            event_notifier: OnceLock::new(),
         }
     }
 
@@ -113,6 +141,48 @@ impl InstanceContext {
     /// This instance's S3 region, if it has been set.
     pub fn region(&self) -> Option<Region> {
         self.region.get().cloned()
+    }
+
+    /// Set this instance's deployment id.
+    ///
+    /// Write-once: panics on a second write, preserving the startup fail-fast
+    /// contract of the process global it replaces.
+    pub fn set_deployment_id(&self, id: Uuid) {
+        self.deployment_id
+            .set(id)
+            .expect("instance deployment id should be initialized once during startup");
+    }
+
+    /// This instance's deployment id, if it has been set.
+    pub fn deployment_id(&self) -> Option<Uuid> {
+        self.deployment_id.get().copied()
+    }
+
+    /// Set this instance's endpoint topology.
+    ///
+    /// Write-once: panics on a second write, preserving the startup fail-fast
+    /// contract of the process global it replaces.
+    pub fn set_endpoints(&self, endpoints: EndpointServerPools) {
+        self.endpoints
+            .set(endpoints)
+            .expect("instance endpoints should be initialized once during storage startup");
+    }
+
+    /// This instance's endpoint topology, if it has been set.
+    pub fn endpoints(&self) -> Option<EndpointServerPools> {
+        self.endpoints.get().cloned()
+    }
+
+    /// This instance's tier configuration manager, materializing it on first
+    /// access. Shared for the lifetime of the instance.
+    pub fn tier_config_mgr(&self) -> Arc<RwLock<TierConfigMgr>> {
+        self.tier_config_mgr.get_or_init(TierConfigMgr::new).clone()
+    }
+
+    /// This instance's event notifier, materializing it on first access.
+    /// Shared for the lifetime of the instance.
+    pub fn event_notifier(&self) -> Arc<RwLock<EventNotifier>> {
+        self.event_notifier.get_or_init(EventNotifier::new).clone()
     }
 
     /// Update this instance's erasure setup type.
@@ -144,6 +214,21 @@ impl InstanceContext {
 impl Default for InstanceContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// Manual Debug: service handles (e.g. the tier config manager) are not Debug,
+// so summarize their materialization state rather than their contents.
+impl std::fmt::Debug for InstanceContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceContext")
+            .field("erasure_kind", &self.erasure_kind)
+            .field("region", &self.region)
+            .field("deployment_id", &self.deployment_id)
+            .field("endpoints", &self.endpoints)
+            .field("tier_config_mgr_set", &self.tier_config_mgr.get().is_some())
+            .field("event_notifier_set", &self.event_notifier.get().is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -284,5 +369,124 @@ mod tests {
         let ctx = InstanceContext::new();
         ctx.set_region(region("us-east-1"));
         ctx.set_region(region("eu-west-1"));
+    }
+
+    // A fresh context has no deployment id until set; set-then-get round-trips.
+    #[tokio::test]
+    async fn deployment_id_set_and_get() {
+        let ctx = InstanceContext::new();
+        assert_eq!(ctx.deployment_id(), None);
+        let id = Uuid::new_v4();
+        ctx.set_deployment_id(id);
+        assert_eq!(ctx.deployment_id(), Some(id));
+    }
+
+    // Two contexts hold independent deployment ids.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_deployment_id() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        ctx_a.set_deployment_id(id_a);
+        ctx_b.set_deployment_id(id_b);
+        assert_eq!(ctx_a.deployment_id(), Some(id_a));
+        assert_eq!(ctx_b.deployment_id(), Some(id_b));
+    }
+
+    // The deployment id is write-once: a second set fails fast.
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_deployment_id_twice_panics() {
+        let ctx = InstanceContext::new();
+        ctx.set_deployment_id(Uuid::new_v4());
+        ctx.set_deployment_id(Uuid::new_v4());
+    }
+
+    fn endpoints_with_pools(n: usize) -> EndpointServerPools {
+        use crate::layout::endpoint::Endpoint;
+        use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+        let pool = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![Endpoint::try_from("http://127.0.0.1:9000/data0").expect("valid endpoint")]),
+            cmd_line: "test".to_string(),
+            platform: "test".to_string(),
+        };
+        EndpointServerPools((0..n).map(|_| pool.clone()).collect())
+    }
+
+    // A fresh context has no endpoints until set; set-then-get round-trips.
+    #[tokio::test]
+    async fn endpoints_set_and_get() {
+        let ctx = InstanceContext::new();
+        assert!(ctx.endpoints().is_none());
+        ctx.set_endpoints(endpoints_with_pools(1));
+        assert_eq!(ctx.endpoints().expect("endpoints set").0.len(), 1);
+    }
+
+    // Two contexts hold independent endpoint topologies.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_endpoints() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        ctx_a.set_endpoints(endpoints_with_pools(1));
+        ctx_b.set_endpoints(endpoints_with_pools(2));
+        assert_eq!(ctx_a.endpoints().expect("a").0.len(), 1);
+        assert_eq!(ctx_b.endpoints().expect("b").0.len(), 2);
+    }
+
+    // Endpoints are write-once: a second set fails fast.
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_endpoints_twice_panics() {
+        let ctx = InstanceContext::new();
+        ctx.set_endpoints(endpoints_with_pools(1));
+        ctx.set_endpoints(endpoints_with_pools(2));
+    }
+
+    // The tier config manager is materialized once and shared for the
+    // instance's lifetime — the "create-once, then share" contract of the
+    // eager process static it replaced.
+    #[tokio::test]
+    async fn tier_config_mgr_is_stable_within_an_instance() {
+        let ctx = InstanceContext::new();
+        assert!(
+            Arc::ptr_eq(&ctx.tier_config_mgr(), &ctx.tier_config_mgr()),
+            "repeated access must return the same manager"
+        );
+    }
+
+    // Two contexts own distinct tier config managers.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_tier_config_mgr() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        assert!(
+            !Arc::ptr_eq(&ctx_a.tier_config_mgr(), &ctx_b.tier_config_mgr()),
+            "fresh contexts must not share a tier config manager"
+        );
+    }
+
+    // The event notifier is materialized once and shared within an instance.
+    #[tokio::test]
+    async fn event_notifier_is_stable_within_an_instance() {
+        let ctx = InstanceContext::new();
+        assert!(
+            Arc::ptr_eq(&ctx.event_notifier(), &ctx.event_notifier()),
+            "repeated access must return the same notifier"
+        );
+    }
+
+    // Two contexts own distinct event notifiers.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_event_notifier() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        assert!(
+            !Arc::ptr_eq(&ctx_a.event_notifier(), &ctx_b.event_notifier()),
+            "fresh contexts must not share an event notifier"
+        );
     }
 }

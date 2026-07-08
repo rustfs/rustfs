@@ -18,7 +18,6 @@ use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
     layout::endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
-    services::event_notification::EventNotifier,
     services::tier::tier::TierConfigMgr,
     store::ECStore,
 };
@@ -47,21 +46,18 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 //   GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_LIFECYCLE_SYS, GLOBAL_EVENT_NOTIFIER, etc.
 // Tier B (keep as static): GLOBAL_RUSTFS_PORT, env var caches, etc.
 //
-// Phase 5 (backlog#939): the erasure setup type and the S3 region moved into
-// the per-instance `InstanceContext` (see `super::instance`); their facades
-// below now forward to the current instance's context.
+// Phase 5 (backlog#939): identity/runtime state (erasure setup, S3 region,
+// deployment id, endpoint topology, tier config manager, ...) is moving into
+// the per-instance `InstanceContext` (see `super::instance`); the facades below
+// forward to the current instance's context.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
-    static ref GLOBAL_DEPLOYMENT_ID: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
-    pub static ref GLOBAL_ENDPOINTS: OnceLock<EndpointServerPools> = OnceLock::new();
     pub static ref GLOBAL_ROOT_DISK_THRESHOLD: RwLock<u64> = RwLock::new(0);
-    pub static ref GLOBAL_TIER_CONFIG_MGR: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
     pub static ref GLOBAL_LIFECYCLE_SYS: Arc<LifecycleSys> = LifecycleSys::new();
-    pub static ref GLOBAL_EVENT_NOTIFIER: Arc<RwLock<EventNotifier>> = EventNotifier::new();
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
     pub static ref GLOBAL_LOCAL_NODE_NAME_FALLBACK: String = "127.0.0.1:9000".to_string();
     pub static ref GLOBAL_LOCAL_NODE_NAME_HEX_FALLBACK: String =
@@ -125,9 +121,7 @@ pub fn set_global_rustfs_port(value: u16) {
 /// * None
 ///
 pub fn set_global_deployment_id(id: Uuid) {
-    GLOBAL_DEPLOYMENT_ID
-        .set(id)
-        .expect("GLOBAL_DEPLOYMENT_ID should be initialized once during startup");
+    current_ctx().set_deployment_id(id);
 }
 
 /// Get the global deployment id
@@ -136,7 +130,7 @@ pub fn set_global_deployment_id(id: Uuid) {
 /// * `Option<String>` - The global deployment id as a string, if set
 ///
 pub fn get_global_deployment_id() -> Option<String> {
-    GLOBAL_DEPLOYMENT_ID.get().map(|v| v.to_string())
+    current_ctx().deployment_id().map(|v| v.to_string())
 }
 /// Set the global endpoints
 ///
@@ -147,9 +141,7 @@ pub fn get_global_deployment_id() -> Option<String> {
 /// * None
 ///
 pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
-    GLOBAL_ENDPOINTS
-        .set(EndpointServerPools::from(eps))
-        .expect("GLOBAL_ENDPOINTS should be initialized once during storage startup")
+    current_ctx().set_endpoints(EndpointServerPools::from(eps));
 }
 
 /// Get the global endpoints
@@ -158,15 +150,11 @@ pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
 /// * `EndpointServerPools` - The global endpoints
 ///
 pub fn get_global_endpoints() -> EndpointServerPools {
-    if let Some(eps) = GLOBAL_ENDPOINTS.get() {
-        eps.clone()
-    } else {
-        EndpointServerPools::default()
-    }
+    current_ctx().endpoints().unwrap_or_default()
 }
 
 pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
-    GLOBAL_ENDPOINTS.get().cloned()
+    current_ctx().endpoints()
 }
 
 #[cfg(test)]
@@ -181,7 +169,7 @@ pub async fn is_first_cluster_node_local() -> bool {
 }
 
 pub fn get_global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
-    GLOBAL_TIER_CONFIG_MGR.clone()
+    current_ctx().tier_config_mgr()
 }
 
 /// Create a new object layer instance
