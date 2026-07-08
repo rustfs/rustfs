@@ -78,7 +78,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
 
         let metadata_stage_start = Instant::now();
-        let (fi, files, disks) = match self.get_object_fileinfo(bucket, object, opts, true).await {
+        let (fi, files, disks) = match self.get_object_fileinfo(bucket, object, opts, true, true).await {
             Ok(result) => result,
             Err(err) => {
                 rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
@@ -1950,7 +1950,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // This avoids HEAD/GetObject metadata visibility skew immediately after
         // PutObject/CompleteMultipartUpload.
         let (fi, _, _) = self
-            .get_object_fileinfo(bucket, object, opts, true)
+            .get_object_fileinfo(bucket, object, opts, true, false)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
@@ -2096,7 +2096,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         //     _lock_guard = guard_opt;
         // }
 
-        let (mut fi, meta_arr, online_disks) = self.get_object_fileinfo(bucket, object, opts, true).await?;
+        let (mut fi, meta_arr, online_disks) = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
         /*if err != nil {
             return Err(to_object_err(err, vec![bucket, object]));
         }*/
@@ -2130,7 +2130,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if let Err(err) = self.heal_object(bucket, object, "", &HealOpts {no_lock: true, ..Default::default()}) {
                 return err.expect("err");
             }
-            (fi, meta_arr, online_disks) = self.get_object_fileinfo(&bucket, &object, &opts, true);
+            (fi, meta_arr, online_disks) = self.get_object_fileinfo(&bucket, &object, &opts, true, false);
             if err != nil {
                 return to_object_err(err, vec![bucket, object]);
             }
@@ -2277,7 +2277,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Err(rerr.unwrap())
         };
         let mut oi = ObjectInfo::default();
-        let fi = self_.clone().get_object_fileinfo(bucket, object, opts, true).await;
+        let fi = self_.clone().get_object_fileinfo(bucket, object, opts, true, false).await;
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
