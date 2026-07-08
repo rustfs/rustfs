@@ -613,6 +613,10 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
 }
 
 pub(in crate::set_disk) fn shard_read_costs_for_disks(disks: &[Option<DiskStore>]) -> Vec<ShardReadCost> {
+    if disks.is_empty() {
+        return Vec::new();
+    }
+
     let local_endpoint_hosts = local_endpoint_hosts_for_shard_costs();
     disks
         .iter()
