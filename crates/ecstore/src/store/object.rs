@@ -1967,7 +1967,47 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
+            ctx: crate::runtime::instance::bootstrap_ctx(),
         }
+    }
+
+    // Phase 5 Slice 2 (backlog#939): the instance context flows down the whole
+    // object graph — ECStore, its Sets, and their SetDisks must all carry the
+    // same `Arc<InstanceContext>` in a single-instance deployment.
+    #[tokio::test]
+    async fn instance_context_flows_through_object_graph() {
+        let store = new_read_lock_test_store().await;
+
+        let sets = store.pools.first().expect("test store has one pool");
+        assert!(
+            std::sync::Arc::ptr_eq(&store.ctx, sets.instance_ctx()),
+            "Sets must carry the store's instance context"
+        );
+
+        let set_disks = sets.disk_set.first().expect("pool has one set");
+        assert!(
+            std::sync::Arc::ptr_eq(sets.instance_ctx(), set_disks.instance_ctx()),
+            "SetDisks must carry the Sets' instance context"
+        );
+    }
+
+    // Phase 5 Slice 3 (backlog#939): a SetDisks sources its lock manager from
+    // its instance context (not an independent process lookup), and in a
+    // single-instance build that context aliases the process lock-manager
+    // singleton — so the lock namespace is unchanged.
+    #[tokio::test]
+    async fn set_disks_lock_manager_comes_from_instance_context() {
+        let store = new_read_lock_test_store().await;
+        let set_disks = store.pools[0].disk_set.first().expect("pool has one set");
+
+        assert!(
+            std::sync::Arc::ptr_eq(set_disks.local_lock_manager_for_test(), &set_disks.instance_ctx().lock_manager()),
+            "SetDisks lock manager must be sourced from its instance context"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(set_disks.local_lock_manager_for_test(), &rustfs_lock::get_global_lock_manager()),
+            "single-instance lock manager must alias the process singleton"
+        );
     }
 
     #[tokio::test]
