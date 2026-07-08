@@ -985,8 +985,7 @@ mod tests {
         let tracked = match worker.scan_all_objects_with_backend(&backend).await {
             Ok(tracked) => tracked,
             Err(err) => {
-                assert!(false, "scan candidates should be tracked: {err}");
-                0
+                panic!("scan candidates should be tracked: {err}");
             }
         };
 
