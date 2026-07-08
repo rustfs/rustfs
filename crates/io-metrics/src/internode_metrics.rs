@@ -467,12 +467,24 @@ fn publish_offline_gauge(peers: &HashMap<String, PeerHealthState>) {
     gauge!(CLUSTER_SERVERS_OFFLINE_TOTAL).set(offline as f64);
 }
 
+/// Canonicalize a peer address before using it as the `CLUSTER_PEER_HEALTH` key.
+///
+/// The same physical peer is referenced by different subsystems in slightly different string forms
+/// — the data path keys by `endpoint.grid_host()` (`scheme://host:port`, no trailing slash) while
+/// the lock path keys by `url::Url::to_string()` (`scheme://host:port/`, trailing slash). Without
+/// normalization each form becomes its own health entry, so one downed node counts as 2 in the
+/// `rustfs_cluster_servers_offline_total` gauge (and 2N for N nodes). Trimming trailing slashes
+/// collapses them to a single canonical key.
+fn normalize_peer_key(addr: &str) -> &str {
+    addr.trim_end_matches('/')
+}
+
 /// Record that a cluster peer is reachable: mark it online and reset its consecutive-failure
 /// counter. Called on a successful dial to `addr`.
 pub fn record_peer_reachable(addr: &str) {
     // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
     let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = peers.entry(addr.to_string()).or_default();
+    let entry = peers.entry(normalize_peer_key(addr).to_string()).or_default();
     entry.online = true;
     entry.consecutive_failures = 0;
     entry.last_reprobe = None;
@@ -484,7 +496,7 @@ pub fn record_peer_reachable(addr: &str) {
 pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
     // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
     let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = peers.entry(addr.to_string()).or_default();
+    let entry = peers.entry(normalize_peer_key(addr).to_string()).or_default();
     entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     if entry.consecutive_failures >= failure_threshold.max(1) {
         entry.online = false;
@@ -495,7 +507,7 @@ pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
 /// Whether a cluster peer is currently considered offline (known and marked offline).
 pub fn cluster_peer_is_offline(addr: &str) -> bool {
     let peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    peers.get(addr).map(|peer| !peer.online).unwrap_or(false)
+    peers.get(normalize_peer_key(addr)).map(|peer| !peer.online).unwrap_or(false)
 }
 
 /// Decide whether to fast-fail (bypass) an offline peer instead of attempting to reach it
@@ -507,7 +519,7 @@ pub fn cluster_peer_is_offline(addr: &str) -> bool {
 /// bypassed.
 pub fn cluster_peer_should_bypass(addr: &str, reprobe_interval: Duration) -> bool {
     let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(entry) = peers.get_mut(addr) else {
+    let Some(entry) = peers.get_mut(normalize_peer_key(addr)) else {
         return false;
     };
     if entry.online {
@@ -529,7 +541,19 @@ pub fn cluster_peer_should_bypass(addr: &str, reprobe_interval: Duration) -> boo
 
 #[cfg(test)]
 fn cluster_peer_online(addr: &str) -> Option<bool> {
-    CLUSTER_PEER_HEALTH.lock().ok()?.get(addr).map(|peer| peer.online)
+    CLUSTER_PEER_HEALTH
+        .lock()
+        .ok()?
+        .get(normalize_peer_key(addr))
+        .map(|peer| peer.online)
+}
+
+#[cfg(test)]
+fn cluster_peer_health_keys() -> Vec<String> {
+    CLUSTER_PEER_HEALTH
+        .lock()
+        .map(|peers| peers.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -710,6 +734,30 @@ mod tests {
         assert_eq!(cluster_peer_online(addr), Some(false));
         record_peer_reachable(addr);
         assert_eq!(cluster_peer_online(addr), Some(true));
+    }
+
+    #[test]
+    fn peer_health_key_is_normalized_across_address_forms() {
+        // Same physical peer, two address forms the codebase actually uses: the data path's
+        // grid_host() (no trailing slash) and the lock path's url::Url::to_string() (trailing slash).
+        // They MUST collapse to one health entry, else one downed node counts as 2 in the gauge.
+        let bare = "http://cluster-peer-health-normalize-test:9000";
+        let slashed = "http://cluster-peer-health-normalize-test:9000/";
+
+        record_peer_unreachable(bare, 1);
+        record_peer_unreachable(slashed, 1);
+
+        let keys: Vec<String> = cluster_peer_health_keys()
+            .into_iter()
+            .filter(|k| k.contains("cluster-peer-health-normalize-test"))
+            .collect();
+        assert_eq!(keys.len(), 1, "two address forms of one peer must be a single health entry, got {keys:?}");
+
+        // Either form observes the peer offline, and a reachable dial via one form clears the other.
+        assert!(cluster_peer_is_offline(bare));
+        assert!(cluster_peer_is_offline(slashed));
+        record_peer_reachable(slashed);
+        assert!(!cluster_peer_is_offline(bare), "reachable via one form must mark the shared entry online");
     }
 
     #[test]
