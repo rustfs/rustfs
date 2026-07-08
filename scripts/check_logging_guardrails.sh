@@ -54,8 +54,6 @@ checked_files=(
   "crates/scanner/src/scanner_io.rs"
   "crates/scanner/src/scanner_folder.rs"
   "crates/concurrency/src/workers.rs"
-  "crates/concurrency/src/manager.rs"
-  "crates/concurrency/src/lock.rs"
   "crates/concurrency/src/deadlock.rs"
   "crates/trusted-proxies/src/global.rs"
   "crates/trusted-proxies/src/config/loader.rs"

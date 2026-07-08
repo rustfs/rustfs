@@ -5,17 +5,17 @@ preservation and runtime workload-class contract slice.
 
 ## Preservation Coverage
 
-The `rustfs-concurrency` tests pin the current reusable scheduler and
-admission-facing behavior before later snapshot extraction:
+The `rustfs-concurrency` tests pin the current reusable admission-facing
+behavior before later snapshot extraction:
 
 - Worker slot over-release remains clamped by the configured worker limit.
-- Scheduler default buffer and priority thresholds remain unchanged.
-- Scheduler priority boundaries remain high below the high threshold, normal at
-  both thresholds, and low above the low threshold.
-- Backpressure pipe metadata reads preserve buffer capacity and state without
-  mutating the manager state.
 - `GetObjectQueueSnapshot` preserves saturated, over-available, and zero-total
   permit semantics.
+
+The former reusable scheduler and backpressure-pipe facades (and their
+preservation tests) were removed as zero-caller dead code in backlog#1025;
+scheduler buffer/priority behavior is now pinned by `rustfs-io-core` and
+`rustfs/src/storage/concurrency` tests.
 
 ## Workload Class Contract
 
