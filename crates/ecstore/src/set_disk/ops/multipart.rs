@@ -1357,8 +1357,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         .await?;
 
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
-                .await?;
+            let committed_dir = fi.data_dir.unwrap_or_default().to_string();
+            // backlog#898: best-effort reclaim of the dereferenced old data dir.
+            // Returns a receipt (never `Err`); a failed GC must not turn an
+            // already-committed multipart completion into a 503.
+            let cleanup = self
+                .commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), &committed_dir, write_quorum)
+                .await;
+            self.report_old_data_dir_cleanup(bucket, object, &old_dir.to_string(), &cleanup)
+                .await;
         }
 
         if let Some(stage_start) = complete_tail_stage_start {
