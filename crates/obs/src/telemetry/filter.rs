@@ -150,6 +150,16 @@ fn should_demote_http_request_logs(logger_level: &str, default_level: Option<&st
     matches!(level.as_str(), "info" | "warn")
 }
 
+fn rust_log_explicitly_names_target(rust_log: &str, target: &str) -> bool {
+    rust_log.split(',').map(str::trim).any(|directive| {
+        if let Some((directive_target, _)) = directive.rsplit_once('=') {
+            directive_target.trim() == target
+        } else {
+            false
+        }
+    })
+}
+
 pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) -> EnvFilter {
     // 1. Determine the base filter source.
     // If `default_level` is set (e.g. forced override), we use it.
@@ -189,6 +199,13 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
         }
 
         for (crate_name, level) in directives {
+            if rust_log_env
+                .as_deref()
+                .is_some_and(|rust_log| rust_log_explicitly_names_target(rust_log, crate_name))
+            {
+                continue;
+            }
+
             // We use `add_directive` which effectively appends to the filter.
             // If RUST_LOG already specified `hyper=debug`, adding `hyper=off` later MIGHT override it
             // depending on specificity, but usually the last directive wins or the most specific one.
@@ -374,6 +391,19 @@ mod tests {
             assert!(
                 !filter_str.contains("rustfs::server::http=warn"),
                 "http log demotion must not fall back to logger_level when RUST_LOG only defines unrelated targets: {filter_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_build_env_filter_preserves_explicit_target_directive() {
+        temp_env::with_var("RUST_LOG", Some("info,hyper=info"), || {
+            let filter = build_env_filter("info", None);
+            let filter_str = filter.to_string().to_ascii_lowercase();
+
+            assert!(
+                !filter_str.contains("hyper=off"),
+                "suppression must not override an explicit target directive: {filter_str}"
             );
         });
     }

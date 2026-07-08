@@ -127,8 +127,6 @@ mod tests {
     fn assert_parallel_cleanup_completes(file_count: usize, workers: usize) -> std::io::Result<()> {
         let tmp = TempDir::new()?;
         let dir = tmp.path().to_path_buf();
-        let expected_freed = (file_count * 256) as u64;
-
         for i in 0..file_count {
             create_log_file(&dir, &format!("app.log.2024-01-{i:03}"), 256)?;
         }
@@ -160,9 +158,22 @@ mod tests {
                 name.starts_with("app.log.") && !compressed_suffixes.iter().any(|suffix| name.ends_with(suffix))
             })
             .count();
+        let archive_bytes: u64 = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                compressed_suffixes.iter().any(|suffix| name.ends_with(suffix))
+            })
+            .map(|entry| entry.metadata().map(|metadata| metadata.len()).unwrap_or(0))
+            .sum();
 
         assert_eq!(result.0, file_count, "all rotated logs should be deleted after compression");
-        assert_eq!(result.1, expected_freed, "freed bytes should match the removed source files");
+        assert_eq!(
+            result.1,
+            (file_count * 256) as u64 - archive_bytes,
+            "freed bytes should exclude archive bytes that still remain on disk"
+        );
         assert_eq!(archive_count, file_count, "each rotated log should leave behind one archive");
         assert_eq!(original_count, 0, "compressed source logs should be removed");
         Ok(())

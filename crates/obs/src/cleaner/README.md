@@ -73,7 +73,7 @@ These values can be wired into dashboards and alert rules for cleanup health.
 
 For regular logs, the cleaner evaluates candidates in this order:
 
-1. keep at least `keep_files` newest matching generations;
+1. keep at most `keep_files` newest matching generations;
 2. remove older files if total retained size still exceeds `max_total_size_bytes`;
 3. remove any file whose individual size exceeds `max_single_file_size_bytes`;
 4. if compression is enabled, archive before deletion;

@@ -111,7 +111,7 @@ impl Builder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MetricMetadata {
     unit: Option<Unit>,
     description: SharedString,
@@ -196,7 +196,7 @@ impl Recorder {
     }
 
     fn get_metadata_for_builder(&self, key_name: &str) -> Option<MetricMetadata> {
-        self.with_metadata_lock(|metadata| metadata.remove(key_name))
+        self.with_metadata_lock(|metadata| metadata.get(key_name).cloned())
     }
 }
 
@@ -264,6 +264,7 @@ impl metrics::Recorder for Recorder {
             gauge,
             labels,
             value: AtomicU64::new(0),
+            record_lock: Mutex::new(()),
         }));
 
         Self::insert_cached_metric(&self.cached_gauges, key.clone(), handle, "gauge")
@@ -313,10 +314,12 @@ struct WrappedGauge {
     gauge: opentelemetry::metrics::Gauge<f64>,
     labels: Vec<KeyValue>,
     value: AtomicU64,
+    record_lock: Mutex<()>,
 }
 
 impl GaugeFn for WrappedGauge {
     fn increment(&self, value: f64) {
+        let _guard = self.record_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut current = self.value.load(Ordering::Relaxed);
         let mut new = f64::from_bits(current) + value;
         while let Err(val) = self
@@ -331,6 +334,7 @@ impl GaugeFn for WrappedGauge {
     }
 
     fn decrement(&self, value: f64) {
+        let _guard = self.record_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut current = self.value.load(Ordering::Relaxed);
         let mut new = f64::from_bits(current) - value;
         while let Err(val) = self
@@ -345,6 +349,7 @@ impl GaugeFn for WrappedGauge {
     }
 
     fn set(&self, value: f64) {
+        let _guard = self.record_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.value.store(value.to_bits(), Ordering::Relaxed);
         self.gauge.record(value, &self.labels);
     }
@@ -472,5 +477,29 @@ mod tests {
 
         let cache = shared.cached_counters.read().unwrap();
         assert_eq!(cache.len(), 1, "concurrent registrations should produce exactly one cache entry");
+    }
+
+    #[test]
+    fn metadata_is_available_for_multiple_label_variants() {
+        let recorder = test_recorder();
+        recorder.describe_counter("shared_counter".into(), Unit::from_string("bytes"), "shared description".into());
+
+        let first = Key::from_parts("shared_counter", vec![metrics::Label::new("kind", "a")]);
+        let second = Key::from_parts("shared_counter", vec![metrics::Label::new("kind", "b")]);
+        let meta = test_metadata();
+
+        let _ = recorder.register_counter(&first, &meta);
+        let second_metadata = recorder.get_metadata_for_builder("shared_counter");
+        assert!(second_metadata.is_some());
+        assert_eq!(
+            second_metadata.as_ref().and_then(|metadata| metadata.unit.clone()),
+            Unit::from_string("bytes")
+        );
+        assert_eq!(
+            second_metadata.as_ref().map(|metadata| metadata.description.to_string()),
+            Some("shared description".to_string())
+        );
+
+        let _ = recorder.register_counter(&second, &meta);
     }
 }
