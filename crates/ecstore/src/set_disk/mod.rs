@@ -91,7 +91,7 @@ use crate::storage_api_contracts::{
         CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations as _, MultipartUploadResult, PartInfo,
     },
     namespace::NamespaceLocking as _,
-    object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
+    object::{DeletedObject, HTTPPreconditions, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
 };
 use crate::store::utils::is_reserved_or_invalid_bucket;
@@ -3562,10 +3562,11 @@ mod tests {
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::disk::new_disk;
     use crate::layout::endpoints::SetupType;
+    use crate::object_api::BLOCK_SIZE_V2;
     use crate::object_api::ObjectInfo;
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
-        namespace::NamespaceLocking as _, object::ObjectOperations as _,
+        namespace::NamespaceLocking as _, object::ObjectIO as _, object::ObjectOperations as _,
     };
     use crate::store::init_format::save_format_file;
     use crate::store::list_objects::ListPathOptions;
@@ -3579,6 +3580,7 @@ mod tests {
     use tempfile::TempDir;
     use time::OffsetDateTime;
     use tokio::fs;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn complete_part_error_maps_confirmed_missing_to_invalid_part() {
@@ -7704,6 +7706,757 @@ mod tests {
             }
         }
         assert!(walked_names.iter().any(|name| name == "object"));
+    }
+
+    #[tokio::test]
+    async fn set_level_put_get_delete_restores_large_object_and_fails_closed_after_delete() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-object-roundtrip";
+        let object = "nested/object.bin";
+        let payload = (0..(BLOCK_SIZE_V2 + 17)).map(|idx| (idx % 251) as u8).collect::<Vec<_>>();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let written = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("large object should be written");
+
+        assert_eq!(written.size, payload.len() as i64);
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("large object reader should open");
+        let mut restored = Vec::new();
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("large object should stream");
+        assert_eq!(restored, payload);
+
+        let deleted = set_disks
+            .delete_object(bucket, object, opts.clone())
+            .await
+            .expect("object delete should succeed");
+        assert_eq!(deleted.name, object);
+
+        let err = match set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+        {
+            Ok(_) => panic!("deleted object must not be readable"),
+            Err(err) => err,
+        };
+        assert!(
+            is_err_object_not_found(&err),
+            "deleted object read must fail closed with object-not-found, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_level_batched_large_put_get_restores_body() {
+        const BATCHED_LARGE_SIZE: usize = 64 * 1024 * 1024;
+
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-batched-large-object";
+        let object = "large/batched.bin";
+        let payload = (0..BATCHED_LARGE_SIZE)
+            .map(|idx| ((idx as u64).wrapping_mul(31).wrapping_add(17) % 251) as u8)
+            .collect::<Vec<_>>();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let written = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("batched-large object should be written");
+        assert_eq!(written.size, payload.len() as i64);
+
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("batched-large object reader should open");
+        let mut restored = Vec::with_capacity(payload.len());
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("batched-large object should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn set_level_put_object_fails_closed_when_writer_quorum_is_unavailable() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-put-writer-quorum";
+        let object = "object.txt";
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created before disk loss");
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[1] = None;
+        }
+
+        let mut reader = PutObjReader::from_vec(b"quorum guarded body".to_vec());
+        let err = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect_err("missing writer quorum must fail the put");
+        assert!(
+            matches!(err, Error::ErasureWriteQuorum | Error::InsufficientWriteQuorum(_, _)),
+            "expected write quorum failure, got {err:?}"
+        );
+
+        let read_err = match set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+        {
+            Ok(_) => panic!("failed put must not leave a readable object"),
+            Err(err) => err,
+        };
+        assert!(
+            is_err_object_not_found(&read_err) || matches!(read_err, Error::ErasureReadQuorum),
+            "failed put must fail closed on read, got {read_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_level_put_object_short_reader_fails_closed_across_write_paths() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-put-short-reader";
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let cases = [
+            ("single-block", b"short body".to_vec(), 32),
+            ("pipeline", b"pipeline short body".to_vec(), BLOCK_SIZE_V2 as i64 + 1),
+            ("batched-large", b"batched short body".to_vec(), 64 * 1024 * 1024),
+        ];
+
+        for (name, payload, declared_size) in cases {
+            let object = format!("{name}/object.txt");
+            let hash_reader = HashReader::from_stream(Cursor::new(payload), declared_size, declared_size, None, None, false)
+                .expect("test reader should be constructed");
+            let mut reader = PutObjReader::new(hash_reader);
+            let err = set_disks
+                .put_object(bucket, &object, &mut reader, &opts)
+                .await
+                .expect_err("short reader must fail the put");
+            let err_text = format!("{err:?}");
+            assert!(
+                err_text.contains("UnexpectedEof") || err_text.contains("IncompleteBody"),
+                "{name} short reader should fail with an EOF/incomplete-body error, got {err:?}"
+            );
+
+            let read_err = match set_disks
+                .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                .await
+            {
+                Ok(_) => panic!("{name} short failed put must not leave a readable object"),
+                Err(err) => err,
+            };
+            assert!(
+                is_err_object_not_found(&read_err) || matches!(read_err, Error::ErasureReadQuorum),
+                "{name} short failed put must fail closed on read, got {read_err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_level_get_restores_body_when_one_shard_is_missing_after_write() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-read-repair-missing-shard";
+        let object = "object.bin";
+        let payload = (0..(BLOCK_SIZE_V2 + 211))
+            .map(|idx| ((idx * 13) % 251) as u8)
+            .collect::<Vec<_>>();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("object should be written before shard loss");
+
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[1] = None;
+        }
+
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("object should remain readable with one missing shard");
+        let mut restored = Vec::new();
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("degraded read should stream");
+
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn set_level_overwrite_restores_new_body_and_cleans_old_data_dir() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-object-overwrite";
+        let object = "nested/object.bin";
+        let first_payload = (0..(BLOCK_SIZE_V2 + 31)).map(|idx| (idx % 239) as u8).collect::<Vec<_>>();
+        let second_payload = (0..(BLOCK_SIZE_V2 + 97))
+            .map(|idx| ((idx * 7) % 251) as u8)
+            .collect::<Vec<_>>();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut first_reader = PutObjReader::from_vec(first_payload);
+        set_disks
+            .put_object(bucket, object, &mut first_reader, &opts)
+            .await
+            .expect("first object body should be written");
+
+        let mut second_reader = PutObjReader::from_vec(second_payload.clone());
+        let second = set_disks
+            .put_object(bucket, object, &mut second_reader, &opts)
+            .await
+            .expect("overwrite body should commit and clean the old data dir");
+
+        assert_eq!(second.size, second_payload.len() as i64);
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("overwritten object reader should open");
+        let mut restored = Vec::new();
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("overwritten object should stream");
+        assert_eq!(restored, second_payload);
+    }
+
+    #[tokio::test]
+    async fn set_level_write_preconditions_fail_closed_and_allow_matching_etags() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-write-preconditions";
+        let object = "object.txt";
+        let write_opts = ObjectOptions {
+            no_lock: true,
+            preserve_etag: Some("conditional-etag".to_string()),
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"conditional body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &write_opts)
+            .await
+            .expect("object should be written with deterministic etag");
+
+        let reject_existing = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("conditional-etag".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            set_disks.check_write_precondition(bucket, object, &reject_existing).await,
+            Some(StorageError::PreconditionFailed)
+        ));
+
+        let allow_matching = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some("\"conditional-etag\"".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            set_disks
+                .check_write_precondition(bucket, object, &allow_matching)
+                .await
+                .is_none()
+        );
+
+        let missing_if_match = ObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some("missing-etag".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            set_disks
+                .check_write_precondition(bucket, "missing-object.txt", &missing_if_match)
+                .await,
+            Some(StorageError::ObjectNotFound(_, _))
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_level_versioned_delete_marker_hides_object_without_corrupting_version_metadata() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-versioned-delete";
+        let object = "object.txt";
+        let opts = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"versioned object body".to_vec());
+        let written = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("versioned object should be written");
+        assert!(written.version_id.is_some());
+
+        let marker = set_disks
+            .delete_object(bucket, object, opts.clone())
+            .await
+            .expect("versioned delete should create a marker");
+
+        assert!(marker.delete_marker);
+        assert!(marker.version_id.is_some());
+        let err = match set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+        {
+            Ok(_) => panic!("latest delete marker must hide object body"),
+            Err(err) => err,
+        };
+        assert!(
+            is_err_object_not_found(&err) || matches!(err, Error::MethodNotAllowed),
+            "delete marker read must fail closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_level_metadata_self_copy_preserves_body_and_updates_metadata() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-metadata-copy";
+        let object = "object.txt";
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let payload = b"metadata copy must not lose committed bytes".to_vec();
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let mut source = set_disks
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect("object info should be readable");
+        let mut metadata = (*source.user_defined).clone();
+        metadata.insert("x-amz-meta-copy-check".to_string(), "present".to_string());
+        source.user_defined = Arc::new(metadata);
+        source.metadata_only = true;
+        source.etag = Some("metadata-copy-etag".to_string());
+
+        let copied = set_disks
+            .copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+            .await
+            .expect("metadata self-copy should succeed");
+        assert_eq!(copied.user_defined.get("x-amz-meta-copy-check").map(String::as_str), Some("present"));
+
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("copied object reader should open");
+        let mut restored = Vec::new();
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("copied object should stream");
+        assert_eq!(restored, payload);
+
+        let reread = set_disks
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect("copied object info should be readable");
+        assert_eq!(reread.user_defined.get("x-amz-meta-copy-check").map(String::as_str), Some("present"));
+    }
+
+    #[tokio::test]
+    async fn set_level_empty_object_read_uses_buffered_empty_body_with_locks() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-empty-object";
+        let object = "empty.bin";
+        let opts = ObjectOptions::default();
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(Vec::new());
+        let written = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("empty object should be written");
+        assert_eq!(written.size, 0);
+
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("empty object reader should open");
+        assert_eq!(get_reader.object_info.size, 0);
+        assert_eq!(get_reader.buffered_body.as_ref().map(Bytes::len), Some(0));
+        let mut restored = Vec::new();
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("empty object should stream");
+        assert!(restored.is_empty());
+
+        let info = set_disks
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect("empty object info should be readable");
+        assert_eq!(info.size, 0);
+    }
+
+    #[tokio::test]
+    async fn set_level_put_object_options_preserve_etag_and_normalize_standard_storage_class() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-put-options";
+        let object = "object.txt";
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_717_171_717).expect("fixed timestamp should parse");
+        let mut user_defined = HashMap::new();
+        user_defined.insert(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD.to_string());
+        user_defined.insert(SUFFIX_COMPRESSION.to_string(), "zstd".to_string());
+        let mut eval_metadata = HashMap::new();
+        eval_metadata.insert("x-amz-meta-evaluated".to_string(), "yes".to_string());
+        let opts = ObjectOptions {
+            mod_time: Some(mod_time),
+            preserve_etag: Some("preserved-etag".to_string()),
+            user_defined,
+            eval_metadata: Some(eval_metadata),
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"option matrix body".to_vec());
+        let written = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("object should be written with option matrix");
+        assert_eq!(written.etag.as_deref(), Some("preserved-etag"));
+        assert_eq!(written.mod_time, Some(mod_time));
+        assert_eq!(written.user_defined.get("x-amz-meta-evaluated").map(String::as_str), Some("yes"));
+        assert!(!written.user_defined.contains_key(AMZ_STORAGE_CLASS));
+
+        let info = set_disks
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect("object info should be readable");
+        assert_eq!(info.etag.as_deref(), Some("preserved-etag"));
+        assert_eq!(info.mod_time, Some(mod_time));
+        assert_eq!(info.user_defined.get("x-amz-meta-evaluated").map(String::as_str), Some("yes"));
+        assert!(!info.user_defined.contains_key(AMZ_STORAGE_CLASS));
+    }
+
+    #[tokio::test]
+    async fn set_level_put_object_metadata_updates_headers_without_rewriting_body() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-put-metadata";
+        let object = "object.txt";
+        let payload = b"metadata update must preserve bytes".to_vec();
+        let write_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &write_opts)
+            .await
+            .expect("object should be written");
+
+        let mut eval_metadata = HashMap::new();
+        eval_metadata.insert("x-amz-meta-updated".to_string(), "true".to_string());
+        let update_time = OffsetDateTime::from_unix_timestamp(1_717_181_818).expect("fixed timestamp should parse");
+        let update_opts = ObjectOptions {
+            eval_metadata: Some(eval_metadata),
+            mod_time: Some(update_time),
+            ..Default::default()
+        };
+        let updated = set_disks
+            .put_object_metadata(bucket, object, &update_opts)
+            .await
+            .expect("metadata update should succeed");
+        assert_eq!(updated.mod_time, Some(update_time));
+        assert_eq!(updated.user_defined.get("x-amz-meta-updated").map(String::as_str), Some("true"));
+
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &write_opts)
+            .await
+            .expect("updated object reader should open");
+        let mut restored = Vec::new();
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("updated object should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn set_level_copy_object_with_prefetched_reader_restores_body() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-copy-reader";
+        let object = "object.txt";
+        let payload = b"copy reader body".to_vec();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut source = ObjectInfo {
+            metadata_only: false,
+            put_object_reader: Some(PutObjReader::from_vec(payload.clone())),
+            ..Default::default()
+        };
+        let copied = set_disks
+            .copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+            .await
+            .expect("copy with prefetched reader should write object data");
+        assert_eq!(copied.size, payload.len() as i64);
+
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("copied reader should open");
+        let mut restored = Vec::new();
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("copied object should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    async fn set_level_version_suspended_delete_creates_null_delete_marker() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-version-suspended-delete";
+        let object = "object.txt";
+        let opts = ObjectOptions {
+            no_lock: true,
+            version_suspended: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"suspended version body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("suspended-version object should be written");
+
+        let marker = set_disks
+            .delete_object(bucket, object, opts.clone())
+            .await
+            .expect("version-suspended delete should create a null marker");
+        assert!(marker.delete_marker);
+        assert_eq!(marker.version_id, Some(Uuid::nil()));
+
+        let err = match set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+        {
+            Ok(_) => panic!("null delete marker must hide object body"),
+            Err(err) => err,
+        };
+        assert!(
+            is_err_object_not_found(&err) || matches!(err, Error::MethodNotAllowed),
+            "null delete marker read must fail closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_level_delete_prefix_removes_nested_objects() {
+        let set_disks = make_local_bucket_test_set_disks().await;
+        let bucket = "bucket-delete-prefix";
+        let object = "prefix/object.txt";
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(b"prefix body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("prefix object should be written");
+
+        set_disks
+            .delete_object(
+                bucket,
+                "prefix/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prefix delete should succeed");
+
+        let err = match set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+        {
+            Ok(_) => panic!("object under deleted prefix must not be readable"),
+            Err(err) => err,
+        };
+        assert!(
+            is_err_object_not_found(&err),
+            "prefix-deleted object must fail closed with object-not-found, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_level_delete_objects_batch_removes_live_data_and_tolerates_missing_keys() {
+        temp_env::async_with_vars([("RUSTFS_ISSUE3031_DIAG_ENABLE", Some("true"))], async {
+            let set_disks = make_local_bucket_test_set_disks().await;
+            let bucket = "bucket-delete-objects";
+            let existing = "existing.txt";
+            let missing = "missing.txt";
+            let opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut reader = PutObjReader::from_vec(b"batch delete body".to_vec());
+            set_disks
+                .put_object(bucket, existing, &mut reader, &opts)
+                .await
+                .expect("object should be written before batch delete");
+
+            let (deleted, errors) = set_disks
+                .delete_objects(
+                    bucket,
+                    vec![
+                        ObjectToDelete {
+                            object_name: existing.to_string(),
+                            ..Default::default()
+                        },
+                        ObjectToDelete {
+                            object_name: missing.to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                    opts.clone(),
+                )
+                .await;
+
+            assert_eq!(deleted.len(), 2);
+            assert_eq!(errors.len(), 2);
+            assert!(errors.iter().all(Option::is_none));
+            assert_eq!(deleted[0].object_name, existing);
+            assert!(deleted[0].found);
+            assert!(!deleted[0].delete_marker);
+            assert_eq!(deleted[1].object_name, missing);
+            assert!(!deleted[1].found);
+            assert!(!deleted[1].delete_marker);
+
+            let err = match set_disks
+                .get_object_reader(bucket, existing, None, HeaderMap::new(), &opts)
+                .await
+            {
+                Ok(_) => panic!("batch-deleted object must not be readable as latest"),
+                Err(err) => err,
+            };
+            assert!(
+                is_err_object_not_found(&err),
+                "batch-deleted object must fail closed with object-not-found, got {err:?}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]

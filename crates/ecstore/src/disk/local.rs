@@ -2755,7 +2755,8 @@ impl LocalDisk {
             return false;
         }
 
-        if cfg!(target_os = "windows") {
+        #[cfg(target_os = "windows")]
+        {
             // Windows volume names must not include reserved characters.
             // This regular expression matches disallowed characters.
             if volname.contains('|')
@@ -2769,8 +2770,6 @@ impl LocalDisk {
             {
                 return false;
             }
-        } else {
-            // Non-Windows systems may require additional validation rules.
         }
 
         true
@@ -5946,10 +5945,11 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 #[cfg(test)]
 mod test {
     use super::*;
+    use rustfs_filemeta::ErasureInfo;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncReadExt, AsyncWrite, ReadBuf};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
     fn test_file_info(name: &str, version_id: Uuid, data_dir: Option<Uuid>, data: Option<Bytes>) -> FileInfo {
         let size = data
@@ -6275,6 +6275,381 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn startup_cleanup_barrier_and_tmp_trash_cleanup_cover_noop_and_delete_paths() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        disk.startup_cleanup_ready.store(0, Ordering::Release);
+        let ready = Arc::clone(&disk.startup_cleanup_ready);
+        let notify = Arc::clone(&disk.startup_cleanup_notify);
+        tokio::spawn(async move {
+            ready.store(1, Ordering::Release);
+            notify.notify_waiters();
+        });
+        disk.wait_for_startup_cleanup().await;
+        assert_eq!(disk.startup_cleanup_ready.load(Ordering::Acquire), 1);
+
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().join("missing-root"), Duration::ZERO)
+            .await
+            .expect("missing tmp path should be a cleanup no-op");
+        LocalDisk::cleanup_deleted_objects(dir.path().join("missing-root"))
+            .await
+            .expect("missing trash path should be a cleanup no-op");
+
+        let tmp_root = dir.path().join(RUSTFS_META_TMP_BUCKET);
+        let stale_dir = tmp_root.join("stale-upload");
+        let live_file = tmp_root.join("part-file");
+        let trash_root = dir.path().join(RUSTFS_META_TMP_DELETED_BUCKET);
+        fs::create_dir_all(&stale_dir).await.expect("stale dir should be created");
+        fs::write(&live_file, b"not-a-dir").await.expect("tmp file should be created");
+        fs::create_dir_all(&trash_root).await.expect("trash dir should be created");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
+            .await
+            .expect("stale tmp directory should move to trash");
+        assert!(!stale_dir.exists(), "stale tmp directory should be moved away");
+        assert!(live_file.exists(), "plain tmp files should be ignored by stale dir cleanup");
+
+        fs::write(trash_root.join("trash-file"), b"delete me")
+            .await
+            .expect("trash file should be created");
+        fs::create_dir_all(trash_root.join("trash-dir"))
+            .await
+            .expect("trash dir should be created");
+        LocalDisk::cleanup_deleted_objects(dir.path().to_path_buf())
+            .await
+            .expect("trash cleanup should remove files and directories");
+        assert!(
+            fs::read_dir(&trash_root)
+                .await
+                .expect("trash root should exist")
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn path_cache_covers_absolute_relative_batch_hit_miss_and_eviction() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let absolute = disk
+            .resolve_abs_path(dir.path().join("absolute-object"))
+            .expect("absolute path should resolve");
+        assert!(absolute.ends_with("absolute-object"));
+
+        {
+            let mut cache = disk.path_cache.write();
+            for index in 0..4096 {
+                cache.insert(format!("cached-{index}"), dir.path().join(format!("cached-{index}")));
+            }
+        }
+        let relative = disk.resolve_abs_path("bucket/object").expect("relative path should resolve");
+        assert!(relative.ends_with("bucket/object"));
+        assert!(
+            disk.path_cache.read().len() < 4097,
+            "cache eviction should run before inserting a new path"
+        );
+
+        let requests = vec![
+            ("bucket".to_string(), "a".to_string()),
+            ("bucket".to_string(), "b".to_string()),
+        ];
+        let first = disk
+            .get_object_paths_batch(&requests)
+            .expect("batch path resolution should handle cache misses");
+        assert_eq!(first.len(), 2);
+        assert!(first[0].ends_with("bucket/a"));
+        assert!(first[1].ends_with("bucket/b"));
+
+        let second = disk
+            .get_object_paths_batch(&requests)
+            .expect("batch path resolution should reuse cache hits");
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn open_file_read_only_returns_existing_payload_without_parent_creation() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let path = dir.path().join("bucket/object/part.1");
+        fs::create_dir_all(path.parent().expect("test file should have a parent"))
+            .await
+            .expect("parent directory should be created");
+        fs::write(&path, b"read-only-payload")
+            .await
+            .expect("test file should be written");
+
+        let mut file = disk.open_file_read_only(&path).await.expect("read-only file should open");
+        let mut payload = Vec::new();
+        file.read_to_end(&mut payload).await.expect("read-only file should read");
+
+        assert_eq!(payload, b"read-only-payload");
+    }
+
+    #[tokio::test]
+    async fn write_metadata_replaces_corrupt_existing_xl_meta_without_losing_new_version() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "metadata-rewrite-bucket";
+        let object = "nested/object";
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"not-valid-xl-meta")
+            .await
+            .expect("corrupt metadata should be installed");
+
+        let version_id = Uuid::new_v4();
+        let mut fi = test_file_info(object, version_id, Some(Uuid::new_v4()), Some(Bytes::from_static(b"restored")));
+        fi.fresh = false;
+        disk.write_metadata(bucket, bucket, object, fi)
+            .await
+            .expect("new metadata write should replace corrupt old metadata");
+
+        let raw = disk
+            .read_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .await
+            .expect("rewritten metadata should be readable");
+        let restored = FileMeta::load(&raw)
+            .expect("rewritten metadata should decode")
+            .into_fileinfo(bucket, object, "", true, false, true)
+            .expect("rewritten metadata should expose the new version");
+
+        assert_eq!(restored.version_id, Some(version_id));
+        assert_eq!(restored.name, object);
+    }
+
+    fn test_check_parts_file_info(data_dir: Uuid) -> FileInfo {
+        FileInfo {
+            name: "dir/object".to_string(),
+            data_dir: Some(data_dir),
+            parts: (1..=4)
+                .map(|number| ObjectPartInfo {
+                    number,
+                    size: 5,
+                    actual_size: 5,
+                    ..Default::default()
+                })
+                .collect(),
+            erasure: ErasureInfo {
+                data_blocks: 2,
+                parity_blocks: 2,
+                block_size: 4,
+                distribution: vec![1, 2, 3, 4],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_parts_classifies_part_and_volume_failures() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let data_dir = Uuid::parse_str("01010101-0101-0101-0101-010101010101").expect("data dir should parse");
+        let fi = test_check_parts_file_info(data_dir);
+
+        ensure_test_volume(&disk, bucket).await;
+        let part_dir = dir.path().join(bucket).join(object).join(data_dir.to_string());
+        fs::create_dir_all(&part_dir).await.expect("part dir should be created");
+        fs::write(part_dir.join("part.1"), vec![1; 4])
+            .await
+            .expect("valid part should be written");
+        fs::write(part_dir.join("part.2"), vec![2; 3])
+            .await
+            .expect("short part should be written");
+        fs::create_dir_all(part_dir.join("part.3"))
+            .await
+            .expect("directory part marker should be created");
+
+        let resp = disk
+            .check_parts(bucket, object, &fi)
+            .await
+            .expect("check_parts should return per-part status");
+        assert_eq!(
+            resp.results,
+            vec![
+                CHECK_PART_SUCCESS,
+                CHECK_PART_FILE_CORRUPT,
+                CHECK_PART_FILE_NOT_FOUND,
+                CHECK_PART_FILE_NOT_FOUND,
+            ],
+            "valid, short, directory, and missing parts must be classified distinctly"
+        );
+
+        let missing_volume_resp = disk
+            .check_parts("missing-bucket", object, &fi)
+            .await
+            .expect("missing volume should be reported per part");
+        assert_eq!(
+            missing_volume_resp.results,
+            vec![CHECK_PART_VOLUME_NOT_FOUND; fi.parts.len()],
+            "missing volume must not be reported as recoverable missing shards"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_parts_reports_bad_metadata_and_missing_data_part() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        let valid_part = ObjectPartInfo {
+            etag: "etag-1".to_string(),
+            number: 1,
+            size: 5,
+            actual_size: 5,
+            ..Default::default()
+        };
+        disk.write_all(bucket, "upload/part.1", Bytes::from_static(b"data-1"))
+            .await
+            .expect("part data should be written");
+        disk.write_all(
+            bucket,
+            "upload/part.1.meta",
+            Bytes::from(valid_part.marshal_msg().expect("part metadata should encode")),
+        )
+        .await
+        .expect("part metadata should be written");
+        disk.write_all(bucket, "upload/part.2", Bytes::from_static(b"data-2"))
+            .await
+            .expect("second part data should be written");
+        disk.write_all(bucket, "upload/part.2.meta", Bytes::from_static(b"not-msgpack"))
+            .await
+            .expect("bad part metadata should be written");
+        disk.write_all(bucket, "upload/part.3.meta", Bytes::from_static(b"orphan-meta"))
+            .await
+            .expect("orphan metadata should be written");
+
+        let parts = disk
+            .read_parts(
+                bucket,
+                &[
+                    "upload/part.1.meta".to_string(),
+                    "upload/part.2.meta".to_string(),
+                    "upload/part.3.meta".to_string(),
+                ],
+            )
+            .await
+            .expect("read_parts should return per-part status");
+
+        assert_eq!(parts[0], valid_part);
+        assert_eq!(parts[1].number, 2);
+        assert!(
+            parts[1].error.is_some(),
+            "bad metadata must be surfaced as a per-part error instead of a decoded part"
+        );
+        assert_eq!(parts[2].number, 3);
+        assert!(parts[2].error.is_some(), "missing data part must be surfaced as a per-part error");
+    }
+
+    #[tokio::test]
+    async fn test_rename_part_rejects_type_mismatch_without_touching_source() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let tmp_volume = "tmp";
+        let bucket = "bucket";
+        ensure_test_volume(&disk, tmp_volume).await;
+        ensure_test_volume(&disk, bucket).await;
+
+        let payload = Bytes::from_static(b"part payload");
+        disk.write_all(tmp_volume, "upload/part.1", payload.clone())
+            .await
+            .expect("source part should be written");
+
+        let result = disk
+            .rename_part(tmp_volume, "upload/part.1", bucket, "object/part.1/", Bytes::from_static(b"metadata"))
+            .await;
+        assert!(
+            matches!(result, Err(DiskError::FileAccessDenied)),
+            "file-to-directory rename_part mismatch must be rejected, got {result:?}"
+        );
+        assert_eq!(
+            disk.read_all(tmp_volume, "upload/part.1")
+                .await
+                .expect("source part must remain after rejected rename"),
+            payload
+        );
+        assert!(
+            matches!(disk.read_all(bucket, "object/part.1.meta").await, Err(DiskError::FileNotFound)),
+            "rejected rename_part must not write destination metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_part_commits_data_and_metadata_then_removes_source() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let tmp_volume = "tmp";
+        let bucket = "bucket";
+        ensure_test_volume(&disk, tmp_volume).await;
+        ensure_test_volume(&disk, bucket).await;
+
+        let payload = Bytes::from_static(b"part payload");
+        let meta = Bytes::from_static(b"part metadata");
+        disk.write_all(tmp_volume, "upload/part.1", payload.clone())
+            .await
+            .expect("source part should be written");
+
+        disk.rename_part(tmp_volume, "upload/part.1", bucket, "object/part.1", meta.clone())
+            .await
+            .expect("rename_part should commit part");
+
+        assert_eq!(
+            disk.read_all(bucket, "object/part.1")
+                .await
+                .expect("destination part should be readable"),
+            payload
+        );
+        assert_eq!(
+            disk.read_all(bucket, "object/part.1.meta")
+                .await
+                .expect("destination metadata should be readable"),
+            meta
+        );
+        assert!(
+            matches!(disk.read_all(tmp_volume, "upload/part.1").await, Err(DiskError::FileNotFound)),
+            "source part must be removed after a successful commit"
+        );
+    }
+
     struct BlockingScanWriter {
         entered_tx: Option<tokio::sync::oneshot::Sender<()>>,
     }
@@ -6294,6 +6669,25 @@ mod test {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Pending
         }
+    }
+
+    #[tokio::test]
+    async fn blocking_scan_writer_keeps_flush_and_shutdown_pending() {
+        let mut flush_writer = BlockingScanWriter { entered_tx: None };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), flush_writer.flush())
+                .await
+                .is_err(),
+            "blocking scan writer flush should stay pending"
+        );
+
+        let mut shutdown_writer = BlockingScanWriter { entered_tx: None };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), shutdown_writer.shutdown())
+                .await
+                .is_err(),
+            "blocking scan writer shutdown should stay pending"
+        );
     }
 
     #[tokio::test]
@@ -7318,6 +7712,51 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_delete_versions_ignores_missing_non_deleted_version_and_deletes_existing() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let existing_version = Uuid::parse_str("10101010-1010-1010-1010-101010101010").expect("version id should parse");
+        let missing_version = Uuid::parse_str("20202020-2020-2020-2020-202020202020").expect("version id should parse");
+        let existing_data_dir = Uuid::parse_str("30303030-3030-3030-3030-303030303030").expect("data dir should parse");
+        let missing_data_dir = Uuid::parse_str("40404040-4040-4040-4040-404040404040").expect("data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(object_dir.join(existing_data_dir.to_string()))
+            .await
+            .expect("existing data dir should be created");
+
+        let existing_fi = test_file_info(object, existing_version, Some(existing_data_dir), None);
+        let missing_fi = test_file_info(object, missing_version, Some(missing_data_dir), None);
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(existing_fi.clone()))
+            .await
+            .expect("existing metadata should be written");
+
+        disk.delete_versions_internal(bucket, object, &[missing_fi, existing_fi])
+            .await
+            .expect("missing non-deleted version should not abort deletion");
+
+        assert!(
+            matches!(
+                disk.read_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}")).await,
+                Err(DiskError::FileNotFound)
+            ),
+            "metadata should be removed once the remaining real version is deleted"
+        );
+        assert!(
+            !object_dir.join(existing_data_dir.to_string()).exists(),
+            "deleted version data directory should leave the object path"
+        );
+    }
+
+    #[tokio::test]
     async fn test_rename_data_failure_before_metadata_commit_preserves_old_metadata() {
         use tempfile::tempdir;
 
@@ -7409,6 +7848,16 @@ mod test {
             .expect_err("stalled local reader should return a timeout error");
 
         assert_eq!(err.kind(), ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn local_read_timeout_reader_with_zero_timeout_stays_pending() {
+        let mut reader = StallTimeoutReader::new(PendingTestReader, Duration::ZERO);
+        let mut buf = [0; 1];
+
+        let result = tokio::time::timeout(Duration::from_millis(10), reader.read(&mut buf)).await;
+
+        assert!(result.is_err(), "zero timeout must leave stalled reads pending instead of failing");
     }
 
     #[tokio::test]
@@ -7686,6 +8135,53 @@ mod test {
         assert!(names.contains(&"foo/bar".to_string()));
         assert!(names.contains(&"foo/bar/xyzzy".to_string()));
         assert!(names.contains(&"quux/thud".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_reports_base_dir_object_metadata() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("operation should succeed");
+        let bucket = "test-bucket";
+        let base_dir = "base-object";
+        let bucket_dir = dir.path().join(bucket);
+        fs::create_dir_all(bucket_dir.join(base_dir))
+            .await
+            .expect("base object dir should be created");
+        fs::write(bucket_dir.join(base_dir).join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("base object metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: base_dir.to_string(),
+            recursive: false,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .expect("operation should succeed");
+        out.close().await.expect("operation should succeed");
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.expect("operation should succeed");
+        let names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+
+        assert_eq!(names, vec![format!("{base_dir}/")]);
+        assert_eq!(objs_returned, 1);
     }
 
     #[tokio::test]
@@ -8331,13 +8827,7 @@ mod test {
         let p = "./testv0";
         fs::create_dir_all(&p).await.expect("operation should succeed");
 
-        let ep = match Endpoint::try_from(p) {
-            Ok(e) => e,
-            Err(e) => {
-                println!("{e}");
-                return;
-            }
-        };
+        let ep = Endpoint::try_from(p).expect("endpoint should parse");
 
         let disk = LocalDisk::new(&ep, false).await.expect("operation should succeed");
 
@@ -8361,13 +8851,7 @@ mod test {
         let p = "./testv1";
         fs::create_dir_all(&p).await.expect("operation should succeed");
 
-        let ep = match Endpoint::try_from(p) {
-            Ok(e) => e,
-            Err(e) => {
-                println!("{e}");
-                return;
-            }
-        };
+        let ep = Endpoint::try_from(p).expect("endpoint should parse");
 
         let disk = LocalDisk::new(&ep, false).await.expect("operation should succeed");
 
@@ -8696,6 +9180,18 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_local_disk_scan_lock_key_combines_base_and_filter_prefixes() {
+        assert_eq!(
+            local_disk_scan_lock_key("bucket", "", Some("/prefix/")),
+            ("bucket".to_string(), "prefix".to_string())
+        );
+        assert_eq!(
+            local_disk_scan_lock_key("bucket", "/base/", Some("/prefix/")),
+            ("bucket".to_string(), "base/prefix".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn test_read_file_exists() {
         let test_file = "./test_read_exists.txt";
@@ -8904,6 +9400,80 @@ mod test {
         });
     }
 
+    #[test]
+    fn direct_io_drive_sync_and_bitrot_retry_envs_respect_overrides() {
+        temp_env::with_var_unset(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, || {
+            assert!(!is_direct_io_read_enabled());
+        });
+        temp_env::with_var(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true"), || {
+            assert!(is_direct_io_read_enabled());
+        });
+
+        temp_env::with_var_unset(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, || {
+            assert_eq!(get_direct_io_read_threshold(), DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD);
+        });
+        temp_env::with_var(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("12345"), || {
+            assert_eq!(get_direct_io_read_threshold(), 12_345);
+        });
+
+        temp_env::with_var_unset(ENV_RUSTFS_DRIVE_SYNC_ENABLE, || {
+            assert!(drive_sync_enabled());
+        });
+        temp_env::with_var(ENV_RUSTFS_DRIVE_SYNC_ENABLE, Some("false"), || {
+            assert!(!drive_sync_enabled());
+        });
+
+        temp_env::with_var_unset(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, || {
+            assert_eq!(bitrot_size_mismatch_retry_count(), DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT as usize);
+        });
+        temp_env::with_var(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, Some("7"), || {
+            assert_eq!(bitrot_size_mismatch_retry_count(), 7);
+        });
+        temp_env::with_var(ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS, Some("42"), || {
+            assert_eq!(bitrot_size_mismatch_retry_delay(), Duration::from_millis(42));
+        });
+    }
+
+    #[test]
+    fn mmap_and_reclaim_metric_helpers_accept_noop_and_positive_paths() {
+        let metrics = || MmapCopyStageMetrics {
+            path: "local_test",
+            access_check_stage: "access",
+            path_resolve_stage: "path",
+            metadata_lookup_stage: "metadata_lookup",
+            metadata_validate_stage: "metadata_validate",
+            blocking_wait_stage: "blocking_wait",
+            blocking_task_stage: "blocking_task",
+            file_open_stage: "file_open",
+            mmap_map_stage: "mmap_map",
+            mmap_copy_stage: "mmap_copy",
+            direct_read_copy_stage: "direct_read_copy",
+        };
+
+        record_mmap_copy_stage(metrics(), "mmap_copy", None);
+        record_mmap_copy_stage(metrics(), "mmap_copy", Some(std::time::Instant::now()));
+        record_file_cache_reclaim_success("read", 128, std::time::Instant::now());
+        record_file_cache_reclaim_error("write");
+
+        #[cfg(unix)]
+        {
+            record_mmap_page_fault_delta("local_test", "mmap_map", MmapPageFaultDelta::default());
+            record_mmap_page_fault_delta("local_test", "mmap_map", MmapPageFaultDelta { minor: 1, major: 2 });
+            record_direct_read_page_fault_delta("local_test", "direct_read_copy", MmapPageFaultDelta::default());
+            record_direct_read_page_fault_delta("local_test", "direct_read_copy", MmapPageFaultDelta { minor: 3, major: 4 });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mmap_page_fault_counts_respect_disabled_and_enabled_modes() {
+        assert_eq!(read_mmap_page_fault_counts(false), None);
+
+        let counts = read_mmap_page_fault_counts(true).expect("getrusage should return page fault counters");
+        assert!(counts.minor >= 0);
+        assert!(counts.major >= 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn mmap_page_size_is_cached_positive() {
@@ -8939,6 +9509,156 @@ mod test {
             },
         )
         .await;
+    }
+
+    #[test]
+    fn resolve_local_disk_root_reports_missing_path_as_volume_not_found() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let missing = dir.path().join("missing");
+
+        let err = resolve_local_disk_root(missing.to_str().expect("temp path should be utf8"))
+            .expect_err("missing disk root must be rejected");
+
+        assert!(matches!(err, DiskError::VolumeNotFound));
+    }
+
+    #[tokio::test]
+    async fn local_disk_debug_includes_stable_identity_fields() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let debug = format!("{disk:?}");
+
+        assert!(debug.contains("LocalDisk"));
+        assert!(debug.contains("root"));
+        assert!(debug.contains("format_path"));
+        assert!(debug.contains("endpoint"));
+    }
+
+    #[tokio::test]
+    async fn std_backend_truncate_append_stream_and_full_read_restore_bytes() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let volume = "test-volume";
+        fs::create_dir_all(dir.path().join(volume))
+            .await
+            .expect("volume should be created");
+        let backend = StdBackend::new(dir.path().to_path_buf());
+
+        let mut writer = backend
+            .open_write(volume, "nested/blob.bin", WriteMode::Truncate { size_hint: 6 })
+            .await
+            .expect("truncate writer should open");
+        writer.write_all(b"abcdef").await.expect("initial bytes should write");
+        writer.shutdown().await.expect("truncate writer should shutdown");
+
+        let window = backend
+            .pread_bytes(volume, "nested/blob.bin", 1, 3, None)
+            .await
+            .expect("pread should restore requested window");
+        assert_eq!(window, Bytes::from_static(b"bcd"));
+
+        let mut writer = backend
+            .open_write(volume, "nested/blob.bin", WriteMode::Truncate { size_hint: 2 })
+            .await
+            .expect("second truncate writer should open");
+        writer.write_all(b"xy").await.expect("truncated bytes should write");
+        writer.shutdown().await.expect("second truncate writer should shutdown");
+
+        let mut writer = backend
+            .open_write(volume, "nested/blob.bin", WriteMode::Append)
+            .await
+            .expect("append writer should open");
+        writer.write_all(b"z").await.expect("append byte should write");
+        writer.shutdown().await.expect("append writer should shutdown");
+
+        let mut stream = backend
+            .open_read_stream(volume, "nested/blob.bin", 0, 3)
+            .await
+            .expect("bounded stream should open");
+        let mut streamed = Vec::new();
+        stream.read_to_end(&mut streamed).await.expect("bounded stream should read");
+        assert_eq!(streamed, b"xyz");
+
+        let mut full = backend
+            .open_full_read(volume, "nested/blob.bin")
+            .await
+            .expect("full stream should open");
+        let mut body = Vec::new();
+        full.read_to_end(&mut body).await.expect("full stream should read");
+        assert_eq!(body, b"xyz");
+    }
+
+    #[tokio::test]
+    async fn std_backend_rejects_overflow_and_out_of_bounds_reads() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let volume = "test-volume";
+        fs::create_dir_all(dir.path().join(volume))
+            .await
+            .expect("volume should be created");
+        fs::write(dir.path().join(volume).join("blob.bin"), b"abc")
+            .await
+            .expect("test object should be written");
+        let backend = StdBackend::new(dir.path().to_path_buf());
+
+        let overflow = backend.pread_bytes(volume, "blob.bin", usize::MAX, 1, None).await;
+        assert!(matches!(overflow, Err(DiskError::FileCorrupt)));
+
+        let out_of_bounds = backend.pread_bytes(volume, "blob.bin", 2, 2, None).await;
+        assert!(matches!(out_of_bounds, Err(DiskError::FileCorrupt)));
+
+        let stream_out_of_bounds = backend.open_read_stream(volume, "blob.bin", 2, 2).await;
+        assert!(matches!(stream_out_of_bounds, Err(DiskError::FileCorrupt)));
+    }
+
+    #[tokio::test]
+    async fn file_cache_reclaim_wrappers_forward_read_write_flush_and_shutdown() {
+        use futures_util::task::noop_waker_ref;
+        use std::io::IoSlice;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let path = dir.path().join("reclaim.bin");
+        let file = File::create(&path).await.expect("writer file should be created");
+        let mut writer = FileCacheReclaimWriter::new(file, 6, true);
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let bufs = [IoSlice::new(b"ab"), IoSlice::new(b"cd")];
+        let vectored = Pin::new(&mut writer).poll_write_vectored(&mut cx, &bufs);
+        assert!(matches!(vectored, Poll::Ready(Ok(_)) | Poll::Pending));
+        let _ = AsyncWrite::is_write_vectored(&writer);
+
+        writer.write_all(b"abcdef").await.expect("writer should forward writes");
+        writer.flush().await.expect("writer should forward flush");
+        writer.shutdown().await.expect("writer should reclaim on shutdown");
+
+        let file = File::open(&path).await.expect("reader file should open");
+        let mut reader = FileCacheReclaimReader::new(file, 0, 6, true);
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("reader should forward reads");
+        assert!(body.ends_with(b"abcdef"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_nocache_helpers_accept_tokio_and_std_files() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let path = dir.path().join("nocache.bin");
+        fs::write(&path, b"nocache").await.expect("test file should be written");
+
+        let tokio_file = File::open(&path).await.expect("tokio file should open");
+        set_fd_nocache(&tokio_file).expect("tokio fd should accept F_NOCACHE");
+
+        let std_file = std::fs::File::open(&path).expect("std file should open");
+        set_std_fd_nocache(&std_file).expect("std fd should accept F_NOCACHE");
     }
 
     #[cfg(unix)]

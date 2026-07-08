@@ -42,6 +42,7 @@ const DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: bool = false;
 /// Read once at first use via `OnceLock` to avoid per-encode syscall.
 static CACHED_MAX_INFLIGHT_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static CACHED_BATCH_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+#[cfg(not(test))]
 static CACHED_BYTESMUT_INGEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 #[inline(always)]
@@ -83,6 +84,15 @@ fn erasure_encode_max_inflight_bytes() -> usize {
 }
 
 fn use_bytesmut_ingest() -> bool {
+    #[cfg(test)]
+    {
+        return rustfs_utils::get_env_bool(
+            ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST,
+            DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST,
+        );
+    }
+
+    #[cfg(not(test))]
     *CACHED_BYTESMUT_INGEST.get_or_init(|| {
         rustfs_utils::get_env_bool(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST)
     })
@@ -230,35 +240,24 @@ impl<'a> MultiWriter<'a> {
             return Ok(());
         }
 
-        if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
-            let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
-            let summary_text = format_write_quorum_failure(&summary);
-            runtime_sources::record_erasure_write_quorum_failure("write", quorum_dominant_error_metric_label(&summary));
-            error!(
-                required = summary.required,
-                achieved = summary.achieved,
-                failed = summary.failed,
-                total = summary.total,
-                offline_disks = summary.offline_disks,
-                retryable_failures = summary.retryable_failures,
-                dominant_error = summary.dominant_error_label,
-                returned_error = %write_err,
-                errs = ?self.errs,
-                "Erasure encode write quorum unavailable: {summary_text}"
-            );
-            return Err(std::io::Error::other(format!("Failed to write data: {summary_text}")));
-        }
-
+        let write_err =
+            reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum).unwrap_or(Error::ErasureWriteQuorum);
         let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
-        Err(std::io::Error::other(format!(
-            "Failed to write data: {}: {}",
-            format_write_quorum_failure(&summary),
-            self.errs
-                .iter()
-                .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
+        let summary_text = format_write_quorum_failure(&summary);
+        runtime_sources::record_erasure_write_quorum_failure("write", quorum_dominant_error_metric_label(&summary));
+        error!(
+            required = summary.required,
+            achieved = summary.achieved,
+            failed = summary.failed,
+            total = summary.total,
+            offline_disks = summary.offline_disks,
+            retryable_failures = summary.retryable_failures,
+            dominant_error = summary.dominant_error_label,
+            returned_error = %write_err,
+            errs = ?self.errs,
+            "Erasure encode write quorum unavailable: {summary_text}"
+        );
+        Err(std::io::Error::other(format!("Failed to write data: {summary_text}")))
     }
 
     async fn shutdown_writer(writer_opt: &mut Option<BitrotWriterWrapper>, err: &mut Option<Error>) {
@@ -296,35 +295,24 @@ impl<'a> MultiWriter<'a> {
             return Ok(());
         }
 
-        if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
-            let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
-            let summary_text = format_write_quorum_failure(&summary);
-            runtime_sources::record_erasure_write_quorum_failure("shutdown", quorum_dominant_error_metric_label(&summary));
-            error!(
-                required = summary.required,
-                achieved = summary.achieved,
-                failed = summary.failed,
-                total = summary.total,
-                offline_disks = summary.offline_disks,
-                retryable_failures = summary.retryable_failures,
-                dominant_error = summary.dominant_error_label,
-                returned_error = %write_err,
-                errs = ?self.errs,
-                "Erasure encode shutdown quorum unavailable: {summary_text}"
-            );
-            return Err(std::io::Error::other(format!("Failed to shutdown writers: {summary_text}")));
-        }
-
+        let write_err =
+            reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum).unwrap_or(Error::ErasureWriteQuorum);
         let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
-        Err(std::io::Error::other(format!(
-            "Failed to shutdown writers: {}: {}",
-            format_write_quorum_failure(&summary),
-            self.errs
-                .iter()
-                .map(|e| e.as_ref().map_or_else(|| "<nil>".to_string(), |e| e.to_string()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
+        let summary_text = format_write_quorum_failure(&summary);
+        runtime_sources::record_erasure_write_quorum_failure("shutdown", quorum_dominant_error_metric_label(&summary));
+        error!(
+            required = summary.required,
+            achieved = summary.achieved,
+            failed = summary.failed,
+            total = summary.total,
+            offline_disks = summary.offline_disks,
+            retryable_failures = summary.retryable_failures,
+            dominant_error = summary.dominant_error_label,
+            returned_error = %write_err,
+            errs = ?self.errs,
+            "Erasure encode shutdown quorum unavailable: {summary_text}"
+        );
+        Err(std::io::Error::other(format!("Failed to shutdown writers: {summary_text}")))
     }
 }
 
@@ -753,7 +741,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
-    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     #[derive(Clone, Default)]
     struct DeferredCommitWriter {
@@ -850,6 +838,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn helper_writers_cover_flush_and_shutdown_paths() {
+        let mut failing_write = FailingWriteWriter;
+        failing_write.flush().await.expect("failing-write flush should succeed");
+        failing_write.shutdown().await.expect("failing-write shutdown should succeed");
+
+        let mut short_write = ShortWriteWriter;
+        let written = short_write
+            .write(b"short")
+            .await
+            .expect("short-write helper should report a partial write");
+        assert_eq!(written, 4);
+        short_write.flush().await.expect("short-write flush should succeed");
+        short_write.shutdown().await.expect("short-write shutdown should succeed");
+
+        let mut shutdown_fail = ShutdownFailWriter::default();
+        shutdown_fail.flush().await.expect("shutdown-fail flush should succeed");
+        let err = shutdown_fail
+            .shutdown()
+            .await
+            .expect_err("shutdown-fail writer should reject shutdown");
+        assert_eq!(err.to_string(), "injected shutdown failure");
+    }
+
+    #[tokio::test]
     async fn multi_writer_short_write_fails_before_shutdown() {
         let mut writers = vec![Some(bitrot_writer(ShortWriteWriter, 16))];
         let err = {
@@ -862,6 +874,61 @@ mod tests {
 
         assert!(err.to_string().contains("Failed to write data"));
         assert!(writers[0].is_none(), "short-write shard must be removed before commit");
+    }
+
+    #[tokio::test]
+    async fn multi_writer_reports_fallback_summary_when_only_offline_writers_remain() {
+        let mut writers = vec![None, None];
+        let err = {
+            let mut writer = MultiWriter::new(&mut writers, 1);
+            writer
+                .write(vec![Bytes::from_static(b"offline-a"), Bytes::from_static(b"offline-b")])
+                .await
+                .expect_err("offline writers cannot satisfy write quorum")
+        };
+
+        let err = err.to_string();
+        assert!(err.contains("Failed to write data"));
+        assert!(err.contains("offline-disks=2/2"));
+        assert!(err.contains("required=1"));
+
+        let shutdown_err = {
+            let mut writer = MultiWriter::new(&mut writers, 1);
+            writer
+                .shutdown()
+                .await
+                .expect_err("offline writers cannot satisfy shutdown quorum")
+        };
+
+        let shutdown_err = shutdown_err.to_string();
+        assert!(shutdown_err.contains("Failed to shutdown writers"));
+        assert!(shutdown_err.contains("offline-disks=2/2"));
+        assert!(shutdown_err.contains("required=1"));
+    }
+
+    #[tokio::test]
+    async fn multi_writer_reports_quorum_failure_when_quorum_exceeds_writer_count() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let mut writers = vec![Some(bitrot_writer(DeferredCommitWriter::new(committed), 16))];
+        let mut writer = MultiWriter::new(&mut writers, 2);
+
+        let err = writer
+            .write(vec![Bytes::from_static(b"quorum impossible")])
+            .await
+            .expect_err("write quorum above writer count must fail");
+        let err = err.to_string();
+        assert!(err.contains("Failed to write data"));
+        assert!(err.contains("required=2"));
+        assert!(err.contains("erasure write quorum"));
+
+        let shutdown_err = writer
+            .shutdown()
+            .await
+            .expect_err("shutdown quorum above writer count must fail");
+        let shutdown_err = shutdown_err.to_string();
+        assert!(shutdown_err.contains("Failed to shutdown writers"));
+        assert!(shutdown_err.contains("required=2"));
+        assert!(shutdown_err.contains("erasure write quorum"));
     }
 
     #[tokio::test]
@@ -898,6 +965,40 @@ mod tests {
 
         assert_eq!(written, b"small payload".len());
         assert!(!committed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn encode_bytesmut_ingest_streaming_path_writes_and_shutdowns_writers() {
+        temp_env::async_with_vars([(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, Some("true"))], async {
+            const DATA_SHARDS: usize = 2;
+            const PARITY_SHARDS: usize = 2;
+            const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+            const BLOCK_SIZE: usize = 32;
+
+            let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+            let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+                .iter()
+                .map(|c| Some(bitrot_writer(DeferredCommitWriter::new(c.clone()), BLOCK_SIZE / DATA_SHARDS)))
+                .collect();
+
+            let payload = vec![0x5a; BLOCK_SIZE * 2 + 7];
+            let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+            let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
+            let (_reader, written) = erasure
+                .encode(reader, &mut writers, DATA_SHARDS)
+                .await
+                .expect("BytesMut ingest path should encode the streaming payload");
+
+            assert_eq!(written, payload.len());
+            for (index, committed) in committed.iter().enumerate() {
+                assert!(
+                    !committed.lock().expect("committed buffer should be lockable").is_empty(),
+                    "shard {index} should receive bytesmut-ingest data"
+                );
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1087,6 +1188,28 @@ mod tests {
             assert!(!a.is_empty(), "shard {index} should receive committed data");
             assert_eq!(a, b, "shard {index} must match between streaming and batched encode");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn encode_block_bytes_mut_works_on_current_thread_runtime() {
+        let erasure = Arc::new(Erasure::new(2, 2, 64));
+        let payload = b"bytesmut current-thread payload";
+        let shards = erasure
+            .clone()
+            .encode_block_bytes_mut(bytes::BytesMut::from(&payload[..]), payload.len())
+            .await
+            .expect("bytesmut encode should succeed on current-thread runtime");
+
+        let expected_shard_size = payload.len().div_ceil(erasure.data_shards);
+        assert_eq!(shards.len(), erasure.total_shard_count());
+        assert!(shards.iter().all(|shard| shard.len() == expected_shard_size));
+
+        let mut restored = Vec::new();
+        for shard in shards.iter().take(erasure.data_shards) {
+            restored.extend_from_slice(shard);
+        }
+        restored.truncate(payload.len());
+        assert_eq!(restored, payload);
     }
 
     #[tokio::test]

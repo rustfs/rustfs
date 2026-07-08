@@ -3060,35 +3060,28 @@ impl SetDisks {
         }
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            let mut revert_futures = Vec::with_capacity(disks.len());
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
                 }
 
                 if let Some(disk) = disks[i].as_ref() {
-                    let disk = disk.clone();
-                    let bucket = bucket.to_string();
                     let path = path_join_buf(&[prefix, STORAGE_FORMAT_FILE]);
-                    revert_futures.push(async move {
-                        if let Err(err) = disk
-                            .delete(
-                                &bucket,
-                                &path,
-                                DeleteOptions {
-                                    recursive: true,
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                        {
-                            warn!("write meta revert err {:?}", err);
-                        }
-                    });
+                    if let Err(err) = disk
+                        .delete(
+                            bucket,
+                            &path,
+                            DeleteOptions {
+                                recursive: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        warn!("write meta revert err {:?}", err);
+                    }
                 }
             }
-
-            join_all(revert_futures).await;
             return Err(err);
         }
         Ok(())
@@ -3811,6 +3804,7 @@ pub(in crate::set_disk) mod cleanup_fault_injection {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
 
     fn metadata_test_fileinfo(object: &str) -> FileInfo {
@@ -3840,12 +3834,72 @@ mod tests {
         }
     }
 
+    async fn read_multiple_test_disk(bucket: &str, objects: &[(&str, &[u8])]) -> (TempDir, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        match disk.make_volume(bucket).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("bucket should be available: {err:?}"),
+        }
+        for (object, body) in objects {
+            disk.write_all(bucket, object, Bytes::copy_from_slice(body))
+                .await
+                .expect("object should be written");
+        }
+
+        (dir, disk)
+    }
+
+    async fn io_primitives_test_set(disks: Vec<Option<DiskStore>>, default_parity_count: usize) -> Arc<SetDisks> {
+        let set_drive_count = disks.len();
+        SetDisks::new(
+            "io-primitives-test".to_string(),
+            Arc::new(RwLock::new(disks)),
+            set_drive_count,
+            default_parity_count,
+            0,
+            0,
+            Vec::new(),
+            FormatV3::new(1, 1),
+            Vec::new(),
+        )
+        .await
+    }
+
     fn failed_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
         Box::pin(async { ReadRepairAdmissionOutcome::Failed("injected submit failure".to_string()) })
     }
 
     fn accepted_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
         Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
+    }
+
+    fn dropped_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        Box::pin(async {
+            ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(
+                rustfs_common::heal_channel::HealAdmissionDropReason::PolicyDropped,
+            ))
+        })
+    }
+
+    fn test_object_bitrot_reader() -> ObjectBitrotReader {
+        BitrotReader::new(
+            Box::new(Cursor::new(vec![1u8, 2, 3, 4])) as Box<dyn AsyncRead + Send + Sync + Unpin>,
+            4,
+            HashAlgorithm::None,
+            false,
+        )
     }
 
     #[test]
@@ -4009,6 +4063,36 @@ mod tests {
         assert!(part.etag.is_empty());
     }
 
+    #[test]
+    fn resolve_read_part_returns_part_when_etag_reaches_quorum() {
+        let responses = vec![
+            Some(vec![read_part_test_part(1, "winner")]),
+            Some(vec![read_part_test_part(1, "loser")]),
+            Some(vec![read_part_test_part(1, "winner")]),
+        ];
+
+        let part = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect("etag quorum should resolve the present part");
+
+        assert_eq!(part.etag, "winner");
+    }
+
+    #[test]
+    fn resolve_read_part_diagnostic_branch_keeps_read_quorum_error() {
+        temp_env::with_var("RUSTFS_ISSUE3031_DIAG_ENABLE", Some("true"), || {
+            let responses = vec![
+                Some(Vec::new()),
+                None,
+                Some(vec![read_part_test_error(1, "permission denied")]),
+            ];
+
+            let err = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+                .expect_err("diagnostic logging must not change the read-quorum result");
+
+            assert_eq!(err, DiskError::ErasureReadQuorum);
+        });
+    }
+
     // Runs under a Tokio runtime like the sibling reservation tests:
     // shard_read_costs_for_disks consults process-global topology state
     // (local_endpoint_hosts_for_shard_costs), whose fast-lock manager lazily
@@ -4019,6 +4103,332 @@ mod tests {
     #[tokio::test]
     async fn shard_read_costs_for_empty_disk_set_are_empty() {
         assert!(shard_read_costs_for_disks(&[]).is_empty());
+    }
+
+    #[test]
+    fn shard_read_cost_for_endpoint_and_missing_disk_cover_all_cost_classes() {
+        let same_node_hosts = vec!["node-a:9000".to_string()];
+
+        assert_eq!(shard_read_cost_for_disk(None, &same_node_hosts), ShardReadCost::Unknown);
+        assert_eq!(shard_read_cost_for_endpoint(true, "", &same_node_hosts), ShardReadCost::Local);
+        assert_eq!(
+            shard_read_cost_for_endpoint(false, "node-a:9000", &same_node_hosts),
+            ShardReadCost::SameNode
+        );
+        assert_eq!(
+            shard_read_cost_for_endpoint(false, "node-b:9000", &same_node_hosts),
+            ShardReadCost::Remote
+        );
+        assert!(local_endpoint_hosts_for_shard_costs().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bitrot_reader_setup_tracks_strategy_counters_and_deferred_readers() {
+        temp_env::with_var(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true"), || {
+            assert!(matches!(
+                get_bitrot_reader_setup_strategy(BitrotReaderSetupMode::ReadQuorum, false),
+                BitrotReaderSetupStrategy::DataBlocksFirst
+            ));
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, Some("true"), || {
+            assert!(matches!(
+                get_bitrot_reader_setup_strategy(BitrotReaderSetupMode::VerifyReconstruction, false),
+                BitrotReaderSetupStrategy::DataBlocksFirst
+            ));
+        });
+        assert_eq!(BitrotReaderSetupMode::ReadQuorum.as_str(), "read_quorum");
+        assert_eq!(BitrotReaderSetupMode::VerifyReconstruction.as_str(), "verify_reconstruction");
+        assert_eq!(BitrotReaderSetupStrategy::AllShards.as_str(), "all_shards");
+        assert_eq!(BitrotReaderSetupStrategy::DataBlocksFirst.as_str(), "data_blocks_first");
+        assert_eq!(BitrotReaderSetupStrategy::DataBlocksOnly.as_str(), "data_blocks_only");
+
+        let mut setup = BitrotReaderSetup::new(4);
+        assert_eq!(setup.scheduled_shards(), 0);
+        assert!(setup.mark_scheduled(0));
+        assert!(!setup.mark_scheduled(0));
+        assert_eq!(setup.scheduled_shards(), 1);
+        assert_eq!(setup.pending_scheduled_shards(), 1);
+        assert_eq!(setup.available_shards(), 0);
+        assert_eq!(setup.completed_failed_shards(), 0);
+        assert_eq!(setup.reconstruction_verification_target(3, 2), 3);
+        assert!(!setup.has_setup_quorum(3, 2, BitrotReaderSetupMode::ReadQuorum));
+        assert!(!setup.data_shards_attempted(3));
+        assert_eq!(setup.scheduling_target(3, 2, BitrotReaderSetupMode::VerifyReconstruction), 3);
+
+        setup.apply_reader_result(0, Ok(Some(test_object_bitrot_reader())));
+        setup.apply_reader_result(1, Ok(None));
+        setup.apply_reader_result(2, Err(DiskError::FileCorrupt));
+
+        assert_eq!(setup.attempted_shards(), 3);
+        assert_eq!(setup.pending_scheduled_shards(), 0);
+        assert_eq!(setup.available_shards(), 1);
+        assert_eq!(setup.available_data_shards(3), 1);
+        assert_eq!(setup.completed_failed_shards(), 2);
+        assert!(setup.data_shards_attempted(3));
+        assert_eq!(setup.reconstruction_verification_target(3, 2), 3);
+        assert_eq!(setup.setup_target(3, 2, BitrotReaderSetupMode::VerifyReconstruction), 3);
+        assert_eq!(setup.scheduling_target(3, 2, BitrotReaderSetupMode::VerifyReconstruction), 3);
+
+        let mut verification_setup = BitrotReaderSetup::new(4);
+        verification_setup.apply_reader_result(0, Ok(Some(test_object_bitrot_reader())));
+        verification_setup.apply_reader_result(1, Ok(Some(test_object_bitrot_reader())));
+        verification_setup.apply_reader_result(2, Err(DiskError::FileCorrupt));
+        verification_setup.apply_reader_result(3, Ok(Some(test_object_bitrot_reader())));
+        assert_eq!(verification_setup.reconstruction_verification_target(3, 2), 4);
+        assert_eq!(verification_setup.setup_target(3, 2, BitrotReaderSetupMode::VerifyReconstruction), 4);
+        assert!(verification_setup.has_setup_quorum(3, 2, BitrotReaderSetupMode::ReadQuorum));
+
+        setup.retain_deferred_reader(3, test_object_bitrot_reader());
+        assert_eq!(setup.deferred_shards(), 1);
+        assert!(setup.readers[3].is_some());
+        assert!(setup.errors[3].is_none());
+    }
+
+    #[tokio::test]
+    async fn write_unique_file_info_reverts_metadata_when_write_quorum_fails() {
+        let bucket = "write-unique-bucket";
+        let object = "object";
+        let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+        let files = vec![metadata_test_fileinfo(object), metadata_test_fileinfo(object)];
+
+        let result = SetDisks::write_unique_file_info(&[Some(disk.clone()), None], bucket, bucket, object, &files, 2).await;
+
+        assert!(result.is_err(), "missing disk must prevent the requested write quorum");
+        assert!(
+            matches!(
+                disk.read_all(bucket, &path_join_buf(&[object, STORAGE_FORMAT_FILE])).await,
+                Err(DiskError::FileNotFound)
+            ),
+            "successful metadata write must be reverted when quorum is not reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_object_meta_handles_empty_metadata_and_missing_quorum() {
+        let set = io_primitives_test_set(vec![None, None], 1).await;
+        let mut empty = metadata_test_fileinfo("object");
+        empty.metadata.clear();
+
+        set.update_object_meta("bucket", "object", empty, &[None, None])
+            .await
+            .expect("empty metadata update without replacement should be a no-op");
+
+        let mut with_metadata = metadata_test_fileinfo("object");
+        with_metadata
+            .metadata
+            .insert("x-amz-meta-test".to_string(), "value".to_string());
+        let result = set.update_object_meta("bucket", "object", with_metadata, &[None, None]).await;
+
+        assert!(result.is_err(), "missing disks must prevent metadata write quorum");
+    }
+
+    #[tokio::test]
+    async fn load_file_info_versions_exact_returns_versions_from_read_quorum() {
+        let bucket = "exact-versions-bucket";
+        let object = "exact-object";
+        let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+        let mut fi = metadata_test_fileinfo(object);
+        fi.version_id = Some(Uuid::new_v4());
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        disk.write_metadata(bucket, bucket, object, fi.clone())
+            .await
+            .expect("metadata should be written");
+        let set = io_primitives_test_set(vec![Some(disk)], 0).await;
+
+        let versions = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("exact version load should succeed")
+            .expect("exact version load should find metadata");
+
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.versions[0].version_id, fi.version_id);
+        assert_eq!(versions.versions[0].name, object);
+    }
+
+    #[tokio::test]
+    async fn commit_rename_data_dir_deletes_committed_data_dir_and_fails_closed() {
+        let bucket = "commit-rename-bucket";
+        let object = "object";
+        let data_dir = "11111111-1111-1111-1111-111111111111";
+        let path = format!("{object}/{data_dir}/part.1");
+        let (_dir1, disk1) = read_multiple_test_disk(bucket, &[(&path, b"one".as_slice())]).await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[(&path, b"two".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone())], 1).await;
+
+        set.commit_rename_data_dir(&[Some(disk1.clone()), Some(disk2.clone())], bucket, object, data_dir, 2)
+            .await
+            .expect("both disks should delete the committed data dir");
+
+        assert!(matches!(disk1.read_all(bucket, &path).await, Err(DiskError::FileNotFound)));
+        assert!(matches!(disk2.read_all(bucket, &path).await, Err(DiskError::FileNotFound)));
+
+        let missing = set.commit_rename_data_dir(&[None, None], bucket, object, data_dir, 1).await;
+        assert!(missing.is_err(), "missing disk slots must fail closed when cleanup quorum is required");
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_removes_present_disks_and_ignores_missing_disk_slots() {
+        let bucket = "delete-prefix-bucket";
+        let (_dir, disk) = read_multiple_test_disk(bucket, &[("prefix/object.txt", b"payload".as_slice())]).await;
+        let set = io_primitives_test_set(vec![Some(disk.clone()), None], 1).await;
+
+        set.delete_prefix(bucket, "prefix")
+            .await
+            .expect("missing disk slots should not block prefix deletion");
+
+        assert!(matches!(disk.read_all(bucket, "prefix/object.txt").await, Err(DiskError::FileNotFound)));
+    }
+
+    #[tokio::test]
+    async fn delete_if_dangling_respects_recent_write_grace_without_deleting_metadata() {
+        let bucket = "dangling-grace-bucket";
+        let object = "object";
+        let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
+        let set = io_primitives_test_set(vec![Some(disk.clone()), None, None], 1).await;
+        let mut fi = metadata_test_fileinfo(object);
+        fi.mod_time = Some(OffsetDateTime::now_utc());
+        disk.write_metadata(bucket, bucket, object, fi.clone())
+            .await
+            .expect("metadata should be written before dangling check");
+
+        let err = set
+            .delete_if_dangling(
+                bucket,
+                object,
+                &[fi, FileInfo::default(), FileInfo::default()],
+                &[None, Some(DiskError::FileNotFound), Some(DiskError::FileNotFound)],
+                &HashMap::new(),
+                ObjectOptions::default(),
+            )
+            .await
+            .expect_err("recent dangling metadata must stay protected by grace");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+        disk.read_all(bucket, &path_join_buf(&[object, STORAGE_FORMAT_FILE]))
+            .await
+            .expect("metadata should remain during dangling grace");
+    }
+
+    #[tokio::test]
+    async fn delete_if_dangling_returns_stale_metadata_when_all_slots_are_already_absent() {
+        let bucket = "dangling-delete-bucket";
+        let object = "object";
+        let set = io_primitives_test_set(vec![None, None, None], 1).await;
+        let mut fi = metadata_test_fileinfo(object);
+        fi.mod_time = Some(OffsetDateTime::now_utc() - time::Duration::hours(2));
+
+        let deleted = set
+            .delete_if_dangling(
+                bucket,
+                object,
+                &[fi.clone(), FileInfo::default(), FileInfo::default()],
+                &[
+                    Some(DiskError::FileNotFound),
+                    Some(DiskError::FileNotFound),
+                    Some(DiskError::FileNotFound),
+                ],
+                &HashMap::new(),
+                ObjectOptions::default(),
+            )
+            .await
+            .expect("stale dangling metadata should pass when every delete target was already absent");
+
+        assert_eq!(deleted.name, object);
+        assert_eq!(deleted.mod_time, fi.mod_time);
+    }
+
+    #[tokio::test]
+    async fn delete_if_dangling_cleans_when_only_part_results_prove_invalid_metadata_is_dangling() {
+        let bucket = "dangling-invalid-meta-bucket";
+        let object = "object";
+        let set = io_primitives_test_set(vec![None, None, None, None], 1).await;
+        let mut data_errs_by_part = HashMap::new();
+        data_errs_by_part.insert(
+            1,
+            vec![
+                CHECK_PART_FILE_NOT_FOUND,
+                CHECK_PART_FILE_NOT_FOUND,
+                CHECK_PART_FILE_NOT_FOUND,
+                CHECK_PART_DISK_NOT_FOUND,
+            ],
+        );
+
+        let deleted = set
+            .delete_if_dangling(
+                bucket,
+                object,
+                &[
+                    FileInfo::default(),
+                    FileInfo::default(),
+                    FileInfo::default(),
+                    FileInfo::default(),
+                ],
+                &[
+                    Some(DiskError::FileNotFound),
+                    Some(DiskError::FileNotFound),
+                    Some(DiskError::FileNotFound),
+                    Some(DiskError::DiskNotFound),
+                ],
+                &data_errs_by_part,
+                ObjectOptions::default(),
+            )
+            .await
+            .expect("invalid metadata should be cleanable when part results prove the object is dangling");
+
+        assert!(!deleted.is_valid());
+    }
+
+    #[tokio::test]
+    async fn read_multiple_files_returns_quorum_data_and_fails_closed_for_partial_file() {
+        let bucket = "read-multiple-bucket";
+        let prefix = "prefix";
+        let (_dir1, disk1) = read_multiple_test_disk(
+            bucket,
+            &[
+                ("prefix/shared.txt", b"longer shared payload".as_slice()),
+                ("prefix/partial.txt", b"only one disk".as_slice()),
+            ],
+        )
+        .await;
+        let (_dir2, disk2) = read_multiple_test_disk(bucket, &[("prefix/shared.txt", b"short".as_slice())]).await;
+        let req = ReadMultipleReq {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            files: vec!["shared.txt".to_string(), "partial.txt".to_string()],
+            max_size: 0,
+            metadata_only: false,
+            abort404: false,
+            max_results: 0,
+        };
+
+        let responses = SetDisks::read_multiple_files(&[Some(disk1), Some(disk2)], req, 2).await;
+
+        assert_eq!(responses.len(), 2);
+        assert!(responses[0].exists);
+        assert_eq!(responses[0].data, b"longer shared payload");
+        assert!(!responses[1].exists);
+        assert_eq!(responses[1].error, Error::ErasureReadQuorum.to_string());
+    }
+
+    #[tokio::test]
+    async fn read_multiple_files_returns_read_quorum_error_when_no_disk_can_answer() {
+        let req = ReadMultipleReq {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            files: vec!["missing.txt".to_string()],
+            max_size: 0,
+            metadata_only: false,
+            abort404: false,
+            max_results: 0,
+        };
+
+        let responses = SetDisks::read_multiple_files(&[None, None], req, 1).await;
+
+        assert_eq!(responses.len(), 1);
+        assert!(!responses[0].exists);
+        assert_eq!(responses[0].error, Error::ErasureReadQuorum.to_string());
     }
 
     #[tokio::test]
@@ -4040,6 +4450,63 @@ mod tests {
             .await
             .expect("released read-repair reservation should allow retry");
         release_read_repair_heal_reservation(&retry_key).await;
+    }
+
+    #[test]
+    fn record_read_repair_dedup_accepts_known_reasons() {
+        record_read_repair_dedup("duplicate");
+        record_read_repair_dedup("policy_drop");
+    }
+
+    #[tokio::test]
+    async fn reserve_read_repair_heal_prunes_oldest_entry_at_capacity() {
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        let first_object = format!("object-{}", Uuid::new_v4());
+        let first_key = reserve_read_repair_heal(&bucket, &first_object, None, 1, 1)
+            .await
+            .expect("first reservation should be accepted");
+
+        let mut keys = vec![first_key.clone()];
+        for index in 0..(READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES + 8) {
+            let object = format!("object-{index}-{}", Uuid::new_v4());
+            if let Some(key) = reserve_read_repair_heal(&bucket, &object, None, 1, 1).await {
+                keys.push(key);
+            }
+        }
+
+        let replaced_first = reserve_read_repair_heal(&bucket, &first_object, None, 1, 1).await;
+        for key in keys {
+            release_read_repair_heal_reservation(&key).await;
+        }
+        if let Some(key) = replaced_first.as_ref() {
+            release_read_repair_heal_reservation(key).await;
+        }
+
+        assert!(
+            replaced_first.is_some(),
+            "capacity pruning should evict the oldest read-repair reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_read_repair_heal_wrapper_records_reservation_without_external_channel() {
+        let object = format!("object-{}", Uuid::new_v4());
+        submit_read_repair_heal("bucket", &object, None, 4, 5, Some(7), "test").await;
+
+        for _ in 0..20 {
+            if let Some(key) = reserve_read_repair_heal("bucket", &object, None, 4, 5).await {
+                release_read_repair_heal_reservation(&key).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if let Some(key) = reserve_read_repair_heal("bucket", &object, None, 4, 5).await {
+            release_read_repair_heal_reservation(&key).await;
+        } else {
+            let admitted_key = ReadRepairHealCacheKey::new("bucket", &object, None, 4, 5);
+            release_read_repair_heal_reservation(&admitted_key).await;
+        }
     }
 
     #[tokio::test]
@@ -4068,6 +4535,34 @@ mod tests {
         }
 
         panic!("failed read-repair submission should release its dedup reservation");
+    }
+
+    #[tokio::test]
+    async fn submit_read_repair_heal_releases_reservation_after_not_admitted_response() {
+        let object = format!("object-{}", Uuid::new_v4());
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: "bucket",
+                object: &object,
+                version_id: Some("version-1"),
+                pool_index: 2,
+                set_index: 3,
+                part_number: Some(2),
+                reason: "test",
+            },
+            dropped_read_repair_submitter,
+        )
+        .await;
+
+        for _ in 0..20 {
+            if let Some(key) = reserve_read_repair_heal("bucket", &object, Some("version-1"), 2, 3).await {
+                release_read_repair_heal_reservation(&key).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("not-admitted read-repair submission should release its dedup reservation");
     }
 
     #[tokio::test]

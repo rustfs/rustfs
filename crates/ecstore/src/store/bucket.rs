@@ -430,6 +430,18 @@ mod tests {
         false
     }
 
+    async fn write_bucket_metadata_marker(disk_paths: &[PathBuf], metadata_prefix: &str) {
+        for disk_path in disk_paths {
+            let marker_path = disk_path.join(metadata_prefix).join("config.json");
+            tokio::fs::create_dir_all(marker_path.parent().expect("metadata marker path should have a parent"))
+                .await
+                .expect("metadata marker parent should be created");
+            tokio::fs::write(marker_path, b"bucket metadata")
+                .await
+                .expect("metadata marker should be written");
+        }
+    }
+
     #[test]
     fn should_not_override_when_metadata_created_is_unix_epoch() {
         assert!(!should_override_created_from_metadata(OffsetDateTime::UNIX_EPOCH));
@@ -509,6 +521,7 @@ mod tests {
         let metadata_prefix = format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}/{bucket}");
 
         create_bucket_with_object(&ecstore, &bucket, object).await;
+        write_bucket_metadata_marker(&disk_paths, &metadata_prefix).await;
         assert!(any_disk_path_exists(&disk_paths, &metadata_prefix).await);
 
         ecstore

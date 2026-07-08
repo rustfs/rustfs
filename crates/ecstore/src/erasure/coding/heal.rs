@@ -208,10 +208,10 @@ mod tests {
     use super::*;
     use crate::erasure::coding::{CustomWriter, Erasure};
     use rustfs_utils::HashAlgorithm;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncWrite, ReadBuf};
 
     /// An `AsyncWrite` that accepts writes until `fail_at` bytes have been
     /// written, then fails every subsequent write. Used to simulate a
@@ -237,6 +237,91 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    struct PendingReader;
+
+    impl AsyncRead for PendingReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("synthetic heal read failure")))
+        }
+    }
+
+    fn inline_writer(shard_size: usize) -> BitrotWriterWrapper {
+        BitrotWriterWrapper::new(CustomWriter::new_inline_buffer(), shard_size, HashAlgorithm::None)
+    }
+
+    #[tokio::test]
+    async fn read_heal_shards_returns_empty_slots_for_zero_sized_shards() {
+        let mut readers = vec![
+            Some(BitrotReader::new(Cursor::new(vec![1, 2, 3]), 0, HashAlgorithm::None, false)),
+            None,
+        ];
+
+        let (shards, errs) = read_heal_shards(&mut readers, 0, Duration::ZERO).await;
+
+        assert_eq!(shards, vec![None, None]);
+        assert_eq!(errs, vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn read_heal_shards_records_reader_errors_and_retiring_timeouts() {
+        let mut readers = vec![Some(BitrotReader::new(FailingReader, 4, HashAlgorithm::None, false))];
+
+        let (shards, errs) = read_heal_shards(&mut readers, 4, Duration::ZERO).await;
+
+        assert!(shards[0].is_none());
+        assert!(
+            errs[0]
+                .as_ref()
+                .is_some_and(|err| err.to_string().contains("synthetic heal read failure"))
+        );
+        assert!(readers[0].is_some(), "ordinary read errors must not retire readers");
+
+        let mut timeout_readers = vec![Some(BitrotReader::new(PendingReader, 4, HashAlgorithm::None, false))];
+        let (shards, errs) = read_heal_shards(&mut timeout_readers, 4, Duration::from_millis(1)).await;
+
+        assert_eq!(shards, vec![None]);
+        assert!(errs[0].as_ref().is_some_and(|err| err.to_string().contains("timed out")));
+        assert!(timeout_readers[0].is_none(), "timed-out readers are retired");
+    }
+
+    #[tokio::test]
+    async fn heal_rejects_invalid_writer_shape_before_reading() {
+        let erasure = Erasure::new(2, 1, 64);
+        let mut writers = vec![Some(inline_writer(erasure.shard_size()))];
+        let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = Vec::new();
+
+        let err = erasure
+            .heal(&mut writers, readers, 0, &[])
+            .await
+            .expect_err("invalid writer count must fail");
+
+        assert!(err.to_string().contains("invalid argument"));
+    }
+
+    #[tokio::test]
+    async fn heal_empty_object_only_shuts_down_available_writers() {
+        let erasure = Erasure::new(2, 1, 64);
+        let mut writers = (0..erasure.total_shard_count())
+            .map(|_| Some(inline_writer(erasure.shard_size())))
+            .collect::<Vec<_>>();
+        let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = Vec::new();
+
+        erasure
+            .heal(&mut writers, readers, 0, &[])
+            .await
+            .expect("empty object heal should only close writers");
+
+        assert!(writers.iter().all(Option::is_some));
     }
 
     #[tokio::test]
@@ -266,11 +351,7 @@ mod tests {
         let mut writers = (0..erasure.total_shard_count())
             .map(|index| {
                 if index == missing_parity {
-                    Some(BitrotWriterWrapper::new(
-                        CustomWriter::new_inline_buffer(),
-                        erasure.shard_size(),
-                        HashAlgorithm::None,
-                    ))
+                    Some(inline_writer(erasure.shard_size()))
                 } else {
                     None
                 }
@@ -319,11 +400,7 @@ mod tests {
         let mut writers = (0..erasure.total_shard_count())
             .map(|index| {
                 if index == missing_data {
-                    Some(BitrotWriterWrapper::new(
-                        CustomWriter::new_inline_buffer(),
-                        erasure.shard_size(),
-                        HashAlgorithm::None,
-                    ))
+                    Some(inline_writer(erasure.shard_size()))
                 } else {
                     None
                 }
@@ -403,11 +480,7 @@ mod tests {
         let mut writers = (0..erasure.total_shard_count())
             .map(|index| {
                 if index == missing_data {
-                    Some(BitrotWriterWrapper::new(
-                        CustomWriter::new_inline_buffer(),
-                        erasure.shard_size(),
-                        HashAlgorithm::None,
-                    ))
+                    Some(inline_writer(erasure.shard_size()))
                 } else {
                     None
                 }

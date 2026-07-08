@@ -942,6 +942,9 @@ mod tests {
     use super::*;
     use proptest::collection::{btree_set, vec};
     use proptest::prelude::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
 
     fn optional_shards(shards: &[Bytes]) -> Vec<Option<Vec<u8>>> {
         shards.iter().map(|shard| Some(shard.to_vec())).collect()
@@ -984,6 +987,29 @@ mod tests {
         assert_eq!(owned, borrowed);
     }
 
+    struct ErrorAfterPartialReader {
+        emitted: bool,
+    }
+
+    impl AsyncRead for ErrorAfterPartialReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if !self.emitted {
+                self.emitted = true;
+                buf.put_slice(&[1]);
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "partial read failure")))
+        }
+    }
+
+    struct ImmediateErrorReader;
+
+    impl AsyncRead for ImmediateErrorReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("immediate read failure")))
+        }
+    }
+
     #[test]
     fn has_valid_dimensions_rejects_zero_block_size_or_data_shards() {
         // Well-formed erasure metadata is accepted.
@@ -997,6 +1023,130 @@ mod tests {
         assert!(!Erasure::new(4, 2, 0).has_valid_dimensions());
         assert!(!Erasure::new(0, 0, 64).has_valid_dimensions());
         assert!(!Erasure::new(0, 0, 0).has_valid_dimensions());
+    }
+
+    #[tokio::test]
+    async fn encode_stream_callback_async_stops_on_reader_errors() {
+        let erasure = std::sync::Arc::new(Erasure::new(2, 1, 4));
+        let mut partial_error = ErrorAfterPartialReader { emitted: false };
+        let mut partial_callbacks = Vec::new();
+        let total = erasure
+            .clone()
+            .encode_stream_callback_async(&mut partial_error, |result| {
+                partial_callbacks.push(result.map(|blocks| blocks.len()).map_err(|err| err.kind()));
+                async { Ok::<(), io::Error>(()) }
+            })
+            .await
+            .expect("partial read error should not make callback fail");
+        assert_eq!(total, 0);
+        assert!(
+            partial_callbacks.is_empty(),
+            "unexpected EOF after a partial read should stop without emitting a block"
+        );
+
+        let mut immediate_error = ImmediateErrorReader;
+        let mut immediate_callbacks = Vec::new();
+        let total = erasure
+            .encode_stream_callback_async(&mut immediate_error, |result| {
+                immediate_callbacks.push(result.map(|blocks| blocks.len()).map_err(|err| err.kind()));
+                async { Ok::<(), io::Error>(()) }
+            })
+            .await
+            .expect("immediate read error should be delivered to callback");
+        assert_eq!(total, 0);
+        assert_eq!(immediate_callbacks, vec![Err(io::ErrorKind::Other)]);
+    }
+
+    #[test]
+    fn default_and_legacy_clone_preserve_safe_zero_state_and_restore_data() {
+        let default = Erasure::default();
+        assert_eq!(default.total_shard_count(), 0);
+        assert!(!default.has_valid_dimensions());
+        assert_eq!(default.shard_file_size(0), 0);
+        assert_eq!(default.shard_file_size(-7), -7);
+
+        let legacy = Erasure::new_with_options(2, 2, 64, true);
+        let cloned = legacy.clone();
+        assert_eq!(cloned.data_shards, legacy.data_shards);
+        assert_eq!(cloned.parity_shards, legacy.parity_shards);
+        assert_eq!(cloned.block_size, legacy.block_size);
+        assert!(cloned.uses_legacy);
+
+        let data = b"legacy clone should keep independent SIMD caches";
+        let encoded = cloned.encode_data(data).expect("legacy clone should encode");
+        let mut shards = optional_shards(&encoded);
+        shards[0] = None;
+        cloned.decode_data(&mut shards).expect("legacy clone should decode");
+        assert_eq!(recover_data(&shards, cloned.data_shards, data.len()), data);
+    }
+
+    #[test]
+    fn legacy_verify_reports_invalid_empty_valid_and_corrupt_parity_sets() {
+        let legacy = LegacyReedSolomonEncoder::new(2, 2).expect("legacy encoder should construct");
+        let wrong_count: [&[u8]; 1] = [&[]];
+        let err = legacy.verify(&wrong_count).expect_err("wrong shard count must be rejected");
+        assert!(err.to_string().contains("invalid shard count"));
+
+        let empty: [&[u8]; 4] = [&[], &[], &[], &[]];
+        assert!(
+            legacy
+                .verify(&empty)
+                .expect("all-empty legacy shards are internally consistent")
+        );
+
+        let erasure = Erasure::new_with_options(2, 2, 64, true);
+        let encoded = erasure
+            .encode_data(b"legacy verify should compare regenerated parity")
+            .expect("legacy encode should succeed");
+        let refs = encoded.iter().map(Bytes::as_ref).collect::<Vec<_>>();
+        assert!(legacy.verify(&refs).expect("valid legacy shards should verify"));
+
+        let mut corrupt = encoded.iter().map(|shard| shard.to_vec()).collect::<Vec<_>>();
+        corrupt[erasure.data_shards][0] ^= 0x80;
+        let corrupt_refs = corrupt.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert!(!legacy.verify(&corrupt_refs).expect("corrupt parity should be detected"));
+    }
+
+    #[test]
+    fn parity_helper_and_empty_payload_recovery_fail_closed_on_malformed_shards() {
+        let mut wrong_count = vec![Some(vec![1])];
+        let err = encode_parity_shards(&mut wrong_count, 2, 1, |_| panic!("wrong count must fail before encode"))
+            .expect_err("wrong shard count must be rejected");
+        assert!(err.to_string().contains("invalid shard count"));
+
+        let mut inconsistent_empty = vec![Some(Vec::new()), Some(vec![1])];
+        let err = encode_parity_shards(&mut inconsistent_empty, 1, 1, |_| panic!("zero-length mismatch must fail before encode"))
+            .expect_err("mixed empty and non-empty shards must be rejected");
+        assert!(err.to_string().contains("inconsistent shard length"));
+
+        let mut inconsistent_non_empty = vec![Some(vec![1]), Some(vec![2, 3])];
+        let err = encode_parity_shards(&mut inconsistent_non_empty, 1, 1, |_| {
+            panic!("non-empty length mismatch must fail before encode")
+        })
+        .expect_err("mismatched non-empty shards must be rejected");
+        assert!(err.to_string().contains("inconsistent shard length"));
+
+        let mut no_present_empty_payload = vec![None, None, None];
+        assert!(
+            !recover_empty_payload_data_shards(&mut no_present_empty_payload, 2, 1)
+                .expect("all-missing empty payload marker should not be synthesized")
+        );
+    }
+
+    #[test]
+    fn verify_data_and_parity_handles_zero_parity_and_rejects_wrong_count() {
+        let no_parity = Erasure::new(2, 0, 64);
+        assert!(
+            no_parity
+                .verify_data_and_parity(&[Some(vec![1]), Some(vec![2, 3])])
+                .expect("zero parity requires no parity verification")
+        );
+
+        let erasure = Erasure::new(2, 2, 64);
+        let err = erasure
+            .verify_data_and_parity(&[Some(Vec::new())])
+            .expect_err("wrong shard count must fail verification");
+        assert!(err.to_string().contains("invalid shard count"));
     }
 
     #[test]
@@ -1753,37 +1903,22 @@ mod tests {
             // Create data that will result in 64+ byte shards
             let data = vec![0x42u8; 200]; // 200 bytes, should create ~50 byte shards per data shard
 
-            let result = erasure.encode_data(&data);
+            let shards = erasure.encode_data(&data).expect("minimum shard size data should encode");
+            println!("SIMD encoding succeeded with shard size: {}", shards[0].len());
 
-            // This might fail due to SIMD shard size requirements
-            match result {
-                Ok(shards) => {
-                    println!("SIMD encoding succeeded with shard size: {}", shards[0].len());
+            // Test decoding
+            let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|b| Some(b.to_vec())).collect();
+            shards_opt[1] = None;
 
-                    // Test decoding
-                    let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|b| Some(b.to_vec())).collect();
-                    shards_opt[1] = None;
-
-                    let decode_result = erasure.decode_data(&mut shards_opt);
-                    match decode_result {
-                        Ok(_) => {
-                            let mut recovered = Vec::new();
-                            for shard in shards_opt.iter().take(data_shards) {
-                                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
-                            }
-                            recovered.truncate(data.len());
-                            assert_eq!(&recovered, &data);
-                        }
-                        Err(e) => {
-                            println!("SIMD decoding failed with shard size {}: {}", shards[0].len(), e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("SIMD encoding failed with small shard size: {e}");
-                    // This is expected for very small shard sizes
-                }
+            erasure
+                .decode_data(&mut shards_opt)
+                .expect("minimum shard size data should decode");
+            let mut recovered = Vec::new();
+            for shard in shards_opt.iter().take(data_shards) {
+                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
             }
+            recovered.truncate(data.len());
+            assert_eq!(&recovered, &data);
         }
 
         #[test]
@@ -1877,46 +2012,26 @@ mod tests {
             let small_data = b"tiny!123".to_vec(); // 8 bytes data
 
             // Test encoding with small data
-            let result = erasure.encode_data(&small_data);
-            match result {
-                Ok(shards) => {
-                    println!("✅ SIMD encoding succeeded: {} bytes into {} shards", small_data.len(), shards.len());
-                    assert_eq!(shards.len(), data_shards + parity_shards);
+            let shards = erasure.encode_data(&small_data).expect("small data should encode");
+            println!("SIMD encoding succeeded: {} bytes into {} shards", small_data.len(), shards.len());
+            assert_eq!(shards.len(), data_shards + parity_shards);
 
-                    // Test decoding
-                    let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|shard| Some(shard.to_vec())).collect();
+            // Test decoding
+            let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|shard| Some(shard.to_vec())).collect();
 
-                    // Lose some shards to test recovery
-                    shards_opt[1] = None; // Lose one data shard
-                    shards_opt[4] = None; // Lose one parity shard
+            // Lose some shards to test recovery
+            shards_opt[1] = None; // Lose one data shard
+            shards_opt[4] = None; // Lose one parity shard
 
-                    let decode_result = erasure.decode_data(&mut shards_opt);
-                    match decode_result {
-                        Ok(()) => {
-                            println!("✅ SIMD decode worked");
-
-                            // Verify recovered data
-                            let mut recovered = Vec::new();
-                            for shard in shards_opt.iter().take(data_shards) {
-                                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
-                            }
-                            recovered.truncate(small_data.len());
-                            println!("recovered: {recovered:?}");
-                            println!("small_data: {small_data:?}");
-                            assert_eq!(&recovered, &small_data);
-                            println!("✅ Data recovery successful with SIMD");
-                        }
-                        Err(e) => {
-                            println!("❌ SIMD decode failed: {e}");
-                            // For very small data, decode failure might be acceptable
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("❌ SIMD encode failed: {e}");
-                    // For very small data or configuration issues, encoding might fail
-                }
+            erasure.decode_data(&mut shards_opt).expect("small data should decode");
+            let mut recovered = Vec::new();
+            for shard in shards_opt.iter().take(data_shards) {
+                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
             }
+            recovered.truncate(small_data.len());
+            println!("recovered: {recovered:?}");
+            println!("small_data: {small_data:?}");
+            assert_eq!(&recovered, &small_data);
         }
 
         #[test]
