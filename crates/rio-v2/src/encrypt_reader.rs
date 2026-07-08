@@ -462,6 +462,19 @@ where
                         let n = read_buf.filled().len();
                         if n == 0 {
                             if *this.header_read == 0 {
+                                // Clean EOF at a package boundary. Execution only reaches here
+                                // with `finalized == false` (the finalized case is consumed at the
+                                // loop top). If at least one package of the current part has been
+                                // decrypted (`ref_nonce.is_some()`) but we never saw a final-flagged
+                                // package, the final package is missing => DARE truncation. Zero
+                                // decrypted packages (`ref_nonce.is_none()`) is a legitimately empty
+                                // object (encrypt emits no packages for empty plaintext), so accept.
+                                if this.ref_nonce.is_some() {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "DARE stream truncated before a finalized package",
+                                    )));
+                                }
                                 *this.finished = true;
                                 return Poll::Ready(Ok(()));
                             }
@@ -850,5 +863,122 @@ mod tests {
 
         assert_eq!(decrypted, expected);
         assert_ne!(encrypted_one, encrypted_two[..encrypted_one.len()]);
+    }
+
+    #[tokio::test]
+    async fn decrypt_reader_rejects_stream_truncated_at_package_boundary() {
+        // Plaintext spans three packages: two full non-final 64KiB packages plus a
+        // short final-flagged package. Dropping the final package at the boundary
+        // between complete packages must be detected as DARE truncation.
+        let plaintext = vec![0xCD; DARE_PAYLOAD_SIZE * 2 + 19];
+        let key_bytes = [0x21u8; 32];
+        let base_nonce = [0x37u8; 12];
+
+        let mut encrypted = Vec::new();
+        EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt multi-package plaintext");
+
+        // Two full non-final packages precede the final package; truncate at their boundary.
+        let truncated = encrypted[..DARE_PACKAGE_SIZE * 2].to_vec();
+        assert!(truncated.len() < encrypted.len(), "truncation must drop the final package");
+
+        let mut decrypted = Vec::new();
+        let err = DecryptReader::new(Cursor::new(truncated), key_bytes, base_nonce)
+            .read_to_end(&mut decrypted)
+            .await
+            .expect_err("truncated DARE stream must fail to decrypt");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn empty_plaintext_roundtrips_without_truncation_error() {
+        // Empty plaintext emits zero DARE packages; decrypt must accept it as an
+        // empty object rather than a truncated stream (no false positive).
+        let key_bytes = [0x5Au8; 32];
+        let base_nonce = [0x11u8; 12];
+
+        let mut encrypted = Vec::new();
+        EncryptReader::new(Cursor::new(Vec::new()), key_bytes, base_nonce)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt empty plaintext");
+        assert!(encrypted.is_empty(), "empty plaintext must emit no DARE packages");
+
+        let mut decrypted = Vec::new();
+        DecryptReader::new(Cursor::new(encrypted), key_bytes, base_nonce)
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("decrypt empty DARE stream");
+        assert!(decrypted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_package_stream_full_roundtrip_succeeds() {
+        // Regression: a complete multi-package stream (ending with a final-flagged
+        // package) still decrypts to the original plaintext.
+        let plaintext = vec![0x7Eu8; DARE_PAYLOAD_SIZE * 2 + 123];
+        let key_bytes = [0x93u8; 32];
+        let base_nonce = [0x4Cu8; 12];
+
+        let mut encrypted = Vec::new();
+        EncryptReader::new(Cursor::new(plaintext.clone()), key_bytes, base_nonce)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt multi-package plaintext");
+
+        let mut decrypted = Vec::new();
+        DecryptReader::new(Cursor::new(encrypted), key_bytes, base_nonce)
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("decrypt complete multi-package stream");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn multipart_stream_full_roundtrip_and_truncation() {
+        let object_key = [0x64u8; 32];
+        let part_one_plaintext = vec![0xA1; DARE_PAYLOAD_SIZE + 31];
+        // Part two spans multiple packages so it can be truncated within the part.
+        let part_two_plaintext = vec![0xB2; DARE_PAYLOAD_SIZE * 2 + 7];
+
+        let mut encrypted_one = Vec::new();
+        EncryptReader::new_multipart_with_object_key(Cursor::new(part_one_plaintext.clone()), object_key, 1)
+            .read_to_end(&mut encrypted_one)
+            .await
+            .expect("encrypt multipart part one");
+
+        let mut encrypted_two = Vec::new();
+        EncryptReader::new_multipart_with_object_key(Cursor::new(part_two_plaintext.clone()), object_key, 2)
+            .read_to_end(&mut encrypted_two)
+            .await
+            .expect("encrypt multipart part two");
+
+        let mut encrypted = encrypted_one.clone();
+        encrypted.extend_from_slice(&encrypted_two);
+
+        // Full multipart stream decrypts back to the concatenated plaintext.
+        let mut decrypted = Vec::new();
+        DecryptReader::new_multipart_with_object_key(Cursor::new(encrypted.clone()), object_key, vec![1, 2])
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("decrypt complete multipart stream");
+        let mut expected = part_one_plaintext.clone();
+        expected.extend_from_slice(&part_two_plaintext);
+        assert_eq!(decrypted, expected);
+
+        // Truncate within part two at its first internal package boundary, dropping its
+        // final package. Part one still ends via `finalized`; the failure surfaces only
+        // once part two hits EOF with at least one decrypted package and no final flag.
+        let truncated = encrypted[..encrypted_one.len() + DARE_PACKAGE_SIZE].to_vec();
+        assert!(truncated.len() < encrypted.len(), "truncation must drop part two's final package");
+
+        let mut sink = Vec::new();
+        let err = DecryptReader::new_multipart_with_object_key(Cursor::new(truncated), object_key, vec![1, 2])
+            .read_to_end(&mut sink)
+            .await
+            .expect_err("multipart stream truncated within a part must fail");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
