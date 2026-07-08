@@ -412,8 +412,12 @@ impl AuditSystem {
     }
 
     pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {
-        let replay_workers = self.stream_cancellers.read().await;
+        // Lock order must match every other path that holds both locks
+        // (`clear_runtime_targets`, `AuditRuntimeFacade::replace_targets`):
+        // acquire `registry` first, then `stream_cancellers`. Reversing the
+        // order here would create an AB-BA deadlock with those paths.
         let registry = self.registry.lock().await;
+        let replay_workers = self.stream_cancellers.read().await;
         registry.runtime_manager().status_snapshot(&replay_workers)
     }
 
@@ -640,5 +644,65 @@ mod tests {
         assert_eq!(system.runtime_status_snapshot().await, ReplayWorkerManager::new().snapshot(0));
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*system.config.read().await, Some(rustfs_config::server_config::Config(HashMap::new())));
+    }
+
+    /// Regression guard for backlog#961: `runtime_status_snapshot` and
+    /// `clear_runtime_targets` both hold `registry` and `stream_cancellers`.
+    /// They previously acquired the two locks in opposite orders (AB-BA),
+    /// which could deadlock the whole audit control plane under concurrency.
+    /// Hammer both paths from multiple worker threads and assert the workload
+    /// completes within a timeout instead of hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_status_and_clear_do_not_deadlock() {
+        use std::time::Duration;
+
+        const ITERATIONS: usize = 2_000;
+        const TASKS_PER_PATH: usize = 4;
+
+        let system = AuditSystem::new();
+
+        // Seed a target + replay worker so both critical sections touch real state.
+        {
+            let mut registry = system.registry.lock().await;
+            registry.add_target("primary:webhook".to_string(), Box::new(TestTarget::new("primary", "webhook")));
+        }
+        {
+            let mut replay_workers = system.stream_cancellers.write().await;
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            replay_workers.insert("primary:webhook".to_string(), cancel_tx);
+        }
+
+        let mut handles = Vec::new();
+
+        for _ in 0..TASKS_PER_PATH {
+            let status_system = system.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ITERATIONS {
+                    // registry -> stream_cancellers (read)
+                    let _ = status_system.runtime_status_snapshot().await;
+                }
+            }));
+
+            let clear_system = system.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ITERATIONS {
+                    // registry -> stream_cancellers (write)
+                    clear_system
+                        .clear_runtime_targets()
+                        .await
+                        .expect("clear_runtime_targets should succeed");
+                }
+            }));
+        }
+
+        let workload = async {
+            for handle in handles {
+                handle.await.expect("worker task panicked");
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), workload)
+            .await
+            .expect("audit lock paths deadlocked (backlog#961 regression)");
     }
 }
