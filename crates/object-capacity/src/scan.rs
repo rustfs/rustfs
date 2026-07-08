@@ -27,6 +27,8 @@ use rustfs_io_metrics::capacity_metrics::{
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
@@ -49,6 +51,7 @@ const EVENT_CAPACITY_SCAN_TRAVERSAL_FAILED: &str = "capacity_scan_traversal_fail
 const EVENT_CAPACITY_SCAN_METADATA_FAILED: &str = "capacity_scan_metadata_failed";
 const EVENT_CAPACITY_SCAN_SAMPLING_APPLIED: &str = "capacity_scan_sampling_applied";
 const EVENT_CAPACITY_SCAN_EXACT_COMPLETED: &str = "capacity_scan_exact_completed";
+const EVENT_CAPACITY_SCAN_HARD_TIMEOUT: &str = "capacity_scan_hard_timeout";
 const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 const RUSTFS_META_TMP_DIR: &str = "tmp";
 const RUSTFS_META_TMP_TRASH_DIR: &str = ".trash";
@@ -695,16 +698,51 @@ fn timeout_fallback_estimate(
     })
 }
 
+/// Hard wall-clock ceiling for one disk scan, enforced from async context.
+///
+/// The in-scan `ProgressMonitor` checks are cooperative — they only run
+/// between walker entries, so a stat/readdir blocked on a dying disk or hung
+/// NFS mount never returns control to them. Twice the cooperative budget
+/// leaves room for a slow-but-alive walker to reach its own timeout fallback
+/// first; only a truly wedged scan trips the outer ceiling.
+fn outer_scan_budget(limits: &ScanLimits) -> Duration {
+    limits.max_timeout.saturating_mul(2).max(Duration::from_secs(5))
+}
+
 async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::Error> {
     let path = path.to_path_buf();
     let limits = ScanLimits::from_env();
+    let budget = outer_scan_budget(&limits);
 
-    tokio::task::spawn_blocking(move || scan_dir_blocking(&path, &limits))
-        .await
-        .map_err(std::io::Error::other)?
+    // The blocking thread cannot be killed; on ceiling expiry the caller (and
+    // with it the refresh singleflight) is released with an error while
+    // `cancelled` asks the walker to exit at its next entry, bounding the
+    // thread leak to the single wedged syscall (backlog#1017 S02).
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let scan_cancelled = cancelled.clone();
+    let scan = tokio::task::spawn_blocking(move || scan_dir_blocking(&path, &limits, &scan_cancelled));
+
+    match tokio::time::timeout(budget, scan).await {
+        Ok(join_result) => join_result.map_err(std::io::Error::other)?,
+        Err(_) => {
+            cancelled.store(true, Ordering::Relaxed);
+            warn!(
+                event = EVENT_CAPACITY_SCAN_HARD_TIMEOUT,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_SCAN,
+                result = "hard_timeout",
+                budget_ms = budget.as_millis() as u64,
+                "capacity scan exceeded hard wall-clock budget; blocking walker asked to stop"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("capacity scan exceeded hard wall-clock budget of {budget:?}"),
+            ))
+        }
+    }
 }
 
-fn scan_dir_blocking(path: &Path, limits: &ScanLimits) -> Result<CapacityScanResult, std::io::Error> {
+fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -> Result<CapacityScanResult, std::io::Error> {
     let ScanLimits {
         max_files_threshold,
         base_timeout,
@@ -745,6 +783,13 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits) -> Result<CapacityScanRes
             .into_iter();
 
         for entry_result in walker {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("capacity scan cancelled after hard budget expiry ({file_count} files seen)"),
+                ));
+            }
+
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -1329,8 +1374,32 @@ mod tests {
         // Zero budget times out at the first progress check with no samples;
         // a tempdir is not a dedicated mount, so no estimator exists and the
         // original timeout error must still surface (last-resort behavior).
-        let result = scan_dir_blocking(temp_dir.path(), &tight_limits(Duration::ZERO));
+        let result = scan_dir_blocking(temp_dir.path(), &tight_limits(Duration::ZERO), &AtomicBool::new(false));
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn test_scan_dir_blocking_stops_when_cancelled() {
+        use std::fs::File;
+        use std::io::Write;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut file = File::create(temp_dir.path().join("f0")).unwrap();
+        file.write_all(b"x").unwrap();
+
+        // A pre-cancelled scan must exit at the first walker entry instead of
+        // completing, so a wedged-then-released walker doesn't keep scanning
+        // long after the outer budget already failed the refresh.
+        let result = scan_dir_blocking(temp_dir.path(), &tight_limits(Duration::from_secs(600)), &AtomicBool::new(true));
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn test_outer_scan_budget_bounds() {
+        // Twice the cooperative ceiling, and never below the 5s floor even for
+        // degenerate max_timeout values.
+        assert_eq!(outer_scan_budget(&tight_limits(Duration::from_secs(15))), Duration::from_secs(30));
+        assert_eq!(outer_scan_budget(&tight_limits(Duration::ZERO)), Duration::from_secs(5));
     }
 
     #[test]
@@ -1344,7 +1413,8 @@ mod tests {
             file.write_all(b"hello").unwrap();
         }
 
-        let result = scan_dir_blocking(temp_dir.path(), &tight_limits(Duration::from_secs(600))).unwrap();
+        let result =
+            scan_dir_blocking(temp_dir.path(), &tight_limits(Duration::from_secs(600)), &AtomicBool::new(false)).unwrap();
         assert_eq!(result.used_bytes, 25);
         assert_eq!(result.file_count, 5);
         assert!(!result.is_estimated);
