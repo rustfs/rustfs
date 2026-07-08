@@ -295,7 +295,8 @@ pub(super) fn init_observability_http(
         .with(tracer_layer)
         .with(otel_bridge)
         .with(metrics_layer)
-        .init();
+        .try_init()
+        .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     counter!("rustfs_start_total").increment(1);
     info!(
