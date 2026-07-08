@@ -45,7 +45,6 @@ use super::replication_storage_boundary::{
 use super::replication_target_boundary::{ReplicationTargetStore, replication_object_is_ssec_encrypted};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
-use lazy_static::lazy_static;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
@@ -1293,14 +1292,16 @@ impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
     }
 }
 
-lazy_static! {
-    pub static ref GLOBAL_REPLICATION_POOL: tokio::sync::OnceCell<Arc<DynReplicationPool>> = tokio::sync::OnceCell::new();
-    pub static ref GLOBAL_REPLICATION_STATS: tokio::sync::OnceCell<Arc<ReplicationStats>> = tokio::sync::OnceCell::new();
-}
-
-/// Initializes background replication with the given options
+/// Initializes background replication with the given options.
+///
+/// Phase 5 (backlog#939): the replication stats/pool moved into the per-instance
+/// `InstanceContext`; this owner initializes the current instance's cells
+/// (lazily, once — single-instance behavior is unchanged).
 pub async fn init_background_replication<S: ReplicationStorage>(storage: Arc<S>) {
-    let stats = GLOBAL_REPLICATION_STATS
+    let ctx = crate::runtime::global::current_ctx();
+
+    let stats = ctx
+        .replication_stats_cell()
         .get_or_init(|| async {
             let stats = Arc::new(ReplicationStats::new());
             stats.start_background_tasks().await;
@@ -1308,7 +1309,8 @@ pub async fn init_background_replication<S: ReplicationStorage>(storage: Arc<S>)
         })
         .await;
 
-    let _pool = GLOBAL_REPLICATION_POOL
+    let _pool = ctx
+        .replication_pool_cell()
         .get_or_init(|| async {
             let pool = ReplicationPool::new(ReplicationPoolOpts::default(), stats.clone(), storage).await;
             pool as Arc<DynReplicationPool>

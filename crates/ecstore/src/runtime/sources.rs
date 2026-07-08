@@ -23,10 +23,7 @@ use crate::disk::endpoint::Endpoint;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState},
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
-    bucket::replication::{
-        DynReplicationPool, ReplicationStats,
-        replication_pool::{GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS},
-    },
+    bucket::replication::{DynReplicationPool, ReplicationStats},
     config::{get_global_storage_class, set_global_storage_class, storageclass},
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
     error::Result,
@@ -271,15 +268,15 @@ pub fn deployment_id() -> Option<String> {
 }
 
 pub(crate) fn replication_pool() -> Option<Arc<DynReplicationPool>> {
-    GLOBAL_REPLICATION_POOL.get().cloned()
+    crate::runtime::global::current_ctx().replication_pool()
 }
 
 pub(crate) fn replication_stats() -> Option<Arc<ReplicationStats>> {
-    GLOBAL_REPLICATION_STATS.get().cloned()
+    crate::runtime::global::current_ctx().replication_stats()
 }
 
 pub(crate) fn replication_runtime_initialized() -> bool {
-    GLOBAL_REPLICATION_STATS.get().is_some() && GLOBAL_REPLICATION_POOL.get().is_some()
+    crate::runtime::global::current_ctx().replication_initialized()
 }
 
 pub(crate) fn ensure_deployment_id(deployment_id: Uuid) {
