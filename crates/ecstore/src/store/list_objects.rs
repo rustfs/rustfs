@@ -20,7 +20,8 @@ use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
 use crate::disk::{DiskAPI, DiskInfo, DiskStore, RUSTFS_META_BUCKET, WalkDirOptions};
 use crate::error::{
-    Error, Result, StorageError, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found, to_object_err,
+    Error, Result, StorageError, is_all_disk_not_found, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found,
+    to_object_err,
 };
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
@@ -104,6 +105,14 @@ fn walk_result_from_set_errors(errs: &[Option<Error>]) -> Result<()> {
         }
 
         return Ok(());
+    }
+
+    // Every set is unreachable (all drives offline / drive-id mismatch, with no
+    // healthy set contributing entries): this is an availability failure, not an
+    // empty listing. Surface it instead of silently swallowing DiskNotFound in
+    // the not-found loop below.
+    if is_all_disk_not_found(errs) {
+        return Err(StorageError::DiskNotFound);
     }
 
     for err in errs.iter().flatten() {
@@ -8840,6 +8849,24 @@ mod test {
     fn walk_result_from_set_errors_ignores_only_unexpected_and_successes() {
         walk_result_from_set_errors(&[None, Some(StorageError::Unexpected)])
             .expect("successful sets and unexpected EOF-style markers should not fail the walk");
+    }
+
+    // Regression for #952 (ECA-11): when every set is unreachable the walk must
+    // surface an availability error, not silently succeed with an empty listing.
+    #[test]
+    fn walk_result_from_set_errors_surfaces_full_offline() {
+        let err = walk_result_from_set_errors(&[Some(StorageError::DiskNotFound), Some(StorageError::DiskNotFound)])
+            .expect_err("all sets unreachable must surface an availability error, not an empty listing");
+
+        assert_eq!(err, StorageError::DiskNotFound);
+    }
+
+    // A partial outage (some set healthy) must still be tolerated as before: the
+    // healthy set's success short-circuits the all-offline detection.
+    #[test]
+    fn walk_result_from_set_errors_tolerates_partial_offline() {
+        walk_result_from_set_errors(&[None, Some(StorageError::DiskNotFound)])
+            .expect("a partial outage with a healthy set must not fail the walk");
     }
 
     // use std::sync::Arc;
