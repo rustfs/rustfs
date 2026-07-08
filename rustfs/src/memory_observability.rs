@@ -369,7 +369,7 @@ pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> Memo
 }
 
 async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
-    match tokio::task::spawn_blocking(|| {
+    match tokio::task::spawn_blocking(move || {
         let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (resource, process) = sampler.snapshot_resource_and_system();
         let total_memory = refresh_total_memory();
