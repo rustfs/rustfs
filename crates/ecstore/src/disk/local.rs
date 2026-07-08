@@ -5122,6 +5122,30 @@ impl DiskAPI for LocalDisk {
                 return Err(to_file_error(err).into());
             }
 
+            // First PUT of an object creates its directory (and any missing prefix
+            // dirs) via reliable_mkdir_all, which never fsyncs the parent chain. The
+            // commit fsync above persists the object dir's *contents*, not its own
+            // entry in the bucket/prefix dir, so on power loss after ack the whole
+            // object dir could vanish (rustfs/backlog#922 step 4). For a new object
+            // (no prior xl.meta) fsync the ancestor chain from the object dir's
+            // parent up to and including the bucket so those new directory entries
+            // are durable. Overwrites already have a durable object dir. The
+            // starts_with guard bounds the walk to the bucket subtree. Relaxed/none
+            // accept the wider window, like the commit fsync above.
+            if has_dst_buf.is_none() && durability.syncs_commit_metadata() {
+                let mut ancestor = dst_file_path.parent().and_then(|object_dir| object_dir.parent());
+                while let Some(dir) = ancestor {
+                    if !dir.starts_with(&dst_volume_dir) {
+                        break;
+                    }
+                    os::fsync_dir(dir).await.map_err(to_file_error)?;
+                    if dir == dst_volume_dir.as_path() {
+                        break;
+                    }
+                    ancestor = dir.parent();
+                }
+            }
+
             if let Some(src_file_path_parent) = src_file_path.parent() {
                 if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
                     let _ = remove_std(src_file_path_parent);
@@ -6319,6 +6343,74 @@ mod test {
         assert!(
             os::fsync_dir_recorder::was_fsynced(&backup_parent),
             "old-metadata rollback backup must keep fsyncing its parent dir"
+        );
+    }
+
+    // Seed a first PUT of `object` (no prior version) through the non-inline
+    // rename_data path and return (disk, tempdir). The object dir and any prefix
+    // dirs are created during the commit.
+    async fn commit_new_object(mode: DurabilityMode, bucket: &str, object: &str) -> (LocalDisk, tempfile::TempDir) {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let tmp_object = "tmp-new-object";
+        let version_id = Uuid::parse_str("77777777-7777-7777-7777-777777777777").expect("version id should parse");
+        let new_data_dir = Uuid::parse_str("88888888-8888-8888-8888-888888888888").expect("new data dir should parse");
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let _mode = durability_mode_override::set(mode);
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit the new object");
+        (disk, dir)
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_new_object_fsyncs_new_ancestor_dirs() {
+        // A first PUT under a new prefix must fsync every newly created ancestor
+        // directory (prefix dir and bucket dir) so the object dir's own entry
+        // survives power loss after ack (rustfs/backlog#922 step 4).
+        let bucket = "new-object-bucket";
+        let (disk, _dir) = commit_new_object(DurabilityMode::Strict, bucket, "prefix/new-object").await;
+
+        let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        let prefix_dir = disk.get_object_path(bucket, "prefix").expect("prefix path should resolve");
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&prefix_dir),
+            "the newly created prefix dir must be fsynced"
+        );
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&bucket_dir),
+            "the bucket dir must be fsynced so the new prefix entry survives power loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_relaxed_new_object_skips_ancestor_fsync() {
+        // Relaxed persists shard payload but leaves metadata/directory commits to
+        // the page cache, so a new object must not fsync the ancestor chain.
+        let bucket = "new-object-bucket-relaxed";
+        let (disk, _dir) = commit_new_object(DurabilityMode::Relaxed, bucket, "prefix/new-object").await;
+
+        let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&bucket_dir),
+            "relaxed durability must not fsync the bucket dir"
         );
     }
 
