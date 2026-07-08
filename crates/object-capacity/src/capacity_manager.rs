@@ -608,10 +608,19 @@ impl Drop for RefreshLeaderGuard {
         }
         // The mutex is momentarily held by a joiner subscribing; finish the
         // reset from a detached task since Drop cannot await.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                reset_cancelled_refresh_state(&mut *state.lock().await);
-            });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    reset_cancelled_refresh_state(&mut *state.lock().await);
+                });
+            }
+            Err(_) => {
+                // Dropped outside any tokio runtime (e.g. block_on teardown).
+                // Blocking is allowed here precisely because there is no
+                // executor to stall; skipping the reset would wedge the
+                // singleflight forever (backlog#1021 S31).
+                reset_cancelled_refresh_state(&mut state.blocking_lock());
+            }
         }
     }
 }
@@ -971,18 +980,24 @@ impl HybridCapacityManager {
         };
 
         let refresh_start = Instant::now();
-        let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
-            warn!(
-                event = EVENT_CAPACITY_REFRESH_PANIC,
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_REFRESH,
-                result = "panic",
-                source = source.as_metric_label(),
-                error = ?err,
-                "capacity refresh panicked"
-            );
-            Err("capacity refresh panicked".to_string())
-        });
+        // `refresh_fn` is invoked inside the wrapped future so a panic while
+        // *constructing* the future is caught too, not only panics while
+        // polling it (backlog#1021 S20).
+        let result = AssertUnwindSafe(async move { refresh_fn().await })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|err| {
+                warn!(
+                    event = EVENT_CAPACITY_REFRESH_PANIC,
+                    component = LOG_COMPONENT_CAPACITY,
+                    subsystem = LOG_SUBSYSTEM_REFRESH,
+                    result = "panic",
+                    source = source.as_metric_label(),
+                    error = ?err,
+                    "capacity refresh panicked"
+                );
+                Err("capacity refresh panicked".to_string())
+            });
         // Commit the update and rebind `result` to the reconciled copy so both the value
         // returned to this caller and the one published to joiners carry the cluster totals
         // rather than a dirty-subset's partial bytes.
@@ -1035,19 +1050,31 @@ impl HybridCapacityManager {
         }
 
         tokio::spawn(async move {
+            // Symmetric with `refresh_or_join`: `catch_unwind` only covers the
+            // refresh future itself, so a panic in the commit/metrics code
+            // below would otherwise kill this task before the reset block,
+            // leaving `running` true forever — scheduled refreshes silently
+            // stop and every joiner hangs (backlog#1021 S20).
+            let mut leader_guard = RefreshLeaderGuard {
+                state: Some(self.refresh_state.clone()),
+            };
+
             let refresh_start = Instant::now();
-            let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
-                warn!(
-                    event = EVENT_CAPACITY_REFRESH_PANIC,
-                    component = LOG_COMPONENT_CAPACITY,
-                    subsystem = LOG_SUBSYSTEM_REFRESH,
-                    result = "panic",
-                    source = source.as_metric_label(),
-                    error = ?err,
-                    "capacity refresh panicked"
-                );
-                Err("capacity refresh panicked".to_string())
-            });
+            let result = AssertUnwindSafe(async move { refresh_fn().await })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|err| {
+                    warn!(
+                        event = EVENT_CAPACITY_REFRESH_PANIC,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_REFRESH,
+                        result = "panic",
+                        source = source.as_metric_label(),
+                        error = ?err,
+                        "capacity refresh panicked"
+                    );
+                    Err("capacity refresh panicked".to_string())
+                });
             // Publish the reconciled update to joiners so a dirty-subset refresh does not
             // broadcast a subset's partial bytes as the cluster total.
             let result = match result {
@@ -1065,6 +1092,7 @@ impl HybridCapacityManager {
             );
 
             let mut state = self.refresh_state.lock().await;
+            leader_guard.disarm();
             state.running = false;
             record_capacity_refresh_inflight(0);
             let _ = state.result_tx.send(Some(result));
@@ -1917,6 +1945,73 @@ mod tests {
         assert_eq!(cached.total_used, 100);
         assert!(cached.degraded);
         assert!(!manager.can_refresh_dirty_subset().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_refresh_recovers_from_construction_panic() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+
+        // A refresh_fn that panics while *constructing* the future (before any
+        // poll). This used to escape catch_unwind and kill the spawned task
+        // before the reset block, wedging the singleflight forever.
+        let spawned = manager
+            .clone()
+            .spawn_refresh_if_needed(DataSource::Scheduled, || {
+                #[allow(unreachable_code)]
+                {
+                    panic!("refresh_fn construction panic");
+                    std::future::ready(Err::<CapacityUpdate, String>("unreachable".into()))
+                }
+            })
+            .await;
+        assert!(spawned);
+
+        for _ in 0..200 {
+            if !manager.refresh_in_progress().await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!manager.refresh_in_progress().await, "singleflight must reset after the panic");
+
+        // The next scheduled refresh must be able to start (and succeed).
+        let spawned_again = manager
+            .clone()
+            .spawn_refresh_if_needed(DataSource::Scheduled, || async { Ok(CapacityUpdate::exact(1, 1)) })
+            .await;
+        assert!(spawned_again);
+    }
+
+    #[test]
+    fn test_leader_guard_drop_without_runtime_resets_state() {
+        let (tx, _) = watch::channel(None);
+        let state = Arc::new(Mutex::new(RefreshState {
+            running: true,
+            result_tx: tx,
+        }));
+
+        // Hold the mutex on another thread so the guard's try_lock fails and
+        // it must take the no-runtime fallback path.
+        let locked = state.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let holder_barrier = barrier.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = locked.blocking_lock();
+            holder_barrier.wait();
+            std::thread::sleep(Duration::from_millis(100));
+            drop(guard);
+        });
+        barrier.wait();
+
+        // No tokio runtime on this thread: the drop must block until the lock
+        // frees and reset the state, not silently skip the reset.
+        drop(RefreshLeaderGuard {
+            state: Some(state.clone()),
+        });
+
+        holder.join().unwrap();
+        assert!(!state.try_lock().unwrap().running);
     }
 
     #[tokio::test(start_paused = true)]
