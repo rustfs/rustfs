@@ -372,12 +372,17 @@ impl FastObjectLockManager {
 
     /// Start background cleanup task
     fn start_cleanup_task(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("Skipping fast lock cleanup task startup because no Tokio runtime is active");
+            return;
+        };
+
         let shards = self.shards.clone();
         let metrics = self.metrics.clone();
         let cleanup_interval = self.config.cleanup_interval;
         let _max_idle_time = self.config.max_idle_time;
 
-        let handle = tokio::spawn(async move {
+        let handle = handle.spawn(async move {
             let mut interval = interval(cleanup_interval);
 
             loop {
@@ -529,6 +534,12 @@ mod tests {
         assert_eq!(shard_groups[2].1.len(), 2);
 
         manager.shutdown().await;
+    }
+
+    #[test]
+    fn test_manager_construction_without_runtime_does_not_panic() {
+        let manager = FastObjectLockManager::new();
+        assert_eq!(manager.shards.len(), crate::fast_lock::DEFAULT_SHARD_COUNT);
     }
 
     #[tokio::test]
