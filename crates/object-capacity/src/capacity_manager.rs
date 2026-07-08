@@ -49,6 +49,7 @@ const EVENT_CAPACITY_REFRESH_CACHE_UPDATED: &str = "capacity_refresh_cache_updat
 const EVENT_CAPACITY_REFRESH_WRITE_RECORDED: &str = "capacity_refresh_write_recorded";
 const EVENT_CAPACITY_REFRESH_DEBOUNCE_STATE: &str = "capacity_refresh_debounce_state";
 const EVENT_CAPACITY_REFRESH_PANIC: &str = "capacity_refresh_panic";
+const EVENT_CAPACITY_CONFIG_CLAMPED: &str = "capacity_config_clamped";
 const EVENT_CAPACITY_REFRESH_JOINER_TIMEOUT: &str = "capacity_refresh_joiner_timeout";
 const EVENT_CAPACITY_REFRESH_CANCELLED: &str = "capacity_refresh_cancelled";
 const EVENT_CAPACITY_REFRESH_RUNTIME_SUMMARY: &str = "capacity_refresh_runtime_summary";
@@ -91,6 +92,26 @@ struct CachedCapacityConfig {
     max_timeout: Duration,
 }
 
+/// Fall back to the default when a capacity env var is set to a value that
+/// would make every scan report 0 bytes or always fail (backlog#1019 S11).
+fn env_u64_at_least(env: &'static str, default: u64, min: u64) -> u64 {
+    let value = get_env_u64(env, default);
+    if value < min {
+        warn!(
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_REFRESH,
+            event = EVENT_CAPACITY_CONFIG_CLAMPED,
+            env,
+            configured = value,
+            effective = default,
+            "capacity configuration value clamped to default"
+        );
+        default
+    } else {
+        value
+    }
+}
+
 impl CachedCapacityConfig {
     /// Build configuration from environment variables
     fn from_env() -> Self {
@@ -108,8 +129,9 @@ impl CachedCapacityConfig {
                 ENV_CAPACITY_FAST_UPDATE_THRESHOLD,
                 DEFAULT_FAST_UPDATE_THRESHOLD_SECS,
             )),
-            max_files_threshold: get_env_usize(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD),
-            stat_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS)),
+            max_files_threshold: env_u64_at_least(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD as u64, 1)
+                as usize,
+            stat_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS, 1)),
             sample_rate: get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE),
             metrics_interval: Duration::from_secs(get_env_u64(
                 ENV_CAPACITY_METRICS_INTERVAL,
@@ -118,8 +140,8 @@ impl CachedCapacityConfig {
             follow_symlinks: get_env_bool(ENV_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_FOLLOW_SYMLINKS),
             max_symlink_depth: get_env_u64(ENV_CAPACITY_MAX_SYMLINK_DEPTH, DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH as u64) as u8,
             enable_dynamic_timeout: get_env_bool(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT),
-            min_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS)),
-            max_timeout: Duration::from_secs(get_env_u64(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS)),
+            min_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 1)),
+            max_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 1)),
         }
     }
 }
@@ -1367,6 +1389,26 @@ mod tests {
         for (env_var, getter, _, override_value, expected) in config_getter_cases() {
             temp_env::with_var(env_var, Some(override_value), || {
                 assert_eq!(getter(), expected, "{env_var}: override not applied");
+            });
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_zero_env_values_clamp_to_defaults() {
+        // A zero threshold makes small disks report 0 bytes; a zero timeout
+        // (with dynamic timeout off) makes every scan fail. Both must fall
+        // back to the defaults instead of being accepted (backlog#1019 S11).
+        type ZeroCase = (&'static str, fn() -> u64, u64);
+        let zero_cases: Vec<ZeroCase> = vec![
+            (ENV_CAPACITY_MAX_FILES_THRESHOLD, || get_max_files_threshold() as u64, 200_000),
+            (ENV_CAPACITY_STAT_TIMEOUT, || get_stat_timeout().as_secs(), 3),
+            (ENV_CAPACITY_MIN_TIMEOUT, || get_min_timeout().as_secs(), 2),
+            (ENV_CAPACITY_MAX_TIMEOUT, || get_max_timeout().as_secs(), 15),
+        ];
+        for (env_var, getter, default) in zero_cases {
+            temp_env::with_var(env_var, Some("0"), || {
+                assert_eq!(getter(), default, "{env_var}: zero must clamp to default");
             });
         }
     }
