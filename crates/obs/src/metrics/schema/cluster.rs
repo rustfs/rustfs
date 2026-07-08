@@ -37,21 +37,21 @@ pub static CLUSTER_CAPACITY_USABLE_TOTAL_BYTES_MD: LazyLock<MetricDescriptor> = 
     )
 });
 
-/// Total used storage capacity in bytes
+/// Total used usable storage capacity in bytes
 pub static CLUSTER_CAPACITY_USED_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::Custom("capacity_used_bytes".to_string()),
-        "Total used storage capacity in bytes",
+        "Total used usable storage capacity in bytes (matches usable total and free capacity)",
         &[],
         subsystems::CLUSTER_BASE_PATH,
     )
 });
 
-/// Total free storage capacity in bytes
+/// Total usable free storage capacity in bytes
 pub static CLUSTER_CAPACITY_FREE_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::Custom("capacity_free_bytes".to_string()),
-        "Total free storage capacity in bytes",
+        "Total usable free storage capacity in bytes (matches usable total and used capacity)",
         &[],
         subsystems::CLUSTER_BASE_PATH,
     )

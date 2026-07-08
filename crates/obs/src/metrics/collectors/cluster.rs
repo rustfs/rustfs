@@ -34,9 +34,9 @@ pub struct ClusterStats {
     pub raw_capacity_bytes: u64,
     /// Usable capacity after erasure coding overhead in bytes
     pub usable_capacity_bytes: u64,
-    /// Currently used storage in bytes
+    /// Currently used usable storage in bytes
     pub used_bytes: u64,
-    /// Available free storage in bytes
+    /// Available usable free storage in bytes
     pub free_bytes: u64,
     /// Number of drives backed by stale capacity snapshots
     pub stale_capacity_drives: u64,
