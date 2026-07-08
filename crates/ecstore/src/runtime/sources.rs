@@ -50,7 +50,7 @@ use rustfs_kms::{ObjectEncryptionService, get_global_encryption_service};
 use rustfs_lock::client::LockClient;
 use s3s::dto::BucketLifecycleConfiguration;
 use s3s::region::Region;
-use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -362,8 +362,16 @@ pub fn bucket_monitor() -> Option<Arc<Monitor>> {
     get_global_bucket_monitor()
 }
 
-pub async fn local_disk_map_read() -> RwLockReadGuard<'static, HashMap<String, Option<DiskStore>>> {
-    GLOBAL_LOCAL_DISK_MAP.read().await
+/// Acquire a read guard over the local disk map as an **owned** guard.
+///
+/// Returns an [`OwnedRwLockReadGuard`] (holding an `Arc` clone of the lock)
+/// rather than a `'static` borrow of the process global. This decouples callers
+/// (notably the heal crate, which holds the guard across `.await`) from the
+/// global's `'static` lifetime, so the map can later move into the per-instance
+/// `InstanceContext` (Phase 5 disk-registry migration, backlog#939) without a
+/// cross-crate signature change. Single-instance behavior is unchanged.
+pub async fn local_disk_map_read() -> OwnedRwLockReadGuard<HashMap<String, Option<DiskStore>>> {
+    GLOBAL_LOCAL_DISK_MAP.clone().read_owned().await
 }
 
 pub(crate) fn init_bucket_monitor_for_current_endpoints() {
