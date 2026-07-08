@@ -22,9 +22,22 @@ use rustfs_config::notify::{
 };
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_targets::{Target, arn::TargetID};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
+
+/// Serializes the read-modify-write sequence over the persisted notify server
+/// config. The persisted config is a single process-global resource (there is
+/// only one backing object store), so without this guard two concurrent updates
+/// can both read the same base config, apply disjoint changes, and race their
+/// full-config writes — the later write silently overwrites the earlier one,
+/// losing updates. Holding this mutex across the whole read→modify→write makes
+/// concurrent updates apply serially so every change is preserved.
+///
+/// The lock is only ever acquired inside `update_server_config`; it never nests
+/// with the per-manager `config` RwLock (the in-memory reload runs after this
+/// guard is released), so it introduces no lock-ordering risk.
+static NOTIFY_CONFIG_RMW_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_CONFIG: &str = "config";
@@ -38,7 +51,7 @@ enum NotifyConfigStoreError {
     Save(String),
 }
 
-async fn update_server_config<F>(mut modifier: F) -> Result<Option<Config>, NotifyConfigStoreError>
+async fn update_server_config<F>(modifier: F) -> Result<Option<Config>, NotifyConfigStoreError>
 where
     F: FnMut(&mut Config) -> bool,
 {
@@ -46,17 +59,50 @@ where
         return Err(NotifyConfigStoreError::StorageNotAvailable);
     };
 
-    let mut new_config = crate::read_notify_server_config_without_migrate(store.clone())
-        .await
-        .map_err(NotifyConfigStoreError::Read)?;
+    let store_for_save = store.clone();
+    serialized_read_modify_write(
+        modifier,
+        move || async move {
+            crate::read_notify_server_config_without_migrate(store)
+                .await
+                .map_err(NotifyConfigStoreError::Read)
+        },
+        move |config| async move {
+            crate::save_notify_server_config(store_for_save, &config)
+                .await
+                .map_err(NotifyConfigStoreError::Save)
+        },
+    )
+    .await
+}
+
+/// Runs a `read → modify → write` over the persisted notify config while holding
+/// [`NOTIFY_CONFIG_RMW_LOCK`], so concurrent updates serialize and cannot clobber
+/// each other's changes (backlog#968). `read`/`save` are injected so the exact
+/// production serialization path can be exercised in tests without a live store.
+async fn serialized_read_modify_write<F, R, RFut, S, SFut>(
+    mut modifier: F,
+    read: R,
+    save: S,
+) -> Result<Option<Config>, NotifyConfigStoreError>
+where
+    F: FnMut(&mut Config) -> bool,
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Result<Config, NotifyConfigStoreError>>,
+    S: FnOnce(Config) -> SFut,
+    SFut: std::future::Future<Output = Result<(), NotifyConfigStoreError>>,
+{
+    // Hold the RMW lock across the entire read→modify→write so concurrent
+    // updates serialize and cannot clobber each other's changes (backlog#968).
+    let _rmw_guard = NOTIFY_CONFIG_RMW_LOCK.lock().await;
+
+    let mut new_config = read().await?;
 
     if !modifier(&mut new_config) {
         return Ok(None);
     }
 
-    crate::save_notify_server_config(store, &new_config)
-        .await
-        .map_err(NotifyConfigStoreError::Save)?;
+    save(new_config.clone()).await?;
 
     Ok(Some(new_config))
 }
@@ -380,7 +426,7 @@ impl NotifyConfigManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{NotifyConfigManager, runtime_target_id_for_subsystem};
+    use super::{NotifyConfigManager, NotifyConfigStoreError, runtime_target_id_for_subsystem, serialized_read_modify_write};
     use crate::{
         integration::NotificationMetrics, notifier::EventNotifier, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
         runtime_facade::NotifyRuntimeFacade,
@@ -389,7 +435,7 @@ mod tests {
         NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_SUB_SYS,
         NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
     };
-    use rustfs_config::server_config::Config;
+    use rustfs_config::server_config::{Config, KVS};
     use rustfs_targets::ReplayWorkerManager;
     use std::sync::Arc;
     use tokio::sync::{RwLock, Semaphore};
@@ -424,6 +470,78 @@ mod tests {
             .reload_config(Config::default())
             .await
             .expect("reload_config should succeed for empty targets");
+    }
+
+    // Regression test for backlog#968: the read-modify-write over the persisted
+    // notify config must be serialized. Many tasks concurrently add a distinct
+    // target through the same production RMW path (`serialized_read_modify_write`,
+    // which holds the global RMW lock across read→modify→write) against a shared
+    // in-memory backend. Every update must survive — no lost updates. Without the
+    // lock, concurrent tasks would read the same base config and clobber each
+    // other's writes, leaving only a subset of targets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_config_updates_preserve_all_targets() {
+        // Shared in-memory stand-in for the persisted config backend.
+        let backend = Arc::new(RwLock::new(Config::default()));
+        const TASKS: usize = 32;
+
+        let mut handles = Vec::with_capacity(TASKS);
+        for idx in 0..TASKS {
+            let backend = backend.clone();
+            handles.push(tokio::spawn(async move {
+                let ttype = NOTIFY_WEBHOOK_SUB_SYS.to_lowercase();
+                let tname = format!("target-{idx}");
+
+                let read_backend = backend.clone();
+                let save_backend = backend.clone();
+
+                let result = serialized_read_modify_write(
+                    |config: &mut Config| {
+                        config
+                            .0
+                            .entry(ttype.clone())
+                            .or_default()
+                            .insert(tname.clone(), KVS::default());
+                        true
+                    },
+                    move || async move {
+                        let snapshot = read_backend.read().await.clone();
+                        // Yield inside the critical section to widen the race window:
+                        // if the RMW were not serialized, other tasks would read this
+                        // same base snapshot and their writes would clobber ours.
+                        tokio::task::yield_now().await;
+                        Ok::<_, NotifyConfigStoreError>(snapshot)
+                    },
+                    move |config: Config| async move {
+                        *save_backend.write().await = config;
+                        Ok::<_, NotifyConfigStoreError>(())
+                    },
+                )
+                .await
+                .expect("serialized RMW should succeed");
+                assert!(result.is_some(), "modifier reported a change, expected Some(config)");
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("update task should not panic");
+        }
+
+        let final_config = backend.read().await;
+        let webhook_targets = final_config
+            .0
+            .get(&NOTIFY_WEBHOOK_SUB_SYS.to_lowercase())
+            .expect("webhook subsystem should exist after updates");
+
+        assert_eq!(
+            webhook_targets.len(),
+            TASKS,
+            "all concurrent target additions must be preserved (no lost updates)"
+        );
+        for idx in 0..TASKS {
+            let tname = format!("target-{idx}");
+            assert!(webhook_targets.contains_key(&tname), "missing target {tname}: concurrent update was lost");
+        }
     }
 
     #[test]
