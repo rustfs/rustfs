@@ -32,6 +32,29 @@ pub struct OptimizedNotify {
     pub notify_pool_index: AtomicUsize,
 }
 
+/// Cancellation-safe waiter-count ticket for [`OptimizedNotify`].
+///
+/// Increments the referenced counter on construction and decrements it on
+/// drop. The decrement therefore runs even when the awaiting future is
+/// cancelled/dropped before the `notified()` await completes, so the counter
+/// cannot leak on capped-wait timeouts.
+struct WaiterCountGuard<'a> {
+    counter: &'a AtomicU32,
+}
+
+impl<'a> WaiterCountGuard<'a> {
+    fn new(counter: &'a AtomicU32) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for WaiterCountGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl OptimizedNotify {
     pub fn new() -> Self {
         // Use random pool index to distribute load
@@ -67,18 +90,20 @@ impl OptimizedNotify {
 
     /// Wait for reader notification
     pub async fn wait_for_read(&self) {
-        self.reader_waiters.fetch_add(1, Ordering::AcqRel);
+        // RAII guard decrements the counter even if this future is dropped at
+        // the await below (e.g. when the caller wraps it in a `timeout(...)`
+        // that elapses), preventing the waiter counter from leaking upward.
+        let _guard = WaiterCountGuard::new(&self.reader_waiters);
         let pool_index = self.notify_pool_index.load(Ordering::Relaxed) % NOTIFY_POOL.len();
         NOTIFY_POOL[pool_index].notified().await;
-        self.reader_waiters.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Wait for writer notification
     pub async fn wait_for_write(&self) {
-        self.writer_waiters.fetch_add(1, Ordering::AcqRel);
+        // See `wait_for_read` for why the decrement must be RAII-guarded.
+        let _guard = WaiterCountGuard::new(&self.writer_waiters);
         let pool_index = self.notify_pool_index.load(Ordering::Relaxed) % NOTIFY_POOL.len();
         NOTIFY_POOL[pool_index].notified().await;
-        self.writer_waiters.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Check if anyone is waiting
@@ -131,5 +156,52 @@ mod tests {
         notify.notify_writer();
 
         assert!(timeout(Duration::from_millis(100), handle).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reader_waiter_count_released_on_abort() {
+        let notify = Arc::new(OptimizedNotify::new());
+        let notify_for_task = notify.clone();
+
+        let handle = tokio::spawn(async move {
+            notify_for_task.wait_for_read().await;
+        });
+
+        // Wait until the task has registered itself as a waiting reader.
+        timeout(Duration::from_secs(1), async {
+            while notify.reader_waiters.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reader waiter never registered");
+        assert_eq!(notify.reader_waiters.load(Ordering::Acquire), 1);
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(
+            notify.reader_waiters.load(Ordering::Acquire),
+            0,
+            "reader waiter count must return to 0 after the waiting future is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_writer_waiter_count_released_after_capped_timeouts() {
+        // Reproduces the shard slow-path pattern: the notification is never
+        // delivered, so each capped `timeout` elapses and drops the waiting
+        // future. Without an RAII decrement the counter would climb by one per
+        // iteration; with it, the counter must return to 0 every time.
+        let notify = OptimizedNotify::new();
+
+        for _ in 0..5 {
+            let _ = timeout(Duration::from_millis(10), notify.wait_for_write()).await;
+            assert_eq!(
+                notify.writer_waiters.load(Ordering::Acquire),
+                0,
+                "writer waiter count must return to 0 after a capped-wait timeout"
+            );
+        }
     }
 }

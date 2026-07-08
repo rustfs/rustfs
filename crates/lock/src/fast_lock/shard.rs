@@ -722,9 +722,13 @@ impl LockShard {
         let mut objects = self.objects.write();
         let mut processed = 0;
 
-        // Process in batches to avoid long-held locks
-        let mut to_recycle = Vec::new();
-        objects.retain(|_key, state| {
+        // Collect the keys to evict during the walk, then remove them afterward.
+        // `retain` only exposes a shared `&Arc`, and cloning it keeps
+        // `strong_count >= 2`, so `Arc::try_unwrap` on that clone can never
+        // succeed. Removing the key after the walk hands back the owned `Arc`,
+        // which can be unwrapped and recycled into the pool.
+        let mut to_remove = Vec::new();
+        objects.retain(|key, state| {
             if processed >= max_batch_size {
                 return true; // Stop processing after batch limit
             }
@@ -735,24 +739,25 @@ impl LockShard {
                 let idle_time = now_millis.saturating_sub(last_access_millis);
 
                 if idle_time > cleanup_threshold_millis {
-                    // Try to recycle the state back to pool if possible
-                    if let Ok(state_box) = Arc::try_unwrap(state.clone()) {
-                        to_recycle.push(state_box);
-                    }
+                    to_remove.push(key.clone());
                     cleaned += 1;
-                    false // Remove
-                } else {
-                    true // Keep
                 }
-            } else {
-                true // Keep active locks
             }
+            // Removal is deferred to the loop below so the owned `Arc` can be
+            // recovered for recycling.
+            true
         });
 
-        // Return recycled objects to pool
-        for state_box in to_recycle {
-            let boxed_state = Box::new(state_box);
-            self.object_pool.release(boxed_state);
+        // Evict the collected keys and recycle their states into the pool.
+        // Removing the key yields the owned `Arc`; `try_unwrap` succeeds only
+        // when this shard held the last reference, in which case the inner
+        // state is reboxed and returned to the pool.
+        for key in to_remove {
+            if let Some(state) = objects.remove(&key)
+                && let Ok(state) = Arc::try_unwrap(state)
+            {
+                self.object_pool.release(Box::new(state));
+            }
         }
 
         self.metrics.record_cleanup(cleaned);
@@ -1002,6 +1007,19 @@ mod tests {
         waiter_handle.abort();
         let _ = waiter_handle.await;
 
+        // The OptimizedNotify writer waiter counter must not leak after the
+        // waiting future is dropped by the abort.
+        if let Some(state) = shard.objects.read().get(&key).cloned() {
+            assert_eq!(
+                state
+                    .optimized_notify
+                    .writer_waiters
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "optimized_notify writer waiter count must return to 0 after abort"
+            );
+        }
+
         assert!(shard.release_lock(&key, &owner1, LockMode::Exclusive));
 
         let followup_reader = ObjectLockRequest {
@@ -1067,6 +1085,19 @@ mod tests {
         waiter_handle.abort();
         let _ = waiter_handle.await;
 
+        // The OptimizedNotify reader waiter counter must not leak after the
+        // waiting future is dropped by the abort.
+        if let Some(state) = shard.objects.read().get(&key).cloned() {
+            assert_eq!(
+                state
+                    .optimized_notify
+                    .reader_waiters
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "optimized_notify reader waiter count must return to 0 after abort"
+            );
+        }
+
         assert!(shard.release_lock(&key, &writer_owner, LockMode::Exclusive));
 
         let followup_writer = ObjectLockRequest {
@@ -1083,5 +1114,60 @@ mod tests {
             "exclusive lock should succeed after reader waiter task is aborted"
         );
         assert!(shard.release_lock(&key, &followup_owner, LockMode::Exclusive));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_batch_recycles_into_pool() {
+        let shard = LockShard::new(0);
+        let owner: Arc<str> = Arc::from("owner");
+        const N: usize = 8;
+
+        // Populate the shard with idle (acquired then released) lock states.
+        for i in 0..N {
+            let key = ObjectKey::new("bucket", format!("obj-{i}"));
+            let request = ObjectLockRequest {
+                key: key.clone(),
+                mode: LockMode::Exclusive,
+                owner: owner.clone(),
+                acquire_timeout: Duration::from_secs(1),
+                lock_timeout: Duration::from_secs(30),
+                priority: LockPriority::Normal,
+            };
+            assert!(shard.acquire_lock(&request).await.is_ok());
+            assert!(shard.release_lock(&key, &owner, LockMode::Exclusive));
+        }
+
+        // The pool started empty, so every acquisition allocated a fresh state:
+        // N misses and no releases yet.
+        let (_hits, misses, releases_before, _pool_size) = shard.pool_stats();
+        assert_eq!(misses, N as u64);
+        assert_eq!(releases_before, 0);
+
+        // Make sure the idle states are old enough to be evicted, then force a
+        // batch cleanup with a zero idle threshold.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let cleaned = shard.cleanup_expired_batch(N, 0);
+        assert_eq!(cleaned, N, "all idle states should be cleaned");
+        assert_eq!(shard.lock_count(), 0, "cleaned entries must be removed from the shard");
+
+        // The evicted states must actually be recycled back into the pool.
+        let (_hits, _misses, releases_after, pool_size) = shard.pool_stats();
+        assert_eq!(releases_after, N as u64, "cleanup must recycle evicted states into the pool");
+        assert_eq!(pool_size, N, "recycled states must be available in the pool");
+
+        // A subsequent acquire should reuse a pooled state, raising the hit rate.
+        let key = ObjectKey::new("bucket", "reuse");
+        let request = ObjectLockRequest {
+            key,
+            mode: LockMode::Exclusive,
+            owner: owner.clone(),
+            acquire_timeout: Duration::from_secs(1),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+        };
+        assert!(shard.acquire_lock(&request).await.is_ok());
+        let (hits, _misses, _releases, _pool_size) = shard.pool_stats();
+        assert!(hits >= 1, "subsequent acquire should hit the recycled pool");
+        assert!(shard.pool_hit_rate() > 0.0, "pool hit rate should rise after recycling");
     }
 }
