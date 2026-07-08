@@ -1637,6 +1637,7 @@ mod metadata_cache_tests {
             Vec::new(),
             FormatV3::new(1, 4),
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await
     }

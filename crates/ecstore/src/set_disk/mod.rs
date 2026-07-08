@@ -1564,6 +1564,11 @@ pub struct SetDisks {
     get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     pub lockers: Vec<Arc<dyn LockClient>>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+    /// Per-instance runtime context, inherited from the owning `Sets`/`ECStore`
+    /// (issue #939, Slice2). Shared `Arc` across every disk in the pool, so the
+    /// set layer reads one instance's runtime identity rather than the process
+    /// facade.
+    pub(crate) ctx: Arc<crate::runtime::instance::InstanceContext>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1698,7 +1703,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    pub(crate) async fn new(
         locker_owner: String,
         disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
         set_drive_count: usize,
@@ -1708,6 +1713,7 @@ impl SetDisks {
         set_endpoints: Vec<Endpoint>,
         format: FormatV3,
         lockers: Vec<Arc<dyn LockClient>>,
+        ctx: Arc<crate::runtime::instance::InstanceContext>,
     ) -> Arc<Self> {
         Arc::new(SetDisks {
             locker_owner,
@@ -1725,6 +1731,7 @@ impl SetDisks {
                 .build(),
             lockers,
             local_lock_manager: runtime_sources::global_lock_manager(),
+            ctx,
         })
     }
 
@@ -3672,6 +3679,7 @@ mod tests {
             endpoints,
             FormatV3::new(1, 2),
             lockers,
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await
     }
@@ -4437,6 +4445,7 @@ mod tests {
             vec![Arc::new(LocalClient::with_manager(Arc::new(
                 rustfs_lock::GlobalLockManager::new(),
             )))],
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await
     }
@@ -5751,6 +5760,7 @@ mod tests {
             endpoints,
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -5795,6 +5805,7 @@ mod tests {
             vec![endpoint],
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -5830,6 +5841,7 @@ mod tests {
             vec![endpoint],
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -5885,6 +5897,7 @@ mod tests {
             vec![endpoint],
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -5974,6 +5987,7 @@ mod tests {
             vec![endpoint],
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -7513,6 +7527,7 @@ mod tests {
             endpoints,
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await
     }
@@ -7563,6 +7578,7 @@ mod tests {
             endpoints,
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await
     }

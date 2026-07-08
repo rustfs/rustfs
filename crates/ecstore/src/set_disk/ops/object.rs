@@ -1332,7 +1332,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
         let mut locked_objects = HashSet::new();
 
-        let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
+        let dist_erasure = self.ctx.is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
         if dist_erasure {
@@ -2371,6 +2371,7 @@ mod hermetic_set_disks_support {
             endpoints,
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
