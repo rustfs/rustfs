@@ -96,6 +96,7 @@ use crate::metrics::stats_collector::{
     collect_process_metric_bundle, collect_replication_stats, collect_scanner_metric_stats,
     collect_system_cpu_and_memory_stats_with,
 };
+use crate::telemetry::retire_metric_series;
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
@@ -428,10 +429,12 @@ fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
     *has_seen_valid_snapshot = true;
 }
 
-fn expire_series_zero_tombstones<T>(zero_tombstones: &mut HashMap<T, u8>) {
+fn expire_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(zero_tombstones: &mut HashMap<T, u8>) -> Vec<T> {
+    let mut expired = Vec::new();
     if !zero_tombstones.is_empty() {
-        zero_tombstones.retain(|_, remaining| {
+        zero_tombstones.retain(|key, remaining| {
             if *remaining <= 1 {
+                expired.push(key.clone());
                 false
             } else {
                 *remaining -= 1;
@@ -439,6 +442,7 @@ fn expire_series_zero_tombstones<T>(zero_tombstones: &mut HashMap<T, u8>) {
             }
         });
     }
+    expired
 }
 
 fn bucket_live_keys(stats: &[crate::metrics::collectors::BucketStats]) -> HashSet<BucketKey> {
@@ -461,6 +465,14 @@ fn collect_bucket_zero_tombstone_metrics(zero_tombstones: &HashMap<BucketKey, u8
     }
 
     zero_metrics
+}
+
+fn retire_bucket_metric_series(bucket: &str) -> usize {
+    let bucket_label: Cow<'static, str> = Cow::Owned(bucket.to_string());
+    let labels = [("bucket", bucket_label.clone())];
+    retire_metric_series(&BUCKET_USAGE_BYTES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_OBJECTS_TOTAL_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_QUOTA_BYTES_MD.get_full_metric_name(), &labels)
 }
 
 fn bucket_usage_live_keys(stats: &[crate::metrics::collectors::BucketUsageStats]) -> HashSet<BucketKey> {
@@ -540,6 +552,24 @@ fn collect_bucket_usage_zero_tombstone_metrics(
     zero_metrics
 }
 
+fn retire_bucket_usage_metric_series(bucket: &str) -> usize {
+    let bucket_label: Cow<'static, str> = Cow::Owned(bucket.to_string());
+    let labels = [(USAGE_BUCKET_LABEL, bucket_label.clone())];
+    retire_metric_series(&USAGE_BUCKET_TOTAL_BYTES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&USAGE_BUCKET_OBJECTS_TOTAL_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&USAGE_BUCKET_VERSIONS_COUNT_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&USAGE_BUCKET_DELETE_MARKERS_COUNT_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&USAGE_BUCKET_QUOTA_TOTAL_BYTES_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_bucket_usage_distribution_series(metric_name: String, bucket: &str, range: &str) -> usize {
+    let labels = [
+        (USAGE_RANGE_LABEL, Cow::Owned(range.to_string())),
+        (USAGE_BUCKET_LABEL, Cow::Owned(bucket.to_string())),
+    ];
+    retire_metric_series(&metric_name, &labels)
+}
+
 fn audit_target_live_keys(stats: &[AuditTargetStats]) -> HashSet<AuditTargetKey> {
     stats.iter().map(|stat| stat.target_id.clone()).collect()
 }
@@ -566,6 +596,13 @@ fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey
     }
 
     zero_metrics
+}
+
+fn retire_audit_target_metric_series(target_id: &str) -> usize {
+    let labels = [(AUDIT_TARGET_ID_LABEL, Cow::Owned(target_id.to_string()))];
+    retire_metric_series(&AUDIT_FAILED_MESSAGES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&AUDIT_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&AUDIT_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
 }
 
 fn notification_target_live_keys(stats: &[NotificationTargetStats]) -> HashSet<NotificationTargetKey> {
@@ -604,6 +641,16 @@ fn collect_notification_target_zero_tombstone_metrics(
     }
 
     zero_metrics
+}
+
+fn retire_notification_target_metric_series(target_id: &str, target_type: &str) -> usize {
+    let labels = [
+        (NOTIFICATION_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
+        (NOTIFICATION_TARGET_TYPE_LABEL, Cow::Owned(target_type.to_string())),
+    ];
+    retire_metric_series(&NOTIFICATION_TARGET_FAILED_MESSAGES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
 }
 
 fn update_repl_bw_zero_tombstones(
@@ -659,17 +706,21 @@ fn collect_repl_bw_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey, u
     zero_metrics
 }
 
-fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut HashMap<ReplBwKey, u8>) {
-    if monitor_available && !zero_tombstones.is_empty() {
-        zero_tombstones.retain(|_, remaining| {
-            if *remaining <= 1 {
-                false
-            } else {
-                *remaining -= 1;
-                true
-            }
-        });
+fn retire_repl_bw_metric_series(bucket: &str, target_arn: &str) -> usize {
+    let labels = [
+        (BUCKET_L, Cow::Owned(bucket.to_string())),
+        (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
+    ];
+    retire_metric_series(&BUCKET_REPL_BANDWIDTH_LIMIT_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_REPL_BANDWIDTH_CURRENT_MD.get_full_metric_name(), &labels)
+}
+
+fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut HashMap<ReplBwKey, u8>) -> Vec<ReplBwKey> {
+    if !monitor_available {
+        return Vec::new();
     }
+
+    expire_series_zero_tombstones(zero_tombstones)
 }
 
 /// Initialize all metrics collectors.
@@ -786,9 +837,23 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             &bucket_usage_object_size_zero_tombstones,
                             &bucket_usage_version_zero_tombstones,
                         ));
-                        expire_series_zero_tombstones(&mut bucket_usage_zero_tombstones);
-                        expire_series_zero_tombstones(&mut bucket_usage_object_size_zero_tombstones);
-                        expire_series_zero_tombstones(&mut bucket_usage_version_zero_tombstones);
+                        for bucket in expire_series_zero_tombstones(&mut bucket_usage_zero_tombstones) {
+                            let _ = retire_bucket_usage_metric_series(&bucket);
+                        }
+                        for (bucket, range) in expire_series_zero_tombstones(&mut bucket_usage_object_size_zero_tombstones) {
+                            let _ = retire_bucket_usage_distribution_series(
+                                USAGE_BUCKET_OBJECT_SIZE_DISTRIBUTION_MD.get_full_metric_name(),
+                                &bucket,
+                                &range,
+                            );
+                        }
+                        for (bucket, range) in expire_series_zero_tombstones(&mut bucket_usage_version_zero_tombstones) {
+                            let _ = retire_bucket_usage_distribution_series(
+                                USAGE_BUCKET_OBJECT_VERSION_COUNT_DISTRIBUTION_MD.get_full_metric_name(),
+                                &bucket,
+                                &range,
+                            );
+                        }
                     }
 
                     if !metrics.is_empty() {
@@ -825,7 +890,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     let mut metrics = collect_bucket_metrics(&stats);
                     metrics.extend(collect_bucket_zero_tombstone_metrics(&bucket_zero_tombstones));
                     report_metrics(&metrics);
-                    expire_series_zero_tombstones(&mut bucket_zero_tombstones);
+                    for bucket in expire_series_zero_tombstones(&mut bucket_zero_tombstones) {
+                        let _ = retire_bucket_metric_series(&bucket);
+                    }
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_stats", state = "cancelled", "metrics runtime state changed");
@@ -895,7 +962,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     report_metrics(&metrics);
 
                     // Phase-2: after N cycles, stop reporting -> series becomes absent after expiration.
-                    expire_repl_bw_zero_tombstones(monitor_available, &mut zero_tombstones);
+                    for (bucket, target_arn) in expire_repl_bw_zero_tombstones(monitor_available, &mut zero_tombstones) {
+                        let _ = retire_repl_bw_metric_series(&bucket, &target_arn);
+                    }
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", state = "cancelled", "metrics runtime state changed");
@@ -935,7 +1004,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                     let mut metrics = collect_audit_metrics(&stats);
                     metrics.extend(collect_audit_zero_tombstone_metrics(&audit_zero_tombstones));
                     report_metrics(&metrics);
-                    expire_series_zero_tombstones(&mut audit_zero_tombstones);
+                    for target_id in expire_series_zero_tombstones(&mut audit_zero_tombstones) {
+                        let _ = retire_audit_target_metric_series(&target_id);
+                    }
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "audit_target_stats", state = "cancelled", "metrics runtime state changed");
@@ -986,7 +1057,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                         &notification_target_zero_tombstones,
                     ));
                     report_metrics(&metrics);
-                    expire_series_zero_tombstones(&mut notification_target_zero_tombstones);
+                    for (target_id, target_type) in expire_series_zero_tombstones(&mut notification_target_zero_tombstones) {
+                        let _ = retire_notification_target_metric_series(&target_id, &target_type);
+                    }
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "notification_stats", state = "cancelled", "metrics runtime state changed");
@@ -1376,10 +1449,12 @@ mod tests {
             assert_eq!(labels.get(TARGET_ARN_L).map(String::as_str), Some("arn:rustfs:replication:target-a"));
         }
 
-        expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        let expired = expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        assert!(expired.is_empty());
         assert_eq!(zero_tombstones.get(&key), Some(&1));
 
-        expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        let expired = expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        assert_eq!(expired, vec![key]);
         assert!(zero_tombstones.is_empty());
     }
 
@@ -1440,7 +1515,8 @@ mod tests {
         assert_eq!(prev_live_keys, repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]));
         assert_eq!(zero_tombstones.get(&repl_bw_key("videos", "arn:rustfs:replication:target-b")), Some(&1));
 
-        expire_repl_bw_zero_tombstones(false, &mut zero_tombstones);
+        let expired = expire_repl_bw_zero_tombstones(false, &mut zero_tombstones);
+        assert!(expired.is_empty());
         assert_eq!(zero_tombstones.get(&repl_bw_key("videos", "arn:rustfs:replication:target-b")), Some(&1));
     }
 
@@ -1477,10 +1553,12 @@ mod tests {
                 .all(|metric| { metric.labels.iter().any(|(key, value)| *key == "bucket" && value == "tmp") })
         );
 
-        expire_series_zero_tombstones(&mut zero_tombstones);
+        let expired = expire_series_zero_tombstones(&mut zero_tombstones);
+        assert!(expired.is_empty());
         assert_eq!(zero_tombstones.get("tmp"), Some(&1));
 
-        expire_series_zero_tombstones(&mut zero_tombstones);
+        let expired = expire_series_zero_tombstones(&mut zero_tombstones);
+        assert_eq!(expired, vec!["tmp".to_string()]);
         assert!(zero_tombstones.is_empty());
     }
 }

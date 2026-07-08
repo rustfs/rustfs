@@ -42,7 +42,7 @@ use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
-use crate::telemetry::recorder::Recorder;
+use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 // Import helper functions from local.rs (sibling module)
@@ -446,7 +446,7 @@ fn build_meter_provider(
         .build();
 
     global::set_meter_provider(provider.clone());
-    metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+    install_process_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
     set_observability_metric_enabled(true);
     Ok(Some(provider))
 }

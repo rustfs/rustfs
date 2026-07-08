@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::GlobalError;
-use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
+use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Label, Metadata, SharedString, Unit};
 use opentelemetry::{
     InstrumentationScope, InstrumentationScopeBuilder, KeyValue, global,
     metrics::{Meter, MeterProvider},
@@ -24,7 +24,7 @@ use std::{
     collections::HashMap,
     ops::Deref,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -33,6 +33,7 @@ use tracing::error;
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_RECORDER: &str = "recorder";
 const EVENT_RECORDER_STATE: &str = "recorder_state";
+static GLOBAL_RECORDER: OnceLock<Recorder> = OnceLock::new();
 
 macro_rules! configure_builder {
     ($builder:expr, $metadata:expr) => {{
@@ -96,6 +97,7 @@ impl Builder {
     pub fn install(self) -> Result<(SdkMeterProvider, Recorder), GlobalError> {
         let (provider, recorder) = self.build();
         metrics::set_global_recorder(recorder.clone())?;
+        remember_global_recorder(&recorder);
 
         Ok((provider, recorder))
     }
@@ -178,6 +180,18 @@ impl Recorder {
         value
     }
 
+    fn remove_cached_metric<T>(lock: &RwLock<HashMap<Key, T>>, key: &Key, metric_type: &str) -> bool {
+        let mut cache = match lock.write() {
+            Ok(g) => g,
+            Err(e) => {
+                error!(event = EVENT_RECORDER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_RECORDER, metric_type = %metric_type, result = "cache_remove_lock_poisoned", error = %e, "recorder state changed");
+                e.into_inner()
+            }
+        };
+
+        cache.remove(key).is_some()
+    }
+
     fn with_metadata_lock<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut HashMap<KeyName, MetricMetadata>) -> R,
@@ -198,6 +212,39 @@ impl Recorder {
     fn get_metadata_for_builder(&self, key_name: &str) -> Option<MetricMetadata> {
         self.with_metadata_lock(|metadata| metadata.remove(key_name))
     }
+
+    fn retire_metric_series_key(&self, key: &Key) -> usize {
+        let mut retired = 0usize;
+        retired += usize::from(Self::remove_cached_metric(&self.cached_counters, key, "counter"));
+        retired += usize::from(Self::remove_cached_metric(&self.cached_gauges, key, "gauge"));
+        retired += usize::from(Self::remove_cached_metric(&self.cached_histograms, key, "histogram"));
+        retired
+    }
+}
+
+fn remember_global_recorder(recorder: &Recorder) {
+    let _ = GLOBAL_RECORDER.set(recorder.clone());
+}
+
+pub(crate) fn install_process_global_recorder(recorder: Recorder) -> Result<(), metrics::SetRecorderError<Recorder>> {
+    metrics::set_global_recorder(recorder.clone())?;
+    remember_global_recorder(&recorder);
+    Ok(())
+}
+
+pub fn retire_metric_series(name: &str, labels: &[(&'static str, Cow<'static, str>)]) -> usize {
+    let Some(recorder) = GLOBAL_RECORDER.get() else {
+        return 0;
+    };
+
+    let key = Key::from_parts(
+        name.to_string(),
+        labels
+            .iter()
+            .map(|(key, value)| Label::new((*key).to_string(), value.to_string()))
+            .collect::<Vec<_>>(),
+    );
+    recorder.retire_metric_series_key(&key)
 }
 
 impl Deref for Recorder {
@@ -472,5 +519,19 @@ mod tests {
 
         let cache = shared.cached_counters.read().unwrap();
         assert_eq!(cache.len(), 1, "concurrent registrations should produce exactly one cache entry");
+    }
+
+    #[test]
+    fn retire_metric_series_key_removes_cached_counter() {
+        let recorder = test_recorder();
+        let key = Key::from_parts("retired_counter", vec![Label::new("bucket", "tmp")]);
+        let meta = test_metadata();
+
+        let _counter = recorder.register_counter(&key, &meta);
+        assert_eq!(recorder.cached_counters.read().unwrap().len(), 1);
+
+        let retired = recorder.retire_metric_series_key(&key);
+        assert_eq!(retired, 1);
+        assert!(recorder.cached_counters.read().unwrap().is_empty());
     }
 }
