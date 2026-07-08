@@ -864,6 +864,22 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
 
+            // Phase 2 (backlog#899): fence the commit on lock loss. If the refresh
+            // heartbeat has observed a refresh-quorum loss, another writer may have
+            // re-acquired this object's lock; committing now would race a double-write.
+            // Abort with a retryable error *before* rename_data makes the new version
+            // durable — once rename_data returns Ok the write is committed and must
+            // never be aborted (that would violate "a committed write is not lost").
+            if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "put_object_commit",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
+
             let rename_stage_start = Instant::now();
             let (online_disks, _, op_old_dir, cleanup_disks) = Self::rename_data(
                 &shuffle_disks,
@@ -1335,7 +1351,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
-        if dist_erasure {
+        if opts.no_lock {
+            locked_objects = unique_objects;
+        } else if dist_erasure {
             (failed_map, locked_objects, dist_batch_lock_ids) = self.acquire_dist_delete_object_locks_batch(&batch).await;
         } else {
             let batch_result = self.local_lock_manager.acquire_locks_batch(batch).await;
@@ -2306,7 +2324,7 @@ mod b3_write_quorum_tests {
 }
 
 #[cfg(test)]
-mod hermetic_set_disks_support {
+pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     //! Shared hermetic `SetDisks` construction for the ops tests below: the
     //! `SetDisks` under test is built directly on formatted local disks (same
     //! pattern as the `ops/locking.rs` tests) so the tests stay hermetic — no
@@ -2318,7 +2336,10 @@ mod hermetic_set_disks_support {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    pub(super) async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+    pub(in crate::set_disk::ops) async fn make_formatted_local_disk(
+        disk_idx: usize,
+        format: &FormatV3,
+    ) -> (TempDir, Endpoint, DiskStore) {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let mut endpoint =
             Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
@@ -2345,7 +2366,7 @@ mod hermetic_set_disks_support {
         (dir, endpoint, disk)
     }
 
-    pub(super) async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         let format = FormatV3::new(1, disk_count);
 
         let mut temp_dirs = Vec::with_capacity(disk_count);
@@ -2614,5 +2635,45 @@ mod delete_objects_lock_gating_tests {
             .get_object_info(bucket, "plain", &ObjectOptions::default())
             .await
             .expect_err("plain object must be deleted");
+    }
+
+    #[tokio::test]
+    async fn delete_objects_honors_no_lock_when_outer_write_lock_is_held() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "batch-no-lock-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, "obj-a").await;
+
+        let _outer_guard = set_disks
+            .new_ns_lock(bucket, "obj-a")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let objects = vec![ObjectToDelete {
+            object_name: "obj-a".to_string(),
+            ..Default::default()
+        }];
+
+        let (deleted, errs) = tokio::time::timeout(
+            Duration::from_secs(1),
+            set_disks.delete_objects(
+                bucket,
+                objects,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("no_lock batch delete path must not wait for the outer lock");
+
+        assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
+        assert!(deleted[0].found, "existing object must still be deleted");
     }
 }
