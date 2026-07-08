@@ -48,8 +48,8 @@ use super::replication_storage_boundary::{
 use super::replication_target_boundary::{
     PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_action_for_target_head,
     replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
-    replication_force_delete_remove_options, replication_put_object_header_size, replication_put_object_options,
-    replication_target_head_is_newer_null_version,
+    replication_force_delete_remove_options, replication_object_is_ssec_encrypted, replication_put_object_header_size,
+    replication_put_object_options, replication_target_head_is_newer_null_version,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -73,6 +73,7 @@ use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 #[cfg(test)]
 use s3s::dto::ReplicationConfiguration;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -94,6 +95,21 @@ const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
 const ERR_REPLICATION_METADATA_COPY_UNSUPPORTED: &str = "metadata-only replication is not implemented";
+const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
+    "dispatch failure",
+    "timeouterror",
+    "timed out",
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "connection aborted",
+    "broken pipe",
+    "dns error",
+    "failed to lookup address",
+    "name or service not known",
+    "deadline has elapsed",
+    "tcp connect error",
+];
 
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
@@ -171,6 +187,19 @@ fn is_version_id_format_mismatch(err: &SdkError<HeadObjectError>) -> bool {
     is_version_id_mismatch(code, raw_status)
 }
 
+fn is_replication_target_offline_error(err: &(impl Display + ?Sized)) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    REPLICATION_TARGET_OFFLINE_ERROR_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+async fn mark_replication_target_offline_if_needed(target_client: &TargetClient, err: &(impl Display + ?Sized)) {
+    if is_replication_target_offline_error(err) {
+        ReplicationTargetStore::mark_target_offline(target_client).await;
+    }
+}
+
 async fn head_object_fallback(
     source_bucket: &str,
     tgt_client: &TargetClient,
@@ -184,6 +213,31 @@ async fn head_object_fallback(
 }
 
 static RESYNC_WORKER_COUNT: usize = 10;
+
+fn resync_status_duration(
+    status: ResyncStatusType,
+    start_time: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> Option<std::time::Duration> {
+    if !matches!(
+        status,
+        ResyncStatusType::ResyncCompleted | ResyncStatusType::ResyncFailed | ResyncStatusType::ResyncCanceled
+    ) {
+        return None;
+    }
+
+    let millis = (now - start_time?).whole_milliseconds();
+    if millis < 0 {
+        return None;
+    }
+
+    let millis = if millis > i128::from(u64::MAX) {
+        u64::MAX
+    } else {
+        u64::try_from(millis).ok()?
+    };
+    Some(std::time::Duration::from_millis(millis))
+}
 
 #[derive(Debug)]
 pub struct ReplicationResyncer {
@@ -223,7 +277,7 @@ impl ReplicationResyncer {
     where
         S: ReplicationObjectIO,
     {
-        let bucket_status = {
+        let (bucket_status, status_duration) = {
             let mut status_map = self.status_map.write().await;
             let now = OffsetDateTime::now_utc();
 
@@ -276,13 +330,17 @@ impl ReplicationResyncer {
             }
             state.resync_status = status;
             state.last_update = Some(now);
+            let status_duration = resync_status_duration(status, state.start_time, now);
 
             bucket_status.last_update = Some(now);
 
-            bucket_status.clone()
+            (bucket_status.clone(), status_duration)
         };
 
         save_resync_status(&opts.bucket, &bucket_status, obj_layer).await?;
+        if let Some(stats) = runtime_sources::replication_stats() {
+            stats.record_resync_status(&opts.bucket, status, status_duration).await;
+        }
 
         Ok(())
     }
@@ -424,7 +482,6 @@ impl ReplicationResyncer {
                 "Failed to update resync status"
             );
         }
-        // TODO: Metrics
     }
 
     #[instrument(skip(cancellation_token, storage))]
@@ -995,7 +1052,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         target_statuses,
         target_purge_statuses,
         replication_timestamp: None,
-        ssec: false, // TODO: add ssec support
+        ssec: replication_object_is_ssec_encrypted(&user_defined),
         user_tags: (*oi.user_tags).clone(),
         checksum: oi.checksum.clone(),
         retry_count: 0,
@@ -1845,7 +1902,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Failed;
             }
-            // TODO: check offline
+            mark_replication_target_offline_if_needed(&tgt_client, &e).await;
         }
     }
 
@@ -2406,7 +2463,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 "Replication target operation failed"
             );
 
-            // TODO: check offline
+            mark_replication_target_offline_if_needed(&tgt_client, &err).await;
             return rinfo;
         }
 
@@ -2835,7 +2892,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 );
                 rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
 
-                // TODO: check offline
+                mark_replication_target_offline_if_needed(&tgt_client, &err).await;
                 return rinfo;
             }
         }
@@ -3017,6 +3074,65 @@ mod tests {
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    fn test_target_client(endpoint: String) -> TargetClient {
+        let config = aws_sdk_s3::Config::builder()
+            .endpoint_url(endpoint.clone())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::SharedCredentialsProvider::new(
+                aws_credential_types::Credentials::new("access", "secret", None, None, "test"),
+            ))
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
+
+        TargetClient {
+            endpoint,
+            credentials: None,
+            bucket: "target-bucket".to_string(),
+            storage_class: String::new(),
+            disable_proxy: false,
+            arn: format!("arn:rustfs:replication:us-east-1:target:{}", Uuid::new_v4()),
+            reset_id: String::new(),
+            secure: false,
+            health_check_duration: std::time::Duration::from_secs(5),
+            replicate_sync: false,
+            client: Arc::new(aws_sdk_s3::Client::from_conf(config)),
+        }
+    }
+
+    #[test]
+    fn replication_target_offline_error_classifier_is_network_scoped() {
+        assert!(is_replication_target_offline_error(&"put_object dispatch failure: connector error"));
+        assert!(is_replication_target_offline_error(&"request TimeoutError after retry"));
+        assert!(is_replication_target_offline_error(&"tcp connect error: connection refused"));
+        assert!(!is_replication_target_offline_error(&"put_object failed: AccessDenied: denied"));
+        assert!(!is_replication_target_offline_error(&"put_object failed: NoSuchBucket"));
+    }
+
+    #[tokio::test]
+    async fn replication_target_network_failure_marks_target_offline() {
+        let endpoint = format!("http://network-failure-{}.example:9000", Uuid::new_v4());
+        let target_client = test_target_client(endpoint);
+
+        assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
+
+        let err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        mark_replication_target_offline_if_needed(&target_client, &err).await;
+
+        assert!(ReplicationTargetStore::target_is_offline(&target_client).await);
+    }
+
+    #[tokio::test]
+    async fn replication_target_service_failure_keeps_target_online() {
+        let endpoint = format!("http://service-failure-{}.example:9000", Uuid::new_v4());
+        let target_client = test_target_client(endpoint);
+
+        assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
+
+        mark_replication_target_offline_if_needed(&target_client, &"put_object failed: AccessDenied: denied").await;
+
+        assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
+    }
 
     #[test]
     fn test_unmarshal_resync_payload() {
@@ -3406,6 +3522,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_heal_replicate_object_info_preserves_ssec_checksum() {
+        let checksum = bytes::Bytes::from_static(b"ssec-checksum");
+        let oi = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "key".to_string(),
+            user_defined: Arc::new(HashMap::from([(
+                rustfs_utils::http::SSEC_ALGORITHM_HEADER.to_string(),
+                "AES256".to_string(),
+            )])),
+            checksum: Some(checksum.clone()),
+            ..Default::default()
+        };
+        let rcfg = ReplicationConfig::new(None, None);
+
+        let roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+
+        assert!(roi.ssec);
+        assert_eq!(roi.checksum, Some(checksum));
+    }
+
+    #[tokio::test]
     async fn test_get_heal_replicate_object_info_maps_version_purge_status_for_role() {
         let role = "arn:rustfs:replication::target:bucket";
         let oi = ObjectInfo {
@@ -3527,5 +3664,21 @@ mod tests {
         assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
         assert!(resync_state_accepts_update(&current, &matching));
         assert!(!resync_state_accepts_update(&current, &stale));
+    }
+
+    #[test]
+    fn test_resync_status_duration_only_tracks_terminal_status() {
+        let start = match OffsetDateTime::from_unix_timestamp(1_700_000_000) {
+            Ok(start) => start,
+            Err(err) => panic!("valid test timestamp: {err}"),
+        };
+        let end = start + time::Duration::seconds(2);
+
+        assert_eq!(
+            resync_status_duration(ResyncStatusType::ResyncCompleted, Some(start), end),
+            Some(std::time::Duration::from_millis(2000))
+        );
+        assert_eq!(resync_status_duration(ResyncStatusType::ResyncStarted, Some(start), end), None);
+        assert_eq!(resync_status_duration(ResyncStatusType::ResyncFailed, None, end), None);
     }
 }
