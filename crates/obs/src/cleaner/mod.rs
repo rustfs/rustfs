@@ -85,10 +85,12 @@ pub use core::LogCleaner;
 mod tests {
     use super::core::LogCleaner;
     use super::scanner;
-    use super::types::FileMatchMode;
+    use super::types::{CompressionAlgorithm, FileMatchMode};
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Create a test log file with deterministic contents and size.
@@ -108,6 +110,62 @@ mod tests {
             .min_file_age_seconds(0) // 0 = no age gate in tests
             .delete_empty_files(true)
             .build()
+    }
+
+    fn make_parallel_compress_cleaner(dir: std::path::PathBuf, workers: usize) -> LogCleaner {
+        LogCleaner::builder(dir, "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .compress_old_files(true)
+            .parallel_compress(true)
+            .parallel_workers(workers)
+            .min_file_age_seconds(0)
+            .delete_empty_files(true)
+            .build()
+    }
+
+    fn assert_parallel_cleanup_completes(file_count: usize, workers: usize) -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let expected_freed = (file_count * 256) as u64;
+
+        for i in 0..file_count {
+            create_log_file(&dir, &format!("app.log.2024-01-{i:03}"), 256)?;
+        }
+
+        let cleaner = make_parallel_compress_cleaner(dir.clone(), workers);
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(cleaner.cleanup());
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("parallel cleanup should finish without blocking on the bounded results channel")?;
+
+        let compressed_suffixes = CompressionAlgorithm::compressed_suffixes();
+        let archive_count = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                compressed_suffixes.iter().any(|suffix| name.ends_with(suffix))
+            })
+            .count();
+        let original_count = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("app.log.") && !compressed_suffixes.iter().any(|suffix| name.ends_with(suffix))
+            })
+            .count();
+
+        assert_eq!(result.0, file_count, "all rotated logs should be deleted after compression");
+        assert_eq!(result.1, expected_freed, "freed bytes should match the removed source files");
+        assert_eq!(archive_count, file_count, "each rotated log should leave behind one archive");
+        assert_eq!(original_count, 0, "compressed source logs should be removed");
+        Ok(())
     }
 
     #[test]
@@ -223,5 +281,15 @@ mod tests {
         assert_eq!(deleted, 1, "should delete exactly one file");
         assert_eq!(freed, 1024);
         Ok(())
+    }
+
+    #[test]
+    fn test_parallel_cleanup_handles_more_results_than_channel_capacity() -> std::io::Result<()> {
+        assert_parallel_cleanup_completes(12, 4)
+    }
+
+    #[test]
+    fn test_parallel_cleanup_handles_results_within_channel_capacity() -> std::io::Result<()> {
+        assert_parallel_cleanup_completes(6, 4)
     }
 }
