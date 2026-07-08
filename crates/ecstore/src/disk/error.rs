@@ -958,9 +958,11 @@ mod tests {
     #[test]
     fn test_metacache_output_stream_closed_classification_survives_clone() {
         let disk_error = DiskError::metacache_output_stream_closed();
+        let cloned_error = disk_error.clone();
 
         assert!(disk_error.is_metacache_output_stream_closed());
-        assert!(disk_error.clone().is_metacache_output_stream_closed());
+        assert!(cloned_error.is_metacache_output_stream_closed());
+        assert_eq!(disk_error, cloned_error);
     }
 
     #[test]
