@@ -505,6 +505,16 @@ run_full_profile() {
 
 run_destructive_profile() {
   run_full_profile
+
+  # Deterministic rename_data crash-consistency harness (rustfs/backlog#935
+  # HP-14 / test plan rustfs/backlog#896): injects a hard power loss at each
+  # pre-commit step across strict/relaxed durability and asserts the object
+  # reopens as old-or-new, never a mixed/corrupt version (rustfs/backlog#878
+  # hard rule). Unit-level, so it runs even when --skip-e2e drops the cluster
+  # scenarios below.
+  run_step "ecstore-crash-consistency" \
+    cargo test -p rustfs-ecstore --lib disk::local::test::crash_consistency -- --test-threads=1
+
   if [[ "$SKIP_E2E" == "true" ]]; then
     record_skip "e2e-destructive" "--skip-e2e was set"
     return
