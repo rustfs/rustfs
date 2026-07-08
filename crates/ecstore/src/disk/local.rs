@@ -5164,6 +5164,8 @@ impl DiskAPI for LocalDisk {
             // Inline: merge read + parse + write + rename into single spawn_blocking
             let src = src_file_path.clone();
             let dst = dst_file_path.clone();
+            // Captured by the closure to fsync the new object's ancestor dir chain.
+            let bucket_dir = dst_volume_dir.clone();
             let cleanup_path = if src_volume == super::RUSTFS_META_MULTIPART_BUCKET {
                 src_file_path.parent().map(|p| p.to_path_buf())
             } else {
@@ -5259,6 +5261,27 @@ impl DiskAPI for LocalDisk {
                 // Persist the commit rename's directory entry across power loss.
                 if sync && let Some(dst_parent) = dst.parent() {
                     os::fsync_dir_std(dst_parent)?;
+                }
+
+                // Same power-loss gap as the non-inline path (rustfs/backlog#922
+                // step 4): a first PUT creates the object dir (and any missing
+                // prefix dirs) whose entry in the bucket/prefix dir reliable_mkdir_all
+                // never fsynced. The fsync above persists the object dir's contents,
+                // not its own entry, so for a new inline object fsync the ancestor
+                // chain up to and including the bucket. Overwrites already have a
+                // durable object dir; the starts_with guard bounds the walk.
+                if sync && has_dst_buf.is_none() {
+                    let mut ancestor = dst.parent().and_then(|object_dir| object_dir.parent());
+                    while let Some(ancestor_dir) = ancestor {
+                        if !ancestor_dir.starts_with(&bucket_dir) {
+                            break;
+                        }
+                        os::fsync_dir_std(ancestor_dir)?;
+                        if ancestor_dir == bucket_dir.as_path() {
+                            break;
+                        }
+                        ancestor = ancestor_dir.parent();
+                    }
                 }
 
                 Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>), std::io::Error>((old_data_dir, version_signature))
@@ -6411,6 +6434,42 @@ mod test {
         assert!(
             !os::fsync_dir_recorder::was_fsynced(&bucket_dir),
             "relaxed durability must not fsync the bucket dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_new_inline_object_fsyncs_new_ancestor_dirs() {
+        // The inline commit path (fi.data present) has the same mkdir gap as the
+        // non-inline path: a first PUT under a new prefix must fsync the newly
+        // created prefix and bucket dirs.
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "new-inline-bucket";
+        let object = "prefix/new-inline-object";
+        let tmp_object = "tmp-new-inline";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let version_id = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("version id should parse");
+        // fi.data present -> no_inline is false -> the inline commit branch runs.
+        let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-payload")));
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("inline rename_data should commit the new object");
+
+        let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        let prefix_dir = disk.get_object_path(bucket, "prefix").expect("prefix path should resolve");
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&prefix_dir),
+            "the newly created prefix dir must be fsynced on an inline first PUT"
+        );
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&bucket_dir),
+            "the bucket dir must be fsynced on an inline first PUT"
         );
     }
 
