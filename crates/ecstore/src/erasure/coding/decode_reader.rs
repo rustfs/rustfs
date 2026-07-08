@@ -298,6 +298,14 @@ where
         if let Some(deferred_error) = deferred_error {
             self.prefetch_error = Some(deferred_error);
         }
+        // Queued stripes are delivered to the client via `prefetched_bufs.pop_front()`
+        // in `poll_read` without touching `self.remaining`, so their bytes must be
+        // accounted for here. Otherwise, under multi-in-flight fill policies (e.g. the
+        // default `DualInFlight`), `remaining` never reaches 0 and a fully delivered
+        // multi-block object still terminates the GET with `LessData`. Buffers in
+        // `queued_buffers` come only from `Ok(true)` decodes, so they are non-empty and
+        // their total is bounded by `remaining - main_buf.len()`, ruling out underflow.
+        self.remaining -= queued_buffers.iter().map(Vec::len).sum::<usize>();
         self.prefetched_bufs.extend(queued_buffers);
 
         match result {
@@ -915,14 +923,22 @@ mod tests {
     where
         E: ErasureDecodeEngine + Clone + Send + Sync + 'static,
     {
+        decode_all_with_engine_and_policy(erasure, engine, data, missing_indexes, FillPolicy::SingleInFlight).await
+    }
+
+    async fn decode_all_with_engine_and_policy<E>(
+        erasure: &Erasure,
+        engine: E,
+        data: &[u8],
+        missing_indexes: &[usize],
+        fill_policy: FillPolicy,
+    ) -> io::Result<Vec<u8>>
+    where
+        E: ErasureDecodeEngine + Clone + Send + Sync + 'static,
+    {
         let source = source_from_data(erasure, data, missing_indexes);
-        let mut reader = ErasureDecodeReader::new_with_fill_policy(
-            source,
-            engine,
-            data.len(),
-            GET_OBJECT_PATH_CODEC_STREAMING,
-            FillPolicy::SingleInFlight,
-        )?;
+        let mut reader =
+            ErasureDecodeReader::new_with_fill_policy(source, engine, data.len(), GET_OBJECT_PATH_CODEC_STREAMING, fill_policy)?;
         let mut decoded = Vec::new();
         reader.read_to_end(&mut decoded).await?;
         Ok(decoded)
@@ -1107,6 +1123,70 @@ mod tests {
         })
         .await
         .expect("dual inflight policy should prefetch two future stripes before current output drains");
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_dual_inflight_reads_multi_block_object_to_end() {
+        // Regression for the byte-accounting bug: under DualInFlight each fill
+        // delivers a main stripe plus a queued stripe, but only the main stripe
+        // used to decrement `remaining`. A fully delivered multi-block object then
+        // terminated with LessData. With three 32-byte stripes (96 bytes total)
+        // the queued-stripe bytes must be accounted for so read_to_end succeeds.
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..96u8).collect::<Vec<_>>();
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let decoded = decode_all_with_engine_and_policy(&erasure, engine, &data, &[], FillPolicy::DualInFlight)
+            .await
+            .expect("dual inflight read_to_end should succeed for a multi-block object");
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_dual_inflight_trims_non_block_aligned_tail() {
+        // Regression companion: a non-block-aligned object (100 bytes, block_size
+        // 32) must decode to exactly its real length under DualInFlight with no
+        // trailing erasure padding. An inflated `remaining` would both fail with
+        // LessData and let the final partial stripe emit padded output.
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..100u8).collect::<Vec<_>>();
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let decoded = decode_all_with_engine_and_policy(&erasure, engine, &data, &[], FillPolicy::DualInFlight)
+            .await
+            .expect("dual inflight read_to_end should succeed for a non-aligned object");
+        assert_eq!(decoded.len(), 100);
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_fill_policies_produce_identical_output() {
+        // Policy-parameterized comparison: SingleInFlight and DualInFlight must
+        // decode the same multi-stripe object to byte-identical output. This locks
+        // the byte-accounting fix against future policy changes.
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..96u8).collect::<Vec<_>>();
+
+        let single = decode_all_with_engine_and_policy(
+            &erasure,
+            LegacyEcDecodeEngine::new(erasure.clone()),
+            &data,
+            &[],
+            FillPolicy::SingleInFlight,
+        )
+        .await
+        .expect("single inflight decode should succeed");
+
+        let dual = decode_all_with_engine_and_policy(
+            &erasure,
+            LegacyEcDecodeEngine::new(erasure.clone()),
+            &data,
+            &[],
+            FillPolicy::DualInFlight,
+        )
+        .await
+        .expect("dual inflight decode should succeed");
+
+        assert_eq!(single, data);
+        assert_eq!(single, dual);
     }
 
     #[tokio::test]
