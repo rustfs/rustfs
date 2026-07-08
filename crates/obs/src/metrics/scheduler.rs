@@ -44,6 +44,7 @@ use crate::metrics::collectors::{
     collect_cluster_usage_metrics,
     collect_compression_cluster_metrics,
     collect_cpu_metrics,
+    collect_current_dial9_metrics,
     collect_drive_count_metrics,
     collect_drive_detailed_metrics,
     collect_erasure_set_metrics,
@@ -1325,8 +1326,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             let mut metrics =
                                 collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
                             #[cfg(not(feature = "gpu"))]
-                            let metrics =
+                            let mut metrics =
                                 collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
+
+                            metrics.extend(collect_current_dial9_metrics());
 
                             #[cfg(feature = "gpu")]
                             if let Some(collector) = gpu_collector.as_ref() {
