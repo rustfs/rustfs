@@ -890,10 +890,23 @@ pub fn is_err_io(err: &Error) -> bool {
     matches!(err, &StorageError::Io(_))
 }
 
+/// Strict "not found" predicate that only matches genuine object/version/volume
+/// absence errors: `FileNotFound`/`VolumeNotFound`/`FileVersionNotFound`/
+/// `ObjectNotFound`/`VersionNotFound`.
+///
+/// Unlike [`is_err_bucket_not_found`], this deliberately excludes
+/// `DiskNotFound` so that an all-drives-unreachable error slice is treated as an
+/// availability/read-quorum failure rather than "the object does not exist".
+/// This mirrors MinIO's `isAllNotFound` and the sibling
+/// [`crate::disk::error::DiskError::is_all_not_found`].
+pub fn is_err_strict_not_found(err: &Error) -> bool {
+    is_err_object_not_found(err) || is_err_version_not_found(err) || matches!(err, &StorageError::VolumeNotFound)
+}
+
 pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
     for err in errs.iter() {
         if let Some(err) = err {
-            if is_err_object_not_found(err) || is_err_version_not_found(err) || is_err_bucket_not_found(err) {
+            if is_err_strict_not_found(err) {
                 continue;
             }
 
@@ -905,10 +918,22 @@ pub fn is_all_not_found(errs: &[Option<Error>]) -> bool {
     !errs.is_empty()
 }
 
+/// Strict "volume not found" predicate matching only `VolumeNotFound`/
+/// `BucketNotFound`.
+///
+/// This is [`is_err_bucket_not_found`] minus `DiskNotFound`: an unreachable
+/// drive must not be mistaken for a missing volume/bucket. Unlike
+/// [`is_err_strict_not_found`] it deliberately excludes file/version level
+/// not-found so that "the object is missing under an existing volume" is not
+/// escalated to "the volume itself is missing".
+pub fn is_err_strict_volume_not_found(err: &Error) -> bool {
+    matches!(err, &StorageError::VolumeNotFound) || matches!(err, &StorageError::BucketNotFound(_))
+}
+
 pub fn is_all_volume_not_found(errs: &[Option<Error>]) -> bool {
     for err in errs.iter() {
         if let Some(err) = err {
-            if is_err_bucket_not_found(err) {
+            if is_err_strict_volume_not_found(err) {
                 continue;
             }
 
@@ -916,6 +941,22 @@ pub fn is_all_volume_not_found(errs: &[Option<Error>]) -> bool {
         }
 
         return false;
+    }
+
+    !errs.is_empty()
+}
+
+/// Returns true when every entry is `DiskNotFound` (all drives offline /
+/// drive-id mismatch across all sets) and the slice is non-empty.
+///
+/// Used to distinguish a full-availability failure from a genuine empty listing
+/// so it can be surfaced as an error instead of being swallowed as "no entries".
+pub fn is_all_disk_not_found(errs: &[Option<Error>]) -> bool {
+    for err in errs.iter() {
+        match err {
+            Some(err) if matches!(err, &StorageError::DiskNotFound) => continue,
+            _ => return false,
+        }
     }
 
     !errs.is_empty()
@@ -1134,6 +1175,75 @@ pub fn storage_to_object_err(err: Error, params: Vec<&str>) -> S3Error {
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
+
+    // Regression for #952 (ECA-11): an all-`DiskNotFound` slice (every drive in
+    // every set unreachable) must NOT be classified as "all not found",
+    // otherwise ListObjects silently returns an empty listing and masks a full
+    // availability failure as "the bucket is empty".
+    #[test]
+    fn is_all_not_found_rejects_all_disk_not_found() {
+        let errs = vec![Some(StorageError::DiskNotFound), Some(StorageError::DiskNotFound)];
+        assert!(!is_all_not_found(&errs), "all-DiskNotFound must not be treated as all-not-found");
+        assert!(
+            !is_all_volume_not_found(&errs),
+            "all-DiskNotFound must not be treated as all-volume-not-found"
+        );
+        assert!(
+            is_all_disk_not_found(&errs),
+            "all-DiskNotFound must be recognised as a full availability failure"
+        );
+    }
+
+    // Genuine not-found errors must still be classified as such so real
+    // "object/version absent" semantics do not regress into availability errors.
+    #[test]
+    fn is_all_not_found_accepts_genuine_not_found() {
+        let object_errs = vec![
+            Some(StorageError::FileNotFound),
+            Some(StorageError::ObjectNotFound("bucket".into(), "object".into())),
+            Some(StorageError::FileVersionNotFound),
+            Some(StorageError::VersionNotFound("bucket".into(), "object".into(), "vid".into())),
+            Some(StorageError::VolumeNotFound),
+        ];
+        assert!(
+            is_all_not_found(&object_errs),
+            "genuine object/version/volume not-found must stay all-not-found"
+        );
+        assert!(!is_all_disk_not_found(&object_errs));
+
+        let volume_errs = vec![Some(StorageError::VolumeNotFound), Some(StorageError::VolumeNotFound)];
+        assert!(is_all_not_found(&volume_errs));
+        assert!(
+            is_all_volume_not_found(&volume_errs),
+            "all-VolumeNotFound must remain all-volume-not-found"
+        );
+    }
+
+    // `is_all_volume_not_found` must escalate only volume/bucket absence, not a
+    // missing object under an existing volume, and must exclude DiskNotFound.
+    #[test]
+    fn is_all_volume_not_found_semantics() {
+        assert!(is_all_volume_not_found(&[Some(StorageError::BucketNotFound("bucket".into()))]));
+        assert!(
+            !is_all_volume_not_found(&[Some(StorageError::FileNotFound), Some(StorageError::VolumeNotFound)]),
+            "a missing object under an existing volume must not escalate to all-volume-not-found"
+        );
+        assert!(!is_all_volume_not_found(&[Some(StorageError::DiskNotFound)]));
+    }
+
+    // A `None` entry (a healthy set) short-circuits both predicates to false so a
+    // partial outage is never mistaken for an all-not-found / all-offline slice.
+    #[test]
+    fn not_found_predicates_reject_partial_and_empty() {
+        let partial = vec![None, Some(StorageError::DiskNotFound)];
+        assert!(!is_all_not_found(&partial));
+        assert!(!is_all_volume_not_found(&partial));
+        assert!(!is_all_disk_not_found(&partial));
+
+        assert!(!is_all_not_found(&[]));
+        assert!(!is_all_volume_not_found(&[]));
+        assert!(!is_all_disk_not_found(&[]));
+    }
 
     #[test]
     fn test_storage_error_to_u32() {
