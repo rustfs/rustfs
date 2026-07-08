@@ -38,7 +38,8 @@ use crate::diagnostics::get::{
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader, object_mmap_read_enabled,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader,
+    object_mmap_read_enabled,
 };
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -1098,6 +1099,10 @@ impl SetDisks {
                 metrics_object_class,
                 metrics_size_bucket,
                 prefer_data_blocks_first_reader_setup,
+                // Single-part objects keep the whole-request fallback: a degraded
+                // sole part is detected before any byte streams, so the caller can
+                // still hand the request to the legacy duplex path unchanged.
+                false,
             )
             .await;
         }
@@ -1146,6 +1151,10 @@ impl SetDisks {
             metrics_object_class,
             metrics_size_bucket,
             false,
+            // The first part stays eager and keeps the whole-request fallback:
+            // if part 1 is already degraded, the entire GET drops to the legacy
+            // duplex path before a single byte is streamed (semantics unchanged).
+            false,
         )
         .await?
         {
@@ -1187,6 +1196,11 @@ impl SetDisks {
                     ctx.metrics_object_class,
                     ctx.metrics_size_bucket,
                     false,
+                    // backlog#879: later parts have already streamed earlier bytes,
+                    // so a whole-request fallback is impossible here. Degrade this
+                    // part in place to a legacy per-part decode reader instead of
+                    // failing the stream mid-flight.
+                    true,
                 )
                 .await
             })
@@ -1214,6 +1228,14 @@ impl SetDisks {
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
+        // backlog#879: when the codec streaming fast path cannot serve this part
+        // (a shard is missing and reconstruction is required), `false` preserves
+        // the historical whole-request fallback by returning `Fallback`, while
+        // `true` degrades in place — building a legacy per-part decode reader that
+        // reuses the shard readers already opened here. Only lazily-built later
+        // parts pass `true`, so the eager first-part fallback semantics are
+        // untouched and the common read path is never affected.
+        allow_inplace_legacy_fallback: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
@@ -1278,6 +1300,33 @@ impl SetDisks {
 
         let missing_shards = reader_setup.completed_failed_shards();
         if let Some(reason) = codec_streaming_reader_setup_fallback_reason(missing_shards) {
+            if allow_inplace_legacy_fallback {
+                // backlog#879: read quorum still holds (checked above), so the
+                // shard readers already opened here can reconstruct this part via
+                // the legacy per-part decode path. Bridge that decode into an
+                // AsyncRead and keep streaming instead of failing mid-flight. This
+                // is a successful degradation, not a pipeline failure: record it on
+                // the existing codec-streaming fallback counter and log at debug.
+                rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
+                debug!(
+                    metrics_path,
+                    part_number,
+                    missing_shards,
+                    fallback_reason = ?reason,
+                    state = "codec_streaming_mid_stream_legacy_fallback",
+                    "Codec streaming later part degraded in place to legacy per-part decode"
+                );
+                let reader = build_legacy_per_part_fallback_reader(
+                    erasure.clone(),
+                    reader_setup.readers,
+                    reader_setup.deferred_stripe_handles,
+                    read_costs,
+                    part_offset,
+                    part_length,
+                    part_size,
+                );
+                return Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader));
+            }
             return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
         }
 
@@ -1429,10 +1478,11 @@ type LazyPartBuilder = Box<dyn FnMut(usize) -> LazyPartBuildHandle + Send + Sync
 /// The first part reader is built eagerly by the caller so the dominant
 /// fallback conditions are detected before any byte is streamed; every
 /// subsequent part is only built once the previous part reaches EOF. If a
-/// later part hits a fallback condition mid-stream, the reader surfaces a read
-/// error instead: data has already been streamed, so switching the whole
-/// request to the legacy path is no longer possible. The next request detects
-/// the condition on its eager first-part setup and falls back cleanly.
+/// later part hits a fallback condition mid-stream, its builder degrades in
+/// place to a legacy per-part decode reader (backlog#879) and streaming
+/// continues, so a degraded later part is reconstructed instead of failing the
+/// request. The builder therefore never yields `Fallback` for a lazily-built
+/// part in production; the `Fallback` arm below stays only as a defensive guard.
 struct LazyMultipartCodecStreamingReader {
     current: Option<Box<dyn AsyncRead + Unpin + Send + Sync>>,
     pending: Option<LazyPartBuildHandle>,
@@ -1491,19 +1541,15 @@ impl AsyncRead for LazyMultipartCodecStreamingReader {
                                 this.current = Some(reader);
                             }
                             Ok(Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason))) => {
-                                // KNOWN LIMITATION (backlog#871 follow-up): once
-                                // earlier parts have streamed we can no longer
-                                // hand the whole request back to the legacy
-                                // duplex path, so a degraded later part surfaces
-                                // as a read error even though legacy per-part
-                                // decode could still reconstruct it. This only
-                                // affects the OPT-IN multipart codec streaming
-                                // path (RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
-                                // default off): the first part stays eager so the
-                                // common case where part 1 is already degraded
-                                // still falls back cleanly before any byte ships.
-                                // A proper fix (in-place per-part legacy
-                                // degradation) is tracked as a follow-up.
+                                // Defensive guard: since backlog#879 the lazy part
+                                // builder degrades a missing-shard part in place to
+                                // a legacy per-part decode reader and returns
+                                // `Reader`, so this arm is not reached on the
+                                // production path. If a builder ever does surface a
+                                // `Fallback` mid-stream, earlier bytes have already
+                                // shipped and the whole request can no longer be
+                                // handed to the legacy duplex path, so we surface a
+                                // read error rather than truncate silently.
                                 record_get_object_pipeline_failure_for_path(
                                     this.metrics_path,
                                     GET_STAGE_READER_SETUP,
@@ -1544,6 +1590,104 @@ impl Drop for LazyMultipartCodecStreamingReader {
         // Abort an in-flight part construction so an early client disconnect
         // does not keep opening shard readers in the background.
         if let Some(handle) = self.pending.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Bridge a degraded later part onto the legacy per-part erasure decode
+/// (backlog#879).
+///
+/// When the codec streaming fast path cannot serve a part because a shard is
+/// missing, read quorum still holds, so the shard readers already opened for
+/// this part reconstruct it through the same `decode_with_stripe_handles` path
+/// the legacy duplex fallback uses. A bounded duplex pipe turns that
+/// push-based decode into the `AsyncRead` the lazy multipart reader expects: a
+/// background task drives the decode into the write half while the returned
+/// reader drains the read half. No extra file descriptors are opened — the
+/// readers are moved in from the setup that just ran.
+fn build_legacy_per_part_fallback_reader(
+    erasure: coding::Erasure,
+    readers: Vec<Option<ObjectBitrotReader>>,
+    deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
+    read_costs: Option<Vec<ShardReadCost>>,
+    part_offset: usize,
+    part_length: usize,
+    part_size: usize,
+) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
+    let buffer = adaptive_duplex_buffer_size(part_size as i64);
+    let (read_half, mut write_half) = tokio::io::duplex(buffer);
+    let decode = tokio::spawn(async move {
+        let (_written, err) = erasure
+            .decode_with_stripe_handles(
+                &mut write_half,
+                readers,
+                part_offset,
+                part_length,
+                part_size,
+                read_costs,
+                deferred_stripe_handles,
+            )
+            .await;
+        // Dropping `write_half` on return signals EOF to the reader half.
+        err
+    });
+    Box::new(LegacyPerPartDecodeReader {
+        inner: read_half,
+        decode: Some(decode),
+        finished: false,
+    })
+}
+
+/// `AsyncRead` over a legacy per-part decode running on a background task
+/// (backlog#879). Bytes flow through a duplex pipe; once the pipe reaches EOF
+/// the decode task result is joined so a reconstruction failure surfaces as a
+/// read error instead of a silently truncated stream.
+struct LegacyPerPartDecodeReader {
+    inner: tokio::io::DuplexStream,
+    decode: Option<tokio::task::JoinHandle<Option<std::io::Error>>>,
+    finished: bool,
+}
+
+impl AsyncRead for LegacyPerPartDecodeReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(Ok(()));
+        }
+        let filled_before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) if buf.filled().len() == filled_before => {
+                // Pipe EOF: the write half was dropped, so the decode task has
+                // finished. Join it to surface any reconstruction error rather
+                // than reporting a clean EOF over a truncated stream.
+                let Some(handle) = this.decode.as_mut() else {
+                    this.finished = true;
+                    return Poll::Ready(Ok(()));
+                };
+                match Pin::new(handle).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(join_result) => {
+                        this.decode = None;
+                        this.finished = true;
+                        match join_result {
+                            Ok(Some(err)) => Poll::Ready(Err(err)),
+                            Ok(None) => Poll::Ready(Ok(())),
+                            Err(join_err) => Poll::Ready(Err(std::io::Error::other(join_err))),
+                        }
+                    }
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for LegacyPerPartDecodeReader {
+    fn drop(&mut self) {
+        // Abort the decode task if the client disconnects before the part is
+        // drained so background reconstruction IO stops.
+        if let Some(handle) = self.decode.take() {
             handle.abort();
         }
     }
@@ -3518,6 +3662,133 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("inconsistent read source shards"));
+    }
+
+    // backlog#879: a later multipart part that loses a shard (read quorum still
+    // holds) must be reconstructed in place through the legacy per-part decode
+    // bridge instead of failing the stream. This exercises the exact reader the
+    // lazy multipart builder now returns from its degraded-part branch.
+    #[tokio::test]
+    async fn legacy_per_part_fallback_reader_reconstructs_missing_shard() {
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data = (0..64u8).map(|value| value.wrapping_add(7)).collect::<Vec<_>>();
+        // Drop data shard 0: reconstruction is required, so the codec streaming
+        // fast path would fall back, but the parity shards keep read quorum.
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[0], &[], &[], HashAlgorithm::HighwayHash256)
+                .await;
+        assert_eq!(setup.completed_failed_shards(), 1, "one shard must be missing to force the fallback");
+        assert!(setup.available_shards() >= 2, "read quorum must still hold");
+
+        let mut reader = build_legacy_per_part_fallback_reader(
+            erasure,
+            setup.readers,
+            setup.deferred_stripe_handles,
+            None,
+            0,
+            data.len(),
+            data.len(),
+        );
+
+        let mut decoded = Vec::new();
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("legacy per-part fallback reader should reconstruct the degraded part");
+        assert_eq!(decoded, data, "reconstructed bytes must match the original part payload");
+    }
+
+    // backlog#879: the whole multipart object must stream to completion when a
+    // later part degrades. Part 1 streams from a healthy reader, part 2 is built
+    // through the legacy per-part fallback reader (missing shard, quorum intact),
+    // and the concatenation must equal part1 || part2 with no mid-stream error.
+    #[tokio::test]
+    async fn lazy_multipart_continues_when_later_part_degrades_to_legacy() {
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let part1: Vec<u8> = (0..64u8).collect();
+        let part2: Vec<u8> = (0..64u8).rev().collect();
+
+        // Build the degraded part-2 setup up front (missing data shard 0).
+        let part2_for_setup = part2.clone();
+        let setup = setup_codec_data_blocks_first_encoded_bitrot_readers(
+            &erasure,
+            &part2_for_setup,
+            &[0],
+            &[],
+            &[],
+            HashAlgorithm::HighwayHash256,
+        )
+        .await;
+        assert_eq!(setup.completed_failed_shards(), 1);
+
+        let erasure_for_builder = erasure.clone();
+        let part2_len = part2.len();
+        let setup_slot = std::sync::Mutex::new(Some((setup, erasure_for_builder)));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_clone = Arc::clone(&builds);
+        let builder: Box<dyn FnMut(usize) -> LazyPartBuildHandle + Send + Sync> = Box::new(move |_remaining_index| {
+            builds_clone.fetch_add(1, Ordering::SeqCst);
+            let (setup, erasure) = setup_slot.lock().expect("setup slot lock").take().expect("part 2 built once");
+            tokio::task::spawn(async move {
+                let reader = build_legacy_per_part_fallback_reader(
+                    erasure,
+                    setup.readers,
+                    setup.deferred_stripe_handles,
+                    None,
+                    0,
+                    part2_len,
+                    part2_len,
+                );
+                Ok(GetCodecStreamingReaderBuildOutcome::Reader(reader))
+            })
+        });
+
+        let mut reader =
+            LazyMultipartCodecStreamingReader::new(Box::new(Cursor::new(part1.clone())), 2, builder, "codec_streaming");
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("degraded later part must be reconstructed instead of failing the stream");
+
+        let mut expected = part1;
+        expected.extend_from_slice(&part2);
+        assert_eq!(output, expected, "full object bytes must match part1 || reconstructed part2");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "part 2 must be built exactly once");
+    }
+
+    // backlog#879: if reconstruction itself fails (inconsistent deferred source),
+    // the bridge must surface a read error at EOF rather than silently truncate
+    // the stream. This guards the join-handle error propagation.
+    #[tokio::test]
+    async fn legacy_per_part_fallback_reader_surfaces_reconstruction_error() {
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data = (0..64u8).map(|value| value.wrapping_mul(3)).collect::<Vec<_>>();
+        // Corrupt shard 0 and feed an inconsistent deferred reconstruction source
+        // (shard 2): reconstruction verification must fail during decode.
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[], &[0], &[2], HashAlgorithm::HighwayHash256)
+                .await;
+
+        let mut reader = build_legacy_per_part_fallback_reader(
+            erasure,
+            setup.readers,
+            setup.deferred_stripe_handles,
+            None,
+            0,
+            data.len(),
+            data.len(),
+        );
+
+        let mut decoded = Vec::new();
+        let err = reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("failed reconstruction must surface as a read error, not a truncated stream");
+        assert!(
+            err.to_string().contains("inconsistent read source shards"),
+            "error should describe the reconstruction failure: {err}"
+        );
     }
 
     #[test]
