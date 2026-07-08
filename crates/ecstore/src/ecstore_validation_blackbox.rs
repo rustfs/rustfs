@@ -12,15 +12,17 @@ use crate::store::init_format::save_format_file;
 use http::HeaderMap;
 use rustfs_filemeta::{MetacacheReader, MetacacheWriter};
 use std::io::Cursor;
-use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 
-async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> Arc<SetDisks> {
+/// Returns the backing [`tempfile::TempDir`]s alongside the set so callers keep
+/// them alive for the test's duration and the directories are removed on drop.
+async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
     let format = FormatV3::new(1, drive_count);
+    let mut dirs = Vec::with_capacity(drive_count);
     let mut endpoints = Vec::with_capacity(drive_count);
     let mut disks = Vec::with_capacity(drive_count);
 
@@ -48,12 +50,12 @@ async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> Arc<Se
             .await
             .expect("format should be saved");
 
-        mem::forget(dir);
+        dirs.push(dir);
         endpoints.push(endpoint);
         disks.push(Some(disk));
     }
 
-    SetDisks::new(
+    let set_disks = SetDisks::new(
         "ecstore-validation-blackbox".to_string(),
         Arc::new(RwLock::new(disks)),
         drive_count,
@@ -64,7 +66,9 @@ async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> Arc<Se
         format,
         Vec::new(),
     )
-    .await
+    .await;
+
+    (dirs, set_disks)
 }
 
 async fn first_shard_part_path(disk: &DiskStore, bucket: &str, object: &str) -> PathBuf {
@@ -99,7 +103,7 @@ async fn shard_part_paths(set_disks: &Arc<SetDisks>, bucket: &str, object: &str)
 
 #[tokio::test]
 async fn blackbox_put_unknown_actual_size_restores_body_and_records_written_size() {
-    let set_disks = make_local_set_disks(4, 2).await;
+    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
     let bucket = "bb-unknown-actual-size";
     let object = "object.bin";
     let payload = (0..(BLOCK_SIZE_V2 + 123))
@@ -140,7 +144,7 @@ async fn blackbox_put_unknown_actual_size_restores_body_and_records_written_size
 
 #[tokio::test]
 async fn blackbox_get_restores_body_after_one_shard_file_is_removed() {
-    let set_disks = make_local_set_disks(4, 2).await;
+    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
     let bucket = "bb-missing-shard-file";
     let object = "object.bin";
     let payload = (0..(BLOCK_SIZE_V2 + 321))
@@ -185,50 +189,106 @@ async fn blackbox_get_restores_body_after_one_shard_file_is_removed() {
 }
 
 #[tokio::test]
+// Serialized: forces the reader-setup strategy through a process-global env var.
+#[serial_test::serial]
 async fn blackbox_get_restores_body_and_enqueues_repair_after_one_corrupt_shard() {
-    let set_disks = make_local_set_disks(4, 2).await;
-    let bucket = "bb-corrupt-shard-repair";
-    let object = "object.bin";
-    let payload = (0..(BLOCK_SIZE_V2 + 777))
-        .map(|idx| ((idx * 29) % 251) as u8)
-        .collect::<Vec<_>>();
-    let opts = ObjectOptions {
-        no_lock: true,
-        ..Default::default()
-    };
+    use rustfs_common::heal_channel::{HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealRequestSource};
 
-    set_disks
-        .make_bucket(bucket, &MakeBucketOptions::default())
-        .await
-        .expect("bucket should be created");
-    let mut reader = PutObjReader::from_vec(payload.clone());
-    set_disks
-        .put_object(bucket, object, &mut reader, &opts)
-        .await
-        .expect("object should be written");
+    // Own the process-global heal channel so the read path's repair submission
+    // becomes observable. init_heal_channel() succeeds exactly once per test
+    // binary: this must stay the only ecstore unit test that takes the receiver.
+    // Submissions from other (non-serial) tests queue in the unbounded channel
+    // while this test is setting up, get drained and dropped by the loop below
+    // (failing their submitter, which releases their dedup reservation), and
+    // fail fast once the receiver drops at test end. Tests that must observe a
+    // deterministic channel state serialize under the same serial key.
+    let mut heal_rx = rustfs_common::heal_channel::init_heal_channel()
+        .expect("this must be the only ecstore test that owns the heal channel receiver");
 
-    let paths = shard_part_paths(&set_disks, bucket, object).await;
-    fs::write(&paths[0], b"corrupt shard bytes")
-        .await
-        .unwrap_or_else(|err| panic!("test shard should be corruptible at {:?}: {err}", paths[0]));
+    // Force the data-blocks-first reader setup (see
+    // ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP in set_disk/core/io_primitives.rs):
+    // under the default all-shards strategy the corrupt shard's failed open can
+    // lose the setup-quorum race, in which case no repair is submitted and the
+    // enqueue assertion below would be a coin flip.
+    temp_env::async_with_vars([("RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP", Some("true"))], async {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "bb-corrupt-shard-repair";
+        let object = "object.bin";
+        let payload = (0..(BLOCK_SIZE_V2 + 777))
+            .map(|idx| ((idx * 29) % 251) as u8)
+            .collect::<Vec<_>>();
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
 
-    let mut get_reader = set_disks
-        .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
-        .await
-        .expect("object should remain readable after one corrupt shard");
-    let mut restored = Vec::new();
-    get_reader
-        .stream
-        .read_to_end(&mut restored)
-        .await
-        .expect("corrupt-shard object should stream from parity");
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("object should be written");
 
-    assert_eq!(restored, payload);
+        // Corrupt the disk holding DATA shard 1, not blindly disk 0 (which holds
+        // a parity shard for this key): a data-blocks-first read must consume the
+        // corrupt data shard, making the missing-shard detection deterministic.
+        // The write path derives the shard distribution the same way (ops/object.rs).
+        let distribution = rustfs_filemeta::FileInfo::new(&format!("{bucket}/{object}"), 2, 2)
+            .erasure
+            .distribution;
+        let corrupt_disk = distribution
+            .iter()
+            .position(|&shard| shard == 1)
+            .expect("distribution should place data shard 1 on a disk");
+        let paths = shard_part_paths(&set_disks, bucket, object).await;
+        fs::write(&paths[corrupt_disk], b"corrupt shard bytes")
+            .await
+            .unwrap_or_else(|err| panic!("test shard should be corruptible at {:?}: {err}", paths[corrupt_disk]));
+
+        let mut get_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("object should remain readable after one corrupt shard");
+        let mut restored = Vec::new();
+        get_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("corrupt-shard object should stream from parity");
+
+        assert_eq!(restored, payload);
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                match heal_rx.recv().await.expect("heal channel should stay open") {
+                    HealChannelCommand::Start { request, response_tx } if request.bucket == bucket => {
+                        let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                        break request;
+                    }
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("corrupt-shard GET should enqueue a read-repair heal request");
+
+        assert_eq!(request.source, HealRequestSource::ReadRepair);
+        assert_eq!(request.object_prefix.as_deref(), Some(object));
+        assert_eq!(request.object_version_id, None, "unversioned PUT must submit repair without a version id");
+        assert_eq!(request.pool_index, Some(0));
+        assert_eq!(request.set_index, Some(0));
+        assert_eq!(request.priority, HealChannelPriority::Low);
+        assert_eq!(request.recreate_missing, Some(true));
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn blackbox_range_read_restores_exact_slice_with_one_offline_disk() {
-    let set_disks = make_local_set_disks(4, 2).await;
+    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
     let bucket = "bb-range-offline-disk";
     let object = "object.bin";
     let payload = (0..(BLOCK_SIZE_V2 + 4096))
@@ -277,7 +337,7 @@ async fn blackbox_range_read_restores_exact_slice_with_one_offline_disk() {
 
 #[tokio::test]
 async fn blackbox_delete_marker_hides_object_body_without_erasing_prior_version_metadata() {
-    let set_disks = make_local_set_disks(4, 2).await;
+    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
     let bucket = "bb-delete-marker-read-negative";
     let object = "object.bin";
     let opts = ObjectOptions {
@@ -310,8 +370,8 @@ async fn blackbox_delete_marker_hides_object_body_without_erasing_prior_version_
         Err(err) => err,
     };
     assert!(
-        matches!(err, Error::ObjectNotFound(_, _) | Error::MethodNotAllowed),
-        "delete marker read must fail closed, got {err:?}"
+        matches!(&err, Error::ObjectNotFound(b, o) if b == bucket && o == object),
+        "latest delete marker read must map to ObjectNotFound for the requested key, got {err:?}"
     );
 }
 
@@ -371,7 +431,7 @@ async fn blackbox_local_disk_walk_dir_emits_metadata_entries_with_prefix_forward
 #[serial_test::serial]
 async fn blackbox_issue3031_diag_covers_put_success_cleanup_and_error_summary() {
     temp_env::async_with_vars([("RUSTFS_ISSUE3031_DIAG_ENABLE", Some("true"))], async {
-        let set_disks = make_local_set_disks(4, 2).await;
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
         let bucket = "bb-issue3031-diag";
         let object = "object.bin";
         let first_payload = b"first diagnostic body".to_vec();
@@ -410,7 +470,7 @@ async fn blackbox_issue3031_diag_covers_put_success_cleanup_and_error_summary() 
             .expect("overwritten object should stream");
         assert_eq!(restored, second_payload);
 
-        let failed_set = make_local_set_disks(1, 0).await;
+        let (_failed_dirs, failed_set) = make_local_set_disks(1, 0).await;
         let failed_bucket = "bb-issue3031-fail";
         failed_set
             .make_bucket(failed_bucket, &MakeBucketOptions::default())

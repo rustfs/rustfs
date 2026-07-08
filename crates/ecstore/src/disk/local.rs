@@ -6275,6 +6275,18 @@ mod test {
         }
     }
 
+    /// Backdate a path's mtime so zero-expiry cleanup tests classify it as
+    /// stale deterministically, instead of sleeping and hoping the filesystem
+    /// timestamp granularity (or a backward wall-clock step) cooperates.
+    fn backdate_mtime(path: &std::path::Path, age: Duration) {
+        use std::fs::{File, FileTimes};
+        let mtime = std::time::SystemTime::now() - age;
+        File::open(path)
+            .expect("path should open to backdate its mtime")
+            .set_times(FileTimes::new().set_modified(mtime))
+            .expect("mtime should rewind into the past");
+    }
+
     #[tokio::test]
     async fn startup_cleanup_barrier_and_tmp_trash_cleanup_cover_noop_and_delete_paths() {
         use tempfile::tempdir;
@@ -6307,7 +6319,7 @@ mod test {
         fs::create_dir_all(&stale_dir).await.expect("stale dir should be created");
         fs::write(&live_file, b"not-a-dir").await.expect("tmp file should be created");
         fs::create_dir_all(&trash_root).await.expect("trash dir should be created");
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        backdate_mtime(&stale_dir, Duration::from_secs(10));
 
         LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
             .await
@@ -7941,7 +7953,9 @@ mod test {
         fs::create_dir_all(&trash).await.expect("operation should succeed");
         fs::write(&stale, b"temporary").await.expect("operation should succeed");
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        // Backdate after the write above: creating stale/data refreshes the
+        // scanned tmp/stale directory's mtime.
+        backdate_mtime(&tmp.join("stale"), Duration::from_secs(10));
         LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
             .await
             .expect("operation should succeed");
@@ -9447,7 +9461,10 @@ mod test {
     }
 
     #[test]
-    fn mmap_and_reclaim_metric_helpers_accept_noop_and_positive_paths() {
+    // Serialized because it flips the process-global GET stage-metrics gate,
+    // which the decode.rs shard-locality tests also toggle under the same key.
+    #[serial_test::serial]
+    fn mmap_and_reclaim_metric_helpers_record_expected_counters_and_samples() {
         let metrics = || MmapCopyStageMetrics {
             path: "local_test",
             access_check_stage: "access",
@@ -9462,17 +9479,63 @@ mod test {
             direct_read_copy_stage: "direct_read_copy",
         };
 
-        record_mmap_copy_stage(metrics(), "mmap_copy", None);
-        record_mmap_copy_stage(metrics(), "mmap_copy", Some(std::time::Instant::now()));
-        record_file_cache_reclaim_success("read", 128, std::time::Instant::now());
-        record_file_cache_reclaim_error("write");
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            record_mmap_copy_stage(metrics(), "mmap_copy", None);
+            record_mmap_copy_stage(metrics(), "mmap_copy", Some(std::time::Instant::now()));
+            record_file_cache_reclaim_success("read", 128, std::time::Instant::now());
+            record_file_cache_reclaim_error("write");
+
+            #[cfg(unix)]
+            {
+                record_mmap_page_fault_delta("local_test", "mmap_map", MmapPageFaultDelta::default());
+                record_mmap_page_fault_delta("local_test", "mmap_map", MmapPageFaultDelta { minor: 1, major: 2 });
+                record_direct_read_page_fault_delta("local_test", "direct_read_copy", MmapPageFaultDelta::default());
+                record_direct_read_page_fault_delta("local_test", "direct_read_copy", MmapPageFaultDelta { minor: 3, major: 4 });
+            }
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert_eq!(
+            recorder.histogram_sample_count("rustfs_io_get_object_stage_duration_seconds"),
+            1,
+            "only the Some-timer stage call must record a duration sample"
+        );
+        assert_eq!(
+            recorder.counter_value("rustfs_page_cache_reclaim_requests_total", &[("kind", "read"), ("result", "ok")]),
+            1
+        );
+        assert_eq!(recorder.counter_value("rustfs_page_cache_reclaim_bytes_total", &[("kind", "read")]), 128);
+        assert_eq!(recorder.histogram_sample_count("rustfs_page_cache_reclaim_duration_seconds"), 1);
+        assert_eq!(
+            recorder.counter_value("rustfs_page_cache_reclaim_requests_total", &[("kind", "write"), ("result", "err")]),
+            1
+        );
 
         #[cfg(unix)]
         {
-            record_mmap_page_fault_delta("local_test", "mmap_map", MmapPageFaultDelta::default());
-            record_mmap_page_fault_delta("local_test", "mmap_map", MmapPageFaultDelta { minor: 1, major: 2 });
-            record_direct_read_page_fault_delta("local_test", "direct_read_copy", MmapPageFaultDelta::default());
-            record_direct_read_page_fault_delta("local_test", "direct_read_copy", MmapPageFaultDelta { minor: 3, major: 4 });
+            for (kind, expected) in [("minor", 1), ("major", 2)] {
+                assert_eq!(
+                    recorder.counter_value(
+                        METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL,
+                        &[("path", "local_test"), ("stage", "mmap_map"), ("kind", kind)]
+                    ),
+                    expected,
+                    "zero deltas must not emit and positive {kind} deltas must accumulate exactly"
+                );
+            }
+            for (kind, expected) in [("minor", 3), ("major", 4)] {
+                assert_eq!(
+                    recorder.counter_value(
+                        METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL,
+                        &[("path", "local_test"), ("stage", "direct_read_copy"), ("kind", kind)]
+                    ),
+                    expected,
+                    "zero deltas must not emit and positive {kind} deltas must accumulate exactly"
+                );
+            }
         }
     }
 
