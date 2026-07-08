@@ -243,6 +243,36 @@ pub struct FileInfo {
     pub uses_legacy_checksum: bool,
 }
 
+/// Validates that an erasure `distribution` is a permutation of `1..=n`.
+///
+/// A well-formed distribution has exactly `n` entries and each 1-based slot
+/// index in `1..=n` appears exactly once. Corrupt or adversarial `xl.meta`
+/// can carry values of `0` or greater than `n`, which are later used as
+/// `distribution[k] - 1` indices into fixed-size vectors and would trigger a
+/// `usize` underflow / out-of-bounds panic. Rejecting such distributions here
+/// lets the metadata surface as a clean quorum/corruption error instead.
+pub(crate) fn is_valid_distribution(distribution: &[usize], n: usize) -> bool {
+    if n == 0 || distribution.len() != n {
+        return false;
+    }
+
+    let mut seen = vec![false; n];
+    for &block_idx in distribution {
+        // Valid 1-based slots are `1..=n`; anything else (including `0`) is invalid.
+        if block_idx < 1 || block_idx > n {
+            return false;
+        }
+        let slot = block_idx - 1;
+        if seen[slot] {
+            // Duplicate slot: not a permutation.
+            return false;
+        }
+        seen[slot] = true;
+    }
+
+    true
+}
+
 impl FileInfo {
     pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
         let indices = {
@@ -286,7 +316,7 @@ impl FileInfo {
             && (data_blocks > 0)
             && (self.erasure.index > 0
                 && self.erasure.index <= data_blocks + parity_blocks
-                && self.erasure.distribution.len() == (data_blocks + parity_blocks))
+                && is_valid_distribution(&self.erasure.distribution, data_blocks + parity_blocks))
     }
 
     pub fn get_etag(&self) -> Option<String> {
@@ -684,6 +714,76 @@ mod tests {
     use super::*;
     use proptest::collection::{hash_map, vec};
     use proptest::prelude::*;
+
+    // backlog#949: distribution range/permutation validation.
+    #[test]
+    fn is_valid_distribution_accepts_permutation() {
+        assert!(is_valid_distribution(&[1, 2, 3, 4], 4));
+        assert!(is_valid_distribution(&[4, 2, 1, 3], 4));
+        assert!(is_valid_distribution(&[1], 1));
+    }
+
+    #[test]
+    fn is_valid_distribution_rejects_zero_value() {
+        // A `0` would underflow `block_idx - 1` in the shuffle helpers.
+        assert!(!is_valid_distribution(&[0, 2, 3, 4], 4));
+    }
+
+    #[test]
+    fn is_valid_distribution_rejects_out_of_range_value() {
+        // A value greater than N would index out of bounds in the shuffle helpers.
+        assert!(!is_valid_distribution(&[1, 2, 3, 5], 4));
+        assert!(!is_valid_distribution(&[usize::MAX, 2, 3, 4], 4));
+    }
+
+    #[test]
+    fn is_valid_distribution_rejects_duplicates() {
+        // In-range but not a permutation.
+        assert!(!is_valid_distribution(&[1, 1, 3, 4], 4));
+    }
+
+    #[test]
+    fn is_valid_distribution_rejects_wrong_length_and_empty() {
+        assert!(!is_valid_distribution(&[1, 2, 3], 4));
+        assert!(!is_valid_distribution(&[1, 2, 3, 4, 4], 4));
+        assert!(!is_valid_distribution(&[], 0));
+        assert!(!is_valid_distribution(&[], 4));
+    }
+
+    fn distribution_test_fileinfo() -> FileInfo {
+        // data=2, parity=2 => N=4, distribution is a valid permutation of 1..=4.
+        let mut fi = FileInfo::new("bucket/object", 2, 2);
+        fi.erasure.index = 1;
+        fi
+    }
+
+    #[test]
+    fn is_valid_accepts_well_formed_distribution() {
+        assert!(distribution_test_fileinfo().is_valid());
+    }
+
+    #[test]
+    fn is_valid_rejects_corrupt_distribution_values() {
+        // Zero value.
+        let mut fi = distribution_test_fileinfo();
+        fi.erasure.distribution = vec![0, 2, 3, 4];
+        assert!(!fi.is_valid());
+
+        // Out-of-range value.
+        let mut fi = distribution_test_fileinfo();
+        fi.erasure.distribution = vec![1, 2, 3, 9];
+        assert!(!fi.is_valid());
+
+        // Duplicate value (not a permutation).
+        let mut fi = distribution_test_fileinfo();
+        fi.erasure.distribution = vec![1, 1, 3, 4];
+        assert!(!fi.is_valid());
+
+        // Wrong length.
+        let mut fi = distribution_test_fileinfo();
+        fi.erasure.distribution = vec![1, 2, 3];
+        assert!(!fi.is_valid());
+    }
 
     fn small_string_strategy() -> impl Strategy<Value = String> {
         proptest::string::string_regex("[A-Za-z0-9._/-]{0,16}").expect("small string regex should compile")
