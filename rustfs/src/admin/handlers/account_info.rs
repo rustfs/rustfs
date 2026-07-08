@@ -18,11 +18,16 @@ use crate::admin::runtime_sources::{current_action_credentials, current_object_s
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::data_usage::{
+    apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_bucket_usage_from_object_layer,
+    refresh_versioned_bucket_usage_from_object_layer, replace_bucket_usage_memory_from_info,
+};
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use rustfs_data_usage::BucketUsageInfo;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
@@ -31,6 +36,7 @@ use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error}
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::debug;
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
@@ -55,6 +61,17 @@ pub fn register_account_info_route(r: &mut S3Router<AdminOperation>) -> std::io:
 
 fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, can_put_object: bool) -> (bool, bool) {
     (can_list_bucket || can_get_bucket_location, can_put_object)
+}
+
+fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAccessInfo, usage: Option<&BucketUsageInfo>) {
+    let Some(usage) = usage else {
+        return;
+    };
+
+    bucket_info.size = usage.size;
+    bucket_info.objects = usage.objects_count;
+    bucket_info.object_sizes_histogram = usage.object_size_histogram.clone();
+    bucket_info.object_versions_histogram = usage.object_versions_histogram.clone();
 }
 
 #[async_trait::async_trait]
@@ -201,12 +218,19 @@ impl Operation for AccountInfoHandler {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
+        let mut data_usage_info = load_data_usage_from_backend(store.clone())
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
+        refresh_versioned_bucket_usage_from_object_layer(store.clone(), &mut data_usage_info).await;
+        replace_bucket_usage_memory_from_info(&data_usage_info).await;
+        apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
+
         for bucket in buckets.iter() {
             let (rd, wr) = is_allow(bucket.name.clone()).await;
             if rd || wr {
                 // TODO: BucketQuotaSys
                 // TODO: other attributes
-                account_info.buckets.push(rustfs_madmin::BucketAccessInfo {
+                let mut bucket_info = rustfs_madmin::BucketAccessInfo {
                     name: bucket.name.clone(),
                     details: Some(rustfs_madmin::BucketDetails {
                         versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
@@ -216,7 +240,18 @@ impl Operation for AccountInfoHandler {
                     created: bucket.created,
                     access: rustfs_madmin::AccountAccess { read: rd, write: wr },
                     ..Default::default()
-                });
+                };
+                // AccountInfo backs Console bucket stats, so prefer object-layer usage over potentially cold scanner snapshots.
+                if let Err(err) = refresh_bucket_usage_from_object_layer(store.clone(), &mut data_usage_info, &bucket.name).await
+                {
+                    debug!(
+                        bucket = %bucket.name,
+                        error = %err,
+                        "failed to refresh account info bucket usage from object layer"
+                    );
+                }
+                apply_usage_to_bucket_access_info(&mut bucket_info, data_usage_info.buckets_usage.get(&bucket.name));
+                account_info.buckets.push(bucket_info);
             }
         }
 
@@ -266,5 +301,42 @@ mod tests {
         assert_eq!(resolve_bucket_access(true, false, false), (true, false));
         assert_eq!(resolve_bucket_access(false, true, false), (true, false));
         assert_eq!(resolve_bucket_access(false, false, true), (false, true));
+    }
+
+    #[test]
+    fn accountinfo_bucket_access_info_uses_data_usage_stats() {
+        let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+            name: "agent".to_string(),
+            ..Default::default()
+        };
+        let usage = BucketUsageInfo {
+            size: 222 * 1024 * 1024,
+            objects_count: 109,
+            object_size_histogram: HashMap::from([("1MiB-10MiB".to_string(), 109)]),
+            object_versions_histogram: HashMap::from([("SINGLE_VERSION".to_string(), 109)]),
+            ..Default::default()
+        };
+
+        apply_usage_to_bucket_access_info(&mut bucket_info, Some(&usage));
+
+        assert_eq!(bucket_info.size, usage.size);
+        assert_eq!(bucket_info.objects, usage.objects_count);
+        assert_eq!(bucket_info.object_sizes_histogram, usage.object_size_histogram);
+        assert_eq!(bucket_info.object_versions_histogram, usage.object_versions_histogram);
+    }
+
+    #[test]
+    fn accountinfo_bucket_access_info_ignores_missing_usage() {
+        let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+            name: "agent".to_string(),
+            size: 5,
+            objects: 2,
+            ..Default::default()
+        };
+
+        apply_usage_to_bucket_access_info(&mut bucket_info, None);
+
+        assert_eq!(bucket_info.size, 5);
+        assert_eq!(bucket_info.objects, 2);
     }
 }
