@@ -183,6 +183,11 @@ async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
             proxied_get_tagging_requests_failures: stats.proxied_get_tagging_requests_failures,
             proxied_delete_tagging_requests_total: stats.proxied_delete_tagging_requests_total,
             proxied_delete_tagging_requests_failures: stats.proxied_delete_tagging_requests_failures,
+            resync_started_count: stats.resync_started_count,
+            resync_completed_count: stats.resync_completed_count,
+            resync_failed_count: stats.resync_failed_count,
+            resync_canceled_count: stats.resync_canceled_count,
+            resync_duration_ms: stats.resync_duration_ms,
             targets: stats
                 .targets
                 .into_iter()
@@ -518,13 +523,9 @@ fn build_system_cpu_stats(system: &System) -> CpuStats {
 
     CpuStats {
         avg_idle: (100.0 - cpu_usage).max(0.0),
-        avg_iowait: 0.0,
         load_avg,
         load_avg_perc: (load_avg / cpu_count) * 100.0,
-        nice: 0.0,
-        steal: 0.0,
-        system: cpu_usage,
-        user: 0.0,
+        usage_perc: cpu_usage,
     }
 }
 
@@ -617,26 +618,22 @@ pub async fn collect_disk_and_system_drive_stats() -> (Vec<DiskStats>, Vec<Drive
                 free_bytes: disk.available_space,
                 capacity_observation_state,
                 capacity_observation_age_seconds,
-                used_inodes: 0,
-                free_inodes: 0,
-                total_inodes: 0,
-                timeout_errors_total: 0,
-                io_errors_total: 0,
-                availability_errors_total: 0,
-                waiting_io: 0,
-                api_latency_micros: 0,
+                used_inodes: None,
+                free_inodes: None,
+                total_inodes: None,
+                timeout_errors_total: None,
+                io_errors_total: None,
+                availability_errors_total: None,
+                waiting_io: None,
+                api_latency_micros: None,
                 health: if is_online { 1 } else { 0 },
-                reads_per_sec: 0.0,
-                reads_kb_per_sec: 0.0,
-                reads_await: 0.0,
-                writes_per_sec: 0.0,
-                writes_kb_per_sec: 0.0,
-                writes_await: 0.0,
-                perc_util: if disk.total_space > 0 {
-                    (disk.used_space as f64 / disk.total_space as f64) * 100.0
-                } else {
-                    0.0
-                },
+                reads_per_sec: None,
+                reads_kb_per_sec: None,
+                reads_await: None,
+                writes_per_sec: None,
+                writes_kb_per_sec: None,
+                writes_await: None,
+                perc_util: None,
             }
         })
         .collect();
@@ -720,16 +717,15 @@ pub fn collect_process_system_stats() -> ProcessStats {
     collect_process_metric_bundle().process
 }
 
-/// Collect host network statistics from the current network interface snapshot.
+/// Collect host network statistics from a refreshed network interface snapshot.
 ///
 /// These counters come from system interfaces and are host-wide, not process-scoped.
-pub fn collect_host_network_stats() -> HostNetworkStats {
-    let networks = Networks::new_with_refreshed_list();
+pub fn collect_host_network_stats_with(networks: &Networks) -> HostNetworkStats {
     let mut total_received = 0u64;
     let mut total_transmitted = 0u64;
     let mut per_interface = Vec::with_capacity(networks.len());
 
-    for (interface_name, data) in &networks {
+    for (interface_name, data) in networks {
         let received = data.received();
         let transmitted = data.transmitted();
         total_received += received;
@@ -742,6 +738,15 @@ pub fn collect_host_network_stats() -> HostNetworkStats {
         total_transmitted,
         per_interface,
     }
+}
+
+/// Collect host network statistics using a persistent `sysinfo::Networks` snapshot.
+///
+/// `sysinfo` reports network I/O as deltas since the previous refresh, so
+/// callers must reuse the same `Networks` instance across collection ticks.
+pub fn collect_host_network_stats(networks: &mut Networks) -> HostNetworkStats {
+    networks.refresh(true);
+    collect_host_network_stats_with(networks)
 }
 
 /// Collect internode network metrics from the global internode metrics snapshot.
@@ -1077,6 +1082,43 @@ pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterSta
 mod tests {
     use super::*;
     use rustfs_common::metrics::ScannerSourceWorkSnapshot;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    fn generate_loopback_traffic() -> std::io::Result<()> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let addr = listener.local_addr()?;
+        let payload = vec![0x5Au8; 64 * 1024];
+        let expected_len = payload.len();
+
+        let server = thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut received = 0usize;
+            let mut buf = [0u8; 8192];
+
+            while received < expected_len {
+                let read = stream.read(&mut buf)?;
+                if read == 0 {
+                    break;
+                }
+                received += read;
+            }
+
+            Ok(())
+        });
+
+        let mut client = TcpStream::connect(addr)?;
+        client.write_all(&payload)?;
+        client.flush()?;
+        client.shutdown(Shutdown::Write)?;
+
+        server
+            .join()
+            .expect("loopback traffic server thread should complete successfully")?;
+        Ok(())
+    }
 
     #[test]
     fn disk_is_online_for_metrics_accepts_online_state_case_insensitive() {
@@ -1222,6 +1264,45 @@ mod tests {
         };
 
         assert_eq!(scanner_lifecycle_checked_versions(&report), 0);
+    }
+
+    #[test]
+    fn host_network_stats_require_a_persistent_networks_snapshot() -> std::io::Result<()> {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return Ok(());
+        }
+
+        let mut persistent_networks = Networks::new();
+        persistent_networks.refresh(true);
+        let initial_stats = collect_host_network_stats_with(&persistent_networks);
+        assert_eq!(
+            initial_stats.total_received + initial_stats.total_transmitted,
+            0,
+            "the first refresh only seeds sysinfo's baseline snapshot"
+        );
+
+        match generate_loopback_traffic() {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+        thread::sleep(Duration::from_millis(100));
+
+        let refreshed_stats = collect_host_network_stats(&mut persistent_networks);
+        assert!(
+            refreshed_stats.total_received > 0 || refreshed_stats.total_transmitted > 0,
+            "a persistent Networks instance should report non-zero loopback deltas after traffic"
+        );
+
+        let recreated_stats = collect_host_network_stats_with(&Networks::new_with_refreshed_list());
+        assert_eq!(
+            recreated_stats.total_received + recreated_stats.total_transmitted,
+            0,
+            "recreating Networks loses the prior refresh baseline and yields zero deltas"
+        );
+        Ok(())
     }
 
     #[test]

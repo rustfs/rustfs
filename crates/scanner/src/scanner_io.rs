@@ -28,7 +28,7 @@ use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, e
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
+use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -90,6 +90,24 @@ fn scanner_metadata_transient_error(reason: impl std::fmt::Display, bucket: &str
     StorageError::other(format!(
         "{SCANNER_METADATA_TRANSIENT_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
     ))
+}
+
+async fn object_lock_config_for_scanner_item(item: &ScannerItem) -> Option<Arc<ObjectLockConfiguration>> {
+    if let Some(config) = item.object_lock.clone() {
+        return Some(config);
+    }
+
+    get_object_lock_config(&item.bucket)
+        .await
+        .ok()
+        .map(|(config, _)| Arc::new(config))
+}
+
+fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
+    config
+        .object_lock_enabled
+        .as_ref()
+        .is_some_and(|enabled| enabled.as_str() == ObjectLockEnabled::ENABLED)
 }
 
 #[derive(Clone)]
@@ -1515,10 +1533,7 @@ impl ScannerIODisk for Disk {
                 .insert(storageclass::RRS.to_string(), TierStats::default());
         }
 
-        let lock_config = match get_object_lock_config(&item.bucket).await {
-            Ok((cfg, _)) => Some(Arc::new(cfg)),
-            Err(_) => None,
-        };
+        let lock_config = object_lock_config_for_scanner_item(&item).await;
 
         item.apply_actions(object_infos, lock_config, &mut size_summary).await;
 
@@ -1574,7 +1589,11 @@ impl ScannerIODisk for Disk {
             cache.info.replication = Some(Arc::new(ReplicationConfig::new(Some(replication_config), Some(targets))));
         }
 
-        // TODO: object lock
+        if let Ok((object_lock_config, _)) = get_object_lock_config(&cache.info.name).await
+            && object_lock_config_enabled(&object_lock_config)
+        {
+            cache.info.object_lock = Some(Arc::new(object_lock_config));
+        }
 
         let Some(ecstore) = resolve_scanner_object_store_handle() else {
             error!(
@@ -1687,6 +1706,47 @@ mod tests {
             versioning: false,
             object_locking: false,
         }
+    }
+
+    #[tokio::test]
+    async fn scanner_item_object_lock_uses_cached_config() {
+        let temp_dir = std::env::temp_dir();
+        let cached = Arc::new(ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            ..Default::default()
+        });
+        let item = ScannerItem {
+            path: temp_dir.join("object").to_string_lossy().to_string(),
+            bucket: "bucket".to_string(),
+            prefix: String::new(),
+            object_name: "object".to_string(),
+            file_type: std::fs::metadata(&temp_dir)
+                .expect("temp dir metadata should be readable")
+                .file_type(),
+            lifecycle: None,
+            object_lock: Some(cached.clone()),
+            replication: None,
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+
+        let resolved = object_lock_config_for_scanner_item(&item)
+            .await
+            .expect("cached object-lock config should resolve");
+
+        assert!(Arc::ptr_eq(&resolved, &cached));
+    }
+
+    #[test]
+    fn object_lock_config_enabled_accepts_enabled_only() {
+        let enabled = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            ..Default::default()
+        };
+
+        assert!(object_lock_config_enabled(&enabled));
+        assert!(!object_lock_config_enabled(&ObjectLockConfiguration::default()));
     }
 
     #[test]
@@ -1960,6 +2020,7 @@ mod tests {
             object_name: STORAGE_FORMAT_FILE.to_string(),
             file_type,
             lifecycle: None,
+            object_lock: None,
             replication: None,
             heal_enabled: false,
             heal_bitrot: false,
@@ -2015,6 +2076,7 @@ mod tests {
             object_name: STORAGE_FORMAT_FILE.to_string(),
             file_type,
             lifecycle: None,
+            object_lock: None,
             replication: None,
             heal_enabled: false,
             heal_bitrot: false,
@@ -2085,6 +2147,7 @@ mod tests {
             object_name: STORAGE_FORMAT_FILE.to_string(),
             file_type,
             lifecycle: None,
+            object_lock: None,
             replication: None,
             heal_enabled: false,
             heal_bitrot: false,

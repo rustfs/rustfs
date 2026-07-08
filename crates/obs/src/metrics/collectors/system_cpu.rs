@@ -32,20 +32,12 @@ use std::borrow::Cow;
 pub struct CpuStats {
     /// Average CPU idle time (percentage, 0-100)
     pub avg_idle: f64,
-    /// Average CPU I/O wait time (percentage, 0-100)
-    pub avg_iowait: f64,
     /// CPU load average over 1 minute
     pub load_avg: f64,
     /// CPU load average as percentage
     pub load_avg_perc: f64,
-    /// CPU nice time (percentage, 0-100)
-    pub nice: f64,
-    /// CPU steal time (percentage, 0-100)
-    pub steal: f64,
-    /// CPU system time (percentage, 0-100)
-    pub system: f64,
-    /// CPU user time (percentage, 0-100)
-    pub user: f64,
+    /// Total measured CPU usage percentage
+    pub usage_perc: f64,
 }
 
 /// Process CPU statistics.
@@ -66,13 +58,9 @@ pub struct ProcessCpuStats {
 pub fn collect_cpu_metrics(stats: &CpuStats) -> Vec<PrometheusMetric> {
     vec![
         PrometheusMetric::from_descriptor(&SYS_CPU_AVG_IDLE_MD, stats.avg_idle),
-        PrometheusMetric::from_descriptor(&SYS_CPU_AVG_IOWAIT_MD, stats.avg_iowait),
         PrometheusMetric::from_descriptor(&SYS_CPU_LOAD_MD, stats.load_avg),
         PrometheusMetric::from_descriptor(&SYS_CPU_LOAD_PERC_MD, stats.load_avg_perc),
-        PrometheusMetric::from_descriptor(&SYS_CPU_NICE_MD, stats.nice),
-        PrometheusMetric::from_descriptor(&SYS_CPU_STEAL_MD, stats.steal),
-        PrometheusMetric::from_descriptor(&SYS_CPU_SYSTEM_MD, stats.system),
-        PrometheusMetric::from_descriptor(&SYS_CPU_USER_MD, stats.user),
+        PrometheusMetric::from_descriptor(&SYS_CPU_USAGE_PERC_MD, stats.usage_perc),
     ]
 }
 
@@ -108,19 +96,15 @@ mod tests {
     fn test_collect_cpu_metrics() {
         let stats = CpuStats {
             avg_idle: 75.5,
-            avg_iowait: 2.3,
             load_avg: 1.5,
             load_avg_perc: 37.5,
-            nice: 0.5,
-            steal: 0.1,
-            system: 10.0,
-            user: 15.0,
+            usage_perc: 24.5,
         };
 
         let metrics = collect_cpu_metrics(&stats);
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 8);
+        assert_eq!(metrics.len(), 4);
 
         // Verify that metric names are properly generated from descriptors
         assert!(metrics.iter().all(|m| m.name.starts_with("rustfs_system_cpu_")));
@@ -131,11 +115,29 @@ mod tests {
         let stats = CpuStats::default();
         let metrics = collect_cpu_metrics(&stats);
 
-        assert_eq!(metrics.len(), 8);
+        assert_eq!(metrics.len(), 4);
         for metric in &metrics {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());
         }
+    }
+
+    #[test]
+    fn system_cpu_metrics_export_total_usage_under_honest_name() {
+        let stats = CpuStats {
+            avg_idle: 40.0,
+            load_avg: 1.0,
+            load_avg_perc: 25.0,
+            usage_perc: 60.0,
+        };
+
+        let metrics = collect_cpu_metrics(&stats);
+        let usage_metric = metrics.iter().find(|metric| metric.name == "rustfs_system_cpu_usage_perc");
+
+        assert!(usage_metric.is_some());
+        assert_eq!(usage_metric.map(|metric| metric.value), Some(60.0));
+        assert!(metrics.iter().all(|metric| metric.name != "rustfs_system_cpu_system"));
+        assert!(metrics.iter().all(|metric| metric.name != "rustfs_system_cpu_user"));
     }
 
     #[test]

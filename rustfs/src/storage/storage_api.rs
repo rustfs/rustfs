@@ -318,8 +318,8 @@ pub(crate) mod ecstore_admin {
 
 pub(crate) mod ecstore_bucket {
     pub(crate) use rustfs_ecstore::api::bucket::{
-        bandwidth, bucket_target_sys, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys, replication,
-        tagging, target, utils,
+        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys,
+        replication, tagging, target, utils,
     };
     pub(crate) use rustfs_ecstore::api::bucket::{quota, versioning, versioning_sys};
 }

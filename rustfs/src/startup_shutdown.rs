@@ -18,6 +18,7 @@ use crate::{
     startup_optional_runtime_sidecars::{
         OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
     },
+    startup_runtime_sources,
 };
 use rustfs_heal::shutdown_ahm_services;
 use rustfs_utils::get_env_bool_with_aliases;
@@ -299,6 +300,17 @@ pub(crate) async fn run_embedded_server_shutdown(
         state = "stopped",
         "Embedded server state changed"
     );
+
+    if let Err(err) = startup_runtime_sources::shutdown_observability_guard() {
+        warn!(
+            component = LOG_COMPONENT_EMBEDDED,
+            subsystem = LOG_SUBSYSTEM_EMBEDDED,
+            event = EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED,
+            service = "observability",
+            error = %err,
+            "Embedded shutdown cleanup failed"
+        );
+    }
 }
 
 #[cfg(test)]

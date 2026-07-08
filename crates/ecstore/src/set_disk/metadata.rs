@@ -885,9 +885,17 @@ impl SetDisks {
                 continue;
             }
 
-            let block_idx = distribution[k];
-            shuffled_parts_metadata[block_idx - 1] = std::mem::take(&mut parts_metadata[k]);
-            shuffled_disks[block_idx - 1] = disks[k].take();
+            // Defensive: a corrupt/adversarial `distribution` value of `0` would
+            // underflow `block_idx - 1`, and a value `> N` would index out of
+            // bounds. Skip such entries instead of panicking (backlog#949).
+            let Some(slot) = distribution[k]
+                .checked_sub(1)
+                .filter(|slot| *slot < shuffled_parts_metadata.len() && *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_parts_metadata[slot] = std::mem::take(&mut parts_metadata[k]);
+            shuffled_disks[slot] = disks[k].take();
         }
 
         (shuffled_disks, shuffled_parts_metadata)
@@ -919,9 +927,17 @@ impl SetDisks {
                 continue;
             }
 
-            let block_idx = distribution[k];
-            shuffled_parts_metadata[block_idx - 1] = parts_metadata[k].clone();
-            shuffled_disks[block_idx - 1].clone_from(&disks[k]);
+            // Defensive: reject out-of-range distribution values instead of
+            // underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution[k]
+                .checked_sub(1)
+                .filter(|slot| *slot < shuffled_parts_metadata.len() && *slot < shuffled_disks.len())
+            else {
+                inconsistent += 1;
+                continue;
+            };
+            shuffled_parts_metadata[slot] = parts_metadata[k].clone();
+            shuffled_disks[slot].clone_from(&disks[k]);
         }
 
         if inconsistent < fi.erasure.parity_blocks {
@@ -955,9 +971,16 @@ impl SetDisks {
             //     continue;
             // }
 
-            let block_idx = distribution[k];
-            shuffled_parts_metadata[block_idx - 1] = parts_metadata[k].clone();
-            shuffled_disks[block_idx - 1].clone_from(&disks[k]);
+            // Defensive: reject out-of-range distribution values instead of
+            // underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution[k]
+                .checked_sub(1)
+                .filter(|slot| *slot < shuffled_parts_metadata.len() && *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_parts_metadata[slot] = parts_metadata[k].clone();
+            shuffled_disks[slot].clone_from(&disks[k]);
         }
 
         (shuffled_disks, shuffled_parts_metadata)
@@ -969,9 +992,17 @@ impl SetDisks {
         }
         let mut shuffled_parts_metadata = vec![FileInfo::default(); parts_metadata.len()];
         // Shuffle slice xl metadata for expected distribution.
-        for index in 0..parts_metadata.len() {
-            let block_index = distribution[index];
-            shuffled_parts_metadata[block_index - 1] = parts_metadata[index].clone();
+        for (index, part) in parts_metadata.iter().enumerate() {
+            // Defensive: skip missing or out-of-range distribution values
+            // instead of underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution
+                .get(index)
+                .and_then(|block_index| block_index.checked_sub(1))
+                .filter(|slot| *slot < shuffled_parts_metadata.len())
+            else {
+                continue;
+            };
+            shuffled_parts_metadata[slot] = part.clone();
         }
         shuffled_parts_metadata
     }
@@ -984,8 +1015,16 @@ impl SetDisks {
         let mut shuffled_disks = vec![None; disks.len()];
 
         for (i, v) in disks.iter().enumerate() {
-            let idx = distribution[i];
-            shuffled_disks[idx - 1].clone_from(v);
+            // Defensive: skip missing or out-of-range distribution values
+            // instead of underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution
+                .get(i)
+                .and_then(|idx| idx.checked_sub(1))
+                .filter(|slot| *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_disks[slot].clone_from(v);
         }
 
         shuffled_disks
@@ -997,8 +1036,16 @@ impl SetDisks {
         }
         let mut shuffled_parts_errs = vec![0; parts_errs.len()];
         for (i, v) in parts_errs.iter().enumerate() {
-            let idx = distribution[i];
-            shuffled_parts_errs[idx - 1] = *v;
+            // Defensive: skip missing or out-of-range distribution values
+            // instead of underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution
+                .get(i)
+                .and_then(|idx| idx.checked_sub(1))
+                .filter(|slot| *slot < shuffled_parts_errs.len())
+            else {
+                continue;
+            };
+            shuffled_parts_errs[slot] = *v;
         }
         shuffled_parts_errs
     }
@@ -1174,5 +1221,57 @@ mod tests {
         let expected_slots: Vec<bool> = expected_disks.iter().map(Option::is_some).collect();
         let owned_slots: Vec<bool> = owned_disks.iter().map(Option::is_some).collect();
         assert_eq!(owned_slots, expected_slots, "fallback disk slots must match the borrowing variant");
+    }
+
+    // backlog#949: corrupt/adversarial distribution values (0 or > N) must not
+    // trigger a `usize` underflow / out-of-bounds panic in the shuffle helpers.
+    #[test]
+    fn shuffle_parts_metadata_survives_corrupt_distribution() {
+        let parts = vec![FileInfo::default(); 4];
+        // distribution[0] = 0 underflows; distribution[1] = 9 is out of range.
+        let result = SetDisks::shuffle_parts_metadata(&parts, &[0, 9, 3, 4]);
+        assert_eq!(result.len(), parts.len(), "output length must be preserved");
+    }
+
+    #[test]
+    fn shuffle_check_parts_survives_corrupt_distribution() {
+        let errs = vec![10usize, 20, 30, 40];
+        let result = SetDisks::shuffle_check_parts(&errs, &[0, 9, 3, 4]);
+        assert_eq!(result.len(), errs.len(), "output length must be preserved");
+        // In-range entries are still placed; corrupt ones are safely skipped.
+        assert_eq!(result[2], 30, "distribution[2]=3 places errs[2] into slot 2");
+        assert_eq!(result[3], 40, "distribution[3]=4 places errs[3] into slot 3");
+    }
+
+    #[tokio::test]
+    async fn shuffle_disks_survives_corrupt_distribution() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let disks = shuffle_test_disks(&tempdir, 4).await;
+        // distribution[0] = 0 underflows; distribution[1] = 9 is out of range.
+        let result = SetDisks::shuffle_disks(&disks, &[0, 9, 3, 4]);
+        assert_eq!(result.len(), disks.len(), "output length must be preserved");
+    }
+
+    #[tokio::test]
+    async fn shuffle_disks_and_parts_metadata_survives_corrupt_distribution() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let (mut fi, parts) = shuffle_fixture(true);
+        let slots = parts.len();
+
+        // Corrupt the selected FileInfo's distribution: a `0` (underflow) and an
+        // out-of-range value. Length and `erasure.index` stay well-formed so the
+        // corruption is only in the distribution values.
+        fi.erasure.distribution = vec![0; slots];
+        fi.erasure.distribution[0] = slots + 5;
+
+        let disks = shuffle_test_disks(&tempdir, slots).await;
+
+        // None of these must panic on the corrupt distribution.
+        let (d1, _) = SetDisks::shuffle_disks_and_parts_metadata(&disks, &parts, &fi);
+        assert_eq!(d1.len(), disks.len());
+        let (d2, _) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
+        assert_eq!(d2.len(), disks.len());
+        let (d3, _) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
+        assert_eq!(d3.len(), slots);
     }
 }

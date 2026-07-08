@@ -63,6 +63,11 @@ pub(crate) struct ObsBucketReplicationStatsSnapshot {
     pub(crate) proxied_get_tagging_requests_failures: u64,
     pub(crate) proxied_delete_tagging_requests_total: u64,
     pub(crate) proxied_delete_tagging_requests_failures: u64,
+    pub(crate) resync_started_count: u64,
+    pub(crate) resync_completed_count: u64,
+    pub(crate) resync_failed_count: u64,
+    pub(crate) resync_canceled_count: u64,
+    pub(crate) resync_duration_ms: u64,
     pub(crate) targets: Vec<ObsBucketReplicationTargetStatsSnapshot>,
 }
 
@@ -89,6 +94,12 @@ fn i64_to_u64_floor_zero(value: i64) -> u64 {
 
 fn i32_to_u64_floor_zero(value: i32) -> u64 {
     u64::try_from(value.max(0)).unwrap_or(0)
+}
+
+fn replication_backlog_count(failed_counts: impl Iterator<Item = i64>, queued_count: i64) -> u64 {
+    let failed_backlog = failed_counts.map(i64_to_u64_floor_zero).sum::<u64>();
+
+    failed_backlog.saturating_add(i64_to_u64_floor_zero(queued_count))
 }
 
 pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketReplicationStatsSnapshot> {
@@ -156,6 +167,11 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             proxied_get_tagging_requests_failures: i64_to_u64_floor_zero(proxy.get_tag_failed),
             proxied_delete_tagging_requests_total: i64_to_u64_floor_zero(proxy.delete_tag_total),
             proxied_delete_tagging_requests_failures: i64_to_u64_floor_zero(proxy.delete_tag_failed),
+            resync_started_count: i64_to_u64_floor_zero(bucket_stats.resync_started_count),
+            resync_completed_count: i64_to_u64_floor_zero(bucket_stats.resync_completed_count),
+            resync_failed_count: i64_to_u64_floor_zero(bucket_stats.resync_failed_count),
+            resync_canceled_count: i64_to_u64_floor_zero(bucket_stats.resync_canceled_count),
+            resync_duration_ms: i64_to_u64_floor_zero(bucket_stats.resync_duration_ms),
             targets,
         });
     }
@@ -181,7 +197,13 @@ pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_ra
         .flat_map(|bucket| bucket.stats.values())
         .map(|stat| stat.xfer_rate_lrg.peak + stat.xfer_rate_sml.peak)
         .sum::<f64>();
-    let recent_backlog_count = stats.mrf_stats.values().copied().filter(|value| *value > 0).sum::<i64>();
+    let recent_backlog_count = replication_backlog_count(
+        all_bucket_stats
+            .values()
+            .flat_map(|bucket| bucket.stats.values())
+            .map(|stat| stat.failed.count),
+        site_metrics.queued.curr.count,
+    );
 
     ObsReplicationSiteStatsSnapshot {
         average_active_workers: site_metrics.active_workers.avg,
@@ -196,7 +218,7 @@ pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_ra
         max_queued_bytes: i64_to_u64_floor_zero(site_metrics.queued.max.bytes),
         max_queued_count: i64_to_u64_floor_zero(site_metrics.queued.max.count),
         max_data_transfer_rate,
-        recent_backlog_count: i64_to_u64_floor_zero(recent_backlog_count),
+        recent_backlog_count,
     }
 }
 
@@ -210,6 +232,16 @@ mod tests {
         assert_eq!(i64_to_u64_floor_zero(42), 42);
         assert_eq!(i32_to_u64_floor_zero(-1), 0);
         assert_eq!(i32_to_u64_floor_zero(42), 42);
+    }
+
+    #[test]
+    fn replication_backlog_count_uses_failed_targets_and_current_queue() {
+        assert_eq!(replication_backlog_count([3, 5].into_iter(), 7), 15);
+    }
+
+    #[test]
+    fn replication_backlog_count_floors_negative_failed_and_queue_values() {
+        assert_eq!(replication_backlog_count([-3, 4].into_iter(), -2), 4);
     }
 }
 

@@ -110,6 +110,21 @@ fn disk_metric_label(disk: &CapacityDiskRef) -> String {
     format!("{}:{mount_name}", disk.endpoint)
 }
 
+/// Extrapolate the total overflow bytes from a sample as
+/// `sampled_bytes * overflow_count / sampled_count`.
+///
+/// The multiplication is performed in `u128` so the intermediate product cannot
+/// saturate `u64` on very large disks. Doing `saturating_mul` in `u64` first and
+/// then dividing (the previous approach) pins the numerator at `u64::MAX` once the
+/// product overflows, which makes the estimate shrink as `sampled_count` grows —
+/// i.e. the reported capacity monotonically *under*-counts as the disk gets
+/// bigger. The final result is clamped to `u64::MAX`. See backlog#1012.
+fn estimate_overflow_bytes(overflow_sampled_bytes: u64, overflow_count: u64, sampled_count: u64) -> u64 {
+    let denom = (sampled_count.max(1)) as u128;
+    let scaled = (overflow_sampled_bytes as u128 * overflow_count as u128) / denom;
+    scaled.min(u64::MAX as u128) as u64
+}
+
 fn disk_scope_key(disk: &CapacityDiskRef) -> CapacityScopeDisk {
     CapacityScopeDisk {
         endpoint: disk.endpoint.clone(),
@@ -653,7 +668,8 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
             if should_check_progress && let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
                 if sampled_count > 0 {
                     let overflow_count = file_count.saturating_sub(max_files_threshold);
-                    let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
+                    let estimated_overflow =
+                        estimate_overflow_bytes(overflow_sampled_bytes, overflow_count as u64, sampled_count as u64);
                     let estimated_total = exact_prefix_bytes.saturating_add(estimated_overflow);
                     info!(
                         event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
@@ -722,7 +738,8 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
             if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
                 if sampled_count > 0 {
                     let overflow_count = file_count.saturating_sub(max_files_threshold);
-                    let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
+                    let estimated_overflow =
+                        estimate_overflow_bytes(overflow_sampled_bytes, overflow_count as u64, sampled_count as u64);
                     let estimated_total = exact_prefix_bytes.saturating_add(estimated_overflow);
                     info!(
                         event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
@@ -768,7 +785,7 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
 
         if file_count > max_files_threshold && sampled_count > 0 {
             let overflow_count = file_count - max_files_threshold;
-            let estimated_overflow = overflow_sampled_bytes.saturating_mul(overflow_count as u64) / sampled_count as u64;
+            let estimated_overflow = estimate_overflow_bytes(overflow_sampled_bytes, overflow_count as u64, sampled_count as u64);
             let estimated_size = exact_prefix_bytes.saturating_add(estimated_overflow);
             info!(
                 event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
@@ -862,6 +879,80 @@ mod tests {
     #[cfg(unix)]
     use rustfs_config::ENV_CAPACITY_FOLLOW_SYMLINKS;
     use serial_test::serial;
+
+    /// Reference implementation using unbounded `u128` arithmetic, clamped to
+    /// `u64::MAX`, used as the source of truth for the sampling extrapolation.
+    fn reference_estimate(overflow_sampled_bytes: u64, overflow_count: u64, sampled_count: u64) -> u64 {
+        let denom = (sampled_count.max(1)) as u128;
+        ((overflow_sampled_bytes as u128 * overflow_count as u128) / denom).min(u64::MAX as u128) as u64
+    }
+
+    #[test]
+    fn test_estimate_overflow_bytes_small_values_unchanged() {
+        // Typical, non-overflowing inputs: result must match the plain
+        // `bytes * count / sampled` computation exactly.
+        let overflow_sampled_bytes = 5_000_000u64;
+        let overflow_count = 1_000_000u64;
+        let sampled_count = 5_000u64;
+        let expected = overflow_sampled_bytes * overflow_count / sampled_count;
+        assert_eq!(estimate_overflow_bytes(overflow_sampled_bytes, overflow_count, sampled_count), expected);
+        assert_eq!(
+            estimate_overflow_bytes(overflow_sampled_bytes, overflow_count, sampled_count),
+            reference_estimate(overflow_sampled_bytes, overflow_count, sampled_count)
+        );
+    }
+
+    #[test]
+    fn test_estimate_overflow_bytes_realistic_large_disk() {
+        // backlog#1012 scenario: ~60M files, ~1.75 MiB average (~105 TB). The old
+        // `saturating_mul` path saturates to u64::MAX before dividing and reports
+        // roughly half the true value; the u128 path stays correct.
+        let overflow_sampled_bytes = 549_000_000_000u64; // ~5.49e11
+        let overflow_count = 59_800_000u64;
+        let sampled_count = 299_000u64;
+
+        // Old behaviour: product overflows u64, saturates, then divides.
+        let saturated = overflow_sampled_bytes.saturating_mul(overflow_count) / sampled_count;
+        assert!(
+            overflow_sampled_bytes.checked_mul(overflow_count).is_none(),
+            "test inputs must overflow u64 to exercise the regression"
+        );
+
+        let expected = reference_estimate(overflow_sampled_bytes, overflow_count, sampled_count);
+        let actual = estimate_overflow_bytes(overflow_sampled_bytes, overflow_count, sampled_count);
+        assert_eq!(actual, expected);
+        // The fixed estimate must be substantially larger than the saturated garbage.
+        assert!(actual > saturated * 3 / 2, "fixed estimate {actual} should dwarf saturated {saturated}");
+    }
+
+    #[test]
+    fn test_estimate_overflow_bytes_not_monotonically_shrinking() {
+        // The core defect: with saturation, a *larger* disk (bigger sampled_count
+        // and proportionally bigger bytes/count) reports a *smaller* total. Verify
+        // the fix scales monotonically instead of collapsing.
+        // Disk A and disk B have identical average file size; B is 10x bigger, so
+        // B's estimate must be ~10x A's, never smaller.
+        let a = estimate_overflow_bytes(2_000_000_000, 6_000_000, 30_000);
+        let b = estimate_overflow_bytes(20_000_000_000, 60_000_000, 300_000);
+        assert!(b > a, "larger disk estimate {b} must exceed smaller disk {a}");
+        assert_eq!(b, reference_estimate(20_000_000_000, 60_000_000, 300_000));
+    }
+
+    #[test]
+    fn test_estimate_overflow_bytes_extreme_values_clamp() {
+        // Both factors near the u64 ceiling: u128 product is astronomically larger
+        // than u64::MAX, so the result must clamp to u64::MAX without panicking.
+        let huge = u64::MAX - 1;
+        assert_eq!(estimate_overflow_bytes(huge, huge, 1), u64::MAX);
+        assert_eq!(estimate_overflow_bytes(huge, huge, 1), reference_estimate(huge, huge, 1));
+    }
+
+    #[test]
+    fn test_estimate_overflow_bytes_zero_sampled_count_guarded() {
+        // `sampled_count == 0` must not divide by zero; `.max(1)` guards it.
+        assert_eq!(estimate_overflow_bytes(100, 10, 0), 1_000);
+        assert_eq!(estimate_overflow_bytes(0, 10, 0), 0);
+    }
 
     #[tokio::test]
     async fn test_get_dir_size_async_empty_directory() {

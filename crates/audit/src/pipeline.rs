@@ -114,18 +114,41 @@ impl AuditPipeline {
 
         if errors.is_empty() {
             observability::record_audit_success(dispatch_time);
-        } else {
-            observability::record_audit_failure(dispatch_time);
-            warn!(
+            return Ok(());
+        }
+
+        observability::record_audit_failure(dispatch_time);
+        let error_count = errors.len();
+
+        if success_count == 0 {
+            // Every configured target rejected the event. For store-backed targets a
+            // failed save() means the entry was neither delivered nor persisted for
+            // replay, so it is lost outright. Propagate the failure instead of
+            // returning Ok so the caller can react (alert, degrade, or reject the
+            // request) rather than assume the audit trail is intact.
+            error!(
                 event = EVENT_AUDIT_DISPATCH_FAILED,
                 component = LOG_COMPONENT_AUDIT,
                 subsystem = LOG_SUBSYSTEM_PIPELINE,
-                error_count = errors.len(),
-                success_count = success_count,
+                error_count = error_count,
                 duration_ms = dispatch_time.as_millis() as u64,
-                "Some audit targets failed to receive audit event"
+                "All audit targets failed to receive audit event"
             );
+            // `errors` is non-empty here, so `remove(0)` cannot panic.
+            return Err(crate::AuditError::Target(errors.remove(0)));
         }
+
+        // Partial failure: at least one target accepted the event, so the entry is
+        // not lost. Surface the degradation but let the dispatch succeed.
+        warn!(
+            event = EVENT_AUDIT_DISPATCH_FAILED,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_PIPELINE,
+            error_count = error_count,
+            success_count = success_count,
+            duration_ms = dispatch_time.as_millis() as u64,
+            "Some audit targets failed to receive audit event"
+        );
 
         Ok(())
     }
@@ -179,6 +202,7 @@ impl AuditPipeline {
         let results = futures::future::join_all(tasks).await;
         let mut total_success = 0;
         let mut total_errors = 0;
+        let mut first_error: Option<rustfs_targets::TargetError> = None;
         for (target_id, success_count, errors) in results {
             total_success += success_count;
             total_errors += errors.len();
@@ -191,6 +215,9 @@ impl AuditPipeline {
                     error = ?e,
                     "Audit batch dispatch failed"
                 );
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
         }
 
@@ -205,6 +232,24 @@ impl AuditPipeline {
             duration_ms = dispatch_time.as_millis() as u64,
             "Completed audit batch dispatch"
         );
+
+        // No save() across any target/entry succeeded while errors were recorded:
+        // the batch was lost entirely. Propagate rather than silently returning Ok.
+        if total_errors > 0 && total_success == 0 {
+            observability::record_audit_failure(dispatch_time);
+            error!(
+                event = EVENT_AUDIT_BATCH_DISPATCH_FAILED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                entry_count = entries.len(),
+                error_count = total_errors,
+                duration_ms = dispatch_time.as_millis() as u64,
+                "All audit targets failed to receive audit batch"
+            );
+            return Err(crate::AuditError::Target(
+                first_error.expect("total_errors > 0 guarantees a captured target error"),
+            ));
+        }
 
         Ok(())
     }

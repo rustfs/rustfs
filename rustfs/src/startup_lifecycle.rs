@@ -23,7 +23,7 @@ use crate::{
 use rustfs_common::GlobalReadiness;
 use rustfs_scanner::init_data_scanner;
 use std::{
-    io::Result,
+    io::{Error, Result},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
@@ -149,6 +149,8 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         result = "stopped",
         "RustFS server stopped"
     );
+    startup_runtime_sources::shutdown_observability_guard()
+        .map_err(|err| Error::other(format!("shutdown_global_guard: {err}")))?;
     Ok(())
 }
 

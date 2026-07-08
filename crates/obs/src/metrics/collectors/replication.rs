@@ -49,7 +49,7 @@ pub struct ReplicationStats {
     pub max_queued_count: u64,
     /// Maximum data transfer rate seen since server start
     pub max_data_transfer_rate: f64,
-    /// Objects in replication backlog in the last 5 minutes
+    /// Objects currently in replication backlog
     pub recent_backlog_count: u64,
 }
 

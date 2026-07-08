@@ -113,6 +113,78 @@ staged in tmp still commits with full `strict` durability.
 The durability mode is server-side configuration only; it cannot be raised or
 lowered by any request header.
 
+## Per-bucket durability (phase 2)
+
+A bucket can override the process-wide mode with its own tier. The override
+is stored in the bucket's metadata (a `durability.json` entry in
+`.rustfs.sys/buckets/<bucket>/.metadata.bin`, written as a RustFS extension
+field that MinIO's decoder skips) and resolved per write at the commit
+points, so no restart is needed.
+
+### Configuration
+
+```bash
+# Set an override (admin credentials, ConfigUpdateAdminAction)
+curl -X PUT "http://<host>/rustfs/admin/v3/bucket-durability/<bucket>" \
+     -d '{"mode":"relaxed"}'   # strict | relaxed | none
+
+# Read it back ("mode": null means the bucket inherits the global mode)
+curl "http://<host>/rustfs/admin/v3/bucket-durability/<bucket>"
+
+# Clear it (the bucket inherits the global mode again)
+curl -X DELETE "http://<host>/rustfs/admin/v3/bucket-durability/<bucket>"
+```
+
+`mc` integration is a follow-up; for now the admin API above is the
+configuration plane.
+
+### Resolution order
+
+For a write committing into volume `V`:
+
+1. system-critical namespaces (`.rustfs.sys`, `.minio.sys` outside the
+   scratch dirs) are always `strict` — a bucket override can never be
+   attached to them, and any attempt is rejected and logged;
+2. otherwise, if the destination bucket has an override, the override wins —
+   in **both** directions (a bucket can be `relaxed` under a `strict` global
+   default, or pinned `strict` under a `relaxed` global default);
+3. otherwise the process-wide mode applies.
+
+Under `legacy-off` (`RUSTFS_DRIVE_SYNC_ENABLE=false`) per-bucket overrides
+do not apply at all: the legacy switch keeps its historical semantics bit
+for bit. `legacy-off` is also not a valid per-bucket tier.
+
+Because scratch-staged data commits under the destination volume, an object
+staged in `.rustfs.sys/tmp` follows the override of the bucket it commits
+into, exactly like the global tier.
+
+### Propagation and effect latency
+
+The override rides the existing bucket-metadata cache, with no invalidation
+channel of its own:
+
+- on the node that applies the config change, the new tier is effective for
+  writes that resolve their durability after the update completes;
+- other nodes are told to reload the bucket's metadata right away (the same
+  peer notification used for every bucket config change); if a peer misses
+  the notification, the periodic bucket-metadata refresh loop (15 minutes)
+  converges it;
+- an in-flight operation keeps the tier it resolved at its start — a single
+  commit is never half-old-tier, half-new-tier;
+- deleting the bucket drops the override with the rest of its metadata.
+
+Until a peer has reloaded the metadata, its writes use the previous tier.
+This is the same eventual-consistency window every other bucket config
+(policy, quota, versioning) already has.
+
+### Power-loss guarantees
+
+Identical to the corresponding global tier, scoped to the bucket. In
+particular the `relaxed` deployment rule (multi-node clusters in independent
+power domains only) applies per bucket: overriding a bucket to `relaxed` on
+a single-node deployment can lose recently acknowledged objects in that
+bucket on power failure.
+
 ## Performance expectations
 
 The often-quoted 26x PUT throughput delta was measured on macOS with the old
@@ -124,6 +196,8 @@ numbers to size `relaxed`.
 
 ## Scope
 
-This is phase 1 of rustfs/backlog#926: a global, per-process tier configured
-by environment variable. Per-bucket durability tiers (bucket metadata +
-admin API) are a separate follow-up phase.
+Phase 1 (rustfs/backlog#926) shipped the global, per-process tier configured
+by environment variable. Phase 2 (rustfs/backlog#938) adds the per-bucket
+override described above, configured through the admin API and stored in
+bucket metadata. `mc admin` integration for the per-bucket tier is a
+follow-up.

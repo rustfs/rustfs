@@ -92,30 +92,33 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> Result<OtelGuard, Telemetry
         || config.metric_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
         || config.log_endpoint.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
 
-    if has_obs {
-        return otel::init_observability_http(config, logger_level, is_production);
-    }
-
-    // ── Rule 2 & 3: Local logging (file or stdout) ────────────────────────────
-    // `init_local_logging` internally decides between file and stdout mode
-    // based on whether a log directory is configured.
-    //
-    // We check the environment variable here (rather than relying solely on the
-    // config struct) to honour dynamic overrides set after config construction.
-    let user_set_log_dir = get_env_opt_str(ENV_OBS_LOG_DIRECTORY);
-    let effective_config = if user_set_log_dir.as_deref().filter(|d| !d.is_empty()).is_some() {
-        // Environment variable is set: ensure the config reflects it so that
-        // `init_local_logging` picks up the value even if the struct was built
-        // before the env var was set.
-        std::borrow::Cow::Owned(OtelConfig {
-            log_directory: user_set_log_dir,
-            ..config.clone()
-        })
+    let mut guard = if has_obs {
+        otel::init_observability_http(config, logger_level, is_production)?
     } else {
-        std::borrow::Cow::Borrowed(config)
+        // ── Rule 2 & 3: Local logging (file or stdout) ────────────────────────
+        // `init_local_logging` internally decides between file and stdout mode
+        // based on whether a log directory is configured.
+        //
+        // We check the environment variable here (rather than relying solely on the
+        // config struct) to honour dynamic overrides set after config construction.
+        let user_set_log_dir = get_env_opt_str(ENV_OBS_LOG_DIRECTORY);
+        let effective_config = if user_set_log_dir.as_deref().filter(|d| !d.is_empty()).is_some() {
+            // Environment variable is set: ensure the config reflects it so that
+            // `init_local_logging` picks up the value even if the struct was built
+            // before the env var was set.
+            std::borrow::Cow::Owned(OtelConfig {
+                log_directory: user_set_log_dir,
+                ..config.clone()
+            })
+        } else {
+            std::borrow::Cow::Borrowed(config)
+        };
+
+        local::init_local_logging(&effective_config, logger_level, is_production)?
     };
 
-    local::init_local_logging(&effective_config, logger_level, is_production)
+    guard.profiling_agent = otel::init_profiler(config);
+    Ok(guard)
 }
 
 #[cfg(test)]
