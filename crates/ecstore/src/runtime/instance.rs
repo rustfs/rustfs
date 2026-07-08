@@ -40,6 +40,7 @@
 //! single-instance behavior is byte-for-byte unchanged.
 
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
+use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
@@ -90,6 +91,11 @@ pub struct InstanceContext {
     /// the "create-once, then share" semantics of the eager process static it
     /// replaces — while a genuinely independent instance gets its own.
     tier_config_mgr: OnceLock<Arc<RwLock<TierConfigMgr>>>,
+    /// This instance's event notifier (Phase 5 Slice 8, backlog#939).
+    ///
+    /// Lazily materialized like the tier config manager; holds the instance's
+    /// notification target list. Replaces the eager process static.
+    event_notifier: OnceLock<Arc<RwLock<EventNotifier>>>,
 }
 
 impl InstanceContext {
@@ -113,6 +119,7 @@ impl InstanceContext {
             deployment_id: OnceLock::new(),
             endpoints: OnceLock::new(),
             tier_config_mgr: OnceLock::new(),
+            event_notifier: OnceLock::new(),
         }
     }
 
@@ -172,6 +179,12 @@ impl InstanceContext {
         self.tier_config_mgr.get_or_init(TierConfigMgr::new).clone()
     }
 
+    /// This instance's event notifier, materializing it on first access.
+    /// Shared for the lifetime of the instance.
+    pub fn event_notifier(&self) -> Arc<RwLock<EventNotifier>> {
+        self.event_notifier.get_or_init(EventNotifier::new).clone()
+    }
+
     /// Update this instance's erasure setup type.
     pub async fn update_erasure_type(&self, setup_type: SetupType) {
         *self.erasure_kind.write().await = setup_type;
@@ -214,6 +227,7 @@ impl std::fmt::Debug for InstanceContext {
             .field("deployment_id", &self.deployment_id)
             .field("endpoints", &self.endpoints)
             .field("tier_config_mgr_set", &self.tier_config_mgr.get().is_some())
+            .field("event_notifier_set", &self.event_notifier.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -452,6 +466,27 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&ctx_a.tier_config_mgr(), &ctx_b.tier_config_mgr()),
             "fresh contexts must not share a tier config manager"
+        );
+    }
+
+    // The event notifier is materialized once and shared within an instance.
+    #[tokio::test]
+    async fn event_notifier_is_stable_within_an_instance() {
+        let ctx = InstanceContext::new();
+        assert!(
+            Arc::ptr_eq(&ctx.event_notifier(), &ctx.event_notifier()),
+            "repeated access must return the same notifier"
+        );
+    }
+
+    // Two contexts own distinct event notifiers.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_event_notifier() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        assert!(
+            !Arc::ptr_eq(&ctx_a.event_notifier(), &ctx_b.event_notifier()),
+            "fresh contexts must not share an event notifier"
         );
     }
 }
