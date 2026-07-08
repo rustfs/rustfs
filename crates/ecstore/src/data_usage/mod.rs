@@ -33,7 +33,7 @@ use crate::{
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, CompressionTotalInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus,
-    SizeSummary,
+    SizeHistogram, SizeSummary, VersionsHistogram,
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -446,9 +446,11 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
     let mut marker: Option<String> = None;
     let mut version_marker: Option<String> = None;
     let mut object_names: HashSet<String> = HashSet::new();
+    let mut object_versions: HashMap<String, u64> = HashMap::new();
     let mut versions_count: u64 = 0;
     let mut total_size: u64 = 0;
     let mut delete_markers: u64 = 0;
+    let mut size_histogram = SizeHistogram::default();
 
     loop {
         let result = store
@@ -475,6 +477,8 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
 
             let object_size = object.size.max(0) as u64;
             object_names.insert(object.name.clone());
+            *object_versions.entry(object.name.clone()).or_insert(0) += 1;
+            size_histogram.add(object_size);
             total_size = total_size.saturating_add(object_size);
             versions_count = versions_count.saturating_add(1);
         }
@@ -495,15 +499,36 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
     }
 
     let objects_count = object_names.len() as u64;
+    let mut versions_histogram = VersionsHistogram::default();
+    for version_count in object_versions.values() {
+        versions_histogram.add(*version_count);
+    }
 
     let usage = BucketUsageInfo {
         size: total_size,
         objects_count,
         versions_count,
         delete_markers_count: delete_markers,
+        object_size_histogram: size_histogram.to_map(),
+        object_versions_histogram: versions_histogram.to_map(),
         ..Default::default()
     };
 
+    Ok(usage)
+}
+
+pub async fn refresh_bucket_usage_from_object_layer(
+    store: Arc<ECStore>,
+    data_usage_info: &mut DataUsageInfo,
+    bucket: &str,
+) -> Result<BucketUsageInfo, Error> {
+    let refresh_started_at = SystemTime::now();
+    let usage = compute_bucket_usage(store, bucket).await?;
+    replace_bucket_usage_memory_from_authoritative(bucket, usage.clone(), refresh_started_at).await;
+    data_usage_info.bucket_sizes.insert(bucket.to_string(), usage.size);
+    data_usage_info.buckets_usage.insert(bucket.to_string(), usage.clone());
+    set_buckets_count_from_usage(data_usage_info);
+    data_usage_info.calculate_totals();
     Ok(usage)
 }
 
@@ -533,22 +558,14 @@ pub async fn refresh_versioned_bucket_usage_from_object_layer(store: Arc<ECStore
             continue;
         }
 
-        let refresh_started_at = SystemTime::now();
-        let usage = match compute_bucket_usage(store.clone(), &bucket).await {
-            Ok(usage) => usage,
-            Err(err) => {
-                debug!(
-                    bucket = %bucket,
-                    error = %err,
-                    "failed to refresh versioned bucket usage from object layer"
-                );
-                continue;
-            }
-        };
-
-        replace_bucket_usage_memory_from_authoritative(&bucket, usage.clone(), refresh_started_at).await;
-        data_usage_info.bucket_sizes.insert(bucket.clone(), usage.size);
-        data_usage_info.buckets_usage.insert(bucket, usage);
+        if let Err(err) = refresh_bucket_usage_from_object_layer(store.clone(), data_usage_info, &bucket).await {
+            debug!(
+                bucket = %bucket,
+                error = %err,
+                "failed to refresh versioned bucket usage from object layer"
+            );
+            continue;
+        }
         changed = true;
     }
 
