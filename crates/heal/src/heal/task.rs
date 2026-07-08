@@ -920,7 +920,7 @@ impl HealTask {
 
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, object_size, object_size);
+                    progress.update_progress(3, 3, 0, object_size);
                 }
                 self.record_result_item(result).await;
                 Ok(())
@@ -1085,7 +1085,7 @@ impl HealTask {
 
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(4, 4, object_size, object_size);
+                    progress.update_progress(4, 4, 0, object_size);
                 }
                 self.record_result_item(result).await;
                 Ok(())
@@ -1882,7 +1882,7 @@ impl HealTask {
 
                 {
                     let mut progress = self.progress.write().await;
-                    progress.update_progress(3, 3, object_size, object_size);
+                    progress.update_progress(3, 3, 0, object_size);
                 }
                 self.record_result_item(result).await;
                 Ok(())

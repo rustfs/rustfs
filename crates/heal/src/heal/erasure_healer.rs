@@ -441,17 +441,24 @@ impl ErasureSetHealer {
             current_object_index = 0;
         }
 
-        // 5. finalize. Only declare the set healed when nothing failed —
-        // otherwise the resume/checkpoint state must survive so the failures are
-        // retried instead of being silently marked "completed" and discarded
-        // (backlog#855 / #799 B6).
-        if failed_objects > 0 {
+        // 5. finalize. Only declare the set healed when nothing failed AND
+        // nothing was transiently skipped — otherwise the resume/checkpoint
+        // state must survive so the failed/skipped versions are retried instead
+        // of being silently marked "completed" and discarded
+        // (backlog#855 / #799 B6 / #1033). Transient skips (unmet quorum,
+        // DiskNotFound, SlowDown, cancellation) are recorded in the checkpoint's
+        // skipped set, which suppresses them on resume; treating a skip pass as
+        // complete would discard that set and never re-heal the versions. The
+        // skip may be because the disk is still down, so these are deferred to a
+        // later heal cycle via the same bounded-retry mechanism as failures —
+        // never hot-retried in place here.
+        if failed_objects > 0 || skipped_objects > 0 {
             if resume_manager.schedule_retry().await? {
                 // Both persistence layers must be reset together: schedule_retry
                 // rewinds the resume state (cursor + counters), and the
-                // checkpoint's per-version dedup sets + position must be cleared
-                // in lockstep, or the retry would skip the very versions it is
-                // meant to re-heal.
+                // checkpoint's per-version dedup + skipped sets and position must
+                // be cleared in lockstep, or the retry would skip the very
+                // versions it is meant to re-heal.
                 checkpoint_manager.reset_for_retry().await?;
                 // Retry budget remains: state has been reset for a full re-scan.
                 // Return Err so `heal_erasure_set` preserves (does not clean up)
@@ -464,11 +471,12 @@ impl ErasureSetHealer {
                     subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
                     set_disk_id,
                     failed_objects,
+                    skipped_objects,
                     state = "retry_scheduled",
-                    "Erasure set heal pass finished with failures; scheduled full re-heal retry"
+                    "Erasure set heal pass finished with unhealed versions; scheduled full re-heal retry"
                 );
                 return Err(Error::other(format!(
-                    "Erasure set heal incomplete: {failed_objects} object(s) failed; retry scheduled"
+                    "Erasure set heal incomplete: {failed_objects} failed, {skipped_objects} skipped object(s); retry scheduled"
                 )));
             }
 
@@ -483,13 +491,14 @@ impl ErasureSetHealer {
                 subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
                 set_disk_id,
                 failed_objects,
+                skipped_objects,
                 state = "failed_after_retries",
-                "Erasure set heal exhausted retries with unrecovered failures"
+                "Erasure set heal exhausted retries with unrecovered versions"
             );
             let _ = resume_manager.cleanup().await;
             let _ = checkpoint_manager.cleanup().await;
             return Err(Error::other(format!(
-                "Erasure set heal exhausted retries with {failed_objects} unrecovered object(s)"
+                "Erasure set heal exhausted retries with {failed_objects} failed, {skipped_objects} skipped object(s)"
             )));
         }
 
@@ -981,6 +990,9 @@ mod resume_loop_tests {
         Ok,
         /// The version vanished before heal ran (deleted mid-heal).
         VersionNotFound,
+        /// A transient infrastructure condition (offline disk / unmet quorum):
+        /// the version must be recorded as skipped and retried on a later pass.
+        Transient,
     }
 
     #[derive(Default)]
@@ -1071,6 +1083,7 @@ mod resume_loop_tests {
                 HealOutcome::VersionNotFound => {
                     Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::FileVersionNotFound))))
                 }
+                HealOutcome::Transient => Ok((HealResultItem::default(), Some(Error::Storage(EcstoreError::DiskNotFound)))),
             }
         }
         async fn heal_bucket(&self, _b: &str, _o: &HealOpts) -> Result<HealResultItem> {
@@ -1377,5 +1390,79 @@ mod resume_loop_tests {
         let checkpoint = env.checkpoint.get_checkpoint().await;
         assert!(checkpoint.processed_objects.is_empty());
         assert_eq!(checkpoint.current_object_index, 0);
+    }
+
+    #[tokio::test]
+    async fn test_transient_error_recorded_as_skipped_not_failed() {
+        // A version whose heal hits a transient infrastructure error (offline
+        // disk) must be counted as skipped, never failed, and never recorded as a
+        // success. Regression guard for backlog#1033. (The per-page checkpoint
+        // skipped set is pruned by complete_page once the page advances; the
+        // durable skip signal is the counter, which the finalize block gates on.)
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("ok", None, false), item("down", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_outcome("down", Some("v1"), HealOutcome::Transient);
+
+        let (_processed, successful, failed, skipped, result) = run(&env).await;
+        result.expect("a transient skip must not fail the bucket pass");
+        assert_eq!(successful, 1, "the healthy version still heals");
+        assert_eq!(failed, 0, "a transient error is not a failure");
+        assert_eq!(skipped, 1, "the transient version is skipped");
+
+        // The transient version must actually have been attempted, not silently
+        // dropped, so the skip reflects a real unmet heal.
+        assert!(
+            env.storage.calls().contains(&("down".to_string(), Some("v1".to_string()))),
+            "the transient version must be attempted before being skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transient_skip_pass_not_marked_completed_state_survives() {
+        // The finalize block must NOT declare a clean completion when a pass had
+        // transient skips (even with zero hard failures): it must not
+        // mark_completed and must preserve the resume/checkpoint state (via the
+        // bounded-retry mechanism) so a later heal cycle re-heals the skipped
+        // versions. Regression guard for backlog#1033 (Transient invariant).
+        let env = make_env().await;
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("down", Some("v1"), false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_outcome("down", Some("v1"), HealOutcome::Transient);
+
+        let result = env
+            .healer
+            .execute_heal_with_resume(&["b".to_string()], "pool_0_set_0", &env.resume, &env.checkpoint)
+            .await;
+
+        result.expect_err("a pass with transient skips must not report clean completion");
+
+        // State must survive for a later pass: not marked completed, and the
+        // bounded retry was armed rather than the state being cleaned up.
+        let state = env.resume.get_state().await;
+        assert!(!state.completed, "a transient-skip pass must not be marked completed");
+        assert_eq!(
+            state.retry_count, 1,
+            "the bounded retry must be armed, preserving state for the next cycle"
+        );
+        // reset_for_retry clears the skipped set so the next pass re-heals the
+        // version instead of suppressing it as already-skipped.
+        let checkpoint = env.checkpoint.get_checkpoint().await;
+        assert!(
+            checkpoint.skipped_objects.is_empty(),
+            "the skipped set must be cleared so the retry re-heals the version"
+        );
     }
 }
