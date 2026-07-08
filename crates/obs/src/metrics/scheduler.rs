@@ -98,6 +98,7 @@ use crate::metrics::stats_collector::{
 };
 use futures_util::FutureExt;
 use rustfs_audit::audit_target_metrics;
+use rustfs_io_metrics::ProcessSampler;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use serde::Serialize;
@@ -1274,6 +1275,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let labels = current_process_metric_labels();
         let mut host_system = System::new_all();
         let mut host_networks = Networks::new();
+        let mut process_sampler = ProcessSampler::new();
         let process_interval = config.process_interval;
         let mut interval = metrics_interval(process_interval, Duration::ZERO);
         let now = Instant::now();
@@ -1311,7 +1313,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::ProcessMetrics, "process_metrics", async {
                         let now = Instant::now();
-                        let bundle = collect_process_metric_bundle();
+                    let bundle = collect_process_metric_bundle_with(&mut process_sampler);
 
                         if now >= next_resource_run {
                             let mut metrics = collect_resource_metrics(&bundle.resource);
