@@ -17,7 +17,7 @@ name: Update Nix Flake
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 0' # Weekly on Sundays
+    - cron: '0 5 * * 0' # Weekly on Sunday 05:00 UTC (staggered after the midnight ci/build crons)
 
 permissions:
   contents: write

@@ -70,9 +70,19 @@ env:
   DOCKER_PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  # Check if we should build Docker images
+  # Check if we should build Docker images.
+  # Short-circuit at job level so per-merge development builds (workflow_run
+  # from a push to main) skip the whole run without spawning a checkout job:
+  # images are only published for tag builds — build.yml push triggers cover
+  # only main and tags, so a non-main head_branch is a tag name — and for
+  # manual dispatch.
   build-check:
     name: Docker Build Check
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch != 'main')
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -86,7 +96,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          fetch-depth: 0
           # For workflow_run events, checkout the specific commit that triggered the workflow
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
@@ -421,6 +430,9 @@ jobs:
     needs: [ build-check, build-docker ]
     if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     strategy:
       fail-fast: false
       matrix:
@@ -450,9 +462,16 @@ jobs:
           severity: CRITICAL,HIGH
           exit-code: "0"
 
+      # Surface findings in the Security tab; an artifact alone is write-only
+      # reporting nobody reviews.
+      - name: Upload scan results to code scanning
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          sarif_file: trivy-${{ matrix.variant }}.sarif
+          category: container-image-${{ matrix.variant }}
+
       - name: Upload container scan report
-        # actions/upload-artifact v7.0.1
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: container-image-scan-${{ matrix.variant }}
           path: trivy-${{ matrix.variant }}.sarif
