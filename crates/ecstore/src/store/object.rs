@@ -356,6 +356,27 @@ fn resolve_data_movement_tiered_resume_result(
     Ok(is_equivalent_data_movement_tiered_object(source, &target))
 }
 
+fn return_batch_delete_lock_error(objects: &[ObjectToDelete], err: Error) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+    let del_objects = objects
+        .iter()
+        .map(|object| DeletedObject {
+            object_name: decode_dir_object(&object.object_name),
+            version_id: object.version_id,
+            ..Default::default()
+        })
+        .collect();
+    let del_errs = objects.iter().map(|_| Some(err.clone())).collect();
+
+    (del_objects, del_errs)
+}
+
+fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
+    let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
+    object_names.sort_unstable();
+    object_names.dedup();
+    object_names
+}
+
 impl ECStore {
     fn map_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
         match err {
@@ -370,17 +391,7 @@ impl ECStore {
         }
     }
 
-    async fn acquire_object_write_lock_if_needed(
-        &self,
-        op: &'static str,
-        bucket: &str,
-        object: &str,
-        opts: &mut ObjectOptions,
-    ) -> Result<Option<ObjectLockDiagGuard>> {
-        if opts.no_lock {
-            return Ok(None);
-        }
-
+    async fn acquire_object_write_lock(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
@@ -398,9 +409,8 @@ impl ECStore {
             acquire_start.elapsed(),
             diag_enabled,
         );
-        opts.no_lock = true;
 
-        Ok(Some(ObjectLockDiagGuard::new(
+        Ok(ObjectLockDiagGuard::new(
             guard,
             diag_enabled,
             op,
@@ -408,7 +418,46 @@ impl ECStore {
             diag_enabled.then(|| object.to_string()),
             owner,
             ObjectLockDiagMode::Write,
-        )))
+        ))
+    }
+
+    async fn acquire_object_write_lock_if_needed(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        opts: &mut ObjectOptions,
+    ) -> Result<Option<ObjectLockDiagGuard>> {
+        if opts.no_lock {
+            return Ok(None);
+        }
+
+        let guard = self.acquire_object_write_lock(op, bucket, object).await?;
+        opts.no_lock = true;
+
+        Ok(Some(guard))
+    }
+
+    async fn acquire_delete_objects_write_locks(
+        &self,
+        bucket: &str,
+        objects: &[ObjectToDelete],
+        opts: &mut ObjectOptions,
+    ) -> Result<Vec<ObjectLockDiagGuard>> {
+        if opts.no_lock || objects.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let object_names = sorted_unique_delete_object_names(objects);
+        // Lock order: encoded object names are acquired in ascending order, then
+        // the set-layer calls receive no_lock so they do not reacquire them.
+        let mut guards = Vec::with_capacity(object_names.len());
+        for object in object_names {
+            guards.push(self.acquire_object_write_lock("delete_objects", bucket, object).await?);
+        }
+        opts.no_lock = true;
+
+        Ok(guards)
     }
 
     async fn acquire_object_read_lock_if_needed(
@@ -1048,7 +1097,11 @@ impl ECStore {
             del_errs.push(None)
         }
 
-        // TODO: nslock
+        let mut opts = opts;
+        let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
+            Ok(guards) => guards,
+            Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+        };
 
         let mut futures = Vec::with_capacity(self.pools.len());
 
@@ -1938,6 +1991,26 @@ mod tests {
         assert!(lookup_opts.no_lock);
     }
 
+    #[test]
+    fn delete_objects_lock_names_are_sorted_and_unique() {
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "alpha".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(sorted_unique_delete_object_names(&objects), vec!["alpha", "beta"]);
+    }
+
     async fn new_read_lock_test_store() -> ECStore {
         let format = FormatV3::new(1, 2);
         let endpoints = vec![
@@ -1968,6 +2041,51 @@ mod tests {
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_objects_write_locks_cover_each_unique_object() {
+        let store = new_read_lock_test_store().await;
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "alpha".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+        ];
+        let mut opts = ObjectOptions::default();
+
+        let guards = store
+            .acquire_delete_objects_write_locks("bucket", &objects, &mut opts)
+            .await
+            .expect("delete object locks should be acquired");
+
+        assert_eq!(guards.len(), 2, "duplicate object names should share one namespace lock");
+        assert!(opts.no_lock, "set layer should not reacquire locks already held by ECStore");
+
+        let alpha_lock = store
+            .handle_new_ns_lock("bucket", "alpha")
+            .await
+            .expect("alpha namespace lock should be created");
+        let err = alpha_lock
+            .get_read_lock(Duration::from_millis(20))
+            .await
+            .expect_err("batch delete write guard should block alpha readers");
+        assert!(matches!(err, rustfs_lock::LockError::Timeout { .. }));
+
+        drop(guards);
+        alpha_lock
+            .get_read_lock(Duration::from_secs(1))
+            .await
+            .expect("alpha read lock should be available after dropping batch guards");
     }
 
     #[tokio::test]
