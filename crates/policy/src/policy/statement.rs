@@ -283,11 +283,16 @@ impl Validator for Statement {
 }
 
 impl PartialEq for Statement {
+    // This equality drives `Policy::drop_duplicate_statements`/`merge_policies`, so it
+    // must compare every field that affects matching. Any new match-affecting field
+    // added to `Statement` MUST be compared here too, otherwise semantically-distinct
+    // statements can be silently dropped and shrink Deny coverage.
     fn eq(&self, other: &Self) -> bool {
         self.effect == other.effect
             && self.actions == other.actions
             && self.not_actions == other.not_actions
             && self.resources == other.resources
+            && self.not_resources == other.not_resources
             && self.conditions == other.conditions
     }
 }
