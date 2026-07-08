@@ -48,7 +48,8 @@ use crate::diagnostics::get::{
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader, object_mmap_read_enabled,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled,
 };
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -911,6 +912,10 @@ pub(in crate::set_disk) const DIRECT_MEMORY_BITROT_READER_STAGE_METRICS: BitrotR
 
 pub(in crate::set_disk) struct BitrotReaderSetup {
     pub(in crate::set_disk) readers: Vec<Option<ObjectBitrotReader>>,
+    /// Per-slot stripe handles for readers that are still unopened deferred
+    /// readers. The lockstep GET decode uses them to open a parity shard
+    /// aligned to the stripe where a data shard failed (backlog#923).
+    pub(in crate::set_disk) deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
     pub(in crate::set_disk) errors: Vec<Option<DiskError>>,
     pub(in crate::set_disk) scheduled: Vec<bool>,
     pub(in crate::set_disk) attempted: Vec<bool>,
@@ -985,6 +990,7 @@ impl BitrotReaderSetup {
     pub(in crate::set_disk) fn new(shards: usize) -> Self {
         Self {
             readers: (0..shards).map(|_| None).collect(),
+            deferred_stripe_handles: (0..shards).map(|_| None).collect(),
             errors: vec![Some(DiskError::DiskNotFound); shards],
             scheduled: vec![false; shards],
             attempted: vec![false; shards],
@@ -1110,8 +1116,14 @@ impl BitrotReaderSetup {
         }
     }
 
-    pub(in crate::set_disk) fn retain_deferred_reader(&mut self, idx: usize, reader: ObjectBitrotReader) {
+    pub(in crate::set_disk) fn retain_deferred_reader(
+        &mut self,
+        idx: usize,
+        reader: ObjectBitrotReader,
+        stripe_handle: DeferredReaderStripeHandle,
+    ) {
         self.readers[idx] = Some(reader);
+        self.deferred_stripe_handles[idx] = Some(stripe_handle);
         self.errors[idx] = None;
         self.deferred_count = self.deferred_count.saturating_add(1);
     }
@@ -1204,21 +1216,58 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        setup.retain_deferred_reader(
-            idx,
-            create_deferred_bitrot_reader(
-                inline_data,
-                disk,
-                bucket,
-                &path,
-                read_offset,
-                read_length,
-                shard_size,
-                checksum_algo.clone(),
-                skip_verify_bitrot,
-                use_mmap_read,
-            ),
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            inline_data,
+            disk,
+            bucket,
+            &path,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
         );
+        setup.retain_deferred_reader(idx, reader, stripe_handle);
+    }
+
+    // With the data-shards-only lockstep gate on (backlog#923), the GET decode
+    // reads only the data shards while the object is healthy; a parity reader
+    // is engaged on demand and must therefore stay unopened so its start
+    // offset can be advanced to the failing stripe. A parity reader that was
+    // opened eagerly during setup is pinned at the stripe-0 stream position
+    // and could never be engaged mid-object, so swap it for an unopened
+    // deferred reader carrying a stripe handle. The eager open already proved
+    // the shard is reachable; no shard bytes were read from it, and the
+    // ready/error bookkeeping that quorum decisions rely on is left untouched.
+    // Gate off (default): keep the eagerly opened parity readers exactly as
+    // before — the lockstep path reads them on every stripe.
+    if !crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled() {
+        return;
+    }
+    for idx in data_shards..disks.len() {
+        if setup.readers[idx].is_none() || setup.deferred_stripe_handles[idx].is_some() {
+            continue;
+        }
+
+        let inline_data = files[idx].data.clone();
+        let disk = disks[idx].clone();
+        let data_dir = files[idx].data_dir.unwrap_or_default();
+        let path = format!("{object}/{data_dir}/part.{part_number}");
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            inline_data,
+            disk,
+            bucket,
+            &path,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
+        );
+        setup.readers[idx] = Some(reader);
+        setup.deferred_stripe_handles[idx] = Some(stripe_handle);
     }
 }
 
@@ -2242,30 +2291,40 @@ impl SetDisks {
             ..Default::default()
         };
 
-        let finfo = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
-            Ok(res) => res,
-            Err(err) => {
-                for item in errs.iter_mut() {
-                    if item.is_none() {
-                        *item = Some(err.clone().into());
+        // Determine the winning version id. When the merged representative decodes to
+        // a valid FileInfo, use its version id. When it is undecodable (Err from
+        // corrupt part arrays) OR decodes but is not valid (e.g. a shallow merged
+        // representative missing erasure detail), do NOT poison every disk: derive the
+        // winning vid from the intact version header and fall into the per-disk loop
+        // below, so healthy disks still populate `meta_file_infos` to satisfy
+        // read_quorum while corrupt disks fail `into_fileinfo` and are flagged
+        // `FileCorrupt` for heal. If every disk is corrupt, they all fail in the loop,
+        // leaving no valid FileInfo so the caller's read_quorum fails cleanly instead
+        // of panicking or returning half-corrupt data. Only when there is no non-free
+        // version header at all is there genuinely nothing to read.
+        //
+        // `into_fileinfo` with an empty version_id selects the first non-free version
+        // (see FileMeta::into_fileinfo); replicate that selection from the header here.
+        let vid = match meta.into_fileinfo(bucket, object, "", true, incl_free_vers, true) {
+            Ok(finfo) if finfo.is_valid() => finfo.version_id.unwrap_or(Uuid::nil()),
+            _ => match meta
+                .versions
+                .iter()
+                .find(|v| !v.header.free_version())
+                .and_then(|v| v.header.version_id)
+            {
+                Some(id) => id,
+                None => {
+                    for item in errs.iter_mut() {
+                        if item.is_none() {
+                            *item = Some(DiskError::FileCorrupt);
+                        }
                     }
-                }
 
-                return (meta_file_infos, errs);
-            }
+                    return (meta_file_infos, errs);
+                }
+            },
         };
-
-        if !finfo.is_valid() {
-            for item in errs.iter_mut() {
-                if item.is_none() {
-                    *item = Some(DiskError::FileCorrupt);
-                }
-            }
-
-            return (meta_file_infos, errs);
-        }
-
-        let vid = finfo.version_id.unwrap_or(Uuid::nil());
 
         for (idx, meta_op) in metadata_array.iter().enumerate() {
             if let Some(meta) = meta_op {
@@ -2394,6 +2453,13 @@ enum OrphanDirScan {
     Empty(Vec<String>),
     /// The prefix does not exist on this disk.
     Missing,
+}
+
+fn rename_data_versions_key(versions: &[u8]) -> Option<[u8; 8]> {
+    let prefix = versions.get(..8)?;
+    let mut key = [0; 8];
+    key.copy_from_slice(prefix);
+    Some(key)
 }
 
 impl SetDisks {
@@ -2567,10 +2633,8 @@ impl SetDisks {
             return Err(ret_err);
         }
 
-        let versions = None;
-        // TODO: reduceCommonVersions
-
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
+        let versions = Self::select_rename_data_versions(&disk_versions, &errs, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
@@ -2590,6 +2654,63 @@ impl SetDisks {
         };
 
         Ok((online_disks, versions, data_dir, cleanup_disks))
+    }
+
+    pub(in crate::set_disk) fn reduce_common_versions(disk_versions: &[Option<Vec<u8>>], write_quorum: usize) -> Option<Vec<u8>> {
+        let mut versions_count = HashMap::new();
+
+        for versions in disk_versions.iter().flatten() {
+            if let Some(key) = rename_data_versions_key(versions) {
+                *versions_count.entry(key).or_insert(0usize) += 1;
+            }
+        }
+
+        let (common_versions, max_count) = versions_count
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .unwrap_or(([0; 8], 0));
+
+        if max_count < write_quorum {
+            return None;
+        }
+
+        disk_versions
+            .iter()
+            .flatten()
+            .find(|versions| rename_data_versions_key(versions).is_some_and(|key| key == common_versions))
+            .cloned()
+    }
+
+    pub(in crate::set_disk) fn select_rename_data_versions(
+        disk_versions: &[Option<Vec<u8>>],
+        errs: &[Option<DiskError>],
+        write_quorum: usize,
+    ) -> Option<Vec<u8>> {
+        let mut versions = Self::reduce_common_versions(disk_versions, write_quorum);
+        for (dversions, err) in disk_versions.iter().zip(errs.iter()) {
+            if err.is_some() {
+                continue;
+            }
+            let Some(dversions) = dversions.as_ref().filter(|versions| !versions.is_empty()) else {
+                continue;
+            };
+
+            match versions.as_ref() {
+                Some(current_versions) if dversions != current_versions => {
+                    if dversions.len() > current_versions.len() {
+                        versions = Some(dversions.clone());
+                    }
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    versions = Some(dversions.clone());
+                    break;
+                }
+            }
+        }
+
+        versions
     }
 
     #[allow(dead_code)]
@@ -3427,6 +3548,43 @@ impl SetDisks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use tokio::io::AsyncReadExt;
+
+    fn metadata_test_fileinfo(object: &str) -> FileInfo {
+        let mut fi = FileInfo::new(object, 2, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = object.to_string();
+        fi.size = 1;
+        fi.erasure.index = 1;
+        fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+        fi.add_object_part(1, "part-etag-1".to_string(), 1, None, 1, None, None);
+        fi
+    }
+
+    fn read_part_test_part(number: usize, etag: &str) -> ObjectPartInfo {
+        ObjectPartInfo {
+            number,
+            etag: etag.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn read_part_test_error(number: usize, error: &str) -> ObjectPartInfo {
+        ObjectPartInfo {
+            number,
+            error: Some(error.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn failed_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        Box::pin(async { ReadRepairAdmissionOutcome::Failed("injected submit failure".to_string()) })
+    }
+
+    fn accepted_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
+    }
 
     #[test]
     fn dangling_delete_grace_defaults_to_one_hour() {
@@ -3443,5 +3601,302 @@ mod tests {
         temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, Some("0"), || {
             assert!(dangling_delete_grace().is_zero());
         });
+    }
+
+    #[tokio::test]
+    async fn multipart_codec_streaming_reader_zero_buffer_is_noop() {
+        let reader = tokio::io::BufReader::new(Cursor::new(b"payload".to_vec()));
+        let mut reader = MultipartCodecStreamingReader::new(vec![Box::new(reader)]);
+        let mut out = [];
+
+        let read = reader
+            .read(&mut out)
+            .await
+            .expect("zero-length read should not poll inner readers");
+
+        assert_eq!(read, 0);
+        assert_eq!(reader.readers.len(), 1);
+    }
+
+    #[test]
+    fn metadata_fanout_observation_classifies_invalid_and_ignored_results() {
+        let invalid = MetadataFanoutObservation::from_file_info(&FileInfo::default(), Duration::from_millis(7));
+        assert_eq!(invalid.outcome, GET_METADATA_RESPONSE_ERROR);
+        assert!(!invalid.valid);
+        assert!(!invalid.ignored);
+
+        let ignored = MetadataFanoutObservation::from_error(&DiskError::DiskNotFound, Duration::from_millis(9));
+        assert_eq!(ignored.outcome, GET_METADATA_RESPONSE_DISK_NOT_FOUND);
+        assert!(!ignored.valid);
+        assert!(ignored.ignored);
+
+        let corrupt = MetadataFanoutObservation::from_error(&DiskError::FileCorrupt, Duration::from_millis(11));
+        assert_eq!(corrupt.outcome, GET_METADATA_RESPONSE_CORRUPT);
+        assert!(!corrupt.ignored);
+    }
+
+    #[test]
+    fn metadata_fanout_diagnostics_reports_counts_and_latency_edges() {
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(40),
+            vec![
+                MetadataFanoutObservation {
+                    outcome: GET_METADATA_RESPONSE_VALID,
+                    elapsed: Duration::from_millis(30),
+                    valid: true,
+                    ignored: false,
+                },
+                MetadataFanoutObservation {
+                    outcome: GET_METADATA_RESPONSE_IGNORED,
+                    elapsed: Duration::from_millis(10),
+                    valid: false,
+                    ignored: true,
+                },
+                MetadataFanoutObservation {
+                    outcome: GET_METADATA_RESPONSE_ERROR,
+                    elapsed: Duration::from_millis(20),
+                    valid: false,
+                    ignored: false,
+                },
+            ],
+        );
+
+        assert_eq!(diagnostics.total_responses(), 3);
+        assert_eq!(diagnostics.valid_responses(), 1);
+        assert_eq!(diagnostics.ignored_responses(), 1);
+        assert_eq!(diagnostics.error_responses(), 2);
+        assert_eq!(diagnostics.first_response_latency(), Some(Duration::from_millis(10)));
+        assert_eq!(diagnostics.first_valid_response_latency(), Some(Duration::from_millis(30)));
+        assert_eq!(diagnostics.slowest_response_latency(), Some(Duration::from_millis(30)));
+        assert_eq!(diagnostics.quorum_candidate_latency(0), Some(Duration::ZERO));
+        assert_eq!(diagnostics.quorum_candidate_latency(1), Some(Duration::from_millis(30)));
+        assert_eq!(diagnostics.quorum_candidate_latency(2), None);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_counts_invalid_metadata_and_ignored_errors() {
+        let mut accumulator = MetadataQuorumAccumulator::new(4, 2, true);
+
+        accumulator.observe_file_info(&FileInfo::default());
+        accumulator.observe_error(&DiskError::DiskNotFound);
+
+        assert_eq!(accumulator.hard_errors, 1);
+        assert_eq!(accumulator.ignored_errors, 1);
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_ERROR);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_candidate_quorum_handles_zero_parity_and_invalid_candidates() {
+        let accumulator = MetadataQuorumAccumulator::new(4, 0, true);
+        let candidate = metadata_test_fileinfo("object");
+        assert_eq!(accumulator.candidate_read_quorum(&candidate), Some(4));
+        assert_eq!(accumulator.missing_response_quorum(), 4);
+
+        let accumulator = MetadataQuorumAccumulator::new(4, 2, true);
+        let mut deleted = candidate.clone();
+        deleted.deleted = true;
+        assert_eq!(accumulator.candidate_read_quorum(&deleted), None);
+
+        let mut empty = candidate.clone();
+        empty.size = 0;
+        assert_eq!(accumulator.candidate_read_quorum(&empty), None);
+
+        let mut impossible_parity = candidate;
+        impossible_parity.erasure.parity_blocks = 4;
+        assert_eq!(accumulator.candidate_read_quorum(&impossible_parity), None);
+    }
+
+    #[test]
+    fn confirmed_missing_part_error_recognizes_legacy_and_s3_markers() {
+        assert!(!is_confirmed_missing_part_error(None));
+        assert!(is_confirmed_missing_part_error(Some("file not found")));
+        assert!(is_confirmed_missing_part_error(Some("No such file or directory")));
+        assert!(is_confirmed_missing_part_error(Some("Specified part could not be found")));
+        assert!(is_confirmed_missing_part_error(Some("part.7 not found")));
+        assert!(!is_confirmed_missing_part_error(Some("part.7 missing")));
+        assert!(!is_confirmed_missing_part_error(Some("permission denied")));
+    }
+
+    #[test]
+    fn resolve_read_part_handles_mismatched_and_transient_responses_without_false_missing() {
+        let responses = vec![
+            Some(Vec::new()),
+            Some(vec![read_part_test_error(1, "permission denied")]),
+            None,
+        ];
+
+        let err = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect_err("mismatched and transient responses must not be treated as confirmed missing");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_read_part_accepts_alternate_missing_error_markers() {
+        let responses = vec![
+            Some(vec![read_part_test_error(1, "Specified part could not be found")]),
+            Some(vec![read_part_test_error(1, "part.1 not found")]),
+            Some(vec![read_part_test_part(1, "stale-etag")]),
+        ];
+
+        let part = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect("alternate missing markers should satisfy missing quorum");
+
+        assert_eq!(part.number, 1);
+        assert_eq!(part.error.as_deref(), Some("part.1 not found"));
+        assert!(part.etag.is_empty());
+    }
+
+    #[test]
+    fn shard_read_costs_for_empty_disk_set_are_empty() {
+        assert!(shard_read_costs_for_disks(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserve_read_repair_heal_dedupes_by_object_version_and_set() {
+        let object = format!("object-{}", Uuid::new_v4());
+        let key = reserve_read_repair_heal("bucket", &object, Some("version-1"), 1, 2)
+            .await
+            .expect("first read-repair reservation should be accepted");
+
+        assert_eq!(key.version_id.as_deref(), Some("version-1"));
+        assert!(
+            reserve_read_repair_heal("bucket", &object, Some("version-1"), 1, 2)
+                .await
+                .is_none()
+        );
+
+        release_read_repair_heal_reservation(&key).await;
+        let retry_key = reserve_read_repair_heal("bucket", &object, Some("version-1"), 1, 2)
+            .await
+            .expect("released read-repair reservation should allow retry");
+        release_read_repair_heal_reservation(&retry_key).await;
+    }
+
+    #[tokio::test]
+    async fn submit_read_repair_heal_releases_reservation_after_submitter_failure() {
+        let object = format!("object-{}", Uuid::new_v4());
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: "bucket",
+                object: &object,
+                version_id: None,
+                pool_index: 1,
+                set_index: 2,
+                part_number: Some(1),
+                reason: "test",
+            },
+            failed_read_repair_submitter,
+        )
+        .await;
+
+        for _ in 0..20 {
+            if let Some(key) = reserve_read_repair_heal("bucket", &object, None, 1, 2).await {
+                release_read_repair_heal_reservation(&key).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("failed read-repair submission should release its dedup reservation");
+    }
+
+    #[tokio::test]
+    async fn submit_read_repair_heal_keeps_admitted_reservation_deduped() {
+        let object = format!("object-{}", Uuid::new_v4());
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: "bucket",
+                object: &object,
+                version_id: None,
+                pool_index: 3,
+                set_index: 4,
+                part_number: None,
+                reason: "test",
+            },
+            accepted_read_repair_submitter,
+        )
+        .await;
+
+        assert!(reserve_read_repair_heal("bucket", &object, None, 3, 4).await.is_none());
+        let key = ReadRepairHealCacheKey::new("bucket", &object, None, 3, 4);
+        release_read_repair_heal_reservation(&key).await;
+    }
+
+    // ------------------------------------------------------------------
+    // backlog#900: pick_latest_quorum_files_info must survive a single
+    // corrupt-part disk (even in the merged representative slot) by deriving
+    // the vid from the header and falling into the per-disk loop, flagging the
+    // corrupt disk for heal instead of poisoning the whole read.
+    // ------------------------------------------------------------------
+
+    use rustfs_filemeta::{ChecksumAlgo, ErasureAlgo, FileMeta, FileMetaVersion, MetaObject, RawFileInfo, VersionType};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    fn raw_object_version(vid: Uuid, part_sizes: Vec<usize>) -> RawFileInfo {
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(MetaObject {
+                version_id: Some(vid),
+                erasure_algorithm: ErasureAlgo::ReedSolomon,
+                erasure_m: 2,
+                erasure_n: 1,
+                erasure_index: 1,
+                erasure_dist: vec![1, 2, 3],
+                erasure_block_size: 1 << 20,
+                bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                part_numbers: vec![1, 2],
+                part_sizes,
+                part_actual_sizes: vec![10, 20],
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        RawFileInfo {
+            buf: fm.marshal_msg().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_latest_quorum_masks_single_corrupt_disk_in_representative_slot() {
+        let vid = Uuid::new_v4();
+        // Deterministic: the corrupt disk is fixed at index 0 (representative slot).
+        let fileinfos = vec![
+            Some(raw_object_version(vid, vec![10])),
+            Some(raw_object_version(vid, vec![10, 20])),
+            Some(raw_object_version(vid, vec![10, 20])),
+        ];
+        let errs = vec![None, None, None];
+
+        let (infos, out_errs) = SetDisks::pick_latest_quorum_files_info(fileinfos, errs, "bucket", "obj", false, false).await;
+
+        // The corrupt representative disk is flagged for heal.
+        assert_eq!(out_errs[0], Some(DiskError::FileCorrupt), "corrupt representative disk must be flagged");
+        // Good disks still produce valid FileInfo, satisfying read_quorum (3.div_ceil(2)=2).
+        let good = infos.iter().filter(|fi| fi.is_valid()).count();
+        assert!(good >= 2, "quorum of good disks must survive corrupt representative, got {good}");
+    }
+
+    #[tokio::test]
+    async fn pick_latest_quorum_all_corrupt_fails_clean_without_panic() {
+        let vid = Uuid::new_v4();
+        let fileinfos = vec![
+            Some(raw_object_version(vid, vec![10])),
+            Some(raw_object_version(vid, vec![10])),
+            Some(raw_object_version(vid, vec![10])),
+        ];
+        let errs = vec![None, None, None];
+
+        let (infos, out_errs) = SetDisks::pick_latest_quorum_files_info(fileinfos, errs, "bucket", "obj", false, false).await;
+
+        assert!(
+            out_errs.iter().all(|e| e == &Some(DiskError::FileCorrupt)),
+            "all disks must be flagged corrupt"
+        );
+        assert!(infos.iter().all(|fi| !fi.is_valid()), "no half-corrupt FileInfo may be returned");
     }
 }

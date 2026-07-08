@@ -120,6 +120,7 @@ impl SetDisks {
             .await;
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn read_version_optimized(
         &self,
         bucket: &str,
@@ -161,6 +162,7 @@ impl SetDisks {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn get_object_fileinfo(
         &self,
         bucket: &str,
@@ -319,6 +321,7 @@ impl SetDisks {
         Ok((fi, parts_metadata, op_online_disks))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn get_object_info_and_quorum(
         &self,
         bucket: &str,
@@ -515,6 +518,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn get_object_with_fileinfo<W>(
         // &self,
         bucket: &str,
@@ -912,13 +916,18 @@ impl SetDisks {
             let decode_stage_start = Instant::now();
             let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
             let readers = reader_setup.readers;
-            let (written, err) = if let Some(read_costs) = read_costs {
-                erasure
-                    .decode_with_read_costs(writer, readers, part_offset, part_length, part_size, read_costs)
-                    .await
-            } else {
-                erasure.decode(writer, readers, part_offset, part_length, part_size).await
-            };
+            let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
+            let (written, err) = erasure
+                .decode_with_stripe_handles(
+                    writer,
+                    readers,
+                    part_offset,
+                    part_length,
+                    part_size,
+                    read_costs,
+                    deferred_stripe_handles,
+                )
+                .await;
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -1037,6 +1046,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn get_object_decode_reader_with_fileinfo(
         bucket: &str,
         object: &str,
@@ -1188,6 +1198,7 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn build_codec_streaming_part_reader(
         bucket: &str,
         object: &str,
@@ -1271,6 +1282,7 @@ impl SetDisks {
         }
 
         let readers = reader_setup.readers;
+        let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
         let source = if let Some(read_costs) = read_costs {
             coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
                 readers,
@@ -1288,7 +1300,8 @@ impl SetDisks {
                 part_size,
                 Some(metrics_path),
             )
-        };
+        }
+        .with_deferred_parity_handles(deferred_stripe_handles);
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader =
             coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?;
@@ -1323,6 +1336,7 @@ fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgori
 /// `get_object_with_fileinfo` (backlog#870) so both report the same
 /// stage-duration semantics.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn setup_multipart_part_readers(
     files: &[FileInfo],
     disks: &[Option<DiskStore>],
@@ -3203,6 +3217,60 @@ mod tests {
 
         assert_eq!(n, 4);
         assert_eq!(&out[..n], [b"aaaa", b"bbbb", b"cccc", b"dddd"][fallback_index]);
+    }
+
+    /// backlog#923: with the data-shards-only lockstep gate on, every retained
+    /// parity reader must be an unopened deferred reader carrying a stripe
+    /// handle, so the decode path can realign it to a mid-object stripe. With
+    /// the gate off (default), eagerly opened parity readers are kept exactly
+    /// as before and carry no handles.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bitrot_reader_setup_gates_parity_stripe_handle_conversion() {
+        for enabled in [None, Some("true")] {
+            // A missing data shard forces the VerifyReconstruction quorum to 3,
+            // so both parity slots complete eagerly (attempted + ready) before
+            // the deferred fill runs.
+            let mut setup = temp_env::async_with_vars(
+                [("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", enabled)],
+                setup_inline_bitrot_readers_with_preference(
+                    vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+                    2,
+                    2,
+                    BitrotReaderSetupMode::VerifyReconstruction,
+                    false,
+                ),
+            )
+            .await;
+
+            assert_eq!(setup.available_shards(), 3);
+            for idx in 2..4 {
+                assert!(setup.attempted[idx] && setup.ready[idx], "parity slot {idx} should be eagerly ready");
+                assert!(setup.readers[idx].is_some(), "parity slot {idx} must keep a reader (enabled={enabled:?})");
+                assert_eq!(
+                    setup.deferred_stripe_handles[idx].is_some(),
+                    enabled.is_some(),
+                    "parity slot {idx} stripe handle must match the gate (enabled={enabled:?})"
+                );
+            }
+
+            if enabled.is_some() {
+                // The converted parity reader is still unopened: its handle
+                // accepts a stripe advance, and reading it yields the shard
+                // bytes (block 0 here).
+                let handle = setup.deferred_stripe_handles[3].as_ref().expect("slot 3 handle");
+                assert!(handle.advance_stripes(1), "unopened converted parity reader must accept a stripe advance");
+
+                let mut reader = setup.readers[2].take().expect("slot 2 reader");
+                let mut out = [0u8; 4];
+                let n = reader
+                    .read(&mut out)
+                    .await
+                    .expect("converted parity reader should open on read");
+                assert_eq!(n, 4);
+                assert_eq!(&out[..n], b"cccc");
+            }
+        }
     }
 
     #[tokio::test]

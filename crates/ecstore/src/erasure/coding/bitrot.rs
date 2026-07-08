@@ -60,6 +60,7 @@ where
 
     /// Read a single (hash+data) block, verify hash, and return the number of bytes read into `out`.
     /// Returns an error if hash verification fails or data exceeds shard_size.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         self.last_verify_duration = Duration::ZERO;
         if out.len() > self.shard_size {
@@ -154,6 +155,7 @@ where
 
     /// Write a (hash+data) block. Returns the number of data bytes written.
     /// Returns an error if called after a short write or if data exceeds shard_size.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "BitrotWriter::write"))]
     pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -232,6 +234,7 @@ pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorith
     size.div_ceil(shard_size) * algo.size() + size
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     mut r: R,
     want_size: usize,

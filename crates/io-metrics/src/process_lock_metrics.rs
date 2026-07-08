@@ -28,11 +28,22 @@ use std::process::Command;
 
 static READ_LOCKS_HELD: AtomicU64 = AtomicU64::new(0);
 static WRITE_LOCKS_HELD: AtomicU64 = AtomicU64::new(0);
+/// Monotonic count of expired lock guards forcibly reclaimed by a contender (#899 observability).
+static LOCKS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+/// Monotonic count of guard heartbeats that observed a refresh-quorum loss (#899 observability).
+static LOCK_REFRESH_QUORUM_LOST: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessLockSnapshot {
     pub read_locks_held: u64,
     pub write_locks_held: u64,
+}
+
+/// Monotonic lock lifecycle counters (distinct from the held gauges above).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessLockEventSnapshot {
+    pub locks_reclaimed: u64,
+    pub lock_refresh_quorum_lost: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,10 +78,28 @@ pub fn record_write_lock_held_release() {
 }
 
 #[inline(always)]
+pub fn record_lock_reclaimed() {
+    LOCKS_RECLAIMED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn record_lock_refresh_quorum_lost() {
+    LOCK_REFRESH_QUORUM_LOST.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline(always)]
 pub fn snapshot_process_lock_counts() -> ProcessLockSnapshot {
     ProcessLockSnapshot {
         read_locks_held: READ_LOCKS_HELD.load(Ordering::Relaxed),
         write_locks_held: WRITE_LOCKS_HELD.load(Ordering::Relaxed),
+    }
+}
+
+#[inline(always)]
+pub fn snapshot_process_lock_events() -> ProcessLockEventSnapshot {
+    ProcessLockEventSnapshot {
+        locks_reclaimed: LOCKS_RECLAIMED.load(Ordering::Relaxed),
+        lock_refresh_quorum_lost: LOCK_REFRESH_QUORUM_LOST.load(Ordering::Relaxed),
     }
 }
 

@@ -42,15 +42,18 @@ struct LocalGuardEntry {
     guard: FastLockGuard,
     expires_at: SystemTime,
     ttl: Duration,
+    /// Owner recorded at acquire time; used only for reclaim diagnostics (#899).
+    owner: String,
 }
 
 impl LocalGuardEntry {
-    fn new(guard: FastLockGuard, ttl: Duration) -> Self {
+    fn new(guard: FastLockGuard, ttl: Duration, owner: String) -> Self {
         let now = SystemTime::now();
         Self {
             guard,
             expires_at: now + ttl,
             ttl,
+            owner,
         }
     }
 
@@ -136,6 +139,24 @@ impl LocalClient {
             };
 
             for mut entry in expired_entries {
+                // An expired entry whose owner never refreshed it (a dead coordinator, #698) is
+                // reclaimed so a live contender can re-form quorum. With guard heartbeats in place
+                // (#899) a live owner keeps its entry from expiring, so reaching here means the
+                // lease genuinely lapsed. Surface it for observability; the reclaim decision itself
+                // is unchanged.
+                let since_last_refresh = entry
+                    .expires_at
+                    .checked_sub(entry.ttl)
+                    .and_then(|last_refresh| SystemTime::now().duration_since(last_refresh).ok())
+                    .unwrap_or(entry.ttl);
+                tracing::warn!(
+                    owner = %entry.owner,
+                    resource = %resource,
+                    ttl_ms = entry.ttl.as_millis() as u64,
+                    since_last_refresh_ms = since_last_refresh.as_millis() as u64,
+                    "reclaiming expired lock guard whose lease was not refreshed"
+                );
+                rustfs_io_metrics::record_lock_reclaimed();
                 let _ = entry.guard.release();
                 reclaimed = reclaimed.saturating_add(1);
             }
@@ -175,7 +196,7 @@ impl LockClient for LocalClient {
                     {
                         let shard = self.get_shard(&lock_id);
                         let mut guards = shard.write().await;
-                        guards.insert(lock_id.clone(), LocalGuardEntry::new(guard, request.ttl));
+                        guards.insert(lock_id.clone(), LocalGuardEntry::new(guard, request.ttl, request.owner.clone()));
                     }
 
                     let lock_info = LockInfo {

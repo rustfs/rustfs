@@ -105,6 +105,20 @@ impl KVS {
             self.insert(key, value);
         }
     }
+
+    fn merged_with_defaults(&self, defaults: &KVS) -> KVS {
+        let mut merged = defaults.clone();
+
+        for kv in &self.0 {
+            if let Some(existing) = merged.0.iter_mut().find(|entry| entry.key == kv.key) {
+                *existing = kv.clone();
+            } else {
+                merged.0.push(kv.clone());
+            }
+        }
+
+        merged
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,8 +175,23 @@ impl Config {
     }
 
     pub fn merge(&self) -> Config {
-        // TODO: merge default
-        self.clone()
+        if let Some(defaults) = DEFAULT_KVS.get() {
+            self.merge_with_defaults(defaults)
+        } else {
+            self.clone()
+        }
+    }
+
+    fn merge_with_defaults(&self, defaults: &HashMap<String, KVS>) -> Config {
+        let mut cfg = self.clone();
+
+        for (sub_sys, default_kvs) in defaults {
+            let targets = cfg.0.entry(sub_sys.clone()).or_default();
+            let default_target = targets.entry(DEFAULT_DELIMITER.to_owned()).or_default();
+            *default_target = default_target.merged_with_defaults(default_kvs);
+        }
+
+        cfg
     }
 }
 
@@ -236,6 +265,87 @@ mod tests {
             "EC:4"
         );
         assert_eq!(loaded.merge(), loaded);
+    }
+
+    #[test]
+    fn config_merge_fills_default_kvs_without_overwriting_user_values() {
+        let defaults = HashMap::from([
+            (
+                "merge_test_existing".to_string(),
+                KVS(vec![
+                    KV {
+                        key: "keep".to_string(),
+                        value: "default-keep".to_string(),
+                        hidden_if_empty: false,
+                    },
+                    KV {
+                        key: "fill".to_string(),
+                        value: "default-fill".to_string(),
+                        hidden_if_empty: true,
+                    },
+                ]),
+            ),
+            (
+                "merge_test_missing".to_string(),
+                KVS(vec![KV {
+                    key: "enabled".to_string(),
+                    value: "on".to_string(),
+                    hidden_if_empty: false,
+                }]),
+            ),
+        ]);
+        let cfg = Config(HashMap::from([
+            (
+                "merge_test_existing".to_string(),
+                HashMap::from([(
+                    DEFAULT_DELIMITER.to_string(),
+                    KVS(vec![KV {
+                        key: "keep".to_string(),
+                        value: "user-keep".to_string(),
+                        hidden_if_empty: false,
+                    }]),
+                )]),
+            ),
+            (
+                "unknown_subsystem".to_string(),
+                HashMap::from([(
+                    DEFAULT_DELIMITER.to_string(),
+                    KVS(vec![KV {
+                        key: "custom".to_string(),
+                        value: "value".to_string(),
+                        hidden_if_empty: false,
+                    }]),
+                )]),
+            ),
+        ]));
+
+        let merged = cfg.merge_with_defaults(&defaults);
+        let existing = merged
+            .get_value("merge_test_existing", DEFAULT_DELIMITER)
+            .expect("existing subsystem should remain");
+        assert_eq!(existing.lookup("keep"), Some("user-keep".to_string()));
+        assert_eq!(existing.lookup("fill"), Some("default-fill".to_string()));
+        assert!(
+            existing.0.iter().any(|kv| kv.key == "fill" && kv.hidden_if_empty),
+            "merged default entry should preserve default metadata"
+        );
+
+        let missing = merged
+            .get_value("merge_test_missing", DEFAULT_DELIMITER)
+            .expect("missing default subsystem should be added");
+        assert_eq!(missing.lookup("enabled"), Some("on".to_string()));
+
+        let unknown = merged
+            .get_value("unknown_subsystem", DEFAULT_DELIMITER)
+            .expect("unknown subsystem should be preserved");
+        assert_eq!(unknown.lookup("custom"), Some("value".to_string()));
+        assert!(
+            cfg.get_value("merge_test_existing", DEFAULT_DELIMITER)
+                .expect("original existing subsystem should remain")
+                .lookup("fill")
+                .is_none(),
+            "merge should not mutate the source config"
+        );
     }
 
     #[test]
