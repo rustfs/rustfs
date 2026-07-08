@@ -9261,6 +9261,7 @@ name = "rustfs-heal"
 version = "1.0.0-beta.8"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "http 1.4.2",
  "metrics",

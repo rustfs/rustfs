@@ -26,6 +26,7 @@ pub(crate) mod integration {
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_storage_api::BucketOperations;
     pub(crate) use rustfs_storage_api::BucketOptions;
+    pub(crate) use rustfs_storage_api::MakeBucketOptions;
     pub(crate) use rustfs_storage_api::ObjectIO;
     pub(crate) use rustfs_storage_api::ObjectOperations;
 }

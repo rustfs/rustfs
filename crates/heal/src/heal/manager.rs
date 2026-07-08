@@ -3039,7 +3039,7 @@ mod tests {
             Ok((HealResultItem::default(), None))
         }
 
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>> {
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<crate::heal::storage::HealListItem>> {
             Ok(Vec::new())
         }
 
@@ -3048,7 +3048,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
-        ) -> Result<(Vec<String>, Option<String>, bool)> {
+        ) -> Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
 

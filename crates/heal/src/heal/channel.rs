@@ -606,7 +606,11 @@ mod tests {
         ) -> crate::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<crate::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> crate::Result<Vec<String>> {
+        async fn list_objects_for_heal(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+        ) -> crate::Result<Vec<crate::heal::storage::HealListItem>> {
             Ok(vec![])
         }
         async fn list_objects_for_heal_page(
@@ -614,7 +618,7 @@ mod tests {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
-        ) -> crate::Result<(Vec<String>, Option<String>, bool)> {
+        ) -> crate::Result<(Vec<crate::heal::storage::HealListItem>, Option<String>, bool)> {
             Ok((vec![], None, false))
         }
         async fn get_disk_for_resume(&self, _set_disk_id: &str) -> crate::Result<DiskStore> {
