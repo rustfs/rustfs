@@ -57,6 +57,10 @@ pub(crate) struct InstanceContext {
     /// bootstrap context deliberately holds the process-global manager (see
     /// [`bootstrap_ctx`]) so single-instance locking is byte-for-byte unchanged.
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+    /// The instance's S3 region (issue #939, Slice4 — topology scalars). A
+    /// write-once cell that preserves the former `GLOBAL_REGION` fail-fast
+    /// contract *per instance*: a second write is a startup bug and panics.
+    region: OnceLock<s3s::region::Region>,
 }
 
 impl InstanceContext {
@@ -77,6 +81,7 @@ impl InstanceContext {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
             local_lock_manager,
+            region: OnceLock::new(),
         }
     }
 
@@ -84,6 +89,20 @@ impl InstanceContext {
     /// the set layer locks within this instance's namespace.
     pub(crate) fn local_lock_manager(&self) -> Arc<rustfs_lock::GlobalLockManager> {
         self.local_lock_manager.clone()
+    }
+
+    /// Publish this instance's region. Fail-fast, exactly as the old
+    /// `set_global_region`: a second write means startup published conflicting
+    /// region state, so it panics rather than silently keeping the first value.
+    pub(crate) fn set_region(&self, region: s3s::region::Region) {
+        self.region
+            .set(region)
+            .expect("instance region should be initialized once during startup");
+    }
+
+    /// This instance's region, if published.
+    pub(crate) fn region(&self) -> Option<s3s::region::Region> {
+        self.region.get().cloned()
     }
 
     /// True when the deployment is erasure-coded — single-node multi-drive
@@ -233,5 +252,40 @@ mod tests {
             !Arc::ptr_eq(&a.local_lock_manager(), &rustfs_lock::get_global_lock_manager()),
             "a fresh context must not share the process-global lock manager"
         );
+    }
+
+    fn test_region(name: &str) -> s3s::region::Region {
+        s3s::region::Region::new(name.into()).expect("valid test region")
+    }
+
+    /// Slice4: region round-trips through the context and starts empty.
+    #[tokio::test]
+    async fn region_round_trips_through_context() {
+        let ctx = InstanceContext::new();
+        assert!(ctx.region().is_none(), "region starts unset");
+        ctx.set_region(test_region("us-east-1"));
+        assert_eq!(ctx.region().map(|r| r.as_str().to_string()), Some("us-east-1".to_string()));
+    }
+
+    /// Slice4: two instances hold independent regions — the isolation this slice
+    /// delivers for the topology scalar.
+    #[tokio::test]
+    async fn distinct_contexts_have_independent_regions() {
+        let a = InstanceContext::new();
+        let b = InstanceContext::new();
+        a.set_region(test_region("us-east-1"));
+        b.set_region(test_region("eu-west-2"));
+        assert_eq!(a.region().unwrap().as_str(), "us-east-1");
+        assert_eq!(b.region().unwrap().as_str(), "eu-west-2");
+    }
+
+    /// Slice4: the former `GLOBAL_REGION` fail-fast contract is preserved
+    /// per-instance — a second write is a startup bug and panics.
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_region_twice_fails_fast() {
+        let ctx = InstanceContext::new();
+        ctx.set_region(test_region("us-east-1"));
+        ctx.set_region(test_region("eu-west-2"));
     }
 }
