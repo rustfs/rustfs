@@ -2065,6 +2065,14 @@ fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> Str
     .encode_marker(&marker)
 }
 
+/// Name of the last RAW entry the walker returned for this page (after
+/// `forward_past`), captured before delimiter folding collapses many keys into a
+/// few common prefixes. Used as a continuation marker so a fully re-folded page
+/// can still advance past its scan window (ECA-03 / #944).
+fn last_scanned_entry_name(entries: Option<&MetaCacheEntriesSorted>) -> Option<String> {
+    entries.and_then(|entries| entries.entries().last().map(|entry| entry.name.clone()))
+}
+
 fn build_list_next_marker(objects: &[ObjectInfo], prefixes: &[String], cache_id: Option<&str>) -> Option<String> {
     if let Some(last) = objects.last() {
         Some(append_list_cache_id_to_marker(last.name.clone(), cache_id))
@@ -2099,6 +2107,7 @@ fn list_objects_paginate(
     disk_has_more: bool,
     cache_id: Option<&str>,
     include_version_id: bool,
+    last_scanned_key: Option<&str>,
 ) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
     let mut get_objects = get_objects;
     let mut is_truncated = false;
@@ -2151,6 +2160,26 @@ fn list_objects_paginate(
             } else {
                 next_marker = build_list_next_marker(&objects, &prefixes, cache_id);
             }
+        } else if delimiter.is_some()
+            && let Some(last_scanned) = last_scanned_key
+        {
+            // Delimiter re-fold guard (backlog ECA-03 / #944): the walker hit its
+            // raw candidate limit (`disk_has_more`), but the scanned keys collapsed
+            // into fewer than `max_keys` common prefixes, so `should_truncate` above
+            // stays false. Without this branch we would return `is_truncated=false`
+            // with no marker and silently drop every key past the scan window, a
+            // data-loss bug for backup/sync/mirror/reconcile consumers.
+            //
+            // Continue from the last RAW scanned key, not from a folded prefix.
+            // `forward_past` advances on `name > marker`, and a folded prefix such as
+            // "data-" is lexicographically smaller than its own keys ("data-0001"),
+            // so using it as the marker would re-list and re-fold the same keys
+            // forever. A real scanned key strictly advances past the already-scanned
+            // window and guarantees finite pagination.
+            is_truncated = true;
+            next_marker = Some(append_list_cache_id_to_marker(last_scanned.to_owned(), cache_id));
+            // A bare key marker with no version id makes `forward_past` skip the whole
+            // scanned window on the next page; its folded prefixes are already emitted.
         }
     }
 
@@ -3754,6 +3783,10 @@ impl ECStore {
 
         // contextCanceled
 
+        // Last RAW scanned key, captured before folding, so `list_objects_paginate`
+        // can advance past a fully-collapsed common-prefix page (ECA-03 / #944).
+        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+
         let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
@@ -3762,8 +3795,15 @@ impl ECStore {
         )
         .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
-            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            false,
+            last_scanned_key.as_deref(),
+        );
         let _ = next_version_idmarker;
 
         Ok(ListObjectsInfo {
@@ -3836,6 +3876,9 @@ impl ECStore {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
+        // Last RAW scanned key, captured before folding (ECA-03 / #944).
+        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+
         let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
@@ -3845,8 +3888,15 @@ impl ECStore {
         )
         .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
-            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            true,
+            last_scanned_key.as_deref(),
+        );
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -4959,6 +5009,9 @@ impl Sets {
             result.forward_past(opts.marker);
         }
 
+        // Last RAW scanned key, captured before folding (ECA-03 / #944).
+        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+
         let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
@@ -4967,8 +5020,15 @@ impl Sets {
         )
         .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
-            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            false,
+            last_scanned_key.as_deref(),
+        );
         let _ = next_version_idmarker;
 
         Ok(ListObjectsInfo {
@@ -5039,6 +5099,9 @@ impl Sets {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
+        // Last RAW scanned key, captured before folding (ECA-03 / #944).
+        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+
         let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
@@ -5048,8 +5111,15 @@ impl Sets {
         )
         .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
-            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            true,
+            last_scanned_key.as_deref(),
+        );
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -5741,6 +5811,9 @@ impl SetDisks {
             result.forward_past(opts.marker);
         }
 
+        // Last RAW scanned key, captured before folding (ECA-03 / #944).
+        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+
         let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
@@ -5749,8 +5822,15 @@ impl SetDisks {
         )
         .await;
 
-        let (objects, prefixes, is_truncated, next_marker, _next_version_idmarker) =
-            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
+        let (objects, prefixes, is_truncated, next_marker, _next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            false,
+            last_scanned_key.as_deref(),
+        );
 
         Ok(ListObjectsInfo {
             is_truncated,
@@ -5820,6 +5900,9 @@ impl SetDisks {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
+        // Last RAW scanned key, captured before folding (ECA-03 / #944).
+        let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
+
         let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
@@ -5829,8 +5912,15 @@ impl SetDisks {
         )
         .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
-            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            max_keys,
+            disk_has_more,
+            next_cache_id.as_deref(),
+            true,
+            last_scanned_key.as_deref(),
+        );
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -6454,9 +6544,9 @@ mod test {
         list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
         list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
         list_objects_index_provider_from_env, list_objects_index_provider_state_from_env, list_objects_key_only_provider_health,
-        list_objects_metadata_fast_guardrails_from_env, list_objects_quorum_from_env, list_quorum_from_env,
-        load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels,
-        namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
+        list_objects_metadata_fast_guardrails_from_env, list_objects_paginate, list_objects_quorum_from_env,
+        list_quorum_from_env, load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one,
+        merge_entry_channels, namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
         namespace_mutation_journal_chaos_enabled_from_env, namespace_mutation_journal_chaos_sequence_from_env,
         namespace_mutation_journal_chaos_status_from_env, normalize_list_quorum, observe_list_objects_mutations_with_store,
         parse_namespace_mutation_journal_state, parse_persistent_key_only_index, parse_persistent_list_metadata_object,
@@ -7109,6 +7199,171 @@ mod test {
         assert_eq!(replay.pool_idx, Some(3));
         assert_eq!(replay.set_idx, Some(7));
         assert!(!replay.create);
+    }
+
+    // Folded common-prefix entry as produced by `from_meta_cache_entries_sorted_infos`:
+    // `is_dir=true` with `mod_time=None`, which `list_objects_paginate` treats as a
+    // CommonPrefix rather than an object.
+    fn folded_prefix_object(name: &str) -> ObjectInfo {
+        ObjectInfo {
+            is_dir: true,
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn plain_object(name: &str) -> ObjectInfo {
+        ObjectInfo {
+            name: name.to_owned(),
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+            ..Default::default()
+        }
+    }
+
+    // Mimics the delimiter folding in `from_meta_cache_entries_sorted_infos`:
+    // consecutive keys sharing the prefix up to (and including) the first delimiter
+    // collapse into a single CommonPrefix entry.
+    fn fold_delimiter_page(raw: &[String], prefix: &str, delimiter: &str) -> Vec<ObjectInfo> {
+        let mut out = Vec::new();
+        let mut prev_prefix = String::new();
+        for name in raw {
+            let remaining = name.strip_prefix(prefix).unwrap_or(name.as_str());
+            if let Some(idx) = remaining.find(delimiter) {
+                let cut = prefix.len() + idx + delimiter.len();
+                let curr = name[..cut].to_string();
+                if curr == prev_prefix {
+                    continue;
+                }
+                prev_prefix = curr.clone();
+                out.push(folded_prefix_object(&curr));
+            } else {
+                out.push(plain_object(name));
+            }
+        }
+        out
+    }
+
+    // ECA-03 / #944: a page whose raw keys fully collapse into fewer than max_keys
+    // common prefixes must still report truncation and carry a continuation marker,
+    // otherwise every key beyond the scan window is silently dropped.
+    #[test]
+    fn list_objects_paginate_delimiter_refold_reports_truncation_with_raw_marker() {
+        let delimiter = Some("-".to_string());
+        let get_objects = vec![folded_prefix_object("data-")];
+
+        let (objects, prefixes, is_truncated, next_marker, _v) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            1000,
+            true, // disk_has_more: walker filled its raw candidate limit
+            None,
+            false,
+            Some("data-1001"), // last RAW scanned key
+        );
+
+        assert!(objects.is_empty());
+        assert_eq!(prefixes, vec!["data-".to_string()]);
+        assert!(is_truncated, "re-folded page with more on disk must be truncated");
+        // Continuation must be the last RAW key, not the folded prefix "data-"
+        // (which is lexicographically < its own keys and would loop forever).
+        assert_eq!(next_marker.as_deref(), Some("data-1001"));
+    }
+
+    // When the disk is actually exhausted, the re-fold guard must NOT fabricate a
+    // marker even though a last scanned key is available.
+    #[test]
+    fn list_objects_paginate_delimiter_refold_no_marker_when_disk_exhausted() {
+        let delimiter = Some("-".to_string());
+        let get_objects = vec![folded_prefix_object("data-")];
+
+        let (_objects, prefixes, is_truncated, next_marker, _v) =
+            list_objects_paginate(get_objects, &delimiter, 1000, false, None, false, Some("data-1001"));
+
+        assert_eq!(prefixes, vec!["data-".to_string()]);
+        assert!(!is_truncated);
+        assert!(next_marker.is_none());
+    }
+
+    // Regression guard: the new last-scanned-key parameter must not hijack the
+    // no-delimiter path, which keeps using the last visible object as its marker.
+    #[test]
+    fn list_objects_paginate_no_delimiter_ignores_raw_scanned_key() {
+        let get_objects = vec![plain_object("obj-0001"), plain_object("obj-0002")];
+
+        let (objects, prefixes, is_truncated, next_marker, _v) =
+            list_objects_paginate(get_objects, &None, 1000, true, None, false, Some("zzz-unrelated"));
+
+        assert_eq!(objects.len(), 2);
+        assert!(prefixes.is_empty());
+        assert!(is_truncated);
+        assert_eq!(next_marker.as_deref(), Some("obj-0002"));
+    }
+
+    // End-to-end pagination over 5000 `data-*` + 100 `other-*` with delimiter '-'.
+    // Every full page re-folds to a single common prefix (< max_keys), the exact
+    // trigger for ECA-03 / #944. Asserts pagination terminates in a bounded number
+    // of pages (no infinite loop) and covers BOTH common prefixes (no data loss).
+    #[test]
+    fn list_objects_paginate_delimiter_refold_paginates_all_prefixes_finitely() {
+        use std::collections::BTreeSet;
+
+        let mut all: Vec<String> = Vec::new();
+        for i in 1..=5000 {
+            all.push(format!("data-{i:04}"));
+        }
+        for i in 1..=100 {
+            all.push(format!("other-{i:04}"));
+        }
+        all.sort();
+
+        let delimiter = Some("-".to_string());
+        let max_keys = 1000i32;
+        // Raw candidates the walker gathers per page (max_keys + 1 lookahead).
+        let limit = max_keys_plus_one(max_keys, true) as usize;
+
+        let mut marker: Option<String> = None;
+        let mut seen_prefixes: BTreeSet<String> = BTreeSet::new();
+        let mut pages = 0;
+
+        loop {
+            pages += 1;
+            assert!(pages <= 64, "pagination did not terminate (possible infinite loop)");
+
+            // Emulate the walker: skip keys <= marker (forward_past semantics), then
+            // gather up to `limit` raw candidates.
+            let start = match &marker {
+                Some(m) => all.partition_point(|k| k.as_str() <= m.as_str()),
+                None => 0,
+            };
+            let window: Vec<String> = all[start..].iter().take(limit).cloned().collect();
+            // disk_has_more mirrors gather_results filling its +1 lookahead slot.
+            let disk_has_more = window.len() == limit;
+            let last_scanned = window.last().cloned();
+
+            let get_objects = fold_delimiter_page(&window, "", "-");
+
+            let (objects, prefixes, is_truncated, next_marker, _v) =
+                list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, None, false, last_scanned.as_deref());
+
+            assert!(objects.is_empty(), "every key folds into a common prefix");
+            for prefix in prefixes {
+                seen_prefixes.insert(prefix);
+            }
+
+            if !is_truncated {
+                assert!(next_marker.is_none());
+                break;
+            }
+
+            let next = next_marker.expect("truncated page must carry a continuation marker");
+            if let Some(prev) = &marker {
+                assert!(next.as_str() > prev.as_str(), "next_marker must strictly advance to stay finite");
+            }
+            marker = Some(next);
+        }
+
+        let expected: BTreeSet<String> = ["data-".to_string(), "other-".to_string()].into_iter().collect();
+        assert_eq!(seen_prefixes, expected, "pagination must cover every common prefix");
     }
 
     #[test]
