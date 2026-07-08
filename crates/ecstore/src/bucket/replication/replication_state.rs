@@ -14,6 +14,7 @@
 
 use super::replication_error_boundary::Error;
 use super::replication_filemeta_boundary::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
+use super::replication_resync_boundary::ResyncStatusType;
 use super::replication_stats_boundary::{
     ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, ProxyMetric, ProxyStatsCache,
     QueueCache, SRMetricsSummary, XferStats,
@@ -250,6 +251,12 @@ impl ReplicationStats {
         // Update site replication statistics
         self.sr_stats.replica_size.fetch_add(size, Ordering::Relaxed);
         self.sr_stats.replica_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub async fn record_resync_status(&self, bucket: &str, status: ResyncStatusType, duration: Option<Duration>) {
+        let mut cache = self.cache.write().await;
+        let stats = cache.entry(bucket.to_string()).or_insert_with(BucketReplicationStats::new);
+        stats.record_resync_status(status, duration);
     }
 
     /// Site replication update replica statistics
@@ -489,6 +496,26 @@ impl ReplicationStats {
             replica_count: tot_replica_count,
             replicated_size: tot_replicated_size,
             replicated_count: tot_replicated_count,
+            resync_started_count: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_started_count)
+                .sum(),
+            resync_completed_count: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_completed_count)
+                .sum(),
+            resync_failed_count: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_failed_count)
+                .sum(),
+            resync_canceled_count: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_canceled_count)
+                .sum(),
+            resync_duration_ms: bucket_stats
+                .iter()
+                .map(|stats| stats.replication_stats.resync_duration_ms)
+                .sum(),
         };
 
         let qs = Default::default();
@@ -642,6 +669,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_record_resync_status_updates_bucket_stats() {
+        let stats = ReplicationStats::new();
+
+        stats
+            .record_resync_status("test-bucket", ResyncStatusType::ResyncStarted, None)
+            .await;
+        stats
+            .record_resync_status("test-bucket", ResyncStatusType::ResyncCompleted, Some(Duration::from_millis(1500)))
+            .await;
+        stats
+            .record_resync_status("test-bucket", ResyncStatusType::ResyncPending, Some(Duration::from_millis(500)))
+            .await;
+
+        let bucket_stats = stats.get("test-bucket").await;
+        assert_eq!(bucket_stats.resync_started_count, 1);
+        assert_eq!(bucket_stats.resync_completed_count, 1);
+        assert_eq!(bucket_stats.resync_failed_count, 0);
+        assert_eq!(bucket_stats.resync_canceled_count, 0);
+        assert_eq!(bucket_stats.resync_duration_ms, 1500);
+        assert!(bucket_stats.has_replication_usage());
+    }
+
+    #[tokio::test]
     async fn test_replication_stats_update() {
         let stats = ReplicationStats::new();
 
@@ -681,6 +731,43 @@ mod tests {
 
         let all = stats.get_all().await;
         assert!(all.contains_key("proxy-only-bucket"));
+    }
+
+    #[tokio::test]
+    async fn test_calculate_bucket_replication_stats_merges_resync_metrics() {
+        let stats = ReplicationStats::new();
+        let got = stats
+            .calculate_bucket_replication_stats(
+                "test-bucket",
+                vec![
+                    BucketStats {
+                        replication_stats: BucketReplicationStats {
+                            resync_started_count: 1,
+                            resync_completed_count: 1,
+                            resync_duration_ms: 1000,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    BucketStats {
+                        replication_stats: BucketReplicationStats {
+                            resync_started_count: 2,
+                            resync_failed_count: 1,
+                            resync_canceled_count: 1,
+                            resync_duration_ms: 2500,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await;
+
+        assert_eq!(got.replication_stats.resync_started_count, 3);
+        assert_eq!(got.replication_stats.resync_completed_count, 1);
+        assert_eq!(got.replication_stats.resync_failed_count, 1);
+        assert_eq!(got.replication_stats.resync_canceled_count, 1);
+        assert_eq!(got.replication_stats.resync_duration_ms, 3500);
     }
 
     #[test]

@@ -19,8 +19,11 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering, Ordering as AtomicOrderi
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 
+use crate::resync::ResyncStatusType;
+
 const ROLLING_WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_LAST_HOUR_WINDOW: Duration = Duration::from_secs(60 * 60);
+const I64_MAX_AS_U128: u128 = 9_223_372_036_854_775_807;
 
 #[derive(Debug)]
 pub struct ExponentialMovingAverage {
@@ -619,6 +622,16 @@ pub struct BucketReplicationStats {
     pub replicated_size: i64,
     pub replicated_count: i64,
     pub q_stat: InQueueMetric,
+    #[serde(default)]
+    pub resync_started_count: i64,
+    #[serde(default)]
+    pub resync_completed_count: i64,
+    #[serde(default)]
+    pub resync_failed_count: i64,
+    #[serde(default)]
+    pub resync_canceled_count: i64,
+    #[serde(default)]
+    pub resync_duration_ms: i64,
 }
 
 impl BucketReplicationStats {
@@ -627,15 +640,46 @@ impl BucketReplicationStats {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stats.is_empty() && self.replica_size == 0 && self.replicated_size == 0
+        self.stats.is_empty()
+            && self.replica_size == 0
+            && self.replicated_size == 0
+            && self.resync_started_count == 0
+            && self.resync_completed_count == 0
+            && self.resync_failed_count == 0
+            && self.resync_canceled_count == 0
+            && self.resync_duration_ms == 0
     }
 
     pub fn has_replication_usage(&self) -> bool {
-        self.replica_size > 0 || self.replicated_size > 0 || !self.stats.is_empty()
+        self.replica_size > 0
+            || self.replicated_size > 0
+            || self.resync_started_count > 0
+            || self.resync_completed_count > 0
+            || self.resync_failed_count > 0
+            || self.resync_canceled_count > 0
+            || self.resync_duration_ms > 0
+            || !self.stats.is_empty()
     }
 
     pub fn clone_stats(&self) -> Self {
         self.clone()
+    }
+
+    pub fn record_resync_status(&mut self, status: ResyncStatusType, duration: Option<Duration>) {
+        match status {
+            ResyncStatusType::ResyncStarted => self.resync_started_count += 1,
+            ResyncStatusType::ResyncCompleted => self.resync_completed_count += 1,
+            ResyncStatusType::ResyncFailed => self.resync_failed_count += 1,
+            ResyncStatusType::ResyncCanceled => self.resync_canceled_count += 1,
+            ResyncStatusType::NoResync | ResyncStatusType::ResyncPending => return,
+        }
+
+        if let Some(duration) = duration {
+            let duration_ms = duration.as_millis().min(I64_MAX_AS_U128);
+            if let Ok(duration_ms) = i64::try_from(duration_ms) {
+                self.resync_duration_ms = self.resync_duration_ms.saturating_add(duration_ms);
+            }
+        }
     }
 }
 

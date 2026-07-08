@@ -16,8 +16,25 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use hashbrown::HashMap;
 use rustfs_s3_ops::is_object_removed_event;
 use rustfs_s3_types::{EventName, event_schema_version};
+use rustfs_utils::http::{is_encryption_metadata_key, is_internal_key};
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
+
+/// Legacy internal-metadata prefix retained for backward compatibility.
+const LEGACY_AMZ_META_INTERNAL_PREFIX: &str = "x-amz-meta-internal-";
+
+/// Returns `true` if `key` is RustFS/MinIO internal metadata that must not be exposed in
+/// notification `userMetadata`. Covers the internal xl.meta prefixes
+/// (`x-rustfs-internal-*` / `x-minio-internal-*`), the server-side-encryption prefixes
+/// (`x-rustfs-encryption-*` / `x-minio-encryption-*`), and the legacy
+/// `x-amz-meta-internal-*` prefix. Case-insensitive.
+fn is_internal_metadata_key(key: &str) -> bool {
+    is_internal_key(key)
+        || is_encryption_metadata_key(key)
+        || key.len() >= LEGACY_AMZ_META_INTERNAL_PREFIX.len()
+            && key.as_bytes()[..LEGACY_AMZ_META_INTERNAL_PREFIX.len()]
+                .eq_ignore_ascii_case(LEGACY_AMZ_META_INTERNAL_PREFIX.as_bytes())
+}
 
 /// Represents the identity of the user who triggered the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,12 +275,18 @@ impl Event {
             s3_metadata.object.size = Some(args.object.size);
             s3_metadata.object.e_tag = args.object.etag.clone();
             s3_metadata.object.content_type = args.object.content_type.clone();
-            // Filter out internal reserved metadata
+            // Filter out internal/reserved metadata so it never leaks to downstream
+            // notification targets (webhook/MQ). RustFS stores internal metadata under both
+            // `x-rustfs-internal-*` and `x-minio-internal-*` (see rustfs_utils metadata_compat),
+            // and server-side-encryption details under `x-rustfs-encryption-*` /
+            // `x-minio-encryption-*` (header_compat). All of these must be stripped; only genuine
+            // user-defined metadata (e.g. `x-amz-meta-*`) is preserved.
             let mut user_metadata = HashMap::new();
             for (k, v) in args.object.user_defined.iter() {
-                if !k.to_lowercase().starts_with("x-amz-meta-internal-") {
-                    user_metadata.insert(k.clone(), v.clone());
+                if is_internal_metadata_key(k) {
+                    continue;
                 }
+                user_metadata.insert(k.clone(), v.clone());
             }
             s3_metadata.object.user_metadata = Some(user_metadata);
         }
@@ -535,6 +558,65 @@ mod tests {
         let glacier = event.glacier_event_data.expect("glacier event data should be present");
         assert_eq!(glacier.restore_event_data.lifecycle_restoration_expiry_time, "2023-11-14T22:13:20.000Z");
         assert_eq!(glacier.restore_event_data.lifecycle_restore_storage_class, "GLACIER");
+    }
+
+    #[test]
+    fn event_user_metadata_strips_internal_and_encryption_keys() {
+        let mut user_defined = HashMap::new();
+        // RustFS internal (xl.meta) keys
+        user_defined.insert("x-rustfs-internal-inline-data".to_string(), "true".to_string());
+        user_defined.insert("x-rustfs-internal-transition-tier".to_string(), "WARM".to_string());
+        // MinIO internal keys (interop) + SSE internal metadata
+        user_defined.insert("x-minio-internal-compression".to_string(), "s2".to_string());
+        user_defined.insert("x-minio-internal-server-side-encryption-iv".to_string(), "secret-iv".to_string());
+        // Encryption prefixes (both flavors), including mixed-case
+        user_defined.insert("x-rustfs-encryption-key".to_string(), "wrapped-key".to_string());
+        user_defined.insert("X-Minio-Encryption-Iv".to_string(), "secret".to_string());
+        // Legacy internal prefix
+        user_defined.insert("x-amz-meta-internal-foo".to_string(), "bar".to_string());
+        // Genuine user metadata that MUST be preserved
+        user_defined.insert("x-amz-meta-project".to_string(), "rustfs".to_string());
+        user_defined.insert("content-type".to_string(), "text/plain".to_string());
+
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                user_defined,
+                ..Default::default()
+            },
+        )
+        .build();
+        let event = Event::new(args);
+
+        let user_metadata = event
+            .s3
+            .object
+            .user_metadata
+            .expect("user_metadata should be present for a create event");
+
+        // All internal / encryption keys stripped.
+        for internal in [
+            "x-rustfs-internal-inline-data",
+            "x-rustfs-internal-transition-tier",
+            "x-minio-internal-compression",
+            "x-minio-internal-server-side-encryption-iv",
+            "x-rustfs-encryption-key",
+            "X-Minio-Encryption-Iv",
+            "x-amz-meta-internal-foo",
+        ] {
+            assert!(
+                !user_metadata.contains_key(internal),
+                "internal key {internal:?} leaked into notification userMetadata"
+            );
+        }
+
+        // Genuine user metadata preserved unchanged.
+        assert_eq!(user_metadata.get("x-amz-meta-project").map(String::as_str), Some("rustfs"));
+        assert_eq!(user_metadata.get("content-type").map(String::as_str), Some("text/plain"));
+        assert_eq!(user_metadata.len(), 2);
     }
 
     #[test]
