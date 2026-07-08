@@ -31,6 +31,36 @@ const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
 
 pub type SharedNotifyTargetList = Arc<RwLock<TargetList>>;
 
+/// Resolves the effective send concurrency (semaphore permit count).
+///
+/// A value of `0` would build a zero-permit semaphore, so `acquire` never
+/// completes and every dispatch deadlocks. A misconfigured
+/// `RUSTFS_NOTIFY_SEND_CONCURRENCY=0` therefore coerces back to the default
+/// instead of silently wedging notifications (backlog#984).
+fn resolve_send_concurrency() -> usize {
+    let configured = rustfs_utils::get_env_usize(ENV_NOTIFY_SEND_CONCURRENCY, DEFAULT_NOTIFY_SEND_CONCURRENCY);
+    coerce_send_concurrency(configured)
+}
+
+/// Coerces a configured send concurrency into a valid semaphore permit count.
+/// `0` maps back to the default; any positive value is passed through. Kept as a
+/// pure function so the coercion is unit-testable without mutating process env.
+fn coerce_send_concurrency(configured: usize) -> usize {
+    if configured == 0 {
+        warn!(
+            event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,
+            component = LOG_COMPONENT_NOTIFY,
+            subsystem = LOG_SUBSYSTEM_DISPATCH,
+            configured,
+            default = DEFAULT_NOTIFY_SEND_CONCURRENCY,
+            "invalid RUSTFS_NOTIFY_SEND_CONCURRENCY=0; falling back to default to avoid a zero-permit deadlock"
+        );
+        DEFAULT_NOTIFY_SEND_CONCURRENCY
+    } else {
+        configured
+    }
+}
+
 /// Manages event notification to targets based on rules
 pub struct EventNotifier {
     metrics: Arc<NotificationMetrics>,
@@ -51,7 +81,7 @@ impl EventNotifier {
     /// # Returns
     /// Returns a new instance of EventNotifier.
     pub fn new(metrics: Arc<NotificationMetrics>, rule_engine: NotifyRuleEngine) -> Self {
-        let max_inflight = rustfs_utils::get_env_usize(ENV_NOTIFY_SEND_CONCURRENCY, DEFAULT_NOTIFY_SEND_CONCURRENCY);
+        let max_inflight = resolve_send_concurrency();
         EventNotifier {
             metrics,
             rule_engine,
@@ -273,7 +303,10 @@ impl EventNotifier {
     #[instrument(skip(self, targets_to_init))]
     pub async fn init_bucket_targets_shared(&self, targets_to_init: Vec<SharedTarget<Event>>) -> Result<(), NotificationError> {
         let mut target_list_guard = self.target_list.write().await;
-        target_list_guard.clear();
+        // Close the currently registered targets before replacing them. A bare
+        // `clear()` drops the old targets without invoking `close()`, leaking their
+        // connections/streams; `clear_targets_only` closes each one first (backlog#984).
+        target_list_guard.clear_targets_only().await;
 
         for target in targets_to_init {
             debug!(
@@ -726,5 +759,113 @@ mod tests {
         );
         assert_ne!(metrics.processing_count(), usize::MAX);
         assert_eq!(metrics.processed_count(), 1);
+    }
+
+    /// Regression test for backlog#984: a `RUSTFS_NOTIFY_SEND_CONCURRENCY=0`
+    /// misconfiguration must not build a zero-permit semaphore (which would
+    /// deadlock every dispatch); it must fall back to the default. Positive values
+    /// pass through unchanged.
+    #[test]
+    fn zero_send_concurrency_falls_back_to_default() {
+        assert_eq!(
+            coerce_send_concurrency(0),
+            DEFAULT_NOTIFY_SEND_CONCURRENCY,
+            "zero concurrency must fall back to the default, never a zero-permit semaphore"
+        );
+        assert!(coerce_send_concurrency(0) > 0, "resolved concurrency must be strictly positive");
+        assert_eq!(coerce_send_concurrency(1), 1);
+        assert_eq!(coerce_send_concurrency(128), 128);
+    }
+
+    /// Regression test for backlog#984: replacing the runtime target set via
+    /// `init_bucket_targets_shared` must `close()` the previously registered
+    /// targets instead of dropping them silently (connection/stream leak).
+    #[tokio::test]
+    async fn init_bucket_targets_shared_closes_replaced_targets() {
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), rule_engine);
+
+        let old_target = ClosableTestTarget::new("old", "webhook");
+        notifier
+            .init_bucket_targets_shared(vec![Arc::new(old_target.clone()) as SharedTarget<Event>])
+            .await
+            .expect("initial install should succeed");
+        assert_eq!(old_target.close_calls.load(Ordering::SeqCst), 0, "target must not close on first install");
+
+        let new_target = ClosableTestTarget::new("new", "webhook");
+        notifier
+            .init_bucket_targets_shared(vec![Arc::new(new_target.clone()) as SharedTarget<Event>])
+            .await
+            .expect("replacement install should succeed");
+
+        assert_eq!(
+            old_target.close_calls.load(Ordering::SeqCst),
+            1,
+            "the replaced target must be closed exactly once"
+        );
+        assert_eq!(
+            new_target.close_calls.load(Ordering::SeqCst),
+            0,
+            "the freshly installed target must stay open"
+        );
+    }
+
+    /// A target that records `close()` invocations, for lifecycle assertions.
+    #[derive(Clone)]
+    struct ClosableTestTarget {
+        id: TargetID,
+        close_calls: Arc<AtomicUsize>,
+    }
+
+    impl ClosableTestTarget {
+        fn new(id: &str, name: &str) -> Self {
+            Self {
+                id: TargetID::new(id.to_string(), name.to_string()),
+                close_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<E> Target<E> for ClosableTestTarget
+    where
+        E: rustfs_targets::PluginEvent,
+    {
+        fn id(&self) -> TargetID {
+            self.id.clone()
+        }
+
+        async fn is_active(&self) -> Result<bool, TargetError> {
+            Ok(true)
+        }
+
+        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), TargetError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
+            None
+        }
+
+        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
+            Box::new(self.clone())
+        }
+
+        async fn init(&self) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
     }
 }

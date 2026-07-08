@@ -249,7 +249,19 @@ impl Event {
         let key_name = form_urlencoded::byte_serialize(args.object.name.as_bytes()).collect::<String>();
         let principal_id = args.req_params.get("principalId").unwrap_or(&String::new()).to_string();
 
-        let version_id = args.object.version_id.clone().or_else(|| Some(args.version_id.clone()));
+        // An unversioned object must omit `versionId` entirely rather than emit it as
+        // an empty string. Prefer the object's own version id, fall back to the
+        // request-scoped one, and treat an empty value from either source as "no
+        // version" so serialization skips the field (`skip_serializing_if` on
+        // `Object::version_id`). This matches S3 and the repo's tier convention that a
+        // `None`/`""` version means "unversioned" (backlog#984).
+        let version_id = args
+            .object
+            .version_id
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| Some(args.version_id.clone()))
+            .filter(|v| !v.is_empty());
 
         let mut s3_metadata = Metadata {
             schema_version: "1.0".to_string(),
@@ -617,6 +629,68 @@ mod tests {
         assert_eq!(user_metadata.get("x-amz-meta-project").map(String::as_str), Some("rustfs"));
         assert_eq!(user_metadata.get("content-type").map(String::as_str), Some("text/plain"));
         assert_eq!(user_metadata.len(), 2);
+    }
+
+    #[test]
+    fn unversioned_object_omits_version_id() {
+        // Neither the object nor the request carries a version id: the field must be
+        // `None` so it is omitted from the serialized event, not `Some("")` (backlog#984).
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                version_id: None,
+                ..Default::default()
+            },
+        )
+        .version_id(String::new())
+        .build();
+        let event = Event::new(args);
+        assert_eq!(event.s3.object.version_id, None);
+
+        let json = serde_json::to_value(&event).expect("event should serialize");
+        assert!(
+            json.pointer("/s3/object/versionId").is_none(),
+            "unversioned object must not serialize a versionId field"
+        );
+    }
+
+    #[test]
+    fn empty_object_version_falls_back_then_omits() {
+        // Empty object version must not shadow a real request-scoped version.
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                version_id: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .version_id("v-42".to_string())
+        .build();
+        let event = Event::new(args);
+        assert_eq!(event.s3.object.version_id.as_deref(), Some("v-42"));
+    }
+
+    #[test]
+    fn present_object_version_is_preserved() {
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                version_id: Some("v-1".to_string()),
+                ..Default::default()
+            },
+        )
+        .build();
+        let event = Event::new(args);
+        assert_eq!(event.s3.object.version_id.as_deref(), Some("v-1"));
     }
 
     #[test]

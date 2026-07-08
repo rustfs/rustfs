@@ -228,6 +228,18 @@ impl NotifyConfigManager {
         let ttype = target_type.to_lowercase();
         let tname = target_id.id.to_lowercase();
 
+        // Guard against orphaning bucket notification rules (backlog#979). Removing a
+        // target while a bucket rule still references it would leave a dangling
+        // binding whose events can never be delivered. This mirrors the symmetric
+        // guard already applied in `remove_target_config`: refuse the removal while
+        // the target is still bound so the caller unbinds the bucket rules first.
+        let bound_target_id = runtime_target_id_for_subsystem(&ttype, &tname);
+        if self.rule_engine.is_target_bound_to_any_bucket(&bound_target_id).await {
+            return Err(NotificationError::Configuration(format!(
+                "Target is still bound to bucket rules and deletion is prohibited: type={ttype} name={tname}"
+            )));
+        }
+
         self.update_config_and_reload(|config| {
             let mut changed = false;
             if let Some(targets_of_type) = config.0.get_mut(&ttype) {
@@ -346,6 +358,17 @@ impl NotifyConfigManager {
 
         self.update_config(new_config.clone()).await;
 
+        // Stop the currently running replay workers *before* activating the new ones
+        // (backlog#970). Each replay worker drains a per-target persisted store; if the
+        // new workers start while the old ones are still running against the same
+        // stores, both drain the same queues and re-deliver events. `replace_targets`
+        // below also stops workers, but only after `activate_targets_with_replay` has
+        // already spawned the new ones — so without this explicit stop-before-start
+        // there is a window where old and new workers overlap. (The full "signal +
+        // join" shutdown lives in the targets crate and is tracked under the same
+        // issue; this reorders the notify-side lifecycle.)
+        self.runtime_facade.stop_replay_workers().await;
+
         let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self
             .registry
             .create_targets_from_config(&new_config)
@@ -427,6 +450,8 @@ impl NotifyConfigManager {
 #[cfg(test)]
 mod tests {
     use super::{NotifyConfigManager, NotifyConfigStoreError, runtime_target_id_for_subsystem, serialized_read_modify_write};
+    use crate::NotificationError;
+    use crate::rules::RulesMap;
     use crate::{
         integration::NotificationMetrics, notifier::EventNotifier, registry::TargetRegistry, rule_engine::NotifyRuleEngine,
         runtime_facade::NotifyRuntimeFacade,
@@ -436,7 +461,9 @@ mod tests {
         NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
     };
     use rustfs_config::server_config::{Config, KVS};
+    use rustfs_s3_types::EventName;
     use rustfs_targets::ReplayWorkerManager;
+    use rustfs_targets::arn::TargetID;
     use std::sync::Arc;
     use tokio::sync::{RwLock, Semaphore};
 
@@ -455,6 +482,33 @@ mod tests {
         );
 
         NotifyConfigManager::new(config, registry, rule_engine, runtime_facade)
+    }
+
+    // Regression test for backlog#979 (b): `remove_target` must refuse to remove a
+    // target that is still referenced by a bucket notification rule, otherwise the
+    // rule is left orphaned (pointing at a target that no longer exists). This
+    // mirrors the guard `remove_target_config` already enforces. The guard runs
+    // before the persisted config read-modify-write, so it returns the refusal
+    // without needing a live object store.
+    #[tokio::test]
+    async fn remove_target_refuses_when_bound_to_bucket_rules() {
+        let manager = build_manager();
+
+        // Bind the runtime target id (webhook/primary) that `remove_target` derives
+        // from (`NOTIFY_WEBHOOK_SUB_SYS`, id="primary") to a bucket rule.
+        let bound_id = TargetID::new("primary".to_string(), "webhook".to_string());
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), bound_id.clone());
+        manager.rule_engine.set_bucket_rules("bucket", rules_map).await;
+
+        let err = manager
+            .remove_target(&bound_id, NOTIFY_WEBHOOK_SUB_SYS)
+            .await
+            .expect_err("removing a bound target must be refused to avoid orphaning bucket rules");
+        assert!(
+            matches!(err, NotificationError::Configuration(_)),
+            "expected a Configuration refusal, got {err:?}"
+        );
     }
 
     #[tokio::test]

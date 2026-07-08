@@ -103,8 +103,18 @@ impl NotifyPipeline {
     }
 
     pub async fn send_event(&self, event: Arc<Event>) {
-        self.live_event_history.write().await.record(event.clone());
-        let _ = self.live_event_sender.send(event.clone());
+        // Assign the history sequence number and publish to live subscribers under
+        // the *same* critical section. `record` allocates a monotonically increasing
+        // sequence and `broadcast::Sender::send` is synchronous, so holding the write
+        // guard across both guarantees the broadcast order matches the recorded
+        // sequence order. Otherwise two concurrent senders could record seq 1 then 2
+        // but broadcast 2 then 1, so a cursor-based consumer would observe events out
+        // of order relative to the replayable history (backlog#984 / #969).
+        {
+            let mut history = self.live_event_history.write().await;
+            history.record(event.clone());
+            let _ = self.live_event_sender.send(event.clone());
+        }
         self.notifier.send(event).await;
     }
 }
