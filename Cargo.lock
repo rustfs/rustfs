@@ -9579,6 +9579,7 @@ dependencies = [
  "crossbeam-utils",
  "dial9-tokio-telemetry",
  "flate2",
+ "futures-util",
  "glob",
  "jiff",
  "metrics",

@@ -30,7 +30,7 @@ pub mod node_disk;
 pub mod notification_target;
 pub mod process_resource;
 pub mod replication;
-pub mod request;
+pub(crate) mod request;
 pub mod scanner;
 pub mod system_cpu;
 pub mod system_drive;

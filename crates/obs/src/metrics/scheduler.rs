@@ -96,15 +96,19 @@ use crate::metrics::stats_collector::{
     collect_process_metric_bundle, collect_replication_stats, collect_scanner_metric_stats,
     collect_system_cpu_and_memory_stats_with,
 };
+use futures_util::FutureExt;
 use rustfs_audit::audit_target_metrics;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use sysinfo::{Networks, System};
-use tokio::time::Instant;
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -133,13 +137,132 @@ const DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES: u8 = 3;
 /// Env var that overrides the zero-emission tombstone cycles for removed replication bandwidth series.
 const ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES: &str = "RUSTFS_METRICS_REPL_BW_ZERO_TOMBSTONE_CYCLES";
 const METRICS_RUNTIME_SERVICE_NAME: &str = "metrics_runtime";
-const METRICS_RUNTIME_COLLECTOR_TASKS: u8 = 10;
+const METRICS_RUNTIME_BASE_COLLECTOR_TASKS: u8 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum MetricsCollectorTaskId {
+    ClusterStats = 0,
+    SupplementaryClusterStats = 1,
+    BucketStats = 2,
+    NodeDiskStats = 3,
+    BucketReplicationBandwidth = 4,
+    AuditTargetStats = 5,
+    NotificationStats = 6,
+    BackgroundWorkflowStats = 7,
+    ProcessMetrics = 8,
+    InternodeNetworkStats = 9,
+    CompressionClusterStats = 10,
+}
+
+const BASE_COLLECTOR_TASK_IDS: [MetricsCollectorTaskId; METRICS_RUNTIME_BASE_COLLECTOR_TASKS as usize] = [
+    MetricsCollectorTaskId::ClusterStats,
+    MetricsCollectorTaskId::SupplementaryClusterStats,
+    MetricsCollectorTaskId::BucketStats,
+    MetricsCollectorTaskId::NodeDiskStats,
+    MetricsCollectorTaskId::BucketReplicationBandwidth,
+    MetricsCollectorTaskId::AuditTargetStats,
+    MetricsCollectorTaskId::NotificationStats,
+    MetricsCollectorTaskId::BackgroundWorkflowStats,
+    MetricsCollectorTaskId::ProcessMetrics,
+    MetricsCollectorTaskId::InternodeNetworkStats,
+];
+
+const ALL_COLLECTOR_TASK_IDS: [MetricsCollectorTaskId; METRICS_RUNTIME_BASE_COLLECTOR_TASKS as usize + 1] = [
+    MetricsCollectorTaskId::ClusterStats,
+    MetricsCollectorTaskId::SupplementaryClusterStats,
+    MetricsCollectorTaskId::BucketStats,
+    MetricsCollectorTaskId::NodeDiskStats,
+    MetricsCollectorTaskId::BucketReplicationBandwidth,
+    MetricsCollectorTaskId::AuditTargetStats,
+    MetricsCollectorTaskId::NotificationStats,
+    MetricsCollectorTaskId::BackgroundWorkflowStats,
+    MetricsCollectorTaskId::ProcessMetrics,
+    MetricsCollectorTaskId::InternodeNetworkStats,
+    MetricsCollectorTaskId::CompressionClusterStats,
+];
+
+#[derive(Debug)]
+struct MetricsRuntimeCollectorHealth {
+    last_success_unix_secs: [AtomicU64; ALL_COLLECTOR_TASK_IDS.len()],
+    collector_panics_total: [AtomicU64; ALL_COLLECTOR_TASK_IDS.len()],
+    failure_state: [AtomicBool; ALL_COLLECTOR_TASK_IDS.len()],
+}
+
+impl MetricsRuntimeCollectorHealth {
+    fn new() -> Self {
+        Self {
+            last_success_unix_secs: std::array::from_fn(|_| AtomicU64::new(0)),
+            collector_panics_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            failure_state: std::array::from_fn(|_| AtomicBool::new(false)),
+        }
+    }
+
+    fn record_success(&self, collector_id: MetricsCollectorTaskId) {
+        let idx = collector_id as usize;
+        self.last_success_unix_secs[idx].store(unix_timestamp_secs_now(), Ordering::Relaxed);
+        self.failure_state[idx].store(false, Ordering::Relaxed);
+    }
+
+    fn record_panic(&self, collector_id: MetricsCollectorTaskId) {
+        let idx = collector_id as usize;
+        self.collector_panics_total[idx].fetch_add(1, Ordering::Relaxed);
+        self.failure_state[idx].store(true, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, active_collectors: &[MetricsCollectorTaskId]) -> MetricsRuntimeCollectorHealthSnapshot {
+        let now = unix_timestamp_secs_now();
+        let mut healthy_collectors = 0_u8;
+        let mut never_succeeded_collectors = 0_u8;
+        let mut collector_panics_total = 0_u64;
+        let mut oldest_success_age_secs = 0_u64;
+
+        for collector_id in active_collectors {
+            let idx = *collector_id as usize;
+            let last_success = self.last_success_unix_secs[idx].load(Ordering::Relaxed);
+            let has_failed = self.failure_state[idx].load(Ordering::Relaxed);
+            collector_panics_total =
+                collector_panics_total.saturating_add(self.collector_panics_total[idx].load(Ordering::Relaxed));
+
+            if last_success == 0 {
+                never_succeeded_collectors = never_succeeded_collectors.saturating_add(1);
+            } else {
+                oldest_success_age_secs = oldest_success_age_secs.max(now.saturating_sub(last_success));
+            }
+
+            if last_success > 0 && !has_failed {
+                healthy_collectors = healthy_collectors.saturating_add(1);
+            }
+        }
+
+        MetricsRuntimeCollectorHealthSnapshot {
+            healthy_collectors,
+            unhealthy_collectors: u8::try_from(active_collectors.len())
+                .unwrap_or(u8::MAX)
+                .saturating_sub(healthy_collectors),
+            never_succeeded_collectors,
+            collector_panics_total,
+            oldest_success_age_secs,
+        }
+    }
+}
+
+static METRICS_RUNTIME_COLLECTOR_HEALTH: OnceLock<MetricsRuntimeCollectorHealth> = OnceLock::new();
 
 type ReplBwKey = (String, String); // (bucket, target_arn)
 type BucketKey = String;
 type BucketRangeKey = (String, String); // (bucket, range)
 type AuditTargetKey = String;
 type NotificationTargetKey = (String, String); // (target_id, target_type)
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct MetricsRuntimeCollectorHealthSnapshot {
+    pub healthy_collectors: u8,
+    pub unhealthy_collectors: u8,
+    pub never_succeeded_collectors: u8,
+    pub collector_panics_total: u64,
+    pub oldest_success_age_secs: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,6 +304,7 @@ pub struct MetricsRuntimeStatusSnapshot {
     pub state: MetricsRuntimeServiceState,
     pub metrics_enabled: bool,
     pub collector_tasks: u8,
+    pub collector_health: MetricsRuntimeCollectorHealthSnapshot,
     pub intervals: MetricsRuntimeIntervalsSnapshot,
     pub cancellation_source: MetricsRuntimeCancellationSource,
     pub shutdown_handle: MetricsRuntimeShutdownHandle,
@@ -338,10 +462,27 @@ fn metrics_runtime_intervals_snapshot(config: MetricsRuntimeConfig) -> MetricsRu
     }
 }
 
+fn metrics_runtime_collector_health() -> &'static MetricsRuntimeCollectorHealth {
+    METRICS_RUNTIME_COLLECTOR_HEALTH.get_or_init(MetricsRuntimeCollectorHealth::new)
+}
+
+fn active_metrics_collector_task_ids(compression_enabled: bool) -> &'static [MetricsCollectorTaskId] {
+    if compression_enabled {
+        &ALL_COLLECTOR_TASK_IDS
+    } else {
+        &BASE_COLLECTOR_TASK_IDS
+    }
+}
+
+fn metrics_runtime_collector_tasks(compression_enabled: bool) -> u8 {
+    u8::try_from(active_metrics_collector_task_ids(compression_enabled).len()).unwrap_or(u8::MAX)
+}
+
 fn build_metrics_runtime_status_snapshot(
     metrics_enabled: bool,
     cancellation_requested: bool,
     config: MetricsRuntimeConfig,
+    compression_enabled: bool,
 ) -> MetricsRuntimeStatusSnapshot {
     let state = if !metrics_enabled {
         MetricsRuntimeServiceState::Disabled
@@ -351,18 +492,29 @@ fn build_metrics_runtime_status_snapshot(
         MetricsRuntimeServiceState::Running
     };
 
+    let collector_health = if metrics_enabled {
+        metrics_runtime_collector_health().snapshot(active_metrics_collector_task_ids(compression_enabled))
+    } else {
+        MetricsRuntimeCollectorHealthSnapshot::default()
+    };
+
     MetricsRuntimeStatusSnapshot {
         service: METRICS_RUNTIME_SERVICE_NAME,
         state,
         metrics_enabled,
-        collector_tasks: METRICS_RUNTIME_COLLECTOR_TASKS,
+        collector_tasks: metrics_runtime_collector_tasks(compression_enabled),
+        collector_health,
         intervals: metrics_runtime_intervals_snapshot(config),
         cancellation_source: MetricsRuntimeCancellationSource::RuntimeToken,
         shutdown_handle: MetricsRuntimeShutdownHandle::RuntimeTokenOnly,
     }
 }
 
-fn build_metrics_runtime_desired_snapshot(metrics_enabled: bool, config: MetricsRuntimeConfig) -> MetricsRuntimeDesiredSnapshot {
+fn build_metrics_runtime_desired_snapshot(
+    metrics_enabled: bool,
+    config: MetricsRuntimeConfig,
+    compression_enabled: bool,
+) -> MetricsRuntimeDesiredSnapshot {
     let state = if metrics_enabled {
         MetricsRuntimeDesiredState::Enabled
     } else {
@@ -371,7 +523,7 @@ fn build_metrics_runtime_desired_snapshot(metrics_enabled: bool, config: Metrics
 
     MetricsRuntimeDesiredSnapshot {
         state,
-        collector_tasks: METRICS_RUNTIME_COLLECTOR_TASKS,
+        collector_tasks: metrics_runtime_collector_tasks(compression_enabled),
         intervals: metrics_runtime_intervals_snapshot(config),
     }
 }
@@ -380,10 +532,11 @@ fn build_metrics_runtime_controller_snapshot(
     metrics_enabled: bool,
     cancellation_requested: bool,
     config: MetricsRuntimeConfig,
+    compression_enabled: bool,
 ) -> MetricsRuntimeControllerSnapshot {
     MetricsRuntimeControllerSnapshot {
-        desired: build_metrics_runtime_desired_snapshot(metrics_enabled, config),
-        status: build_metrics_runtime_status_snapshot(metrics_enabled, cancellation_requested, config),
+        desired: build_metrics_runtime_desired_snapshot(metrics_enabled, config, compression_enabled),
+        status: build_metrics_runtime_status_snapshot(metrics_enabled, cancellation_requested, config, compression_enabled),
     }
 }
 
@@ -392,6 +545,7 @@ pub fn metrics_runtime_status_snapshot(token: &CancellationToken) -> MetricsRunt
         crate::observability_metric_enabled(),
         token.is_cancelled(),
         configured_metrics_runtime_config(),
+        obs_is_disk_compression_enabled(),
     )
 }
 
@@ -400,7 +554,61 @@ pub fn metrics_runtime_controller_snapshot(token: &CancellationToken) -> Metrics
         crate::observability_metric_enabled(),
         token.is_cancelled(),
         configured_metrics_runtime_config(),
+        obs_is_disk_compression_enabled(),
     )
+}
+
+fn unix_timestamp_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn stagger_duration(period: Duration, numerator: u32, denominator: u32) -> Duration {
+    let staggered_nanos = period
+        .as_nanos()
+        .saturating_mul(u128::from(numerator))
+        .checked_div(u128::from(denominator))
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX));
+    Duration::from_nanos(u64::try_from(staggered_nanos).unwrap_or(u64::MAX))
+}
+
+fn metrics_interval(period: Duration, initial_delay: Duration) -> Interval {
+    let mut interval = tokio::time::interval_at(Instant::now() + initial_delay, period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
+}
+
+async fn run_metrics_collector_tick<F>(
+    health: &MetricsRuntimeCollectorHealth,
+    collector_id: MetricsCollectorTaskId,
+    collector: &'static str,
+    future: F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(()) => health.record_success(collector_id),
+        Err(payload) => {
+            health.record_panic(collector_id);
+            let panic_message = payload
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic payload");
+            warn!(
+                event = EVENT_METRICS_RUNTIME_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME,
+                collector,
+                result = "panic_caught",
+                panic_message,
+                "metrics runtime state changed"
+            );
+        }
+    }
 }
 
 fn repl_bw_live_keys(stats: &[BucketReplicationBandwidthStats]) -> HashSet<ReplBwKey> {
@@ -698,6 +906,7 @@ fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut
 /// - `RUSTFS_METRICS_RESOURCE_INTERVAL`
 pub fn init_metrics_runtime(token: CancellationToken) {
     let config = configured_metrics_runtime_config();
+    let health = metrics_runtime_collector_health();
     let cluster_interval = config.cluster_interval;
     let bucket_interval = config.bucket_interval;
     let bucket_replication_bandwidth_interval = config.bucket_replication_bandwidth_interval;
@@ -705,18 +914,21 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let resource_interval = config.resource_interval;
     let audit_interval = config.audit_interval;
     let notification_interval = config.notification_interval;
+    let compression_enabled = obs_is_disk_compression_enabled();
 
     // Spawn task for cluster metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(cluster_interval);
+        let mut interval = metrics_interval(cluster_interval, Duration::ZERO);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let (stats, cluster_health) = collect_cluster_and_health_stats().await;
-                    let mut metrics = collect_cluster_metrics(&stats);
-                    metrics.extend(collect_cluster_health_metrics(&cluster_health));
-                    report_metrics(&metrics);
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::ClusterStats, "cluster_stats", async {
+                        let (stats, cluster_health) = collect_cluster_and_health_stats().await;
+                        let mut metrics = collect_cluster_metrics(&stats);
+                        metrics.extend(collect_cluster_health_metrics(&cluster_health));
+                        report_metrics(&metrics);
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "cluster_stats", state = "cancelled", "metrics runtime state changed");
@@ -730,7 +942,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // but filled by later task-specific runtime sources.
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(cluster_interval);
+        let mut interval = metrics_interval(cluster_interval, stagger_duration(cluster_interval, 1, 3));
         let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
         let mut has_seen_bucket_usage_snapshot = false;
         let mut prev_bucket_usage_keys: HashSet<BucketKey> = HashSet::new();
@@ -742,58 +954,65 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let mut metrics = Vec::new();
+                    run_metrics_collector_tick(
+                        health,
+                        MetricsCollectorTaskId::SupplementaryClusterStats,
+                        "supplementary_cluster_stats",
+                        async {
+                            let mut metrics = Vec::new();
 
-                    if let Some(stats) = collect_cluster_config_stats().await {
-                        metrics.extend(collect_cluster_config_metrics(&stats));
-                    }
+                            if let Some(stats) = collect_cluster_config_stats().await {
+                                metrics.extend(collect_cluster_config_metrics(&stats));
+                            }
 
-                    let erasure_sets = collect_erasure_set_stats().await;
-                    if !erasure_sets.is_empty() {
-                        metrics.extend(collect_erasure_set_metrics(&erasure_sets));
-                    }
+                            let erasure_sets = collect_erasure_set_stats().await;
+                            if !erasure_sets.is_empty() {
+                                metrics.extend(collect_erasure_set_metrics(&erasure_sets));
+                            }
 
-                    if let Some(stats) = collect_iam_stats().await {
-                        metrics.extend(collect_iam_metrics(&stats));
-                    }
+                            if let Some(stats) = collect_iam_stats().await {
+                                metrics.extend(collect_iam_metrics(&stats));
+                            }
 
-                    if let Some((cluster_usage, bucket_usage)) = collect_cluster_usage_metric_stats().await {
-                        metrics.extend(collect_cluster_usage_metrics(&cluster_usage));
-                        update_series_zero_tombstones(
-                            &mut has_seen_bucket_usage_snapshot,
-                            &mut prev_bucket_usage_keys,
-                            &mut bucket_usage_zero_tombstones,
-                            bucket_usage_live_keys(&bucket_usage),
-                            tombstone_cycles,
-                        );
-                        update_series_zero_tombstones(
-                            &mut has_seen_bucket_usage_snapshot,
-                            &mut prev_bucket_usage_object_size_keys,
-                            &mut bucket_usage_object_size_zero_tombstones,
-                            bucket_usage_object_size_live_keys(&bucket_usage),
-                            tombstone_cycles,
-                        );
-                        update_series_zero_tombstones(
-                            &mut has_seen_bucket_usage_snapshot,
-                            &mut prev_bucket_usage_version_keys,
-                            &mut bucket_usage_version_zero_tombstones,
-                            bucket_usage_version_live_keys(&bucket_usage),
-                            tombstone_cycles,
-                        );
-                        metrics.extend(collect_bucket_usage_metrics(&bucket_usage));
-                        metrics.extend(collect_bucket_usage_zero_tombstone_metrics(
-                            &bucket_usage_zero_tombstones,
-                            &bucket_usage_object_size_zero_tombstones,
-                            &bucket_usage_version_zero_tombstones,
-                        ));
-                        expire_series_zero_tombstones(&mut bucket_usage_zero_tombstones);
-                        expire_series_zero_tombstones(&mut bucket_usage_object_size_zero_tombstones);
-                        expire_series_zero_tombstones(&mut bucket_usage_version_zero_tombstones);
-                    }
+                            if let Some((cluster_usage, bucket_usage)) = collect_cluster_usage_metric_stats().await {
+                                metrics.extend(collect_cluster_usage_metrics(&cluster_usage));
+                                update_series_zero_tombstones(
+                                    &mut has_seen_bucket_usage_snapshot,
+                                    &mut prev_bucket_usage_keys,
+                                    &mut bucket_usage_zero_tombstones,
+                                    bucket_usage_live_keys(&bucket_usage),
+                                    tombstone_cycles,
+                                );
+                                update_series_zero_tombstones(
+                                    &mut has_seen_bucket_usage_snapshot,
+                                    &mut prev_bucket_usage_object_size_keys,
+                                    &mut bucket_usage_object_size_zero_tombstones,
+                                    bucket_usage_object_size_live_keys(&bucket_usage),
+                                    tombstone_cycles,
+                                );
+                                update_series_zero_tombstones(
+                                    &mut has_seen_bucket_usage_snapshot,
+                                    &mut prev_bucket_usage_version_keys,
+                                    &mut bucket_usage_version_zero_tombstones,
+                                    bucket_usage_version_live_keys(&bucket_usage),
+                                    tombstone_cycles,
+                                );
+                                metrics.extend(collect_bucket_usage_metrics(&bucket_usage));
+                                metrics.extend(collect_bucket_usage_zero_tombstone_metrics(
+                                    &bucket_usage_zero_tombstones,
+                                    &bucket_usage_object_size_zero_tombstones,
+                                    &bucket_usage_version_zero_tombstones,
+                                ));
+                                expire_series_zero_tombstones(&mut bucket_usage_zero_tombstones);
+                                expire_series_zero_tombstones(&mut bucket_usage_object_size_zero_tombstones);
+                                expire_series_zero_tombstones(&mut bucket_usage_version_zero_tombstones);
+                            }
 
-                    if !metrics.is_empty() {
-                        report_metrics(&metrics);
-                    }
+                            if !metrics.is_empty() {
+                                report_metrics(&metrics);
+                            }
+                        },
+                    ).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "supplementary_cluster_stats", state = "cancelled", "metrics runtime state changed");
@@ -806,7 +1025,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for bucket metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(bucket_interval);
+        let mut interval = metrics_interval(bucket_interval, Duration::ZERO);
         let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
         let mut has_seen_bucket_snapshot = false;
         let mut prev_bucket_keys: HashSet<BucketKey> = HashSet::new();
@@ -814,18 +1033,20 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let stats = collect_bucket_stats().await;
-                    update_series_zero_tombstones(
-                        &mut has_seen_bucket_snapshot,
-                        &mut prev_bucket_keys,
-                        &mut bucket_zero_tombstones,
-                        bucket_live_keys(&stats),
-                        tombstone_cycles,
-                    );
-                    let mut metrics = collect_bucket_metrics(&stats);
-                    metrics.extend(collect_bucket_zero_tombstone_metrics(&bucket_zero_tombstones));
-                    report_metrics(&metrics);
-                    expire_series_zero_tombstones(&mut bucket_zero_tombstones);
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::BucketStats, "bucket_stats", async {
+                        let stats = collect_bucket_stats().await;
+                        update_series_zero_tombstones(
+                            &mut has_seen_bucket_snapshot,
+                            &mut prev_bucket_keys,
+                            &mut bucket_zero_tombstones,
+                            bucket_live_keys(&stats),
+                            tombstone_cycles,
+                        );
+                        let mut metrics = collect_bucket_metrics(&stats);
+                        metrics.extend(collect_bucket_zero_tombstone_metrics(&bucket_zero_tombstones));
+                        report_metrics(&metrics);
+                        expire_series_zero_tombstones(&mut bucket_zero_tombstones);
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_stats", state = "cancelled", "metrics runtime state changed");
@@ -838,15 +1059,17 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for node/disk metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(node_interval);
+        let mut interval = metrics_interval(node_interval, Duration::ZERO);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_stats().await;
-                    let mut metrics = collect_node_metrics(&disk_stats);
-                    metrics.extend(collect_drive_detailed_metrics(&drive_stats));
-                    metrics.extend(collect_drive_count_metrics(&drive_counts));
-                    report_metrics(&metrics);
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::NodeDiskStats, "node_disk_stats", async {
+                        let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_stats().await;
+                        let mut metrics = collect_node_metrics(&disk_stats);
+                        metrics.extend(collect_drive_detailed_metrics(&drive_stats));
+                        metrics.extend(collect_drive_count_metrics(&drive_counts));
+                        report_metrics(&metrics);
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "node_disk_stats", state = "cancelled", "metrics runtime state changed");
@@ -859,7 +1082,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for bucket replication bandwidth metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(bucket_replication_bandwidth_interval);
+        let mut interval = metrics_interval(bucket_replication_bandwidth_interval, Duration::ZERO);
         let repl_bw_zero_tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
         let mut prev_live_keys: HashSet<ReplBwKey> = HashSet::new();
         let mut zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
@@ -867,35 +1090,42 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let monitor_available = bucket_monitor_available();
-                    let stats = collect_bucket_replication_bandwidth_stats();
+                    run_metrics_collector_tick(
+                        health,
+                        MetricsCollectorTaskId::BucketReplicationBandwidth,
+                        "bucket_replication_bandwidth",
+                        async {
+                            let monitor_available = bucket_monitor_available();
+                            let stats = collect_bucket_replication_bandwidth_stats();
 
-                    let current_live_keys = repl_bw_live_keys(&stats);
+                            let current_live_keys = repl_bw_live_keys(&stats);
 
-                    if !monitor_available {
-                        warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", result = "bucket_monitor_unavailable", "metrics runtime state changed");
-                    }
-                    update_repl_bw_zero_tombstones(
-                        monitor_available,
-                        &mut has_seen_valid_snapshot,
-                        &mut prev_live_keys,
-                        &mut zero_tombstones,
-                        current_live_keys,
-                        repl_bw_zero_tombstone_cycles,
-                    );
-                    let mut metrics = collect_bucket_replication_bandwidth_metrics(&stats);
+                            if !monitor_available {
+                                warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", result = "bucket_monitor_unavailable", "metrics runtime state changed");
+                            }
+                            update_repl_bw_zero_tombstones(
+                                monitor_available,
+                                &mut has_seen_valid_snapshot,
+                                &mut prev_live_keys,
+                                &mut zero_tombstones,
+                                current_live_keys,
+                                repl_bw_zero_tombstone_cycles,
+                            );
+                            let mut metrics = collect_bucket_replication_bandwidth_metrics(&stats);
 
-                    // Phase-1 action: force zero for removed keys during tombstone cycles.
-                    metrics.extend(collect_repl_bw_zero_tombstone_metrics(&zero_tombstones));
+                            // Phase-1 action: force zero for removed keys during tombstone cycles.
+                            metrics.extend(collect_repl_bw_zero_tombstone_metrics(&zero_tombstones));
 
-                    let bucket_replication = collect_bucket_replication_detail_stats().await;
-                    metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
-                    let replication = collect_replication_stats().await;
-                    metrics.extend(collect_replication_metrics(&replication));
-                    report_metrics(&metrics);
+                            let bucket_replication = collect_bucket_replication_detail_stats().await;
+                            metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
+                            let replication = collect_replication_stats().await;
+                            metrics.extend(collect_replication_metrics(&replication));
+                            report_metrics(&metrics);
 
-                    // Phase-2: after N cycles, stop reporting -> series becomes absent after expiration.
-                    expire_repl_bw_zero_tombstones(monitor_available, &mut zero_tombstones);
+                            // Phase-2: after N cycles, stop reporting -> series becomes absent after expiration.
+                            expire_repl_bw_zero_tombstones(monitor_available, &mut zero_tombstones);
+                        },
+                    ).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", state = "cancelled", "metrics runtime state changed");
@@ -908,7 +1138,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for audit target delivery metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(audit_interval);
+        let mut interval = metrics_interval(audit_interval, Duration::ZERO);
         let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
         let mut has_seen_audit_snapshot = false;
         let mut prev_audit_target_keys: HashSet<AuditTargetKey> = HashSet::new();
@@ -916,26 +1146,28 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let stats = audit_target_metrics().await
-                        .into_iter()
-                        .map(|snapshot| AuditTargetStats {
-                            failed_messages: snapshot.failed_messages,
-                            queue_length: snapshot.queue_length,
-                            target_id: snapshot.target_id,
-                            total_messages: snapshot.total_messages,
-                        })
-                        .collect::<Vec<_>>();
-                    update_series_zero_tombstones(
-                        &mut has_seen_audit_snapshot,
-                        &mut prev_audit_target_keys,
-                        &mut audit_zero_tombstones,
-                        audit_target_live_keys(&stats),
-                        tombstone_cycles,
-                    );
-                    let mut metrics = collect_audit_metrics(&stats);
-                    metrics.extend(collect_audit_zero_tombstone_metrics(&audit_zero_tombstones));
-                    report_metrics(&metrics);
-                    expire_series_zero_tombstones(&mut audit_zero_tombstones);
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::AuditTargetStats, "audit_target_stats", async {
+                        let stats = audit_target_metrics().await
+                            .into_iter()
+                            .map(|snapshot| AuditTargetStats {
+                                failed_messages: snapshot.failed_messages,
+                                queue_length: snapshot.queue_length,
+                                target_id: snapshot.target_id,
+                                total_messages: snapshot.total_messages,
+                            })
+                            .collect::<Vec<_>>();
+                        update_series_zero_tombstones(
+                            &mut has_seen_audit_snapshot,
+                            &mut prev_audit_target_keys,
+                            &mut audit_zero_tombstones,
+                            audit_target_live_keys(&stats),
+                            tombstone_cycles,
+                        );
+                        let mut metrics = collect_audit_metrics(&stats);
+                        metrics.extend(collect_audit_zero_tombstone_metrics(&audit_zero_tombstones));
+                        report_metrics(&metrics);
+                        expire_series_zero_tombstones(&mut audit_zero_tombstones);
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "audit_target_stats", state = "cancelled", "metrics runtime state changed");
@@ -948,7 +1180,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for notification delivery metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(notification_interval);
+        let mut interval = metrics_interval(notification_interval, Duration::ZERO);
         let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
         let mut has_seen_notification_target_snapshot = false;
         let mut prev_notification_target_keys: HashSet<NotificationTargetKey> = HashSet::new();
@@ -956,37 +1188,39 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let snapshot = notification_metrics_snapshot();
-                    let mut metrics = collect_notification_metrics(&NotificationStats {
-                        current_send_in_progress: snapshot.current_send_in_progress,
-                        events_errors_total: snapshot.events_errors_total,
-                        events_sent_total: snapshot.events_sent_total,
-                        events_skipped_total: snapshot.events_skipped_total,
-                    });
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::NotificationStats, "notification_stats", async {
+                        let snapshot = notification_metrics_snapshot();
+                        let mut metrics = collect_notification_metrics(&NotificationStats {
+                            current_send_in_progress: snapshot.current_send_in_progress,
+                            events_errors_total: snapshot.events_errors_total,
+                            events_sent_total: snapshot.events_sent_total,
+                            events_skipped_total: snapshot.events_skipped_total,
+                        });
 
-                    let target_stats = notification_target_metrics().await
-                        .into_iter()
-                        .map(|snapshot| NotificationTargetStats {
-                            failed_messages: snapshot.failed_messages,
-                            queue_length: snapshot.queue_length,
-                            target_id: snapshot.target_id,
-                            target_type: snapshot.target_type,
-                            total_messages: snapshot.total_messages,
-                        })
-                        .collect::<Vec<_>>();
-                    update_series_zero_tombstones(
-                        &mut has_seen_notification_target_snapshot,
-                        &mut prev_notification_target_keys,
-                        &mut notification_target_zero_tombstones,
-                        notification_target_live_keys(&target_stats),
-                        tombstone_cycles,
-                    );
-                    metrics.extend(collect_notification_target_metrics(&target_stats));
-                    metrics.extend(collect_notification_target_zero_tombstone_metrics(
-                        &notification_target_zero_tombstones,
-                    ));
-                    report_metrics(&metrics);
-                    expire_series_zero_tombstones(&mut notification_target_zero_tombstones);
+                        let target_stats = notification_target_metrics().await
+                            .into_iter()
+                            .map(|snapshot| NotificationTargetStats {
+                                failed_messages: snapshot.failed_messages,
+                                queue_length: snapshot.queue_length,
+                                target_id: snapshot.target_id,
+                                target_type: snapshot.target_type,
+                                total_messages: snapshot.total_messages,
+                            })
+                            .collect::<Vec<_>>();
+                        update_series_zero_tombstones(
+                            &mut has_seen_notification_target_snapshot,
+                            &mut prev_notification_target_keys,
+                            &mut notification_target_zero_tombstones,
+                            notification_target_live_keys(&target_stats),
+                            tombstone_cycles,
+                        );
+                        metrics.extend(collect_notification_target_metrics(&target_stats));
+                        metrics.extend(collect_notification_target_zero_tombstone_metrics(
+                            &notification_target_zero_tombstones,
+                        ));
+                        report_metrics(&metrics);
+                        expire_series_zero_tombstones(&mut notification_target_zero_tombstones);
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "notification_stats", state = "cancelled", "metrics runtime state changed");
@@ -999,23 +1233,30 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for background workflow metrics such as ILM and scanner.
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(cluster_interval);
+        let mut interval = metrics_interval(cluster_interval, stagger_duration(cluster_interval, 2, 3));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let mut metrics = Vec::new();
+                    run_metrics_collector_tick(
+                        health,
+                        MetricsCollectorTaskId::BackgroundWorkflowStats,
+                        "background_workflow_stats",
+                        async {
+                            let mut metrics = Vec::new();
 
-                    if let Some(stats) = collect_ilm_metric_stats().await {
-                        metrics.extend(collect_ilm_metrics(&stats));
-                    }
+                            if let Some(stats) = collect_ilm_metric_stats().await {
+                                metrics.extend(collect_ilm_metrics(&stats));
+                            }
 
-                    if let Some(stats) = collect_scanner_metric_stats().await {
-                        metrics.extend(collect_scanner_metrics(&stats));
-                    }
+                            if let Some(stats) = collect_scanner_metric_stats().await {
+                                metrics.extend(collect_scanner_metrics(&stats));
+                            }
 
-                    if !metrics.is_empty() {
-                        report_metrics(&metrics);
-                    }
+                            if !metrics.is_empty() {
+                                report_metrics(&metrics);
+                            }
+                        },
+                    ).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "background_workflow_stats", state = "cancelled", "metrics runtime state changed");
@@ -1034,7 +1275,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut host_system = System::new_all();
         let mut host_networks = Networks::new();
         let process_interval = config.process_interval;
-        let mut interval = tokio::time::interval(process_interval);
+        let mut interval = metrics_interval(process_interval, Duration::ZERO);
         let now = Instant::now();
         let mut next_resource_run = now;
         let mut next_system_run = now;
@@ -1064,41 +1305,43 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let now = Instant::now();
-                    let bundle = collect_process_metric_bundle();
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::ProcessMetrics, "process_metrics", async {
+                        let now = Instant::now();
+                        let bundle = collect_process_metric_bundle();
 
-                    if now >= next_resource_run {
-                        let mut metrics = collect_resource_metrics(&bundle.resource);
-                        metrics.extend(collect_process_metrics(&bundle.process));
-                        report_metrics(&metrics);
-                        advance_deadline(&mut next_resource_run, resource_interval, now);
-                    }
-
-                    if now >= next_system_run {
-                        #[cfg(feature = "gpu")]
-                        let mut metrics =
-                            collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
-                        #[cfg(not(feature = "gpu"))]
-                        let metrics =
-                            collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
-
-                        #[cfg(feature = "gpu")]
-                        if let Some(collector) = gpu_collector.as_ref() {
-                            use crate::metrics::collectors::collect_gpu_metrics;
-
-                            match collector.collect() {
-                                Ok(gpu_stats) => {
-                                    metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
-                                }
-                                Err(e) => {
-                                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collect_failed", error = %e, "metrics runtime state changed");
-                                }
-                            }
+                        if now >= next_resource_run {
+                            let mut metrics = collect_resource_metrics(&bundle.resource);
+                            metrics.extend(collect_process_metrics(&bundle.process));
+                            report_metrics(&metrics);
+                            advance_deadline(&mut next_resource_run, resource_interval, now);
                         }
 
-                        report_metrics(&metrics);
-                        advance_deadline(&mut next_system_run, system_interval, now);
-                    }
+                        if now >= next_system_run {
+                            #[cfg(feature = "gpu")]
+                            let mut metrics =
+                                collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
+                            #[cfg(not(feature = "gpu"))]
+                            let metrics =
+                                collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
+
+                            #[cfg(feature = "gpu")]
+                            if let Some(collector) = gpu_collector.as_ref() {
+                                use crate::metrics::collectors::collect_gpu_metrics;
+
+                                match collector.collect() {
+                                    Ok(gpu_stats) => {
+                                        metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
+                                    }
+                                    Err(e) => {
+                                        warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collect_failed", error = %e, "metrics runtime state changed");
+                                    }
+                                }
+                            }
+
+                            report_metrics(&metrics);
+                            advance_deadline(&mut next_system_run, system_interval, now);
+                        }
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "process_metrics", state = "cancelled", "metrics runtime state changed");
@@ -1109,19 +1352,26 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     });
 
     // Spawn task for compression metrics.
-    if obs_is_disk_compression_enabled() {
+    if compression_enabled {
         let token_clone = token.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(cluster_interval);
+            let mut interval = metrics_interval(cluster_interval, stagger_duration(cluster_interval, 3, 4));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Some(stats) = collect_compression_cluster_stats().await {
-                            let metrics = collect_compression_cluster_metrics(&stats);
-                            if !metrics.is_empty() {
-                                report_metrics(&metrics);
+                        run_metrics_collector_tick(
+                            health,
+                            MetricsCollectorTaskId::CompressionClusterStats,
+                            "compression_cluster_stats",
+                            async {
+                                if let Some(stats) = collect_compression_cluster_stats().await {
+                                    let metrics = collect_compression_cluster_metrics(&stats);
+                                    if !metrics.is_empty() {
+                                        report_metrics(&metrics);
+                                    }
+                                }
                             }
-                        }
+                        ).await;
                     }
                     _ = token_clone.cancelled() => {
                         warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "compression_cluster_stats", state = "cancelled", "metrics runtime state changed");
@@ -1135,16 +1385,23 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for internode/system network metrics.
     let token_clone = token;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(system_interval);
+        let mut interval = metrics_interval(system_interval, Duration::ZERO);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Some(stats) = collect_internode_network_stats() {
-                        let metrics = collect_network_metrics(&stats);
-                        if !metrics.is_empty() {
-                            report_metrics(&metrics);
-                        }
-                    }
+                    run_metrics_collector_tick(
+                        health,
+                        MetricsCollectorTaskId::InternodeNetworkStats,
+                        "internode_network_stats",
+                        async {
+                            if let Some(stats) = collect_internode_network_stats() {
+                                let metrics = collect_network_metrics(&stats);
+                                if !metrics.is_empty() {
+                                    report_metrics(&metrics);
+                                }
+                            }
+                        },
+                    ).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "internode_network_stats", state = "cancelled", "metrics runtime state changed");
@@ -1261,6 +1518,19 @@ mod tests {
         }
     }
 
+    fn reset_metrics_runtime_collector_health_for_test() {
+        let health = metrics_runtime_collector_health();
+        for entry in &health.last_success_unix_secs {
+            entry.store(0, Ordering::Relaxed);
+        }
+        for entry in &health.collector_panics_total {
+            entry.store(0, Ordering::Relaxed);
+        }
+        for entry in &health.failure_state {
+            entry.store(false, Ordering::Relaxed);
+        }
+    }
+
     fn repl_bw_key(bucket: &str, target_arn: &str) -> ReplBwKey {
         (bucket.to_string(), target_arn.to_string())
     }
@@ -1273,12 +1543,13 @@ mod tests {
 
     #[test]
     fn metrics_runtime_status_reports_disabled_state() {
-        let snapshot = build_metrics_runtime_status_snapshot(false, false, fixed_metrics_runtime_config());
+        let snapshot = build_metrics_runtime_status_snapshot(false, false, fixed_metrics_runtime_config(), false);
 
         assert_eq!(snapshot.service, METRICS_RUNTIME_SERVICE_NAME);
         assert_eq!(snapshot.state, MetricsRuntimeServiceState::Disabled);
         assert!(!snapshot.metrics_enabled);
-        assert_eq!(snapshot.collector_tasks, METRICS_RUNTIME_COLLECTOR_TASKS);
+        assert_eq!(snapshot.collector_tasks, METRICS_RUNTIME_BASE_COLLECTOR_TASKS);
+        assert_eq!(snapshot.collector_health, MetricsRuntimeCollectorHealthSnapshot::default());
         assert_eq!(snapshot.intervals.cluster_interval_secs, 60);
         assert_eq!(snapshot.intervals.bucket_interval_secs, 300);
         assert_eq!(snapshot.intervals.process_interval_secs, 10);
@@ -1289,19 +1560,21 @@ mod tests {
 
     #[test]
     fn metrics_runtime_status_reports_running_and_stopping_states() {
-        let running = build_metrics_runtime_status_snapshot(true, false, fixed_metrics_runtime_config());
-        let stopping = build_metrics_runtime_status_snapshot(true, true, fixed_metrics_runtime_config());
+        reset_metrics_runtime_collector_health_for_test();
+        let running = build_metrics_runtime_status_snapshot(true, false, fixed_metrics_runtime_config(), false);
+        let stopping = build_metrics_runtime_status_snapshot(true, true, fixed_metrics_runtime_config(), false);
 
         assert_eq!(running.state, MetricsRuntimeServiceState::Running);
         assert_eq!(stopping.state, MetricsRuntimeServiceState::Stopping);
         assert!(running.metrics_enabled);
         assert!(stopping.metrics_enabled);
+        assert_eq!(running.collector_health.unhealthy_collectors, METRICS_RUNTIME_BASE_COLLECTOR_TASKS);
     }
 
     #[test]
     fn metrics_runtime_controller_reconcile_is_idempotent() {
         let controller = MetricsRuntimeController;
-        let snapshot = build_metrics_runtime_controller_snapshot(true, false, fixed_metrics_runtime_config());
+        let snapshot = build_metrics_runtime_controller_snapshot(true, false, fixed_metrics_runtime_config(), false);
 
         let first = controller.reconcile_snapshot(snapshot);
         let second = controller.reconcile_snapshot(snapshot);
@@ -1316,7 +1589,7 @@ mod tests {
     #[test]
     fn metrics_runtime_controller_reports_disabled_without_worker_mutation() {
         let controller = MetricsRuntimeController;
-        let snapshot = build_metrics_runtime_controller_snapshot(false, false, fixed_metrics_runtime_config());
+        let snapshot = build_metrics_runtime_controller_snapshot(false, false, fixed_metrics_runtime_config(), false);
         let plan = controller.reconcile_snapshot(snapshot);
 
         assert_eq!(snapshot.desired.state, MetricsRuntimeDesiredState::Disabled);
@@ -1339,6 +1612,38 @@ mod tests {
         let mut deadline = base;
         advance_deadline(&mut deadline, Duration::from_secs(5), base + Duration::from_secs(12));
         assert_eq!(deadline, base + Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn metrics_interval_uses_delay_missed_tick_behavior() {
+        let interval = metrics_interval(Duration::from_secs(5), Duration::from_secs(1));
+        assert_eq!(interval.missed_tick_behavior(), MissedTickBehavior::Delay);
+    }
+
+    #[test]
+    fn metrics_runtime_collector_tasks_expand_when_compression_enabled() {
+        assert_eq!(metrics_runtime_collector_tasks(false), 10);
+        assert_eq!(metrics_runtime_collector_tasks(true), 11);
+    }
+
+    #[tokio::test]
+    async fn supervised_tick_records_success_and_panic_health() {
+        let health = MetricsRuntimeCollectorHealth::new();
+
+        run_metrics_collector_tick(&health, MetricsCollectorTaskId::ClusterStats, "cluster_stats", async {}).await;
+        let success = health.snapshot(&[MetricsCollectorTaskId::ClusterStats]);
+        assert_eq!(success.healthy_collectors, 1);
+        assert_eq!(success.unhealthy_collectors, 0);
+        assert_eq!(success.collector_panics_total, 0);
+
+        run_metrics_collector_tick(&health, MetricsCollectorTaskId::ClusterStats, "cluster_stats", async {
+            panic!("collector panic");
+        })
+        .await;
+        let failed = health.snapshot(&[MetricsCollectorTaskId::ClusterStats]);
+        assert_eq!(failed.healthy_collectors, 0);
+        assert_eq!(failed.unhealthy_collectors, 1);
+        assert_eq!(failed.collector_panics_total, 1);
     }
 
     #[test]

@@ -1146,6 +1146,67 @@ fn should_fail_before_old_metadata_backup(_dst_path: &str) -> bool {
     false
 }
 
+/// Commit-sequence points where the rename_data crash-consistency harness
+/// (rustfs/backlog#935, test plan in rustfs/backlog#896) can simulate an
+/// abrupt power loss.
+///
+/// Unlike [`should_fail_before_old_metadata_backup`], which exercises the
+/// graceful in-process rollback (delete the staged data dir, return an
+/// error), a crash point models a hard power loss: the commit sequence stops
+/// dead at the armed step with **no** cleanup, leaving the on-disk state
+/// exactly as the preceding steps left it. The harness then reopens the disk
+/// and asserts the raw state is coherent — the object reads back as either the
+/// old version or the new version, never a mixed or corrupt one — without any
+/// rollback code having run.
+///
+/// The variants are constructed at the real commit-path call sites in every
+/// build, but the arming static and [`should_crash_rename_data_at`] are
+/// `#[cfg(test)]`; in production the guard is a const-`false` no-op, so the
+/// injection points compile away to nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenameDataCrashPoint {
+    /// After the data dir has been renamed into its destination but before the
+    /// old-metadata rollback backup is written. xl.meta has not been committed
+    /// yet, so a crash here must leave the object readable as the old version.
+    AfterDataRename,
+    /// After the rollback backup is persisted, immediately before the xl.meta
+    /// commit rename that makes the new version visible. Still pre-commit, so a
+    /// crash here must also leave the object readable as the old version.
+    AfterBackupBeforeMetaCommit,
+}
+
+#[cfg(test)]
+static RENAME_DATA_CRASH_POINT: std::sync::Mutex<Option<(RenameDataCrashPoint, String)>> = std::sync::Mutex::new(None);
+
+/// Arm a one-shot crash injection: the next `rename_data` committing into
+/// `dst_path` stops at `point`. Consumed on the first match so it never leaks
+/// into an unrelated commit.
+#[cfg(test)]
+fn arm_rename_data_crash(point: RenameDataCrashPoint, dst_path: &str) {
+    *RENAME_DATA_CRASH_POINT
+        .lock()
+        .expect("test crash point lock should not be poisoned") = Some((point, dst_path.to_string()));
+}
+
+#[cfg(test)]
+fn should_crash_rename_data_at(point: RenameDataCrashPoint, dst_path: &str) -> bool {
+    let mut armed = RENAME_DATA_CRASH_POINT
+        .lock()
+        .expect("test crash point lock should not be poisoned");
+    if armed.as_ref().is_some_and(|(p, path)| *p == point && path == dst_path) {
+        armed.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn should_crash_rename_data_at(_point: RenameDataCrashPoint, _dst_path: &str) -> bool {
+    false
+}
+
 fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
     warn!(
         event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
@@ -4956,6 +5017,14 @@ impl DiskAPI for LocalDisk {
                 return Err(err);
             }
 
+            // Crash-consistency injection: hard power loss after the data dir
+            // is in place but before xl.meta commits. No cleanup — the harness
+            // reopens the disk and asserts the object still reads as the old
+            // version (the staged data dir is a harmless orphan for GC).
+            if should_crash_rename_data_at(RenameDataCrashPoint::AfterDataRename, dst_path) {
+                return Err(DiskError::Unexpected);
+            }
+
             if should_fail_before_old_metadata_backup(dst_path) {
                 if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
                     let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
@@ -5004,6 +5073,14 @@ impl DiskAPI for LocalDisk {
                     "Disk local rename flow failed"
                 );
                 return Err(err);
+            }
+
+            // Crash-consistency injection: hard power loss after the rollback
+            // backup is durable but before the xl.meta commit rename. No
+            // cleanup — the harness asserts the object still reads as the old
+            // version, since the destination xl.meta is untouched here.
+            if should_crash_rename_data_at(RenameDataCrashPoint::AfterBackupBeforeMetaCommit, dst_path) {
+                return Err(DiskError::Unexpected);
             }
 
             if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
@@ -5759,6 +5836,183 @@ mod test {
         match disk.make_volume(volume).await {
             Ok(()) | Err(DiskError::VolumeExists) => {}
             Err(err) => panic!("test volume should be available: {err:?}"),
+        }
+    }
+
+    /// Crash-consistency harness for the rename_data commit sequence
+    /// (rustfs/backlog#935 HP-14, test plan rustfs/backlog#896; hard rule from
+    /// rustfs/backlog#878: "partial commit 后对象只能是旧版本或新版本,不能混合").
+    ///
+    /// For every pre-commit crash point × durability tier, it seeds a committed
+    /// object, stages a replacement, injects a hard power loss (no in-process
+    /// rollback runs), reopens the disk to model a restart, and asserts the
+    /// object still reads back as exactly the old version — or, when there was
+    /// no old version, does not exist. The un-injected run asserts the commit
+    /// makes the new version visible. Relaxed is exercised alongside Strict so
+    /// the durability relaxations landing in HP-1/HP-4/HP-5 are held to the same
+    /// old-or-new invariant, only with a wider (documented) power-loss window.
+    mod crash_consistency {
+        use super::*;
+        use tempfile::tempdir;
+
+        const VERSION_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        const OLD_DATA_DIR: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        const NEW_DATA_DIR: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+        async fn run_scenario(mode: DurabilityMode, crash: Option<RenameDataCrashPoint>, with_old_version: bool) {
+            // Serializes with every other durability-sensitive test and pins the
+            // resolved tier for the whole scenario (held until dropped).
+            let _mode = durability_mode_override::set(mode);
+
+            let dir = tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+            let bucket = "bucket";
+            let object = "crash-object";
+            let tmp_object = "tmp-crash-object";
+            let version_id = Uuid::parse_str(VERSION_ID).expect("version id should parse");
+            let old_data_dir = Uuid::parse_str(OLD_DATA_DIR).expect("old data dir should parse");
+            let new_data_dir = Uuid::parse_str(NEW_DATA_DIR).expect("new data dir should parse");
+
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+            let object_dir = dir.path().join(bucket).join(object);
+            let meta_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+            let old_meta = if with_old_version {
+                let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+                let old_meta = test_meta(old_fi);
+                fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+                    .await
+                    .expect("old data dir should be created");
+                fs::write(&meta_path, &old_meta)
+                    .await
+                    .expect("old metadata should be written");
+                Some(old_meta)
+            } else {
+                None
+            };
+
+            // Stage the replacement version's shard data under the tmp bucket.
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join(tmp_object)
+                .join(new_data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("new tmp data dir should be created");
+            fs::write(tmp_data_dir.join("part.1"), b"new-data")
+                .await
+                .expect("new tmp data should be written");
+
+            if let Some(point) = crash {
+                arm_rename_data_crash(point, object);
+            }
+            let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+            let result = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+                .await;
+
+            // Reopen the disk to model a process restart after the crash.
+            drop(disk);
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should reopen");
+            let read = disk
+                .read_version("", bucket, object, &version_id.to_string(), &ReadOptions::default())
+                .await;
+
+            match crash {
+                Some(point) => {
+                    assert!(result.is_err(), "{mode:?}/{point:?}: an armed crash must surface as an error");
+                    match &old_meta {
+                        Some(old) => {
+                            // The commit rename never ran: xl.meta is byte-for-byte
+                            // the old version and its data dir is intact.
+                            let after = fs::read(&meta_path).await.expect("old metadata must survive the crash");
+                            assert_eq!(&after, old, "{mode:?}/{point:?}: xl.meta must remain the old version");
+                            assert!(
+                                object_dir.join(old_data_dir.to_string()).exists(),
+                                "{mode:?}/{point:?}: old data dir must remain on disk"
+                            );
+                            let fi = read.expect("old version must be readable after the crash");
+                            assert_eq!(
+                                fi.data_dir,
+                                Some(old_data_dir),
+                                "{mode:?}/{point:?}: read must resolve to the old data dir, never the half-committed new one"
+                            );
+                        }
+                        None => {
+                            // No prior version: a pre-commit crash must leave no
+                            // object behind at all.
+                            assert!(
+                                !meta_path.exists(),
+                                "{mode:?}/{point:?}: no old version means no xl.meta after a pre-commit crash"
+                            );
+                            let err = read.expect_err("absent object must not be readable");
+                            assert!(
+                                matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound),
+                                "{mode:?}/{point:?}: unexpected error for absent object: {err:?}"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    result.expect("un-injected rename_data must commit");
+                    let fi = read.expect("new version must be readable after commit");
+                    assert_eq!(
+                        fi.data_dir,
+                        Some(new_data_dir),
+                        "{mode:?}: read must resolve to the newly committed data dir"
+                    );
+                    assert!(
+                        object_dir.join(new_data_dir.to_string()).exists(),
+                        "{mode:?}: new data dir must be in place after commit"
+                    );
+                }
+            }
+        }
+
+        const CRASH_POINTS: [RenameDataCrashPoint; 2] = [
+            RenameDataCrashPoint::AfterDataRename,
+            RenameDataCrashPoint::AfterBackupBeforeMetaCommit,
+        ];
+
+        #[tokio::test]
+        async fn overwrite_pre_commit_crash_keeps_old_version_strict() {
+            for point in CRASH_POINTS {
+                run_scenario(DurabilityMode::Strict, Some(point), true).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn overwrite_pre_commit_crash_keeps_old_version_relaxed() {
+            for point in CRASH_POINTS {
+                run_scenario(DurabilityMode::Relaxed, Some(point), true).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn fresh_pre_commit_crash_leaves_no_object_strict() {
+            for point in CRASH_POINTS {
+                run_scenario(DurabilityMode::Strict, Some(point), false).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn fresh_pre_commit_crash_leaves_no_object_relaxed() {
+            for point in CRASH_POINTS {
+                run_scenario(DurabilityMode::Relaxed, Some(point), false).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn commit_without_crash_makes_new_version_visible() {
+            run_scenario(DurabilityMode::Strict, None, true).await;
+            run_scenario(DurabilityMode::Relaxed, None, true).await;
+            run_scenario(DurabilityMode::Strict, None, false).await;
         }
     }
 
