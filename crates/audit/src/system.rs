@@ -415,7 +415,7 @@ impl AuditSystem {
         // Lock order must match every other path that holds both locks
         // (`clear_runtime_targets`, `AuditRuntimeFacade::replace_targets`):
         // acquire `registry` first, then `stream_cancellers`. Reversing the
-        // order here would create an AB-BA deadlock with those paths.
+        // order here would create an ABBA deadlock with those paths.
         let registry = self.registry.lock().await;
         let replay_workers = self.stream_cancellers.read().await;
         registry.runtime_manager().status_snapshot(&replay_workers)
@@ -648,7 +648,7 @@ mod tests {
 
     /// Regression guard for backlog#961: `runtime_status_snapshot` and
     /// `clear_runtime_targets` both hold `registry` and `stream_cancellers`.
-    /// They previously acquired the two locks in opposite orders (AB-BA),
+    /// They previously acquired the two locks in opposite orders (ABBA),
     /// which could deadlock the whole audit control plane under concurrency.
     /// Hammer both paths from multiple worker threads and assert the workload
     /// completes within a timeout instead of hanging.
