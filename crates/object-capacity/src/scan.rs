@@ -733,6 +733,16 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
             ));
         }
 
+        // Resolve the scan root before walking. A drive_path that is itself a
+        // symlink (container/k8s indirection) combined with
+        // follow_root_links(false) used to yield a single skipped symlink
+        // entry and commit an exact 0-byte result into the per-disk baseline
+        // with no error and no log (backlog#1015 S05). Resolution failures are
+        // surfaced instead of silently counting zero.
+        let resolved_root = std::fs::canonicalize(path)
+            .map_err(|err| std::io::Error::new(err.kind(), format!("failed to resolve scan root {path:?}: {err}")))?;
+        let path = resolved_root.as_path();
+
         let start_time = Instant::now();
         let mut exact_prefix_bytes = 0u64;
         let mut overflow_sampled_bytes = 0u64;
@@ -1417,6 +1427,30 @@ mod tests {
         // degenerate max_timeout values.
         assert_eq!(outer_scan_budget(&tight_limits(Duration::from_secs(15))), Duration::from_secs(30));
         assert_eq!(outer_scan_budget(&tight_limits(Duration::ZERO)), Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_dir_blocking_resolves_symlink_root() {
+        use std::fs::File;
+        use std::io::Write;
+
+        let target_dir = tempfile::TempDir::new().unwrap();
+        for i in 0..3 {
+            let mut file = File::create(target_dir.path().join(format!("f{i}"))).unwrap();
+            file.write_all(b"data").unwrap();
+        }
+
+        // drive_path is a symlink to the real data directory; with symlink
+        // following disabled this used to return exact 0 bytes / 0 files.
+        let link_parent = tempfile::TempDir::new().unwrap();
+        let link = link_parent.path().join("rustfs0");
+        std::os::unix::fs::symlink(target_dir.path(), &link).unwrap();
+
+        let result = scan_dir_blocking(&link, &tight_limits(Duration::from_secs(600)), &AtomicBool::new(false)).unwrap();
+        assert_eq!(result.used_bytes, 12);
+        assert_eq!(result.file_count, 3);
+        assert!(!result.is_estimated);
     }
 
     #[test]
