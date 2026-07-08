@@ -201,6 +201,16 @@ where
 
         let hash_algo = &self.hash_algo;
 
+        // Interleaved per-block bitrot: prepend the block's hash so the on-disk
+        // block is `[hash][data]`. This `size() > 0` condition is broader than
+        // the streaming-only condition in `bitrot_shard_file_size`, so it is
+        // only self-consistent for the two streaming Highway variants
+        // (`HighwayHash256S` / `HighwayHash256SLegacy`) — the only algorithms
+        // production ever uses here (backlog#959 / ECA-18). For non-streaming
+        // algorithms MinIO uses whole-file bitrot with no interleaved hash, so
+        // driving one through this writer would produce a file whose length
+        // disagrees with `bitrot_shard_file_size` and fail `bitrot_verify`; do
+        // not feed a non-streaming algorithm here without a separate path.
         if hash_algo.size() > 0 {
             let hash = hash_algo.hash_encode(buf);
             if hash.as_ref().is_empty() {
@@ -272,13 +282,52 @@ where
     Ok(())
 }
 
+/// On-disk size of a shard file for a part of `size` data bytes.
+///
+/// This is a byte-for-byte port of MinIO's `bitrotShardFileSize` and encodes
+/// MinIO's per-algorithm bitrot layout, NOT a uniform "one hash per block" rule:
+///
+/// - `HighwayHash256S` / `HighwayHash256SLegacy` are the *streaming* variants.
+///   They use interleaved per-block bitrot: every `shard_size` block on disk is
+///   `[hash][data]`, so the file carries `ceil(size / shard_size)` extra hashes.
+/// - Every other algorithm (`SHA256`, `HighwayHash256`, `BLAKE2b512`, `Md5`,
+///   `None`) maps to MinIO's *whole-file* bitrot for legacy V1 objects: the hash
+///   lives in xl.meta, not interleaved on disk, so the on-disk file is exactly
+///   `size` bytes. Returning the bare `size` here is therefore correct, not a
+///   bug — adding per-block hash bytes would make this guard reject genuine
+///   legacy whole-file-bitrot parts and break MinIO interop.
+///
+/// INVARIANT (backlog#959 / ECA-18): this crate only ever writes and verifies
+/// the *streaming* per-block layout. `BitrotWriter::write` interleaves a hash on
+/// any `hash_algo.size() > 0`, and `bitrot_verify`'s read loop assumes an
+/// interleaved hash per block; both are only consistent with THIS function for
+/// the two streaming Highway variants. That is safe because every production
+/// write path hardcodes `HighwayHash256S` and `ErasureInfo::get_checksum_info`
+/// defaults to `HighwayHash256S` (see the regression tests below and in
+/// rustfs-filemeta). The non-streaming branches of this function exist purely to
+/// preserve the MinIO formula's whole-file semantics; feeding a non-streaming
+/// algorithm through `BitrotWriter` + `bitrot_verify` is unsupported and would
+/// mismatch this size — do not wire one in without a dedicated whole-file path.
 pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorithm) -> usize {
     if algo != HashAlgorithm::HighwayHash256S && algo != HashAlgorithm::HighwayHash256SLegacy {
+        // Non-streaming (whole-file bitrot) algorithms carry no interleaved
+        // per-block hashes on disk; the on-disk file is exactly `size` bytes.
         return size;
     }
+    // Streaming Highway variants: one hash is interleaved before every block.
     size.div_ceil(shard_size) * algo.size() + size
 }
 
+/// Verify an interleaved per-block bitrot shard file.
+///
+/// The read loop below assumes every block on disk is `[hash][data]` (streaming
+/// bitrot). It is therefore only valid for the streaming Highway variants, whose
+/// on-disk length matches `bitrot_shard_file_size` — production always uses
+/// `HighwayHash256S` (backlog#959 / ECA-18). Passing a non-streaming algorithm
+/// (`SHA256` / `HighwayHash256` / `BLAKE2b512` / `Md5`) is unsupported: MinIO
+/// stores those as whole-file bitrot with no interleaved hash, so the size guard
+/// on the next line would reject a genuinely healthy part. Reading legacy V1
+/// whole-file-bitrot objects would need a separate verification path.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub async fn bitrot_verify<R: AsyncRead + Unpin + Send>(
     mut r: R,
@@ -487,6 +536,7 @@ mod tests {
 
     use super::BitrotReader;
     use super::BitrotWriter;
+    use super::bitrot_shard_file_size;
     use rustfs_utils::HashAlgorithm;
     use std::io::{Cursor, IoSlice};
     use std::sync::{
@@ -830,6 +880,101 @@ mod tests {
         assert_eq!(n, shard_size);
         assert_eq!(out, payload);
         assert!(reads.load(Ordering::SeqCst) > 1, "partial reads should loop");
+    }
+
+    // --- backlog#959 / ECA-18 invariant guards -------------------------------
+    //
+    // These tests pin the *intended* per-algorithm bitrot layout so a future
+    // change can't silently drift `bitrot_shard_file_size`, `BitrotWriter`, and
+    // `bitrot_verify` out of agreement. The design contract (see the doc
+    // comments above): only the two streaming Highway variants use interleaved
+    // per-block `[hash][data]` layout; every other algorithm maps to MinIO
+    // whole-file bitrot and its shard file is exactly `size` bytes on disk.
+
+    #[test]
+    fn bitrot_shard_file_size_counts_hash_only_for_streaming_variants() {
+        // For a range of sizes (including exact multiples and non-multiples of
+        // shard_size), streaming variants add one hash per block; all others
+        // return the bare `size`.
+        let shard_size = 16usize;
+        let hash = 32usize; // both streaming Highway variants are 32 bytes
+        for &size in &[0usize, 1, 15, 16, 17, 31, 32, 33, 100, 160] {
+            let blocks = size.div_ceil(shard_size);
+
+            for algo in [HashAlgorithm::HighwayHash256S, HashAlgorithm::HighwayHash256SLegacy] {
+                assert_eq!(
+                    bitrot_shard_file_size(size, shard_size, algo.clone()),
+                    size + blocks * hash,
+                    "streaming variant {algo:?} must count per-block hash bytes (size={size})"
+                );
+            }
+
+            for algo in [
+                HashAlgorithm::SHA256,
+                HashAlgorithm::HighwayHash256,
+                HashAlgorithm::BLAKE2b512,
+                HashAlgorithm::Md5,
+                HashAlgorithm::None,
+            ] {
+                assert_eq!(
+                    bitrot_shard_file_size(size, shard_size, algo.clone()),
+                    size,
+                    "non-streaming variant {algo:?} must return the bare on-disk size (size={size})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bitrot_shard_file_size_matches_streaming_writer_output() {
+        // The size formula for streaming variants must equal the byte count that
+        // BitrotWriter actually writes to disk, across integral and partial
+        // final blocks — this is the invariant `bitrot_verify`'s size guard
+        // relies on.
+        let shard_size = 16usize;
+        for algo in [HashAlgorithm::HighwayHash256S, HashAlgorithm::HighwayHash256SLegacy] {
+            for &size in &[1usize, 16, 17, 32, 40, 48] {
+                let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
+                let mut w = BitrotWriter::new(Cursor::new(Vec::<u8>::new()), shard_size, algo.clone());
+                for chunk in payload.chunks(shard_size) {
+                    w.write(chunk).await.unwrap();
+                }
+                let on_disk = w.into_inner().into_inner().len();
+                assert_eq!(
+                    on_disk,
+                    bitrot_shard_file_size(size, shard_size, algo.clone()),
+                    "writer output must match size formula ({algo:?}, size={size})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_variants_are_the_only_per_block_bitrot_algorithms() {
+        // Documents the known, intentional divergence at the heart of ECA-18:
+        // BitrotWriter interleaves a hash whenever `size() > 0`, but the shard
+        // size formula only counts hash bytes for the streaming variants. The
+        // two conditions agree ONLY for the streaming variants; this test locks
+        // that boundary so nobody "fixes" one side without the other. If a new
+        // algorithm is added, this test forces an explicit decision here.
+        let shard_size = 16usize;
+        let size = 40usize; // spans multiple blocks
+        for algo in [
+            HashAlgorithm::SHA256,
+            HashAlgorithm::HighwayHash256,
+            HashAlgorithm::HighwayHash256S,
+            HashAlgorithm::HighwayHash256SLegacy,
+            HashAlgorithm::BLAKE2b512,
+            HashAlgorithm::Md5,
+            HashAlgorithm::None,
+        ] {
+            let streaming = matches!(algo, HashAlgorithm::HighwayHash256S | HashAlgorithm::HighwayHash256SLegacy);
+            let formula_counts_hash = bitrot_shard_file_size(size, shard_size, algo.clone()) > size;
+            assert_eq!(
+                formula_counts_hash, streaming,
+                "only streaming Highway variants may count per-block hash bytes ({algo:?})"
+            );
+        }
     }
 
     #[tokio::test]
