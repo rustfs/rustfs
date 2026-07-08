@@ -31,7 +31,7 @@ const SECRET_KEY_MAX_LEN: usize = 40;
 pub const ACCOUNT_ON: &str = "on";
 pub const ACCOUNT_OFF: &str = "off";
 
-const RESERVED_CHARS: &str = "=,";
+const RESERVED_CHARS: &[char] = &['=', ','];
 
 /// ContainsReservedChars - returns whether the input string contains reserved characters.
 ///
@@ -42,6 +42,9 @@ const RESERVED_CHARS: &str = "=,";
 /// * `bool` - true if contains reserved characters, false otherwise.
 ///
 pub fn contains_reserved_chars(s: &str) -> bool {
+    // Match ANY reserved character, mirroring MinIO's `strings.ContainsAny(s, "=,")`.
+    // The previous `s.contains("=,")` only matched the literal substring "=,", so an
+    // access key or group name containing a lone `=` or `,` slipped through (backlog#806).
     s.contains(RESERVED_CHARS)
 }
 
@@ -414,3 +417,27 @@ impl TryFrom<CredentialsBuilder> for Credentials {
 //         }
 //     }
 // }
+
+#[cfg(test)]
+mod reserved_chars_tests {
+    use super::contains_reserved_chars;
+
+    #[test]
+    fn detects_any_reserved_char_not_just_the_substring() {
+        // Regression (backlog#806): a lone `=` or `,` must be rejected, not only
+        // the exact "=," substring.
+        assert!(contains_reserved_chars("a=b"));
+        assert!(contains_reserved_chars("a,b"));
+        assert!(contains_reserved_chars("="));
+        assert!(contains_reserved_chars(","));
+        assert!(contains_reserved_chars("=,"));
+        assert!(contains_reserved_chars("key,with=both"));
+    }
+
+    #[test]
+    fn allows_clean_strings() {
+        assert!(!contains_reserved_chars(""));
+        assert!(!contains_reserved_chars("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!contains_reserved_chars("group-name_1"));
+    }
+}
