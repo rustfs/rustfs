@@ -715,6 +715,38 @@ mod tests {
     use proptest::collection::{hash_map, vec};
     use proptest::prelude::*;
 
+    // backlog#959 / ECA-18: the interleaved per-block bitrot subsystem in
+    // rustfs-ecstore (BitrotWriter / bitrot_verify / bitrot_shard_file_size) is
+    // only self-consistent for the streaming Highway variants. That safety rests
+    // on production always resolving a streaming checksum algorithm, so pin the
+    // default here: a part with no explicit ChecksumInfo must resolve to
+    // HighwayHash256S. If this default ever changes, the ecstore bitrot layout
+    // assumptions must be revisited in lockstep.
+    #[test]
+    fn get_checksum_info_defaults_to_highwayhash256s() {
+        let ei = ErasureInfo::default();
+        assert!(ei.checksums.is_empty(), "default ErasureInfo carries no checksums");
+        let info = ei.get_checksum_info(1);
+        assert_eq!(
+            info.algorithm,
+            HashAlgorithm::HighwayHash256S,
+            "missing ChecksumInfo must default to the streaming HighwayHash256S algorithm"
+        );
+
+        // A present entry is returned as-is; the default only applies on miss.
+        let ei = ErasureInfo {
+            checksums: vec![ChecksumInfo {
+                part_number: 2,
+                algorithm: HashAlgorithm::SHA256,
+                hash: Bytes::new(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(ei.get_checksum_info(2).algorithm, HashAlgorithm::SHA256);
+        // A part_number with no entry still falls back to the streaming default.
+        assert_eq!(ei.get_checksum_info(99).algorithm, HashAlgorithm::HighwayHash256S);
+    }
+
     // backlog#949: distribution range/permutation validation.
     #[test]
     fn is_valid_distribution_accepts_permutation() {
