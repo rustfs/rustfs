@@ -19,7 +19,7 @@ pub static COMPRESSION_BYTES_ORIGINAL_TOTAL: LazyLock<MetricDescriptor> = LazyLo
     new_counter_md(
         MetricName::OriginedBytesTotal,
         "Total bytes before compression (original)",
-        &["compression"],
+        &[],
         subsystems::COMPRESSION,
     )
 });
@@ -28,7 +28,7 @@ pub static COMPRESSION_BYTES_COMPRESSED_TOTAL: LazyLock<MetricDescriptor> = Lazy
     new_counter_md(
         MetricName::CompressedBytesTotal,
         "Total bytes after compression",
-        &["compression"],
+        &[],
         subsystems::COMPRESSION,
     )
 });
@@ -37,7 +37,7 @@ pub static COMPRESSION_BYTES_SAVED_TOTAL: LazyLock<MetricDescriptor> = LazyLock:
     new_counter_md(
         MetricName::SavedBytesTotal,
         "Total bytes saved by compression",
-        &["compression"],
+        &[],
         subsystems::COMPRESSION,
     )
 });
@@ -46,7 +46,7 @@ pub static COMPRESSION_RATIO: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::CompressionRatio,
         "Compression ratio (0.0 - 1.0)",
-        &["compression"],
+        &[],
         subsystems::COMPRESSION,
     )
 });
@@ -55,7 +55,7 @@ pub static COMPRESSION_OPERATIONS_TOTAL: LazyLock<MetricDescriptor> = LazyLock::
     new_counter_md(
         MetricName::CompressionOperationsTotal,
         "Total number of compression operations performed",
-        &["compression"],
+        &[],
         subsystems::COMPRESSION,
     )
 });
