@@ -36,7 +36,7 @@ impl fmt::Display for UnknownChecksumAlgorithmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            r#"unknown checksum algorithm "{}", please pass a known algorithm name ("crc32", "crc32c", "sha1", "sha256", "md5")"#,
+            r#"unknown checksum algorithm "{}", please pass a known algorithm name ("crc32", "crc32c", "crc64nvme", "sha1", "sha256")"#,
             self.checksum_algorithm
         )
     }
