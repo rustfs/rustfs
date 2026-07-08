@@ -1,21 +1,28 @@
 # GitHub Workflow Instructions
 
-Applies to `.github/` and repository pull-request operations.
+Applies to `.github/`.
 
 ## Pull Requests
 
-- PR titles and descriptions must be in English.
-- Use `.github/pull_request_template.md` for every PR body.
-- Keep all template section headings.
-- Use `N/A` for non-applicable sections.
-- Include verification commands in the PR details.
-- For `gh pr create` and `gh pr edit`, always write markdown body to a file and pass `--body-file`.
-- Do not use multiline inline `--body`; backticks and shell expansion can corrupt content or trigger unintended commands.
-- Recommended pattern:
-  - `cat > /tmp/pr_body.md <<'EOF'`
-  - `...markdown...`
-  - `EOF`
-  - `gh pr create ... --body-file /tmp/pr_body.md`
+PR conventions (English title/body, template usage, `--body-file` with the
+heredoc pattern, review-thread etiquette) live in the root `AGENTS.md` under
+"Git and PR Baseline" — that section is the single normative home; do not
+duplicate its rules here.
+
+## Workflow Changes
+
+- Any change touching `.github/workflows/` must pass `actionlint` (run from
+  the repo root) with zero findings before commit/PR. Install via
+  `brew install actionlint`, or the download script in the actionlint repo
+  (rhysd/actionlint); `make pre-pr` does not cover workflow files, so this is
+  the required check for them.
+- Custom self-hosted runner labels (`sm-standard-*`, `dind-*`) are declared
+  in `.github/actionlint.yaml`. When introducing a new `runs-on:` label,
+  declare it there in the same change. Never use the config or `-ignore` to
+  silence real findings — fix the workflow (root `AGENTS.md`: make checks
+  pass by fixing the cause, not by weakening the gate).
+- If `shellcheck` is installed, actionlint also lints `run:` scripts; treat
+  those findings as part of the gate.
 
 ## CI Alignment
 
