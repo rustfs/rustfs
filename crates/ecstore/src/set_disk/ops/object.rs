@@ -2306,7 +2306,7 @@ mod b3_write_quorum_tests {
 }
 
 #[cfg(test)]
-mod hermetic_set_disks_support {
+pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     //! Shared hermetic `SetDisks` construction for the ops tests below: the
     //! `SetDisks` under test is built directly on formatted local disks (same
     //! pattern as the `ops/locking.rs` tests) so the tests stay hermetic — no
@@ -2318,7 +2318,10 @@ mod hermetic_set_disks_support {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    pub(super) async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+    pub(in crate::set_disk::ops) async fn make_formatted_local_disk(
+        disk_idx: usize,
+        format: &FormatV3,
+    ) -> (TempDir, Endpoint, DiskStore) {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let mut endpoint =
             Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
@@ -2345,7 +2348,7 @@ mod hermetic_set_disks_support {
         (dir, endpoint, disk)
     }
 
-    pub(super) async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(in crate::set_disk::ops) async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         let format = FormatV3::new(1, disk_count);
 
         let mut temp_dirs = Vec::with_capacity(disk_count);
