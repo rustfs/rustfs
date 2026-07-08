@@ -30,9 +30,9 @@ use rustfs_config::{
     ENV_CAPACITY_WRITE_TRIGGER_DELAY,
 };
 use rustfs_io_metrics::capacity_metrics::{
-    record_capacity_current_bytes, record_capacity_dirty_disk_count, record_capacity_refresh_inflight,
-    record_capacity_refresh_joiner, record_capacity_refresh_result, record_capacity_update_completed,
-    record_capacity_update_failed, record_capacity_write_operation,
+    record_capacity_current_bytes, record_capacity_degraded_reading, record_capacity_dirty_disk_count,
+    record_capacity_refresh_inflight, record_capacity_refresh_joiner, record_capacity_refresh_result,
+    record_capacity_update_completed, record_capacity_update_failed, record_capacity_write_operation,
 };
 use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
 use std::collections::{HashMap, HashSet};
@@ -323,6 +323,9 @@ pub struct CachedCapacity {
     pub file_count: usize,
     /// Whether it's an estimated value
     pub is_estimated: bool,
+    /// Whether the value comes from a refresh that had partial disk failures
+    /// (some disks kept their last-known values or were dropped entirely).
+    pub degraded: bool,
     /// Data source
     pub source: DataSource,
 }
@@ -336,6 +339,10 @@ pub struct CapacityUpdate {
     pub file_count: usize,
     /// Whether the value is estimated instead of exact.
     pub is_estimated: bool,
+    /// Whether the refresh behind this update had partial disk failures.
+    /// `is_estimated` only reflects sampling; this flag is the only carrier of
+    /// the "some disks failed to scan" fact (backlog#1014).
+    pub degraded: bool,
     /// Per-disk breakdown captured from a successful refresh.
     pub per_disk: Vec<DiskCapacityUpdate>,
     /// Expected disk count for a complete disk cache.
@@ -353,6 +360,7 @@ impl CapacityUpdate {
             total_used,
             file_count,
             is_estimated: false,
+            degraded: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -366,6 +374,7 @@ impl CapacityUpdate {
             total_used,
             file_count,
             is_estimated: true,
+            degraded: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -379,6 +388,7 @@ impl CapacityUpdate {
             total_used,
             file_count: 0,
             is_estimated: true,
+            degraded: false,
             per_disk: Vec::new(),
             expected_disk_count: None,
             replaces_disk_cache: false,
@@ -671,11 +681,14 @@ impl HybridCapacityManager {
     pub async fn update_capacity(&self, mut update: CapacityUpdate, source: DataSource) -> CapacityUpdate {
         let start = Instant::now();
 
-        if !update.per_disk.is_empty() {
+        if !update.per_disk.is_empty() || update.degraded {
             let mut disk_cache = self.disk_cache.write().await;
             let mut disk_cache_complete = self.disk_cache_complete.write().await;
 
-            let recompute = if update.replaces_disk_cache && update.expected_disk_count == Some(update.per_disk.len()) {
+            let recompute = if !update.per_disk.is_empty()
+                && update.replaces_disk_cache
+                && update.expected_disk_count == Some(update.per_disk.len())
+            {
                 disk_cache.clear();
                 for entry in &update.per_disk {
                     disk_cache.insert(
@@ -690,6 +703,11 @@ impl HybridCapacityManager {
                 *disk_cache_complete = true;
                 true
             } else if *disk_cache_complete {
+                // Merging over a complete cache also covers a degraded
+                // (partial-failure) full refresh: successfully scanned disks
+                // are refreshed while failed disks keep their last-known
+                // values, so the published total does not dip to the
+                // surviving-subset sum and bounce back on the next refresh.
                 for entry in &update.per_disk {
                     disk_cache.insert(
                         entry.disk.clone(),
@@ -722,6 +740,7 @@ impl HybridCapacityManager {
             last_update: Instant::now(),
             file_count: update.file_count,
             is_estimated: update.is_estimated,
+            degraded: update.degraded,
             source,
         });
 
@@ -741,12 +760,16 @@ impl HybridCapacityManager {
             total_used,
             file_count = update.file_count,
             estimated = update.is_estimated,
+            degraded = update.degraded,
             source = source.as_metric_label(),
             elapsed_ms = start.elapsed().as_millis() as u64,
             "capacity refresh cache updated"
         );
         record_capacity_current_bytes(total_used);
         record_capacity_update_completed(source.as_metric_label(), start.elapsed(), total_used, update.is_estimated);
+        if update.degraded {
+            record_capacity_degraded_reading(source.as_metric_label());
+        }
         update
     }
 
@@ -1675,6 +1698,7 @@ mod tests {
                     total_used: 300,
                     file_count: 3,
                     is_estimated: false,
+                    degraded: false,
                     per_disk: vec![
                         DiskCapacityUpdate {
                             disk: CapacityScopeDisk {
@@ -1709,6 +1733,7 @@ mod tests {
                     total_used: 150,
                     file_count: 1,
                     is_estimated: true,
+                    degraded: false,
                     per_disk: vec![DiskCapacityUpdate {
                         disk: CapacityScopeDisk {
                             endpoint: "node-a".to_string(),
@@ -1739,6 +1764,138 @@ mod tests {
         assert!(cached.is_estimated);
     }
 
+    fn disk_entry(endpoint: &str, drive_path: &str, used_bytes: u64, file_count: usize) -> DiskCapacityUpdate {
+        DiskCapacityUpdate {
+            disk: CapacityScopeDisk {
+                endpoint: endpoint.to_string(),
+                drive_path: drive_path.to_string(),
+            },
+            used_bytes,
+            file_count,
+            is_estimated: false,
+        }
+    }
+
+    fn full_two_disk_update() -> CapacityUpdate {
+        CapacityUpdate {
+            total_used: 200,
+            file_count: 2,
+            is_estimated: false,
+            degraded: false,
+            per_disk: vec![
+                disk_entry("node-a", "/tmp/disk-a", 100, 1),
+                disk_entry("node-b", "/tmp/disk-b", 100, 1),
+            ],
+            expected_disk_count: Some(2),
+            replaces_disk_cache: true,
+            clear_dirty_disks: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_update_capacity_degraded_full_refresh_merges_cache_and_does_not_oscillate() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+
+        // Round 1: healthy full refresh seeds a complete cache (A=100, B=100).
+        manager.update_capacity(full_two_disk_update(), DataSource::RealTime).await;
+
+        // Round 2: disk B fails mid-scan; the degraded update carries only the
+        // surviving subset's totals and per-disk entries.
+        let degraded = manager
+            .update_capacity(
+                CapacityUpdate {
+                    total_used: 100,
+                    file_count: 1,
+                    is_estimated: false,
+                    degraded: true,
+                    per_disk: vec![disk_entry("node-a", "/tmp/disk-a", 100, 1)],
+                    expected_disk_count: None,
+                    replaces_disk_cache: false,
+                    clear_dirty_disks: Vec::new(),
+                },
+                DataSource::Scheduled,
+            )
+            .await;
+
+        // Disk B keeps its last-known 100 bytes: the published total must not
+        // dip to the surviving-subset sum.
+        assert_eq!(degraded.total_used, 200);
+        assert!(degraded.degraded);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 200);
+        assert!(cached.degraded);
+
+        // Round 3: disk B recovers; the healthy full refresh clears the flag
+        // and the reported total never oscillated (200 → 200 → 200).
+        let recovered = manager.update_capacity(full_two_disk_update(), DataSource::Scheduled).await;
+        assert_eq!(recovered.total_used, 200);
+        assert!(!recovered.degraded);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 200);
+        assert!(!cached.degraded);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_update_capacity_degraded_with_empty_per_disk_serves_merged_cache() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        manager.update_capacity(full_two_disk_update(), DataSource::RealTime).await;
+
+        // Every surviving disk had intra-disk errors, so no per-disk entry is
+        // trustworthy; the complete cache must still back the published total.
+        let degraded = manager
+            .update_capacity(
+                CapacityUpdate {
+                    total_used: 40,
+                    file_count: 1,
+                    is_estimated: false,
+                    degraded: true,
+                    per_disk: Vec::new(),
+                    expected_disk_count: None,
+                    replaces_disk_cache: false,
+                    clear_dirty_disks: Vec::new(),
+                },
+                DataSource::Scheduled,
+            )
+            .await;
+
+        assert_eq!(degraded.total_used, 200);
+        assert!(degraded.degraded);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_update_capacity_degraded_without_complete_cache_keeps_partial_sum() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+
+        // No complete cache exists: nothing to merge, the partial sum is the
+        // best available value, but it must be visibly marked degraded and the
+        // partial per-disk data must not mark the cache complete (#805).
+        let degraded = manager
+            .update_capacity(
+                CapacityUpdate {
+                    total_used: 100,
+                    file_count: 1,
+                    is_estimated: false,
+                    degraded: true,
+                    per_disk: vec![disk_entry("node-a", "/tmp/disk-a", 100, 1)],
+                    expected_disk_count: None,
+                    replaces_disk_cache: false,
+                    clear_dirty_disks: Vec::new(),
+                },
+                DataSource::Scheduled,
+            )
+            .await;
+
+        assert_eq!(degraded.total_used, 100);
+        assert!(degraded.degraded);
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, 100);
+        assert!(cached.degraded);
+        assert!(!manager.can_refresh_dirty_subset().await);
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_refresh_or_join_returns_cluster_total_for_dirty_subset() {
@@ -1751,6 +1908,7 @@ mod tests {
                     total_used: 300,
                     file_count: 3,
                     is_estimated: false,
+                    degraded: false,
                     per_disk: vec![
                         DiskCapacityUpdate {
                             disk: CapacityScopeDisk {
@@ -1784,6 +1942,7 @@ mod tests {
             total_used: 150,
             file_count: 1,
             is_estimated: true,
+            degraded: false,
             per_disk: vec![DiskCapacityUpdate {
                 disk: CapacityScopeDisk {
                     endpoint: "node-a".to_string(),
