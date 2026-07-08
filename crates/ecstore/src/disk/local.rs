@@ -834,6 +834,10 @@ fn is_bitrot_size_mismatch_error(err: &std::io::Error) -> bool {
     err.to_string().contains("bitrot shard file size mismatch")
 }
 
+fn is_bitrot_verification_error(err: &std::io::Error) -> bool {
+    is_bitrot_size_mismatch_error(err) || err.to_string().contains("bitrot hash mismatch")
+}
+
 fn metacache_write_error(err: rustfs_filemeta::Error) -> DiskError {
     let err = DiskError::from(err);
     if err.contains_io_error_kind(ErrorKind::BrokenPipe) {
@@ -2887,11 +2891,12 @@ impl LocalDisk {
                     );
                     tokio::time::sleep(retry_delay).await;
                 }
+                Err(err) if is_bitrot_verification_error(&err) => return Err(DiskError::FileCorrupt),
                 Err(err) => return Err(to_file_error(err).into()),
             }
         }
 
-        Err(DiskError::other("bitrot size mismatch retry loop exhausted"))
+        Err(DiskError::FileCorrupt)
     }
 
     #[async_recursion::async_recursion]
@@ -4123,7 +4128,6 @@ impl DiskAPI for LocalDisk {
         self.io_backend.open_write(volume, path, WriteMode::Append).await
     }
 
-    // TODO: io verifier
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         crate::hp_guard!("LocalDisk::read_file");
@@ -7688,6 +7692,72 @@ mod test {
     fn test_is_bitrot_size_mismatch_error_only_matches_target_message() {
         assert!(is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot shard file size mismatch")));
         assert!(!is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot hash mismatch")));
+    }
+
+    #[test]
+    fn test_is_bitrot_verification_error_matches_hash_and_size_mismatch() {
+        assert!(is_bitrot_verification_error(&std::io::Error::other("bitrot shard file size mismatch")));
+        assert!(is_bitrot_verification_error(&std::io::Error::other("bitrot hash mismatch")));
+        assert!(!is_bitrot_verification_error(&std::io::Error::other("unrelated io failure")));
+    }
+
+    #[tokio::test]
+    async fn local_disk_read_file_verifier_reports_bitrot_mismatch() {
+        use crate::erasure::coding::BitrotWriter;
+        use rustfs_filemeta::ChecksumInfo;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "verify-volume";
+        ensure_test_volume(&disk, volume).await;
+
+        let payload = Bytes::from_static(b"bitrot-payload!!");
+        let object = "object.bin";
+        let data_dir = Uuid::new_v4();
+        let part_number = 1;
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let mut file_info = FileInfo::new(object, 1, 0);
+        file_info.volume = volume.to_string();
+        file_info.name = object.to_string();
+        file_info.size = i64::try_from(payload.len()).expect("test payload length should fit i64");
+        file_info.data_dir = Some(data_dir);
+        file_info.erasure.block_size = payload.len();
+        file_info.erasure.index = 1;
+        file_info.erasure.checksums = vec![ChecksumInfo {
+            part_number,
+            algorithm: checksum_algo.clone(),
+            hash: Bytes::new(),
+        }];
+        file_info.parts = vec![ObjectPartInfo {
+            number: part_number,
+            size: payload.len(),
+            actual_size: i64::try_from(payload.len()).expect("test payload length should fit i64"),
+            ..Default::default()
+        }];
+
+        let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::new()), file_info.erasure.shard_size(), checksum_algo);
+        writer
+            .write(&payload)
+            .await
+            .expect("bitrot writer should encode test payload");
+        writer.shutdown().await.expect("bitrot writer should flush test payload");
+        let mut encoded = writer.into_inner().into_inner();
+        let last = encoded.last_mut().expect("encoded part should not be empty");
+        *last ^= 0xff;
+
+        let part_path = path_join_buf(&[object, &data_dir.to_string(), &format!("part.{part_number}")]);
+        disk.write_all(volume, &part_path, Bytes::from(encoded))
+            .await
+            .expect("corrupted encoded part should be written");
+
+        let result = disk
+            .verify_file(volume, object, &file_info)
+            .await
+            .expect("verify_file should return per-part status");
+
+        assert_eq!(result.results, vec![CHECK_PART_FILE_CORRUPT]);
     }
 
     /// Differential test for the LocalIoBackend refactor: every read shape
