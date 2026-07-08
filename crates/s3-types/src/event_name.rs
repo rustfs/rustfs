@@ -310,16 +310,29 @@ impl EventName {
     pub fn mask(&self) -> u64 {
         let value = *self as u32;
         if value > 0 && value <= LAST_SINGLE_TYPE_VALUE {
-            // It's a single type
-            1u64 << (value - 1)
-        } else {
-            // It's a compound type
-            let mut mask = 0u64;
-            for n in self.expand() {
-                mask |= n.mask(); // Recursively call mask
-            }
-            mask
+            // It's a single type in the sequential range: one dedicated bit.
+            return 1u64 << (value - 1);
         }
+
+        // Everything past the sequential range is either a compound "All" type
+        // or an internal leaf event. Compound types expand into their component
+        // single types; internal leaf events (e.g. multipart upload
+        // create/abort, batch delete) are placed after the compound range and
+        // expand to themselves. Recursing on a self-expanding leaf would loop
+        // forever (backlog#965), so give each such leaf its own dedicated bit
+        // derived from its discriminant. These bits sit above the single-type
+        // bits, so they never collide with each other or with any "All" mask.
+        let expanded = self.expand();
+        if matches!(expanded.as_slice(), [only] if *only == *self) {
+            return 1u64 << (value - 1);
+        }
+
+        // It's a compound type: OR together its component masks.
+        let mut mask = 0u64;
+        for n in expanded {
+            mask |= n.mask();
+        }
+        mask
     }
 }
 
@@ -479,5 +492,104 @@ mod tests {
         let parsed = EventName::try_from_event_str("s3:ObjectCreated:Put").unwrap();
         assert_eq!(parsed, EventName::ObjectCreatedPut);
         assert!(EventName::try_from_event_str("s3:Invalid").is_err());
+    }
+
+    /// Every `EventName` variant in declaration order. Kept exhaustive so the
+    /// `mask()` regressions below cover single, compound, and internal events.
+    const ALL_EVENT_NAMES: &[EventName] = &[
+        EventName::ObjectAccessedGet,
+        EventName::ObjectAccessedGetRetention,
+        EventName::ObjectAccessedGetLegalHold,
+        EventName::ObjectAccessedHead,
+        EventName::ObjectAccessedAttributes,
+        EventName::ObjectCreatedCompleteMultipartUpload,
+        EventName::ObjectCreatedCopy,
+        EventName::ObjectCreatedPost,
+        EventName::ObjectCreatedPut,
+        EventName::ObjectCreatedPutRetention,
+        EventName::ObjectCreatedPutLegalHold,
+        EventName::ObjectTaggingPut,
+        EventName::ObjectTaggingDelete,
+        EventName::ObjectRemovedDelete,
+        EventName::ObjectRemovedDeleteMarkerCreated,
+        EventName::ObjectRemovedDeleteAllVersions,
+        EventName::ObjectRemovedNoOP,
+        EventName::BucketCreated,
+        EventName::BucketRemoved,
+        EventName::ObjectReplicationFailed,
+        EventName::ObjectReplicationComplete,
+        EventName::ObjectReplicationMissedThreshold,
+        EventName::ObjectReplicationReplicatedAfterThreshold,
+        EventName::ObjectReplicationNotTracked,
+        EventName::ObjectRestorePost,
+        EventName::ObjectRestoreCompleted,
+        EventName::ObjectTransitionFailed,
+        EventName::ObjectTransitionComplete,
+        EventName::ScannerManyVersions,
+        EventName::ScannerLargeVersions,
+        EventName::ScannerBigPrefix,
+        EventName::LifecycleDelMarkerExpirationDelete,
+        EventName::ObjectAclPut,
+        EventName::LifecycleExpirationDelete,
+        EventName::LifecycleExpirationDeleteMarkerCreated,
+        EventName::LifecycleTransition,
+        EventName::IntelligentTiering,
+        EventName::ObjectAccessedAll,
+        EventName::ObjectCreatedAll,
+        EventName::ObjectRemovedAll,
+        EventName::ObjectReplicationAll,
+        EventName::ObjectRestoreAll,
+        EventName::ObjectTaggingAll,
+        EventName::LifecycleExpirationAll,
+        EventName::ObjectTransitionAll,
+        EventName::ObjectScannerAll,
+        EventName::Everything,
+        EventName::ObjectRemovedAbortMultipartUpload,
+        EventName::ObjectCreatedCreateMultipartUpload,
+        EventName::ObjectRemovedDeleteObjects,
+    ];
+
+    /// Regression for backlog#965: `mask()` used to recurse forever for the
+    /// three internal leaf events, overflowing the stack. Every variant must
+    /// now return a finite, non-panicking mask.
+    #[test]
+    fn test_mask_never_recurses_for_any_variant() {
+        for ev in ALL_EVENT_NAMES {
+            // Must terminate (no infinite recursion / stack overflow).
+            let _ = ev.mask();
+        }
+    }
+
+    /// The three internal events (backlog#965) must each carry a non-zero mask
+    /// that collides neither with each other nor with any S3-facing bit.
+    #[test]
+    fn test_internal_event_masks_are_nonzero_and_distinct() {
+        let internal = [
+            EventName::ObjectRemovedAbortMultipartUpload,
+            EventName::ObjectCreatedCreateMultipartUpload,
+            EventName::ObjectRemovedDeleteObjects,
+        ];
+        let everything = EventName::Everything.mask();
+
+        let mut seen = 0u64;
+        for ev in internal {
+            let m = ev.mask();
+            assert_ne!(m, 0, "internal event {ev} must have a non-zero mask");
+            assert_eq!(seen & m, 0, "internal event {ev} mask overlaps another internal event");
+            assert_eq!(everything & m, 0, "internal event {ev} mask collides with a single-type bit");
+            seen |= m;
+        }
+    }
+
+    /// `Everything` must cover every sequential single-type bit.
+    #[test]
+    fn test_everything_mask_covers_all_single_types() {
+        let everything = EventName::Everything.mask();
+        for ev in ALL_EVENT_NAMES {
+            let value = *ev as u32;
+            if value > 0 && value <= LAST_SINGLE_TYPE_VALUE {
+                assert_eq!(everything & ev.mask(), ev.mask(), "Everything mask should cover {ev}");
+            }
+        }
     }
 }
