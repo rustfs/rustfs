@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_api::bucket::{
     metadata::{
@@ -38,6 +39,7 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
+use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
@@ -833,6 +835,7 @@ impl Operation for ImportBucketMetadata {
         // field and saves it, preserving any configs not present in the import archive.
         for (bucket_name, metadata) in &bucket_metadatas {
             for (config_file, data) in imported_configs_to_persist(metadata) {
+                let site_replication_item = imported_config_to_site_replication_item(bucket_name, metadata, config_file, &data)?;
                 if let Err(e) = metadata_sys::update(bucket_name, config_file, data).await {
                     warn!(
                         event = EVENT_ADMIN_BUCKET_META_STATE,
@@ -850,10 +853,23 @@ impl Operation for ImportBucketMetadata {
                         "failed to persist imported bucket metadata for {bucket_name}/{config_file}: {e}"
                     ));
                 }
+                if let Some(item) = site_replication_item
+                    && let Err(err) = site_replication_bucket_meta_hook(item).await
+                {
+                    warn!(
+                        event = EVENT_ADMIN_BUCKET_META_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                        action = "import_bucket_metadata",
+                        result = "site_replication_notify_failed",
+                        bucket = %bucket_name,
+                        config_name = %config_file,
+                        error = %err,
+                        "admin bucket meta state"
+                    );
+                }
             }
         }
-
-        // TODO: site replication notify
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
@@ -887,6 +903,80 @@ fn imported_configs_to_persist(metadata: &BucketMetadata) -> Vec<(&'static str, 
         .collect()
 }
 
+fn imported_config_to_site_replication_item(
+    bucket_name: &str,
+    metadata: &BucketMetadata,
+    config_file: &str,
+    data: &[u8],
+) -> S3Result<Option<SRBucketMeta>> {
+    let mut item = match config_file {
+        BUCKET_POLICY_CONFIG => site_replication_bucket_meta_item(bucket_name, "policy", metadata.policy_config_updated_at),
+        BUCKET_LIFECYCLE_CONFIG => {
+            site_replication_bucket_meta_item(bucket_name, "lc-config", metadata.lifecycle_config_updated_at)
+        }
+        BUCKET_SSECONFIG => site_replication_bucket_meta_item(bucket_name, "sse-config", metadata.encryption_config_updated_at),
+        BUCKET_TAGGING_CONFIG => site_replication_bucket_meta_item(bucket_name, "tags", metadata.tagging_config_updated_at),
+        BUCKET_QUOTA_CONFIG_FILE => {
+            site_replication_bucket_meta_item(bucket_name, "quota-config", metadata.quota_config_updated_at)
+        }
+        OBJECT_LOCK_CONFIG => {
+            site_replication_bucket_meta_item(bucket_name, "object-lock-config", metadata.object_lock_config_updated_at)
+        }
+        BUCKET_VERSIONING_CONFIG => {
+            site_replication_bucket_meta_item(bucket_name, "version-config", metadata.versioning_config_updated_at)
+        }
+        BUCKET_REPLICATION_CONFIG => {
+            site_replication_bucket_meta_item(bucket_name, "replication-config", metadata.replication_config_updated_at)
+        }
+        _ => return Ok(None),
+    };
+
+    match config_file {
+        BUCKET_POLICY_CONFIG => {
+            item.policy =
+                Some(serde_json::from_slice(data).map_err(|e| {
+                    s3_error!(InternalError, "failed to encode imported bucket policy for site replication: {e}")
+                })?);
+        }
+        BUCKET_LIFECYCLE_CONFIG => {
+            set_imported_config_string(&mut item.expiry_lc_config, config_file, data)?;
+            item.expiry_updated_at = item.updated_at;
+        }
+        BUCKET_SSECONFIG => set_imported_config_string(&mut item.sse_config, config_file, data)?,
+        BUCKET_TAGGING_CONFIG => set_imported_config_string(&mut item.tags, config_file, data)?,
+        BUCKET_QUOTA_CONFIG_FILE => {
+            item.quota = Some(
+                serde_json::from_slice(data)
+                    .map_err(|e| s3_error!(InternalError, "failed to encode imported bucket quota for site replication: {e}"))?,
+            );
+        }
+        OBJECT_LOCK_CONFIG => set_imported_config_string(&mut item.object_lock_config, config_file, data)?,
+        BUCKET_VERSIONING_CONFIG => set_imported_config_string(&mut item.versioning, config_file, data)?,
+        BUCKET_REPLICATION_CONFIG => set_imported_config_string(&mut item.replication_config, config_file, data)?,
+        _ => unreachable!(),
+    }
+
+    Ok(Some(item))
+}
+
+fn site_replication_bucket_meta_item(bucket_name: &str, item_type: &str, updated_at: OffsetDateTime) -> SRBucketMeta {
+    SRBucketMeta {
+        bucket: bucket_name.to_string(),
+        r#type: item_type.to_string(),
+        updated_at: Some(updated_at),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    }
+}
+
+fn set_imported_config_string(target: &mut Option<String>, config_file: &str, data: &[u8]) -> S3Result<()> {
+    *target = Some(
+        String::from_utf8(data.to_vec())
+            .map_err(|e| s3_error!(InternalError, "imported bucket metadata {config_file} is not valid UTF-8: {e}"))?,
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod import_persist_tests {
     use super::*;
@@ -918,5 +1008,65 @@ mod import_persist_tests {
         // never overwrites existing on-disk configs with empty payloads.
         let metadata = BucketMetadata::new("untouched-bucket");
         assert!(imported_configs_to_persist(&metadata).is_empty());
+    }
+
+    #[test]
+    fn imported_configs_are_scheduled_for_site_replication() {
+        let updated_at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(42);
+        let mut metadata = BucketMetadata::new("restored-bucket");
+        metadata.policy_config_json = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        metadata.policy_config_updated_at = updated_at;
+        metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+        metadata.versioning_config_updated_at = updated_at;
+        metadata.lifecycle_config_xml = b"<LifecycleConfiguration></LifecycleConfiguration>".to_vec();
+        metadata.lifecycle_config_updated_at = updated_at;
+        metadata.quota_config_json = br#"{"quota":1024}"#.to_vec();
+        metadata.quota_config_updated_at = updated_at;
+
+        let mut items = imported_configs_to_persist(&metadata)
+            .into_iter()
+            .filter_map(|(config_file, data)| {
+                imported_config_to_site_replication_item("restored-bucket", &metadata, config_file, &data)
+                    .expect("site replication item should encode")
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.r#type.cmp(&right.r#type));
+
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().all(|item| item.bucket == "restored-bucket"));
+        assert!(items.iter().all(|item| item.updated_at == Some(updated_at)));
+        assert!(
+            items
+                .iter()
+                .all(|item| item.api_version.as_deref() == Some(SITE_REPL_API_VERSION))
+        );
+        assert!(items.iter().any(|item| item.r#type == "policy" && item.policy.is_some()));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.r#type == "version-config" && item.versioning.is_some())
+        );
+        assert!(items.iter().any(|item| {
+            item.r#type == "lc-config" && item.expiry_lc_config.is_some() && item.expiry_updated_at == Some(updated_at)
+        }));
+        assert!(items.iter().any(|item| item.r#type == "quota-config" && item.quota.is_some()));
+    }
+
+    #[test]
+    fn unsupported_imported_configs_are_not_site_replicated() {
+        let mut metadata = BucketMetadata::new("restored-bucket");
+        metadata.notification_config_xml = b"<NotificationConfiguration></NotificationConfiguration>".to_vec();
+        metadata.bucket_targets_config_json = b"[]".to_vec();
+
+        let has_site_replication_item = imported_configs_to_persist(&metadata)
+            .into_iter()
+            .filter_map(|(config_file, data)| {
+                imported_config_to_site_replication_item("restored-bucket", &metadata, config_file, &data)
+                    .expect("unsupported configs should be skipped")
+            })
+            .next()
+            .is_some();
+
+        assert!(!has_site_replication_item);
     }
 }
