@@ -37,6 +37,7 @@ pub fn run_process() {
             // Tracing may not be initialized when startup fails this early.
             emit_fatal_stderr("Server runtime failed", e);
         }
+        let _ = crate::startup_runtime_sources::shutdown_observability_guard();
         std::process::exit(1);
     }
 }
@@ -59,6 +60,7 @@ async fn async_main() -> Result<()> {
         Ok(result) => result,
         Err(e) => {
             emit_fatal_stderr("Command parse failed", e);
+            let _ = crate::startup_runtime_sources::shutdown_observability_guard();
             std::process::exit(1);
         }
     };

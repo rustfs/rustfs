@@ -213,14 +213,14 @@ pub(super) fn init_local_logging(
         match init_file_logging_internal(config, log_directory, logger_level, is_production) {
             Ok(guard) => Ok(guard),
             Err(error) if should_fallback_to_stdout(&error) => {
-                let guard = init_stdout_only(config, logger_level, is_production);
+                let guard = init_stdout_only(config, logger_level, is_production)?;
                 emit_file_logging_fallback_warning(log_directory, &error);
                 Ok(guard)
             }
             Err(error) => Err(error),
         }
     } else {
-        Ok(init_stdout_only(config, logger_level, is_production))
+        init_stdout_only(config, logger_level, is_production)
     }
 }
 
@@ -236,7 +236,7 @@ pub(super) fn init_local_logging(
 /// * `_config` - Unused at the moment; reserved for future configuration.
 /// * `logger_level` - Effective log level string.
 /// * `is_production` - Controls span event verbosity.
-fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
+fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> Result<OtelGuard, TelemetryError> {
     let env_filter = build_env_filter(logger_level, None);
     let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
     let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
@@ -249,7 +249,8 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         .with(env_filter)
         .with(ErrorLayer::default())
         .with(fmt_layer)
-        .init();
+        .try_init()
+        .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     set_observability_metric_enabled(false);
     counter!("rustfs_start_total").increment(1);
@@ -266,7 +267,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         "local logging state"
     );
 
-    OtelGuard {
+    Ok(OtelGuard {
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
@@ -274,7 +275,7 @@ fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: boo
         tracing_guard: Some(guard),
         stdout_guard: None,
         cleanup_handle: None,
-    }
+    })
 }
 
 // ─── File-rolling ─────────────────────────────────────────────────────────────
@@ -359,7 +360,8 @@ fn init_file_logging_internal(
         .with(ErrorLayer::default())
         .with(file_layer)
         .with(stdout_layer)
-        .init();
+        .try_init()
+        .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     set_observability_metric_enabled(false);
 

@@ -66,6 +66,10 @@ pub(crate) fn set_observability_guard(guard: OtelGuard) -> Result<(), Observabil
     rustfs_obs::set_global_guard(guard)
 }
 
+pub(crate) fn shutdown_observability_guard() -> Result<(), ObservabilityError> {
+    rustfs_obs::shutdown_global_guard()
+}
+
 pub(crate) fn observability_metric_enabled() -> bool {
     rustfs_obs::observability_metric_enabled()
 }
