@@ -199,6 +199,7 @@ pub(super) fn scan_log_directory(
         let info = FileInfo {
             path,
             size: file_size,
+            projected_freed_bytes: file_size,
             modified,
         };
 

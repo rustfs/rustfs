@@ -80,7 +80,7 @@ const LEGACY_ENV_OBS_PROFILING_ENABLED: &str = "RUSTFS_OBS_PROFILING_ENABLED";
 /// - All fields are `Option<T>` to allow partial configuration via environment
 ///   variables with sensible defaults provided by constants in `rustfs-config`.
 /// - `log_keep_files` is used to derive the rolling-appender's upper bound on
-///   retained files (if enabled) and to set the cleaner's minimum retention count.
+///   retained files (if enabled) and to set the cleaner's retained-file ceiling.
 ///
 /// # Example
 /// ```no_run

@@ -403,7 +403,7 @@ fn parse_metrics_interval(primary_env: &str, legacy_env: &str, default_interval:
 
 fn parse_system_metrics_interval() -> Duration {
     get_env_opt_u64(ENV_SYSTEM_METRICS_INTERVAL)
-        .or_else(|| get_env_opt_u64(LEGACY_SYSTEM_METRICS_INTERVAL).map(|ms| ms / 1000))
+        .or_else(|| get_env_opt_u64(LEGACY_SYSTEM_METRICS_INTERVAL).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) }))
         .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
         .filter(|&v| v > 0)
         .map(Duration::from_secs)
@@ -1280,6 +1280,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut next_resource_run = now;
         let mut next_system_run = now;
 
+        host_system.refresh_cpu_all();
+        tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+        host_system.refresh_cpu_all();
+
         #[cfg(feature = "gpu")]
         let current_pid = match sysinfo::get_current_pid() {
             Ok(pid) => Some(pid),
@@ -1799,5 +1803,33 @@ mod tests {
 
         expire_series_zero_tombstones(&mut zero_tombstones);
         assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn parse_system_metrics_interval_rounds_legacy_millis_up_to_one_second() {
+        temp_env::with_vars(
+            [
+                (ENV_SYSTEM_METRICS_INTERVAL, None::<&str>),
+                (LEGACY_SYSTEM_METRICS_INTERVAL, Some("500")),
+                (ENV_DEFAULT_METRICS_INTERVAL, None::<&str>),
+            ],
+            || {
+                assert_eq!(parse_system_metrics_interval(), Duration::from_secs(1));
+            },
+        );
+    }
+
+    #[test]
+    fn parse_system_metrics_interval_rounds_legacy_millis_up() {
+        temp_env::with_vars(
+            [
+                (ENV_SYSTEM_METRICS_INTERVAL, None::<&str>),
+                (LEGACY_SYSTEM_METRICS_INTERVAL, Some("1500")),
+                (ENV_DEFAULT_METRICS_INTERVAL, None::<&str>),
+            ],
+            || {
+                assert_eq!(parse_system_metrics_interval(), Duration::from_secs(2));
+            },
+        );
     }
 }

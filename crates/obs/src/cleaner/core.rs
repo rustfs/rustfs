@@ -69,7 +69,7 @@ pub struct LogCleaner {
     pub(super) active_filename: String,
     /// Whether `file_pattern` is interpreted as a prefix or suffix.
     pub(super) match_mode: FileMatchMode,
-    /// Minimum number of regular log files to keep regardless of size.
+    /// Maximum number of newest regular log files to keep.
     pub(super) keep_files: usize,
     /// Optional cap for the cumulative size of regular logs.
     pub(super) max_total_size_bytes: u64,
@@ -205,8 +205,8 @@ impl LogCleaner {
     /// Choose regular log files that should be compressed and/or deleted.
     ///
     /// The `files` slice must already be sorted from oldest to newest. The
-    /// method first preserves the newest `keep_files` generations, then applies
-    /// total-size and per-file-size limits to the remaining tail.
+    /// method first enforces the `keep_files` ceiling, then applies total-size
+    /// and per-file-size limits to the remaining tail.
     pub(super) fn select_files_to_process(&self, files: &[FileInfo], total_size: u64) -> Vec<FileInfo> {
         let mut to_delete = Vec::new();
         if files.is_empty() {
@@ -325,8 +325,6 @@ impl LogCleaner {
                         } else {
                             match injector.steal_batch_and_pop(&local_worker) {
                                 Steal::Success(file) => {
-                                    attempts.fetch_add(1, Ordering::Relaxed);
-                                    successes.fetch_add(1, Ordering::Relaxed);
                                     Some(file)
                                 }
                                 Steal::Retry => continue,
@@ -357,6 +355,7 @@ impl LogCleaner {
                             continue;
                         };
 
+                        let mut file = file;
                         let compressed = match compress_file(&file.path, &options) {
                             Ok(output) => {
                                 debug!(
@@ -371,6 +370,7 @@ impl LogCleaner {
                                     state = "parallel_compression_done",
                                     "log cleaner state changed"
                                 );
+                                file.projected_freed_bytes = output.input_bytes.saturating_sub(output.output_bytes);
                                 true
                             }
                             Err(err) => {
@@ -508,7 +508,9 @@ impl LogCleaner {
                             state = "serial_compression_done",
                             "log cleaner state changed"
                         );
-                        deletable.push(file.clone());
+                        let mut file = file.clone();
+                        file.projected_freed_bytes = output.input_bytes.saturating_sub(output.output_bytes);
+                        deletable.push(file);
                     }
                     Err(err) => {
                         warn!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?file.path, error = %err, result = "serial_compression_failed", "log cleaner state changed");
@@ -585,15 +587,15 @@ impl LogCleaner {
             if self.dry_run {
                 info!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_delete", file = ?f.path, bytes = f.size, "log cleaner state changed");
                 deleted += 1;
-                freed += f.size;
+                freed += f.projected_freed_bytes;
                 continue;
             }
 
             match self.secure_delete(&f.path) {
                 Ok(()) => {
                     deleted += 1;
-                    freed += f.size;
-                    debug!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "deleted", file = ?f.path, bytes = f.size, "log cleaner state changed");
+                    freed += f.projected_freed_bytes;
+                    debug!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "deleted", file = ?f.path, bytes = f.size, projected_freed_bytes = f.projected_freed_bytes, "log cleaner state changed");
                 }
                 Err(e) => {
                     error!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, result = "delete_failed", file = ?f.path, error = %e, "log cleaner state changed");
@@ -665,7 +667,7 @@ impl LogCleanerBuilder {
         self
     }
 
-    /// Preserve at least this many newest regular log files.
+    /// Keep at most this many newest regular log files.
     pub fn keep_files(mut self, keep_files: usize) -> Self {
         self.keep_files = keep_files;
         self

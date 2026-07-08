@@ -125,7 +125,17 @@ fn legacy_profiling_env_keys_present() -> Vec<&'static str> {
 }
 
 fn target_env() -> &'static str {
-    option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown")
+    if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "msvc") {
+        "msvc"
+    } else if cfg!(target_env = "sgx") {
+        "sgx"
+    } else {
+        "unknown"
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +155,11 @@ mod tests {
                 assert!(keys.contains(&ENV_OUTPUT_DIR));
             },
         );
+    }
+
+    #[test]
+    fn target_env_reports_known_compile_target_or_unknown() {
+        let value = target_env();
+        assert!(matches!(value, "gnu" | "musl" | "msvc" | "sgx" | "unknown"));
     }
 }
