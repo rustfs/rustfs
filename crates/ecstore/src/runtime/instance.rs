@@ -48,6 +48,7 @@ use tokio::sync::RwLock;
 /// This is intentionally minimal in the first migration slice; subsequent
 /// slices move additional identity/runtime state (topology, disk registry,
 /// service handles, cancellation token) into this struct.
+#[derive(Debug)]
 pub struct InstanceContext {
     /// The deployment's erasure setup type.
     ///
