@@ -63,6 +63,7 @@ pub fn collect_notification_target_metrics(stats: &[NotificationTargetStats]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::schema::MetricType;
 
     #[test]
     fn test_collect_notification_target_metrics() {
@@ -88,5 +89,12 @@ mod tests {
                     .iter()
                     .any(|(key, value)| *key == TARGET_TYPE && value == "webhook")
         }));
+    }
+
+    #[test]
+    fn notification_target_totals_are_exported_as_gauges() {
+        assert_eq!(NOTIFICATION_TARGET_FAILED_MESSAGES_MD.metric_type, MetricType::Gauge);
+        assert_eq!(NOTIFICATION_TARGET_QUEUE_LENGTH_MD.metric_type, MetricType::Gauge);
+        assert_eq!(NOTIFICATION_TARGET_TOTAL_MESSAGES_MD.metric_type, MetricType::Gauge);
     }
 }

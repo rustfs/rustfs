@@ -20,8 +20,8 @@ use time::OffsetDateTime;
 
 mod ecstore_bucket {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::{
-        bandwidth, bucket_target_sys, lifecycle, metadata, metadata_sys, quota, replication, target, utils, versioning,
-        versioning_sys,
+        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, quota, replication, target, utils,
+        versioning, versioning_sys,
     };
 }
 
@@ -209,6 +209,7 @@ pub(crate) mod metadata {
     pub(crate) const BUCKET_TAGGING_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_TAGGING_CONFIG;
     pub(crate) const BUCKET_TARGETS_FILE: &str = super::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
     pub(crate) const BUCKET_VERSIONING_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
+    pub(crate) const BUCKET_DURABILITY_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_DURABILITY_CONFIG;
     pub(crate) const OBJECT_LOCK_CONFIG: &str = super::ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
 
     pub(crate) type BucketMetadata = super::ecstore_bucket::metadata::BucketMetadata;
@@ -216,6 +217,10 @@ pub(crate) mod metadata {
     pub(crate) fn table_catalog_path_hash(value: &str) -> String {
         super::ecstore_bucket::metadata::table_catalog_path_hash(value)
     }
+}
+
+pub(crate) mod durability {
+    pub(crate) type BucketDurabilityConfig = super::ecstore_bucket::durability::BucketDurabilityConfig;
 }
 
 pub(crate) mod metadata_sys {
@@ -269,6 +274,12 @@ pub(crate) mod metadata_sys {
 
     pub(crate) async fn get_object_lock_config(bucket: &str) -> Result<(ObjectLockConfiguration, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
+    }
+
+    pub(crate) async fn get_durability_config(
+        bucket: &str,
+    ) -> Result<(Option<super::durability::BucketDurabilityConfig>, OffsetDateTime)> {
+        super::ecstore_bucket::metadata_sys::get_durability_config(bucket).await
     }
 
     pub(crate) async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
@@ -457,6 +468,7 @@ pub(crate) mod access {
 pub(crate) mod bucket {
     pub(crate) use super::bandwidth;
     pub(crate) use super::bucket_target_sys as target_sys;
+    pub(crate) use super::durability;
     #[cfg(test)]
     pub(crate) use super::lifecycle;
     pub(crate) use super::metadata;

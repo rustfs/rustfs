@@ -27,9 +27,11 @@ pub enum GlobalError {
     #[error("Failed to set a global recorder: {0}")]
     SetRecorder(#[from] metrics::SetRecorderError<crate::Recorder>),
     #[error("Failed to set global guard: {0}")]
-    SetError(#[from] SetError<Arc<Mutex<OtelGuard>>>),
+    SetError(#[from] SetError<Arc<Mutex<Option<OtelGuard>>>>),
     #[error("Global guard not initialized")]
     NotInitialized,
+    #[error("Global guard lock poisoned: {0}")]
+    GuardPoisoned(&'static str),
     #[error("Global system metrics err: {0}")]
     MetricsError(String),
     #[error("Failed to get current PID: {0}")]
