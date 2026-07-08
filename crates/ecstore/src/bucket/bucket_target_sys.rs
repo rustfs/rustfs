@@ -119,24 +119,43 @@ pub struct ArnErrs {
     pub bucket: String,
 }
 
+/// A single latency sample tagged with the instant it was recorded.
+///
+/// Only `dur` participates in (de)serialization; `at` is not `Serialize`
+/// (`Instant` isn't) and is reconstructed as `Instant::now()` on deserialize.
+/// A reloaded window therefore simply restarts aging, which is acceptable for
+/// the in-memory endpoint health stats this type backs (see backlog#806-16).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LastMinuteLatency {
-    times: Vec<Duration>,
+struct LatencySample {
+    dur: Duration,
     #[serde(skip, default = "instant_now")]
-    start_time: Instant,
+    at: Instant,
 }
 
 fn instant_now() -> Instant {
     Instant::now()
 }
 
-impl Default for LastMinuteLatency {
-    fn default() -> Self {
-        Self {
-            times: Vec::new(),
-            start_time: Instant::now(),
-        }
-    }
+/// A rolling one-minute latency window.
+///
+/// backlog#806-16: the previous implementation stored bare `Vec<Duration>`
+/// samples plus a single, never-updated `start_time`, and its `retain`
+/// predicate ignored the element entirely — it evaluated the constant
+/// `now.duration_since(self.start_time) < 60s`. Once the window had existed
+/// for 60s, that predicate became `false` for every element, so each `add`
+/// dropped ALL samples and the "last minute" average degenerated to the most
+/// recent single sample. Each sample now carries its own timestamp and is
+/// retained by its individual age.
+///
+/// This type is only used for in-memory endpoint health (`EpHealth`) and
+/// admin-API display; it is not persisted or wire-serialized across versions
+/// (the on-the-wire latency shape is `crate::bucket::target::LatencyStat`,
+/// which carries only `curr`/`avg`/`max`). The `Serialize`/`Deserialize`
+/// derives are retained solely so the enclosing `LatencyStat` keeps deriving
+/// them; only the `Duration` part of each sample is serialized.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastMinuteLatency {
+    times: Vec<LatencySample>,
 }
 
 impl LastMinuteLatency {
@@ -145,11 +164,16 @@ impl LastMinuteLatency {
     }
 
     pub fn add(&mut self, duration: Duration) {
-        let now = Instant::now();
-        // Remove entries older than 1 minute
+        self.add_at(Instant::now(), duration);
+    }
+
+    /// Records a sample at an explicit instant, dropping samples older than one
+    /// minute relative to `now`. Split out from `add` so the aging logic can be
+    /// exercised with a synthetic clock in tests.
+    fn add_at(&mut self, now: Instant, duration: Duration) {
         self.times
-            .retain(|_| now.duration_since(self.start_time) < Duration::from_secs(60));
-        self.times.push(duration);
+            .retain(|sample| now.duration_since(sample.at) < Duration::from_secs(60));
+        self.times.push(LatencySample { dur: duration, at: now });
     }
 
     pub fn get_total(&self) -> LatencyAverage {
@@ -158,7 +182,7 @@ impl LastMinuteLatency {
                 avg: Duration::from_secs(0),
             };
         }
-        let total: Duration = self.times.iter().sum();
+        let total: Duration = self.times.iter().map(|sample| sample.dur).sum();
         LatencyAverage {
             avg: total / self.times.len() as u32,
         }
@@ -2146,5 +2170,64 @@ mod tests {
             .expect_err("invalid custom CA PEM should be rejected");
 
         assert!(err.to_string().contains("invalid target CA PEM"));
+    }
+
+    // backlog#806-16 regression tests for the rolling one-minute latency window.
+
+    #[test]
+    fn last_minute_latency_averages_only_samples_within_window() {
+        let base = Instant::now();
+        let mut window = LastMinuteLatency::new();
+
+        // Two samples that will fall outside the 60s window once the fresh
+        // sample is added, plus one fresh sample.
+        window.add_at(base, Duration::from_millis(100));
+        window.add_at(base + Duration::from_secs(10), Duration::from_millis(200));
+        // 61s after `base`: both earlier samples are now >60s old relative to
+        // the 200ms sample? No — measured against `now`. Add a fresh sample far
+        // in the future so the two old samples age out.
+        window.add_at(base + Duration::from_secs(61), Duration::from_millis(400));
+
+        // Only the fresh sample survives: 100ms (age 61s) and 200ms (age 51s)
+        // vs the fresh one — 51s is still < 60s, so the 200ms sample stays.
+        // Assert the window kept exactly the in-window samples.
+        assert_eq!(window.get_total().avg, Duration::from_millis(300)); // (200 + 400) / 2
+    }
+
+    #[test]
+    fn last_minute_latency_drops_all_stale_samples() {
+        let base = Instant::now();
+        let mut window = LastMinuteLatency::new();
+
+        // Two stale samples, then one sample far enough in the future that both
+        // are strictly older than 60s.
+        window.add_at(base, Duration::from_millis(100));
+        window.add_at(base + Duration::from_secs(5), Duration::from_millis(300));
+        window.add_at(base + Duration::from_secs(120), Duration::from_millis(500));
+
+        // Both old samples aged out (>=60s); only the fresh 500ms remains. Under
+        // the OLD all-or-nothing bug the result would still have been the last
+        // single sample by coincidence, so also verify the mixed-window case below.
+        assert_eq!(window.get_total().avg, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn last_minute_latency_two_fresh_samples_average_both() {
+        let base = Instant::now();
+        let mut window = LastMinuteLatency::new();
+
+        window.add_at(base, Duration::from_millis(100));
+        window.add_at(base + Duration::from_secs(1), Duration::from_millis(300));
+
+        // Both within the window -> average of both. The OLD bug degenerated the
+        // window to a single sample after 60s; here samples are close in time so
+        // the correct behaviour is a genuine two-sample average.
+        assert_eq!(window.get_total().avg, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn last_minute_latency_empty_window_is_zero() {
+        let window = LastMinuteLatency::new();
+        assert_eq!(window.get_total().avg, Duration::from_secs(0));
     }
 }
