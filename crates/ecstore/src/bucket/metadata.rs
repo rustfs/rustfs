@@ -689,6 +689,7 @@ impl BucketMetadata {
             }
             BUCKET_LIFECYCLE_CONFIG => {
                 self.lifecycle_config_xml = data;
+                self.lifecycle_config = None;
                 self.lifecycle_config_updated_at = updated;
             }
             BUCKET_SSECONFIG => {
@@ -1238,6 +1239,23 @@ mod test {
         assert_eq!(bucket_targets.targets.len(), 1);
         assert_eq!(bucket_targets.targets[0].endpoint, "s3.amazonaws.com");
         assert_eq!(bucket_targets.targets[0].target_bucket, "target-bucket");
+    }
+
+    #[test]
+    fn lifecycle_update_config_clears_parsed_config_on_delete() {
+        let mut bm = BucketMetadata::new("test-bucket");
+        let lifecycle_xml = br#"<LifecycleConfiguration><Rule><ID>rule1</ID><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"#;
+
+        bm.update_config(BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.to_vec())
+            .expect("lifecycle config should update");
+        bm.parse_all_configs().expect("lifecycle config should parse");
+        assert!(bm.lifecycle_config.is_some());
+
+        bm.update_config(BUCKET_LIFECYCLE_CONFIG, Vec::new())
+            .expect("lifecycle config delete should update metadata");
+
+        assert!(bm.lifecycle_config_xml.is_empty());
+        assert!(bm.lifecycle_config.is_none());
     }
 
     #[tokio::test]
