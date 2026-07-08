@@ -40,6 +40,7 @@
 //! single-instance behavior is byte-for-byte unchanged.
 
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
+use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
 use std::sync::{Arc, OnceLock};
@@ -51,7 +52,6 @@ use uuid::Uuid;
 /// This is intentionally minimal in the first migration slice; subsequent
 /// slices move additional identity/runtime state (topology, disk registry,
 /// service handles, cancellation token) into this struct.
-#[derive(Debug)]
 pub struct InstanceContext {
     /// The deployment's erasure setup type.
     ///
@@ -83,6 +83,13 @@ pub struct InstanceContext {
     /// Write-once: storage startup publishes the server pools exactly once.
     /// Replaces the process-global endpoints static.
     endpoints: OnceLock<EndpointServerPools>,
+    /// This instance's tier configuration manager (Phase 5 Slice 7, backlog#939).
+    ///
+    /// Lazily materialized on first access so `InstanceContext::new()` stays
+    /// cheap: single-instance creates one shared manager on first use — exactly
+    /// the "create-once, then share" semantics of the eager process static it
+    /// replaces — while a genuinely independent instance gets its own.
+    tier_config_mgr: OnceLock<Arc<RwLock<TierConfigMgr>>>,
 }
 
 impl InstanceContext {
@@ -105,6 +112,7 @@ impl InstanceContext {
             region: OnceLock::new(),
             deployment_id: OnceLock::new(),
             endpoints: OnceLock::new(),
+            tier_config_mgr: OnceLock::new(),
         }
     }
 
@@ -158,6 +166,12 @@ impl InstanceContext {
         self.endpoints.get().cloned()
     }
 
+    /// This instance's tier configuration manager, materializing it on first
+    /// access. Shared for the lifetime of the instance.
+    pub fn tier_config_mgr(&self) -> Arc<RwLock<TierConfigMgr>> {
+        self.tier_config_mgr.get_or_init(TierConfigMgr::new).clone()
+    }
+
     /// Update this instance's erasure setup type.
     pub async fn update_erasure_type(&self, setup_type: SetupType) {
         *self.erasure_kind.write().await = setup_type;
@@ -187,6 +201,20 @@ impl InstanceContext {
 impl Default for InstanceContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// Manual Debug: service handles (e.g. the tier config manager) are not Debug,
+// so summarize their materialization state rather than their contents.
+impl std::fmt::Debug for InstanceContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceContext")
+            .field("erasure_kind", &self.erasure_kind)
+            .field("region", &self.region)
+            .field("deployment_id", &self.deployment_id)
+            .field("endpoints", &self.endpoints)
+            .field("tier_config_mgr_set", &self.tier_config_mgr.get().is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -402,5 +430,28 @@ mod tests {
         let ctx = InstanceContext::new();
         ctx.set_endpoints(endpoints_with_pools(1));
         ctx.set_endpoints(endpoints_with_pools(2));
+    }
+
+    // The tier config manager is materialized once and shared for the
+    // instance's lifetime — the "create-once, then share" contract of the
+    // eager process static it replaced.
+    #[tokio::test]
+    async fn tier_config_mgr_is_stable_within_an_instance() {
+        let ctx = InstanceContext::new();
+        assert!(
+            Arc::ptr_eq(&ctx.tier_config_mgr(), &ctx.tier_config_mgr()),
+            "repeated access must return the same manager"
+        );
+    }
+
+    // Two contexts own distinct tier config managers.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_tier_config_mgr() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        assert!(
+            !Arc::ptr_eq(&ctx_a.tier_config_mgr(), &ctx_b.tier_config_mgr()),
+            "fresh contexts must not share a tier config manager"
+        );
     }
 }
