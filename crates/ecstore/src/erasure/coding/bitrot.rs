@@ -27,8 +27,10 @@ pin_project! {
         inner: R,
         hash_algo: HashAlgorithm,
         shard_size: usize,
+        // Scratch buffer reused across reads. On the hashed path it holds the
+        // contiguous on-disk `[hash][data]` block so both are pulled in a single
+        // pass; grown lazily and never shrunk.
         buf: Vec<u8>,
-        hash_buf: Vec<u8>,
         skip_verify: bool,
         last_verify_duration: Duration,
         id: Uuid,
@@ -41,13 +43,11 @@ where
 {
     /// Create a new BitrotReader.
     pub fn new(inner: R, shard_size: usize, algo: HashAlgorithm, skip_verify: bool) -> Self {
-        let hash_size = algo.size();
         Self {
             inner,
             hash_algo: algo,
             shard_size,
             buf: Vec::new(),
-            hash_buf: vec![0u8; hash_size],
             skip_verify,
             last_verify_duration: Duration::ZERO,
             id: Uuid::new_v4(),
@@ -71,53 +71,76 @@ where
         }
 
         let hash_size = self.hash_algo.size();
-        // Read hash
 
-        if hash_size > 0 {
-            self.inner.read_exact(&mut self.hash_buf).await.map_err(|e| {
-                error!("bitrot reader read hash error: {}", e);
-                e
-            })?;
+        // No-hash path: pull the shard straight into the caller's buffer with no
+        // intermediate copy. There is no leading hash to co-locate, so a combined
+        // buffer would only add a memcpy.
+        if hash_size == 0 {
+            let data_len = fill(&mut self.inner, out).await?;
+            return self.finish_len(data_len, out.len());
         }
 
-        // Read data
-        let mut data_len = 0;
-        while data_len < out.len() {
-            let n = self.inner.read(&mut out[data_len..]).await.map_err(|e| {
-                error!("bitrot reader read data error: {}", e);
-                e
-            })?;
-            if n == 0 {
-                break;
-            }
-            data_len += n;
+        // Hashed path: the on-disk block is a contiguous `[hash][data]` run, so
+        // read both in a single pass into the scratch buffer instead of one
+        // dispatch for the 32-byte hash and another for the shard. On the
+        // streaming disk reader (a raw tokio File whose every `read` is a
+        // spawn_blocking round-trip) this halves the per-block dispatch count;
+        // on an in-memory Cursor (inline/mmap) it is a plain slice copy. The
+        // trailing `out.copy_from_slice` is the only added cost versus the old
+        // two-read path.
+        let need = hash_size + out.len();
+        if self.buf.len() < need {
+            self.buf.resize(need, 0);
         }
+        let filled = fill(&mut self.inner, &mut self.buf[..need]).await?;
 
-        // A short read (EOF before the caller-sized buffer is filled) means a
-        // truncated/incomplete shard. Return an error so the caller drops this
-        // reader from the stripe and reconstruction from parity engages, instead
-        // of silently returning fewer bytes and shifting every downstream byte
-        // (backlog#799 B2). This is deliberately BEFORE and independent of the
-        // bitrot hash check so it also fires under skip_verify /
-        // HashAlgorithm::None / parity=0, where there is no hash to catch it. The
-        // caller sizes `out` to exactly the expected shard length for the current
-        // stripe, so "buffer full" == "shard complete".
-        if data_len < out.len() {
-            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, data_len, out.len());
+        // A short read (EOF before the full `[hash][data]` block is in hand)
+        // means a truncated/incomplete shard — whether the hash itself or the
+        // data was cut. Return an error so the caller drops this reader from the
+        // stripe and reconstruction from parity engages, instead of silently
+        // returning fewer bytes and shifting every downstream byte (backlog#799
+        // B2). This fires BEFORE and independent of the bitrot hash check so it
+        // also catches truncation under skip_verify, where the hash comparison
+        // is skipped. The caller sizes `out` to exactly the expected shard
+        // length for the current stripe, so "block complete" == "shard complete".
+        if filled < need {
+            let got_data = filled.saturating_sub(hash_size);
+            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, got_data, out.len());
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("short shard read: got {data_len} of {} bytes", out.len()),
+                format!("short shard read: got {got_data} of {} bytes", out.len()),
             ));
         }
 
-        if hash_size > 0 && !self.skip_verify {
+        let (hash, data) = self.buf[..need].split_at(hash_size);
+        out.copy_from_slice(data);
+
+        if !self.skip_verify {
             let verify_start = std::time::Instant::now();
-            let actual_hash = self.hash_algo.hash_encode(&out[..data_len]);
+            let actual_hash = self.hash_algo.hash_encode(data);
             self.last_verify_duration = verify_start.elapsed();
-            if actual_hash.as_ref() != self.hash_buf.as_slice() {
-                error!("bitrot reader hash mismatch, id={} data_len={}, out_len={}", self.id, data_len, out.len());
+            if actual_hash.as_ref() != hash {
+                error!(
+                    "bitrot reader hash mismatch, id={} data_len={}, out_len={}",
+                    self.id,
+                    data.len(),
+                    out.len()
+                );
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
             }
+        }
+        Ok(out.len())
+    }
+
+    /// Map a completed no-hash read to the shared short-shard contract: a full
+    /// buffer returns its length, a short read is UnexpectedEof (backlog#799 B2).
+    fn finish_len(&self, data_len: usize, want: usize) -> std::io::Result<usize> {
+        if data_len < want {
+            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, data_len, want);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("short shard read: got {data_len} of {want} bytes"),
+            ));
         }
         Ok(data_len)
     }
@@ -198,6 +221,28 @@ where
         self.inner.flush().await?;
         self.inner.shutdown().await
     }
+}
+
+/// Read into `buf` until it is full or the reader hits EOF, returning the number
+/// of bytes actually read. A raw tokio File typically satisfies this in one
+/// `read` (one spawn_blocking round-trip); the loop only re-enters on a genuine
+/// partial read. Callers treat `filled < buf.len()` as a truncated shard.
+async fn fill<R>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..]).await.map_err(|e| {
+            error!("bitrot reader read error: {}", e);
+            e
+        })?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
 }
 
 async fn write_all_vectored<W>(writer: &mut W, hash: &[u8], data: &[u8]) -> std::io::Result<()>
@@ -701,5 +746,106 @@ mod tests {
         bitrot_writer.write(b"payload").await.unwrap();
 
         assert!(vectored_writes.load(Ordering::SeqCst) > 0);
+    }
+
+    /// A reader that hands back at most `chunk` bytes per `poll_read` and counts
+    /// how many times it is polled — a stand-in for the streaming disk File where
+    /// each poll is a spawn_blocking round-trip.
+    struct CountingReader {
+        data: std::io::Cursor<Vec<u8>>,
+        reads: Arc<AtomicUsize>,
+        chunk: usize,
+    }
+
+    impl tokio::io::AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let cap = buf.remaining().min(self.chunk);
+            if cap == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let mut scratch = vec![0u8; cap];
+            let n = std::io::Read::read(&mut self.data, &mut scratch).unwrap_or(0);
+            buf.put_slice(&scratch[..n]);
+            let _ = cx;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn encode_one_block(payload: &[u8], shard_size: usize, algo: HashAlgorithm) -> Vec<u8> {
+        let mut w = BitrotWriter::new(Cursor::new(Vec::<u8>::new()), shard_size, algo);
+        w.write(payload).await.unwrap();
+        w.into_inner().into_inner()
+    }
+
+    #[tokio::test]
+    async fn hashed_read_issues_a_single_dispatch_per_block() {
+        // The hashed path must pull the contiguous [hash][data] block in one
+        // read, not one dispatch for the 32-byte hash and another for the shard
+        // (backlog#933 item 2). With a reader large enough to satisfy the whole
+        // block in a single poll, exactly one poll_read per block is expected.
+        let shard_size = 64usize;
+        let payload = vec![9u8; shard_size];
+        let block = encode_one_block(&payload, shard_size, HashAlgorithm::HighwayHash256).await;
+        assert!(block.len() > shard_size, "block must carry a leading hash");
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            data: Cursor::new(block),
+            reads: reads.clone(),
+            chunk: usize::MAX,
+        };
+        let mut r = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256, false);
+        let mut out = vec![0u8; shard_size];
+        let n = r.read(&mut out).await.unwrap();
+
+        assert_eq!(n, shard_size);
+        assert_eq!(out, payload);
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "one contiguous read for hash+data");
+    }
+
+    #[tokio::test]
+    async fn hashed_read_reassembles_across_partial_reads() {
+        // When the underlying reader dribbles the block out a few bytes at a
+        // time, the fill loop must reassemble the full [hash][data] run before
+        // splitting — no byte shifting, hash still verifies.
+        let shard_size = 40usize;
+        let payload: Vec<u8> = (0..shard_size as u8).collect();
+        let block = encode_one_block(&payload, shard_size, HashAlgorithm::HighwayHash256).await;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            data: Cursor::new(block),
+            reads: reads.clone(),
+            chunk: 7, // force many partial reads
+        };
+        let mut r = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256, false);
+        let mut out = vec![0u8; shard_size];
+        let n = r.read(&mut out).await.unwrap();
+
+        assert_eq!(n, shard_size);
+        assert_eq!(out, payload);
+        assert!(reads.load(Ordering::SeqCst) > 1, "partial reads should loop");
+    }
+
+    #[tokio::test]
+    async fn hashed_read_truncated_within_hash_is_unexpected_eof() {
+        // Truncation that lands inside the leading hash (not the data) must still
+        // surface as UnexpectedEof, so the stripe drops this reader and rebuilds
+        // from parity instead of hanging or mis-splitting (backlog#799 B2).
+        let shard_size = 32usize;
+        let block = encode_one_block(&vec![3u8; shard_size], shard_size, HashAlgorithm::HighwayHash256).await;
+        let hash_size = HashAlgorithm::HighwayHash256.size();
+        // Keep only part of the hash; drop the rest of the block.
+        let truncated = block[..hash_size / 2].to_vec();
+
+        let mut r = BitrotReader::new(Cursor::new(truncated), shard_size, HashAlgorithm::HighwayHash256, false);
+        let mut out = vec![0u8; shard_size];
+        let err = r.read(&mut out).await.expect_err("truncated hash must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }
