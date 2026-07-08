@@ -2984,14 +2984,30 @@ impl LocalDisk {
 
         if let Some(err) = err {
             if err == Error::DiskFull {
+                // Out of space to stage the trash rename: fall back to an in-place
+                // remove and propagate any failure from that remove.
                 if recursive {
                     remove_all_std(delete_path).map_err(to_volume_error)?;
                 } else {
                     remove_std(delete_path).map_err(to_file_error)?;
                 }
+
+                return Ok(());
             }
 
-            return Ok(());
+            // A missing source is benign (the object is already gone). Both the
+            // recursive path (rename_all_ignore_missing_source) and the
+            // non-recursive NotFound arm above already fold that case into `None`,
+            // but keep the guard explicit so a genuine rename failure is never
+            // reported as success. Every other error is a real failure: propagate
+            // it (already mapped by to_file_error, e.g. I/O -> FaultyDisk,
+            // permission -> FileAccessDenied) so callers can surface a faulty disk
+            // and trigger heal, matching MinIO's deleteFile.
+            if err == Error::FileNotFound {
+                return Ok(());
+            }
+
+            return Err(err);
         }
 
         Ok(())
@@ -4551,7 +4567,15 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::FileAccessDenied);
             }
 
-            remove_std(&dst_file_path).map_err(to_file_error)?;
+            // Clear any stale destination before the directory rename. An absent
+            // destination is the normal case when renaming a directory to a new
+            // location, so tolerate NotFound instead of aborting the whole rename
+            // (MinIO's RenameFile ignores osIsNotExist here).
+            if let Err(e) = remove_std(&dst_file_path)
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(to_file_error(e).into());
+            }
         } else {
             let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
             if meta.is_dir() {
@@ -4656,7 +4680,15 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::FileAccessDenied);
             }
 
-            remove(&dst_file_path).await.map_err(to_file_error)?;
+            // Clear any stale destination before the directory rename. An absent
+            // destination is the normal case when renaming a directory to a new
+            // location, so tolerate NotFound instead of aborting the whole rename
+            // (MinIO's RenameFile ignores osIsNotExist here).
+            if let Err(e) = remove(&dst_file_path).await
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(to_file_error(e).into());
+            }
         }
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
@@ -5895,6 +5927,124 @@ mod test {
         match disk.make_volume(volume).await {
             Ok(()) | Err(DiskError::VolumeExists) => {}
             Err(err) => panic!("test volume should be available: {err:?}"),
+        }
+    }
+
+    /// Regression coverage for the disk-layer delete/rename fixes:
+    /// - move_to_trash must propagate real rename failures instead of silently
+    ///   reporting success (rustfs/backlog#948, ECA-07).
+    /// - the directory (trailing-slash) branch of rename_file/rename_part must
+    ///   tolerate a missing destination instead of aborting on NotFound
+    ///   (rustfs/backlog#960, ECA-19).
+    mod delete_and_rename_regressions {
+        use super::*;
+        use tempfile::tempdir;
+
+        async fn new_disk() -> (LocalDisk, tempfile::TempDir) {
+            let dir = tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            (disk, dir)
+        }
+
+        // #948: a genuinely missing source is benign and must still return Ok.
+        #[tokio::test]
+        async fn move_to_trash_missing_source_is_ok() {
+            let (disk, dir) = new_disk().await;
+            let missing = dir.path().join("bucket").join("does-not-exist");
+
+            disk.move_to_trash(&missing, true, false)
+                .await
+                .expect("missing source must be treated as benign");
+            disk.move_to_trash(&missing, false, false)
+                .await
+                .expect("missing source must be treated as benign (non-recursive)");
+        }
+
+        // #948: a real rename failure (here ENOTDIR, because a path component is a
+        // regular file) must propagate instead of being swallowed as Ok(()). Before
+        // the fix every non-DiskFull error fell through to `return Ok(())`.
+        #[tokio::test]
+        async fn move_to_trash_propagates_real_rename_error() {
+            let (disk, dir) = new_disk().await;
+            let bucket_dir = dir.path().join("bucket");
+            fs::create_dir_all(&bucket_dir).await.expect("bucket dir should be created");
+            let regular_file = bucket_dir.join("afile");
+            fs::write(&regular_file, b"x").await.expect("regular file should be written");
+
+            // Traversing through the regular file yields ENOTDIR at rename time.
+            let bad_path = regular_file.join("child");
+
+            let err = disk
+                .move_to_trash(&bad_path, true, false)
+                .await
+                .expect_err("a real rename failure must propagate, not be reported as success");
+            assert_eq!(err, DiskError::FileAccessDenied, "ENOTDIR must map to FileAccessDenied via to_file_error");
+        }
+
+        // #948: the happy path is unchanged — an existing object is moved out of its
+        // original location and the call succeeds.
+        #[tokio::test]
+        async fn move_to_trash_moves_existing_object() {
+            let (disk, dir) = new_disk().await;
+            let object_dir = dir.path().join("bucket").join("obj-dir");
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            fs::write(object_dir.join("part.1"), b"data")
+                .await
+                .expect("part should be written");
+
+            disk.move_to_trash(&object_dir, true, false)
+                .await
+                .expect("existing object should move to trash");
+            assert!(!object_dir.exists(), "object must be gone from its original location");
+        }
+
+        // #960: renaming a directory to a brand-new (non-existent) location must
+        // succeed. Before the fix the unconditional pre-rename remove returned
+        // FileNotFound and aborted the whole rename.
+        #[tokio::test]
+        async fn rename_file_directory_to_missing_destination_succeeds() {
+            let (disk, dir) = new_disk().await;
+            ensure_test_volume(&disk, "vol").await;
+
+            let src_dir = dir.path().join("vol").join("a").join("dir");
+            fs::create_dir_all(&src_dir).await.expect("src dir should be created");
+            fs::write(src_dir.join("file"), b"payload")
+                .await
+                .expect("src file should be written");
+
+            assert!(has_suffix("a/dir/", SLASH_SEPARATOR), "src path must carry directory semantics");
+            disk.rename_file("vol", "a/dir/", "vol", "b/newdir/")
+                .await
+                .expect("directory rename to a missing destination must succeed");
+
+            let moved = dir.path().join("vol").join("b").join("newdir").join("file");
+            assert_eq!(fs::read(&moved).await.expect("moved file should be readable"), b"payload");
+            assert!(!src_dir.exists(), "source directory must be gone after rename");
+        }
+
+        // #960: the same NotFound-tolerance fix applied to rename_part.
+        #[tokio::test]
+        async fn rename_part_directory_to_missing_destination_succeeds() {
+            let (disk, dir) = new_disk().await;
+            ensure_test_volume(&disk, "vol").await;
+
+            let src_dir = dir.path().join("vol").join("a").join("dir");
+            fs::create_dir_all(&src_dir).await.expect("src dir should be created");
+            fs::write(src_dir.join("file"), b"payload")
+                .await
+                .expect("src file should be written");
+
+            disk.rename_part("vol", "a/dir/", "vol", "b/newdir/", Bytes::from_static(b"meta-bytes"))
+                .await
+                .expect("directory rename_part to a missing destination must succeed");
+
+            let moved = dir.path().join("vol").join("b").join("newdir").join("file");
+            assert_eq!(fs::read(&moved).await.expect("moved file should be readable"), b"payload");
+            let meta = dir.path().join("vol").join("b").join("newdir").join(".meta");
+            assert_eq!(fs::read(&meta).await.expect("meta file should be readable"), b"meta-bytes");
+            assert!(!src_dir.exists(), "source directory must be gone after rename");
         }
     }
 
