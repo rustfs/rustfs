@@ -1342,6 +1342,22 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             );
         }
 
+        // Phase 2 (backlog#899): fence the commit on lock loss before any destructive
+        // step. If the refresh heartbeat has observed a refresh-quorum loss, another
+        // writer may have re-acquired this object's lock; proceeding would race a
+        // double-write. Abort with a retryable error *before* cleanup_multipart_path
+        // (which removes the source parts) and rename_data (which commits the object),
+        // so a lost lock leaves the upload intact and retryable.
+        if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "complete_multipart_upload_commit",
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+
         let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
         self.cleanup_multipart_path(&parts).await;
 

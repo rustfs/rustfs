@@ -864,6 +864,22 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
             }
 
+            // Phase 2 (backlog#899): fence the commit on lock loss. If the refresh
+            // heartbeat has observed a refresh-quorum loss, another writer may have
+            // re-acquired this object's lock; committing now would race a double-write.
+            // Abort with a retryable error *before* rename_data makes the new version
+            // durable — once rename_data returns Ok the write is committed and must
+            // never be aborted (that would violate "a committed write is not lost").
+            if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "put_object_commit",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
+
             let rename_stage_start = Instant::now();
             let (online_disks, _, op_old_dir, cleanup_disks) = Self::rename_data(
                 &shuffle_disks,

@@ -118,6 +118,16 @@ impl NamespaceLockGuard {
             Self::Fast(guard) => guard.is_released(),
         }
     }
+
+    /// Whether the distributed guard's refresh heartbeat has observed a
+    /// refresh-quorum loss (backlog#899 Phase 2). Local (fast) locks are
+    /// single-node and never lose quorum, so they always report `false`.
+    pub fn is_lock_lost(&self) -> bool {
+        match self {
+            Self::Standard(guard) => guard.is_lock_lost(),
+            Self::Fast(_) => false,
+        }
+    }
 }
 
 /// Namespace lock for managing locks by resource namespaces

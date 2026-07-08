@@ -1214,6 +1214,31 @@ mod tests {
         drop(guard);
     }
 
+    // Phase 2 passthrough: NamespaceLockGuard::Standard must forward the distributed
+    // guard's lock-loss signal so the write path can fence its commit on it.
+    #[tokio::test]
+    async fn namespace_guard_forwards_lock_lost() {
+        let (clients, _counters) = counting_clients(&[
+            RefreshOutcome::NotFound,
+            RefreshOutcome::NotFound,
+            RefreshOutcome::Alive,
+            RefreshOutcome::Alive,
+        ]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(120))
+            .with_refresh_interval(Duration::from_millis(20));
+
+        let guard = lock.acquire_guard(&request).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await; // at least one tick -> lost
+
+        let ns_guard = crate::namespace::NamespaceLockGuard::Standard(guard);
+        assert!(
+            ns_guard.is_lock_lost(),
+            "NamespaceLockGuard::Standard must forward the distributed guard's lock-loss signal"
+        );
+    }
+
     // A5 -- refresh RPC jitter (Err) is not counted as not_found; the lock is not declared lost.
     #[tokio::test]
     async fn heartbeat_rpc_error_not_counted_as_lock_lost() {
