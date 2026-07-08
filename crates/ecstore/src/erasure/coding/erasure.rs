@@ -610,6 +610,12 @@ impl Erasure {
 
     /// Encode data from an owned `BytesMut` buffer, avoiding the initial copy
     /// from a borrowed slice into a fresh `BytesMut`.
+    ///
+    /// Capacity contract: when the caller pre-reserves
+    /// `shard_size() * total_shard_count()` bytes (the EC-expanded size of a full
+    /// block), the `resize(need_total_size)` below stays within capacity for every
+    /// `data_len <= block_size` — both shard-size formulas are monotone in
+    /// `data_len` — so this function never reallocates the buffer.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn encode_data_bytes_mut(&self, mut data_buffer: BytesMut, data_len: usize) -> io::Result<Vec<Bytes>> {
         let shard_size_fn = if self.uses_legacy {
@@ -1008,13 +1014,68 @@ mod tests {
     fn encode_data_bytes_mut_matches_borrowed_path() {
         for uses_legacy in [false, true] {
             let erasure = Erasure::new_with_options(4, 2, 64, uses_legacy);
-            for data in [Vec::new(), b"small payload".to_vec(), (0_u8..37).collect::<Vec<_>>()] {
+            let block_size = erasure.block_size;
+            let expanded_block_bytes = erasure.shard_size() * erasure.total_shard_count();
+            let cases: Vec<Vec<u8>> = vec![
+                Vec::new(),
+                b"small payload".to_vec(),
+                (0_u8..37).collect(),
+                vec![0xA5; block_size - 1], // last block one byte short of full
+                vec![0x5A; block_size],     // exactly one full block
+            ];
+            for data in cases {
                 let borrowed = erasure.encode_data(&data).expect("borrowed encode should succeed");
-                let bytes_mut = BytesMut::from(&data[..]);
+
                 let owned = erasure
-                    .encode_data_bytes_mut(bytes_mut, data.len())
+                    .encode_data_bytes_mut(BytesMut::from(&data[..]), data.len())
                     .expect("bytesmut encode should succeed");
                 assert_eq!(owned, borrowed);
+
+                // Ingest-shaped buffer: spare capacity pre-reserved for the EC-expanded
+                // block, exactly what the HP-10 streaming ingest path hands over.
+                let mut ingest = BytesMut::with_capacity(expanded_block_bytes.max(block_size));
+                ingest.extend_from_slice(&data);
+                let preallocated = erasure
+                    .encode_data_bytes_mut(ingest, data.len())
+                    .expect("preallocated bytesmut encode should succeed");
+                assert_eq!(preallocated, borrowed);
+
+                // Buffer longer than data_len (stale bytes past the logical block)
+                // must be truncated before padding.
+                let mut oversized = BytesMut::from(&data[..]);
+                oversized.extend_from_slice(&[0xFF; 8]);
+                let truncated = erasure
+                    .encode_data_bytes_mut(oversized, data.len())
+                    .expect("oversized bytesmut encode should succeed");
+                assert_eq!(truncated, borrowed);
+            }
+        }
+    }
+
+    /// HP-10 capacity invariant: both shard-size formulas are monotone in `data_len`,
+    /// so pre-reserving `shard_size(block_size) * total_shard_count` covers the
+    /// `need_total_size` of every block-or-smaller payload and the ingest buffer
+    /// never reallocates inside `encode_data_bytes_mut`.
+    #[test]
+    fn shard_size_monotonicity_bounds_expanded_block_capacity() {
+        for shard_fn in [calc_shard_size, calc_shard_size_legacy] {
+            for data_shards in 1usize..=16 {
+                for block_size in [1usize, 2, 63, 64, 65, 1024, 4096] {
+                    let full = shard_fn(block_size, data_shards);
+                    let mut prev = shard_fn(0, data_shards);
+                    for data_len in 1..=block_size {
+                        let cur = shard_fn(data_len, data_shards);
+                        assert!(cur >= prev, "shard size must be monotone (len {data_len}, shards {data_shards})");
+                        assert!(cur <= full, "per-block shard size must not exceed the full-block bound");
+                        prev = cur;
+                    }
+                }
+                // Spot-check the production-scale block size at its boundaries.
+                let block_size = 1usize << 20;
+                let full = shard_fn(block_size, data_shards);
+                for data_len in [0usize, 1, block_size / 2, block_size - 1, block_size] {
+                    assert!(shard_fn(data_len, data_shards) <= full);
+                }
             }
         }
     }
