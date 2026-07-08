@@ -99,7 +99,7 @@ crate 不是“超时就直接失败”的设计：
 
 ### 符号链接处理
 
-- 默认不跟随符号链接：`RUSTFS_CAPACITY_FOLLOW_SYMLINKS=false`。
+- 默认不跟随符号链接：`RUSTFS_CAPACITY_FOLLOW_SYMLINKS=false`。开启后会统计符号链接目标,循环由遍历器的祖先环检测阻断。
 - 开启后会做循环引用检测和最大深度限制。
 - 默认最大深度是 `3`。
 
@@ -289,7 +289,6 @@ get_capacity_manager()
 | `RUSTFS_CAPACITY_SAMPLE_RATE` | `200` | overflow 文件采样间隔 |
 | `RUSTFS_CAPACITY_METRICS_INTERVAL` | `600s` | runtime summary 打点间隔 |
 | `RUSTFS_CAPACITY_FOLLOW_SYMLINKS` | `false` | 是否跟随符号链接 |
-| `RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH` | `3` | 符号链接最大跟随深度 |
 | `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` | `true` | 是否启用动态超时 |
 | `RUSTFS_CAPACITY_MIN_TIMEOUT` | `2s` | 动态超时下界 |
 | `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15s` | 动态超时上界 |

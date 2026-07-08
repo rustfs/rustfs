@@ -14,18 +14,18 @@
 
 use super::capacity_manager::{
     CapacityUpdate, DiskCapacityUpdate, HybridCapacityManager, get_enable_dynamic_timeout, get_follow_symlinks,
-    get_max_files_threshold, get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stat_timeout,
+    get_max_files_threshold, get_max_timeout, get_min_timeout, get_sample_rate, get_stat_timeout,
 };
 use super::types::{CapacityDiskRef, CapacityScanResult, CapacityScanSummary};
 use crate::capacity_scope::CapacityScopeDisk;
 use futures::{StreamExt, stream};
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_dynamic_timeout, record_capacity_scan_disk, record_capacity_scan_mode, record_capacity_scan_sampling,
-    record_capacity_symlink, record_capacity_timeout_fallback,
+    record_capacity_timeout_fallback,
 };
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -41,8 +41,6 @@ const LOG_SUBSYSTEM_SAMPLING: &str = "sampling";
 const EVENT_CAPACITY_SCAN_DISK_COMPLETED: &str = "capacity_scan_disk_completed";
 const EVENT_CAPACITY_SCAN_DISK_FAILED: &str = "capacity_scan_disk_failed";
 const EVENT_CAPACITY_SCAN_SUMMARY: &str = "capacity_scan_summary";
-const EVENT_CAPACITY_SCAN_SYMLINK_SKIPPED: &str = "capacity_scan_symlink_skipped";
-const EVENT_CAPACITY_SCAN_SYMLINK_SUMMARY: &str = "capacity_scan_symlink_summary";
 const EVENT_CAPACITY_SCAN_DYNAMIC_TIMEOUT: &str = "capacity_scan_dynamic_timeout";
 const EVENT_CAPACITY_SCAN_TIMEOUT: &str = "capacity_scan_timeout";
 const EVENT_CAPACITY_SCAN_SAMPLING_CLAMPED: &str = "capacity_scan_sampling_clamped";
@@ -365,69 +363,6 @@ pub async fn scan_used_capacity_disks(
     Ok(calculate_data_dir_used_capacity(disks).await?.into())
 }
 
-/// Tracker for symlink resolution with circular reference detection.
-struct SymlinkTracker {
-    visited: HashSet<PathBuf>,
-    symlink_count: usize,
-    symlink_size: u64,
-    max_depth: u8,
-}
-
-impl SymlinkTracker {
-    fn new(max_depth: u8) -> Self {
-        Self {
-            visited: HashSet::new(),
-            symlink_count: 0,
-            symlink_size: 0,
-            max_depth,
-        }
-    }
-
-    fn should_follow(&self, path: &Path, depth: u8) -> bool {
-        if depth >= self.max_depth {
-            debug!(
-                event = EVENT_CAPACITY_SCAN_SYMLINK_SKIPPED,
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_SCAN,
-                result = "skipped",
-                reason = "depth_limit",
-                depth,
-                max_depth = self.max_depth,
-                path = ?path,
-                "capacity scan symlink skipped"
-            );
-            return false;
-        }
-
-        if self.visited.contains(path) {
-            warn!(
-                event = EVENT_CAPACITY_SCAN_SYMLINK_SKIPPED,
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_SCAN,
-                result = "skipped",
-                reason = "cycle_detected",
-                path = ?path,
-                "capacity scan symlink skipped"
-            );
-            return false;
-        }
-
-        true
-    }
-
-    fn record_symlink(&mut self, path: PathBuf, size: u64) {
-        if self.visited.insert(path) {
-            self.symlink_count += 1;
-            self.symlink_size += size;
-            record_capacity_symlink(size);
-        }
-    }
-
-    fn get_stats(&self) -> (usize, u64) {
-        (self.symlink_count, self.symlink_size)
-    }
-}
-
 /// Monitor for directory traversal progress with a cooperative timeout.
 ///
 /// The old in-loop stall detector was structurally unreachable: cooperative
@@ -549,7 +484,6 @@ struct ScanLimits {
     sample_rate: usize,
     enable_dynamic_timeout: bool,
     follow_symlinks: bool,
-    max_symlink_depth: u8,
 }
 
 impl ScanLimits {
@@ -579,7 +513,6 @@ impl ScanLimits {
             sample_rate: effective_sample_rate,
             enable_dynamic_timeout: get_enable_dynamic_timeout(),
             follow_symlinks: get_follow_symlinks(),
-            max_symlink_depth: get_max_symlink_depth(),
         }
     }
 }
@@ -723,7 +656,6 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
         sample_rate: effective_sample_rate,
         enable_dynamic_timeout,
         follow_symlinks,
-        max_symlink_depth,
     } = *limits;
     {
         if !path.exists() {
@@ -756,13 +688,17 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
         // elapses before the exact prefix fills (early sampling entry).
         let mut effective_threshold = max_files_threshold;
 
-        let mut symlink_tracker = SymlinkTracker::new(max_symlink_depth);
         let mut progress_monitor = ProgressMonitor::new(base_timeout, min_timeout, max_timeout, enable_dynamic_timeout);
 
-        let walker = WalkDir::new(path)
-            .follow_links(follow_symlinks)
-            .follow_root_links(follow_symlinks)
-            .into_iter();
+        // With follow_links(true), symlink targets are counted and walkdir's
+        // own ancestor-loop detection breaks cycles (diamond-shaped links may
+        // still be counted once per path). With the default (false), symlink
+        // targets are not counted. The old SymlinkTracker layered on top of
+        // this never influenced traversal, reported tree depth as chain depth
+        // and always tracked 0 bytes, so it was removed along with the no-op
+        // RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH knob (backlog#1018 S12). The root
+        // itself is pre-resolved above (backlog#1015).
+        let walker = WalkDir::new(path).follow_links(follow_symlinks).into_iter();
 
         for entry_result in walker {
             if cancelled.load(Ordering::Relaxed) {
@@ -863,14 +799,6 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                     continue;
                 }
             };
-
-            if follow_symlinks
-                && entry.path_is_symlink()
-                && let Ok(target) = std::fs::read_link(entry.path())
-                && symlink_tracker.should_follow(&target, entry.depth().min(u8::MAX as usize) as u8)
-            {
-                symlink_tracker.record_symlink(target, 0);
-            }
 
             let file_type = entry.file_type();
             if file_type.is_dir() {
@@ -975,19 +903,6 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 }
                 return Err(e);
             }
-        }
-
-        let (symlink_count, symlink_size) = symlink_tracker.get_stats();
-        if symlink_count > 0 {
-            info!(
-                event = EVENT_CAPACITY_SCAN_SYMLINK_SUMMARY,
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_SCAN,
-                result = "observed",
-                symlink_count,
-                tracked_bytes = symlink_size,
-                "capacity scan symlink summary"
-            );
         }
 
         if file_count > effective_threshold && sampled_count > 0 {
@@ -1369,7 +1284,6 @@ mod tests {
             sample_rate: 1,
             enable_dynamic_timeout: false,
             follow_symlinks: false,
-            max_symlink_depth: 40,
         }
     }
 
