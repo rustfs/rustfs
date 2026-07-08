@@ -92,7 +92,7 @@ use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use sysinfo::System;
+use sysinfo::{Networks, System};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -739,6 +739,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     tokio::spawn(async move {
         let labels = current_process_metric_labels();
         let mut host_system = System::new_all();
+        let mut host_networks = Networks::new();
         let process_interval = config.process_interval;
         let mut interval = tokio::time::interval(process_interval);
         let now = Instant::now();
@@ -769,9 +770,11 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
                     if now >= next_system_run {
                         #[cfg(feature = "gpu")]
-                        let mut metrics = collect_system_monitoring_metrics(&bundle, &labels, &mut host_system);
+                        let mut metrics =
+                            collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
                         #[cfg(not(feature = "gpu"))]
-                        let metrics = collect_system_monitoring_metrics(&bundle, &labels, &mut host_system);
+                        let metrics =
+                            collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
 
                         #[cfg(feature = "gpu")]
                         if let Some(pid) = current_pid {
@@ -907,6 +910,7 @@ fn collect_system_monitoring_metrics(
     bundle: &ProcessMetricBundle,
     labels: &[(&'static str, Cow<'static, str>)],
     host_system: &mut System,
+    host_networks: &mut Networks,
 ) -> Vec<PrometheusMetric> {
     let cpu_stats = ProcessCpuStats {
         usage: bundle.resource.cpu_percent,
@@ -920,7 +924,7 @@ fn collect_system_monitoring_metrics(
         read_bytes: bundle.disk_read_bytes,
         written_bytes: bundle.disk_write_bytes,
     };
-    let network_stats = collect_host_network_stats();
+    let network_stats = collect_host_network_stats(host_networks);
     let (system_cpu_stats, system_memory_stats) = collect_system_cpu_and_memory_stats_with(host_system);
 
     let mut metrics = Vec::new();

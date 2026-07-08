@@ -711,16 +711,15 @@ pub fn collect_process_system_stats() -> ProcessStats {
     collect_process_metric_bundle().process
 }
 
-/// Collect host network statistics from the current network interface snapshot.
+/// Collect host network statistics from a refreshed network interface snapshot.
 ///
 /// These counters come from system interfaces and are host-wide, not process-scoped.
-pub fn collect_host_network_stats() -> HostNetworkStats {
-    let networks = Networks::new_with_refreshed_list();
+pub fn collect_host_network_stats_with(networks: &Networks) -> HostNetworkStats {
     let mut total_received = 0u64;
     let mut total_transmitted = 0u64;
     let mut per_interface = Vec::with_capacity(networks.len());
 
-    for (interface_name, data) in &networks {
+    for (interface_name, data) in networks {
         let received = data.received();
         let transmitted = data.transmitted();
         total_received += received;
@@ -733,6 +732,15 @@ pub fn collect_host_network_stats() -> HostNetworkStats {
         total_transmitted,
         per_interface,
     }
+}
+
+/// Collect host network statistics using a persistent `sysinfo::Networks` snapshot.
+///
+/// `sysinfo` reports network I/O as deltas since the previous refresh, so
+/// callers must reuse the same `Networks` instance across collection ticks.
+pub fn collect_host_network_stats(networks: &mut Networks) -> HostNetworkStats {
+    networks.refresh(true);
+    collect_host_network_stats_with(networks)
 }
 
 /// Collect internode network metrics from the global internode metrics snapshot.
@@ -1067,6 +1075,43 @@ pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterSta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    fn generate_loopback_traffic() -> std::io::Result<()> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let addr = listener.local_addr()?;
+        let payload = vec![0x5Au8; 64 * 1024];
+        let expected_len = payload.len();
+
+        let server = thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut received = 0usize;
+            let mut buf = [0u8; 8192];
+
+            while received < expected_len {
+                let read = stream.read(&mut buf)?;
+                if read == 0 {
+                    break;
+                }
+                received += read;
+            }
+
+            Ok(())
+        });
+
+        let mut client = TcpStream::connect(addr)?;
+        client.write_all(&payload)?;
+        client.flush()?;
+        client.shutdown(Shutdown::Write)?;
+
+        server
+            .join()
+            .expect("loopback traffic server thread should complete successfully")?;
+        Ok(())
+    }
 
     #[test]
     fn disk_is_online_for_metrics_accepts_online_state_case_insensitive() {
@@ -1176,6 +1221,45 @@ mod tests {
         let life_time_ops = HashMap::new();
 
         assert_eq!(scanner_bucket_scans_started(&life_time_ops, 5), 5);
+    }
+
+    #[test]
+    fn host_network_stats_require_a_persistent_networks_snapshot() -> std::io::Result<()> {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return Ok(());
+        }
+
+        let mut persistent_networks = Networks::new();
+        persistent_networks.refresh(true);
+        let initial_stats = collect_host_network_stats_with(&persistent_networks);
+        assert_eq!(
+            initial_stats.total_received + initial_stats.total_transmitted,
+            0,
+            "the first refresh only seeds sysinfo's baseline snapshot"
+        );
+
+        match generate_loopback_traffic() {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+        thread::sleep(Duration::from_millis(100));
+
+        let refreshed_stats = collect_host_network_stats(&mut persistent_networks);
+        assert!(
+            refreshed_stats.total_received > 0 || refreshed_stats.total_transmitted > 0,
+            "a persistent Networks instance should report non-zero loopback deltas after traffic"
+        );
+
+        let recreated_stats = collect_host_network_stats_with(&Networks::new_with_refreshed_list());
+        assert_eq!(
+            recreated_stats.total_received + recreated_stats.total_transmitted,
+            0,
+            "recreating Networks loses the prior refresh baseline and yields zero deltas"
+        );
+        Ok(())
     }
 
     #[test]
