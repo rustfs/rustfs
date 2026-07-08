@@ -1960,7 +1960,7 @@ mod tests {
             platform: "test".to_string(),
         };
         let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints.clone()]);
-        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1)
+        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1, ctx.clone())
             .await
             .expect("test sets should be created with empty disks");
 
@@ -2014,6 +2014,33 @@ mod tests {
         assert!(store_b.setup_is_erasure_sd().await);
         assert!(!store_b.setup_is_dist_erasure().await);
         assert!(!store_b.setup_is_erasure().await);
+    }
+
+    /// #939 Slice2: the instance context threads *identically* down the whole
+    /// pool graph — `ECStore.ctx`, every `Sets.ctx`, and every `SetDisks.ctx`
+    /// are the same `Arc`. The set layer therefore reads this instance's setup
+    /// type (`self.ctx`) rather than the process facade.
+    #[tokio::test]
+    async fn ctx_threads_through_pool_graph() {
+        use crate::layout::endpoints::SetupType;
+        use crate::runtime::instance::InstanceContext;
+
+        let ctx = std::sync::Arc::new(InstanceContext::new());
+        ctx.set_erasure_kind(SetupType::DistErasure).await;
+
+        let store = new_test_store_with_ctx(ctx.clone()).await;
+        assert!(std::sync::Arc::ptr_eq(&store.ctx, &ctx), "store must hold the passed ctx");
+
+        assert!(!store.pools.is_empty(), "test store should have one pool");
+        for sets in &store.pools {
+            assert!(std::sync::Arc::ptr_eq(&sets.ctx, &ctx), "Sets must share the store ctx");
+            assert!(!sets.disk_set.is_empty(), "pool should have one set");
+            for set_disks in &sets.disk_set {
+                assert!(std::sync::Arc::ptr_eq(&set_disks.ctx, &ctx), "SetDisks must share the store ctx");
+                // set-layer predicate reads self.ctx, so it sees DistErasure
+                assert!(set_disks.ctx.is_dist_erasure().await);
+            }
+        }
     }
 
     #[tokio::test]

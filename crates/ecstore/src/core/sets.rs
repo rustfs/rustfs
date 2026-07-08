@@ -33,6 +33,7 @@ use crate::{
     error::StorageError,
     layout::endpoints::{Endpoints, PoolEndpoints},
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    runtime::instance::InstanceContext,
     runtime::sources as runtime_sources,
     set_disk::SetDisks,
     store::init_format::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
@@ -77,6 +78,10 @@ pub struct Sets {
     pub default_parity_count: usize,
     pub distribution_algo: DistributionAlgoVersion,
     exit_signal: Option<Sender<()>>,
+    /// Per-instance runtime context, inherited from the owning `ECStore`
+    /// (issue #939, Slice2). Each `SetDisks` in `disk_set` shares this same
+    /// `Arc`, so the whole pool reads one instance's runtime identity.
+    pub(crate) ctx: Arc<InstanceContext>,
 }
 
 impl Drop for Sets {
@@ -88,13 +93,14 @@ impl Drop for Sets {
 }
 
 impl Sets {
-    #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, parity_count))]
-    pub async fn new(
+    #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, parity_count, ctx))]
+    pub(crate) async fn new(
         disks: Vec<Option<DiskStore>>,
         endpoints: &PoolEndpoints,
         fm: &FormatV3,
         pool_idx: usize,
         parity_count: usize,
+        ctx: Arc<InstanceContext>,
     ) -> Result<Arc<Self>> {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
@@ -120,7 +126,7 @@ impl Sets {
                     continue;
                 }
 
-                if disk.as_ref().unwrap().is_local() && runtime_sources::setup_is_dist_erasure().await {
+                if disk.as_ref().unwrap().is_local() && ctx.is_dist_erasure().await {
                     let local_disk = runtime_sources::local_disk_set_drive(pool_idx, i, j).await;
 
                     if local_disk.is_none() {
@@ -166,6 +172,7 @@ impl Sets {
                 set_endpoints,
                 fm.clone(),
                 lockers,
+                ctx.clone(),
             )
             .await;
 
@@ -186,6 +193,7 @@ impl Sets {
             default_parity_count: parity_count,
             distribution_algo: fm.erasure.distribution_algo.clone(),
             exit_signal: Some(tx),
+            ctx,
         });
 
         let asets = sets.clone();
@@ -1165,6 +1173,7 @@ mod tests {
             default_parity_count: 1,
             distribution_algo: DistributionAlgoVersion::V1,
             exit_signal: None,
+            ctx: crate::runtime::instance::bootstrap_ctx(),
         };
 
         let result = sets
@@ -1222,6 +1231,7 @@ mod tests {
             endpoints.clone(),
             format.clone(),
             vec![Arc::new(LocalClient::new()), Arc::new(LocalClient::new())],
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -1244,6 +1254,7 @@ mod tests {
             default_parity_count: 1,
             distribution_algo: DistributionAlgoVersion::V1,
             exit_signal: None,
+            ctx: crate::runtime::instance::bootstrap_ctx(),
         });
 
         let bucket = format!("bucket-{}", Uuid::new_v4().simple());
@@ -1290,6 +1301,7 @@ mod tests {
             default_parity_count: 0,
             distribution_algo: DistributionAlgoVersion::V1,
             exit_signal: None,
+            ctx: crate::runtime::instance::bootstrap_ctx(),
         };
 
         let err = sets

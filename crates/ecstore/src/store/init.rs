@@ -174,6 +174,12 @@ impl ECStore {
         let mut pools = Vec::with_capacity(endpoint_pools.as_ref().len());
         let mut disk_map = HashMap::with_capacity(endpoint_pools.as_ref().len());
 
+        // The runtime context this store will adopt (issue #939, Slice2). Startup
+        // published erasure/disk state into this same `bootstrap_ctx` cell before
+        // any ECStore existed; every pool's `Sets`/`SetDisks` and the store itself
+        // share this one `Arc`, so the whole instance reads one runtime identity.
+        let instance_ctx = crate::runtime::instance::bootstrap_ctx();
+
         let mut local_disks = Vec::new();
 
         debug!(
@@ -308,7 +314,7 @@ impl ECStore {
                 }
             }
 
-            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, common_parity_drives).await?;
+            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, common_parity_drives, instance_ctx.clone()).await?;
             pools.push(sets);
 
             disk_map.insert(i, disks);
@@ -334,10 +340,10 @@ impl ECStore {
             decommission_cancelers,
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
-            // Adopt the process bootstrap context: startup published erasure/disk
-            // state into it before this ECStore existed, so reads after
-            // construction must hit the same cell (issue #939, Slice1).
-            ctx: crate::runtime::instance::bootstrap_ctx(),
+            // Same `Arc` the pools above were built with: startup published
+            // erasure/disk state into it before this ECStore existed, so reads
+            // after construction hit the same cell (issue #939, Slice1/Slice2).
+            ctx: instance_ctx,
         });
 
         // Only set it when the global deployment ID is not yet configured

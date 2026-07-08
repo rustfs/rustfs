@@ -30,7 +30,7 @@ impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        let set_lock = if runtime_sources::setup_is_dist_erasure().await {
+        let set_lock = if self.ctx.is_dist_erasure().await {
             // Calculate quorum based on lockers count (majority)
             let lockers_count = self.lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
@@ -361,7 +361,7 @@ impl SetDisks {
             let path = new_disk.endpoint().to_string();
             global_local_disk_map.insert(path, Some(new_disk.clone()));
 
-            if runtime_sources::setup_is_dist_erasure().await {
+            if self.ctx.is_dist_erasure().await {
                 let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
                 let mut local_set_drives = local_disk_set_drives.write().await;
                 local_set_drives[self.pool_index][set_idx][disk_idx] = Some(new_disk.clone());
@@ -529,6 +529,7 @@ mod tests {
             endpoints,
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -584,6 +585,7 @@ mod tests {
             endpoints,
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -651,6 +653,7 @@ mod tests {
             endpoints,
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -695,6 +698,7 @@ mod tests {
             endpoints.clone(),
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 
@@ -740,6 +744,7 @@ mod tests {
             endpoints.clone(),
             format,
             Vec::new(),
+            crate::runtime::instance::bootstrap_ctx(),
         )
         .await;
 

@@ -1740,6 +1740,7 @@ mod tests {
                 endpoints,
                 crate::disk::format::FormatV3::new(1, 2),
                 lockers,
+                crate::runtime::instance::bootstrap_ctx(),
             )
             .await;
 
