@@ -36,6 +36,15 @@ pub static SYS_CPU_LOAD_PERC_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     )
 });
 
+pub static SYS_CPU_USAGE_PERC_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("usage_perc".to_string()),
+        "Total CPU usage percentage across all measured CPU time categories",
+        &[],
+        subsystems::SYSTEM_CPU,
+    )
+});
+
 pub static SYS_CPU_NICE_MD: LazyLock<MetricDescriptor> =
     LazyLock::new(|| new_gauge_md(MetricName::SysCPUNice, "CPU nice time", &[], subsystems::SYSTEM_CPU));
 
