@@ -1377,6 +1377,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let ver_cfg = BucketVersioningSys::get(bucket).await.unwrap_or_default();
 
+        // backlog#929 (HP-8): the per-object stat below exists solely to feed
+        // check_object_lock_delete (#4297). Resolve the bucket lock
+        // configuration once (in-memory cache) and skip the whole stat fanout
+        // for buckets without Object Lock; unknown metadata fails closed and
+        // keeps the stat, so the #4297 protection is preserved verbatim for
+        // every object-lock-enabled bucket.
+        let object_lock_checks_required = object_lock_delete_check_required(metadata_sys::get(bucket).await.ok().as_deref());
+
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
 
         for (i, dobj) in objects.iter().enumerate() {
@@ -1386,20 +1394,22 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             let explicit_null_version = is_explicit_null_version(dobj.version_id);
             let version_id = delete_file_info_version_id(dobj.version_id);
-            let check_opts = ObjectOptions {
-                version_id: version_id.map(|version_id| version_id.to_string()),
-                versioned: ver_cfg.prefix_enabled(dobj.object_name.as_str()),
-                version_suspended: ver_cfg.suspended(),
-                object_lock_delete: opts.object_lock_delete.clone(),
-                no_lock: true,
-                ..Default::default()
-            };
-            let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
-            if gerr.is_none()
-                && let Err(err) = check_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts).await
-            {
-                del_errs[i] = Some(err);
-                continue;
+            if object_lock_checks_required {
+                let check_opts = ObjectOptions {
+                    version_id: version_id.map(|version_id| version_id.to_string()),
+                    versioned: ver_cfg.prefix_enabled(dobj.object_name.as_str()),
+                    version_suspended: ver_cfg.suspended(),
+                    object_lock_delete: opts.object_lock_delete.clone(),
+                    no_lock: true,
+                    ..Default::default()
+                };
+                let (goi, _write_quorum, gerr) = self.get_object_info_and_quorum(bucket, &dobj.object_name, &check_opts).await;
+                if gerr.is_none()
+                    && let Err(err) = check_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts).await
+                {
+                    del_errs[i] = Some(err);
+                    continue;
+                }
             }
 
             let mut vr = FileInfo {
@@ -2296,29 +2306,19 @@ mod b3_write_quorum_tests {
 }
 
 #[cfg(test)]
-mod put_object_tmp_cleanup_tests {
-    //! Regression coverage for backlog#924 (HP-3): the speculative tmp-dir
-    //! cleanup at the end of a successful PUT runs on a spawned task (off the
-    //! response path), while a failed PUT must still clean its tmp shards
-    //! inline before returning.
-    //!
-    //! The `SetDisks` under test is constructed directly on formatted local
-    //! disks (same pattern as the `ops/locking.rs` tests) so the tests stay
-    //! hermetic: no global local-disk registry, lock clients, or ECStore
-    //! instance is touched, and each test owns its tmp workspace.
+mod hermetic_set_disks_support {
+    //! Shared hermetic `SetDisks` construction for the ops tests below: the
+    //! `SetDisks` under test is built directly on formatted local disks (same
+    //! pattern as the `ops/locking.rs` tests) so the tests stay hermetic — no
+    //! global local-disk registry, lock clients, or ECStore instance is
+    //! touched, and each test owns its temp workspace.
 
     use super::*;
-    use crate::disk::DiskAPI as _;
     use crate::store::init_format::save_format_file;
-    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    /// Large enough that the erasure shards are written as real tmp files
-    /// (never inlined into xl.meta), so both tests exercise actual cleanup.
-    const TEST_OBJECT_SIZE: usize = 1 << 20;
-
-    async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+    pub(super) async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let mut endpoint =
             Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
@@ -2345,7 +2345,7 @@ mod put_object_tmp_cleanup_tests {
         (dir, endpoint, disk)
     }
 
-    async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
+    pub(super) async fn hermetic_set_disks(disk_count: usize) -> (Vec<TempDir>, Vec<DiskStore>, Arc<SetDisks>) {
         let format = FormatV3::new(1, disk_count);
 
         let mut temp_dirs = Vec::with_capacity(disk_count);
@@ -2362,7 +2362,7 @@ mod put_object_tmp_cleanup_tests {
         }
 
         let set_disks = SetDisks::new(
-            "tmp-cleanup-test-owner".to_string(),
+            "hermetic-ops-test-owner".to_string(),
             Arc::new(RwLock::new(disks)),
             disk_count,
             disk_count / 2,
@@ -2376,6 +2376,24 @@ mod put_object_tmp_cleanup_tests {
 
         (temp_dirs, disk_stores, set_disks)
     }
+}
+
+#[cfg(test)]
+mod put_object_tmp_cleanup_tests {
+    //! Regression coverage for backlog#924 (HP-3): the speculative tmp-dir
+    //! cleanup at the end of a successful PUT runs on a spawned task (off the
+    //! response path), while a failed PUT must still clean its tmp shards
+    //! inline before returning.
+
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::disk::DiskAPI as _;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Large enough that the erasure shards are written as real tmp files
+    /// (never inlined into xl.meta), so both tests exercise actual cleanup.
+    const TEST_OBJECT_SIZE: usize = 1 << 20;
 
     /// Entries under `.rustfs.sys/tmp` on every disk, excluding the `.trash`
     /// staging directory (trash reclamation is a background concern).
@@ -2454,5 +2472,147 @@ mod put_object_tmp_cleanup_tests {
         );
 
         drop(temp_dirs);
+    }
+}
+
+#[cfg(test)]
+mod delete_objects_lock_gating_tests {
+    //! Regression coverage for backlog#929 (HP-8): the batch-delete per-object
+    //! stat is gated on the bucket object-lock configuration. For buckets whose
+    //! metadata is unknown the gate fails closed, so these hermetic tests (their
+    //! buckets are never registered with the metadata sys) exercise the
+    //! locked-stat path and prove the #4297 delete protection is intact end to
+    //! end, while per-key result mapping of mixed batches stays stable.
+
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::disk::DiskAPI as _;
+
+    async fn put_plain_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) {
+        let mut reader = PutObjReader::from_vec(vec![3u8; 1024]);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("plain object should be written");
+    }
+
+    #[tokio::test]
+    async fn delete_objects_reports_mixed_results_per_key() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "hp8-mixed-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        put_plain_object(&set_disks, bucket, "obj-a").await;
+        put_plain_object(&set_disks, bucket, "obj-c").await;
+
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "obj-a".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "missing-b".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "obj-c".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let (deleted, errs) = set_disks.delete_objects(bucket, objects, ObjectOptions::default()).await;
+
+        assert_eq!(deleted.len(), 3);
+        assert_eq!(errs.len(), 3);
+        assert!(
+            errs.iter().all(Option::is_none),
+            "S3 batch delete reports missing keys as deleted, not as errors: {errs:?}"
+        );
+        assert_eq!(deleted[0].object_name, "obj-a");
+        assert_eq!(deleted[1].object_name, "missing-b");
+        assert_eq!(deleted[2].object_name, "obj-c");
+        assert!(deleted[0].found, "existing key must be reported as found");
+        assert!(!deleted[1].found, "missing key must be reported as not found");
+        assert!(deleted[2].found, "existing key must be reported as found");
+
+        for object in ["obj-a", "obj-c"] {
+            set_disks
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect_err("deleted object must be gone");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_objects_blocks_locked_object_and_deletes_the_rest() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "hp8-locked-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        // COMPLIANCE retention metadata on the object; this bucket is unknown
+        // to the metadata sys, so the fail-closed gate must keep the held-lock
+        // stat and the #4297 rejection.
+        let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 30);
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            retain_until
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("retain-until date should format"),
+        );
+        let mut reader = PutObjReader::from_vec(vec![7u8; 512]);
+        set_disks
+            .put_object(
+                bucket,
+                "locked",
+                &mut reader,
+                &ObjectOptions {
+                    user_defined,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("locked object should be written");
+
+        put_plain_object(&set_disks, bucket, "plain").await;
+
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "locked".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "plain".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let (_deleted, errs) = set_disks.delete_objects(bucket, objects, ObjectOptions::default()).await;
+
+        let lock_err = errs[0]
+            .as_ref()
+            .expect("COMPLIANCE retention must block the batch delete entry");
+        assert!(
+            matches!(lock_err, Error::PrefixAccessDenied(_, _)),
+            "locked entry must fail with access denied, got: {lock_err:?}"
+        );
+        assert!(errs[1].is_none(), "unlocked entry must still be deleted: {:?}", errs[1]);
+
+        set_disks
+            .get_object_info(bucket, "locked", &ObjectOptions::default())
+            .await
+            .expect("locked object must survive the batch delete");
+        set_disks
+            .get_object_info(bucket, "plain", &ObjectOptions::default())
+            .await
+            .expect_err("plain object must be deleted");
     }
 }
