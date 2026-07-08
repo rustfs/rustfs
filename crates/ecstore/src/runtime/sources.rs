@@ -179,7 +179,7 @@ pub fn rustfs_port() -> u16 {
     global_rustfs_port()
 }
 
-pub(crate) fn background_services_cancel_token() -> Option<&'static CancellationToken> {
+pub(crate) fn background_services_cancel_token() -> Option<CancellationToken> {
     get_background_services_cancel_token()
 }
 

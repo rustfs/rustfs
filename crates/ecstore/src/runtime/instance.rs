@@ -52,6 +52,7 @@ use s3s::region::Region;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OnceCell, RwLock};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Runtime state owned by a single `ECStore` instance.
@@ -138,6 +139,13 @@ pub struct InstanceContext {
     local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
     local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
     local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
+    /// This instance's background-services cancellation token (Phase 5 Slice 13,
+    /// backlog#939).
+    ///
+    /// Set once at startup; cancelling it stops this instance's background
+    /// workers (scanner/heal/tier/lifecycle) without touching another instance.
+    /// Replaces the process-global cancel-token static.
+    background_cancel_token: OnceLock<CancellationToken>,
 }
 
 impl InstanceContext {
@@ -170,6 +178,7 @@ impl InstanceContext {
             local_disk_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_id_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
+            background_cancel_token: OnceLock::new(),
         }
     }
 
@@ -301,6 +310,16 @@ impl InstanceContext {
         self.local_disk_set_drives.clone()
     }
 
+    /// Set this instance's background-services cancellation token (once).
+    pub fn init_background_cancel_token(&self, token: CancellationToken) -> Result<(), CancellationToken> {
+        self.background_cancel_token.set(token)
+    }
+
+    /// This instance's background-services cancellation token, if initialized.
+    pub fn background_cancel_token(&self) -> Option<CancellationToken> {
+        self.background_cancel_token.get().cloned()
+    }
+
     /// Update this instance's erasure setup type.
     pub async fn update_erasure_type(&self, setup_type: SetupType) {
         *self.erasure_kind.write().await = setup_type;
@@ -349,6 +368,7 @@ impl std::fmt::Debug for InstanceContext {
             .field("bucket_monitor_set", &self.bucket_monitor.get().is_some())
             .field("replication_stats_set", &self.replication_stats.get().is_some())
             .field("replication_pool_set", &self.replication_pool.get().is_some())
+            .field("background_cancel_token_set", &self.background_cancel_token.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -659,5 +679,27 @@ mod tests {
             ctx_b.replication_stats().is_none(),
             "a distinct instance has independent replication state"
         );
+    }
+
+    // The background cancel token is set-once, and cancelling one instance's
+    // token leaves a distinct instance's uninitialized.
+    #[tokio::test]
+    async fn background_cancel_token_init_once_and_isolated() {
+        let ctx_a = InstanceContext::new();
+        assert!(ctx_a.background_cancel_token().is_none());
+
+        let token = CancellationToken::new();
+        ctx_a.init_background_cancel_token(token.clone()).expect("init once");
+        assert!(ctx_a.background_cancel_token().is_some());
+        assert!(
+            ctx_a.init_background_cancel_token(CancellationToken::new()).is_err(),
+            "second init rejected"
+        );
+
+        let ctx_b = InstanceContext::new();
+        assert!(ctx_b.background_cancel_token().is_none(), "distinct instance is independent");
+
+        token.cancel();
+        assert!(ctx_a.background_cancel_token().unwrap().is_cancelled());
     }
 }

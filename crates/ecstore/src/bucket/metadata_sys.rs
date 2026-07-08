@@ -93,7 +93,7 @@ pub async fn remove_bucket_metadata(bucket: &str) -> Result<bool> {
 }
 
 fn start_refresh_buckets_metadata_loop(sys: Arc<RwLock<BucketMetadataSys>>) {
-    let Some(cancel_token) = runtime_sources::background_services_cancel_token().cloned() else {
+    let Some(cancel_token) = runtime_sources::background_services_cancel_token() else {
         warn!("bucket metadata refresh loop skipped because background cancellation token is not initialized");
         return;
     };

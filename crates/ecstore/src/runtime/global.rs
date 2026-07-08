@@ -76,11 +76,8 @@ pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
     current_ctx().bucket_monitor()
 }
 
-// Startup-owned process globals intentionally fail fast on duplicate writes.
+// Startup-owned instance-context state intentionally fails fast on duplicate writes.
 // A second write means startup published conflicting runtime scalar state.
-
-/// Global cancellation token for background services (data scanner and auto heal)
-static GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
 /// Get the global rustfs port
 ///
@@ -297,7 +294,7 @@ pub fn get_global_region() -> Option<s3s::region::Region> {
 /// * `Err(CancellationToken)` if setting fails
 ///
 pub fn init_background_services_cancel_token(cancel_token: CancellationToken) -> Result<(), CancellationToken> {
-    GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.set(cancel_token)
+    current_ctx().init_background_cancel_token(cancel_token)
 }
 
 /// Get the global background services cancellation token
@@ -305,8 +302,8 @@ pub fn init_background_services_cancel_token(cancel_token: CancellationToken) ->
 /// # Returns
 /// * `Option<&'static CancellationToken>` - The global cancellation token, if set
 ///
-pub fn get_background_services_cancel_token() -> Option<&'static CancellationToken> {
-    GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.get()
+pub fn get_background_services_cancel_token() -> Option<CancellationToken> {
+    current_ctx().background_cancel_token()
 }
 
 /// Create and initialize the global background services cancellation token
@@ -326,7 +323,7 @@ pub fn create_background_services_cancel_token() -> CancellationToken {
 /// # Returns
 /// * None
 pub fn shutdown_background_services() {
-    if let Some(cancel_token) = GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.get() {
+    if let Some(cancel_token) = get_background_services_cancel_token() {
         cancel_token.cancel();
     }
 }
