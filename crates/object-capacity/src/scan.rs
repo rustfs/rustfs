@@ -14,15 +14,14 @@
 
 use super::capacity_manager::{
     CapacityUpdate, DiskCapacityUpdate, HybridCapacityManager, get_enable_dynamic_timeout, get_follow_symlinks,
-    get_max_files_threshold, get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stall_timeout,
-    get_stat_timeout,
+    get_max_files_threshold, get_max_symlink_depth, get_max_timeout, get_min_timeout, get_sample_rate, get_stat_timeout,
 };
 use super::types::{CapacityDiskRef, CapacityScanResult, CapacityScanSummary};
 use crate::capacity_scope::CapacityScopeDisk;
 use futures::{StreamExt, stream};
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_dynamic_timeout, record_capacity_scan_disk, record_capacity_scan_mode, record_capacity_scan_sampling,
-    record_capacity_stall_detected, record_capacity_symlink, record_capacity_timeout_fallback,
+    record_capacity_symlink, record_capacity_timeout_fallback,
 };
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -35,6 +34,7 @@ use walkdir::WalkDir;
 
 const MAX_CAPACITY_SCAN_CONCURRENCY: usize = 4;
 const CAPACITY_PROGRESS_CHECK_STRIDE: usize = 512;
+const CAPACITY_SCAN_ERROR_WARN_CAP: usize = 10;
 const LOG_COMPONENT_CAPACITY: &str = "capacity";
 const LOG_SUBSYSTEM_SCAN: &str = "scan";
 const LOG_SUBSYSTEM_SAMPLING: &str = "sampling";
@@ -45,7 +45,6 @@ const EVENT_CAPACITY_SCAN_SYMLINK_SKIPPED: &str = "capacity_scan_symlink_skipped
 const EVENT_CAPACITY_SCAN_SYMLINK_SUMMARY: &str = "capacity_scan_symlink_summary";
 const EVENT_CAPACITY_SCAN_DYNAMIC_TIMEOUT: &str = "capacity_scan_dynamic_timeout";
 const EVENT_CAPACITY_SCAN_TIMEOUT: &str = "capacity_scan_timeout";
-const EVENT_CAPACITY_SCAN_STALL_DETECTED: &str = "capacity_scan_stall_detected";
 const EVENT_CAPACITY_SCAN_SAMPLING_CLAMPED: &str = "capacity_scan_sampling_clamped";
 const EVENT_CAPACITY_SCAN_TRAVERSAL_FAILED: &str = "capacity_scan_traversal_failed";
 const EVENT_CAPACITY_SCAN_METADATA_FAILED: &str = "capacity_scan_metadata_failed";
@@ -429,35 +428,28 @@ impl SymlinkTracker {
     }
 }
 
-/// Monitor for directory traversal progress with timeout and stall detection.
+/// Monitor for directory traversal progress with a cooperative timeout.
+///
+/// The old in-loop stall detector was structurally unreachable: cooperative
+/// checks only run when the walker yields entries, so a walker that stops
+/// yielding can never be observed from here. Genuine wedges are handled by
+/// the hard outer wall-clock budget instead (backlog#1016 S09, backlog#1017).
 struct ProgressMonitor {
     start_time: Instant,
-    last_check: Instant,
-    last_checkpoint_files: usize,
     timeout: Duration,
     min_timeout: Duration,
     max_timeout: Duration,
-    stall_timeout: Duration,
     enable_dynamic_timeout: bool,
     used_dynamic_timeout: bool,
 }
 
 impl ProgressMonitor {
-    fn new(
-        base_timeout: Duration,
-        min_timeout: Duration,
-        max_timeout: Duration,
-        stall_timeout: Duration,
-        enable_dynamic: bool,
-    ) -> Self {
+    fn new(base_timeout: Duration, min_timeout: Duration, max_timeout: Duration, enable_dynamic: bool) -> Self {
         Self {
             start_time: Instant::now(),
-            last_check: Instant::now(),
-            last_checkpoint_files: 0,
             timeout: base_timeout,
             min_timeout,
             max_timeout,
-            stall_timeout,
             enable_dynamic_timeout: enable_dynamic,
             used_dynamic_timeout: false,
         }
@@ -529,33 +521,6 @@ impl ProgressMonitor {
             ));
         }
 
-        let now = Instant::now();
-        if now.duration_since(self.last_check) >= self.stall_timeout {
-            let files_per_checkpoint = files_processed.saturating_sub(self.last_checkpoint_files);
-
-            if files_per_checkpoint == 0 && files_processed > 0 {
-                warn!(
-                    event = EVENT_CAPACITY_SCAN_STALL_DETECTED,
-                    component = LOG_COMPONENT_CAPACITY,
-                    subsystem = LOG_SUBSYSTEM_SCAN,
-                    result = "stall",
-                    file_count = files_processed,
-                    stall_timeout_ms = self.stall_timeout.as_millis() as u64,
-                    "capacity scan stall detected"
-                );
-
-                record_capacity_stall_detected();
-
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("Stall detected at {} files", files_processed),
-                ));
-            }
-
-            self.last_check = now;
-            self.last_checkpoint_files = files_processed;
-        }
-
         Ok(())
     }
 
@@ -581,7 +546,6 @@ struct ScanLimits {
     base_timeout: Duration,
     min_timeout: Duration,
     max_timeout: Duration,
-    stall_timeout: Duration,
     sample_rate: usize,
     enable_dynamic_timeout: bool,
     follow_symlinks: bool,
@@ -612,7 +576,6 @@ impl ScanLimits {
             base_timeout: get_stat_timeout(),
             min_timeout: get_min_timeout(),
             max_timeout: get_max_timeout(),
-            stall_timeout: get_stall_timeout(),
             sample_rate: effective_sample_rate,
             enable_dynamic_timeout: get_enable_dynamic_timeout(),
             follow_symlinks: get_follow_symlinks(),
@@ -757,7 +720,6 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
         base_timeout,
         min_timeout,
         max_timeout,
-        stall_timeout,
         sample_rate: effective_sample_rate,
         enable_dynamic_timeout,
         follow_symlinks,
@@ -777,14 +739,15 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
         let mut file_count = 0usize;
         let mut sampled_count = 0usize;
         let mut had_partial_errors = false;
-        let mut last_progress_check_files = 0usize;
+        let mut entries_visited = 0usize;
+        let mut last_progress_check_entries = 0usize;
+        let mut error_warn_count = 0usize;
         // Lowered from the configured threshold when half the time budget
         // elapses before the exact prefix fills (early sampling entry).
         let mut effective_threshold = max_files_threshold;
 
         let mut symlink_tracker = SymlinkTracker::new(max_symlink_depth);
-        let mut progress_monitor =
-            ProgressMonitor::new(base_timeout, min_timeout, max_timeout, stall_timeout, enable_dynamic_timeout);
+        let mut progress_monitor = ProgressMonitor::new(base_timeout, min_timeout, max_timeout, enable_dynamic_timeout);
 
         let walker = WalkDir::new(path)
             .follow_links(follow_symlinks)
@@ -799,20 +762,94 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                 ));
             }
 
+            // Progress is measured in visited entries, not counted files:
+            // directory-only stretches and error-dense trees previously never
+            // advanced file_count and so never reached a timeout check,
+            // holding the blocking thread for unbounded time (backlog#1016 S13).
+            entries_visited += 1;
+            let should_check_progress = entries_visited == 1
+                || entries_visited.saturating_sub(last_progress_check_entries) >= CAPACITY_PROGRESS_CHECK_STRIDE;
+            if should_check_progress {
+                let exact_count = file_count.min(effective_threshold);
+                let avg_size = if exact_count > 0 {
+                    exact_prefix_bytes / exact_count as u64
+                } else {
+                    0
+                };
+
+                if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
+                    if let Some(result) = timeout_fallback_estimate(
+                        path,
+                        "timeout",
+                        exact_prefix_bytes,
+                        overflow_sampled_bytes,
+                        file_count,
+                        sampled_count,
+                        effective_threshold,
+                        had_partial_errors,
+                        start_time,
+                    ) {
+                        return Ok(result);
+                    }
+                    return Err(e);
+                }
+
+                // Half the time budget is gone and the exact prefix hasn't
+                // filled: freeze the threshold at the current position so the
+                // remaining budget collects overflow samples. Without this, a
+                // disk too slow to enumerate the full prefix within the budget
+                // reaches the timeout with sampled_count == 0 and used to lose
+                // the whole scan (backlog#1013 S03).
+                if effective_threshold == max_files_threshold
+                    && file_count < effective_threshold
+                    && progress_monitor.half_budget_elapsed(file_count, avg_size)
+                {
+                    effective_threshold = file_count.max(1);
+                    info!(
+                        event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
+                        component = LOG_COMPONENT_CAPACITY,
+                        subsystem = LOG_SUBSYSTEM_SAMPLING,
+                        result = "early_sampling",
+                        reason = "time_budget",
+                        file_count,
+                        exact_prefix_bytes,
+                        frozen_threshold = effective_threshold,
+                        configured_threshold = max_files_threshold,
+                        "capacity scan sampling applied"
+                    );
+                    record_capacity_scan_mode("early_sampling");
+                }
+
+                last_progress_check_entries = entries_visited;
+            }
+
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(err) => {
-                    warn!(
-                        event = EVENT_CAPACITY_SCAN_TRAVERSAL_FAILED,
-                        component = LOG_COMPONENT_CAPACITY,
-                        subsystem = LOG_SUBSYSTEM_SCAN,
-                        result = "partial",
-                        root_path = ?path,
-                        file_count,
-                        error = %err,
-                        "capacity scan traversal failed"
-                    );
                     had_partial_errors = true;
+                    error_warn_count += 1;
+                    if error_warn_count <= CAPACITY_SCAN_ERROR_WARN_CAP {
+                        warn!(
+                            event = EVENT_CAPACITY_SCAN_TRAVERSAL_FAILED,
+                            component = LOG_COMPONENT_CAPACITY,
+                            subsystem = LOG_SUBSYSTEM_SCAN,
+                            result = "partial",
+                            root_path = ?path,
+                            file_count,
+                            error = %err,
+                            "capacity scan traversal failed"
+                        );
+                    } else if error_warn_count == CAPACITY_SCAN_ERROR_WARN_CAP + 1 {
+                        warn!(
+                            event = EVENT_CAPACITY_SCAN_TRAVERSAL_FAILED,
+                            component = LOG_COMPONENT_CAPACITY,
+                            subsystem = LOG_SUBSYSTEM_SCAN,
+                            result = "suppressed",
+                            root_path = ?path,
+                            warn_cap = CAPACITY_SCAN_ERROR_WARN_CAP,
+                            "further capacity scan errors suppressed for this scan"
+                        );
+                    }
                     continue;
                 }
             };
@@ -851,76 +888,34 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
                         continue;
                     }
 
-                    warn!(
-                        event = EVENT_CAPACITY_SCAN_METADATA_FAILED,
-                        component = LOG_COMPONENT_CAPACITY,
-                        subsystem = LOG_SUBSYSTEM_SCAN,
-                        result = "partial",
-                        entry_path = ?entry.path(),
-                        file_count,
-                        error = %err,
-                        "capacity scan metadata failed"
-                    );
                     had_partial_errors = true;
+                    error_warn_count += 1;
+                    if error_warn_count <= CAPACITY_SCAN_ERROR_WARN_CAP {
+                        warn!(
+                            event = EVENT_CAPACITY_SCAN_METADATA_FAILED,
+                            component = LOG_COMPONENT_CAPACITY,
+                            subsystem = LOG_SUBSYSTEM_SCAN,
+                            result = "partial",
+                            entry_path = ?entry.path(),
+                            file_count,
+                            error = %err,
+                            "capacity scan metadata failed"
+                        );
+                    } else if error_warn_count == CAPACITY_SCAN_ERROR_WARN_CAP + 1 {
+                        warn!(
+                            event = EVENT_CAPACITY_SCAN_METADATA_FAILED,
+                            component = LOG_COMPONENT_CAPACITY,
+                            subsystem = LOG_SUBSYSTEM_SCAN,
+                            result = "suppressed",
+                            warn_cap = CAPACITY_SCAN_ERROR_WARN_CAP,
+                            "further capacity scan errors suppressed for this scan"
+                        );
+                    }
                     continue;
                 }
             };
 
             file_count += 1;
-            let exact_count = file_count.min(effective_threshold);
-            let avg_size = if exact_count > 0 {
-                exact_prefix_bytes / exact_count as u64
-            } else {
-                0
-            };
-
-            let should_check_progress =
-                file_count == 1 || file_count.saturating_sub(last_progress_check_files) >= CAPACITY_PROGRESS_CHECK_STRIDE;
-
-            if should_check_progress {
-                if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
-                    if let Some(result) = timeout_fallback_estimate(
-                        path,
-                        "timeout_or_stall",
-                        exact_prefix_bytes,
-                        overflow_sampled_bytes,
-                        file_count,
-                        sampled_count,
-                        effective_threshold,
-                        had_partial_errors,
-                        start_time,
-                    ) {
-                        return Ok(result);
-                    }
-                    return Err(e);
-                }
-
-                // Half the time budget is gone and the exact prefix hasn't
-                // filled: freeze the threshold at the current position so the
-                // remaining budget collects overflow samples. Without this, a
-                // disk too slow to enumerate the full prefix within the budget
-                // reaches the timeout with sampled_count == 0 and used to lose
-                // the whole scan (backlog#1013 S03).
-                if file_count < effective_threshold && progress_monitor.half_budget_elapsed(file_count, avg_size) {
-                    effective_threshold = file_count;
-                    info!(
-                        event = EVENT_CAPACITY_SCAN_SAMPLING_APPLIED,
-                        component = LOG_COMPONENT_CAPACITY,
-                        subsystem = LOG_SUBSYSTEM_SAMPLING,
-                        result = "early_sampling",
-                        reason = "time_budget",
-                        file_count,
-                        exact_prefix_bytes,
-                        frozen_threshold = effective_threshold,
-                        configured_threshold = max_files_threshold,
-                        "capacity scan sampling applied"
-                    );
-                    record_capacity_scan_mode("early_sampling");
-                }
-
-                last_progress_check_files = file_count;
-            }
-
             if file_count <= effective_threshold {
                 exact_prefix_bytes += metadata.len();
             } else {
@@ -946,7 +941,7 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
             }
         }
 
-        if file_count > last_progress_check_files {
+        if entries_visited > last_progress_check_entries {
             let exact_count = file_count.min(effective_threshold);
             let avg_size = if exact_count > 0 {
                 exact_prefix_bytes / exact_count as u64
@@ -957,7 +952,7 @@ fn scan_dir_blocking(path: &Path, limits: &ScanLimits, cancelled: &AtomicBool) -
             if let Err(e) = progress_monitor.update_and_check_timeout(file_count, avg_size) {
                 if let Some(result) = timeout_fallback_estimate(
                     path,
-                    "final_timeout_or_stall",
+                    "final_timeout",
                     exact_prefix_bytes,
                     overflow_sampled_bytes,
                     file_count,
@@ -1347,7 +1342,7 @@ mod tests {
     #[test]
     fn test_half_budget_elapsed_boundary() {
         let budget = Duration::from_secs(60);
-        let mut monitor = ProgressMonitor::new(budget, Duration::from_secs(1), budget, Duration::from_secs(600), false);
+        let mut monitor = ProgressMonitor::new(budget, Duration::from_secs(1), budget, false);
         assert!(!monitor.half_budget_elapsed(10, 1024));
 
         // Backdate the start beyond half the budget: sampling must engage.
@@ -1361,7 +1356,6 @@ mod tests {
             base_timeout,
             min_timeout: Duration::from_millis(0),
             max_timeout: base_timeout,
-            stall_timeout: Duration::from_secs(600),
             sample_rate: 1,
             enable_dynamic_timeout: false,
             follow_symlinks: false,
@@ -1383,6 +1377,20 @@ mod tests {
         // Zero budget times out at the first progress check with no samples;
         // a tempdir is not a dedicated mount, so no estimator exists and the
         // original timeout error must still surface (last-resort behavior).
+        let result = scan_dir_blocking(temp_dir.path(), &tight_limits(Duration::ZERO), &AtomicBool::new(false));
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn test_scan_dir_blocking_times_out_on_directory_only_tree() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        for i in 0..5 {
+            std::fs::create_dir(temp_dir.path().join(format!("d{i}"))).unwrap();
+        }
+
+        // A tree with no regular files never advances file_count; progress
+        // checks are entry-driven now, so the zero budget must still trip a
+        // timeout instead of silently completing as exact 0 bytes.
         let result = scan_dir_blocking(temp_dir.path(), &tight_limits(Duration::ZERO), &AtomicBool::new(false));
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
