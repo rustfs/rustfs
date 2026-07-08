@@ -545,28 +545,27 @@ where
                     return Err(StoreError::Deserialization(format!("Failed to deserialize item in batch: {e}")));
                 }
                 None => {
-                    // Reached end of stream sooner than item_count
-                    if items.len() < key.item_count && !items.is_empty() {
-                        // Partial read
-                        warn!(
-                            event = EVENT_TARGET_STORE_STATE,
-                            component = LOG_COMPONENT_TARGETS,
-                            subsystem = LOG_SUBSYSTEM_STORE,
-                            action = "read_batch",
-                            key = %key,
-                            expected_items = key.item_count,
-                            actual_items = items.len(),
-                            reason = "partial_batch_read",
-                            "target store state"
-                        );
-                        // Depending on strictness, this could be an error.
-                    } else if items.is_empty() {
-                        // No items at all, but file existed
-                        return Err(StoreError::Deserialization(format!(
-                            "No items deserialized for key {key} though file existed."
-                        )));
-                    }
-                    break;
+                    // Reached end of stream before deserializing `item_count` items: the
+                    // batch file was truncated or corrupted. This MUST be surfaced as an
+                    // error rather than silently returning the partial set. If we returned
+                    // `Ok(partial)`, the caller would treat the batch as fully delivered,
+                    // delete the store entry, and permanently lose the missing events.
+                    warn!(
+                        event = EVENT_TARGET_STORE_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_STORE,
+                        action = "read_batch",
+                        key = %key,
+                        expected_items = key.item_count,
+                        actual_items = items.len(),
+                        reason = "truncated_batch_read",
+                        "target store state"
+                    );
+                    return Err(StoreError::Deserialization(format!(
+                        "Truncated batch for key {key}: expected {} items but only deserialized {}",
+                        key.item_count,
+                        items.len()
+                    )));
                 }
             }
         }
@@ -796,6 +795,41 @@ mod tests {
         let err = store.put(Arc::new("second".to_string())).unwrap_err();
 
         assert!(matches!(err, StoreError::LimitExceeded));
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn get_multiple_errors_on_truncated_batch_instead_of_partial_success() {
+        let dir = temp_store_dir("truncated-batch");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", false);
+        store.open().unwrap();
+
+        let items = vec!["aa".to_string(), "bb".to_string(), "cc".to_string()];
+        let key = store.put_multiple(items).unwrap();
+        assert_eq!(key.item_count, 3);
+
+        // Truncate the batch file at a clean boundary after the first two serialized
+        // items (`"aa""bb"`), so the read of the third item hits end-of-stream — the
+        // exact "partial read" condition that previously returned Ok silently.
+        let prefix_len =
+            serde_json::to_vec(&"aa".to_string()).unwrap().len() + serde_json::to_vec(&"bb".to_string()).unwrap().len();
+        let path = store.file_path(&key);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(prefix_len as u64).unwrap();
+        drop(file);
+
+        // A truncated batch must be reported as an error, not silently returned as a
+        // partial-but-successful result that would drop the missing "cc" event.
+        let err = store.get_multiple(&key).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Deserialization(_)),
+            "expected Deserialization error, got {err:?}"
+        );
+
+        // Because get_multiple failed, the batch entry is still on disk for the caller
+        // to retry — the missing events are not silently discarded.
+        assert!(store.file_path(&key).exists());
 
         let _ = store.delete();
     }
