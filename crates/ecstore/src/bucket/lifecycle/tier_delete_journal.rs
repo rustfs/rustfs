@@ -63,7 +63,12 @@ impl PersistedTierDeleteJournalEntry {
         if self.version != TIER_DELETE_JOURNAL_VERSION {
             return Err(Error::other(format!("unsupported tier delete journal version {}", self.version)));
         }
-        if self.obj_name.is_empty() || self.version_id.is_empty() || self.tier_name.is_empty() {
+        // Empty `version_id` is a legal sentinel for objects transitioned to an
+        // unversioned remote tier (see CLAUDE.md: a tier version of `None`/`""`
+        // means the tier bucket is unversioned, so the remote delete is issued
+        // without a versionId). Only reject entries missing the object or tier
+        // name, which are always populated for a TRANSITION_COMPLETE object.
+        if self.obj_name.is_empty() || self.tier_name.is_empty() {
             return Err(Error::other("tier delete journal entry is incomplete"));
         }
         Ok(Jentry {
@@ -319,5 +324,40 @@ mod tests {
         let err = decode_tier_delete_journal_entry(payload).expect_err("incomplete journal entry should be rejected");
 
         assert!(err.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn tier_delete_journal_recovers_unversioned_tier_entry() {
+        // A remote tier that is unversioned records an empty `version_id`. Such a
+        // WAL entry must decode successfully so recovery can drive a versionless
+        // remote delete, otherwise the remote object is orphaned and the journal
+        // file leaks forever.
+        let payload = br#"{"version":1,"obj_name":"remote/object","version_id":"","tier_name":"WARM"}"#;
+
+        let decoded = decode_tier_delete_journal_entry(payload).expect("unversioned tier entry should decode");
+
+        assert_eq!(decoded.obj_name, "remote/object");
+        assert!(decoded.version_id.is_empty());
+        assert_eq!(decoded.tier_name, "WARM");
+    }
+
+    #[test]
+    fn tier_delete_journal_rejects_missing_tier_name() {
+        let payload = br#"{"version":1,"obj_name":"remote/object","version_id":"v1","tier_name":""}"#;
+
+        let err = decode_tier_delete_journal_entry(payload).expect_err("entry missing tier name should be rejected");
+
+        assert!(err.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn tier_delete_journal_rejects_truncated_payload() {
+        // A partially written journal file fails at JSON deserialization, so
+        // relaxing the empty-version_id check does not admit truncated records.
+        let payload = br#"{"version":1,"obj_name":"remote/object","version_id":""#;
+
+        let err = decode_tier_delete_journal_entry(payload).expect_err("truncated journal payload should be rejected");
+
+        assert!(err.to_string().contains("decode tier delete journal failed"));
     }
 }
