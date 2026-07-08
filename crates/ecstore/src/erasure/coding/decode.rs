@@ -2332,11 +2332,14 @@ mod tests {
             .collect()
     }
 
+    /// One prefetch env configuration: a label plus the env vars it sets.
+    type PrefetchEnvConfig = (&'static str, Vec<(&'static str, Option<&'static str>)>);
+
     /// Prefetch on/off env configurations exercised by the HP-9 tests.
     /// `serial-default` pins both switches off (the byte-identical serial path);
     /// the others turn the depth-1 prefetch pipeline on through each switch and
     /// through a count above 1 (which collapses to depth 1 by design).
-    fn prefetch_env_configs() -> Vec<(&'static str, Vec<(&'static str, Option<&'static str>)>)> {
+    fn prefetch_env_configs() -> Vec<PrefetchEnvConfig> {
         vec![
             (
                 "serial-default",
