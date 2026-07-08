@@ -39,6 +39,15 @@ impl LiveEventHistory {
         let mut next_sequence = after_sequence;
         let mut truncated = false;
 
+        // A gap means the consumer's cursor points before the oldest event we
+        // still retain: the events in between were evicted from the ring buffer
+        // and can never be delivered. Report it so the consumer knows it lost
+        // events instead of silently resuming from the oldest available one.
+        let gap = match self.events.front() {
+            Some((oldest, _)) => after_sequence.saturating_add(1) < *oldest,
+            None => false,
+        };
+
         for (sequence, event) in self.events.iter() {
             if *sequence <= after_sequence {
                 continue;
@@ -55,6 +64,7 @@ impl LiveEventHistory {
             events,
             next_sequence,
             truncated,
+            gap,
         }
     }
 }
@@ -103,7 +113,7 @@ pub type NotifyEventBridge = NotifyPipeline;
 
 #[cfg(test)]
 mod tests {
-    use super::{LiveEventHistory, NotifyPipeline};
+    use super::{LiveEventHistory, MAX_RECENT_LIVE_EVENTS, NotifyPipeline};
     use crate::{Event, integration::NotificationMetrics, notifier::EventNotifier, rule_engine::NotifyRuleEngine};
     use rustfs_s3_types::EventName;
     use std::sync::Arc;
@@ -135,7 +145,35 @@ mod tests {
         let batch = pipeline.recent_live_events_since(0, 16).await;
         assert_eq!(batch.next_sequence, 1);
         assert!(!batch.truncated);
+        assert!(!batch.gap);
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].s3.object.key, "one");
+    }
+
+    #[test]
+    fn snapshot_reports_gap_when_cursor_predates_evicted_history() {
+        let mut history = LiveEventHistory::default();
+        // Fill past the ring-buffer capacity so the oldest events are evicted.
+        let total = MAX_RECENT_LIVE_EVENTS + 128;
+        for i in 1..=total {
+            history.record(Arc::new(Event::new_test_event("bucket", &i.to_string(), EventName::ObjectCreatedPut)));
+        }
+
+        let oldest_retained = (total - MAX_RECENT_LIVE_EVENTS + 1) as u64;
+
+        // A consumer whose cursor sits inside the evicted range must be told a
+        // gap exists instead of silently resuming from the oldest available.
+        let batch = history.snapshot_since(10, 4096);
+        assert!(batch.gap, "cursor predating evicted history must report a gap");
+        assert_eq!(batch.events.first().unwrap().s3.object.key, oldest_retained.to_string());
+
+        // A cursor contiguous with the oldest retained event must not report a gap.
+        let contiguous = history.snapshot_since(oldest_retained - 1, 4096);
+        assert!(!contiguous.gap, "cursor contiguous with retained history must not report a gap");
+
+        // A caught-up cursor must not report a gap either.
+        let caught_up = history.snapshot_since(total as u64, 4096);
+        assert!(!caught_up.gap);
+        assert!(caught_up.events.is_empty());
     }
 }
