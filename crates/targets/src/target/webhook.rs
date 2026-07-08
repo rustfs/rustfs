@@ -452,6 +452,10 @@ where
         })?;
 
         let status = resp.status();
+        // Drain the response body so the underlying connection is returned to the
+        // pool and can be reused (keep-alive) instead of being closed mid-stream
+        // (backlog#983). The body content is not needed for delivery accounting.
+        let _ = resp.bytes().await;
         if status.is_success() {
             debug!(
                 event = EVENT_WEBHOOK_DELIVERY_STATE,
