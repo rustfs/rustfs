@@ -137,7 +137,13 @@ pub(crate) type Endpoint = EcstoreEndpoint;
 pub(crate) type StorageError = EcstoreStorageError;
 pub(crate) type LocalDiskMap = std::collections::HashMap<String, Option<DiskStore>>;
 
-pub(crate) async fn local_disk_map_read() -> tokio::sync::RwLockReadGuard<'static, LocalDiskMap> {
+/// Read the local disk map as an owned guard.
+///
+/// Returns an owned guard (see the ecstore boundary), so the heal manager can
+/// hold it across `.await` without depending on a `'static` process global —
+/// the prerequisite for moving the disk map into the per-instance
+/// `InstanceContext` (backlog#939). Usage is otherwise unchanged.
+pub(crate) async fn local_disk_map_read() -> tokio::sync::OwnedRwLockReadGuard<LocalDiskMap> {
     ecstore_local_disk_map_read().await
 }
 
