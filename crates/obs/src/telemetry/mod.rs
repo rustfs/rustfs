@@ -52,7 +52,7 @@ mod rolling;
 use crate::TelemetryError;
 use crate::config::OtelConfig;
 pub use guard::OtelGuard;
-pub use recorder::Recorder;
+pub use recorder::{Recorder, retire_metric_series};
 use rustfs_config::observability::ENV_OBS_LOG_DIRECTORY;
 use rustfs_config::{DEFAULT_LOG_LEVEL, ENVIRONMENT, observability::DEFAULT_OBS_ENVIRONMENT_PRODUCTION};
 use rustfs_utils::get_env_opt_str;
