@@ -119,6 +119,10 @@ fn obs_total_usable_capacity_free_bytes(storage_info: &ObsStorageInfo) -> u64 {
     usize_to_u64_saturating(obs_get_total_usable_capacity_free(&storage_info.disks, storage_info))
 }
 
+fn usable_capacity_used_bytes(usable_capacity: u64, free_bytes: u64) -> u64 {
+    usable_capacity.saturating_sub(free_bytes)
+}
+
 async fn obs_bucket_quota_limit_bytes(bucket: &str) -> u64 {
     obs_get_quota_config(bucket)
         .await
@@ -326,9 +330,9 @@ pub async fn collect_cluster_and_health_stats() -> (ClusterStats, ClusterHealthS
 
     let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
     let raw_capacity: u64 = storage_info.disks.iter().map(|d| d.total_space).sum();
-    let used: u64 = storage_info.disks.iter().map(|d| d.used_space).sum();
     let usable_capacity = obs_total_usable_capacity_bytes(&storage_info);
     let free = obs_total_usable_capacity_free_bytes(&storage_info);
+    let used = usable_capacity_used_bytes(usable_capacity, free);
     let stale_capacity_drives = storage_info
         .disks
         .iter()
@@ -1273,5 +1277,15 @@ mod tests {
         assert_eq!(scanner_work_rate_per_second(90, 0.0), 0.0);
         assert_eq!(scanner_work_rate_per_second(90, f64::INFINITY), 0.0);
         assert_eq!(scanner_work_rate_per_second(90, f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn usable_capacity_used_bytes_matches_usable_total_minus_free() {
+        assert_eq!(usable_capacity_used_bytes(240, 90), 150);
+    }
+
+    #[test]
+    fn usable_capacity_used_bytes_saturates_when_free_exceeds_total() {
+        assert_eq!(usable_capacity_used_bytes(90, 240), 0);
     }
 }
