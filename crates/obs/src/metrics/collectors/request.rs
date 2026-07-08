@@ -21,6 +21,7 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::request::*;
+use std::collections::HashMap;
 
 /// API request statistics for a specific API endpoint.
 #[derive(Debug, Clone, Default)]
@@ -54,8 +55,13 @@ pub struct ApiRequestStats {
 /// Returns a vector of Prometheus metrics for API request statistics.
 pub fn collect_request_metrics(stats: &[ApiRequestStats]) -> Vec<PrometheusMetric> {
     let mut metrics = Vec::new();
+    let mut traffic_by_type: HashMap<&str, (u64, u64)> = HashMap::with_capacity(stats.len());
 
     for stat in stats {
+        let entry = traffic_by_type.entry(stat.req_type.as_str()).or_default();
+        entry.0 = entry.0.saturating_add(stat.sent_bytes);
+        entry.1 = entry.1.saturating_add(stat.recv_bytes);
+
         // In-flight requests
         metrics.push(
             PrometheusMetric::from_descriptor(&API_REQUESTS_IN_FLIGHT_TOTAL_MD, stat.in_flight as f64)
@@ -107,15 +113,16 @@ pub fn collect_request_metrics(stats: &[ApiRequestStats]) -> Vec<PrometheusMetri
                     .with_label_owned(LE_LABEL, le.clone()),
             );
         }
+    }
 
-        // Traffic metrics
+    for (req_type, (sent_bytes, recv_bytes)) in traffic_by_type {
         metrics.push(
-            PrometheusMetric::from_descriptor(&API_TRAFFIC_SENT_BYTES_MD, stat.sent_bytes as f64)
-                .with_label_owned(TYPE_LABEL, stat.req_type.clone()),
+            PrometheusMetric::from_descriptor(&API_TRAFFIC_SENT_BYTES_MD, sent_bytes as f64)
+                .with_label_owned(TYPE_LABEL, req_type.to_string()),
         );
         metrics.push(
-            PrometheusMetric::from_descriptor(&API_TRAFFIC_RECV_BYTES_MD, stat.recv_bytes as f64)
-                .with_label_owned(TYPE_LABEL, stat.req_type.clone()),
+            PrometheusMetric::from_descriptor(&API_TRAFFIC_RECV_BYTES_MD, recv_bytes as f64)
+                .with_label_owned(TYPE_LABEL, req_type.to_string()),
         );
     }
 
@@ -170,5 +177,61 @@ mod tests {
         let stats: Vec<ApiRequestStats> = vec![];
         let metrics = collect_request_metrics(&stats);
         assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn test_collect_request_metrics_aggregates_traffic_per_type() {
+        let stats = vec![
+            ApiRequestStats {
+                name: "GetObject".to_string(),
+                req_type: "s3".to_string(),
+                in_flight: 1,
+                total: 10,
+                errors_total: 0,
+                errors_5xx: 0,
+                errors_4xx: 0,
+                canceled: 0,
+                ttfb_distribution: vec![],
+                sent_bytes: 100,
+                recv_bytes: 10,
+            },
+            ApiRequestStats {
+                name: "HeadObject".to_string(),
+                req_type: "s3".to_string(),
+                in_flight: 2,
+                total: 20,
+                errors_total: 1,
+                errors_5xx: 1,
+                errors_4xx: 0,
+                canceled: 0,
+                ttfb_distribution: vec![],
+                sent_bytes: 200,
+                recv_bytes: 20,
+            },
+        ];
+
+        let metrics = collect_request_metrics(&stats);
+
+        let sent_name = API_TRAFFIC_SENT_BYTES_MD.get_full_metric_name();
+        let sent_metrics: Vec<_> = metrics.iter().filter(|metric| metric.name == sent_name).collect();
+        assert_eq!(sent_metrics.len(), 1);
+        assert_eq!(sent_metrics[0].value, 300.0);
+        assert!(
+            sent_metrics[0]
+                .labels
+                .iter()
+                .any(|(key, value)| *key == TYPE_LABEL && value == "s3")
+        );
+
+        let recv_name = API_TRAFFIC_RECV_BYTES_MD.get_full_metric_name();
+        let recv_metrics: Vec<_> = metrics.iter().filter(|metric| metric.name == recv_name).collect();
+        assert_eq!(recv_metrics.len(), 1);
+        assert_eq!(recv_metrics[0].value, 30.0);
+        assert!(
+            recv_metrics[0]
+                .labels
+                .iter()
+                .any(|(key, value)| *key == TYPE_LABEL && value == "s3")
+        );
     }
 }
