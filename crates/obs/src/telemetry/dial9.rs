@@ -33,15 +33,27 @@ use rustfs_config::{
 use rustfs_utils::get_env_bool;
 use rustfs_utils::get_env_f64;
 use rustfs_utils::get_env_opt_str;
+use rustfs_utils::get_env_opt_u64;
+use rustfs_utils::get_env_opt_usize;
 use rustfs_utils::get_env_str;
-use rustfs_utils::get_env_u64;
-use rustfs_utils::get_env_usize;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_DIAL9: &str = "dial9";
 const EVENT_DIAL9_STATE: &str = "dial9_state";
+
+fn sanitize_dial9_max_file_size(bytes: u64) -> u64 {
+    bytes.max(1)
+}
+
+fn sanitize_dial9_rotation_count(count: usize) -> usize {
+    count.max(1)
+}
+
+fn dial9_total_rotation_size(max_file_size: u64, rotation_count: usize) -> u64 {
+    max_file_size.saturating_mul(u64::try_from(rotation_count).unwrap_or(u64::MAX))
+}
 
 /// Configuration for dial9 Tokio telemetry.
 #[derive(Debug, Clone)]
@@ -95,12 +107,37 @@ impl Dial9Config {
             return Self::default();
         }
 
+        let raw_max_file_size = get_env_opt_u64(ENV_RUNTIME_DIAL9_MAX_FILE_SIZE);
+        let raw_rotation_count = get_env_opt_usize(ENV_RUNTIME_DIAL9_ROTATION_COUNT);
+        let max_file_size = sanitize_dial9_max_file_size(raw_max_file_size.unwrap_or(DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE));
+        let rotation_count = sanitize_dial9_rotation_count(raw_rotation_count.unwrap_or(DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT));
+        if raw_max_file_size == Some(0) {
+            warn!(
+                event = EVENT_DIAL9_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_DIAL9,
+                result = "invalid_max_file_size",
+                fallback_bytes = 1_u64,
+                "dial9 state changed"
+            );
+        }
+        if raw_rotation_count == Some(0) {
+            warn!(
+                event = EVENT_DIAL9_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_DIAL9,
+                result = "invalid_rotation_count",
+                fallback_count = 1_usize,
+                "dial9 state changed"
+            );
+        }
+
         Self {
             enabled,
             output_dir: get_env_str(ENV_RUNTIME_DIAL9_OUTPUT_DIR, DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR),
             file_prefix: get_env_str(ENV_RUNTIME_DIAL9_FILE_PREFIX, DEFAULT_RUNTIME_DIAL9_FILE_PREFIX),
-            max_file_size: get_env_u64(ENV_RUNTIME_DIAL9_MAX_FILE_SIZE, DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE),
-            rotation_count: get_env_usize(ENV_RUNTIME_DIAL9_ROTATION_COUNT, DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT),
+            max_file_size,
+            rotation_count,
             s3_bucket: get_env_opt_str(ENV_RUNTIME_DIAL9_S3_BUCKET).filter(|s| !s.is_empty()),
             s3_prefix: get_env_opt_str(ENV_RUNTIME_DIAL9_S3_PREFIX).filter(|s| !s.is_empty()),
             sampling_rate: get_env_f64(ENV_RUNTIME_DIAL9_SAMPLING_RATE, DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE).clamp(0.0, 1.0),
@@ -282,8 +319,12 @@ pub fn build_traced_runtime(
 
     // Create rotating writer (synchronous for runtime building)
     let base_path = config.base_path();
-    let writer = RotatingWriter::new(base_path, config.max_file_size, config.max_file_size * config.rotation_count as u64)
-        .map_err(|e| TelemetryError::Io(format!("Failed to create RotatingWriter: {}", e)))?;
+    let writer = RotatingWriter::new(
+        base_path,
+        config.max_file_size,
+        dial9_total_rotation_size(config.max_file_size, config.rotation_count),
+    )
+    .map_err(|e| TelemetryError::Io(format!("Failed to create RotatingWriter: {}", e)))?;
 
     // Build traced runtime
     // Note: sampling_rate and S3 upload settings are reserved for future use
@@ -317,6 +358,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.base_path(), PathBuf::from("/tmp/telemetry/rustfs"));
+    }
+
+    #[test]
+    fn test_dial9_sanitizers_reject_zero_values() {
+        assert_eq!(sanitize_dial9_max_file_size(0), 1);
+        assert_eq!(sanitize_dial9_rotation_count(0), 1);
+    }
+
+    #[test]
+    fn test_dial9_total_rotation_size_saturates() {
+        assert_eq!(dial9_total_rotation_size(u64::MAX, 2), u64::MAX);
     }
 
     #[test]

@@ -40,6 +40,12 @@ use tracing::{debug, error, info, warn};
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
 const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const MAX_RETENTION_DAYS_BEFORE_SATURATION: u64 = u64::MAX / SECONDS_PER_DAY;
+
+fn compressed_file_retention_window(days: u64) -> Duration {
+    Duration::from_secs(days.saturating_mul(SECONDS_PER_DAY))
+}
 
 #[derive(Debug)]
 struct CompressionTaskResult {
@@ -231,7 +237,18 @@ impl LogCleaner {
 
     /// Select compressed archives whose age exceeds the archive retention window.
     fn select_expired_compressed(&self, files: &mut [FileInfo]) -> Vec<FileInfo> {
-        let retention = Duration::from_secs(self.compressed_file_retention_days * 24 * 3600);
+        if self.compressed_file_retention_days > MAX_RETENTION_DAYS_BEFORE_SATURATION {
+            warn!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                result = "retention_days_saturated",
+                configured_days = self.compressed_file_retention_days,
+                fallback_days = MAX_RETENTION_DAYS_BEFORE_SATURATION,
+                "log cleaner state changed"
+            );
+        }
+        let retention = compressed_file_retention_window(self.compressed_file_retention_days);
         let now = SystemTime::now();
         let mut expired = Vec::new();
 
@@ -783,5 +800,33 @@ impl LogCleanerBuilder {
             zstd_fallback_to_gzip: self.zstd_fallback_to_gzip,
             zstd_workers: self.zstd_workers.max(1),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_RETENTION_DAYS_BEFORE_SATURATION, SECONDS_PER_DAY, compressed_file_retention_window};
+    use std::time::Duration;
+
+    #[test]
+    fn compressed_file_retention_window_scales_days_without_wrap() {
+        assert_eq!(compressed_file_retention_window(3), Duration::from_secs(3 * SECONDS_PER_DAY));
+    }
+
+    #[test]
+    fn compressed_file_retention_window_saturates_on_large_values() {
+        assert_eq!(compressed_file_retention_window(u64::MAX), Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn retention_day_saturation_boundary_is_safe() {
+        assert_eq!(
+            compressed_file_retention_window(MAX_RETENTION_DAYS_BEFORE_SATURATION),
+            Duration::from_secs(MAX_RETENTION_DAYS_BEFORE_SATURATION * SECONDS_PER_DAY)
+        );
+        assert_eq!(
+            compressed_file_retention_window(MAX_RETENTION_DAYS_BEFORE_SATURATION.saturating_add(1)),
+            Duration::from_secs(u64::MAX)
+        );
     }
 }
