@@ -126,12 +126,6 @@ pub fn record_capacity_timeout_fallback() {
     counter!("rustfs_capacity_timeout_fallback").increment(1);
 }
 
-/// Record stall detection event.
-#[inline(always)]
-pub fn record_capacity_stall_detected() {
-    counter!("rustfs_capacity_timeout_stall").increment(1);
-}
-
 /// Record dynamic timeout usage.
 #[inline(always)]
 pub fn record_capacity_dynamic_timeout(timeout: Duration) {

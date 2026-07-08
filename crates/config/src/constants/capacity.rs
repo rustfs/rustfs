@@ -57,9 +57,6 @@ pub const ENV_CAPACITY_MIN_TIMEOUT: &str = "RUSTFS_CAPACITY_MIN_TIMEOUT";
 /// Environment variable for maximum capacity calculation timeout
 pub const ENV_CAPACITY_MAX_TIMEOUT: &str = "RUSTFS_CAPACITY_MAX_TIMEOUT";
 
-/// Environment variable for progress stall detection timeout
-pub const ENV_CAPACITY_STALL_TIMEOUT: &str = "RUSTFS_CAPACITY_STALL_TIMEOUT";
-
 // ============================================================================
 // Default Values
 // ============================================================================
@@ -116,10 +113,6 @@ pub const DEFAULT_CAPACITY_MIN_TIMEOUT_SECS: u64 = 2;
 /// Default: 15 seconds
 pub const DEFAULT_CAPACITY_MAX_TIMEOUT_SECS: u64 = 15;
 
-/// Progress stall detection timeout in seconds
-/// Default: 20 seconds
-pub const DEFAULT_CAPACITY_STALL_TIMEOUT_SECS: u64 = 20;
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -143,6 +136,5 @@ mod tests {
         assert_eq!(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, "RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT");
         assert_eq!(ENV_CAPACITY_MIN_TIMEOUT, "RUSTFS_CAPACITY_MIN_TIMEOUT");
         assert_eq!(ENV_CAPACITY_MAX_TIMEOUT, "RUSTFS_CAPACITY_MAX_TIMEOUT");
-        assert_eq!(ENV_CAPACITY_STALL_TIMEOUT, "RUSTFS_CAPACITY_STALL_TIMEOUT");
     }
 }
