@@ -279,6 +279,7 @@ impl<'a> MultiWriter<'a> {
     }
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        crate::hp_guard!("MultiWriter::shutdown");
         {
             let mut futures = FuturesUnordered::new();
             for (writer_opt, err) in self.writers.iter_mut().zip(self.errs.iter_mut()) {
