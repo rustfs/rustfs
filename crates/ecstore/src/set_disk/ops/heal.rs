@@ -977,7 +977,12 @@ impl SetDisks {
         object: &str,
         version_id: &str,
     ) -> HealResultItem {
-        let disk_len = { self.disks.read().await.len() };
+        // Take a single snapshot of the disk vector and drive both `disk_len` and
+        // the per-drive loop below from it, so the reported `disk_count` and the
+        // pushed drive records always agree (previously two independent
+        // `self.disks.read()` calls could observe different lengths).
+        let disks = self.disks.read().await;
+        let disk_len = disks.len();
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Object.to_string(),
             bucket: bucket.to_string(),
@@ -996,7 +1001,11 @@ impl SetDisks {
 
         result.data_blocks = disk_len - result.parity_blocks;
 
-        for (index, disk) in self.disks.read().await.iter().enumerate() {
+        // `errs` is index-aligned with the disk vector; only the online path below
+        // indexes into it (the offline branch `continue`s before touching it).
+        debug_assert_eq!(errs.len(), disk_len, "errs length must match the disk count");
+
+        for (index, disk) in disks.iter().enumerate() {
             if disk.is_none() {
                 result.before.drives.push(HealDriveInfo {
                     uuid: "".to_string(),
@@ -1009,6 +1018,10 @@ impl SetDisks {
                     endpoint: self.set_endpoints[index].to_string(),
                     state: DriveState::Offline.to_string(),
                 });
+                // Offline disks contribute exactly one record; without this the
+                // control flow fell through and pushed a second (Corrupt) record
+                // for the same disk, doubling the list and breaking index alignment.
+                continue;
             }
 
             let mut drive_state = DriveState::Corrupt;
@@ -1209,5 +1222,153 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         // Multipart orphan reconciliation is intentionally retained above the set layer
         // until there is a concrete caller and a stable lower-level contract to implement.
         Err(StorageError::NotImplemented)
+    }
+}
+
+#[cfg(test)]
+mod heal_result_report_tests {
+    use super::SetDisks;
+    use crate::disk::endpoint::Endpoint;
+    use crate::disk::error::DiskError;
+    use crate::disk::format::FormatV3;
+    use crate::disk::{DiskOption, DiskStore, new_disk};
+    use rustfs_common::heal_channel::DriveState;
+    use rustfs_filemeta::FileInfo;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    async fn real_disk() -> (TempDir, Endpoint, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+        (dir, endpoint, disk)
+    }
+
+    async fn set_disks_with(
+        disks: Vec<Option<DiskStore>>,
+        endpoints: Vec<Endpoint>,
+        default_parity_count: usize,
+    ) -> Arc<SetDisks> {
+        let set_drive_count = disks.len();
+        SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            set_drive_count,
+            default_parity_count,
+            0,
+            0,
+            endpoints,
+            FormatV3::new(1, set_drive_count),
+            vec![],
+        )
+        .await
+    }
+
+    // Regression for #955: an offline disk must contribute exactly one drive
+    // record. Before the fix the offline branch fell through and pushed a second
+    // (Corrupt) record for the same disk, so `before/after.drives` grew to
+    // `disk_count + offline_count` and every entry after the first offline slot
+    // was misaligned relative to its disk index.
+    #[tokio::test]
+    async fn default_heal_result_reports_one_record_per_disk_and_stays_aligned() {
+        // index 0: online, no error       -> Ok
+        // index 1: offline (None)         -> Offline (single record)
+        // index 2: online, FileNotFound   -> Missing
+        // index 3: online, DiskAccessDenied-> Corrupt
+        let (_d0, ep0, disk0) = real_disk().await;
+        let (_d2, ep2, disk2) = real_disk().await;
+        let (_d3, ep3, disk3) = real_disk().await;
+        let ep1 = Endpoint::try_from("http://127.0.0.1:9001/data").expect("endpoint should parse");
+
+        let disks = vec![Some(disk0), None, Some(disk2), Some(disk3)];
+        let endpoints = vec![ep0, ep1, ep2, ep3];
+        let set = set_disks_with(disks, endpoints, 1).await;
+
+        let errs = vec![
+            None,
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::FileNotFound),
+            Some(DiskError::DiskAccessDenied),
+        ];
+
+        let result = set
+            .default_heal_result(FileInfo::default(), &errs, "bucket", "object", "")
+            .await;
+
+        // Exactly one record per disk (not disk_count + offline_count).
+        assert_eq!(result.disk_count, 4);
+        assert_eq!(result.before.drives.len(), 4, "one before record per disk");
+        assert_eq!(result.after.drives.len(), 4, "one after record per disk");
+
+        // Records stay index-aligned with the disk vector and set_endpoints.
+        let expected_states = [
+            DriveState::Ok.to_string(),
+            DriveState::Offline.to_string(),
+            DriveState::Missing.to_string(),
+            DriveState::Corrupt.to_string(),
+        ];
+        for (i, expected) in expected_states.iter().enumerate() {
+            assert_eq!(&result.before.drives[i].state, expected, "before state at {i}");
+            assert_eq!(&result.after.drives[i].state, expected, "after state at {i}");
+            assert_eq!(
+                result.before.drives[i].endpoint,
+                set.set_endpoints[i].to_string(),
+                "before endpoint aligned at {i}"
+            );
+            assert_eq!(
+                result.after.drives[i].endpoint,
+                set.set_endpoints[i].to_string(),
+                "after endpoint aligned at {i}"
+            );
+        }
+
+        // The offline endpoint appears exactly once, never as a second Corrupt row.
+        let offline_ep = set.set_endpoints[1].to_string();
+        assert_eq!(
+            result.before.drives.iter().filter(|d| d.endpoint == offline_ep).count(),
+            1,
+            "offline disk must not produce a duplicate record"
+        );
+    }
+
+    // Two interleaved offline disks: assert every record still maps to its own
+    // set_endpoints[index] (no cumulative drift after the first offline slot).
+    #[tokio::test]
+    async fn default_heal_result_alignment_with_multiple_offline_disks() {
+        let (_d1, ep1, disk1) = real_disk().await;
+        let (_d3, ep3, disk3) = real_disk().await;
+        let ep0 = Endpoint::try_from("http://127.0.0.1:9000/data").expect("endpoint should parse");
+        let ep2 = Endpoint::try_from("http://127.0.0.1:9002/data").expect("endpoint should parse");
+
+        // index 0 offline, 1 online, 2 offline, 3 online.
+        let disks = vec![None, Some(disk1), None, Some(disk3)];
+        let endpoints = vec![ep0, ep1, ep2, ep3];
+        let set = set_disks_with(disks, endpoints, 1).await;
+
+        let errs = vec![Some(DiskError::DiskNotFound), None, Some(DiskError::DiskNotFound), None];
+
+        let result = set
+            .default_heal_result(FileInfo::default(), &errs, "bucket", "object", "")
+            .await;
+
+        assert_eq!(result.before.drives.len(), 4);
+        assert_eq!(result.after.drives.len(), 4);
+        for i in 0..4 {
+            assert_eq!(result.before.drives[i].endpoint, set.set_endpoints[i].to_string(), "aligned at {i}");
+        }
+        assert_eq!(result.before.drives[0].state, DriveState::Offline.to_string());
+        assert_eq!(result.before.drives[1].state, DriveState::Ok.to_string());
+        assert_eq!(result.before.drives[2].state, DriveState::Offline.to_string());
+        assert_eq!(result.before.drives[3].state, DriveState::Ok.to_string());
     }
 }

@@ -47,7 +47,7 @@ use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::heal_channel::{DriveState, HealItemType};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
-use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
+use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -868,14 +868,15 @@ impl crate::storage_api_contracts::heal::HealOperations for Sets {
             set_count: self.set_count,
             ..Default::default()
         };
+        // One drive record per endpoint (`formats_to_drives_info` returns exactly
+        // N entries). Assign directly instead of pre-filling N defaults and then
+        // pushing N real entries: the old form produced a 2N-long list whose empty
+        // placeholder half received the healed uuid/Ok updates below (indexed by
+        // `i * set_drive_count + j`, i.e. 0..N), leaving the real drive entries
+        // never marked healed. Mirrors the set-level `heal_format`.
         let before_derives = formats_to_drives_info(&self.endpoints.endpoints, &formats, &errs);
-        res.before.drives = vec![HealDriveInfo::default(); before_derives.len()];
-        res.after.drives = vec![HealDriveInfo::default(); before_derives.len()];
-
-        for v in before_derives.iter() {
-            res.before.drives.push(v.clone());
-            res.after.drives.push(v.clone());
-        }
+        res.before.drives = before_derives.clone();
+        res.after.drives = before_derives;
         if count_errs(&errs, &DiskError::UnformattedDisk) == 0 {
             info!("disk formats success, NoHealRequired, errs: {:?}", errs);
             return Ok((res, Some(StorageError::NoHealRequired)));
@@ -1317,5 +1318,132 @@ mod tests {
             .await
             .expect_err("abandoned-parts ownership should stay above the pool/set storage layers");
         assert!(matches!(err, StorageError::NotImplemented));
+    }
+
+    // Builds a single-set `Sets` over `SET_DRIVE_COUNT` local temp-dir disks,
+    // formatting the first `num_formatted` of them against a shared reference
+    // format and leaving the rest unformatted. Returns the live TempDir handles
+    // (must be kept alive), the reference format, and the assembled `Sets`.
+    // `disk_set` is intentionally empty: these tests only drive `heal_format`
+    // with `dry_run == true`, which never touches `disk_set`.
+    async fn setup_heal_format_sets(num_formatted: usize) -> (Vec<tempfile::TempDir>, FormatV3, Sets) {
+        const SET_DRIVE_COUNT: usize = 3;
+        let ref_format = FormatV3::new(1, SET_DRIVE_COUNT);
+
+        let mut dirs = Vec::with_capacity(SET_DRIVE_COUNT);
+        let mut endpoints = Vec::with_capacity(SET_DRIVE_COUNT);
+        for i in 0..SET_DRIVE_COUNT {
+            let dir = tempfile::tempdir().expect("tempdir should be created");
+            let mut endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(i);
+            dirs.push(dir);
+            endpoints.push(endpoint);
+        }
+
+        for (i, endpoint) in endpoints.iter().enumerate().take(num_formatted) {
+            let disk = new_disk(
+                endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("disk should be created");
+            let mut disk_format = ref_format.clone();
+            disk_format.erasure.this = ref_format.erasure.sets[0][i];
+            save_format_file(&Some(disk), &Some(disk_format))
+                .await
+                .expect("format should be saved");
+        }
+
+        let sets = Sets {
+            id: ref_format.id,
+            disk_set: Vec::new(),
+            pool_idx: 0,
+            endpoints: PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: SET_DRIVE_COUNT,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: String::new(),
+                platform: String::new(),
+            },
+            format: ref_format.clone(),
+            parity_count: 1,
+            set_count: 1,
+            set_drive_count: SET_DRIVE_COUNT,
+            default_parity_count: 1,
+            distribution_algo: DistributionAlgoVersion::V1,
+            exit_signal: None,
+            ctx: bootstrap_ctx(),
+        };
+
+        (dirs, ref_format, sets)
+    }
+
+    // Regression for #956 (NoHealRequired path): with every disk already
+    // formatted, `heal_format` reports exactly one drive record per disk
+    // (N = set_count * set_drive_count), each carrying a real endpoint. Before
+    // the fix the list was pre-filled with N empty placeholders and then N real
+    // entries were pushed, yielding a 2N list whose first half was blank.
+    #[tokio::test]
+    #[serial]
+    async fn heal_format_no_heal_required_reports_one_record_per_disk() {
+        let (_dirs, _ref_format, sets) = setup_heal_format_sets(3).await;
+
+        let (res, err) = sets.heal_format(true).await.expect("heal_format should succeed");
+        // All disks formatted -> NoHealRequired early return, still returns `res`.
+        assert!(matches!(err, Some(StorageError::NoHealRequired)), "expected NoHealRequired, got {err:?}");
+
+        assert_eq!(res.before.drives.len(), 3, "before drives must be N, not 2N");
+        assert_eq!(res.after.drives.len(), 3, "after drives must be N, not 2N");
+        for (i, d) in res.before.drives.iter().enumerate() {
+            assert!(
+                !d.endpoint.is_empty(),
+                "before drive {i} endpoint must not be empty (no placeholder rows)"
+            );
+            assert_eq!(d.state, DriveState::Ok.to_string(), "formatted disk {i} must be Ok");
+        }
+        for (i, d) in res.after.drives.iter().enumerate() {
+            assert!(!d.endpoint.is_empty(), "after drive {i} endpoint must not be empty (no placeholder rows)");
+        }
+    }
+
+    // Regression for #956 (heal path): with one unformatted disk the heal path is
+    // taken (past the NoHealRequired check). Even here the reported drive list is
+    // length N (never 2N) and index-aligned with the endpoints, so the healed
+    // status updates (indexed `i * set_drive_count + j`, 0..N) address the real
+    // drive entries rather than an empty placeholder half. `dry_run == true` keeps
+    // the assertion on the reported shape without mutating disks or global state.
+    #[tokio::test]
+    #[serial]
+    async fn heal_format_heal_path_reports_one_record_per_disk_aligned() {
+        // Disks 0 and 1 formatted (quorum), disk 2 unformatted.
+        let (_dirs, _ref_format, sets) = setup_heal_format_sets(2).await;
+
+        let (res, err) = sets.heal_format(true).await.expect("heal_format should succeed");
+        // Unformatted disk present -> heal path, not NoHealRequired.
+        assert!(err.is_none(), "expected heal path (no NoHealRequired), got {err:?}");
+
+        assert_eq!(res.before.drives.len(), 3, "before drives must be N, not 2N");
+        assert_eq!(res.after.drives.len(), 3, "after drives must be N, not 2N");
+
+        // Every record maps to a real endpoint; the drive list is index-aligned
+        // with `formats_to_drives_info`, so no empty placeholder half remains.
+        for (i, d) in res.before.drives.iter().enumerate() {
+            assert!(!d.endpoint.is_empty(), "before drive {i} endpoint must not be empty");
+        }
+        assert_eq!(res.before.drives[0].state, DriveState::Ok.to_string());
+        assert_eq!(res.before.drives[1].state, DriveState::Ok.to_string());
+        // The unformatted disk is reported Missing on its own (real) entry.
+        assert_eq!(
+            res.before.drives[2].state,
+            DriveState::Missing.to_string(),
+            "unformatted disk must be Missing on its real index, not on a placeholder"
+        );
     }
 }
