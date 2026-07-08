@@ -164,8 +164,9 @@ pub use process_lock_metrics::{
 };
 pub use s3_api_metrics::{init_s3_metrics, record_s3_op};
 pub use sampler::{
-    ProcessResourceSnapshot, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_platform, snapshot_process_resource,
-    snapshot_process_resource_and_system, snapshot_process_system,
+    ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_platform,
+    snapshot_process_resource, snapshot_process_resource_and_system, snapshot_process_resource_and_system_with,
+    snapshot_process_system,
 };
 pub use system_path_metrics::record_system_path_failure;
 
