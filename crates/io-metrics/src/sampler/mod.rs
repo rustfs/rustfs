@@ -16,7 +16,7 @@ pub mod process;
 pub mod system;
 
 pub use process::{
-    ProcessResourceSnapshot, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_resource,
-    snapshot_process_resource_and_system, snapshot_process_system,
+    ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_resource,
+    snapshot_process_resource_and_system, snapshot_process_resource_and_system_with, snapshot_process_system,
 };
 pub use system::snapshot_process_platform;
