@@ -3463,6 +3463,7 @@ mod tests {
             "test-object-class",
             "test-size-bucket",
             false,
+            false,
         )
         .await;
         assert!(oversized.is_err(), "part_length > part_size must be rejected");
@@ -3481,6 +3482,7 @@ mod tests {
             false,
             "test-object-class",
             "test-size-bucket",
+            false,
             false,
         )
         .await;
