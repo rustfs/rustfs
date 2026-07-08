@@ -1141,6 +1141,24 @@ fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOpti
     headers
 }
 
+/// Resolve the S3 `versionId` query parameter for a target DELETE.
+///
+/// A replication delete omits the `versionId` query param ONLY when it is
+/// propagating a delete-marker CREATION (`replication_delete_marker`), so the
+/// target mints its own marker. A version purge / delete-marker purge / force
+/// delete must address the exact version — otherwise a generic (non-MinIO /
+/// non-RustFS) S3 target ignores the internal `x-*-source-version-id` header
+/// and silently creates a delete marker instead of removing the version, while
+/// the source stamps `VersionPurgeStatus=Complete` (backlog#799 B8 / #857).
+/// Non-replication callers always pass the version through unchanged.
+fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
+    if opts.replication_request && opts.replication_delete_marker {
+        None
+    } else {
+        version_id
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AdvancedPutOptions {
     pub source_version_id: String,
@@ -1719,7 +1737,7 @@ impl TargetClient {
         opts: RemoveObjectOptions,
     ) -> Result<(), S3ClientError> {
         let headers = build_remove_object_headers(version_id.as_deref(), &opts);
-        let api_version_id = if opts.replication_request { None } else { version_id };
+        let api_version_id = resolve_delete_api_version_id(version_id, &opts);
 
         match self
             .client
@@ -1943,6 +1961,54 @@ mod tests {
             rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
             "delete-marker version purges must not masquerade as delete-marker creations"
         );
+    }
+
+    fn remove_opts(replication_request: bool, replication_delete_marker: bool) -> RemoveObjectOptions {
+        RemoveObjectOptions {
+            force_delete: false,
+            governance_bypass: false,
+            replication_delete_marker,
+            replication_mtime: None,
+            replication_status: ReplicationStatusType::Replica,
+            replication_request,
+            replication_validity_check: false,
+        }
+    }
+
+    #[test]
+    fn version_purge_sends_versionid_query_param_to_generic_target() {
+        // A replication VERSION PURGE (delete_marker=false) must carry the S3
+        // `?versionId=` query param so a generic S3 target removes that exact
+        // version instead of silently creating a delete marker (backlog#799 B8).
+        let vid = Uuid::new_v4().to_string();
+        let got = resolve_delete_api_version_id(Some(vid.clone()), &remove_opts(true, false));
+        assert_eq!(got.as_deref(), Some(vid.as_str()));
+    }
+
+    #[test]
+    fn delete_marker_propagation_omits_versionid_query_param() {
+        // Propagating a delete-marker CREATION (delete_marker=true): the target
+        // must mint its own marker, so no `versionId` query param is sent.
+        let vid = Uuid::new_v4().to_string();
+        let got = resolve_delete_api_version_id(Some(vid), &remove_opts(true, true));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn non_replication_delete_passes_version_through() {
+        let vid = Uuid::new_v4().to_string();
+        let got = resolve_delete_api_version_id(Some(vid.clone()), &remove_opts(false, false));
+        assert_eq!(got.as_deref(), Some(vid.as_str()));
+    }
+
+    #[test]
+    fn delete_marker_purge_addresses_exact_version() {
+        // Purging a specific delete-marker version on the target
+        // (replication_delete_marker_purge_remove_options → delete_marker=false)
+        // must target that version, not degenerate to a new marker.
+        let vid = Uuid::new_v4().to_string();
+        let got = resolve_delete_api_version_id(Some(vid.clone()), &remove_opts(true, false));
+        assert_eq!(got.as_deref(), Some(vid.as_str()));
     }
 
     #[test]
