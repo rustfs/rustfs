@@ -284,6 +284,24 @@ impl SizeHistogram {
     }
 
     pub fn to_map(&self) -> HashMap<String, u64> {
+        // Numeric interval bounds, kept in lockstep with `add` above. The
+        // rollup for the v1-compat `BETWEEN_1024B_AND_1_MB` bucket is derived
+        // from these bounds rather than the display names to avoid undercounting
+        // the sub-ranges in [1 KiB, 512 KiB).
+        const ONE_MIB: u64 = 1024 * 1024;
+        let intervals = [
+            (0, 1024),                          // LESS_THAN_1024_B
+            (1024, 64 * 1024 - 1),              // BETWEEN_1024_B_AND_64_KB
+            (64 * 1024, 256 * 1024 - 1),        // BETWEEN_64_KB_AND_256_KB
+            (256 * 1024, 512 * 1024 - 1),       // BETWEEN_256_KB_AND_512_KB
+            (512 * 1024, ONE_MIB - 1),          // BETWEEN_512_KB_AND_1_MB
+            (1024, ONE_MIB - 1),                // BETWEEN_1024B_AND_1_MB (v1-compat rollup)
+            (ONE_MIB, 10 * ONE_MIB - 1),        // BETWEEN_1_MB_AND_10_MB
+            (10 * ONE_MIB, 64 * ONE_MIB - 1),   // BETWEEN_10_MB_AND_64_MB
+            (64 * ONE_MIB, 128 * ONE_MIB - 1),  // BETWEEN_64_MB_AND_128_MB
+            (128 * ONE_MIB, 512 * ONE_MIB - 1), // BETWEEN_128_MB_AND_512_MB
+            (512 * ONE_MIB, u64::MAX),          // GREATER_THAN_512_MB
+        ];
         let names = [
             "LESS_THAN_1024_B",
             "BETWEEN_1024_B_AND_64_KB",
@@ -298,14 +316,21 @@ impl SizeHistogram {
             "GREATER_THAN_512_MB",
         ];
 
+        // Sum every sub-bucket whose interval lies entirely within [1024, 1 MiB),
+        // excluding the compat bucket itself, to form the v1-compat rollup.
+        let compat_rollup: u64 = self
+            .0
+            .iter()
+            .zip(intervals.iter())
+            .zip(names.iter())
+            .filter(|((_, (start, end)), name)| name != &&"BETWEEN_1024B_AND_1_MB" && *start >= 1024 && *end < ONE_MIB)
+            .map(|((count, _), _)| *count)
+            .sum();
+
         let mut res = HashMap::new();
-        let mut spl_count = 0;
         for (count, name) in self.0.iter().zip(names.iter()) {
             if name == &"BETWEEN_1024B_AND_1_MB" {
-                res.insert(name.to_string(), spl_count);
-            } else if name.starts_with("BETWEEN_") && name.contains("_KB_") && name.contains("_MB") {
-                spl_count += count;
-                res.insert(name.to_string(), *count);
+                res.insert(name.to_string(), compat_rollup);
             } else {
                 res.insert(name.to_string(), *count);
             }
@@ -1316,6 +1341,24 @@ mod tests {
 
         assert_eq!(summary1.total_size, 300);
         assert_eq!(summary1.versions, 15);
+    }
+
+    #[test]
+    fn test_size_histogram_compat_rollup_sums_all_sub_buckets() {
+        let mut hist = SizeHistogram::default();
+        // One object in each of the four sub-ranges within [1024, 1 MiB).
+        hist.add(32 * 1024); // [1024, 64 KiB)
+        hist.add(128 * 1024); // [64 KiB, 256 KiB)
+        hist.add(384 * 1024); // [256 KiB, 512 KiB)
+        hist.add(768 * 1024); // [512 KiB, 1 MiB)
+
+        let map = hist.to_map();
+
+        assert_eq!(map["BETWEEN_1024B_AND_1_MB"], 4);
+        assert_eq!(map["BETWEEN_1024_B_AND_64_KB"], 1);
+        assert_eq!(map["BETWEEN_64_KB_AND_256_KB"], 1);
+        assert_eq!(map["BETWEEN_256_KB_AND_512_KB"], 1);
+        assert_eq!(map["BETWEEN_512_KB_AND_1_MB"], 1);
     }
 
     #[test]
