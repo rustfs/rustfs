@@ -495,6 +495,8 @@ mod read;
 mod replication;
 pub(crate) mod shard_source;
 
+pub use ops::heal_walk::HealWalkVersion;
+
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
 /// Lock acquisition timeout. Cached: this is consulted on every object

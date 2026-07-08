@@ -579,12 +579,26 @@ impl ErasureSetHealer {
             Self::effective_heal_page_object_concurrency_for_source(self.source, self.heal_opts.scan_mode);
         let in_flight = Arc::new(AtomicUsize::new(0));
 
+        // backlog#920: select the per-erasure-set DISK-WALK union enumerator when
+        // the scan is Deep OR the request came from AutoHeal — these are the paths
+        // that must repair sub-quorum-but-reconstructable versions. Every other
+        // (Normal, non-AutoHeal) request keeps the unchanged B5 read-quorum path,
+        // which stays the default.
+        let use_disk_walk =
+            matches!(self.heal_opts.scan_mode, HealScanMode::Deep) || matches!(self.source, HealRequestSource::AutoHeal);
+
         loop {
             // Get one page of object versions
-            let (objects, next_token, is_truncated) = self
-                .storage
-                .list_objects_for_heal_page(bucket, "", continuation_token.as_deref())
-                .await?;
+            let (objects, next_token, is_truncated) = if use_disk_walk {
+                self.storage
+                    .list_versions_for_heal_page_disk_walk(set_disk_id, bucket, "", continuation_token.as_deref())
+                    .await?
+            } else {
+                self.storage
+                    .list_objects_for_heal_page(bucket, "", continuation_token.as_deref())
+                    .await?
+            };
+            let page_is_empty = objects.is_empty();
             let checkpoint = checkpoint_manager.get_checkpoint().await;
             let page_resume_index = *current_object_index;
             let semaphore = Arc::new(Semaphore::new(page_concurrency_limit));
@@ -777,6 +791,15 @@ impl ErasureSetHealer {
             // Check if there are more pages
             if !is_truncated {
                 break;
+            }
+
+            // Anti-loop guard: an empty page reported as truncated cannot advance
+            // the cursor (there is no last identity to move past), so treat it as a
+            // non-advancing listing and abort rather than spin forever.
+            if page_is_empty {
+                return Err(Error::other(format!(
+                    "Erasure set heal listing for bucket {bucket} returned an empty page marked truncated; aborting to avoid an infinite loop"
+                )));
             }
 
             // Anti-loop guard: if the backend keeps reporting truncation but the

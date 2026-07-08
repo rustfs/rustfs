@@ -182,6 +182,78 @@ pub(crate) fn decode_heal_token(token: &str) -> (Option<String>, Option<String>)
     (payload.m, payload.v)
 }
 
+const DISK_WALK_TOKEN_PREFIX: &str = "dw1:";
+
+/// Encode the disk-walk resume cursor (`next_forward` object key) into an opaque
+/// continuation token: `"dw1:" + base64url_nopad(forward)`.
+///
+/// The `dw1:` namespace is DISJOINT from the B5 `v1:` token namespace so the two
+/// enumerators can never misread each other's cursor: a `dw1:` token decodes to
+/// `(None, None)` under the B5 decoder, and a `v1:` token decodes to `None` here.
+pub(crate) fn encode_disk_walk_token(next_forward: &str) -> String {
+    format!("{DISK_WALK_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(next_forward.as_bytes()))
+}
+
+/// Decode a disk-walk continuation token back into the `next_forward` object key.
+///
+/// TOTAL function: an empty token, a missing `"dw1:"` prefix (including a foreign
+/// B5 `v1:` token), invalid base64, or invalid UTF-8 all decode to `None` (start
+/// the walk from the beginning). This makes a restart across an enumerator switch
+/// idempotent rather than corrupting.
+pub(crate) fn decode_disk_walk_token(token: &str) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+
+    let Some(encoded) = token.strip_prefix(DISK_WALK_TOKEN_PREFIX) else {
+        warn!(
+            target: "rustfs::heal::storage",
+            event = EVENT_HEAL_STORAGE_ADMIN_OP,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_STORAGE,
+            operation = "decode_disk_walk_token",
+            state = "foreign_or_missing_prefix",
+            "Disk-walk continuation token missing dw1 prefix; restarting walk"
+        );
+        return None;
+    };
+
+    let bytes = match URL_SAFE_NO_PAD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                target: "rustfs::heal::storage",
+                event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
+                operation = "decode_disk_walk_token",
+                state = "bad_base64",
+                error = %e,
+                "Disk-walk continuation token has invalid base64; restarting walk"
+            );
+            return None;
+        }
+    };
+
+    match String::from_utf8(bytes) {
+        Ok(forward) if !forward.is_empty() => Some(forward),
+        Ok(_) => None,
+        Err(e) => {
+            warn!(
+                target: "rustfs::heal::storage",
+                event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
+                operation = "decode_disk_walk_token",
+                state = "bad_utf8",
+                error = %e,
+                "Disk-walk continuation token has invalid utf8; restarting walk"
+            );
+            None
+        }
+    }
+}
+
 /// A single object version to heal.
 ///
 /// `is_delete_marker` is OBSERVABILITY-ONLY (metrics / logging / e2e
@@ -297,6 +369,26 @@ pub trait HealStorageAPI: Send + Sync {
         prefix: &str,
         continuation_token: Option<&str>,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)>;
+
+    /// List versions for healing via a per-erasure-set DISK-WALK union enumerator
+    /// (backlog#920). Unlike `list_objects_for_heal_page` (which reflects only the
+    /// READ-QUORUM metadata view via `list_object_versions`), this surfaces every
+    /// `(object, version)` present on ANY disk in the set identified by
+    /// `set_disk_id`, so sub-quorum-but-reconstructable versions are healed.
+    ///
+    /// The continuation token uses the disjoint `"dw1:"` namespace. The DEFAULT
+    /// implementation falls back to the read-quorum listing so mock/alternate
+    /// storages keep compiling and behaving; `ECStoreHealStorage` overrides it
+    /// with the real disk walk.
+    async fn list_versions_for_heal_page_disk_walk(
+        &self,
+        _set_disk_id: &str,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+        self.list_objects_for_heal_page(bucket, prefix, continuation_token).await
+    }
 
     /// Get disk for resume functionality
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore>;
@@ -1363,6 +1455,93 @@ impl HealStorageAPI for ECStoreHealStorage {
         Ok((page_objects, next_token, list_info.is_truncated))
     }
 
+    async fn list_versions_for_heal_page_disk_walk(
+        &self,
+        set_disk_id: &str,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<&str>,
+    ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+        // Per-page bounds for the disk-walk union enumerator. Objects are atomic
+        // (never split across pages), so version_budget only bounds how many
+        // versions accumulate before the page is cut at the next object boundary.
+        const BATCH_OBJECTS: usize = 1000;
+        const VERSION_BUDGET: usize = 10_000;
+
+        debug!(
+            target: "rustfs::heal::storage",
+            event = EVENT_HEAL_STORAGE_ADMIN_OP,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_STORAGE,
+            operation = "list_versions_for_heal_page_disk_walk",
+            set_disk_id,
+            bucket,
+            prefix,
+            continuation_token = ?continuation_token,
+            state = "started",
+            "Heal storage disk-walk union enumeration started"
+        );
+
+        let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+        // Decode the dw1: cursor into the forward_to object key. Malformed/foreign
+        // tokens restart the walk from the beginning (decode_disk_walk_token is total).
+        let forward_to = decode_disk_walk_token(continuation_token.unwrap_or(""));
+
+        let (versions, next_forward, is_truncated) = self
+            .ecstore
+            .heal_walk_versions_page(pool_idx, set_idx, bucket, prefix, forward_to.as_deref(), BATCH_OBJECTS, VERSION_BUDGET)
+            .await
+            .map_err(|e| {
+                error!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "list_versions_for_heal_page_disk_walk",
+                    set_disk_id,
+                    bucket,
+                    prefix,
+                    result = "failed",
+                    error = %e,
+                    "Heal storage disk-walk union enumeration failed"
+                );
+                Error::other(e)
+            })?;
+
+        let page_objects: Vec<HealListItem> = versions
+            .into_iter()
+            .map(|v| HealListItem {
+                name: v.name,
+                version_id: v.version_id,
+                is_delete_marker: v.is_delete_marker,
+            })
+            .collect();
+        let page_count = page_objects.len();
+
+        let next_token = if is_truncated {
+            next_forward.map(|fw| encode_disk_walk_token(&fw))
+        } else {
+            None
+        };
+
+        debug!(
+            target: "rustfs::heal::storage",
+            event = EVENT_HEAL_STORAGE_ADMIN_OP,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_STORAGE,
+            operation = "list_versions_for_heal_page_disk_walk",
+            set_disk_id,
+            bucket,
+            prefix,
+            version_count = page_count,
+            is_truncated,
+            state = "page_loaded",
+            "Heal storage disk-walk union enumeration page loaded"
+        );
+
+        Ok((page_objects, next_token, is_truncated))
+    }
+
     async fn get_disk_for_resume(&self, set_disk_id: &str) -> Result<DiskStore> {
         debug!(
             target: "rustfs::heal::storage",
@@ -1411,8 +1590,8 @@ impl HealStorageAPI for ECStoreHealStorage {
 mod tests {
     use super::super::StorageError;
     use super::{
-        decode_heal_token, encode_heal_token, is_transient_object_exists_error, is_transient_object_exists_message,
-        next_heal_listing_token,
+        decode_disk_walk_token, decode_heal_token, encode_disk_walk_token, encode_heal_token, is_transient_object_exists_error,
+        is_transient_object_exists_message, next_heal_listing_token,
     };
     use base64::Engine as _;
 
@@ -1479,6 +1658,37 @@ mod tests {
         let json = br#"{"m":null,"v":"orphan-version"}"#;
         let token = format!("v1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json));
         assert_eq!(decode_heal_token(&token), (None, None), "version-only marker must coerce to (None, None)");
+    }
+
+    #[test]
+    fn disk_walk_cursor_round_trip_and_foreign_token_restarts() {
+        // Round-trip: a real object key survives encode -> decode.
+        let token = encode_disk_walk_token("some/deep/object.bin");
+        assert!(token.starts_with("dw1:"));
+        assert_eq!(decode_disk_walk_token(&token), Some("some/deep/object.bin".to_string()));
+
+        // Empty / garbage / missing-prefix all restart the walk (None).
+        assert_eq!(decode_disk_walk_token(""), None);
+        assert_eq!(decode_disk_walk_token("dw1:!!!not-base64!!!"), None);
+        assert_eq!(decode_disk_walk_token("no-prefix-here"), None);
+
+        // CROSS-DECODER ISOLATION (both directions): a dw1 token must not be
+        // misread as a B5 (marker, version_marker) pair, and a v1 token must not
+        // be misread as a disk-walk forward cursor.
+        let dw = encode_disk_walk_token("obj/key");
+        assert_eq!(
+            decode_heal_token(&dw),
+            (None, None),
+            "a dw1: token must decode to (None, None) under the B5 decoder"
+        );
+
+        let v1 = encode_heal_token(Some("obj/key"), Some("v-123"));
+        assert!(v1.starts_with("v1:"));
+        assert_eq!(
+            decode_disk_walk_token(&v1),
+            None,
+            "a v1: token must decode to None under the disk-walk decoder"
+        );
     }
 
     #[test]
