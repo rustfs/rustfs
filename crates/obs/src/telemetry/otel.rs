@@ -115,56 +115,22 @@ pub(super) fn init_observability_http(
     // service identity and deployment metadata.
     let res = build_resource(config);
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME).to_owned();
-    let use_stdout = config.use_stdout.unwrap_or(!is_production);
+    let use_stdout = resolve_otlp_use_stdout(config.use_stdout, is_production);
     let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
     let sampler = build_tracer_sampler(sample_ratio);
 
     // ── Endpoint resolution ───────────────────────────────────────────────────
     // Each signal may have a dedicated endpoint; if absent, fall back to the
     // root endpoint with the standard OTLP path suffix appended.
-    let root_ep = config.endpoint.clone();
+    let root_ep = normalize_otlp_root_endpoint(&config.endpoint);
 
-    let trace_ep: String = config
-        .trace_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/traces")
-            } else {
-                String::new()
-            }
-        });
-
-    let metric_ep: String = config
-        .metric_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/metrics")
-            } else {
-                String::new()
-            }
-        });
+    let trace_ep = resolve_signal_endpoint(config.trace_endpoint.as_deref(), root_ep, "/v1/traces");
+    let metric_ep = resolve_signal_endpoint(config.metric_endpoint.as_deref(), root_ep, "/v1/metrics");
 
     // If `log_endpoint` is not explicitly set, fall back to `root_ep/v1/logs`
     // only when a root endpoint exists. An empty result intentionally triggers
     // the file-logging path below instead of silently disabling application logs.
-    let log_ep: String = config
-        .log_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/logs")
-            } else {
-                String::new()
-            }
-        });
+    let log_ep = resolve_signal_endpoint(config.log_endpoint.as_deref(), root_ep, "/v1/logs");
 
     // ── Tracer provider (HTTP) ────────────────────────────────────────────────
     let tracer_provider = build_tracer_provider(&trace_ep, config, res.clone(), sampler, use_stdout)?;
@@ -189,7 +155,7 @@ pub(super) fn init_observability_http(
         // Init OTLP logger logic.
         // We initialize the OTLP collector and honor the configured stdout setting
         // (e.g. via RUSTFS_OBS_USE_STDOUT / config.use_stdout) when building the provider.
-        logger_provider = build_logger_provider(&log_ep, config, res, false)?;
+        logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
 
         // Build bridge to capture `tracing` events.
         otel_bridge = logger_provider
@@ -385,10 +351,31 @@ fn build_tracer_provider(
 /// disappear due to configuration mistakes.
 fn build_tracer_sampler(sample_ratio: f64) -> Sampler {
     if sample_ratio.is_finite() && (0.0..=1.0).contains(&sample_ratio) {
-        Sampler::TraceIdRatioBased(sample_ratio)
+        Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(sample_ratio)))
     } else {
-        Sampler::AlwaysOn
+        Sampler::ParentBased(Box::new(Sampler::AlwaysOn))
     }
+}
+
+fn resolve_otlp_use_stdout(config_use_stdout: Option<bool>, is_production: bool) -> bool {
+    config_use_stdout.unwrap_or(!is_production)
+}
+
+fn normalize_otlp_root_endpoint(root_ep: &str) -> &str {
+    root_ep.trim_end_matches('/')
+}
+
+fn resolve_signal_endpoint(signal_endpoint: Option<&str>, root_ep: &str, suffix: &str) -> String {
+    signal_endpoint
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if root_ep.is_empty() {
+                String::new()
+            } else {
+                format!("{root_ep}{suffix}")
+            }
+        })
 }
 
 /// Build an optional [`SdkMeterProvider`] for the given metrics endpoint.
@@ -665,23 +652,33 @@ mod tests {
     /// Valid ratios should produce trace-id-ratio sampling.
     fn test_build_tracer_sampler_uses_trace_ratio_for_valid_values() {
         let sampler = build_tracer_sampler(0.0);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
 
         let sampler = build_tracer_sampler(1.0);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
 
         let sampler = build_tracer_sampler(0.5);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
     }
 
     #[test]
     /// Invalid ratios should degrade to the safest non-dropping sampler.
     fn test_build_tracer_sampler_rejects_invalid_ratio_with_always_on() {
         let sampler = build_tracer_sampler(-0.1);
-        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("AlwaysOn"));
 
         let sampler = build_tracer_sampler(1.2);
-        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("AlwaysOn"));
     }
 
     #[test]
@@ -712,6 +709,34 @@ mod tests {
         assert_eq!(resolve_signal_timeout(None, None), None);
         assert_eq!(resolve_signal_timeout(Some(0), None), None);
         assert_eq!(resolve_signal_timeout(None, Some(0)), None);
+    }
+
+    #[test]
+    fn test_normalize_otlp_root_endpoint_trims_trailing_slashes() {
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318/"), "http://collector:4318");
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318///"), "http://collector:4318");
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318"), "http://collector:4318");
+    }
+
+    #[test]
+    fn test_resolve_signal_endpoint_avoids_double_slashes() {
+        assert_eq!(
+            resolve_signal_endpoint(None, normalize_otlp_root_endpoint("http://collector:4318/"), "/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            resolve_signal_endpoint(Some("http://custom:4318/v1/custom"), "http://collector:4318", "/v1/traces"),
+            "http://custom:4318/v1/custom"
+        );
+        assert_eq!(resolve_signal_endpoint(None, "", "/v1/traces"), "");
+    }
+
+    #[test]
+    fn test_resolve_otlp_use_stdout_honors_config_or_environment_default() {
+        assert!(resolve_otlp_use_stdout(Some(true), true));
+        assert!(!resolve_otlp_use_stdout(Some(false), false));
+        assert!(resolve_otlp_use_stdout(None, false));
+        assert!(!resolve_otlp_use_stdout(None, true));
     }
 
     #[test]
