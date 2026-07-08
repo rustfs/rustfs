@@ -127,8 +127,8 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
         if cache_age < fast_update_threshold {
             record_capacity_cache_served("fresh");
             debug!(
-                "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={})",
-                cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated
+                "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={}, degraded={})",
+                cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated, cached.degraded
             );
             return cached.total_used;
         }
@@ -157,6 +157,7 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
                         duration_ms = elapsed.as_millis() as u64,
                         file_count = update.file_count,
                         is_estimated = update.is_estimated,
+                        degraded = update.degraded,
                         "Capacity refresh completed"
                     );
                     update.total_used
@@ -188,6 +189,7 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
             source = ?cached.source,
             file_count = cached.file_count,
             is_estimated = cached.is_estimated,
+            degraded = cached.degraded,
             needs_update,
             blocking = should_block,
             "Served cached capacity"
@@ -233,6 +235,7 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
                 duration_ms = elapsed.as_millis() as u64,
                 file_count = update.file_count,
                 is_estimated = update.is_estimated,
+                degraded = update.degraded,
                 "Capacity refresh completed"
             );
             update.total_used

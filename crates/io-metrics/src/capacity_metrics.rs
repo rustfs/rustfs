@@ -55,6 +55,13 @@ pub fn record_capacity_update_completed(source: &'static str, duration: Duration
     .increment(1);
 }
 
+/// Record a committed capacity reading that is degraded: the refresh behind it
+/// had partial disk failures, so some disks kept last-known values.
+#[inline(always)]
+pub fn record_capacity_degraded_reading(source: &'static str) {
+    counter!("rustfs_capacity_degraded_readings_total", "source" => source).increment(1);
+}
+
 /// Record failed capacity update.
 #[inline(always)]
 pub fn record_capacity_update_failed(source: &'static str) {
