@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::target::REDACTED_SECRET;
 use hashbrown::HashMap;
 use hyper::HeaderMap;
 use regex::Regex;
@@ -22,6 +23,25 @@ use std::path::Path;
 use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
+
+/// Request headers whose values carry credentials or session tokens and must
+/// never be serialized verbatim into audit/notification entries, which are
+/// forwarded to external sinks (webhook/kafka/file/...). Matched
+/// case-insensitively; hyper lowercases header names, but we normalize
+/// defensively so this stays correct for any caller.
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "x-amz-security-token",
+    "x-amz-content-sha256",
+    "cookie",
+    "set-cookie",
+];
+
+/// Returns true when the header name is credential-bearing and its value must
+/// be redacted before leaving the process.
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
 
 static HOST_LABEL_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").expect("operation should succeed"));
@@ -82,11 +102,19 @@ pub fn extract_req_params_header(head: &HeaderMap) -> HashMap<String, String> {
 }
 
 /// Extract parameters from hyper::HeaderMap, mainly header information.
+///
+/// Credential-bearing headers (see [`SENSITIVE_HEADERS`]) are redacted: the
+/// header name is preserved for correlation, but its value is replaced with
+/// [`REDACTED_SECRET`] so secrets never reach downstream audit/notification
+/// sinks. Non-sensitive headers keep their existing behavior.
 pub fn extract_params_header(head: &HeaderMap) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for (key, value) in head.iter() {
-        if let Ok(val_str) = value.to_str() {
-            params.insert(key.as_str().to_string(), val_str.to_string());
+        let name = key.as_str();
+        if is_sensitive_header(name) {
+            params.insert(name.to_string(), REDACTED_SECRET.to_string());
+        } else if let Ok(val_str) = value.to_str() {
+            params.insert(name.to_string(), val_str.to_string());
         }
     }
     params
@@ -431,6 +459,36 @@ pub fn is_conn_refused_err(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use hyper::header::HeaderValue;
+
+    #[test]
+    fn extract_params_header_redacts_credential_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=AKIA.../secret"));
+        headers.insert("x-amz-security-token", HeaderValue::from_static("FQoGZXIvYXdzE.../session-token"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static("e3b0c44298fc1c149afbf4c8996fb924"));
+        headers.insert("cookie", HeaderValue::from_static("session=abc123"));
+        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+        headers.insert("user-agent", HeaderValue::from_static("aws-cli/2.0"));
+
+        let params = extract_params_header(&headers);
+
+        // Sensitive headers keep their name for correlation but never leak the value.
+        for name in ["authorization", "x-amz-security-token", "x-amz-content-sha256", "cookie"] {
+            assert_eq!(params.get(name).map(String::as_str), Some(REDACTED_SECRET), "{name} must be redacted");
+        }
+        // Non-sensitive headers are preserved verbatim.
+        assert_eq!(params.get("content-type").map(String::as_str), Some("application/octet-stream"));
+        assert_eq!(params.get("user-agent").map(String::as_str), Some("aws-cli/2.0"));
+    }
+
+    #[test]
+    fn is_sensitive_header_matches_case_insensitively() {
+        assert!(is_sensitive_header("Authorization"));
+        assert!(is_sensitive_header("X-Amz-Security-Token"));
+        assert!(is_sensitive_header("X-AMZ-CONTENT-SHA256"));
+        assert!(!is_sensitive_header("content-type"));
+        assert!(!is_sensitive_header("x-amz-request-id"));
+    }
 
     #[test]
     fn test_get_request_port() {
