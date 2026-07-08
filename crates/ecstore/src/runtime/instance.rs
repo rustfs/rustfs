@@ -41,6 +41,7 @@
 
 use crate::layout::endpoints::SetupType;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
+use s3s::region::Region;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
@@ -66,6 +67,11 @@ pub struct InstanceContext {
     /// contend). Single-instance aliases the process singleton, so behavior is
     /// unchanged; see [`bootstrap_ctx`].
     lock_manager: Arc<GlobalLockManager>,
+    /// This instance's S3 region (Phase 5 Slice 4, backlog#939).
+    ///
+    /// Write-once like the process global it replaces: startup sets it exactly
+    /// once and a duplicate write fails fast (see [`InstanceContext::set_region`]).
+    region: OnceLock<Region>,
 }
 
 impl InstanceContext {
@@ -85,12 +91,28 @@ impl InstanceContext {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
             lock_manager,
+            region: OnceLock::new(),
         }
     }
 
     /// This instance's namespace lock manager.
     pub fn lock_manager(&self) -> Arc<GlobalLockManager> {
         self.lock_manager.clone()
+    }
+
+    /// Set this instance's S3 region.
+    ///
+    /// Write-once: panics on a second write, preserving the startup fail-fast
+    /// contract of the process global it replaces.
+    pub fn set_region(&self, region: Region) {
+        self.region
+            .set(region)
+            .expect("instance region should be initialized once during startup");
+    }
+
+    /// This instance's S3 region, if it has been set.
+    pub fn region(&self) -> Option<Region> {
+        self.region.get().cloned()
     }
 
     /// Update this instance's erasure setup type.
@@ -228,5 +250,39 @@ mod tests {
             !Arc::ptr_eq(&ctx_a.lock_manager(), &ctx_b.lock_manager()),
             "fresh contexts must not share a lock manager"
         );
+    }
+
+    fn region(name: &str) -> Region {
+        name.parse().expect("valid test region")
+    }
+
+    // A fresh context has no region until set; set-then-get round-trips.
+    #[tokio::test]
+    async fn region_set_and_get() {
+        let ctx = InstanceContext::new();
+        assert_eq!(ctx.region(), None);
+        ctx.set_region(region("us-east-1"));
+        assert_eq!(ctx.region(), Some(region("us-east-1")));
+    }
+
+    // Two contexts hold independent regions.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_region() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        ctx_a.set_region(region("us-east-1"));
+        ctx_b.set_region(region("eu-west-1"));
+        assert_eq!(ctx_a.region(), Some(region("us-east-1")));
+        assert_eq!(ctx_b.region(), Some(region("eu-west-1")));
+    }
+
+    // The region is write-once: a second set fails fast, preserving the
+    // startup contract of the process global it replaced.
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_region_twice_panics() {
+        let ctx = InstanceContext::new();
+        ctx.set_region(region("us-east-1"));
+        ctx.set_region(region("eu-west-1"));
     }
 }
