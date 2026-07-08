@@ -4844,7 +4844,16 @@ async fn merge_entry_channels(
         }
     }
 
-    let mut last = String::new();
+    // Cross-iteration dedup state. Because the heap orders by the *cleaned*
+    // key, a plain object `a` and its same-named prefix dir `a/` share one key.
+    // They are distinct S3 keys (Contents `a` vs CommonPrefix `a/`), so both
+    // must survive — yet each kind may legitimately appear at most once per
+    // cleaned key. We therefore remember, per cleaned key, whether an object
+    // and/or a prefix dir has already been emitted so redundant heads from
+    // other drives (or later polls of the same drive) collapse.
+    let mut last_key = String::new();
+    let mut emitted_object = false;
+    let mut emitted_dir = false;
     let mut group: Vec<Box<MergeHead>> = Vec::new();
     let mut refill: Vec<usize> = Vec::with_capacity(in_channels.len());
 
@@ -4860,47 +4869,74 @@ async fn merge_entry_channels(
             group.push(next);
         }
 
-        // Legacy same-name resolution rules (heads arrive in ascending
-        // channel order):
-        //  - prefix dir vs prefix dir with the same suffix shape: the first
-        //    head wins and the rest collapse;
-        //  - prefix dir vs object: the object wins;
-        //  - object vs object: the later channel wins;
-        //  - both dirs with different suffix shape: the smaller raw name wins.
-        let mut winner = first;
-        for other in group.drain(..) {
-            let dir_matches = winner.entry.is_dir() && other.entry.is_dir();
-            let suffix_matches = winner.entry.name.ends_with(SLASH_SEPARATOR) == other.entry.name.ends_with(SLASH_SEPARATOR);
-
-            if dir_matches && suffix_matches {
-                continue;
-            }
-
-            if !dir_matches {
-                if other.entry.is_dir() {
-                    continue;
+        // Resolve the same-cleaned-key group into at most one prefix-dir winner
+        // and at most one object winner (heads arrive in ascending channel
+        // order). Unlike the legacy rule, an object no longer *discards* a
+        // same-named prefix dir: a plain object `a` and a prefix dir `a/` are
+        // different S3 keys and both are emitted below. Only genuine duplicates
+        // of the same kind collapse:
+        //  - prefix dir vs prefix dir: the first (lowest channel) wins, and the
+        //    rest collapse (all prefix dirs share the trailing-slash suffix);
+        //  - object vs object: the later channel wins (legacy authority rule).
+        let mut dir_winner: Option<Box<MergeHead>> = None;
+        let mut object_winner: Option<Box<MergeHead>> = None;
+        for head in std::iter::once(first).chain(group.drain(..)) {
+            if head.entry.is_dir() {
+                if dir_winner.is_none() {
+                    dir_winner = Some(head);
                 }
-                winner = other;
-                continue;
-            }
-
-            if winner.entry.name > other.entry.name {
-                winner = other;
+            } else {
+                object_winner = Some(head);
             }
         }
 
-        // Gate emission on the same cleaned key the heap orders by, not the raw
-        // name. The heap pops in non-decreasing cleaned order, so comparing the
-        // raw name here could drop a legitimate entry whose cleaned order and
-        // raw order disagree (e.g. redundant slashes or `./` segments).
-        let emit = winner.sort_key() > last.as_str();
-        if emit {
-            last.clear();
-            last.push_str(winner.sort_key());
+        // An object whose raw name ends with the separator (an explicit
+        // "directory marker" object such as `folder/`) denotes the *same* S3
+        // key as the prefix dir `folder/`, not a distinct one. Preserve the
+        // legacy behavior there: the object shadows the prefix dir (they must
+        // not both surface as Contents + CommonPrefix). A plain object `a`
+        // (no trailing slash) is a different key from `a/` and coexists with it.
+        let object_shadows_dir = object_winner
+            .as_ref()
+            .is_some_and(|head| head.entry.name.ends_with(SLASH_SEPARATOR));
+
+        // Reset the per-key emission flags when the cleaned key advances. The
+        // heap pops in non-decreasing cleaned order, so a differing key is
+        // always strictly greater; comparing the cleaned key (not the raw name)
+        // keeps redundant-slash variants such as `a//b` and `a/b` collapsed.
+        let key = object_winner.as_deref().or(dir_winner.as_deref()).map(MergeHead::sort_key);
+        if let Some(key) = key
+            && key != last_key.as_str()
+        {
+            last_key.clear();
+            last_key.push_str(key);
+            emitted_object = false;
+            emitted_dir = false;
         }
-        let MergeHead { entry, .. } = *winner;
-        if emit && !send_or_cancel(&rx, &out_channel, entry).await? {
-            return Ok(());
+
+        // Emit the object first (raw `a` sorts before `a/`), then the prefix
+        // dir. A directory-marker object also consumes the prefix-dir slot so a
+        // later same-key prefix dir cannot re-emit the same key as a prefix.
+        if let Some(head) = object_winner
+            && !emitted_object
+        {
+            emitted_object = true;
+            if object_shadows_dir {
+                emitted_dir = true;
+            }
+            let MergeHead { entry, .. } = *head;
+            if !send_or_cancel(&rx, &out_channel, entry).await? {
+                return Ok(());
+            }
+        }
+        if let Some(head) = dir_winner
+            && !emitted_dir
+        {
+            emitted_dir = true;
+            let MergeHead { entry, .. } = *head;
+            if !send_or_cancel(&rx, &out_channel, entry).await? {
+                return Ok(());
+            }
         }
 
         for &idx in &refill {
@@ -9637,13 +9673,17 @@ mod test {
     }
 
     #[tokio::test]
-    async fn merge_entry_channels_object_wins_over_same_named_prefix_dir() {
+    async fn merge_entry_channels_object_and_same_named_prefix_dir_coexist() {
+        // Regression for backlog #880. `path::clean("a/") == "a"`, so a plain
+        // object `a` and the prefix dir `a/` group under the same cleaned key.
+        // Per S3 delimiter semantics they are *distinct* keys: `a` belongs in
+        // Contents and `a/` rolls up into CommonPrefixes. The old rule let the
+        // object shadow the prefix dir, dropping the CommonPrefix — that was the
+        // bug. Both must now be emitted (object first, since raw `a` < `a/`).
         let (tx_a, rx_a) = mpsc::channel(4);
         let (tx_b, rx_b) = mpsc::channel(4);
         let (out_tx, mut out_rx) = mpsc::channel(8);
 
-        // `path::clean("a/") == "a"`, so the prefix dir and the object group
-        // under the same key and the object must win.
         tx_a.send(test_dir_meta_entry("a/")).await.unwrap();
         drop(tx_a);
         tx_b.send(test_object_meta_entry("a")).await.unwrap();
@@ -9654,12 +9694,73 @@ mod test {
 
         let mut results = Vec::new();
         while let Some(entry) = out_rx.recv().await {
-            assert!(entry.is_object(), "the object entry must shadow the same-named prefix dir");
+            results.push((entry.name.clone(), entry.is_object(), entry.is_dir()));
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            results,
+            vec![("a".to_owned(), true, false), ("a/".to_owned(), false, true)],
+            "the object `a` and the prefix dir `a/` are distinct keys and must both survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_object_and_prefix_dir_coexist_from_one_channel() {
+        // The object `a` and prefix dir `a/` can arrive sequentially on a single
+        // channel (each drive is internally sorted, and raw `a` < `a/`). They are
+        // then processed in separate merge iterations, so the per-key dedup must
+        // still let both survive rather than collapsing the later prefix dir.
+        let (tx, rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        tx.send(test_object_meta_entry("a")).await.unwrap();
+        tx.send(test_dir_meta_entry("a/")).await.unwrap();
+        drop(tx);
+
+        // Two channels so the k-way merge path (not the single-channel fast
+        // path) is exercised; the second channel is empty and closed up front so
+        // the merge does not block waiting on it.
+        let (tx_empty, rx_empty) = mpsc::channel(4);
+        drop(tx_empty);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx, rx_empty], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push((entry.name.clone(), entry.is_object(), entry.is_dir()));
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(results, vec![("a".to_owned(), true, false), ("a/".to_owned(), false, true)],);
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_directory_marker_object_shadows_prefix_dir() {
+        // An explicit "directory marker" object `folder/` (trailing slash, real
+        // metadata) denotes the *same* S3 key as the prefix dir `folder/`, unlike
+        // a plain object `a` vs `a/`. It must keep shadowing the prefix dir so the
+        // key does not surface as both Contents and a CommonPrefix (issue #1797).
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        tx_a.send(test_dir_meta_entry("folder/")).await.unwrap();
+        drop(tx_a);
+        tx_b.send(test_object_meta_entry("folder/")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            assert!(entry.is_object(), "the directory-marker object must shadow the same-named prefix dir");
             results.push(entry.name.clone());
         }
         handle.await.unwrap().unwrap();
 
-        assert_eq!(results, vec!["a"]);
+        assert_eq!(results, vec!["folder/"]);
     }
 
     #[tokio::test]
