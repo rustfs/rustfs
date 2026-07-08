@@ -347,8 +347,8 @@ pub(super) fn should_count_rebalance_version_complete(result: &MigrationVersionR
     result.cleanup_ignored || (result.moved && !result.failed)
 }
 
-pub(super) fn should_cleanup_rebalance_source_entry(rebalanced: usize, total_versions: usize) -> bool {
-    rebalanced == total_versions
+pub(super) fn should_cleanup_rebalance_source_entry(rebalanced: usize, total_versions: usize, expired: usize) -> bool {
+    rebalanced.saturating_add(expired) == total_versions
 }
 
 pub(super) fn should_skip_rebalance_delete_marker(

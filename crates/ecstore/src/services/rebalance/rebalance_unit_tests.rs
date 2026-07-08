@@ -110,35 +110,26 @@ struct LegacyRebalanceMeta {
 
 struct MigrationBackendSpy {
     get_object_reader: Mutex<Option<core::result::Result<GetObjectReader, Error>>>,
-    delete_object: Mutex<Option<core::result::Result<ObjectInfo, Error>>>,
     move_remote: Mutex<Option<core::result::Result<(), Error>>>,
     get_calls: AtomicUsize,
-    delete_calls: AtomicUsize,
     move_remote_calls: AtomicUsize,
 }
 
 impl MigrationBackendSpy {
     fn new(
         get_object_reader: Option<core::result::Result<GetObjectReader, Error>>,
-        delete_object: Option<core::result::Result<ObjectInfo, Error>>,
         move_remote: Option<core::result::Result<(), Error>>,
     ) -> Self {
         Self {
             get_object_reader: Mutex::new(get_object_reader),
-            delete_object: Mutex::new(delete_object),
             move_remote: Mutex::new(move_remote),
             get_calls: AtomicUsize::new(0),
-            delete_calls: AtomicUsize::new(0),
             move_remote_calls: AtomicUsize::new(0),
         }
     }
 
     fn get_calls(&self) -> usize {
         self.get_calls.load(Ordering::SeqCst)
-    }
-
-    fn delete_calls(&self) -> usize {
-        self.delete_calls.load(Ordering::SeqCst)
     }
 
     fn move_remote_calls(&self) -> usize {
@@ -170,15 +161,6 @@ impl MigrationBackend for MigrationBackendSpy {
         }
 
         Ok(Self::make_reader())
-    }
-
-    async fn delete_object_for_migration(&self, _bucket: &str, _object: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
-        self.delete_calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(result) = self.delete_object.lock().unwrap().take() {
-            return result;
-        }
-
-        Ok(ObjectInfo::default())
     }
 
     async fn move_remote_version_for_migration(
@@ -249,7 +231,7 @@ fn test_rebalance_delete_marker_opts_preserves_replication_state() {
 
 #[tokio::test]
 async fn test_migrate_entry_version_remote_version_is_moved_without_transfer() {
-    let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Ok(())));
+    let backend = MigrationBackendSpy::new(None, Some(Ok(())));
     let version = version_remote();
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
@@ -272,6 +254,7 @@ async fn test_migrate_entry_version_remote_version_is_moved_without_transfer() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -283,16 +266,12 @@ async fn test_migrate_entry_version_remote_version_is_moved_without_transfer() {
     assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
     assert_eq!(backend.move_remote_calls(), 1);
     assert_eq!(backend.get_calls(), 0);
-    assert_eq!(backend.delete_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
-    let backend = MigrationBackendSpy::new(
-        None,
-        Some(Ok(ObjectInfo::default())),
-        Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))),
-    );
+    let backend =
+        MigrationBackendSpy::new(None, Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))));
     let version = version_remote();
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
@@ -315,6 +294,7 @@ async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -326,13 +306,11 @@ async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
     assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
     assert_eq!(backend.move_remote_calls(), 1);
     assert_eq!(backend.get_calls(), 0);
-    assert_eq!(backend.delete_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
     let backend = MigrationBackendSpy::new(
-        None,
         None,
         Some(Err(Error::DataMovementOverwriteErr(
             "bucket".to_string(),
@@ -352,6 +330,7 @@ async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -366,7 +345,7 @@ async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
 
 #[tokio::test]
 async fn test_migrate_entry_version_remote_failure_is_reported() {
-    let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), Some(Err(Error::SlowDown)));
+    let backend = MigrationBackendSpy::new(None, Some(Err(Error::SlowDown)));
     let version = version_remote();
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
@@ -389,6 +368,7 @@ async fn test_migrate_entry_version_remote_failure_is_reported() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -400,14 +380,26 @@ async fn test_migrate_entry_version_remote_failure_is_reported() {
     assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
     assert_eq!(backend.move_remote_calls(), 1);
     assert_eq!(backend.get_calls(), 0);
-    assert_eq!(backend.delete_calls(), 0);
 }
 
 #[tokio::test]
-async fn test_migrate_entry_version_deleted_version_calls_delete_and_moved() {
-    let backend = MigrationBackendSpy::new(None, Some(Ok(ObjectInfo::default())), None);
+async fn test_migrate_entry_version_deleted_version_routes_delete_through_store_and_moved() {
+    let backend = MigrationBackendSpy::new(None, None);
     let version = version_deleted();
     let mut transfer = |_, _, _| async move { Ok(()) };
+    // The delete marker must be routed through the store closure (cross-pool routing), never
+    // through the source SetDisks. Assert the closure is invoked and the source set is not.
+    let delete_calls = Arc::new(AtomicUsize::new(0));
+    let mut delete_marker = {
+        let delete_calls = delete_calls.clone();
+        move |_: String, _: String, _: ObjectOptions| {
+            let delete_calls = delete_calls.clone();
+            async move {
+                delete_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ObjectInfo::default())
+            }
+        }
+    };
 
     let result = migrate_entry_version(
         &backend,
@@ -418,6 +410,7 @@ async fn test_migrate_entry_version_deleted_version_calls_delete_and_moved() {
         3,
         false,
         &mut transfer,
+        &mut delete_marker,
     )
     .await;
 
@@ -427,18 +420,25 @@ async fn test_migrate_entry_version_deleted_version_calls_delete_and_moved() {
     assert!(!result.failed);
     assert!(result.error.is_none());
     assert_eq!(backend.get_calls(), 0);
-    assert_eq!(backend.delete_calls(), 1);
+    assert_eq!(delete_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn test_migrate_entry_version_deleted_version_not_found_is_ignored() {
-    let backend = MigrationBackendSpy::new(
-        None,
-        Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))),
-        None,
-    );
+    let backend = MigrationBackendSpy::new(None, None);
     let version = version_deleted();
     let mut transfer = |_, _, _| async move { Ok(()) };
+    let delete_calls = Arc::new(AtomicUsize::new(0));
+    let mut delete_marker = {
+        let delete_calls = delete_calls.clone();
+        move |_: String, _: String, _: ObjectOptions| {
+            let delete_calls = delete_calls.clone();
+            async move {
+                delete_calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))
+            }
+        }
+    };
 
     let result = migrate_entry_version(
         &backend,
@@ -449,6 +449,7 @@ async fn test_migrate_entry_version_deleted_version_not_found_is_ignored() {
         3,
         false,
         &mut transfer,
+        &mut delete_marker,
     )
     .await;
 
@@ -457,22 +458,29 @@ async fn test_migrate_entry_version_deleted_version_not_found_is_ignored() {
     assert!(!result.moved);
     assert!(!result.failed);
     assert!(result.error.is_none());
-    assert_eq!(backend.delete_calls(), 1);
+    assert_eq!(delete_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn test_migrate_entry_version_deleted_version_overwrite_is_not_ignored() {
-    let backend = MigrationBackendSpy::new(
-        None,
-        Some(Err(Error::DataMovementOverwriteErr(
-            "bucket".to_string(),
-            "object.bin".to_string(),
-            "vid-1".to_string(),
-        ))),
-        None,
-    );
+    let backend = MigrationBackendSpy::new(None, None);
     let version = version_deleted();
     let mut transfer = |_, _, _| async move { Ok(()) };
+    let delete_calls = Arc::new(AtomicUsize::new(0));
+    let mut delete_marker = {
+        let delete_calls = delete_calls.clone();
+        move |_: String, _: String, _: ObjectOptions| {
+            let delete_calls = delete_calls.clone();
+            async move {
+                delete_calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::DataMovementOverwriteErr(
+                    "bucket".to_string(),
+                    "object.bin".to_string(),
+                    "vid-1".to_string(),
+                ))
+            }
+        }
+    };
 
     let result = migrate_entry_version(
         &backend,
@@ -483,6 +491,7 @@ async fn test_migrate_entry_version_deleted_version_overwrite_is_not_ignored() {
         3,
         false,
         &mut transfer,
+        &mut delete_marker,
     )
     .await;
 
@@ -492,16 +501,13 @@ async fn test_migrate_entry_version_deleted_version_overwrite_is_not_ignored() {
     assert!(!result.moved);
     assert_eq!(result.stage, Some("delete_marker"));
     assert!(matches!(result.error, Some(Error::DataMovementOverwriteErr(_, _, _))));
-    assert_eq!(backend.delete_calls(), 1);
+    assert_eq!(delete_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn test_migrate_entry_version_reader_not_found_is_ignored() {
-    let backend = MigrationBackendSpy::new(
-        Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))),
-        None,
-        None,
-    );
+    let backend =
+        MigrationBackendSpy::new(Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))), None);
     let version = version_normal();
     let mut transfer = |_, _, _| async move { Ok(()) };
 
@@ -514,6 +520,7 @@ async fn test_migrate_entry_version_reader_not_found_is_ignored() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -523,12 +530,11 @@ async fn test_migrate_entry_version_reader_not_found_is_ignored() {
     assert!(!result.failed);
     assert!(result.error.is_none());
     assert_eq!(backend.get_calls(), 1);
-    assert_eq!(backend.delete_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_migrate_entry_version_reader_retries_before_success() {
-    let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None, None);
+    let backend = MigrationBackendSpy::new(Some(Err(Error::SlowDown)), None);
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let wait_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
@@ -552,6 +558,7 @@ async fn test_migrate_entry_version_reader_retries_before_success() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
         {
             let wait_count = wait_count.clone();
             move |_| {
@@ -570,7 +577,6 @@ async fn test_migrate_entry_version_reader_retries_before_success() {
     assert!(!result.failed);
     assert!(result.error.is_none());
     assert_eq!(backend.get_calls(), 2);
-    assert_eq!(backend.delete_calls(), 0);
     assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
     assert_eq!(wait_count.load(Ordering::SeqCst), 1);
 }
@@ -603,10 +609,6 @@ impl MigrationBackend for AlwaysFailGetBackend {
     ) -> Result<GetObjectReader> {
         self.get_calls.fetch_add(1, Ordering::SeqCst);
         Err(Error::SlowDown)
-    }
-
-    async fn delete_object_for_migration(&self, _bucket: &str, _object: &str, _opts: ObjectOptions) -> Result<ObjectInfo> {
-        Ok(ObjectInfo::default())
     }
 
     async fn move_remote_version_for_migration(
@@ -645,6 +647,7 @@ async fn test_migrate_entry_version_reader_fails_after_retries() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -682,6 +685,7 @@ async fn test_migrate_entry_version_zero_max_attempts_still_attempts_once() {
         0,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -696,7 +700,7 @@ async fn test_migrate_entry_version_zero_max_attempts_still_attempts_once() {
 
 #[tokio::test]
 async fn test_migrate_entry_version_transfer_retries_before_success() {
-    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let wait_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
@@ -723,6 +727,7 @@ async fn test_migrate_entry_version_transfer_retries_before_success() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
         {
             let wait_count = wait_count.clone();
             move |_| {
@@ -746,7 +751,7 @@ async fn test_migrate_entry_version_transfer_retries_before_success() {
 
 #[tokio::test]
 async fn test_migrate_entry_version_transfer_non_transient_fails_without_retry() {
-    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let wait_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
@@ -770,6 +775,7 @@ async fn test_migrate_entry_version_transfer_non_transient_fails_without_retry()
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
         {
             let wait_count = wait_count.clone();
             move |_| {
@@ -793,7 +799,7 @@ async fn test_migrate_entry_version_transfer_non_transient_fails_without_retry()
 
 #[tokio::test]
 async fn test_migrate_entry_version_transfer_fails_after_retries() {
-    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
         let transfer_count = transfer_count.clone();
@@ -816,6 +822,7 @@ async fn test_migrate_entry_version_transfer_fails_after_retries() {
         2,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -830,7 +837,7 @@ async fn test_migrate_entry_version_transfer_fails_after_retries() {
 
 #[tokio::test]
 async fn test_migrate_entry_version_transfer_not_found_is_ignored() {
-    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
         let transfer_count = transfer_count.clone();
@@ -853,6 +860,7 @@ async fn test_migrate_entry_version_transfer_not_found_is_ignored() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -866,7 +874,7 @@ async fn test_migrate_entry_version_transfer_not_found_is_ignored() {
 
 #[tokio::test]
 async fn test_migrate_entry_version_transfer_overwrite_is_not_ignored() {
-    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
     let transfer_count = Arc::new(AtomicUsize::new(0));
     let mut transfer = {
         let transfer_count = transfer_count.clone();
@@ -893,6 +901,7 @@ async fn test_migrate_entry_version_transfer_overwrite_is_not_ignored() {
         3,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -907,7 +916,7 @@ async fn test_migrate_entry_version_transfer_overwrite_is_not_ignored() {
 
 #[tokio::test]
 async fn test_migrate_entry_version_ignores_data_usage_cache_when_enabled() {
-    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
     let version = {
         let mut version = version_normal();
         version.name = format!("{}.{}", DATA_USAGE_CACHE_NAME, version.name);
@@ -934,6 +943,7 @@ async fn test_migrate_entry_version_ignores_data_usage_cache_when_enabled() {
         2,
         true,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -944,12 +954,11 @@ async fn test_migrate_entry_version_ignores_data_usage_cache_when_enabled() {
     assert!(result.error.is_none());
     assert_eq!(transfer_count.load(Ordering::SeqCst), 0);
     assert_eq!(backend.get_calls(), 0);
-    assert_eq!(backend.delete_calls(), 0);
 }
 
 #[tokio::test]
 async fn test_migrate_entry_version_data_usage_cache_moves_when_ignore_disabled() {
-    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
     let version = {
         let mut version = version_normal();
         version.name = format!("{}.{}", DATA_USAGE_CACHE_NAME, version.name);
@@ -976,6 +985,7 @@ async fn test_migrate_entry_version_data_usage_cache_moves_when_ignore_disabled(
         2,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -986,7 +996,6 @@ async fn test_migrate_entry_version_data_usage_cache_moves_when_ignore_disabled(
     assert!(result.error.is_none());
     assert_eq!(transfer_count.load(Ordering::SeqCst), 1);
     assert_eq!(backend.get_calls(), 1);
-    assert_eq!(backend.delete_calls(), 0);
 }
 
 #[test]
@@ -1864,7 +1873,7 @@ fn test_with_rebalance_entry_context_formats_precise_stage() {
 
 #[tokio::test]
 async fn test_migrate_entry_version_transfer_failure_reports_write_target_stage() {
-    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None, None);
+    let backend = MigrationBackendSpy::new(Some(Ok(MigrationBackendSpy::make_reader())), None);
     let mut transfer = |_, _, _| async { Err(Error::SlowDown) };
     let version = version_normal();
 
@@ -1877,6 +1886,7 @@ async fn test_migrate_entry_version_transfer_failure_reports_write_target_stage(
         1,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -1900,6 +1910,7 @@ async fn test_migrate_entry_version_reader_failure_reports_read_source_stage() {
         1,
         false,
         &mut transfer,
+        |_: String, _: String, _: ObjectOptions| async move { Ok::<_, Error>(ObjectInfo::default()) },
     )
     .await;
 
@@ -2026,12 +2037,35 @@ fn test_should_skip_rebalance_delete_marker_rejects_multiple_remaining_versions(
 
 #[test]
 fn test_should_cleanup_rebalance_source_entry_accepts_all_versions_completed() {
-    assert!(should_cleanup_rebalance_source_entry(3, 3));
+    assert!(should_cleanup_rebalance_source_entry(3, 3, 0));
 }
 
 #[test]
-fn test_should_cleanup_rebalance_source_entry_rejects_versions_only_expired_by_lifecycle() {
-    assert!(!should_cleanup_rebalance_source_entry(2, 3));
+fn test_should_cleanup_rebalance_source_entry_accepts_migrated_and_safely_expired_versions() {
+    // A multi-version object where one version was migrated and another expired by lifecycle
+    // must still be cleaned up; otherwise the migrated version leaks in the source pool.
+    assert!(should_cleanup_rebalance_source_entry(1, 2, 1));
+}
+
+#[test]
+fn test_should_cleanup_rebalance_source_entry_accepts_single_version_only_expired_by_lifecycle() {
+    assert!(should_cleanup_rebalance_source_entry(0, 1, 1));
+}
+
+#[test]
+fn test_should_cleanup_rebalance_source_entry_accepts_versions_only_expired_by_lifecycle() {
+    assert!(should_cleanup_rebalance_source_entry(0, 2, 2));
+}
+
+#[test]
+fn test_should_cleanup_rebalance_source_entry_rejects_unmigrated_version() {
+    // One version neither migrated nor expired must block source cleanup.
+    assert!(!should_cleanup_rebalance_source_entry(1, 2, 0));
+}
+
+#[test]
+fn test_should_cleanup_rebalance_source_entry_rejects_counter_overrun() {
+    assert!(!should_cleanup_rebalance_source_entry(2, 2, 1));
 }
 
 #[test]
