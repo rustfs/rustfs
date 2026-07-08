@@ -44,6 +44,7 @@ use crate::error::{
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
 use crate::runtime::global::DISK_RESERVE_FRACTION;
+use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
 use crate::services::rebalance::RebalanceMeta;
 use crate::storage_api_contracts::{
@@ -187,6 +188,14 @@ pub struct ECStore {
     /// The saver then clones the latest `pool_meta` under a short read lock and
     /// releases it before awaiting disk writes.
     pub(crate) pool_meta_save_gate: Mutex<()>,
+    /// Per-instance runtime-identity context (issue #939, Slice1).
+    ///
+    /// Carries the runtime state that distinguishes this instance from another
+    /// (currently the erasure setup type). Method bodies read `self.ctx` and
+    /// spawned children inherit it through the moved object graph. Production
+    /// construction *adopts* the process `bootstrap_ctx()` so the startup-time
+    /// write and post-construction read share one cell.
+    pub(crate) ctx: Arc<InstanceContext>,
 }
 
 impl std::fmt::Debug for ECStore {
@@ -262,6 +271,32 @@ impl ECStore {
     /// Get the storage class configuration
     pub fn storage_class(&self) -> Option<crate::config::storageclass::Config> {
         runtime_sources::storage_class_config()
+    }
+}
+
+/// Phase 5 (#939): instance-scoped setup-type predicates.
+///
+/// These read `self.ctx` directly instead of the process facade, so they report
+/// *this* instance's setup type — the isolation seam that lets two ECStores
+/// coexist without the erasure booleans of one leaking into the other. Slice1
+/// exercises them from tests; the data-path call sites move onto `self.ctx` in
+/// Slice2, so the seam is intentionally established ahead of its production
+/// callers.
+#[allow(dead_code)] // #939 Slice1: consumed by tests now, by the data path in Slice2.
+impl ECStore {
+    /// True when this instance is erasure-coded (`Erasure` or `DistErasure`).
+    pub(crate) async fn setup_is_erasure(&self) -> bool {
+        self.ctx.is_erasure().await
+    }
+
+    /// True only when this instance is distributed erasure.
+    pub(crate) async fn setup_is_dist_erasure(&self) -> bool {
+        self.ctx.is_dist_erasure().await
+    }
+
+    /// True only when this instance is single-drive erasure.
+    pub(crate) async fn setup_is_erasure_sd(&self) -> bool {
+        self.ctx.is_erasure_sd().await
     }
 }
 

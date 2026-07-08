@@ -17,6 +17,7 @@ use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
     layout::endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
+    runtime::instance::{InstanceContext, bootstrap_ctx},
     services::event_notification::EventNotifier,
     services::tier::tier::TierConfigMgr,
     store::ECStore,
@@ -49,9 +50,9 @@ lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     static ref GLOBAL_DEPLOYMENT_ID: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-    pub static ref GLOBAL_IS_ERASURE: RwLock<bool> = RwLock::new(false);
-    pub static ref GLOBAL_IS_DIST_ERASURE: RwLock<bool> = RwLock::new(false);
-    pub static ref GLOBAL_IS_ERASURE_SD: RwLock<bool> = RwLock::new(false);
+    // GLOBAL_IS_ERASURE / GLOBAL_IS_DIST_ERASURE / GLOBAL_IS_ERASURE_SD were three
+    // independent `RwLock<bool>` truth sources. Issue #939 Slice1 collapsed them into
+    // a single `InstanceContext.erasure_kind`; the accessors below now forward there.
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
@@ -226,8 +227,7 @@ pub async fn set_object_layer(o: Arc<ECStore>) {
 /// * `bool` - True if the setup type is distributed erasure coding, false otherwise
 ///
 pub async fn is_dist_erasure() -> bool {
-    let lock = GLOBAL_IS_DIST_ERASURE.read().await;
-    *lock
+    current_ctx().is_dist_erasure().await
 }
 
 /// Check if the setup type is erasure coding with single data center
@@ -236,8 +236,7 @@ pub async fn is_dist_erasure() -> bool {
 /// * `bool` - True if the setup type is erasure coding with single data center, false otherwise
 ///
 pub async fn is_erasure_sd() -> bool {
-    let lock = GLOBAL_IS_ERASURE_SD.read().await;
-    *lock
+    current_ctx().is_erasure_sd().await
 }
 
 /// Check if the setup type is erasure coding
@@ -246,8 +245,7 @@ pub async fn is_erasure_sd() -> bool {
 /// * `bool` - True if the setup type is erasure coding, false otherwise
 ///
 pub async fn is_erasure() -> bool {
-    let lock = GLOBAL_IS_ERASURE.read().await;
-    *lock
+    current_ctx().is_erasure().await
 }
 
 /// Update the global erasure type based on the setup type
@@ -258,18 +256,25 @@ pub async fn is_erasure() -> bool {
 /// # Returns
 /// * None
 pub async fn update_erasure_type(setup_type: SetupType) {
-    let mut is_erasure = GLOBAL_IS_ERASURE.write().await;
-    *is_erasure = setup_type == SetupType::Erasure;
+    current_ctx().set_erasure_kind(setup_type).await;
+}
 
-    let mut is_dist_erasure = GLOBAL_IS_DIST_ERASURE.write().await;
-    *is_dist_erasure = setup_type == SetupType::DistErasure;
-
-    if *is_dist_erasure {
-        *is_erasure = true
+/// Resolve the runtime-identity context the legacy free-function facade should
+/// act on.
+///
+/// This is the honest single-instance default: once the process object layer is
+/// published it forwards to the live store's `ctx`; before then it forwards to
+/// the process [`bootstrap_ctx`]. Because `ECStore::new` *adopts* the same
+/// bootstrap `Arc`, the startup write and the post-construction read hit one
+/// cell — single-instance behavior is unchanged. It does not (and cannot)
+/// disambiguate between multiple concurrent instances from a free function; per
+/// #939 that isolation is delivered by callers reaching `self.ctx` on the object
+/// graph, not through this facade.
+pub(crate) fn current_ctx() -> Arc<InstanceContext> {
+    match GLOBAL_OBJECT_API.get() {
+        Some(store) => store.ctx.clone(),
+        None => bootstrap_ctx(),
     }
-
-    let mut is_erasure_sd = GLOBAL_IS_ERASURE_SD.write().await;
-    *is_erasure_sd = setup_type == SetupType::ErasureSD;
 }
 
 // pub fn is_legacy() -> bool {

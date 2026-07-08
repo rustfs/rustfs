@@ -334,6 +334,10 @@ impl ECStore {
             decommission_cancelers,
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
+            // Adopt the process bootstrap context: startup published erasure/disk
+            // state into it before this ECStore existed, so reads after
+            // construction must hit the same cell (issue #939, Slice1).
+            ctx: crate::runtime::instance::bootstrap_ctx(),
         });
 
         // Only set it when the global deployment ID is not yet configured

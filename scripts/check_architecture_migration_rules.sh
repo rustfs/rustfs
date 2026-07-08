@@ -4046,7 +4046,7 @@ fi
   rg -n --with-filename '\bGLOBAL_(IsErasure|IS_ERASURE)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
-    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+    rg -v '^crates/ecstore/src/runtime/(global|instance|sources)\.rs:' || true
 ) >"$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE" ]]; then
@@ -4058,7 +4058,7 @@ fi
   rg -n --with-filename '\bGLOBAL_(IsDistErasure|IS_DIST_ERASURE)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
-    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+    rg -v '^crates/ecstore/src/runtime/(global|instance|sources)\.rs:' || true
 ) >"$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE" ]]; then
@@ -4106,7 +4106,7 @@ fi
   rg -n --with-filename '\bGLOBAL_(IsErasureSD|IS_ERASURE_SD)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
-    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+    rg -v '^crates/ecstore/src/runtime/(global|instance|sources)\.rs:' || true
 ) >"$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE" ]]; then

@@ -1939,6 +1939,13 @@ mod tests {
     }
 
     async fn new_read_lock_test_store() -> ECStore {
+        new_test_store_with_ctx(crate::runtime::instance::bootstrap_ctx()).await
+    }
+
+    /// Build a minimal in-memory ECStore carrying a caller-supplied runtime
+    /// context. Used by the #939 isolation test to give two stores *distinct*
+    /// `ctx` so their setup-type state cannot bleed across.
+    async fn new_test_store_with_ctx(ctx: std::sync::Arc<crate::runtime::instance::InstanceContext>) -> ECStore {
         let format = FormatV3::new(1, 2);
         let endpoints = vec![
             Endpoint::try_from("http://127.0.0.1:9000/data0").expect("first endpoint should parse"),
@@ -1967,7 +1974,46 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
+            ctx,
         }
+    }
+
+    /// The bootstrap-adopting constructor path (production `ECStore::new` and the
+    /// default test helper) must land on the *same* `Arc` the startup writes went
+    /// to, or single-instance reads would see stale state.
+    #[tokio::test]
+    async fn store_adopts_bootstrap_context() {
+        let store = new_read_lock_test_store().await;
+        assert!(
+            std::sync::Arc::ptr_eq(&store.ctx, &crate::runtime::instance::bootstrap_ctx()),
+            "default-constructed store must adopt the process bootstrap context"
+        );
+    }
+
+    /// End-to-end (non-strawman) isolation proof: two real ECStores, each with a
+    /// distinct `ctx`, read their setup type through the real `&self` predicate
+    /// methods. One is DistErasure, the other ErasureSD; neither sees the other's
+    /// state — the guarantee #3243 lacked.
+    #[tokio::test]
+    async fn instance_context_carrier_isolates_two_stores() {
+        use crate::layout::endpoints::SetupType;
+        use crate::runtime::instance::InstanceContext;
+
+        let ctx_a = std::sync::Arc::new(InstanceContext::new());
+        let ctx_b = std::sync::Arc::new(InstanceContext::new());
+        ctx_a.set_erasure_kind(SetupType::DistErasure).await;
+        ctx_b.set_erasure_kind(SetupType::ErasureSD).await;
+
+        let store_a = new_test_store_with_ctx(ctx_a).await;
+        let store_b = new_test_store_with_ctx(ctx_b).await;
+
+        assert!(store_a.setup_is_dist_erasure().await);
+        assert!(store_a.setup_is_erasure().await); // DistErasure ⇒ is_erasure
+        assert!(!store_a.setup_is_erasure_sd().await);
+
+        assert!(store_b.setup_is_erasure_sd().await);
+        assert!(!store_b.setup_is_dist_erasure().await);
+        assert!(!store_b.setup_is_erasure().await);
     }
 
     #[tokio::test]
