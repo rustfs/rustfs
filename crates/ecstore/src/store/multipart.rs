@@ -135,10 +135,19 @@ impl ECStore {
             uploads.extend(res.uploads);
         }
 
+        // Each pool caps its own page at `max_uploads`, so the concatenation is
+        // unordered across pools and may exceed the global cap. Re-sort, re-cap,
+        // and derive the truncation markers so a bucket whose uploads span pools
+        // pages correctly instead of being silently reported complete.
+        let (uploads, is_truncated, next_key_marker, next_upload_id_marker) = merge_multipart_upload_pages(uploads, max_uploads);
+
         Ok(ListMultipartsInfo {
             key_marker,
             upload_id_marker,
+            next_key_marker,
+            next_upload_id_marker,
             max_uploads,
+            is_truncated,
             uploads,
             prefix: prefix.to_owned(),
             delimiter: delimiter.to_owned(),
@@ -379,6 +388,36 @@ impl ECStore {
     }
 }
 
+/// Merges per-pool `ListMultipartUploads` pages into a single globally paginated
+/// page.
+///
+/// Each pool independently applies the `max_uploads` cap, so the concatenated
+/// input can hold up to `pools * max_uploads` entries and is unordered across
+/// pools. This re-sorts the union by `(key, upload_id)` — the order S3 clients
+/// page through — caps it to `max_uploads`, and derives the truncation markers
+/// from the first overflow element (used only as a probe, never returned) so a
+/// bucket whose uploads span pools can be paged without loss or duplication.
+fn merge_multipart_upload_pages(
+    mut uploads: Vec<MultipartInfo>,
+    max_uploads: usize,
+) -> (Vec<MultipartInfo>, bool, Option<String>, Option<String>) {
+    uploads.sort_by(|a, b| a.object.cmp(&b.object).then_with(|| a.upload_id.cmp(&b.upload_id)));
+
+    let is_truncated = uploads.len() > max_uploads;
+    uploads.truncate(max_uploads);
+
+    let (next_key_marker, next_upload_id_marker) = if is_truncated {
+        match uploads.last() {
+            Some(last) => (Some(last.object.clone()), Some(last.upload_id.clone())),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    (uploads, is_truncated, next_key_marker, next_upload_id_marker)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +426,105 @@ mod tests {
         format::FormatV3,
     };
     use std::time::Duration;
+
+    fn mp(object: &str, upload_id: &str) -> MultipartInfo {
+        MultipartInfo {
+            bucket: "bucket".to_string(),
+            object: object.to_string(),
+            upload_id: upload_id.to_string(),
+            initiated: None,
+            ..Default::default()
+        }
+    }
+
+    /// Models a single pool's `list_multipart_uploads`: returns uploads strictly
+    /// after the `(key, upload_id)` marker in `(key, upload_id)` order, capped at
+    /// `max_uploads` (mirroring the per-pool page cap).
+    fn pool_query(
+        pool: &[MultipartInfo],
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: usize,
+    ) -> Vec<MultipartInfo> {
+        pool.iter()
+            .filter(|u| match (key_marker, upload_id_marker) {
+                (Some(k), Some(uid)) => (u.object.as_str(), u.upload_id.as_str()) > (k, uid),
+                (Some(k), None) => u.object.as_str() > k,
+                _ => true,
+            })
+            .take(max_uploads)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_sorts_and_caps_across_pools() {
+        // Union of two pools, unordered and exceeding the global cap.
+        let uploads = vec![mp("b", "u1"), mp("a", "u2"), mp("a", "u1"), mp("c", "u1"), mp("b", "u2")];
+
+        let (page, is_truncated, next_key_marker, next_upload_id_marker) = merge_multipart_upload_pages(uploads, 3);
+
+        assert!(is_truncated);
+        assert_eq!(page.len(), 3);
+        let ordered: Vec<(&str, &str)> = page.iter().map(|u| (u.object.as_str(), u.upload_id.as_str())).collect();
+        assert_eq!(ordered, vec![("a", "u1"), ("a", "u2"), ("b", "u1")]);
+        assert_eq!(next_key_marker.as_deref(), Some("b"));
+        assert_eq!(next_upload_id_marker.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_reports_complete_within_cap() {
+        let uploads = vec![mp("b", "u1"), mp("a", "u1")];
+
+        let (page, is_truncated, next_key_marker, next_upload_id_marker) = merge_multipart_upload_pages(uploads, 3);
+
+        assert_eq!(page.len(), 2);
+        assert!(!is_truncated);
+        assert!(next_key_marker.is_none());
+        assert!(next_upload_id_marker.is_none());
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_paginates_across_pools_without_loss() {
+        // Uploads for the same bucket spread across two pools, together exceeding
+        // the cap, so pagination must span multiple pages.
+        let pool0 = vec![mp("a", "u1"), mp("a", "u3"), mp("c", "u1"), mp("e", "u1")];
+        let pool1 = vec![mp("a", "u2"), mp("b", "u1"), mp("d", "u1"), mp("f", "u1")];
+
+        let mut expected: Vec<(String, String)> = pool0
+            .iter()
+            .chain(pool1.iter())
+            .map(|u| (u.object.clone(), u.upload_id.clone()))
+            .collect();
+        expected.sort();
+
+        let max_uploads = 3;
+        let mut key_marker: Option<String> = None;
+        let mut upload_id_marker: Option<String> = None;
+        let mut collected: Vec<(String, String)> = Vec::new();
+
+        for _ in 0..16 {
+            let mut merged = Vec::new();
+            for pool in [&pool0, &pool1] {
+                merged.extend(pool_query(pool, key_marker.as_deref(), upload_id_marker.as_deref(), max_uploads));
+            }
+
+            let (page, is_truncated, next_key_marker, next_upload_id_marker) = merge_multipart_upload_pages(merged, max_uploads);
+            assert!(page.len() <= max_uploads);
+            collected.extend(page.iter().map(|u| (u.object.clone(), u.upload_id.clone())));
+
+            if !is_truncated {
+                break;
+            }
+            key_marker = next_key_marker;
+            upload_id_marker = next_upload_id_marker;
+        }
+
+        assert_eq!(collected, expected, "pagination must return every upload exactly once, in sorted order");
+        let mut deduped = collected.clone();
+        deduped.dedup();
+        assert_eq!(deduped.len(), collected.len(), "pagination must not duplicate uploads");
+    }
 
     async fn new_multipart_lock_test_store() -> ECStore {
         let format = FormatV3::new(1, 2);
