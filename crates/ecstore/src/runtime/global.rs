@@ -64,20 +64,19 @@ lazy_static! {
         rustfs_utils::crypto::hex(GLOBAL_LOCAL_NODE_NAME_FALLBACK.as_bytes());
     pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn LockClient>> = OnceLock::new();
     pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
-    pub static ref GLOBAL_BUCKET_MONITOR: OnceLock<Arc<Monitor>> = OnceLock::new();
 }
 
 pub fn init_global_bucket_monitor(num_nodes: u64) {
-    if GLOBAL_BUCKET_MONITOR.set(Monitor::new(num_nodes)).is_err() {
+    if !current_ctx().init_bucket_monitor(num_nodes) {
         warn!(
-            "global bucket monitor already initialized, ignoring re-initialization with num_nodes={}",
+            "bucket monitor already initialized, ignoring re-initialization with num_nodes={}",
             num_nodes
         );
     }
 }
 
 pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
-    GLOBAL_BUCKET_MONITOR.get().cloned()
+    current_ctx().bucket_monitor()
 }
 
 // Startup-owned process globals intentionally fail fast on duplicate writes.
