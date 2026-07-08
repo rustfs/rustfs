@@ -423,6 +423,8 @@ pub struct BucketDetails {
     pub versioning_suspended: bool,
     pub locking: bool,
     pub replication: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<u64>,
     // pub tagging: Option<Tagging>,
 }
 
@@ -1036,6 +1038,7 @@ mod tests {
                 versioning_suspended: false,
                 locking: true,
                 replication: false,
+                quota: None,
             }),
             prefix_usage,
             created: Some(now),
@@ -1064,12 +1067,27 @@ mod tests {
             versioning_suspended: false,
             locking: true,
             replication: true,
+            quota: Some(1024),
         };
 
         assert!(details.versioning);
         assert!(!details.versioning_suspended);
         assert!(details.locking);
         assert!(details.replication);
+        assert_eq!(details.quota, Some(1024));
+    }
+
+    #[test]
+    fn bucket_details_serializes_quota_only_when_configured() {
+        let with_quota = BucketDetails {
+            quota: Some(1024),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(with_quota).expect("bucket details should serialize");
+        assert_eq!(value["quota"], 1024);
+
+        let without_quota = serde_json::to_value(BucketDetails::default()).expect("bucket details should serialize");
+        assert!(without_quota.get("quota").is_none());
     }
 
     #[test]

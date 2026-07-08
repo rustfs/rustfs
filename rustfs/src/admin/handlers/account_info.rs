@@ -104,6 +104,13 @@ async fn bucket_replication_enabled(bucket: &str) -> bool {
         .is_some_and(|(config, _)| replication_config_enabled(&config))
 }
 
+async fn bucket_quota_limit(bucket: &str) -> Option<u64> {
+    metadata_sys::get_quota_config(bucket)
+        .await
+        .ok()
+        .and_then(|(config, _)| config.get_quota_limit())
+}
+
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -258,7 +265,6 @@ impl Operation for AccountInfoHandler {
         for bucket in buckets.iter() {
             let (rd, wr) = is_allow(bucket.name.clone()).await;
             if rd || wr {
-                // TODO: BucketQuotaSys
                 let mut bucket_info = rustfs_madmin::BucketAccessInfo {
                     name: bucket.name.clone(),
                     details: Some(rustfs_madmin::BucketDetails {
@@ -266,6 +272,7 @@ impl Operation for AccountInfoHandler {
                         versioning_suspended: BucketVersioningSys::suspended(bucket.name.as_str()).await,
                         locking: bucket_locking_enabled(bucket.name.as_str()).await,
                         replication: bucket_replication_enabled(bucket.name.as_str()).await,
+                        quota: bucket_quota_limit(bucket.name.as_str()).await,
                     }),
                     created: bucket.created,
                     access: rustfs_madmin::AccountAccess { read: rd, write: wr },
