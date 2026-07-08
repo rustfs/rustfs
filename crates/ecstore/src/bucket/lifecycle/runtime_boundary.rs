@@ -35,7 +35,7 @@ pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
     sources::tier_config_mgr_handle()
 }
 
-pub(crate) fn background_services_cancel_token() -> Option<&'static CancellationToken> {
+pub(crate) fn background_services_cancel_token() -> Option<CancellationToken> {
     sources::background_services_cancel_token()
 }
 

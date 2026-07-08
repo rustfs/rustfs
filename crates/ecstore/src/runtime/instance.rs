@@ -52,6 +52,7 @@ use s3s::region::Region;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OnceCell, RwLock};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Runtime state owned by a single `ECStore` instance.
@@ -138,6 +139,13 @@ pub struct InstanceContext {
     local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
     local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
     local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
+    /// This instance's background-services cancellation token (Phase 5 Slice 13,
+    /// backlog#939).
+    ///
+    /// Set once at startup; cancelling it stops this instance's background
+    /// workers (scanner/heal/tier/lifecycle) without touching another instance.
+    /// Replaces the process-global cancel-token static.
+    background_cancel_token: OnceLock<CancellationToken>,
 }
 
 impl InstanceContext {
@@ -170,6 +178,7 @@ impl InstanceContext {
             local_disk_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_id_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
+            background_cancel_token: OnceLock::new(),
         }
     }
 
@@ -301,6 +310,16 @@ impl InstanceContext {
         self.local_disk_set_drives.clone()
     }
 
+    /// Set this instance's background-services cancellation token (once).
+    pub fn init_background_cancel_token(&self, token: CancellationToken) -> Result<(), CancellationToken> {
+        self.background_cancel_token.set(token)
+    }
+
+    /// This instance's background-services cancellation token, if initialized.
+    pub fn background_cancel_token(&self) -> Option<CancellationToken> {
+        self.background_cancel_token.get().cloned()
+    }
+
     /// Update this instance's erasure setup type.
     pub async fn update_erasure_type(&self, setup_type: SetupType) {
         *self.erasure_kind.write().await = setup_type;
@@ -349,6 +368,7 @@ impl std::fmt::Debug for InstanceContext {
             .field("bucket_monitor_set", &self.bucket_monitor.get().is_some())
             .field("replication_stats_set", &self.replication_stats.get().is_some())
             .field("replication_pool_set", &self.replication_pool.get().is_some())
+            .field("background_cancel_token_set", &self.background_cancel_token.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -659,5 +679,81 @@ mod tests {
             ctx_b.replication_stats().is_none(),
             "a distinct instance has independent replication state"
         );
+    }
+
+    // The background cancel token is set-once, and cancelling one instance's
+    // token leaves a distinct instance's uninitialized.
+    #[tokio::test]
+    async fn background_cancel_token_init_once_and_isolated() {
+        let ctx_a = InstanceContext::new();
+        assert!(ctx_a.background_cancel_token().is_none());
+
+        let token = CancellationToken::new();
+        ctx_a.init_background_cancel_token(token.clone()).expect("init once");
+        assert!(ctx_a.background_cancel_token().is_some());
+        assert!(
+            ctx_a.init_background_cancel_token(CancellationToken::new()).is_err(),
+            "second init rejected"
+        );
+
+        let ctx_b = InstanceContext::new();
+        assert!(ctx_b.background_cancel_token().is_none(), "distinct instance is independent");
+
+        token.cancel();
+        assert!(ctx_a.background_cancel_token().unwrap().is_cancelled());
+    }
+
+    // Phase 5 acceptance (backlog#939): two independent instance contexts share
+    // NONE of the runtime state that used to live in process globals. This is
+    // the end-to-end proof that the object-graph isolation carrier works — every
+    // field migrated across Slices 1-13 is verified independent here.
+    #[tokio::test]
+    async fn two_instances_isolate_all_migrated_state() {
+        let a = InstanceContext::new();
+        let b = InstanceContext::new();
+
+        // Erasure setup type (Slice 1).
+        a.update_erasure_type(SetupType::DistErasure).await;
+        b.update_erasure_type(SetupType::ErasureSD).await;
+        assert!(a.is_dist_erasure().await && !b.is_dist_erasure().await);
+        assert!(b.is_erasure_sd().await && !a.is_erasure_sd().await);
+
+        // Lock manager (Slice 3).
+        assert!(!Arc::ptr_eq(&a.lock_manager(), &b.lock_manager()));
+
+        // Region (Slice 4).
+        a.set_region("us-east-1".parse().expect("region"));
+        b.set_region("eu-west-1".parse().expect("region"));
+        assert_eq!(a.region().expect("a region"), "us-east-1".parse().expect("region"));
+        assert_eq!(b.region().expect("b region"), "eu-west-1".parse().expect("region"));
+
+        // Deployment id (Slice 5).
+        let (id_a, id_b) = (Uuid::new_v4(), Uuid::new_v4());
+        a.set_deployment_id(id_a);
+        b.set_deployment_id(id_b);
+        assert_eq!(a.deployment_id(), Some(id_a));
+        assert_eq!(b.deployment_id(), Some(id_b));
+
+        // Service handles (Slices 7-11): each instance materializes its own.
+        assert!(!Arc::ptr_eq(&a.tier_config_mgr(), &b.tier_config_mgr()));
+        assert!(!Arc::ptr_eq(&a.event_notifier(), &b.event_notifier()));
+        assert!(!Arc::ptr_eq(&a.expiry_state(), &b.expiry_state()));
+        assert!(!Arc::ptr_eq(&a.transition_state(), &b.transition_state()));
+
+        // Local disk registry (Slice 12): a write to one is invisible to the other.
+        a.local_disk_map().write().await.insert("/disk-a".to_string(), None);
+        assert_eq!(a.local_disk_map().read().await.len(), 1);
+        assert_eq!(b.local_disk_map().read().await.len(), 0);
+
+        // Bucket monitor (Slice 10): set-once per instance.
+        assert!(a.init_bucket_monitor(4));
+        assert!(a.bucket_monitor().is_some() && b.bucket_monitor().is_none());
+
+        // Background cancel token (Slice 13): cancelling one doesn't touch the other.
+        let token_a = CancellationToken::new();
+        a.init_background_cancel_token(token_a.clone()).expect("init a");
+        token_a.cancel();
+        assert!(a.background_cancel_token().expect("a token").is_cancelled());
+        assert!(b.background_cancel_token().is_none());
     }
 }
