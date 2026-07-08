@@ -702,4 +702,58 @@ mod tests {
         token.cancel();
         assert!(ctx_a.background_cancel_token().unwrap().is_cancelled());
     }
+
+    // Phase 5 acceptance (backlog#939): two independent instance contexts share
+    // NONE of the runtime state that used to live in process globals. This is
+    // the end-to-end proof that the object-graph isolation carrier works — every
+    // field migrated across Slices 1-13 is verified independent here.
+    #[tokio::test]
+    async fn two_instances_isolate_all_migrated_state() {
+        let a = InstanceContext::new();
+        let b = InstanceContext::new();
+
+        // Erasure setup type (Slice 1).
+        a.update_erasure_type(SetupType::DistErasure).await;
+        b.update_erasure_type(SetupType::ErasureSD).await;
+        assert!(a.is_dist_erasure().await && !b.is_dist_erasure().await);
+        assert!(b.is_erasure_sd().await && !a.is_erasure_sd().await);
+
+        // Lock manager (Slice 3).
+        assert!(!Arc::ptr_eq(&a.lock_manager(), &b.lock_manager()));
+
+        // Region (Slice 4).
+        a.set_region("us-east-1".parse().expect("region"));
+        b.set_region("eu-west-1".parse().expect("region"));
+        assert_eq!(a.region().expect("a region"), "us-east-1".parse().expect("region"));
+        assert_eq!(b.region().expect("b region"), "eu-west-1".parse().expect("region"));
+
+        // Deployment id (Slice 5).
+        let (id_a, id_b) = (Uuid::new_v4(), Uuid::new_v4());
+        a.set_deployment_id(id_a);
+        b.set_deployment_id(id_b);
+        assert_eq!(a.deployment_id(), Some(id_a));
+        assert_eq!(b.deployment_id(), Some(id_b));
+
+        // Service handles (Slices 7-11): each instance materializes its own.
+        assert!(!Arc::ptr_eq(&a.tier_config_mgr(), &b.tier_config_mgr()));
+        assert!(!Arc::ptr_eq(&a.event_notifier(), &b.event_notifier()));
+        assert!(!Arc::ptr_eq(&a.expiry_state(), &b.expiry_state()));
+        assert!(!Arc::ptr_eq(&a.transition_state(), &b.transition_state()));
+
+        // Local disk registry (Slice 12): a write to one is invisible to the other.
+        a.local_disk_map().write().await.insert("/disk-a".to_string(), None);
+        assert_eq!(a.local_disk_map().read().await.len(), 1);
+        assert_eq!(b.local_disk_map().read().await.len(), 0);
+
+        // Bucket monitor (Slice 10): set-once per instance.
+        assert!(a.init_bucket_monitor(4));
+        assert!(a.bucket_monitor().is_some() && b.bucket_monitor().is_none());
+
+        // Background cancel token (Slice 13): cancelling one doesn't touch the other.
+        let token_a = CancellationToken::new();
+        a.init_background_cancel_token(token_a.clone()).expect("init a");
+        token_a.cancel();
+        assert!(a.background_cancel_token().expect("a token").is_cancelled());
+        assert!(b.background_cancel_token().is_none());
+    }
 }

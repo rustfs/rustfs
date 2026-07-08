@@ -41,6 +41,18 @@ const EVENT_SERVER_READY: &str = "server_ready";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 const EVENT_EMBEDDED_SERVER_STATE: &str = "embedded_server_state";
 
+/// Guards against a second embedded server starting in the same process.
+///
+/// Phase 5 (backlog#939) moved per-instance runtime state (erasure setup,
+/// region, deployment id, endpoints, service handles, disk registry, cancel
+/// token) into `ECStore`'s `InstanceContext`, so two `ECStore` object graphs
+/// can now stay isolated. This guard is intentionally **retained**: the startup
+/// path still publishes into the process-level *bootstrap* context (write-once
+/// region/endpoints/deployment id) and the single `GLOBAL_OBJECT_API` handle,
+/// so a second startup would fail-fast on that shared state. Lifting the guard
+/// requires threading a per-instance context through storage startup (so each
+/// server constructs its own context instead of sharing the bootstrap); until
+/// then, rejecting the second start is safer than the panic it would become.
 static EMBEDDED_SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
