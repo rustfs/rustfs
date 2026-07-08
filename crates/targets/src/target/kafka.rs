@@ -29,7 +29,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
+use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError, KafkaCode};
 use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SaslConfig, SecurityConfig};
 use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_private_key};
 use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
@@ -247,10 +247,23 @@ where
     E: PluginEvent,
 {
     fn map_kafka_error(err: KafkaError, context: &str) -> TargetError {
-        match err {
-            KafkaError::Connection(ConnectionError::NoHostReachable) => TargetError::NotConnected,
-            KafkaError::Connection(ConnectionError::Timeout(_)) => TargetError::Timeout(format!("{context}: {err}")),
-            KafkaError::Connection(_) => TargetError::Network(format!("{context}: {err}")),
+        // Prefer the client's own retriable classification so transient broker
+        // states (leader election / NotLeaderForPartition, coordinator load,
+        // network blips, RequestTimedOut) are retried via store replay instead of
+        // being dropped as permanent failures (backlog#973).
+        if err.is_retriable() {
+            return match &err {
+                KafkaError::Connection(ConnectionError::Timeout(_)) | KafkaError::Kafka(KafkaCode::RequestTimedOut) => {
+                    TargetError::Timeout(format!("{context}: {err}"))
+                }
+                _ => TargetError::NotConnected,
+            };
+        }
+
+        // Non-retriable errors: configuration problems are permanent config
+        // errors; everything else (e.g. UnknownTopicOrPartition, authorization
+        // failures, oversize messages) is a permanent request-level failure.
+        match &err {
             KafkaError::Config(_) => TargetError::Configuration(format!("{context}: {err}")),
             _ => TargetError::Request(format!("{context}: {err}")),
         }
@@ -332,12 +345,22 @@ where
             self.tls_state.lock().await.refresh(next_fingerprint);
         }
 
-        let mut cached = self.producer.lock().await;
-        if let Some(producer) = cached.as_ref() {
-            return Ok(Arc::clone(producer));
+        {
+            let cached = self.producer.lock().await;
+            if let Some(producer) = cached.as_ref() {
+                return Ok(Arc::clone(producer));
+            }
         }
 
+        // Build the producer without holding the cache lock so a slow connect
+        // does not block other senders (which only need to read the cache).
+        // Re-check the cache after building in case another task raced us
+        // (backlog#983).
         let producer = Arc::new(self.build_producer().await?);
+        let mut cached = self.producer.lock().await;
+        if let Some(existing) = cached.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
         *cached = Some(Arc::clone(&producer));
         Ok(producer)
     }
@@ -367,7 +390,14 @@ where
 
         let producer = self.get_or_build_producer().await?;
 
-        if let Err(err) = producer.send(&Record::from_value(&self.args.topic, body.as_slice())).await {
+        // Use "<bucket>/<object>" as the message key so all events for the same
+        // object hash to the same partition and preserve per-object ordering
+        // across multiple partitions (backlog#983).
+        let partition_key = format!("{}/{}", meta.bucket_name, meta.object_name);
+        if let Err(err) = producer
+            .send(&Record::from_key_value(&self.args.topic, partition_key, body.as_slice()))
+            .await
+        {
             let mapped = Self::map_kafka_error(err, "Failed to send message to Kafka");
             invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_producer()).await;
             return Err(mapped);
@@ -661,6 +691,39 @@ mod tests {
         assert_eq!(sasl.mechanism(), KAFKA_SASL_SCRAM_SHA_512);
         assert_eq!(sasl.username(), "user");
         assert_eq!(sasl.password(), "secret");
+    }
+
+    #[test]
+    fn map_kafka_error_treats_transient_broker_states_as_retriable() {
+        // Leader election / metadata staleness must be retried, not dropped
+        // as a permanent failure (backlog#973).
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Kafka(KafkaCode::NotLeaderForPartition), "send"),
+            TargetError::NotConnected
+        ));
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Kafka(KafkaCode::LeaderNotAvailable), "send"),
+            TargetError::NotConnected
+        ));
+        // RequestTimedOut is retriable and surfaced as a timeout.
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Kafka(KafkaCode::RequestTimedOut), "send"),
+            TargetError::Timeout(_)
+        ));
+    }
+
+    #[test]
+    fn map_kafka_error_treats_permanent_broker_states_as_request_error() {
+        // A missing topic/partition is a permanent condition; retrying would
+        // storm the broker.
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Kafka(KafkaCode::UnknownTopicOrPartition), "send"),
+            TargetError::Request(_)
+        ));
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Config("bad".to_string()), "send"),
+            TargetError::Configuration(_)
+        ));
     }
 
     #[test]

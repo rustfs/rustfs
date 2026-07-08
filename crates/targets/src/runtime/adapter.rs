@@ -142,8 +142,15 @@ where
         replay_workers: &mut ReplayWorkerManager,
         activation: RuntimeActivation<E>,
     ) -> Result<(), TargetError> {
+        // Stop (and join) the old replay workers before installing the new set so
+        // no two workers ever drain the same store concurrently, then close the
+        // old targets. A close failure during reload is logged but does not abort
+        // the reload — the new configuration must still take effect.
         self.stop_replay_workers(replay_workers).await;
-        runtime.clear_and_close().await;
+        let close_errors = runtime.clear_and_close().await;
+        if !close_errors.is_empty() {
+            tracing::warn!(failed_targets = close_errors.len(), "Some targets failed to close during runtime reload");
+        }
 
         for target in activation.targets {
             runtime.add_arc(target);
@@ -174,8 +181,19 @@ where
         runtime: &mut TargetRuntimeManager<E>,
         replay_workers: &mut ReplayWorkerManager,
     ) -> Result<(), TargetError> {
+        // On explicit shutdown, propagate any close/flush failures instead of
+        // swallowing them: the runtime is still fully torn down, but the caller
+        // learns that a target could not be flushed/closed cleanly.
         self.stop_replay_workers(replay_workers).await;
-        runtime.clear_and_close().await;
+        let close_errors = runtime.clear_and_close().await;
+        if !close_errors.is_empty() {
+            let detail = close_errors
+                .into_iter()
+                .map(|(target_id, err)| format!("{target_id}: {err}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(TargetError::Storage(format!("Failed to close {detail}")));
+        }
         Ok(())
     }
 }

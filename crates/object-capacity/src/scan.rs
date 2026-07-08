@@ -95,6 +95,26 @@ impl CapacityScanReport {
             update.expected_disk_count = Some(expected_disk_count);
             update.replaces_disk_cache = replaces_disk_cache;
             update.clear_dirty_disks = update.per_disk.iter().map(|entry| entry.disk.clone()).collect();
+        } else if self.summary.had_partial_errors {
+            // Partial failure: mark the reading degraded and surface only the
+            // disks whose own scan fully succeeded, so the manager can merge
+            // them over a complete disk cache while failed disks keep their
+            // last-known values. A disk with intra-disk errors under-counts,
+            // so its stale cache entry is closer to the truth than its scan.
+            // The cache is never replaced from a degraded refresh.
+            update.degraded = true;
+            update.per_disk = self
+                .per_disk
+                .into_iter()
+                .filter(|entry| !entry.scan.had_partial_errors)
+                .map(|entry| DiskCapacityUpdate {
+                    disk: entry.disk,
+                    used_bytes: entry.scan.used_bytes,
+                    file_count: entry.scan.file_count,
+                    is_estimated: entry.scan.is_estimated,
+                })
+                .collect();
+            update.clear_dirty_disks = update.per_disk.iter().map(|entry| entry.disk.clone()).collect();
         }
 
         update
@@ -1123,6 +1143,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_partial_scan_report_produces_degraded_update() {
+        use std::fs::File;
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut file = File::create(temp_dir.path().join("test.txt")).unwrap();
+        file.write_all(b"Hello, World!").unwrap();
+        drop(file);
+
+        let good_disk = CapacityDiskRef {
+            endpoint: "disk-1".to_string(),
+            drive_path: temp_dir.path().to_string_lossy().into_owned(),
+        };
+        let disks = vec![
+            good_disk.clone(),
+            CapacityDiskRef {
+                endpoint: "disk-2".to_string(),
+                drive_path: "/nonexistent/path".to_string(),
+            },
+        ];
+
+        let report = calculate_data_dir_used_capacity_report(&disks).await.unwrap();
+        let update = report.into_capacity_update(disks.len(), true);
+
+        // A partial full refresh is degraded and must never replace the disk
+        // cache; only the surviving disk is surfaced for cache merging.
+        assert!(update.degraded);
+        assert!(!update.replaces_disk_cache);
+        assert_eq!(update.expected_disk_count, None);
+        assert_eq!(update.per_disk.len(), 1);
+        assert_eq!(update.per_disk[0].disk, disk_scope_key(&good_disk));
+        assert_eq!(update.clear_dirty_disks, vec![disk_scope_key(&good_disk)]);
+    }
+
+    #[test]
+    fn test_into_capacity_update_partial_failure_filters_intra_disk_errors() {
+        let clean = DiskCapacityScanResult {
+            disk: CapacityScopeDisk {
+                endpoint: "node-a".to_string(),
+                drive_path: "/tmp/disk-a".to_string(),
+            },
+            scan: CapacityScanResult {
+                used_bytes: 100,
+                file_count: 1,
+                ..Default::default()
+            },
+        };
+        let partial = DiskCapacityScanResult {
+            disk: CapacityScopeDisk {
+                endpoint: "node-b".to_string(),
+                drive_path: "/tmp/disk-b".to_string(),
+            },
+            scan: CapacityScanResult {
+                used_bytes: 40,
+                file_count: 1,
+                had_partial_errors: true,
+                ..Default::default()
+            },
+        };
+        let report = CapacityScanReport {
+            summary: CapacityScanResult {
+                used_bytes: 140,
+                file_count: 2,
+                had_partial_errors: true,
+                ..Default::default()
+            },
+            per_disk: vec![clean.clone(), partial],
+        };
+
+        let update = report.into_capacity_update(3, true);
+
+        // A disk whose own scan had intra-disk errors under-counts, so it must
+        // not overwrite its last-known cached value.
+        assert!(update.degraded);
+        assert_eq!(update.per_disk.len(), 1);
+        assert_eq!(update.per_disk[0].disk, clean.disk);
+        assert_eq!(update.per_disk[0].used_bytes, 100);
+        assert!(!update.replaces_disk_cache);
+    }
+
+    #[tokio::test]
     async fn test_select_capacity_refresh_disks_returns_full_when_disk_cache_incomplete() {
         let manager = create_isolated_manager(HybridStrategyConfig::default());
         manager
@@ -1159,6 +1261,7 @@ mod tests {
                     total_used: 300,
                     file_count: 3,
                     is_estimated: false,
+                    degraded: false,
                     per_disk: vec![
                         DiskCapacityUpdate {
                             disk: CapacityScopeDisk {

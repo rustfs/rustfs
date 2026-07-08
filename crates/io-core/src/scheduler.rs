@@ -36,7 +36,14 @@ pub enum IoPriority {
 
 impl IoPriority {
     /// Determine priority based on request size.
+    ///
+    /// A negative `size` means the size is unknown (-1 by convention) and maps
+    /// to `Normal`; casting it to `usize` would wrap to a huge value and
+    /// misclassify the request as `Low`.
     pub fn from_size(size: i64, high_threshold: usize, low_threshold: usize) -> Self {
+        if size < 0 {
+            return IoPriority::Normal;
+        }
         let size = size as usize;
         if size < high_threshold {
             IoPriority::High
@@ -729,6 +736,13 @@ mod tests {
         assert_eq!(IoPriority::from_size(1024, 64 * 1024, 4 * 1024 * 1024), IoPriority::High);
         assert_eq!(IoPriority::from_size(1024 * 1024, 64 * 1024, 4 * 1024 * 1024), IoPriority::Normal);
         assert_eq!(IoPriority::from_size(10 * 1024 * 1024, 64 * 1024, 4 * 1024 * 1024), IoPriority::Low);
+    }
+
+    #[test]
+    fn test_io_priority_unknown_size_is_normal() {
+        // -1 means "size unknown" and must not wrap to usize::MAX (=> Low).
+        assert_eq!(IoPriority::from_size(-1, 64 * 1024, 4 * 1024 * 1024), IoPriority::Normal);
+        assert_eq!(IoPriority::from_size(i64::MIN, 64 * 1024, 4 * 1024 * 1024), IoPriority::Normal);
     }
 
     #[test]

@@ -474,8 +474,26 @@ where
                 .publish::<_, _, i64>(self.args.channel.as_str(), body.as_slice())
                 .await
             {
-                Ok(_) => {
-                    debug!(target_id = %self.id, channel = %self.args.channel, attempt, "Event published to Redis channel");
+                Ok(receiver_count) => {
+                    // PUBLISH returns the number of subscribers that received the
+                    // message. Redis pub/sub is best-effort: with zero subscribers
+                    // the event is delivered to no one, yet the durable copy is
+                    // deleted. Warn so operators relying on reliable delivery are
+                    // not silently losing events (backlog#982).
+                    if receiver_count == 0 {
+                        warn!(
+                            target_id = %self.id,
+                            channel = %self.args.channel,
+                            "Redis PUBLISH reached 0 subscribers; the event was not received by any consumer (pub/sub is best-effort)"
+                        );
+                    }
+                    debug!(
+                        target_id = %self.id,
+                        channel = %self.args.channel,
+                        attempt,
+                        receiver_count,
+                        "Event published to Redis channel"
+                    );
                     self.delivery_counters.record_success();
                     return Ok(());
                 }
@@ -528,14 +546,17 @@ where
             return Ok(false);
         }
 
-        let client = self.publisher_client.lock().clone();
-        match tokio::time::timeout(Duration::from_secs(5), ping_redis_server(&client, &self.args)).await {
+        // Reuse the cached ConnectionManager for the health probe (via
+        // ensure_publisher_ready) instead of building a brand-new manager — and
+        // thus a fresh TCP+TLS handshake — on every health check (backlog#982).
+        // ensure_publisher_ready already invalidates the cached manager on a
+        // connectivity error so the next attempt rebuilds it.
+        match tokio::time::timeout(Duration::from_secs(5), self.ensure_publisher_ready()).await {
             Ok(Ok(())) => {
                 self.connected.store(true, Ordering::SeqCst);
                 Ok(true)
             }
             Ok(Err(err)) => {
-                invalidate_cache_on_connectivity_error(&err, || self.invalidate_cached_publisher()).await;
                 mark_target_disconnected_on_connectivity_error(&self.connected, &err);
                 Err(err)
             }
@@ -650,6 +671,13 @@ pub(crate) fn build_redis_client(args: &RedisArgs) -> Result<Client, TargetError
     let mut url = args.url.clone();
     if args.tls.allow_insecure {
         url.set_fragment(Some("insecure"));
+        // Mirror the webhook `skip_tls_verify` warning: this disables Redis
+        // server certificate verification and must only be used for testing
+        // (backlog#982).
+        warn!(
+            target = %redact_redis_url(&args.url),
+            "Redis tls_allow_insecure is enabled: server certificate verification is DISABLED (insecure). Use for testing only."
+        );
     }
 
     let mut connection_info: ConnectionInfo = url.into_connection_info().map_err(map_redis_error)?;

@@ -4008,8 +4008,15 @@ mod tests {
         assert!(part.etag.is_empty());
     }
 
-    #[test]
-    fn shard_read_costs_for_empty_disk_set_are_empty() {
+    // Runs under a Tokio runtime like the sibling reservation tests:
+    // shard_read_costs_for_disks consults process-global topology state
+    // (local_endpoint_hosts_for_shard_costs), whose fast-lock manager lazily
+    // spawns a background cleanup task on first access. As a plain sync #[test]
+    // this panicked with a TryCurrentError whenever it was the first test in a
+    // process to touch that global (e.g. under nextest's per-test isolation),
+    // making it order-dependent flaky in CI.
+    #[tokio::test]
+    async fn shard_read_costs_for_empty_disk_set_are_empty() {
         assert!(shard_read_costs_for_disks(&[]).is_empty());
     }
 

@@ -37,7 +37,14 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
 
     match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
         Ok(_) => Ok(()),
-        Err(_) => Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized)),
+        Err(losing_system) => {
+            // Another initializer won the race. `init()` above already started this
+            // system's targets and replay workers, so simply dropping it would leak
+            // those background tasks. Shut the losing instance down cleanly before
+            // reporting the conflict (backlog#984).
+            losing_system.shutdown().await;
+            Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized))
+        }
     }
 }
 

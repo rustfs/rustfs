@@ -32,8 +32,8 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use hyper_rustls::ConfigBuilderExt;
 use rumqttc::{
-    AsyncClient, Broker, ConnectionError, EventLoop, Incoming, MqttOptions, Outgoing, QoS, Transport,
-    mqttbytes::Error as MqttBytesError,
+    AsyncClient, Broker, ClientError, ConnectionError, EventLoop, Incoming, MqttOptions, Outgoing, PublishNoticeError, QoS,
+    Transport, mqttbytes::Error as MqttBytesError,
 };
 use rustfs_config::{
     EnableState, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_WS_PATH_ALLOWLIST,
@@ -58,6 +58,10 @@ const DEFAULT_MQTT_TCP_PORT: u16 = 1883;
 const DEFAULT_MQTT_TLS_PORT: u16 = 8883;
 const DEFAULT_MQTT_WSS_PORT: u16 = 443;
 const MAX_MQTT_PACKET_SIZE_BYTES: u32 = 100 * 1024 * 1024;
+/// Upper bound on how long a single publish may wait for broker acknowledgement
+/// (PUBACK/PUBCOMP for QoS>=1, or network flush for QoS0) before it is treated as
+/// a timeout so the durable copy is retained and replayed (backlog#971).
+const MQTT_PUBLISH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 /// Minimum delay before the supervisor rebuilds the client and event loop
 /// after a session exits. Also the delay used right after a session that had
 /// successfully connected, so a transient drop reconnects promptly.
@@ -779,40 +783,78 @@ where
             "mqtt delivery state"
         );
 
-        client
-            .publish(&self.args.topic, self.args.qos, false, body)
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("Connection") || e.to_string().contains("Timeout") {
-                    warn!(
-                        event = EVENT_MQTT_DELIVERY_STATE,
-                        component = LOG_COMPONENT_TARGETS,
-                        subsystem = LOG_SUBSYSTEM_MQTT,
-                        target_id = %self.id,
-                        state = "publish_failed",
-                        reason = "connectivity_error",
-                        error = %e,
-                        "mqtt delivery state"
-                    );
-                    let err = TargetError::NotConnected;
-                    mark_target_disconnected_on_connectivity_error(&self.connected, &err);
-                    err
-                } else {
-                    TargetError::Request(format!("Failed to publish message: {e}"))
-                }
-            })?;
+        // Enqueue a tracked publish so we can wait for broker acknowledgement
+        // (PUBACK for QoS1, PUBCOMP for QoS2, or network flush for QoS0) before
+        // reporting success. Previously the publish was treated as delivered as
+        // soon as it was queued on the event loop, so a disconnect after queueing
+        // silently dropped the event while its durable copy was already deleted
+        // (backlog#971). Error classification now matches on the typed error
+        // instead of substring matching on the display string.
+        let notice = match client.publish_tracked(&self.args.topic, self.args.qos, false, body).await {
+            Ok(notice) => notice,
+            Err(e) => {
+                let err = classify_mqtt_client_error(&e);
+                warn!(
+                    event = EVENT_MQTT_DELIVERY_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "publish_failed",
+                    reason = "enqueue_error",
+                    error = %e,
+                    "mqtt delivery state"
+                );
+                mark_target_disconnected_on_connectivity_error(&self.connected, &err);
+                return Err(err);
+            }
+        };
 
-        debug!(
-            event = EVENT_MQTT_DELIVERY_STATE,
-            component = LOG_COMPONENT_TARGETS,
-            subsystem = LOG_SUBSYSTEM_MQTT,
-            target_id = %self.id,
-            topic = %self.args.topic,
-            state = "published",
-            "mqtt delivery state"
-        );
-        self.delivery_counters.record_success();
-        Ok(())
+        // Release the client lock before awaiting the broker acknowledgement so a
+        // slow/hung broker never blocks other senders from queueing publishes.
+        drop(client_guard);
+
+        match tokio::time::timeout(MQTT_PUBLISH_CONFIRM_TIMEOUT, notice.wait_completion_async()).await {
+            Ok(Ok(())) => {
+                debug!(
+                    event = EVENT_MQTT_DELIVERY_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    topic = %self.args.topic,
+                    state = "published",
+                    "mqtt delivery state"
+                );
+                self.delivery_counters.record_success();
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let err = classify_mqtt_notice_error(&e);
+                warn!(
+                    event = EVENT_MQTT_DELIVERY_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "publish_unconfirmed",
+                    error = %e,
+                    "mqtt delivery state"
+                );
+                mark_target_disconnected_on_connectivity_error(&self.connected, &err);
+                Err(err)
+            }
+            Err(_) => {
+                let err = TargetError::Timeout("Timed out waiting for MQTT publish acknowledgement".to_string());
+                warn!(
+                    event = EVENT_MQTT_DELIVERY_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_MQTT,
+                    target_id = %self.id,
+                    state = "publish_confirm_timeout",
+                    "mqtt delivery state"
+                );
+                mark_target_disconnected_on_connectivity_error(&self.connected, &err);
+                Err(err)
+            }
+        }
     }
 
     pub fn clone_target(&self) -> Box<dyn Target<E> + Send + Sync> {
@@ -1188,6 +1230,33 @@ async fn run_mqtt_event_loop(mut eventloop: EventLoop, connected_status: Arc<Ato
     );
 
     initial_connection_established
+}
+
+/// Classifies a publish-enqueue failure. Every [`ClientError`] variant means the
+/// publish could not be handed to the event loop (channel closed/full, or the
+/// tracked-publish API is unavailable), i.e. the client is not currently able to
+/// deliver. These are treated as retriable connectivity errors so the durable
+/// copy is preserved and replayed rather than dropped (backlog#971).
+fn classify_mqtt_client_error(err: &ClientError) -> TargetError {
+    match err {
+        ClientError::Request(_) | ClientError::TryRequest(_) | ClientError::TrackingUnavailable => TargetError::NotConnected,
+    }
+}
+
+/// Classifies a publish acknowledgement failure returned while waiting for the
+/// broker to confirm delivery. Connectivity/session problems keep the event for
+/// replay; a broker rejection with a failing reason code is surfaced as a
+/// request-level error (backlog#971).
+fn classify_mqtt_notice_error(err: &PublishNoticeError) -> TargetError {
+    match err {
+        PublishNoticeError::Recv
+        | PublishNoticeError::SessionReset
+        | PublishNoticeError::Qos0NotFlushed
+        | PublishNoticeError::TopicAliasReplayUnavailable(_) => TargetError::NotConnected,
+        PublishNoticeError::V5PubAck(_) | PublishNoticeError::V5PubRec(_) | PublishNoticeError::V5PubComp(_) => {
+            TargetError::Request(format!("MQTT broker rejected publish: {err}"))
+        }
+    }
 }
 
 /// Check whether the given MQTT connection error should be considered a fatal error,
@@ -1636,15 +1705,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MQTT_RECONNECT_BACKOFF_MAX, MQTT_RECONNECT_BACKOFF_MIN, MQTTArgs, MQTTTlsConfig, QoS, next_reconnect_backoff,
-        reconnect_supervisor, validate_mqtt_broker_url,
+        ClientError, MQTT_RECONNECT_BACKOFF_MAX, MQTT_RECONNECT_BACKOFF_MIN, MQTTArgs, MQTTTlsConfig, PublishNoticeError, QoS,
+        classify_mqtt_client_error, classify_mqtt_notice_error, next_reconnect_backoff, reconnect_supervisor,
+        validate_mqtt_broker_url,
     };
+    use crate::error::TargetError;
     use crate::target::{REDACTED_SECRET, TargetType};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use url::Url;
+
+    #[test]
+    fn mqtt_client_error_classified_as_not_connected() {
+        // A publish that cannot be handed to the event loop means the client is
+        // not connected; the durable copy must be kept for replay (backlog#971).
+        assert!(matches!(
+            classify_mqtt_client_error(&ClientError::TrackingUnavailable),
+            TargetError::NotConnected
+        ));
+    }
+
+    #[test]
+    fn mqtt_notice_connectivity_errors_kept_for_replay() {
+        for err in [
+            PublishNoticeError::SessionReset,
+            PublishNoticeError::Qos0NotFlushed,
+            PublishNoticeError::Recv,
+        ] {
+            assert!(
+                matches!(classify_mqtt_notice_error(&err), TargetError::NotConnected),
+                "unconfirmed publish {err:?} should be retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn mqtt_notice_broker_rejection_is_request_error() {
+        // The broker acknowledged the publish but rejected it: this is a
+        // request-level failure, not a transient disconnect.
+        let err = PublishNoticeError::V5PubAck(rumqttc::PubAckReason::NotAuthorized);
+        assert!(matches!(classify_mqtt_notice_error(&err), TargetError::Request(_)));
+    }
 
     #[test]
     fn next_reconnect_backoff_doubles_until_capped() {

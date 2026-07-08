@@ -44,6 +44,7 @@ use crate::metrics::collectors::{
     collect_cluster_usage_metrics,
     collect_compression_cluster_metrics,
     collect_cpu_metrics,
+    collect_current_dial9_metrics,
     collect_drive_count_metrics,
     collect_drive_detailed_metrics,
     collect_erasure_set_metrics,
@@ -93,11 +94,12 @@ use crate::metrics::stats_collector::{
     collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
     collect_compression_cluster_stats, collect_disk_and_system_drive_stats, collect_erasure_set_stats,
     collect_host_network_stats, collect_iam_stats, collect_ilm_metric_stats, collect_internode_network_stats,
-    collect_process_metric_bundle, collect_replication_stats, collect_scanner_metric_stats,
+    collect_process_metric_bundle_with, collect_replication_stats, collect_scanner_metric_stats,
     collect_system_cpu_and_memory_stats_with,
 };
 use futures_util::FutureExt;
 use rustfs_audit::audit_target_metrics;
+use rustfs_io_metrics::ProcessSampler;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use serde::Serialize;
@@ -1274,6 +1276,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let labels = current_process_metric_labels();
         let mut host_system = System::new_all();
         let mut host_networks = Networks::new();
+        let mut process_sampler = ProcessSampler::new();
         let process_interval = config.process_interval;
         let mut interval = metrics_interval(process_interval, Duration::ZERO);
         let now = Instant::now();
@@ -1311,7 +1314,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                 _ = interval.tick() => {
                     run_metrics_collector_tick(health, MetricsCollectorTaskId::ProcessMetrics, "process_metrics", async {
                         let now = Instant::now();
-                        let bundle = collect_process_metric_bundle();
+                    let bundle = collect_process_metric_bundle_with(&mut process_sampler);
 
                         if now >= next_resource_run {
                             let mut metrics = collect_resource_metrics(&bundle.resource);
@@ -1325,8 +1328,10 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             let mut metrics =
                                 collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
                             #[cfg(not(feature = "gpu"))]
-                            let metrics =
+                            let mut metrics =
                                 collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
+
+                            metrics.extend(collect_current_dial9_metrics());
 
                             #[cfg(feature = "gpu")]
                             if let Some(collector) = gpu_collector.as_ref() {

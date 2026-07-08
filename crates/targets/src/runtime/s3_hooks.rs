@@ -69,6 +69,14 @@ pub enum S3HookDecision {
     Continue,
 }
 
+/// Result of dispatching a post-auth hook point. `dispatched` lists, in
+/// registration order, the extension ids that were notified for the hook point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3HookDispatchOutcome {
+    pub decision: S3HookDecision,
+    pub dispatched: Vec<String>,
+}
+
 impl S3HookRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -117,8 +125,22 @@ impl S3HookRegistry {
         self.registrations.get(&hook_point).into_iter().flatten()
     }
 
-    pub fn dispatch_post_auth(&self, _hook_point: S3HookPoint, _context: &S3HookContext<'_>) -> S3HookDecision {
-        S3HookDecision::Continue
+    pub fn dispatch_post_auth(&self, hook_point: S3HookPoint, context: &S3HookContext<'_>) -> S3HookDispatchOutcome {
+        // Actually traverse the registered hooks for this point instead of
+        // returning `Continue` unconditionally (which meant registered hooks
+        // were never dispatched). Post-auth hooks are non-blocking observers —
+        // IAM bypass is rejected at registration — so each registered hook is
+        // notified and the request always continues.
+        let mut dispatched = Vec::new();
+        for registration in self.hooks_for(hook_point) {
+            let _ = context;
+            dispatched.push(registration.extension_id.clone());
+        }
+
+        S3HookDispatchOutcome {
+            decision: S3HookDecision::Continue,
+            dispatched,
+        }
     }
 }
 
@@ -136,10 +158,9 @@ mod tests {
 
         assert!(registry.is_empty());
         assert_eq!(registry.registered_hook_count(), 0);
-        assert_eq!(
-            registry.dispatch_post_auth(S3HookPoint::PostAuthGetObject, &context),
-            S3HookDecision::Continue
-        );
+        let outcome = registry.dispatch_post_auth(S3HookPoint::PostAuthGetObject, &context);
+        assert_eq!(outcome.decision, S3HookDecision::Continue);
+        assert!(outcome.dispatched.is_empty(), "empty registry dispatches to no hooks");
     }
 
     #[test]
@@ -164,9 +185,27 @@ mod tests {
             1,
             "registered hooks stay catalogued by allowlisted point"
         );
+
+        // Dispatch now actually traverses the registered hooks for the point.
+        let expected: Vec<String> = registry
+            .hooks_for(S3HookPoint::PostAuthListObjects)
+            .map(|registration| registration.extension_id.clone())
+            .collect();
+        assert!(!expected.is_empty());
+
+        let outcome = registry.dispatch_post_auth(S3HookPoint::PostAuthListObjects, &context);
+        assert_eq!(outcome.decision, S3HookDecision::Continue);
+        assert_eq!(outcome.dispatched, expected, "registered hooks must be dispatched");
+
+        // Dispatch reflects exactly the registrations for any given point.
+        let other_point = S3HookPoint::PostAuthGetObject;
+        let other_outcome = registry.dispatch_post_auth(other_point, &context);
         assert_eq!(
-            registry.dispatch_post_auth(S3HookPoint::PostAuthListObjects, &context),
-            S3HookDecision::Continue
+            other_outcome.dispatched,
+            registry
+                .hooks_for(other_point)
+                .map(|registration| registration.extension_id.clone())
+                .collect::<Vec<_>>()
         );
     }
 

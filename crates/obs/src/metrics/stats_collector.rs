@@ -37,7 +37,10 @@ use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
+use rustfs_io_metrics::{
+    ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, snapshot_process_resource_and_system,
+    snapshot_process_resource_and_system_with,
+};
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
@@ -662,6 +665,19 @@ pub async fn collect_system_drive_stats() -> (Vec<DriveDetailedStats>, DriveCoun
 #[inline]
 pub fn collect_process_metric_bundle() -> ProcessMetricBundle {
     let (resource_snapshot, process_snapshot) = snapshot_process_resource_and_system();
+    process_metric_bundle_from_snapshots(resource_snapshot, process_snapshot)
+}
+
+#[inline]
+pub fn collect_process_metric_bundle_with(sampler: &mut ProcessSampler) -> ProcessMetricBundle {
+    let (resource_snapshot, process_snapshot) = snapshot_process_resource_and_system_with(sampler);
+    process_metric_bundle_from_snapshots(resource_snapshot, process_snapshot)
+}
+
+fn process_metric_bundle_from_snapshots(
+    resource_snapshot: ProcessResourceSnapshot,
+    process_snapshot: ProcessSystemSnapshot,
+) -> ProcessMetricBundle {
     let status = match process_snapshot.status {
         ProcessStatusSnapshot::Running => ProcessStatusType::Running,
         ProcessStatusSnapshot::Sleeping => ProcessStatusType::Sleeping,

@@ -93,12 +93,17 @@ impl SubscriberIndex {
     pub fn store_snapshot(&self, bucket: &str, new_snapshot: BucketRulesSnapshot<DynRulesContainer>) {
         let key = bucket.to_string();
 
-        let cell = self.inner.get(&key).unwrap_or_else(|| {
-            // Insert a default cell (empty snapshot)
-            let init = Arc::new(ArcSwap::from_pointee(BucketRulesSnapshot::empty(self.empty_rules.clone())));
-            self.inner.insert(key.clone(), init.clone());
-            init
-        });
+        // Atomic get-or-create of the bucket's cell. The previous `get()` then
+        // `insert()` was a TOCTOU: two concurrent first-writers for the same bucket
+        // could both observe `None`, each build a distinct `ArcSwap` cell, and both
+        // `insert` — the second insert overwrites the first cell, so the snapshot
+        // stored into the discarded cell is silently lost. `compute_if_absent` holds
+        // the shard write lock across the check-and-insert, so every caller shares the
+        // one winning cell and no snapshot is dropped (backlog#984).
+        let empty_rules = self.empty_rules.clone();
+        let cell = self
+            .inner
+            .compute_if_absent(key, || Arc::new(ArcSwap::from_pointee(BucketRulesSnapshot::empty(empty_rules.clone()))));
 
         cell.store(Arc::new(new_snapshot));
     }
@@ -116,16 +121,74 @@ impl SubscriberIndex {
 
 impl Default for SubscriberIndex {
     fn default() -> Self {
-        // An available empty rule container is required; here it is implemented using minimal empty
-        #[derive(Debug)]
-        struct EmptyRules;
-        impl crate::rules::subscriber_snapshot::RulesContainer for EmptyRules {
-            type Rule = dyn crate::rules::subscriber_snapshot::RuleEvents;
-            fn iter_rules<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Self::Rule> + 'a> {
-                Box::new(std::iter::empty())
-            }
-        }
-
         Self::new(Arc::new(EmptyRules) as Arc<DynRulesContainer>)
+    }
+}
+
+/// A minimal empty rules container used for empty snapshots and tests.
+#[derive(Debug)]
+struct EmptyRules;
+
+impl crate::rules::subscriber_snapshot::RulesContainer for EmptyRules {
+    type Rule = dyn crate::rules::subscriber_snapshot::RuleEvents;
+    fn iter_rules<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Self::Rule> + 'a> {
+        Box::new(std::iter::empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_s3_types::EventName;
+
+    fn snapshot_with_mask(mask: u64) -> BucketRulesSnapshot<DynRulesContainer> {
+        BucketRulesSnapshot {
+            event_mask: mask,
+            rules: Arc::new(EmptyRules) as Arc<DynRulesContainer>,
+        }
+    }
+
+    #[test]
+    fn store_then_load_roundtrips_snapshot() {
+        let index = SubscriberIndex::default();
+        assert!(!index.has_subscriber("bucket", &EventName::ObjectCreatedPut));
+
+        index.store_snapshot("bucket", snapshot_with_mask(EventName::ObjectCreatedPut.mask()));
+        assert!(index.has_subscriber("bucket", &EventName::ObjectCreatedPut));
+
+        index.clear_bucket("bucket");
+        assert!(!index.has_subscriber("bucket", &EventName::ObjectCreatedPut));
+    }
+
+    /// Regression test for backlog#984 (subscriber_index TOCTOU): many tasks
+    /// concurrently perform the first write for the *same* new bucket. The old
+    /// `get()`-then-`insert()` path could have concurrent first-writers each build
+    /// a distinct cell and clobber one another in the map, orphaning a stored
+    /// snapshot. With the atomic `compute_if_absent` upsert every writer shares the
+    /// one winning cell, so the final snapshot is always a real, non-empty store —
+    /// never the discarded empty default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_first_writes_share_one_cell() {
+        let mask = EventName::ObjectCreatedPut.mask();
+        for _round in 0..64 {
+            let index = Arc::new(SubscriberIndex::default());
+            const WRITERS: usize = 16;
+
+            let mut handles = Vec::with_capacity(WRITERS);
+            for _ in 0..WRITERS {
+                let index = index.clone();
+                handles.push(tokio::spawn(async move {
+                    index.store_snapshot("shared-bucket", snapshot_with_mask(mask));
+                }));
+            }
+            for handle in handles {
+                handle.await.expect("writer task must not panic");
+            }
+
+            assert!(
+                index.has_subscriber("shared-bucket", &EventName::ObjectCreatedPut),
+                "a concurrently-stored snapshot must survive; none was lost to a clobbered cell"
+            );
+        }
     }
 }

@@ -110,12 +110,14 @@ impl OpsDiagnosticsRegistry {
     }
 
     pub fn authorize_read(&self, request: OpsDiagnosticsReadRequest<'_>) -> OpsDiagnosticsAccessDecision {
-        if !self.registrations.contains_key(&request.surface) {
-            return OpsDiagnosticsAccessDecision::DenyUnknownSurface;
-        }
-
+        // Authorize before probing the registry so an unauthorized caller cannot
+        // distinguish a registered surface from an unknown one (existence leak).
         if !request.admin_action_authorized {
             return OpsDiagnosticsAccessDecision::DenyMissingAdminAction;
+        }
+
+        if !self.registrations.contains_key(&request.surface) {
+            return OpsDiagnosticsAccessDecision::DenyUnknownSurface;
         }
 
         if request.capability != OPS_DIAGNOSTICS_CAPABILITY {
@@ -182,6 +184,33 @@ mod tests {
             }),
             OpsDiagnosticsAccessDecision::DenyMissingAdminAction
         );
+    }
+
+    #[test]
+    fn unauthorized_read_does_not_leak_surface_existence() {
+        let mut registry = OpsDiagnosticsRegistry::new();
+        // Register only the Metrics surface so Health is genuinely unknown.
+        let mut contract = builtin_ops_diagnostics_contract();
+        contract.surfaces = vec![OpsDiagnosticSurface::Metrics];
+        registry
+            .register_schema(&builtin_ops_diagnostics_extension_schema(), &contract)
+            .expect("subset ops diagnostics contract should register");
+
+        // A registered surface and an unknown surface must be indistinguishable
+        // to an unauthorized caller.
+        let registered = registry.authorize_read(OpsDiagnosticsReadRequest {
+            surface: OpsDiagnosticSurface::Metrics,
+            capability: OPS_DIAGNOSTICS_CAPABILITY,
+            admin_action_authorized: false,
+        });
+        let unknown = registry.authorize_read(OpsDiagnosticsReadRequest {
+            surface: OpsDiagnosticSurface::Health,
+            capability: OPS_DIAGNOSTICS_CAPABILITY,
+            admin_action_authorized: false,
+        });
+
+        assert_eq!(registered, OpsDiagnosticsAccessDecision::DenyMissingAdminAction);
+        assert_eq!(unknown, OpsDiagnosticsAccessDecision::DenyMissingAdminAction);
     }
 
     #[test]

@@ -60,6 +60,10 @@ pub struct TargetTlsRuntimeState<M> {
     pub last_error: parking_lot::RwLock<Option<String>>,
     /// The TLS file paths this state watches.
     pub inputs: TargetTlsInputSet,
+    /// Serializes reload cycles for this target. Without it a `force_reload`
+    /// and a poll-loop tick could interleave, producing duplicate generations
+    /// or publishing an older material over a newer one.
+    pub reload_lock: tokio::sync::Mutex<()>,
 }
 
 impl<M> TargetTlsRuntimeState<M> {
@@ -72,6 +76,7 @@ impl<M> TargetTlsRuntimeState<M> {
             last_success_unix_ms: AtomicU64::new(0),
             last_error: parking_lot::RwLock::new(None),
             inputs,
+            reload_lock: tokio::sync::Mutex::new(()),
         }
     }
 
