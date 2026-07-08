@@ -352,6 +352,10 @@ pub struct CapacityUpdate {
     pub replaces_disk_cache: bool,
     /// Dirty disks that can be cleared after the update is committed.
     pub clear_dirty_disks: Vec<CapacityScopeDisk>,
+    /// When the scan behind this update started; dirty marks recorded after
+    /// this instant survive the commit (backlog#1020 S19). `None` clears
+    /// unconditionally.
+    pub scan_started_at: Option<Instant>,
 }
 
 impl CapacityUpdate {
@@ -366,6 +370,7 @@ impl CapacityUpdate {
             expected_disk_count: None,
             replaces_disk_cache: false,
             clear_dirty_disks: Vec::new(),
+            scan_started_at: None,
         }
     }
 
@@ -380,6 +385,7 @@ impl CapacityUpdate {
             expected_disk_count: None,
             replaces_disk_cache: false,
             clear_dirty_disks: Vec::new(),
+            scan_started_at: None,
         }
     }
 
@@ -394,6 +400,7 @@ impl CapacityUpdate {
             expected_disk_count: None,
             replaces_disk_cache: false,
             clear_dirty_disks: Vec::new(),
+            scan_started_at: None,
         }
     }
 }
@@ -631,8 +638,10 @@ pub struct HybridCapacityManager {
     cache: Arc<RwLock<Option<CachedCapacity>>>,
     /// Write record
     write_record: Arc<RwLock<WriteRecord>>,
-    /// Dirty disks recorded from write-side scope propagation.
-    dirty_disks: Arc<RwLock<HashSet<CapacityScopeDisk>>>,
+    /// Dirty disks recorded from write-side scope propagation, keyed to the
+    /// instant they were last marked so a commit only clears marks that
+    /// predate its scan (backlog#1020 S19).
+    dirty_disks: Arc<RwLock<HashMap<CapacityScopeDisk, Instant>>>,
     /// Per-disk cache populated after a successful full refresh and updated by dirty subset refreshes.
     disk_cache: Arc<RwLock<HashMap<CapacityScopeDisk, CachedDiskCapacity>>>,
     /// Whether the per-disk cache currently covers all known disks.
@@ -650,8 +659,9 @@ impl HybridCapacityManager {
             return;
         }
 
+        let now = Instant::now();
         let mut dirty_disks = self.dirty_disks.write().await;
-        dirty_disks.extend(scopes);
+        dirty_disks.extend(scopes.into_iter().map(|disk| (disk, now)));
         record_capacity_dirty_disk_count(dirty_disks.len());
     }
 
@@ -670,7 +680,7 @@ impl HybridCapacityManager {
                 write_count: 0,
                 write_buckets: [WriteBucket::default(); WRITE_WINDOW_BUCKETS],
             })),
-            dirty_disks: Arc::new(RwLock::new(HashSet::new())),
+            dirty_disks: Arc::new(RwLock::new(HashMap::new())),
             disk_cache: Arc::new(RwLock::new(HashMap::new())),
             disk_cache_complete: Arc::new(RwLock::new(false)),
             config,
@@ -765,7 +775,18 @@ impl HybridCapacityManager {
         if !update.clear_dirty_disks.is_empty() {
             let mut dirty_disks = self.dirty_disks.write().await;
             for disk in &update.clear_dirty_disks {
-                dirty_disks.remove(disk);
+                // Only clear marks that predate the scan behind this update: a
+                // write landing while the walker was already past its prefix
+                // re-marks the disk, and that mark must survive the commit or
+                // the next dirty-subset refresh serves stale bytes as exact
+                // (backlog#1020 S19).
+                let clearable = match (update.scan_started_at, dirty_disks.get(disk)) {
+                    (Some(scan_start), Some(marked_at)) => *marked_at <= scan_start,
+                    _ => true,
+                };
+                if clearable {
+                    dirty_disks.remove(disk);
+                }
             }
             record_capacity_dirty_disk_count(dirty_disks.len());
         }
@@ -815,8 +836,9 @@ impl HybridCapacityManager {
             return;
         }
 
+        let now = Instant::now();
         let mut dirty_disks = self.dirty_disks.write().await;
-        dirty_disks.extend(scope.disks.iter().cloned());
+        dirty_disks.extend(scope.disks.iter().cloned().map(|disk| (disk, now)));
         record_capacity_dirty_disk_count(dirty_disks.len());
     }
 
@@ -908,7 +930,22 @@ impl HybridCapacityManager {
     pub async fn get_dirty_disks(&self) -> Vec<CapacityScopeDisk> {
         self.sync_global_dirty_scopes().await;
         let dirty_disks = self.dirty_disks.read().await;
-        dirty_disks.iter().cloned().collect()
+        dirty_disks.keys().cloned().collect()
+    }
+
+    /// Drop dirty marks for disks outside the current local topology.
+    ///
+    /// The write side records every disk of an EC set — including remote
+    /// peers — while scans and dirty clearing only ever cover local disks, so
+    /// remote or removed disks would otherwise stay marked forever and keep
+    /// the dirty-disk gauge permanently non-zero (backlog#1020 S30).
+    pub async fn retain_dirty_disks_within(&self, local: &HashSet<CapacityScopeDisk>) {
+        let mut dirty_disks = self.dirty_disks.write().await;
+        let before = dirty_disks.len();
+        dirty_disks.retain(|disk, _| local.contains(disk));
+        if dirty_disks.len() != before {
+            record_capacity_dirty_disk_count(dirty_disks.len());
+        }
     }
 
     /// Returns true if the manager has a complete per-disk cache and can safely refresh only dirty disks.
@@ -1773,6 +1810,7 @@ mod tests {
                     expected_disk_count: Some(2),
                     replaces_disk_cache: true,
                     clear_dirty_disks: Vec::new(),
+                    scan_started_at: None,
                 },
                 DataSource::RealTime,
             )
@@ -1797,6 +1835,7 @@ mod tests {
                     expected_disk_count: Some(1),
                     replaces_disk_cache: false,
                     clear_dirty_disks: Vec::new(),
+                    scan_started_at: None,
                 },
                 DataSource::WriteTriggered,
             )
@@ -1840,6 +1879,7 @@ mod tests {
             expected_disk_count: Some(2),
             replaces_disk_cache: true,
             clear_dirty_disks: Vec::new(),
+            scan_started_at: None,
         }
     }
 
@@ -1864,6 +1904,7 @@ mod tests {
                     expected_disk_count: None,
                     replaces_disk_cache: false,
                     clear_dirty_disks: Vec::new(),
+                    scan_started_at: None,
                 },
                 DataSource::Scheduled,
             )
@@ -1906,6 +1947,7 @@ mod tests {
                     expected_disk_count: None,
                     replaces_disk_cache: false,
                     clear_dirty_disks: Vec::new(),
+                    scan_started_at: None,
                 },
                 DataSource::Scheduled,
             )
@@ -1934,6 +1976,7 @@ mod tests {
                     expected_disk_count: None,
                     replaces_disk_cache: false,
                     clear_dirty_disks: Vec::new(),
+                    scan_started_at: None,
                 },
                 DataSource::Scheduled,
             )
@@ -1945,6 +1988,84 @@ mod tests {
         assert_eq!(cached.total_used, 100);
         assert!(cached.degraded);
         assert!(!manager.can_refresh_dirty_subset().await);
+    }
+
+    fn scope_disk(endpoint: &str, drive_path: &str) -> CapacityScopeDisk {
+        CapacityScopeDisk {
+            endpoint: endpoint.to_string(),
+            drive_path: drive_path.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_commit_keeps_dirty_marks_recorded_after_scan_start() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        let disk = scope_disk("node-a", "/tmp/disk-a");
+
+        // Dirty before the scan starts: this mark is what the scan observed.
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![disk.clone()],
+            })
+            .await;
+        let scan_started_at = Instant::now();
+
+        // A write lands while the scan is in flight and re-marks the disk;
+        // the commit must not clear this newer mark.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![disk.clone()],
+            })
+            .await;
+
+        let mut update = CapacityUpdate::exact(100, 1);
+        update.clear_dirty_disks = vec![disk.clone()];
+        update.scan_started_at = Some(scan_started_at);
+        manager.update_capacity(update, DataSource::Scheduled).await;
+
+        assert_eq!(manager.get_dirty_disks().await, vec![disk]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_commit_clears_dirty_marks_recorded_before_scan_start() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        let disk = scope_disk("node-a", "/tmp/disk-a");
+
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![disk.clone()],
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let mut update = CapacityUpdate::exact(100, 1);
+        update.clear_dirty_disks = vec![disk.clone()];
+        update.scan_started_at = Some(Instant::now());
+        manager.update_capacity(update, DataSource::Scheduled).await;
+
+        assert!(manager.get_dirty_disks().await.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_retain_dirty_disks_within_drops_ghost_entries() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        let local = scope_disk("node-a", "/tmp/disk-a");
+        let remote = scope_disk("http://peer:9000", "/data/disk-1");
+
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![local.clone(), remote],
+            })
+            .await;
+
+        let local_set: HashSet<CapacityScopeDisk> = [local.clone()].into_iter().collect();
+        manager.retain_dirty_disks_within(&local_set).await;
+
+        assert_eq!(manager.get_dirty_disks().await, vec![local]);
     }
 
     #[tokio::test]
@@ -2078,6 +2199,7 @@ mod tests {
                     expected_disk_count: Some(2),
                     replaces_disk_cache: true,
                     clear_dirty_disks: Vec::new(),
+                    scan_started_at: None,
                 },
                 DataSource::RealTime,
             )
@@ -2101,6 +2223,7 @@ mod tests {
             expected_disk_count: Some(1),
             replaces_disk_cache: false,
             clear_dirty_disks: Vec::new(),
+            scan_started_at: None,
         };
 
         let returned = manager
