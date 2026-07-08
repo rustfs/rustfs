@@ -42,7 +42,6 @@ const DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST: bool = false;
 /// Read once at first use via `OnceLock` to avoid per-encode syscall.
 static CACHED_MAX_INFLIGHT_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static CACHED_BATCH_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-#[cfg(not(test))]
 static CACHED_BYTESMUT_INGEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 #[inline(always)]
@@ -84,12 +83,6 @@ fn erasure_encode_max_inflight_bytes() -> usize {
 }
 
 fn use_bytesmut_ingest() -> bool {
-    #[cfg(test)]
-    {
-        rustfs_utils::get_env_bool(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST)
-    }
-
-    #[cfg(not(test))]
     *CACHED_BYTESMUT_INGEST.get_or_init(|| {
         rustfs_utils::get_env_bool(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST)
     })
@@ -422,8 +415,9 @@ impl Erasure {
     }
 
     /// Streaming encode with an explicit ingest-buffer strategy. `encode` resolves the
-    /// strategy from `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST`; tests call this directly to
-    /// exercise both paths regardless of the cached environment value.
+    /// strategy from `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST` once per process via
+    /// `OnceLock`, so the cached value latches on first use; tests must call this
+    /// directly with an explicit flag (not `encode` + env vars) to exercise both paths.
     async fn encode_with_ingest_mode<R>(
         self: Arc<Self>,
         mut reader: R,
@@ -965,37 +959,33 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn encode_bytesmut_ingest_streaming_path_writes_and_shutdowns_writers() {
-        temp_env::async_with_vars([(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, Some("true"))], async {
-            const DATA_SHARDS: usize = 2;
-            const PARITY_SHARDS: usize = 2;
-            const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
-            const BLOCK_SIZE: usize = 32;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const TOTAL_SHARDS: usize = DATA_SHARDS + PARITY_SHARDS;
+        const BLOCK_SIZE: usize = 32;
 
-            let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
-            let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
-                .iter()
-                .map(|c| Some(bitrot_writer(DeferredCommitWriter::new(c.clone()), BLOCK_SIZE / DATA_SHARDS)))
-                .collect();
+        let committed: Vec<Arc<Mutex<Vec<u8>>>> = (0..TOTAL_SHARDS).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut writers: Vec<Option<BitrotWriterWrapper>> = committed
+            .iter()
+            .map(|c| Some(bitrot_writer(DeferredCommitWriter::new(c.clone()), BLOCK_SIZE / DATA_SHARDS)))
+            .collect();
 
-            let payload = vec![0x5a; BLOCK_SIZE * 2 + 7];
-            let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
-            let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
-            let (_reader, written) = erasure
-                .encode(reader, &mut writers, DATA_SHARDS)
-                .await
-                .expect("BytesMut ingest path should encode the streaming payload");
+        let payload = vec![0x5a; BLOCK_SIZE * 2 + 7];
+        let erasure = Arc::new(Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE));
+        let reader = tokio::io::BufReader::new(Cursor::new(payload.clone()));
+        let (_reader, written) = erasure
+            .encode_with_ingest_mode(reader, &mut writers, DATA_SHARDS, true)
+            .await
+            .expect("BytesMut ingest path should encode the streaming payload");
 
-            assert_eq!(written, payload.len());
-            for (index, committed) in committed.iter().enumerate() {
-                assert!(
-                    !committed.lock().expect("committed buffer should be lockable").is_empty(),
-                    "shard {index} should receive bytesmut-ingest data"
-                );
-            }
-        })
-        .await;
+        assert_eq!(written, payload.len());
+        for (index, committed) in committed.iter().enumerate() {
+            assert!(
+                !committed.lock().expect("committed buffer should be lockable").is_empty(),
+                "shard {index} should receive bytesmut-ingest data"
+            );
+        }
     }
 
     #[tokio::test]

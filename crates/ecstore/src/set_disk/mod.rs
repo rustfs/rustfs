@@ -8067,7 +8067,7 @@ mod tests {
             .expect("versioned delete should create a marker");
 
         assert!(marker.delete_marker);
-        assert!(marker.version_id.is_some());
+        let marker_version = marker.version_id.expect("versioned delete marker should carry a version id");
         let err = match set_disks
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
             .await
@@ -8076,8 +8076,24 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            is_err_object_not_found(&err) || matches!(err, Error::MethodNotAllowed),
-            "delete marker read must fail closed, got {err:?}"
+            is_err_object_not_found(&err),
+            "latest delete marker read must map to ObjectNotFound, got {err:?}"
+        );
+
+        let versioned_opts = ObjectOptions {
+            version_id: Some(marker_version.to_string()),
+            ..opts.clone()
+        };
+        let err = match set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &versioned_opts)
+            .await
+        {
+            Ok(_) => panic!("explicit delete marker version must not expose a body"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::MethodNotAllowed),
+            "explicit delete marker version read must map to MethodNotAllowed, got {err:?}"
         );
     }
 
@@ -8343,8 +8359,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            is_err_object_not_found(&err) || matches!(err, Error::MethodNotAllowed),
-            "null delete marker read must fail closed, got {err:?}"
+            is_err_object_not_found(&err),
+            "null delete marker read must map to ObjectNotFound, got {err:?}"
         );
     }
 

@@ -3064,6 +3064,7 @@ impl SetDisks {
         }
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            let mut revert_futures = Vec::with_capacity(disks.len());
             for (i, err) in errs.iter().enumerate() {
                 if err.is_some() {
                     continue;
@@ -3071,21 +3072,25 @@ impl SetDisks {
 
                 if let Some(disk) = disks[i].as_ref() {
                     let path = path_join_buf(&[prefix, STORAGE_FORMAT_FILE]);
-                    if let Err(err) = disk
-                        .delete(
-                            bucket,
-                            &path,
-                            DeleteOptions {
-                                recursive: true,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                    {
-                        warn!("write meta revert err {:?}", err);
-                    }
+                    revert_futures.push(async move {
+                        if let Err(err) = disk
+                            .delete(
+                                bucket,
+                                &path,
+                                DeleteOptions {
+                                    recursive: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            warn!("write meta revert err {:?}", err);
+                        }
+                    });
                 }
             }
+
+            join_all(revert_futures).await;
             return Err(err);
         }
         Ok(())
@@ -4489,9 +4494,22 @@ mod tests {
     }
 
     #[test]
-    fn record_read_repair_dedup_accepts_known_reasons() {
-        record_read_repair_dedup("duplicate");
-        record_read_repair_dedup("policy_drop");
+    fn record_read_repair_dedup_counts_each_reason_separately() {
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_read_repair_dedup("duplicate");
+            record_read_repair_dedup("duplicate");
+            record_read_repair_dedup("policy_drop");
+        });
+
+        assert_eq!(
+            recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "duplicate")]),
+            2
+        );
+        assert_eq!(
+            recorder.counter_value("rustfs_heal_read_repair_dedup_total", &[("reason", "policy_drop")]),
+            1
+        );
     }
 
     #[tokio::test]
@@ -4525,7 +4543,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_read_repair_heal_wrapper_records_reservation_without_external_channel() {
+    // Serialized so this never overlaps the blackbox corrupt-shard test, which
+    // owns the global heal channel receiver: without the serial key this test
+    // could submit into a live-but-not-yet-drained channel and time out below.
+    #[serial_test::serial]
+    async fn submit_read_repair_heal_wrapper_releases_reservation_when_channel_unavailable() {
+        // Serialized against the blackbox heal-channel owner, the channel is in
+        // one of two deterministic states here: never initialized (the default
+        // submitter fails with "Heal channel not initialized") or initialized
+        // with its receiver already dropped (the send fails immediately). Either
+        // way the wrapper must release the dedup reservation it recorded before
+        // spawning — the fail-closed release path.
         let object = format!("object-{}", Uuid::new_v4());
         submit_read_repair_heal("bucket", &object, None, 4, 5, Some(7), "test").await;
 
@@ -4537,12 +4565,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        if let Some(key) = reserve_read_repair_heal("bucket", &object, None, 4, 5).await {
-            release_read_repair_heal_reservation(&key).await;
-        } else {
-            let admitted_key = ReadRepairHealCacheKey::new("bucket", &object, None, 4, 5);
-            release_read_repair_heal_reservation(&admitted_key).await;
-        }
+        panic!("unserviced heal channel must release the wrapper's read-repair dedup reservation");
     }
 
     #[tokio::test]

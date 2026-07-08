@@ -12,6 +12,14 @@ UNIT_COVERAGE_MIN="95"
 UNIT_COVERAGE_TARGET="100"
 UNIT_COVERAGE_SCOPE="ec-critical"
 
+# These two tests bootstrap process-wide ECStore state, so each runs in its
+# own cargo-test process and is skipped from every aggregate --lib run.
+# Single source of truth: the isolated steps, ecstore-lib-all, and
+# run_coverage all read these, so a test rename is a one-line update here
+# (and a stale name fails loudly via run_filtered_test_step).
+readonly ISOLATED_BUCKET_MIGRATION_TEST="bucket::migration::tests::migrates_real_minio_bucket_metadata_end_to_end"
+readonly ISOLATED_DELETE_LOCK_GATING_TEST="set_disk::ops::object::delete_objects_lock_gating_tests::delete_objects_blocks_locked_object_and_deletes_the_rest"
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -184,21 +192,49 @@ run_step() {
   fi
 }
 
+# cargo test exits 0 when a filter matches nothing ("running 0 tests"), so a
+# renamed test would let a filtered gate pass vacuously. Run the command,
+# mirror its output (run_step's tee still sees the live stream), and fail
+# unless libtest reports at least one matched test ("running 1 test",
+# "running 12 tests", ...). If libtest ever rewords that line, this fails
+# loudly instead of passing silently — the safe direction.
+require_matched_tests() {
+  local scratch="$1"
+  shift
+  local status=0
+  "$@" 2>&1 | tee "$scratch" || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    return "$status"
+  fi
+  if ! grep -qE '^running [1-9][0-9]* tests?$' "$scratch"; then
+    printf 'ERROR: test filter matched 0 tests (test renamed or moved?): '
+    quote_command "$@"
+    printf '\n'
+    return 1
+  fi
+}
+
+run_filtered_test_step() {
+  local label="$1"
+  shift
+  run_step "$label" require_matched_tests "$OUT_DIR/logs/$(safe_label "$label").tests.log" "$@"
+}
+
 run_core_unit_steps() {
-	  run_step "filemeta-lib" cargo test -p rustfs-filemeta --lib
-	  run_step "ecstore-erasure-lib" cargo test -p rustfs-ecstore --lib erasure
-	  run_step "ecstore-set-disk-read-lib" cargo test -p rustfs-ecstore --lib set_disk::read
-	  run_step "ecstore-io-primitives-lib" cargo test -p rustfs-ecstore --lib set_disk::core::io_primitives
-	  run_step "ecstore-rename-rollback" \
-	    cargo test -p rustfs-ecstore --lib set_disk::tests::test_rename_data_quorum_failure_rolls_back_destination_object
-	  run_step "ecstore-disk-local-lib" cargo test -p rustfs-ecstore --lib disk::local
-  run_step "ecstore-global-bucket-migration" \
-    cargo test -p rustfs-ecstore --lib bucket::migration::tests::migrates_real_minio_bucket_metadata_end_to_end -- --exact
-  run_step "ecstore-global-delete-lock-gating" \
-    cargo test -p rustfs-ecstore --lib set_disk::ops::object::delete_objects_lock_gating_tests::delete_objects_blocks_locked_object_and_deletes_the_rest -- --exact
+  run_step "filemeta-lib" cargo test -p rustfs-filemeta --lib
+  run_filtered_test_step "ecstore-erasure-lib" cargo test -p rustfs-ecstore --lib erasure
+  run_filtered_test_step "ecstore-set-disk-read-lib" cargo test -p rustfs-ecstore --lib set_disk::read
+  run_filtered_test_step "ecstore-io-primitives-lib" cargo test -p rustfs-ecstore --lib set_disk::core::io_primitives
+  run_filtered_test_step "ecstore-rename-rollback" \
+    cargo test -p rustfs-ecstore --lib set_disk::tests::test_rename_data_quorum_failure_rolls_back_destination_object
+  run_filtered_test_step "ecstore-disk-local-lib" cargo test -p rustfs-ecstore --lib disk::local
+  run_filtered_test_step "ecstore-global-bucket-migration" \
+    cargo test -p rustfs-ecstore --lib "$ISOLATED_BUCKET_MIGRATION_TEST" -- --exact
+  run_filtered_test_step "ecstore-global-delete-lock-gating" \
+    cargo test -p rustfs-ecstore --lib "$ISOLATED_DELETE_LOCK_GATING_TEST" -- --exact
   run_step "ecstore-lib-all" cargo test -p rustfs-ecstore --lib -- --test-threads=1 \
-    --skip bucket::migration::tests::migrates_real_minio_bucket_metadata_end_to_end \
-    --skip set_disk::ops::object::delete_objects_lock_gating_tests::delete_objects_blocks_locked_object_and_deletes_the_rest
+    --skip "$ISOLATED_BUCKET_MIGRATION_TEST" \
+    --skip "$ISOLATED_DELETE_LOCK_GATING_TEST"
 }
 
 run_quick_e2e_steps() {
@@ -444,8 +480,8 @@ run_coverage() {
   local coverage_files="$coverage_dir/files.tsv"
   local cmd=(
     cargo llvm-cov -p rustfs-ecstore --lib --lcov --output-path "$lcov_path" -- --test-threads=1
-    --skip bucket::migration::tests::migrates_real_minio_bucket_metadata_end_to_end
-    --skip set_disk::ops::object::delete_objects_lock_gating_tests::delete_objects_blocks_locked_object_and_deletes_the_rest
+    --skip "$ISOLATED_BUCKET_MIGRATION_TEST"
+    --skip "$ISOLATED_DELETE_LOCK_GATING_TEST"
   )
   local root
   root="$(pwd)"
@@ -522,7 +558,7 @@ run_destructive_profile() {
   # reopens as old-or-new, never a mixed/corrupt version (rustfs/backlog#878
   # hard rule). Unit-level, so it runs even when --skip-e2e drops the cluster
   # scenarios below.
-  run_step "ecstore-crash-consistency" \
+  run_filtered_test_step "ecstore-crash-consistency" \
     cargo test -p rustfs-ecstore --lib disk::local::test::crash_consistency -- --test-threads=1
 
   if [[ "$SKIP_E2E" == "true" ]]; then
