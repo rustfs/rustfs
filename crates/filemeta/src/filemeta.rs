@@ -166,7 +166,7 @@ impl FileMeta {
     }
 
     fn get_idx(&self, idx: usize) -> Result<FileMetaVersion> {
-        if idx > self.versions.len() {
+        if idx >= self.versions.len() {
             return Err(Error::FileNotFound);
         }
 
@@ -1138,6 +1138,33 @@ mod test {
         newfm.unmarshal_msg(&buff).unwrap();
 
         assert_eq!(fm, newfm)
+    }
+
+    #[test]
+    fn test_get_idx_out_of_bounds_returns_error_without_panic() {
+        let mut fm = FileMeta::new();
+
+        let (m, n) = (3, 2);
+        for i in 0..3 {
+            let mut fi = FileInfo::new(i.to_string().as_str(), m, n);
+            fi.version_id = Some(Uuid::from_u128(i + 1));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).unwrap();
+        }
+
+        let len = fm.versions.len();
+        assert_eq!(len, 3);
+
+        // In-bounds indices resolve.
+        assert!(fm.get_idx(0).is_ok());
+        assert!(fm.get_idx(len - 1).is_ok());
+
+        // idx == len must return FileNotFound rather than panic on the
+        // out-of-bounds slice index, matching set_idx's guard.
+        match fm.get_idx(len) {
+            Err(Error::FileNotFound) => {}
+            other => panic!("expected FileNotFound for idx == len, got {other:?}"),
+        }
     }
 
     #[test]
