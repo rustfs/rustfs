@@ -659,6 +659,7 @@ mod tests {
     type MetadataResult = SwiftResult<Option<HashMap<String, String>>>;
 
     #[derive(Default)]
+    #[allow(clippy::type_complexity)]
     struct MockExpirationObjectBackend {
         metadata_results: Mutex<VecDeque<MetadataResult>>,
         delete_results: Mutex<VecDeque<SwiftResult<()>>>,

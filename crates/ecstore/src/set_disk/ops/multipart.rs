@@ -264,6 +264,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
+        crate::hp_guard!("SetDisks::put_object_part");
         let upload_id_path = Self::get_upload_id_dir(bucket, object, upload_id);
 
         let (fi, _) = self.check_upload_id_exists(bucket, object, upload_id, true).await?;
@@ -786,6 +787,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
+        crate::hp_guard!("SetDisks::new_multipart_upload");
         let mut _object_lock_guard = None;
 
         if opts.http_preconditions.is_some() {
@@ -955,6 +957,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
+        crate::hp_guard!("SetDisks::complete_multipart_upload");
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let mut object_lock_guard = None;
@@ -1354,8 +1357,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         .await?;
 
         if let Some(old_dir) = op_old_dir {
-            self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
-                .await?;
+            let committed_dir = fi.data_dir.unwrap_or_default().to_string();
+            // backlog#898: best-effort reclaim of the dereferenced old data dir.
+            // Returns a receipt (never `Err`); a failed GC must not turn an
+            // already-committed multipart completion into a 503.
+            let cleanup = self
+                .commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), &committed_dir, write_quorum)
+                .await;
+            self.report_old_data_dir_cleanup(bucket, object, &old_dir.to_string(), &cleanup)
+                .await;
         }
 
         if let Some(stage_start) = complete_tail_stage_start {

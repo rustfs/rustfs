@@ -122,7 +122,7 @@ pub use capacity_metrics::{
     record_capacity_refresh_joiner, record_capacity_refresh_request, record_capacity_refresh_result,
     record_capacity_refresh_scope, record_capacity_scan_disk, record_capacity_scan_mode, record_capacity_scan_sampling,
     record_capacity_stall_detected, record_capacity_symlink, record_capacity_timeout_fallback, record_capacity_update_completed,
-    record_capacity_update_failed, record_capacity_write_operation,
+    record_capacity_update_failed, record_capacity_write_operation, record_old_data_dir_cleanup,
 };
 
 // I/O metrics exports

@@ -172,3 +172,22 @@ pub fn record_capacity_scan_disk(
         counter!("rustfs_capacity_scan_disk_partial_errors_total", "disk" => disk.to_owned()).increment(1);
     }
 }
+
+/// Record the outcome of a post-commit old-data-dir cleanup (backlog#898).
+///
+/// This is fired once per committed overwrite that had a previous data dir to
+/// reclaim. `leaked` is the number of disks whose old data dir could not be
+/// removed (a non-ignored, non-not-found failure) and is therefore a residue
+/// that leaks disk space until a heal reclaims it. The leak counter is the
+/// operator-visible backstop for that residue — see backlog#898 §3.4/§5.
+#[inline(always)]
+pub fn record_old_data_dir_cleanup(attempted: usize, reclaimed: usize, leaked: usize, below_quorum: bool) {
+    counter!("rustfs_old_data_dir_cleanup_attempted_total").increment(attempted as u64);
+    counter!("rustfs_old_data_dir_cleanup_reclaimed_total").increment(reclaimed as u64);
+    if leaked > 0 {
+        counter!("rustfs_old_data_dir_leaked_total").increment(leaked as u64);
+    }
+    if below_quorum {
+        counter!("rustfs_old_data_dir_cleanup_below_quorum_total").increment(1);
+    }
+}
