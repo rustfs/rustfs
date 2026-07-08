@@ -187,19 +187,32 @@ impl SidecarPluginRuntime {
         }
     }
 
-    pub fn send_with_timeout(&mut self, operation_timeout: Duration, simulated_latency: Duration) -> Result<(), String> {
-        if simulated_latency > operation_timeout {
-            self.record_failure(format!(
-                "sidecar send timeout after {:?} (budget {:?})",
-                simulated_latency, operation_timeout
-            ));
+    /// Simulates a send bounded by the policy's operation timeout. On timeout the
+    /// failure is recorded through the policy (so error details are redacted when
+    /// `redact_error_details` is set and the configurable failure threshold —
+    /// not a hardcoded constant — drives circuit breaking). A successful send
+    /// clears the failure count so transient blips never accumulate toward the
+    /// breaker.
+    pub fn send_with_timeout(&mut self, policy: &SidecarRuntimePolicy, simulated_latency: Duration) -> Result<(), String> {
+        if simulated_latency > policy.operation_timeout {
+            self.record_failure_with_policy(
+                policy,
+                format!(
+                    "sidecar send timeout after {:?} (budget {:?})",
+                    simulated_latency, policy.operation_timeout
+                ),
+            );
             return Err(self
                 .last_error
                 .clone()
-                .unwrap_or_else(|| "sidecar timeout without recorded error".to_string()));
+                .unwrap_or_else(|| "sidecar operation failed".to_string()));
         }
         self.healthy = true;
         self.last_error = None;
+        // Success resets the circuit-breaker accounting: a healthy send must not
+        // leave stale failures that could trip the breaker on the next blip.
+        self.failure_count = 0;
+        self.degraded_to_builtin = false;
         Ok(())
     }
 
@@ -404,12 +417,42 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_runtime_send_timeout_records_last_error() {
+    fn sidecar_runtime_send_timeout_redacts_error_and_uses_policy_threshold() {
         let mut runtime = SidecarPluginRuntime::new("grpc://127.0.0.1:50051", notify_sidecar_handshake());
+        // redact_error_details defaults to true; threshold 2 is honored, not the
+        // hardcoded DEFAULT_FAILURE_THRESHOLD.
+        let policy = SidecarRuntimePolicy::verified_external(16, Duration::from_millis(50), 2);
 
-        let result = runtime.send_with_timeout(Duration::from_millis(50), Duration::from_millis(75));
+        let result = runtime.send_with_timeout(&policy, Duration::from_millis(75));
 
         assert!(result.is_err());
-        assert_eq!(runtime.last_error.as_deref(), Some("sidecar send timeout after 75ms (budget 50ms)"));
+        // The raw budget/latency detail must not leak; it is redacted.
+        assert_eq!(runtime.last_error.as_deref(), Some("sidecar operation failed"));
+        assert_eq!(runtime.failure_count, 1);
+        assert!(!runtime.degraded_to_builtin);
+
+        // Second timeout hits the configured threshold and degrades.
+        let _ = runtime.send_with_timeout(&policy, Duration::from_millis(75));
+        assert_eq!(runtime.failure_count, 2);
+        assert!(runtime.degraded_to_builtin);
+    }
+
+    #[test]
+    fn sidecar_runtime_successful_send_clears_failure_count() {
+        let mut runtime = SidecarPluginRuntime::new("grpc://127.0.0.1:50051", notify_sidecar_handshake());
+        let policy = SidecarRuntimePolicy::verified_external(16, Duration::from_millis(50), 3);
+
+        // Accumulate a failure, then a successful send must reset the breaker
+        // accounting so a later single failure does not immediately degrade.
+        let _ = runtime.send_with_timeout(&policy, Duration::from_millis(75));
+        assert_eq!(runtime.failure_count, 1);
+
+        runtime
+            .send_with_timeout(&policy, Duration::from_millis(10))
+            .expect("a within-budget send should succeed");
+        assert_eq!(runtime.failure_count, 0);
+        assert!(!runtime.degraded_to_builtin);
+        assert!(runtime.healthy);
+        assert!(runtime.last_error.is_none());
     }
 }
