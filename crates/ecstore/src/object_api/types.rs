@@ -764,9 +764,13 @@ impl ObjectInfo {
             return Ok((checksums, true));
         }
 
-        // TODO: decrypt checksums
-
         if let Some(data) = &self.checksum {
+            if self.is_encrypted() {
+                // Object-level encrypted checksum bytes require SSE decrypt material,
+                // so do not expose them as plaintext checksum headers here.
+                return Ok((HashMap::new(), false));
+            }
+
             let (checksums, is_multipart) = rustfs_rio::read_checksums(data.as_ref(), 0);
             return Ok((checksums, is_multipart));
         }
@@ -1173,6 +1177,73 @@ mod tests {
         };
 
         assert!(info.is_encrypted());
+    }
+
+    #[test]
+    fn decrypt_checksums_reads_plain_object_checksum() {
+        let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"plain-object")
+            .expect("test checksum should be valid");
+        let checksum_key = checksum.checksum_type.to_string();
+        let expected_checksum = checksum.encoded.clone();
+        let info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            ..Default::default()
+        };
+
+        let (checksums, is_multipart) = info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("plain checksum should decode");
+
+        assert!(!is_multipart);
+        assert_eq!(checksums.get(&checksum_key), Some(&expected_checksum));
+    }
+
+    #[test]
+    fn decrypt_checksums_hides_encrypted_object_checksum_without_decrypt_material() {
+        let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
+            .expect("test checksum should be valid");
+        let info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            user_defined: Arc::new(HashMap::from([(
+                rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let (checksums, is_multipart) = info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("encrypted checksum should fail closed");
+
+        assert!(!is_multipart);
+        assert!(checksums.is_empty());
+    }
+
+    #[test]
+    fn decrypt_checksums_keeps_encrypted_part_checksum_metadata() {
+        let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
+            .expect("test checksum should be valid");
+        let part_checksums = HashMap::from([("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string())]);
+        let info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            user_defined: Arc::new(HashMap::from([(
+                rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )])),
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 2,
+                checksums: Some(part_checksums.clone()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let (checksums, is_multipart) = info
+            .decrypt_checksums(2, &HeaderMap::new())
+            .expect("part checksum metadata should remain readable");
+
+        assert!(is_multipart);
+        assert_eq!(checksums, part_checksums);
     }
 
     #[test]
