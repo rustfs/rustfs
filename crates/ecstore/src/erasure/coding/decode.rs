@@ -141,6 +141,38 @@ fn is_bitrot_decode_overlap_enabled() -> bool {
     )
 }
 
+/// Whether the legacy decode duplex loop should prefetch the next stripe while
+/// the current stripe is reconstructed and emitted (backlog#930 HP-9 step 2).
+///
+/// Two independent switches feed this decision:
+/// * `RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT` (> 1) — the operator asks for
+///   stripe reads to run ahead of decode.
+/// * `RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE` — overlap the read+bitrot-verify
+///   of the next stripe with the decode of the current one.
+///
+/// Both describe the same realisable mechanism. `ParallelReader::read` is
+/// inherently serial: it takes `&mut self` and advances a shared stripe cursor,
+/// so at most one stripe read can be in flight. The only overlap available is
+/// issuing the *next* stripe read while the *current* stripe is reconstructed
+/// and emitted (depth 1). A prefetch count above 1 therefore collapses to the
+/// same single-stripe-ahead pipeline rather than reading several stripes ahead.
+///
+/// Default (`count == 1`, `overlap == false`) => disabled => the loop keeps its
+/// pre-existing strictly-serial read → reconstruct → emit behaviour, byte for
+/// byte.
+fn legacy_stripe_prefetch_enabled() -> bool {
+    get_decode_stripe_prefetch_count() > 1 || is_bitrot_decode_overlap_enabled()
+}
+
+/// Outcome of reconstructing and emitting a single already-read stripe in the
+/// legacy decode loop.
+enum StripeFlow {
+    /// The stripe was emitted; the loop should continue with the next stripe.
+    Continue,
+    /// A terminal condition was recorded in `ret_err`; the loop must stop.
+    Stop,
+}
+
 #[derive(Default)]
 struct ShardReadCostCounts {
     local: usize,
@@ -1305,6 +1337,23 @@ fn get_data_block_len(shards: &[Option<Vec<u8>>], data_blocks: usize) -> usize {
     size
 }
 
+/// Read one stripe from the parallel reader, wrapped in the legacy-duplex
+/// stripe-read stage timer. Factored out so the depth-1 prefetch loop and the
+/// serial loop time reads identically. A free `async fn` (rather than a closure)
+/// so the returned future's borrow of `reader` is correctly tied to the call.
+async fn read_stripe_timed<R>(
+    reader: &mut ParallelReader<R>,
+    stage_metrics_enabled: bool,
+) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>)
+where
+    R: AsyncRead + Unpin + Send + Sync,
+{
+    let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    let out = reader.read().await;
+    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
+    out
+}
+
 /// Write data blocks from encoded blocks to target, supporting offset and length
 async fn write_data_blocks<W>(
     writer: &mut W,
@@ -1489,6 +1538,108 @@ impl Erasure {
             .await
     }
 
+    /// Reconstruct and emit one already-read stripe.
+    ///
+    /// This is the shared per-stripe body used by both the serial legacy loop
+    /// and the depth-1 prefetch loop, so the two paths cannot drift: the quorum
+    /// check, reconstruction-verification, emit, error attribution, and stage
+    /// metrics are identical regardless of whether the *next* stripe read is
+    /// already running concurrently. It never recycles shard buffers — the
+    /// caller owns that, because under prefetch the buffers must not return to
+    /// the pool until the overlapping next-stripe read has claimed its own.
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_decoded_stripe<W>(
+        &self,
+        writer: &mut W,
+        shards: &mut [Option<Vec<u8>>],
+        errs: &[Option<Error>],
+        block_offset: usize,
+        block_length: usize,
+        written: &mut usize,
+        ret_err: &mut Option<std::io::Error>,
+        stage_metrics_enabled: bool,
+    ) -> StripeFlow
+    where
+        W: AsyncWrite + Send + Sync + Unpin,
+    {
+        if ret_err.is_none()
+            && let (_, Some(err)) = reduce_errs(errs, &[])
+            && (err == Error::FileNotFound || err == Error::FileCorrupt)
+        {
+            *ret_err = Some(err.into());
+        }
+
+        // Equivalent to `ParallelReader::can_decode`; inlined so this helper does
+        // not need to borrow the reader, leaving the reader free for the
+        // concurrent next-stripe read under prefetch.
+        let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+        if available_shards < self.data_shards {
+            let reason = GetObjectFailureReason::ReadQuorum;
+            error!(
+                data_shards = self.data_shards,
+                total_shards = self.data_shards + self.parity_shards,
+                available_shards,
+                block_offset,
+                block_length,
+                stage = GET_STAGE_STRIPE_READ,
+                reason = reason.as_str(),
+                errors = ?errs,
+                "Erasure decode could not gather enough shards"
+            );
+            record_get_object_pipeline_failure(GET_STAGE_STRIPE_READ, reason);
+            *ret_err = Some(Error::ErasureReadQuorum.into());
+            return StripeFlow::Stop;
+        }
+
+        // Decode the shards. If this stripe needed parity to reconstruct a
+        // missing data shard and an extra source shard was available, verify
+        // the reconstructed data against that source before streaming bytes.
+        let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        if let Err(e) = self.decode_data_with_reconstruction_verification(shards) {
+            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
+            let reason = GetObjectFailureReason::DecodeError;
+            error!(
+                data_shards = self.data_shards,
+                total_shards = self.data_shards + self.parity_shards,
+                block_offset,
+                block_length,
+                stage = GET_STAGE_RECONSTRUCT,
+                reason = reason.as_str(),
+                error = ?e,
+                "Erasure shard reconstruction failed"
+            );
+            record_get_object_pipeline_failure(GET_STAGE_RECONSTRUCT, reason);
+            *ret_err = Some(e);
+            return StripeFlow::Stop;
+        }
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
+
+        let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        let n = match write_data_blocks(writer, shards, self.data_shards, block_offset, block_length).await {
+            Ok(n) => {
+                record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_EMIT, emit_stage_start);
+                n
+            }
+            Err(e) => {
+                record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_EMIT, emit_stage_start);
+                error!(
+                    block_offset,
+                    block_length,
+                    bytes_written = *written,
+                    stage = GET_STAGE_EMIT,
+                    reason = classify_io_error(&e).as_str(),
+                    error = ?e,
+                    "Erasure decode failed to emit reconstructed data"
+                );
+                *ret_err = Some(e);
+                return StripeFlow::Stop;
+            }
+        };
+
+        *written += n;
+        StripeFlow::Continue
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn decode_inner<W, R>(
         &self,
@@ -1552,8 +1703,10 @@ impl Erasure {
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;
 
-        for i in start..=end {
-            let (block_offset, block_length) = if start == end {
+        // Emit geometry (block offset, block length) for block `i`. Pure function
+        // of `i`; identical to the original inline computation.
+        let block_geometry = |i: usize| -> (usize, usize) {
+            if start == end {
                 (offset % self.block_size, length)
             } else if i == start {
                 (offset % self.block_size, self.block_size - (offset % self.block_size))
@@ -1562,97 +1715,138 @@ impl Erasure {
                 (0, if end_remainder == 0 { self.block_size } else { end_remainder })
             } else {
                 (0, self.block_size)
-            };
-
-            if block_length == 0 {
-                // error!("erasure decode decode block_length == 0");
-                break;
             }
+        };
 
+        if legacy_stripe_prefetch_enabled() {
+            // Depth-1 stripe prefetch (backlog#930 HP-9 step 2): while the current
+            // stripe is reconstructed and emitted, the next stripe's shard reads
+            // (including bitrot verification) run concurrently, hiding read
+            // latency under the emit / duplex-backpressure stage.
+            //
+            // Correctness notes:
+            // * The reconstruct/emit body is the *same* `emit_decoded_stripe`
+            //   used by the serial path, so error attribution, quorum handling,
+            //   reconstruction verification and metrics are unchanged.
+            // * A speculatively prefetched read for stripe N+1 is only ever
+            //   consumed when the loop actually reaches stripe N+1. If stripe N
+            //   stops the loop, the in-flight read is awaited (join) and then
+            //   dropped, so its errors never surface against stripe N.
+            // * Shard buffers are recycled only after the overlapping next read
+            //   has already claimed its own buffers — costing one extra stripe of
+            //   memory (double buffering) while preserving buffer reuse with a
+            //   one-stripe lag.
             let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
-            let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-            let (mut shards, errs) = reader.read().await;
-            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
 
-            if ret_err.is_none()
-                && let (_, Some(err)) = reduce_errs(&errs, &[])
-                && (err == Error::FileNotFound || err == Error::FileCorrupt)
-            {
-                ret_err = Some(err.into());
-            }
-
-            if !reader.can_decode(&shards) {
-                let reason = GetObjectFailureReason::ReadQuorum;
-                error!(
-                    data_shards = self.data_shards,
-                    total_shards = self.data_shards + self.parity_shards,
-                    available_shards = shards.iter().filter(|shard| shard.is_some()).count(),
-                    block_offset,
-                    block_length,
-                    stage = GET_STAGE_STRIPE_READ,
-                    reason = reason.as_str(),
-                    errors = ?errs,
-                    "Erasure decode could not gather enough shards"
-                );
-                record_get_object_pipeline_failure(GET_STAGE_STRIPE_READ, reason);
-                ret_err = Some(Error::ErasureReadQuorum.into());
-                break;
-            }
-
-            // Decode the shards. If this stripe needed parity to reconstruct a
-            // missing data shard and an extra source shard was available, verify
-            // the reconstructed data against that source before streaming bytes.
-            let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-            if let Err(e) = self.decode_data_with_reconstruction_verification(&mut shards) {
-                record_get_stage_duration_if_enabled(
-                    GET_OBJECT_PATH_LEGACY_DUPLEX,
-                    GET_STAGE_RECONSTRUCT,
-                    reconstruct_stage_start,
-                );
-                let reason = GetObjectFailureReason::DecodeError;
-                error!(
-                    data_shards = self.data_shards,
-                    total_shards = self.data_shards + self.parity_shards,
-                    block_offset,
-                    block_length,
-                    stage = GET_STAGE_RECONSTRUCT,
-                    reason = reason.as_str(),
-                    error = ?e,
-                    "Erasure shard reconstruction failed"
-                );
-                record_get_object_pipeline_failure(GET_STAGE_RECONSTRUCT, reason);
-                ret_err = Some(e);
-                break;
-            }
-            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
-
-            let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-            let n = match write_data_blocks(writer, &shards, self.data_shards, block_offset, block_length).await {
-                Ok(n) => {
-                    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_EMIT, emit_stage_start);
-                    n
-                }
-                Err(e) => {
-                    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_EMIT, emit_stage_start);
-                    error!(
-                        block_offset,
-                        block_length,
-                        bytes_written = written,
-                        stage = GET_STAGE_EMIT,
-                        reason = classify_io_error(&e).as_str(),
-                        error = ?e,
-                        "Erasure decode failed to emit reconstructed data"
-                    );
-                    ret_err = Some(e);
+            // Block geometries to emit, stopping at the first zero-length block
+            // exactly as the serial loop's `break` did.
+            let mut blocks = Vec::with_capacity(end - start + 1);
+            for i in start..=end {
+                let geometry = block_geometry(i);
+                if geometry.1 == 0 {
                     break;
                 }
-            };
+                blocks.push(geometry);
+            }
 
-            written += n;
+            if !blocks.is_empty() {
+                // Prime the first stripe read. `current` holds the stripe to
+                // process next; `take()` moves it out cleanly per iteration and
+                // the prefetch branch refills it with the overlapping read.
+                let mut current = Some(read_stripe_timed(&mut reader, stage_metrics_enabled).await);
 
-            // Hand active-reader buffers back so the next stripe can reuse them
-            // without retaining offline shard data that cannot be read again.
-            reader.recycle_shards(&mut shards);
+                for idx in 0..blocks.len() {
+                    let (block_offset, block_length) = blocks[idx];
+                    let Some((mut shards, errs)) = current.take() else {
+                        break;
+                    };
+
+                    if idx + 1 < blocks.len() {
+                        // Overlap: read stripe idx+1 while reconstructing/emitting idx.
+                        let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
+                        let emit_fut = self.emit_decoded_stripe(
+                            writer,
+                            &mut shards,
+                            &errs,
+                            block_offset,
+                            block_length,
+                            &mut written,
+                            &mut ret_err,
+                            stage_metrics_enabled,
+                        );
+                        let (next, flow) = tokio::join!(read_fut, emit_fut);
+                        match flow {
+                            StripeFlow::Continue => {
+                                reader.recycle_shards(&mut shards);
+                                current = Some(next);
+                            }
+                            StripeFlow::Stop => {
+                                // `next` is speculative; drop it without surfacing
+                                // its errors against the stripe that stopped.
+                                drop(next);
+                                break;
+                            }
+                        }
+                    } else {
+                        // Final stripe: nothing left to prefetch.
+                        match self
+                            .emit_decoded_stripe(
+                                writer,
+                                &mut shards,
+                                &errs,
+                                block_offset,
+                                block_length,
+                                &mut written,
+                                &mut ret_err,
+                                stage_metrics_enabled,
+                            )
+                            .await
+                        {
+                            StripeFlow::Continue => reader.recycle_shards(&mut shards),
+                            StripeFlow::Stop => break,
+                        }
+                    }
+                }
+            }
+        } else {
+            // Default strictly-serial path: read → reconstruct → emit, one stripe
+            // at a time. Byte-for-byte identical to the pre-HP-9 behaviour.
+            for i in start..=end {
+                let (block_offset, block_length) = block_geometry(i);
+
+                if block_length == 0 {
+                    // error!("erasure decode decode block_length == 0");
+                    break;
+                }
+
+                let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+                let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+                let (mut shards, errs) = reader.read().await;
+                record_get_stage_duration_if_enabled(
+                    GET_OBJECT_PATH_LEGACY_DUPLEX,
+                    GET_STAGE_STRIPE_READ,
+                    stripe_read_stage_start,
+                );
+
+                match self
+                    .emit_decoded_stripe(
+                        writer,
+                        &mut shards,
+                        &errs,
+                        block_offset,
+                        block_length,
+                        &mut written,
+                        &mut ret_err,
+                        stage_metrics_enabled,
+                    )
+                    .await
+                {
+                    // Hand active-reader buffers back so the next stripe can reuse
+                    // them without retaining offline shard data.
+                    StripeFlow::Continue => reader.recycle_shards(&mut shards),
+                    StripeFlow::Stop => break,
+                }
+            }
         }
 
         if ret_err.is_some() {
@@ -2075,6 +2269,333 @@ mod tests {
             })
             .await;
         }
+    }
+
+    // ---- backlog#930 HP-9 step 2: legacy decode-loop stripe prefetch ----
+
+    /// Encode `total_data` into per-shard bitrot streams for the given layout,
+    /// returning the raw shard buffers.
+    async fn encode_prefetch_object(erasure: &Erasure, total_data: &[u8], hash_algo: &HashAlgorithm) -> Vec<Vec<u8>> {
+        let total_shards = erasure.data_shards + erasure.parity_shards;
+        let shard_size = erasure.shard_size();
+        let block_size = erasure.block_size;
+        let mut shard_writers: Vec<BitrotWriter<Cursor<Vec<u8>>>> = (0..total_shards)
+            .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone()))
+            .collect();
+        let mut offset = 0;
+        while offset < total_data.len() {
+            let end = (offset + block_size).min(total_data.len());
+            let shards = erasure.encode_data(&total_data[offset..end]).unwrap();
+            for (i, shard) in shards.iter().enumerate() {
+                shard_writers[i].write(shard).await.unwrap();
+            }
+            offset = end;
+        }
+        shard_writers.into_iter().map(|w| w.into_inner().into_inner()).collect()
+    }
+
+    /// Build a reader set positioned at the block covering `offset`, optionally
+    /// dropping (`missing`) or byte-flipping (`corrupt`) individual shards. All
+    /// readers keep bitrot verification ON so corruption is actually detected.
+    fn build_prefetch_readers(
+        shard_bufs: &[Vec<u8>],
+        shard_size: usize,
+        hash_algo: &HashAlgorithm,
+        block_size: usize,
+        offset: usize,
+        missing: &[usize],
+        corrupt: &[usize],
+    ) -> Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> {
+        let hash_size = hash_algo.size();
+        let start_block = offset / block_size;
+        let cursor_pos = start_block * (shard_size + hash_size);
+        shard_bufs
+            .iter()
+            .enumerate()
+            .map(|(i, buf)| {
+                if missing.contains(&i) {
+                    return None;
+                }
+                let mut bytes = buf.clone();
+                if corrupt.contains(&i) {
+                    // Flip the first data byte of the starting block, past its
+                    // per-block checksum, so bitrot verification must reject it.
+                    let flip = cursor_pos + hash_size;
+                    if flip < bytes.len() {
+                        bytes[flip] ^= 0xFF;
+                    }
+                }
+                let mut cursor = Cursor::new(bytes);
+                cursor.set_position(cursor_pos as u64);
+                Some(BitrotReader::new(cursor, shard_size, hash_algo.clone(), false))
+            })
+            .collect()
+    }
+
+    /// Prefetch on/off env configurations exercised by the HP-9 tests.
+    /// `serial-default` pins both switches off (the byte-identical serial path);
+    /// the others turn the depth-1 prefetch pipeline on through each switch and
+    /// through a count above 1 (which collapses to depth 1 by design).
+    fn prefetch_env_configs() -> Vec<(&'static str, Vec<(&'static str, Option<&'static str>)>)> {
+        vec![
+            (
+                "serial-default",
+                vec![
+                    (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, None),
+                    (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, None),
+                ],
+            ),
+            (
+                "prefetch-count-2",
+                vec![
+                    (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("2")),
+                    (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, None),
+                ],
+            ),
+            (
+                "bitrot-overlap",
+                vec![
+                    (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, None),
+                    (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("true")),
+                ],
+            ),
+            (
+                "prefetch-count-8",
+                vec![
+                    (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("8")),
+                    (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("true")),
+                ],
+            ),
+        ]
+    }
+
+    /// Full and ranged healthy reads must be byte-exact under every prefetch
+    /// configuration, proving the depth-1 pipeline preserves range offset/length
+    /// precision, the short final stripe, and equivalence with the serial path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_legacy_prefetch_full_and_range_reads_match_serial() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        let total_data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+        let shard_bufs = encode_prefetch_object(&erasure, &total_data, &hash_algo).await;
+
+        let cases: &[(usize, usize, &str)] = &[
+            (0, total_len, "full read"),
+            (0, 50, "head partial block"),
+            (10, 30, "within first block"),
+            (60, 80, "crossing two block boundaries"),
+            (128, 50, "starting at block boundary"),
+            (130, 10, "small range deep in middle"),
+            (192, 8, "tail partial block"),
+        ];
+
+        for (label, vars) in prefetch_env_configs() {
+            temp_env::async_with_vars(vars, async {
+                for &(off, len, desc) in cases {
+                    let readers = build_prefetch_readers(&shard_bufs, shard_size, &hash_algo, BLOCK_SIZE, off, &[], &[]);
+                    let mut output = Vec::new();
+                    let (written, err) = erasure.decode(&mut output, readers, off, len, total_len).await;
+                    assert!(err.is_none(), "{label}/{desc}: unexpected error {err:?}");
+                    assert_eq!(written, len, "{label}/{desc}: written mismatch");
+                    assert_eq!(output, total_data[off..off + len], "{label}/{desc}: bytes mismatch");
+                }
+            })
+            .await;
+        }
+    }
+
+    /// Degraded read: two data shards offline, so every stripe reconstructs from
+    /// the survivors. Must stay byte-exact under prefetch, exercising buffer
+    /// recycle and reconstruction while the next stripe read runs concurrently.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_legacy_prefetch_degraded_read_reconstructs() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        let total_data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+        let shard_bufs = encode_prefetch_object(&erasure, &total_data, &hash_algo).await;
+
+        for (label, vars) in prefetch_env_configs() {
+            temp_env::async_with_vars(vars, async {
+                let readers = build_prefetch_readers(&shard_bufs, shard_size, &hash_algo, BLOCK_SIZE, 0, &[0, 2], &[]);
+                let mut output = Vec::new();
+                let (written, err) = erasure.decode(&mut output, readers, 0, total_len, total_len).await;
+                assert!(err.is_none(), "{label}: degraded read errored {err:?}");
+                assert_eq!(written, total_len, "{label}: degraded short write");
+                assert_eq!(output, total_data, "{label}: degraded bytes mismatch");
+            })
+            .await;
+        }
+    }
+
+    /// A single bit-flipped data shard must be rejected by HighwayHash on every
+    /// prefetch configuration, and the object must still reconstruct byte-exact
+    /// from the survivors — proving prefetch neither bypasses bitrot nor lets a
+    /// corrupt shard leak into the output.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_legacy_prefetch_rejects_corrupt_shard_but_recovers() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        let total_data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+        let shard_bufs = encode_prefetch_object(&erasure, &total_data, &hash_algo).await;
+
+        for (label, vars) in prefetch_env_configs() {
+            temp_env::async_with_vars(vars, async {
+                let readers = build_prefetch_readers(&shard_bufs, shard_size, &hash_algo, BLOCK_SIZE, 0, &[], &[1]);
+                let mut output = Vec::new();
+                let (written, err) = erasure.decode(&mut output, readers, 0, total_len, total_len).await;
+                assert!(err.is_none(), "{label}: corrupt-shard read errored {err:?}");
+                assert_eq!(written, total_len, "{label}: corrupt-shard short write");
+                assert_eq!(output, total_data, "{label}: corrupt bytes leaked into output");
+            })
+            .await;
+        }
+    }
+
+    /// Unrecoverable stripe 0 (two shards offline + one corrupt leaves < quorum)
+    /// must fail the read on every prefetch configuration, and must not emit any
+    /// bytes reconstructed from absent/corrupt data — so a speculatively
+    /// prefetched read can never turn a failure into silent garbage output.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_legacy_prefetch_unrecoverable_corruption_errors() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        let total_data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+        let shard_bufs = encode_prefetch_object(&erasure, &total_data, &hash_algo).await;
+
+        for (label, vars) in prefetch_env_configs() {
+            temp_env::async_with_vars(vars, async {
+                let readers = build_prefetch_readers(&shard_bufs, shard_size, &hash_algo, BLOCK_SIZE, 0, &[0, 1], &[2]);
+                let mut output = Vec::new();
+                let (_written, err) = erasure.decode(&mut output, readers, 0, total_len, total_len).await;
+                assert!(err.is_some(), "{label}: unrecoverable corruption must fail the read");
+                assert!(output.is_empty(), "{label}: emitted bytes despite an unrecoverable stripe 0");
+            })
+            .await;
+        }
+    }
+
+    /// The first stripe is fully recoverable but the parity readers are
+    /// truncated to one block, so a *later* stripe loses quorum. Under prefetch
+    /// that later read is issued speculatively while stripe 0 emits, yet its
+    /// failure must be attributed to the later stripe: stripe 0's bytes are
+    /// emitted and the read then fails, rather than the prefetch error poisoning
+    /// the already-good stripe.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_legacy_prefetch_attributes_late_stripe_failure() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        let total_data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::HighwayHash256;
+        let hash_size = hash_algo.size();
+        let shard_bufs = encode_prefetch_object(&erasure, &total_data, &hash_algo).await;
+        let first_block_len = hash_size + shard_size;
+
+        for (label, vars) in prefetch_env_configs() {
+            temp_env::async_with_vars(vars, async {
+                let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = shard_bufs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, buf)| {
+                        if i == 0 || i == 1 {
+                            return None; // two data shards offline
+                        }
+                        let bytes = if i >= DATA_SHARDS {
+                            buf[..first_block_len.min(buf.len())].to_vec() // parity: one block only
+                        } else {
+                            buf.clone()
+                        };
+                        Some(BitrotReader::new(Cursor::new(bytes), shard_size, hash_algo.clone(), false))
+                    })
+                    .collect();
+                let mut output = Vec::new();
+                let (written, err) = erasure.decode(&mut output, readers, 0, total_len, total_len).await;
+                assert!(err.is_some(), "{label}: truncated-parity object must fail on the later stripe");
+                assert_eq!(written, BLOCK_SIZE, "{label}: first stripe must emit before the later failure");
+                assert_eq!(output, total_data[..BLOCK_SIZE], "{label}: first stripe bytes wrong");
+            })
+            .await;
+        }
+    }
+
+    /// `hash_size == 0` (HashAlgorithm::None) direct pass-through must stay
+    /// byte-exact under prefetch for both a full and a mid-object range read.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_legacy_prefetch_no_hash_passthrough() {
+        const DATA_SHARDS: usize = 4;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        let total_data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let total_len = total_data.len();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let hash_algo = HashAlgorithm::None;
+        let shard_bufs = encode_prefetch_object(&erasure, &total_data, &hash_algo).await;
+
+        for (label, vars) in prefetch_env_configs() {
+            temp_env::async_with_vars(vars, async {
+                for &(off, len) in &[(0usize, total_len), (70usize, 90usize)] {
+                    let readers = build_prefetch_readers(&shard_bufs, shard_size, &hash_algo, BLOCK_SIZE, off, &[], &[]);
+                    let mut output = Vec::new();
+                    let (written, err) = erasure.decode(&mut output, readers, off, len, total_len).await;
+                    assert!(err.is_none(), "{label}: no-hash read errored {err:?}");
+                    assert_eq!(written, len, "{label}: no-hash written mismatch");
+                    assert_eq!(output, total_data[off..off + len], "{label}: no-hash bytes mismatch");
+                }
+            })
+            .await;
+        }
+    }
+
+    /// The prefetch gate is off by default and turns on through either switch.
+    #[test]
+    #[serial_test::serial]
+    fn test_legacy_stripe_prefetch_gate_defaults_off() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, None::<&str>),
+                (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, None::<&str>),
+            ],
+            || assert!(!legacy_stripe_prefetch_enabled(), "prefetch must default off"),
+        );
+        temp_env::with_vars([(ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("2"))], || {
+            assert!(legacy_stripe_prefetch_enabled(), "count > 1 must enable prefetch");
+        });
+        temp_env::with_vars([(ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("true"))], || {
+            assert!(legacy_stripe_prefetch_enabled(), "overlap switch must enable prefetch");
+        });
+        temp_env::with_vars([(ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("1"))], || {
+            assert!(!legacy_stripe_prefetch_enabled(), "count == 1 must stay serial");
+        });
     }
 
     /// Decode a healthy 2+2 multi-stripe object through the lockstep GET path
