@@ -1716,6 +1716,10 @@ impl SetDisks {
         format: FormatV3,
         lockers: Vec<Arc<dyn LockClient>>,
     ) -> Arc<Self> {
+        // Single-instance sources the process bootstrap context (the one the
+        // owning ECStore adopts). Slice 8 threads a per-instance context in for
+        // true multi-instance.
+        let ctx = bootstrap_ctx();
         Arc::new(SetDisks {
             locker_owner,
             disks,
@@ -1731,18 +1735,24 @@ impl SetDisks {
                 .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)
                 .build(),
             lockers,
-            local_lock_manager: runtime_sources::global_lock_manager(),
-            // Same injection pattern as local_lock_manager: single-instance
-            // sources the process bootstrap context (the one the owning ECStore
-            // adopts). Slice 8 threads a per-instance context for isolation.
-            ctx: bootstrap_ctx(),
+            // Sourced from the instance context so each instance owns its lock
+            // namespace (Phase 5 Slice 3). Single-instance: ctx aliases the
+            // process lock-manager singleton, so this is unchanged.
+            local_lock_manager: ctx.lock_manager(),
+            ctx,
         })
     }
 
     /// This set's per-instance runtime context (Phase 5, backlog#939).
-    #[allow(dead_code)] // Consumed starting Slice 3 (lock-namespace isolation).
+    #[allow(dead_code)] // Read by tests; consumed by later slices.
     pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
         &self.ctx
+    }
+
+    /// The lock manager this set actually uses (test-only; Phase 5 Slice 3).
+    #[cfg(test)]
+    pub(crate) fn local_lock_manager_for_test(&self) -> &Arc<rustfs_lock::GlobalLockManager> {
+        &self.local_lock_manager
     }
 
     // async fn cached_disk_health(&self, index: usize) -> Option<bool> {
