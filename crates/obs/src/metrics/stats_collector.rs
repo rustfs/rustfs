@@ -174,6 +174,11 @@ async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
             proxied_get_tagging_requests_failures: stats.proxied_get_tagging_requests_failures,
             proxied_delete_tagging_requests_total: stats.proxied_delete_tagging_requests_total,
             proxied_delete_tagging_requests_failures: stats.proxied_delete_tagging_requests_failures,
+            resync_started_count: stats.resync_started_count,
+            resync_completed_count: stats.resync_completed_count,
+            resync_failed_count: stats.resync_failed_count,
+            resync_canceled_count: stats.resync_canceled_count,
+            resync_duration_ms: stats.resync_duration_ms,
             targets: stats
                 .targets
                 .into_iter()

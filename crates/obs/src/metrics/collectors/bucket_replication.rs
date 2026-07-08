@@ -24,12 +24,14 @@ use crate::metrics::schema::bucket_replication::{
     BUCKET_REPL_PROXIED_GET_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_HEAD_REQUESTS_FAILURES_MD,
     BUCKET_REPL_PROXIED_HEAD_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_PUT_REQUESTS_FAILURES_MD,
     BUCKET_REPL_PROXIED_PUT_REQUESTS_TOTAL_MD, BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_FAILURES_MD,
-    BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD, BUCKET_REPL_SENT_COUNT_MD,
-    BUCKET_REPL_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
+    BUCKET_REPL_PROXIED_PUT_TAGGING_REQUESTS_TOTAL_MD, BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD,
+    BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD, BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD, BUCKET_REPL_RESYNC_FAILED_TOTAL_MD,
+    BUCKET_REPL_RESYNC_STARTED_TOTAL_MD, BUCKET_REPL_SENT_BYTES_MD, BUCKET_REPL_SENT_COUNT_MD, BUCKET_REPL_TOTAL_FAILED_BYTES_MD,
+    BUCKET_REPL_TOTAL_FAILED_COUNT_MD, OPERATION_L, RANGE_L, TARGET_ARN_L,
 };
 use std::borrow::Cow;
 
-const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 20;
+const BASE_BUCKET_REPLICATION_METRICS_PER_BUCKET: usize = 25;
 
 #[derive(Debug, Clone, Default)]
 pub struct BucketReplicationTargetStats {
@@ -70,6 +72,11 @@ pub struct BucketReplicationStats {
     pub proxied_get_tagging_requests_failures: u64,
     pub proxied_delete_tagging_requests_total: u64,
     pub proxied_delete_tagging_requests_failures: u64,
+    pub resync_started_count: u64,
+    pub resync_completed_count: u64,
+    pub resync_failed_count: u64,
+    pub resync_canceled_count: u64,
+    pub resync_duration_ms: u64,
     pub targets: Vec<BucketReplicationTargetStats>,
 }
 
@@ -222,6 +229,26 @@ pub fn collect_bucket_replication_metrics(stats: &[BucketReplicationStats]) -> V
             )
             .with_label(BUCKET_L, bucket_label.clone()),
         );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_RESYNC_STARTED_TOTAL_MD, stat.resync_started_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_RESYNC_COMPLETED_TOTAL_MD, stat.resync_completed_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_RESYNC_FAILED_TOTAL_MD, stat.resync_failed_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_RESYNC_CANCELED_TOTAL_MD, stat.resync_canceled_count as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD, stat.resync_duration_ms as f64)
+                .with_label(BUCKET_L, bucket_label.clone()),
+        );
 
         for target in &stat.targets {
             let target_label: Cow<'static, str> = Cow::Owned(target.target_arn.clone());
@@ -266,6 +293,11 @@ mod tests {
             proxied_get_tagging_requests_failures: 0,
             proxied_delete_tagging_requests_total: 1,
             proxied_delete_tagging_requests_failures: 1,
+            resync_started_count: 2,
+            resync_completed_count: 1,
+            resync_failed_count: 1,
+            resync_canceled_count: 0,
+            resync_duration_ms: 1500,
             targets: vec![BucketReplicationTargetStats {
                 target_arn: "arn:rustfs:replication:us-east-1:1:target".to_string(),
                 bandwidth_limit_bytes_per_sec: 2048,
@@ -275,7 +307,7 @@ mod tests {
         }];
 
         let metrics = collect_bucket_replication_metrics(&stats);
-        assert_eq!(metrics.len(), 21);
+        assert_eq!(metrics.len(), 26);
 
         let sent_name = BUCKET_REPL_SENT_COUNT_MD.get_full_metric_name();
         assert!(metrics.iter().any(|metric| {
@@ -319,6 +351,20 @@ mod tests {
         assert!(metrics.iter().any(|metric| {
             metric.name == delete_tagging_failures_name
                 && metric.value == 1.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let resync_started_name = BUCKET_REPL_RESYNC_STARTED_TOTAL_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == resync_started_name
+                && metric.value == 2.0
+                && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
+        }));
+
+        let resync_duration_name = BUCKET_REPL_RESYNC_DURATION_MS_TOTAL_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == resync_duration_name
+                && metric.value == 1500.0
                 && metric.labels.iter().any(|(key, value)| *key == BUCKET_L && value == "b1")
         }));
     }

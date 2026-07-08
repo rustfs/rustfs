@@ -63,6 +63,11 @@ pub(crate) struct ObsBucketReplicationStatsSnapshot {
     pub(crate) proxied_get_tagging_requests_failures: u64,
     pub(crate) proxied_delete_tagging_requests_total: u64,
     pub(crate) proxied_delete_tagging_requests_failures: u64,
+    pub(crate) resync_started_count: u64,
+    pub(crate) resync_completed_count: u64,
+    pub(crate) resync_failed_count: u64,
+    pub(crate) resync_canceled_count: u64,
+    pub(crate) resync_duration_ms: u64,
     pub(crate) targets: Vec<ObsBucketReplicationTargetStatsSnapshot>,
 }
 
@@ -156,6 +161,11 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
             proxied_get_tagging_requests_failures: i64_to_u64_floor_zero(proxy.get_tag_failed),
             proxied_delete_tagging_requests_total: i64_to_u64_floor_zero(proxy.delete_tag_total),
             proxied_delete_tagging_requests_failures: i64_to_u64_floor_zero(proxy.delete_tag_failed),
+            resync_started_count: i64_to_u64_floor_zero(bucket_stats.resync_started_count),
+            resync_completed_count: i64_to_u64_floor_zero(bucket_stats.resync_completed_count),
+            resync_failed_count: i64_to_u64_floor_zero(bucket_stats.resync_failed_count),
+            resync_canceled_count: i64_to_u64_floor_zero(bucket_stats.resync_canceled_count),
+            resync_duration_ms: i64_to_u64_floor_zero(bucket_stats.resync_duration_ms),
             targets,
         });
     }

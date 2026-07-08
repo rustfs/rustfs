@@ -185,6 +185,31 @@ async fn head_object_fallback(
 
 static RESYNC_WORKER_COUNT: usize = 10;
 
+fn resync_status_duration(
+    status: ResyncStatusType,
+    start_time: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> Option<std::time::Duration> {
+    if !matches!(
+        status,
+        ResyncStatusType::ResyncCompleted | ResyncStatusType::ResyncFailed | ResyncStatusType::ResyncCanceled
+    ) {
+        return None;
+    }
+
+    let millis = (now - start_time?).whole_milliseconds();
+    if millis < 0 {
+        return None;
+    }
+
+    let millis = if millis > i128::from(u64::MAX) {
+        u64::MAX
+    } else {
+        u64::try_from(millis).ok()?
+    };
+    Some(std::time::Duration::from_millis(millis))
+}
+
 #[derive(Debug)]
 pub struct ReplicationResyncer {
     pub status_map: Arc<RwLock<HashMap<String, BucketReplicationResyncStatus>>>,
@@ -223,7 +248,7 @@ impl ReplicationResyncer {
     where
         S: ReplicationObjectIO,
     {
-        let bucket_status = {
+        let (bucket_status, status_duration) = {
             let mut status_map = self.status_map.write().await;
             let now = OffsetDateTime::now_utc();
 
@@ -276,13 +301,17 @@ impl ReplicationResyncer {
             }
             state.resync_status = status;
             state.last_update = Some(now);
+            let status_duration = resync_status_duration(status, state.start_time, now);
 
             bucket_status.last_update = Some(now);
 
-            bucket_status.clone()
+            (bucket_status.clone(), status_duration)
         };
 
         save_resync_status(&opts.bucket, &bucket_status, obj_layer).await?;
+        if let Some(stats) = runtime_sources::replication_stats() {
+            stats.record_resync_status(&opts.bucket, status, status_duration).await;
+        }
 
         Ok(())
     }
@@ -424,7 +453,6 @@ impl ReplicationResyncer {
                 "Failed to update resync status"
             );
         }
-        // TODO: Metrics
     }
 
     #[instrument(skip(cancellation_token, storage))]
@@ -3527,5 +3555,21 @@ mod tests {
         assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
         assert!(resync_state_accepts_update(&current, &matching));
         assert!(!resync_state_accepts_update(&current, &stale));
+    }
+
+    #[test]
+    fn test_resync_status_duration_only_tracks_terminal_status() {
+        let start = match OffsetDateTime::from_unix_timestamp(1_700_000_000) {
+            Ok(start) => start,
+            Err(err) => panic!("valid test timestamp: {err}"),
+        };
+        let end = start + time::Duration::seconds(2);
+
+        assert_eq!(
+            resync_status_duration(ResyncStatusType::ResyncCompleted, Some(start), end),
+            Some(std::time::Duration::from_millis(2000))
+        );
+        assert_eq!(resync_status_duration(ResyncStatusType::ResyncStarted, Some(start), end), None);
+        assert_eq!(resync_status_duration(ResyncStatusType::ResyncFailed, None, end), None);
     }
 }
