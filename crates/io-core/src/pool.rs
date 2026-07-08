@@ -314,6 +314,13 @@ impl PoolTier {
             available.pop()
         };
         let was_reused = buffer_opt.is_some();
+        if was_reused {
+            // A reused buffer leaves the available pool. `return_buffer` does a
+            // matching `fetch_add(1)` on push, so without this the
+            // `available_buffers` gauge only ever grows and never reflects the real
+            // pool size (backlog#806).
+            pool_metrics.available_buffers.fetch_sub(1, Ordering::Relaxed);
+        }
 
         let buffer = if let Some(mut buf) = buffer_opt {
             let previous_capacity = buf.capacity();
@@ -542,6 +549,22 @@ mod tests {
         let pool = BytesPool::new_tiered();
         let buffer = pool.acquire_buffer(2048).await;
         assert!(buffer.capacity() >= 2048);
+    }
+
+    #[tokio::test]
+    async fn available_buffers_gauge_decrements_on_reuse() {
+        // Regression (backlog#806): acquiring a pooled (reused) buffer must
+        // decrement the available_buffers gauge, mirroring return_buffer's
+        // increment, so the gauge reflects the real pool size instead of only
+        // growing.
+        let pool = BytesPool::new_tiered();
+        let buf = pool.acquire_buffer(2048).await;
+        drop(buf); // returns to the pool -> gauge += 1
+        assert_eq!(pool.available_buffers(), 1, "returned buffer should be counted");
+        let buf2 = pool.acquire_buffer(2048).await; // reuses the pooled buffer -> gauge -= 1
+        assert_eq!(pool.available_buffers(), 0, "reused buffer must decrement the gauge");
+        drop(buf2);
+        assert_eq!(pool.available_buffers(), 1, "gauge tracks the real pool size");
     }
 
     #[tokio::test]
