@@ -38,6 +38,18 @@ fn into_static_str(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value
     intern_string(cache, value)
 }
 
+fn counter_value_from_f64(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+
+    if value >= u64::MAX as f64 {
+        Some(u64::MAX)
+    } else {
+        Some(value as u64)
+    }
+}
+
 pub fn report_metrics(metrics: &[PrometheusMetric]) {
     for metric in metrics {
         let name = into_static_str(&NAME_CACHE, &metric.name);
@@ -53,8 +65,10 @@ pub fn report_metrics(metrics: &[PrometheusMetric]) {
 
         match metric.metric_type {
             MetricType::Counter => {
-                let counter = counter!(name, &labels);
-                counter.absolute(metric.value as u64);
+                if let Some(value) = counter_value_from_f64(metric.value) {
+                    let counter = counter!(name, &labels);
+                    counter.absolute(value);
+                }
             }
             MetricType::Gauge => {
                 let gauge = gauge!(name, &labels);
@@ -167,5 +181,18 @@ mod tests {
             assert_eq!(metric.name, expected_name);
             assert_eq!(metric.metric_type, metric_type);
         }
+    }
+
+    #[test]
+    fn counter_value_from_f64_rejects_negative_and_nan_inputs() {
+        assert_eq!(counter_value_from_f64(-1.0), None);
+        assert_eq!(counter_value_from_f64(f64::NAN), None);
+        assert_eq!(counter_value_from_f64(f64::NEG_INFINITY), None);
+    }
+
+    #[test]
+    fn counter_value_from_f64_clamps_large_values() {
+        assert_eq!(counter_value_from_f64(42.0), Some(42));
+        assert_eq!(counter_value_from_f64(u64::MAX as f64 * 2.0), Some(u64::MAX));
     }
 }

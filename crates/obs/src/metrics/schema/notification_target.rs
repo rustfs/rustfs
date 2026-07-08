@@ -14,7 +14,7 @@
 
 #![allow(dead_code)]
 
-use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 pub const TARGET_ID: &str = "target_id";
@@ -23,7 +23,7 @@ pub const TARGET_TYPE: &str = "target_type";
 const NOTIFICATION_TARGET_LABELS: [&str; 2] = [TARGET_ID, TARGET_TYPE];
 
 pub static NOTIFICATION_TARGET_FAILED_MESSAGES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
-    new_counter_md(
+    new_gauge_md(
         MetricName::NotificationTargetFailedMessages,
         "Total number of notification messages that permanently failed to send",
         &NOTIFICATION_TARGET_LABELS,
@@ -41,7 +41,7 @@ pub static NOTIFICATION_TARGET_QUEUE_LENGTH_MD: LazyLock<MetricDescriptor> = Laz
 });
 
 pub static NOTIFICATION_TARGET_TOTAL_MESSAGES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
-    new_counter_md(
+    new_gauge_md(
         MetricName::NotificationTargetTotalMessages,
         "Total number of notification messages successfully delivered",
         &NOTIFICATION_TARGET_LABELS,

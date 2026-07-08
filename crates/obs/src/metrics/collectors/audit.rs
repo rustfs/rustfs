@@ -72,6 +72,7 @@ pub fn collect_audit_metrics(stats: &[AuditTargetStats]) -> Vec<PrometheusMetric
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::schema::MetricType;
 
     #[test]
     fn test_collect_audit_metrics() {
@@ -105,5 +106,12 @@ mod tests {
         let stats: Vec<AuditTargetStats> = vec![];
         let metrics = collect_audit_metrics(&stats);
         assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn audit_target_totals_are_exported_as_gauges() {
+        assert_eq!(AUDIT_FAILED_MESSAGES_MD.metric_type, MetricType::Gauge);
+        assert_eq!(AUDIT_TARGET_QUEUE_LENGTH_MD.metric_type, MetricType::Gauge);
+        assert_eq!(AUDIT_TOTAL_MESSAGES_MD.metric_type, MetricType::Gauge);
     }
 }

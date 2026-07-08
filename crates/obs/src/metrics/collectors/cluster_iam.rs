@@ -87,6 +87,7 @@ pub fn collect_iam_metrics(stats: &IamStats) -> Vec<PrometheusMetric> {
 mod tests {
     use super::*;
     use crate::metrics::report::report_metrics;
+    use crate::metrics::schema::MetricType;
 
     #[test]
     fn test_collect_iam_metrics() {
@@ -124,5 +125,26 @@ mod tests {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());
         }
+    }
+
+    #[test]
+    fn iam_metric_descriptors_preserve_gauge_vs_counter_semantics() {
+        let gauge_descriptors = [
+            &LAST_SYNC_DURATION_MILLIS_MD,
+            &PLUGIN_AUTHN_SERVICE_FAILED_REQUESTS_MINUTE_MD,
+            &PLUGIN_AUTHN_SERVICE_LAST_FAIL_SECONDS_MD,
+            &PLUGIN_AUTHN_SERVICE_LAST_SUCC_SECONDS_MD,
+            &PLUGIN_AUTHN_SERVICE_SUCC_AVG_RTT_MS_MINUTE_MD,
+            &PLUGIN_AUTHN_SERVICE_SUCC_MAX_RTT_MS_MINUTE_MD,
+            &PLUGIN_AUTHN_SERVICE_TOTAL_REQUESTS_MINUTE_MD,
+            &SINCE_LAST_SYNC_MILLIS_MD,
+        ];
+
+        for descriptor in gauge_descriptors {
+            assert_eq!(descriptor.metric_type, MetricType::Gauge);
+        }
+
+        assert_eq!(SYNC_FAILURES_MD.metric_type, MetricType::Counter);
+        assert_eq!(SYNC_SUCCESSES_MD.metric_type, MetricType::Counter);
     }
 }
