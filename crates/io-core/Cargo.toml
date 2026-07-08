@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync"] }
 memmap2 = { workspace = true }
 rustfs-io-metrics = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
