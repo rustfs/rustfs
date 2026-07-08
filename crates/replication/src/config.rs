@@ -174,7 +174,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 
         rules.sort_by(|a, b| {
             if a.destination == b.destination {
-                a.priority.cmp(&b.priority)
+                b.priority.cmp(&a.priority)
             } else {
                 std::cmp::Ordering::Equal
             }
@@ -550,5 +550,59 @@ mod tests {
             false,
             &target_arns
         ));
+    }
+
+    fn delete_marker_rule(id: &str, arn: &str, prefix: &str, priority: i32, delete_marker_enabled: bool) -> ReplicationRule {
+        let status = if delete_marker_enabled {
+            DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)
+        } else {
+            DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)
+        };
+        ReplicationRule {
+            delete_marker_replication: Some(DeleteMarkerReplication { status: Some(status) }),
+            delete_replication: None,
+            destination: Destination {
+                bucket: arn.to_string(),
+                ..Default::default()
+            },
+            existing_object_replication: Some(ExistingObjectReplication {
+                status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+            }),
+            filter: None,
+            id: Some(id.to_string()),
+            prefix: Some(prefix.to_string()),
+            priority: Some(priority),
+            source_selection_criteria: None,
+            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+        }
+    }
+
+    // Regression test for backlog#1029: two ENABLED rules to the same destination with
+    // overlapping prefixes must be evaluated highest-priority-first (AWS S3 / MinIO precedence).
+    // The higher-priority rule disables delete-marker replication, so a delete-marker op must
+    // NOT replicate; if the sort were ascending the lower-priority ENABLED rule would win.
+    #[test]
+    fn replicate_delete_marker_follows_highest_priority_rule() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![
+                delete_marker_rule("low-priority-enabled", arn, "logs/", 1, true),
+                delete_marker_rule("high-priority-disabled", arn, "logs/2026/", 5, false),
+            ],
+        };
+
+        let opts = ObjectOpts {
+            name: "logs/2026/app.log".to_string(),
+            op_type: ReplicationType::Delete,
+            delete_marker: true,
+            version_id: None,
+            ..Default::default()
+        };
+
+        assert!(
+            !config.replicate(&opts),
+            "highest-priority rule disables delete-marker replication, so the delete marker must not replicate"
+        );
     }
 }
