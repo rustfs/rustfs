@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(feature = "fips"))]
+#[cfg(all(any(test, feature = "crypto"), not(feature = "fips")))]
 mod aes;
 
 #[cfg(any(test, feature = "crypto"))]
