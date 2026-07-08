@@ -44,6 +44,7 @@ use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Runtime state owned by a single `ECStore` instance.
 ///
@@ -72,6 +73,11 @@ pub struct InstanceContext {
     /// Write-once like the process global it replaces: startup sets it exactly
     /// once and a duplicate write fails fast (see [`InstanceContext::set_region`]).
     region: OnceLock<Region>,
+    /// This instance's deployment id (Phase 5 Slice 5, backlog#939).
+    ///
+    /// Write-once identity, mirrored by `ECStore::id` (both come from the same
+    /// startup value). Replaces the process-global deployment-id static.
+    deployment_id: OnceLock<Uuid>,
 }
 
 impl InstanceContext {
@@ -92,6 +98,7 @@ impl InstanceContext {
             erasure_kind: RwLock::new(SetupType::Unknown),
             lock_manager,
             region: OnceLock::new(),
+            deployment_id: OnceLock::new(),
         }
     }
 
@@ -113,6 +120,21 @@ impl InstanceContext {
     /// This instance's S3 region, if it has been set.
     pub fn region(&self) -> Option<Region> {
         self.region.get().cloned()
+    }
+
+    /// Set this instance's deployment id.
+    ///
+    /// Write-once: panics on a second write, preserving the startup fail-fast
+    /// contract of the process global it replaces.
+    pub fn set_deployment_id(&self, id: Uuid) {
+        self.deployment_id
+            .set(id)
+            .expect("instance deployment id should be initialized once during startup");
+    }
+
+    /// This instance's deployment id, if it has been set.
+    pub fn deployment_id(&self) -> Option<Uuid> {
+        self.deployment_id.get().copied()
     }
 
     /// Update this instance's erasure setup type.
@@ -284,5 +306,37 @@ mod tests {
         let ctx = InstanceContext::new();
         ctx.set_region(region("us-east-1"));
         ctx.set_region(region("eu-west-1"));
+    }
+
+    // A fresh context has no deployment id until set; set-then-get round-trips.
+    #[tokio::test]
+    async fn deployment_id_set_and_get() {
+        let ctx = InstanceContext::new();
+        assert_eq!(ctx.deployment_id(), None);
+        let id = Uuid::new_v4();
+        ctx.set_deployment_id(id);
+        assert_eq!(ctx.deployment_id(), Some(id));
+    }
+
+    // Two contexts hold independent deployment ids.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_deployment_id() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        ctx_a.set_deployment_id(id_a);
+        ctx_b.set_deployment_id(id_b);
+        assert_eq!(ctx_a.deployment_id(), Some(id_a));
+        assert_eq!(ctx_b.deployment_id(), Some(id_b));
+    }
+
+    // The deployment id is write-once: a second set fails fast.
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_deployment_id_twice_panics() {
+        let ctx = InstanceContext::new();
+        ctx.set_deployment_id(Uuid::new_v4());
+        ctx.set_deployment_id(Uuid::new_v4());
     }
 }
