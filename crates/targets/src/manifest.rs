@@ -103,7 +103,12 @@ pub struct TargetPluginMarketplaceManifest {
     pub distribution: Option<TargetPluginDistributionManifest>,
 }
 
-const BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION: &str = "rustfs.target-plugin.v1";
+/// The plugin API compatibility version this build understands. Installable
+/// external plugins must declare exactly this value in their marketplace
+/// manifest to be installable; anything else is rejected during planning.
+pub const SUPPORTED_PLUGIN_API_COMPATIBILITY_VERSION: &str = "rustfs.target-plugin.v1";
+
+const BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION: &str = SUPPORTED_PLUGIN_API_COMPATIBILITY_VERSION;
 const BUILTIN_PLUGIN_RUNTIME_PROTOCOL_VERSION: &str = "rustfs.target-runtime.v1";
 
 const SUPPORTED_BUILTIN_DOMAINS: &[TargetDomain] = &[TargetDomain::Audit, TargetDomain::Notify];

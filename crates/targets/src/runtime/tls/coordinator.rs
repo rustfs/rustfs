@@ -28,10 +28,18 @@ use super::validate::validate_tls_material;
 use crate::error::TargetError;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+/// Minimum positive poll interval. A zero interval would panic inside
+/// `tokio::time::interval`, silently killing the poll loop.
+const MIN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Bound on how long registration waits to join a replaced poll loop before
+/// detaching it, so a stuck old loop cannot block a re-registration forever.
+const REPLACE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct TargetReloadEntry {
     #[expect(dead_code)]
@@ -78,10 +86,14 @@ impl TargetTlsReloadCoordinator {
         let inputs = target.tls_input_set();
         let target_label = inputs.target_label.clone();
 
-        // Build initial material
-        let initial_material = Arc::new(target.build_tls_material().await?);
+        // Compute the fingerprint BEFORE building material. If a cert rotation
+        // races registration, this ordering guarantees the stored fingerprint is
+        // never *newer* than the published material, so the next poll observes a
+        // fingerprint change and rebuilds (self-healing). The reverse ordering
+        // pinned the old cert permanently (TOCTOU).
         let initial_fingerprint =
             build_target_tls_fingerprint(&inputs.ca_path, &inputs.client_cert_path, &inputs.client_key_path).await?;
+        let initial_material = Arc::new(target.build_tls_material().await?);
 
         let initial_state = Arc::new(TargetTlsPublishedState {
             generation: TargetTlsGeneration(1),
@@ -90,24 +102,39 @@ impl TargetTlsReloadCoordinator {
             loaded_at_unix_ms: unix_time_ms(),
         });
 
-        let runtime_state = Arc::new(TargetTlsRuntimeState::new(initial_state.clone(), inputs));
+        let runtime_state = Arc::new(TargetTlsRuntimeState::new(initial_state, inputs));
 
-        if options.detect_mode == ReloadDetectMode::Poll || options.detect_mode == ReloadDetectMode::Hybrid {
-            let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
-            let poll_handle = tokio::spawn(spawn_target_poll_loop(target, Arc::clone(&runtime_state), options, cancel_rx));
+        // A detection loop always runs when reload is enabled. Watch mode used to
+        // return success without any loop, silently disabling hot-reload; it now
+        // falls back to interval-based polling so detection is never a no-op.
+        let mut entries = self.entries.write().await;
 
-            let mut entries = self.entries.write().await;
-            entries.insert(
-                target_label.clone(),
-                TargetReloadEntry {
-                    target_label: target_label.clone(),
-                    cancel_tx,
-                    poll_handle,
-                },
-            );
-
-            info!(target = %target_label, "Registered target for TLS reload coordinator");
+        // Stop-before-start: if a loop is already registered under this label,
+        // cancel and join it *before* publishing the replacement so two loops
+        // never race on the same target's TLS material (issue #970).
+        if let Some(previous) = entries.remove(&target_label) {
+            let _ = previous.cancel_tx.send(()).await;
+            if tokio::time::timeout(REPLACE_JOIN_TIMEOUT, previous.poll_handle)
+                .await
+                .is_err()
+            {
+                warn!(target = %target_label, "Timed out joining previous TLS reload loop; detaching");
+            }
+            info!(target = %target_label, "Replaced existing TLS reload loop (stop-before-start)");
         }
+
+        let detect_mode = options.detect_mode;
+        let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel(1);
+        let poll_handle = tokio::spawn(spawn_target_poll_loop(target, Arc::clone(&runtime_state), options, cancel_rx));
+        entries.insert(
+            target_label.clone(),
+            TargetReloadEntry {
+                target_label: target_label.clone(),
+                cancel_tx,
+                poll_handle,
+            },
+        );
+        info!(target = %target_label, detect_mode = ?detect_mode, "Registered target for TLS reload coordinator");
 
         Ok(runtime_state)
     }
@@ -186,13 +213,16 @@ async fn spawn_target_poll_loop<T: ReloadableTargetTls>(
     options: TlsReloadOptions,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) {
-    let mut interval = tokio::time::interval(options.interval);
+    // Normalize a zero interval to a safe minimum: `tokio::time::interval(0)`
+    // panics, which would silently kill this spawned loop.
+    let interval_period = effective_reload_interval(options.interval);
+    let mut interval = tokio::time::interval(interval_period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await; // skip the immediate first tick
 
     let label = &runtime_state.inputs.target_label;
     let debounce = options.debounce;
-    debug!(target = %label, interval_secs = options.interval.as_secs(), "TLS reload poll loop started");
+    debug!(target = %label, interval_secs = interval_period.as_secs(), "TLS reload poll loop started");
 
     loop {
         tokio::select! {
@@ -230,6 +260,11 @@ async fn reload_target_once<T: ReloadableTargetTls>(
     runtime_state: &TargetTlsRuntimeState<T::Material>,
     options: &TlsReloadOptions,
 ) -> Result<TargetTlsGeneration, TargetError> {
+    // Serialize reload cycles for this target so a force_reload and a poll-loop
+    // tick cannot interleave and publish a stale material or duplicate a
+    // generation.
+    let _reload_guard = runtime_state.reload_lock.lock().await;
+
     let now = unix_time_ms();
     runtime_state.mark_attempt(now);
     let started_at = std::time::Instant::now();
@@ -238,7 +273,17 @@ async fn reload_target_once<T: ReloadableTargetTls>(
     // 1. Read TLS files and compute fingerprint
     let inputs = &runtime_state.inputs;
     let next_fingerprint =
-        build_target_tls_fingerprint(&inputs.ca_path, &inputs.client_cert_path, &inputs.client_key_path).await?;
+        match build_target_tls_fingerprint(&inputs.ca_path, &inputs.client_cert_path, &inputs.client_key_path).await {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                // The first step must not fail silently: record the error and a
+                // failure metric so the observability surface does not show
+                // "all healthy" while reload is actually broken.
+                *runtime_state.last_error.write() = Some(err.to_string());
+                record_target_tls_publication_fail(label);
+                return Err(err);
+            }
+        };
 
     // 2. Compare with current — skip if unchanged
     let current = runtime_state.current.load();
@@ -302,6 +347,12 @@ async fn reload_target_once<T: ReloadableTargetTls>(
 
 fn unix_time_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// Normalizes a reload interval to a strictly positive duration. A zero
+/// interval would panic inside `tokio::time::interval`.
+fn effective_reload_interval(interval: Duration) -> Duration {
+    if interval.is_zero() { MIN_RELOAD_INTERVAL } else { interval }
 }
 
 #[cfg(test)]
@@ -393,7 +444,7 @@ mod tests {
         let target = Arc::new(MockTarget::new("test:webhook"));
 
         let options = TlsReloadOptions {
-            detect_mode: ReloadDetectMode::Watch, // no poll loop for this test
+            detect_mode: ReloadDetectMode::Watch,
             ..default_options()
         };
         let state = coordinator.register(target.clone(), options).await.unwrap();
@@ -636,6 +687,81 @@ mod tests {
 
         coordinator.unregister("test:pulsar").await.unwrap();
         assert!(coordinator.entries.read().await.is_empty());
+    }
+
+    #[test]
+    fn effective_reload_interval_normalizes_zero() {
+        assert_eq!(effective_reload_interval(std::time::Duration::ZERO), MIN_RELOAD_INTERVAL);
+        let nonzero = std::time::Duration::from_secs(7);
+        assert_eq!(effective_reload_interval(nonzero), nonzero);
+    }
+
+    #[tokio::test]
+    async fn zero_interval_registration_does_not_panic() {
+        let coordinator = TargetTlsReloadCoordinator::new();
+        let target = Arc::new(MockTarget::new("test:zero-interval"));
+
+        let options = TlsReloadOptions {
+            interval: std::time::Duration::ZERO,
+            ..default_options()
+        };
+        // Registration spawns the poll loop; a zero interval must be normalized
+        // rather than panicking inside the spawned task.
+        let state = coordinator.register(target, options).await.unwrap();
+        assert_eq!(state.current.load().generation, TargetTlsGeneration(1));
+        assert_eq!(coordinator.entries.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn watch_mode_starts_detection_loop() {
+        let coordinator = TargetTlsReloadCoordinator::new();
+        let target = Arc::new(MockTarget::new("test:watch"));
+
+        let options = TlsReloadOptions {
+            detect_mode: ReloadDetectMode::Watch,
+            ..default_options()
+        };
+        // Watch mode must not silently skip starting a detection loop.
+        let _state = coordinator.register(target, options).await.unwrap();
+        assert_eq!(coordinator.entries.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_label_registration_replaces_previous_loop() {
+        let coordinator = TargetTlsReloadCoordinator::new();
+        let first = Arc::new(MockTarget::new("test:dup"));
+        let second = Arc::new(MockTarget::new("test:dup"));
+
+        let _s1 = coordinator.register(first, default_options()).await.unwrap();
+        assert_eq!(coordinator.entries.read().await.len(), 1);
+
+        // Re-registering the same label must stop-and-join the old loop, leaving
+        // exactly one active entry (no orphaned duplicate loop).
+        let _s2 = coordinator.register(second, default_options()).await.unwrap();
+        assert_eq!(coordinator.entries.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn first_step_fingerprint_failure_records_error_and_metric() {
+        let mut target = MockTarget::new("test:fp-fail");
+        // A non-empty CA path that does not exist forces the very first step
+        // (fingerprint read) to fail.
+        target.inputs.ca_path = "/nonexistent/rustfs-tls-test/ca-does-not-exist.pem".to_string();
+
+        let initial_state = Arc::new(TargetTlsPublishedState {
+            generation: TargetTlsGeneration(1),
+            fingerprint: TargetTlsFingerprint::default(),
+            material: Arc::new("initial".to_string()),
+            loaded_at_unix_ms: 0,
+        });
+        let runtime_state = Arc::new(TargetTlsRuntimeState::new(initial_state, target.tls_input_set()));
+
+        let result = reload_target_once(&target, &runtime_state, &default_options()).await;
+        assert!(result.is_err());
+        // The first-step failure must be visible, not silently swallowed.
+        assert!(runtime_state.last_error.read().is_some());
+        // Build must not have been reached.
+        assert_eq!(target.build_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

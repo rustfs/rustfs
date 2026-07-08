@@ -9946,6 +9946,7 @@ dependencies = [
  "mysql_async",
  "parking_lot",
  "pulsar",
+ "rcgen",
  "redis",
  "regex",
  "reqwest",
