@@ -86,10 +86,7 @@ fn erasure_encode_max_inflight_bytes() -> usize {
 fn use_bytesmut_ingest() -> bool {
     #[cfg(test)]
     {
-        return rustfs_utils::get_env_bool(
-            ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST,
-            DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST,
-        );
+        rustfs_utils::get_env_bool(ENV_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST, DEFAULT_RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST)
     }
 
     #[cfg(not(test))]
