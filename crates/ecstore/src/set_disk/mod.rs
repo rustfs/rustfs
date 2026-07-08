@@ -972,6 +972,7 @@ enum GetCodecStreamingFallbackReason {
     HeaderCompatibilityUnconfirmed,
     LockOptimizationDisabled,
     Range,
+    PartNumber,
     BelowMinSize,
     Encrypted,
     Compressed,
@@ -992,6 +993,7 @@ impl GetCodecStreamingFallbackReason {
             Self::HeaderCompatibilityUnconfirmed => "header_compatibility_unconfirmed",
             Self::LockOptimizationDisabled => "lock_optimization_disabled",
             Self::Range => "range",
+            Self::PartNumber => "part_number",
             Self::BelowMinSize => "below_min_size",
             Self::Encrypted => "encrypted",
             Self::Compressed => "compressed",
@@ -1296,6 +1298,7 @@ fn get_codec_streaming_reader_gate(
     bucket: &str,
     object: &str,
     range: &Option<HTTPRangeSpec>,
+    part_number: Option<usize>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     lock_optimization_enabled: bool,
@@ -1341,6 +1344,20 @@ fn get_codec_streaming_reader_gate(
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range),
+            prefer_data_blocks_first_reader_setup: false,
+        };
+    }
+    // A partNumber GET arrives with `range == None`, so it is not caught by the
+    // Range class above, yet it still requires a non-zero storage offset/length
+    // (synthesized from the part size). The codec-streaming path builds a
+    // full-object reader and drops the offset/length returned by
+    // `GetObjectReader::new`, so partNumber >= 2 would stream the whole object.
+    // Mirror the direct-memory part_number fallback and route these requests back
+    // to the legacy duplex path, which applies the offset/length correctly.
+    if part_number.is_some() {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::PartNumber),
             prefer_data_blocks_first_reader_setup: false,
         };
     }

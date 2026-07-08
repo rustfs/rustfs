@@ -2719,6 +2719,25 @@ mod tests {
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             range,
+            None,
+            object_info,
+            fi,
+            lock_optimization_enabled,
+        )
+    }
+
+    fn codec_streaming_reader_gate_for_test_with_part_number(
+        range: &Option<HTTPRangeSpec>,
+        part_number: Option<usize>,
+        object_info: &ObjectInfo,
+        fi: &FileInfo,
+        lock_optimization_enabled: bool,
+    ) -> GetCodecStreamingGate {
+        get_codec_streaming_reader_gate(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            range,
+            part_number,
             object_info,
             fi,
             lock_optimization_enabled,
@@ -4075,6 +4094,48 @@ mod tests {
                 assert_eq!(
                     codec_streaming_reader_gate_for_test(&range, &object_info, &fi, true).object_class,
                     GetCodecStreamingObjectClass::Range
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_falls_back_on_part_number_request() {
+        // A partNumber GET has `range == None`, so it is classified as a plain
+        // object and would otherwise reach the codec-streaming path. That path
+        // builds a full-object reader and drops the storage offset/length, so
+        // partNumber >= 2 would stream the whole object. The gate must route any
+        // partNumber request back to the legacy duplex path via Fallback.
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("100")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                // Baseline: without a partNumber the gate uses codec streaming.
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test_with_part_number(&None, None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Use
+                );
+
+                // partNumber >= 2 must fall back to legacy duplex.
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test_with_part_number(&None, Some(2), &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::PartNumber)
+                );
+
+                // partNumber == 1 also falls back even though its offset is 0, so the
+                // legacy path stays the single owner of part offset application.
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test_with_part_number(&None, Some(1), &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::PartNumber)
                 );
             },
         );

@@ -299,8 +299,15 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         }
 
         let path_decision_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let codec_streaming_gate =
-            get_codec_streaming_reader_gate(bucket, object, &range, &object_info, &fi, lock_optimization_enabled);
+        let codec_streaming_gate = get_codec_streaming_reader_gate(
+            bucket,
+            object,
+            &range,
+            opts.part_number,
+            &object_info,
+            &fi,
+            lock_optimization_enabled,
+        );
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
 
         if object_info.is_remote() {
