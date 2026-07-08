@@ -3515,7 +3515,11 @@ impl DefaultObjectUsecase {
                 .await
                 .map_err(ApiError::from)?,
         );
-        let previous_current_size = match store.get_object_info(&bucket, &key, &current_opts).await {
+        let previous_current_info = {
+            crate::hp_guard!("S3::put_object_prelookup");
+            store.get_object_info(&bucket, &key, &current_opts).await
+        };
+        let previous_current_size = match previous_current_info {
             Ok(existing_obj_info) => {
                 validate_existing_object_lock_for_write(&existing_obj_info, &opts)?;
                 Some(existing_obj_info.size.max(0) as u64)

@@ -1648,6 +1648,7 @@ impl SetDisks {
     }
 
     async fn acquire_read_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
+        crate::hp_guard!("SetDisks::acquire_read_lock");
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
@@ -1669,6 +1670,7 @@ impl SetDisks {
     }
 
     async fn acquire_write_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
+        crate::hp_guard!("SetDisks::acquire_write_lock");
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();

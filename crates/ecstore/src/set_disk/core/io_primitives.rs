@@ -2744,6 +2744,7 @@ impl SetDisks {
         committed_data_dir: &str,
         write_quorum: usize,
     ) -> OldDataDirCleanup {
+        crate::hp_guard!("SetDisks::commit_rename_data_dir");
         // Anti-misdelete guard (parity retained): MinIO sets `res.OldDataDir=""`
         // when old == new (`xl-storage.go:2796`) and `commitRenameDataDir` skips
         // the empty value (`:1837`). Rather miss a reclaim than delete the data
