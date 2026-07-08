@@ -2393,6 +2393,12 @@ mod tests {
             (128, 50, "starting at block boundary"),
             (130, 10, "small range deep in middle"),
             (192, 8, "tail partial block"),
+            // Multi-stripe ranges ending exactly on a block boundary exercise the
+            // `end_remainder == 0 => block_size` geometry branch under the prefetch
+            // pipeline (the final covered stripe must emit a full block, not a
+            // short tail). See backlog#930 HP-9 step 2 adversarial review.
+            (0, 128, "two full stripes ending on block boundary"),
+            (64, 64, "single full interior stripe on boundaries"),
         ];
 
         for (label, vars) in prefetch_env_configs() {
