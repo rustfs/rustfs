@@ -49,6 +49,10 @@ mod quota_test;
 #[cfg(test)]
 mod bucket_policy_check_test;
 
+// Security boundary tests: DoS limits, SSRF prevention, concurrent-write integrity
+#[cfg(test)]
+mod security_boundary_test;
+
 /// IAM / bucket / STS session policy with `s3:ExistingObjectTag` conditions (E2E).
 #[cfg(test)]
 mod existing_object_tag_policy_test;
