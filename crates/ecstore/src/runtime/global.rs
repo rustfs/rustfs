@@ -47,10 +47,10 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 //   GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_LIFECYCLE_SYS, GLOBAL_EVENT_NOTIFIER, etc.
 // Tier B (keep as static): GLOBAL_RUSTFS_PORT, env var caches, etc.
 //
-// Phase 5 (backlog#939): the erasure setup type, the S3 region, the deployment
-// id, and the endpoint topology moved into the per-instance `InstanceContext`
-// (see `super::instance`); their facades below now forward to the current
-// instance's context.
+// Phase 5 (backlog#939): identity/runtime state (erasure setup, S3 region,
+// deployment id, endpoint topology, tier config manager, ...) is moving into
+// the per-instance `InstanceContext` (see `super::instance`); the facades below
+// forward to the current instance's context.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
@@ -58,7 +58,6 @@ lazy_static! {
     pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_ROOT_DISK_THRESHOLD: RwLock<u64> = RwLock::new(0);
-    pub static ref GLOBAL_TIER_CONFIG_MGR: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
     pub static ref GLOBAL_LIFECYCLE_SYS: Arc<LifecycleSys> = LifecycleSys::new();
     pub static ref GLOBAL_EVENT_NOTIFIER: Arc<RwLock<EventNotifier>> = EventNotifier::new();
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
@@ -172,7 +171,7 @@ pub async fn is_first_cluster_node_local() -> bool {
 }
 
 pub fn get_global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
-    GLOBAL_TIER_CONFIG_MGR.clone()
+    current_ctx().tier_config_mgr()
 }
 
 /// Create a new object layer instance
