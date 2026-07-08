@@ -144,11 +144,14 @@ impl LastMinuteLatency {
             merged.last_sec = o.last_sec;
         }
 
+        // Both operands must be read in their forwarded form so aged-out
+        // ring-buffer slots stay zeroed: `x` is the forwarded copy of `o`,
+        // and `self` is forwarded in place in the `else` branch above.
         for i in 0..merged.totals.len() {
             merged.totals[i] = AccElem {
-                total: self.totals[i].total + o.totals[i].total,
-                n: self.totals[i].n + o.totals[i].n,
-                size: self.totals[i].size + o.totals[i].size,
+                total: self.totals[i].total.wrapping_add(x.totals[i].total),
+                n: self.totals[i].n.wrapping_add(x.totals[i].n),
+                size: self.totals[i].size.wrapping_add(x.totals[i].size),
             }
         }
         merged
@@ -370,6 +373,105 @@ mod tests {
 
         assert_eq!(merged.last_sec, 1010); // Should use the later time
         assert_eq!(merged.totals[0].total, 30);
+    }
+
+    #[test]
+    fn test_last_minute_latency_merge_ages_out_stale_slots_self_newer() {
+        // self.last_sec > o.last_sec branch: `o` is forwarded to self.last_sec,
+        // which zeroes the ring-buffer slots for seconds 1001..=1010, i.e.
+        // indices 41..=50. Data parked in one of those slots is stale and must
+        // be excluded from the merged result.
+        let mut newer = LastMinuteLatency::default();
+        let mut older = LastMinuteLatency::default();
+
+        newer.last_sec = 1010;
+        older.last_sec = 1000;
+
+        // Stale slot: second 1005 -> index 45, cleared by forward_to(1010).
+        let stale_idx = (1005 % 60) as usize;
+        older.totals[stale_idx].total = 111;
+        older.totals[stale_idx].n = 5;
+        older.totals[stale_idx].size = 999;
+
+        // In-window slot: older's own last_sec (1000 -> index 40) is kept.
+        let kept_idx = (1000 % 60) as usize;
+        older.totals[kept_idx].total = 3;
+        older.totals[kept_idx].n = 1;
+        older.totals[kept_idx].size = 30;
+
+        // newer's current data (1010 -> index 50) must survive.
+        let newer_idx = (1010 % 60) as usize;
+        newer.totals[newer_idx].total = 7;
+        newer.totals[newer_idx].n = 1;
+        newer.totals[newer_idx].size = 70;
+
+        let merged = newer.merge(&older);
+
+        assert_eq!(merged.last_sec, 1010);
+        // The stale older slot is aged out -> excluded from the sum.
+        assert_eq!(merged.totals[stale_idx].total, 0);
+        assert_eq!(merged.totals[stale_idx].n, 0);
+        assert_eq!(merged.totals[stale_idx].size, 0);
+        // In-window older data is retained.
+        assert_eq!(merged.totals[kept_idx].total, 3);
+        assert_eq!(merged.totals[kept_idx].n, 1);
+        // newer data is retained.
+        assert_eq!(merged.totals[newer_idx].total, 7);
+    }
+
+    #[test]
+    fn test_last_minute_latency_merge_ages_out_of_window_self_newer() {
+        // self.last_sec > o.last_sec with a full-window gap (>= 60s): all of
+        // `o` is aged out and only `self`'s data remains.
+        let mut newer = LastMinuteLatency::default();
+        let mut older = LastMinuteLatency::default();
+
+        newer.last_sec = 1070;
+        older.last_sec = 1000; // gap of 70 >= 60 -> all of older is aged out
+
+        // 1070 % 60 == 1000 % 60 == 10, so both write the same slot; the fix
+        // must yield exactly newer's value, not newer + stale older.
+        let idx = (1070 % 60) as usize;
+        older.totals[idx].total = 111;
+        older.totals[idx].n = 5;
+        older.totals[idx].size = 999;
+        newer.totals[idx].total = 7;
+        newer.totals[idx].n = 1;
+        newer.totals[idx].size = 70;
+
+        let merged = newer.merge(&older);
+
+        assert_eq!(merged.last_sec, 1070);
+        assert_eq!(merged.totals[idx].total, 7);
+        assert_eq!(merged.totals[idx].n, 1);
+        assert_eq!(merged.totals[idx].size, 70);
+    }
+
+    #[test]
+    fn test_last_minute_latency_merge_ages_out_of_window_o_newer() {
+        // Mirror of the above for the else branch: `self` is older and is
+        // forwarded to o.last_sec, aging out self's out-of-window data.
+        let mut older = LastMinuteLatency::default();
+        let mut newer = LastMinuteLatency::default();
+
+        older.last_sec = 1000;
+        newer.last_sec = 1070; // gap of 70 >= 60 -> all of older (self) is aged out
+
+        let idx = (1070 % 60) as usize; // 1000 % 60 == 1070 % 60 == 10
+        older.totals[idx].total = 111;
+        older.totals[idx].n = 5;
+        older.totals[idx].size = 999;
+        newer.totals[idx].total = 7;
+        newer.totals[idx].n = 1;
+        newer.totals[idx].size = 70;
+
+        let merged = older.merge(&newer);
+
+        assert_eq!(merged.last_sec, 1070);
+        // self's stale data aged out; only newer's data remains.
+        assert_eq!(merged.totals[idx].total, 7);
+        assert_eq!(merged.totals[idx].n, 1);
+        assert_eq!(merged.totals[idx].size, 70);
     }
 
     #[test]
