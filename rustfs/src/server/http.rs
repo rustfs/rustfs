@@ -230,11 +230,84 @@ pub(crate) fn active_http_requests() -> u64 {
     ACTIVE_HTTP_REQUESTS.load(Ordering::Relaxed)
 }
 
+/// RAII guard that increments the in-flight HTTP request gauge on construction
+/// and decrements it exactly once on drop.
+///
+/// backlog#806-35: the gauge used to be maintained with tower-http `TraceLayer`
+/// hooks — `on_request` (+1), `on_response` (-1) and `on_failure` (-1). With
+/// the default `ServerErrorsAsFailures` classifier a 5xx response fires BOTH
+/// `on_response` AND `on_failure`, so every 5xx decremented the gauge twice
+/// (net -1), and a streaming 200 that failed mid-body did the same. The gauge
+/// therefore drifted downward / underflowed, corrupting the readiness
+/// busy-protection signal (see `alias_busy_threshold_exceeded`). Counting with
+/// a guard tied to the response future's lifetime makes the delta exactly-once
+/// for 2xx, 5xx, streaming errors, and no-response transport errors alike.
+struct InFlightGuard;
+
+impl InFlightGuard {
+    fn new() -> Self {
+        record_active_http_requests(1);
+        Self
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        record_active_http_requests(-1);
+    }
+}
+
+/// Tower layer that maintains the in-flight HTTP request gauge with an
+/// [`InFlightGuard`], replacing the previous (double-counting) `TraceLayer`
+/// hook arithmetic. See [`InFlightGuard`] for the backlog#806-35 rationale.
+#[derive(Clone, Copy, Default)]
+struct InFlightLayer;
+
+impl<S> tower::Layer<S> for InFlightLayer {
+    type Service = InFlightService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        InFlightService { inner }
+    }
+}
+
+#[derive(Clone)]
+struct InFlightService<S> {
+    inner: S,
+}
+
+impl<S, B, ResBody> Service<HttpRequest<B>> for InFlightService<S>
+where
+    S: Service<HttpRequest<B>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
+        // Clone-and-replace so the guard lives for exactly THIS request's
+        // future (the standard tower pattern for a `Clone` inner service). The
+        // guard is dropped when the future resolves to a response (any status)
+        // or a service error, or if the future is cancelled — decrementing the
+        // gauge exactly once in every case.
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            let _guard = InFlightGuard::new();
+            inner.call(req).await
+        })
+    }
+}
+
 fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, span: &Span) {
     span.record("status_code", tracing::field::display(response.status()));
     let _enter = span.enter();
     let status_class = status_class_label(response.status());
-    record_active_http_requests(-1);
     histogram!(
         METRIC_HTTP_SERVER_REQUEST_DURATION_SECONDS,
         LABEL_HTTP_STATUS_CLASS => status_class
@@ -1142,6 +1215,11 @@ fn process_connection(
                 // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
                 // Pre-computed in ConnectionContext to avoid per-connection OnceLock read.
                 .layer(KeystoneAuthLayer::new(keystone_auth.clone()))
+                // Maintain the in-flight request gauge with an RAII guard so it is
+                // decremented exactly once per request (backlog#806-35). Placed just
+                // outside TraceLayer so the counting window matches the old on_request
+                // timing while avoiding the 5xx double-decrement.
+                .layer(InFlightLayer)
                 .layer(
                     TraceLayer::new_for_http()
                         .make_span_with(|request: &HttpRequest<_>| {
@@ -1214,7 +1292,8 @@ fn process_connection(
                             let _enter = span.enter();
                             trace!("HTTP request started");
                             let method = request_method_label(request.method());
-                            record_active_http_requests(1);
+                            // In-flight counting is handled by InFlightLayer's RAII guard
+                            // (backlog#806-35); do not adjust the active-requests gauge here.
                             counter!(
                                 METRIC_HTTP_SERVER_REQUESTS_TOTAL,
                                 LABEL_HTTP_METHOD => method
@@ -1258,7 +1337,10 @@ fn process_connection(
                         })
                         .on_failure(|error, latency: Duration, span: &Span| {
                             let _enter = span.enter();
-                            record_active_http_requests(-1);
+                            // In-flight counting is handled by InFlightLayer's RAII guard
+                            // (backlog#806-35). This hook previously also fired for 5xx
+                            // responses (which ALSO hit on_response), double-decrementing
+                            // the gauge; only the failure metric is recorded here now.
                             counter!(
                                 METRIC_HTTP_SERVER_FAILURES_TOTAL,
                                 LABEL_HTTP_STATUS_CLASS => "transport"
@@ -1293,6 +1375,11 @@ fn process_connection(
                 .layer(CatchPanicLayer::new())
                 .layer(ReadinessGateLayer::new(readiness.clone()))
                 .layer(KeystoneAuthLayer::new(keystone_auth.clone()))
+                // Maintain the in-flight request gauge with an RAII guard so it is
+                // decremented exactly once per request (backlog#806-35). Placed just
+                // outside TraceLayer so the counting window matches the old on_request
+                // timing while avoiding the 5xx double-decrement.
+                .layer(InFlightLayer)
                 .layer(
                     TraceLayer::new_for_http()
                         .make_span_with(|request: &HttpRequest<_>| {
@@ -1365,7 +1452,8 @@ fn process_connection(
                             let _enter = span.enter();
                             trace!("HTTP request started");
                             let method = request_method_label(request.method());
-                            record_active_http_requests(1);
+                            // In-flight counting is handled by InFlightLayer's RAII guard
+                            // (backlog#806-35); do not adjust the active-requests gauge here.
                             counter!(
                                 METRIC_HTTP_SERVER_REQUESTS_TOTAL,
                                 LABEL_HTTP_METHOD => method
@@ -1409,7 +1497,10 @@ fn process_connection(
                         })
                         .on_failure(|error, latency: Duration, span: &Span| {
                             let _enter = span.enter();
-                            record_active_http_requests(-1);
+                            // In-flight counting is handled by InFlightLayer's RAII guard
+                            // (backlog#806-35). This hook previously also fired for 5xx
+                            // responses (which ALSO hit on_response), double-decrementing
+                            // the gauge; only the failure metric is recorded here now.
                             counter!(
                                 METRIC_HTTP_SERVER_FAILURES_TOTAL,
                                 LABEL_HTTP_STATUS_CLASS => "transport"
@@ -1686,8 +1777,9 @@ mod tests {
         };
 
         /// Number of middleware layers in the canonical stack order (see http.rs).
-        /// Layers 1-2 are per-connection (AddExtension), 3-21 are stateless.
-        pub const MIDDLEWARE_LAYER_COUNT: usize = 21;
+        /// Layers 1-2 are per-connection (AddExtension), 3-22 are stateless
+        /// (includes InFlightLayer, added for backlog#806-35).
+        pub const MIDDLEWARE_LAYER_COUNT: usize = 22;
 
         /// Current HTTP/2 defaults (from rustfs_config).
         pub const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE;
@@ -1728,7 +1820,7 @@ mod tests {
 
     #[test]
     fn test_baseline_middleware_count() {
-        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 21);
+        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 22);
     }
 
     #[test]
@@ -1965,5 +2057,77 @@ mod tests {
         ));
         assert!(!PathDispatchService::<MarkerService, MarkerService>::is_internode_path("/rustfs/rpcx"));
         let _ = service;
+    }
+
+    // backlog#806-35: in-flight gauge must be adjusted exactly once per request.
+
+    #[derive(Clone, Copy)]
+    struct StatusService {
+        status: StatusCode,
+    }
+
+    impl<ReqBody> Service<HttpRequest<ReqBody>> for StatusService {
+        type Response = Response<Empty<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<std::result::Result<Response<Empty<Bytes>>, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<ReqBody>) -> Self::Future {
+            std::future::ready(Ok(Response::builder().status(self.status).body(Empty::new()).expect("response")))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ErrService;
+
+    impl<ReqBody> Service<HttpRequest<ReqBody>> for ErrService {
+        type Response = Response<Empty<Bytes>>;
+        type Error = std::io::Error;
+        type Future = Ready<std::result::Result<Response<Empty<Bytes>>, std::io::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: HttpRequest<ReqBody>) -> Self::Future {
+            std::future::ready(Err(std::io::Error::other("simulated transport error")))
+        }
+    }
+
+    /// All in-flight gauge assertions live in a single test so they run
+    /// sequentially: `ACTIVE_HTTP_REQUESTS` is a process-global static and no
+    /// other test in this binary touches it, so a single-threaded test avoids
+    /// cross-test races on the shared counter.
+    #[test]
+    fn in_flight_gauge_nets_to_zero_for_every_outcome() {
+        // Guard in isolation: +1 on construct, -1 on drop.
+        let base = active_http_requests();
+        {
+            let _guard = InFlightGuard::new();
+            assert_eq!(active_http_requests(), base + 1, "guard must increment on construct");
+        }
+        assert_eq!(active_http_requests(), base, "guard must decrement on drop");
+
+        // Drive the layer for a 2xx and a 5xx response. The 5xx is the crux of
+        // backlog#806-35: under the old hook arithmetic it netted -1, not 0.
+        for status in [StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR] {
+            let before = active_http_requests();
+            let mut svc = InFlightLayer.layer(StatusService { status });
+            let req = HttpRequest::builder().body(Empty::<Bytes>::new()).expect("request");
+            let response = futures::executor::block_on(svc.call(req)).expect("response");
+            assert_eq!(response.status(), status);
+            assert_eq!(active_http_requests(), before, "gauge must net to zero for {status}");
+        }
+
+        // No-response service error: guard still fires exactly once.
+        let before = active_http_requests();
+        let mut svc = InFlightLayer.layer(ErrService);
+        let req = HttpRequest::builder().body(Empty::<Bytes>::new()).expect("request");
+        let result = futures::executor::block_on(svc.call(req));
+        assert!(result.is_err(), "ErrService must return an error");
+        assert_eq!(active_http_requests(), before, "gauge must net to zero on service error");
     }
 }
