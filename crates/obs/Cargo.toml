@@ -58,6 +58,7 @@ metrics = { workspace = true }
 crossbeam-channel = { workspace = true }
 crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
+futures-util = { workspace = true }
 num_cpus = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
