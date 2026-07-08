@@ -16,8 +16,8 @@ use super::metadata::{BucketMetadata, load_bucket_metadata};
 use super::quota::BucketQuota;
 use super::target::BucketTargets;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
-use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
-use crate::bucket::utils::{deserialize, is_meta_bucketname};
+use crate::bucket::metadata::load_bucket_metadata_parse;
+use crate::bucket::utils::is_meta_bucketname;
 use crate::error::{Error, Result, is_err_bucket_not_found};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::heal::HealOperations as _;
@@ -454,32 +454,6 @@ impl BucketMetadataSys {
     }
 
     pub async fn delete(&mut self, bucket: &str, config_file: &str) -> Result<OffsetDateTime> {
-        if config_file == BUCKET_LIFECYCLE_CONFIG {
-            let meta = match self.get_config_from_disk(bucket).await {
-                Ok(res) => res,
-                Err(err) => {
-                    if err != Error::ConfigNotFound {
-                        return Err(err);
-                    } else {
-                        BucketMetadata::new(bucket)
-                    }
-                }
-            };
-
-            if !meta.lifecycle_config_xml.is_empty() {
-                if let Ok(cfg) = deserialize::<BucketLifecycleConfiguration>(&meta.lifecycle_config_xml) {
-                    if let Some(_v) = cfg.rules.first() {}
-                } else {
-                    tracing::warn!(
-                        bucket = %bucket,
-                        "delete: failed to parse lifecycle config XML"
-                    );
-                }
-            }
-
-            // TODO: other lifecycle handle
-        }
-
         self.update_and_parse(bucket, config_file, Vec::new(), false).await
     }
 
