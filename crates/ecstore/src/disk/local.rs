@@ -39,7 +39,7 @@ use metrics::counter;
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
-    get_file_info, read_xl_meta_no_data,
+    get_file_info, read_xl_meta_no_data_sync,
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
@@ -62,7 +62,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
@@ -3124,25 +3124,41 @@ impl LocalDisk {
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
 
-        let mut f = super::fs::open_file(file_path.as_ref(), O_RDONLY)
-            .await
-            .map_err(to_file_error)?;
+        // HP-12 item 1 (sub-change A): fold the open + fstat + bounded xl.meta
+        // read into a single spawn_blocking dispatch instead of three separate
+        // async fs hops. The closure mirrors the previous async body one-to-one,
+        // including every error mapping, so the returned Result stays
+        // byte-for-byte equivalent (see read_xl_meta_no_data_sync equivalence
+        // tests in rustfs-filemeta):
+        //  - open failure     -> to_file_error (was fs::open_file(..).map_err(to_file_error))
+        //  - is_dir           -> Error::FileNotFound (NOT to_file_error(EISDIR))
+        //  - metadata failure -> to_file_error
+        //  - parse failure    -> propagated verbatim from read_xl_meta_no_data_sync (`?`)
+        let path = file_path.as_ref().to_path_buf();
+        let (data, modtime) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
+            // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
+            let mut f = std::fs::File::open(&path).map_err(to_file_error)?;
 
-        let meta = f.metadata().await.map_err(to_file_error)?;
+            let meta = f.metadata().map_err(to_file_error)?;
 
-        if meta.is_dir() {
-            // fix use io::Error
-            return Err(Error::FileNotFound);
-        }
+            if meta.is_dir() {
+                // fix use io::Error
+                return Err(Error::FileNotFound);
+            }
 
-        let size = meta.len() as usize;
+            let size = meta.len() as usize;
 
-        let data = read_xl_meta_no_data(&mut f, size).await?;
+            let data = read_xl_meta_no_data_sync(&mut f, size)?;
 
-        let modtime = match meta.modified() {
-            Ok(md) => Some(OffsetDateTime::from(md)),
-            Err(_) => None,
-        };
+            let modtime = match meta.modified() {
+                Ok(md) => Some(OffsetDateTime::from(md)),
+                Err(_) => None,
+            };
+
+            Ok((data, modtime))
+        })
+        .await
+        .map_err(DiskError::from)??;
 
         Ok((data, modtime))
     }
@@ -3161,9 +3177,60 @@ impl LocalDisk {
         volume_dir: impl AsRef<Path>,
         file_path: impl AsRef<Path>,
     ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-        let mut f = match super::fs::open_file(file_path.as_ref(), O_RDONLY).await {
-            Ok(f) => f,
-            Err(e) => {
+        // HP-12 item 1 (sub-change A): fold open + fstat + is_dir + try_reserve +
+        // read_to_end into a single spawn_blocking dispatch. The closure mirrors
+        // the previous async body one-to-one so the returned Result stays
+        // byte-for-byte equivalent. Post-open errors are mapped to their final
+        // DiskError inside the closure (metadata/read -> to_file_error; is_dir ->
+        // FileNotFound; try_reserve -> Error::other) exactly as before. The raw
+        // open error is carried out unmapped so the async side can preserve the
+        // original NotFound -> access(volume_dir) -> VolumeNotFound fallback.
+        //
+        // Only the open() call can yield ErrorKind::NotFound here: once open
+        // succeeds the fd is valid, so fstat/read never return ENOENT. Hence
+        // gating the volume fallback on the open error alone is equivalent to
+        // the original code, where the fallback lived solely in the open match arm.
+        enum ReadAllError {
+            /// Raw, unmapped open() error; the async side decides the fallback.
+            Open(std::io::Error),
+            /// Already-mapped post-open error.
+            Disk(DiskError),
+        }
+
+        let path = file_path.as_ref().to_path_buf();
+        let res =
+            tokio::task::spawn_blocking(move || -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
+                // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
+                let mut f = std::fs::File::open(&path).map_err(ReadAllError::Open)?;
+
+                let meta = f.metadata().map_err(|e| ReadAllError::Disk(to_file_error(e).into()))?;
+
+                if meta.is_dir() {
+                    return Err(ReadAllError::Disk(DiskError::FileNotFound));
+                }
+
+                let size = meta.len() as usize;
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(size)
+                    .map_err(|e| ReadAllError::Disk(Error::other(e)))?;
+
+                std::io::Read::read_to_end(&mut f, &mut bytes).map_err(|e| ReadAllError::Disk(to_file_error(e).into()))?;
+
+                let modtime = match meta.modified() {
+                    Ok(md) => Some(OffsetDateTime::from(md)),
+                    Err(_) => None,
+                };
+
+                Ok((bytes, modtime))
+            })
+            .await
+            .map_err(DiskError::from)?;
+
+        let (bytes, modtime) = match res {
+            Ok(v) => v,
+            Err(ReadAllError::Disk(e)) => return Err(e),
+            Err(ReadAllError::Open(e)) => {
                 if e.kind() == ErrorKind::NotFound
                     && !skip_access_checks(volume)
                     && let Err(er) = access(volume_dir.as_ref()).await
@@ -3182,23 +3249,6 @@ impl LocalDisk {
 
                 return Err(to_file_error(e).into());
             }
-        };
-
-        let meta = f.metadata().await.map_err(to_file_error)?;
-
-        if meta.is_dir() {
-            return Err(DiskError::FileNotFound);
-        }
-
-        let size = meta.len() as usize;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size).map_err(Error::other)?;
-
-        f.read_to_end(&mut bytes).await.map_err(to_file_error)?;
-
-        let modtime = match meta.modified() {
-            Ok(md) => Some(OffsetDateTime::from(md)),
-            Err(_) => None,
         };
 
         Ok((bytes, modtime))

@@ -3198,6 +3198,113 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
     }
 }
 
+/// Synchronous twin of [`read_more`].
+///
+/// Line-for-line mirror of the async version; the only difference is that
+/// `reader.read_exact(&mut buf[has..]).await?` becomes the blocking
+/// `std::io::Read::read_exact`. std's `read_exact` reports the same
+/// `ErrorKind::UnexpectedEof` on a short read as tokio's, so the `?`
+/// conversion into [`Error`] is identical. Kept in lockstep with `read_more`
+/// so the two paths stay byte-for-byte equivalent (see equivalence tests).
+fn read_more_sync<R: std::io::Read>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    total_size: usize,
+    read_size: usize,
+    has_full: bool,
+) -> Result<()> {
+    let has = buf.len();
+
+    if has >= read_size {
+        return Ok(());
+    }
+
+    if has_full || read_size > total_size {
+        return Err(Error::other(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Unexpected EOF")));
+    }
+
+    let extra = read_size - has;
+    if buf.capacity() >= read_size {
+        // Extend the buffer if we have enough space.
+        buf.resize(read_size, 0);
+    } else {
+        buf.extend(vec![0u8; extra]);
+    }
+
+    reader.read_exact(&mut buf[has..])?;
+    Ok(())
+}
+
+/// Synchronous twin of [`read_xl_meta_no_data`].
+///
+/// Byte-for-byte equivalent to the async version for any input: the parsing
+/// logic (`check_xl2_v1` / `read_bytes_header` / major-minor branches / `want`
+/// computation / 5-byte CRC trailer handling / `truncate` / `FileCorrupt` /
+/// `InvalidData` / `UnexpectedEof`) is copied verbatim; only the reads switch
+/// from async `read_exact(...).await` to blocking `std::io::Read::read_exact`.
+/// This lets a caller fold open+fstat+read into a single `spawn_blocking`
+/// closure without changing any observable result.
+pub fn read_xl_meta_no_data_sync<R: std::io::Read>(reader: &mut R, size: usize) -> Result<Vec<u8>> {
+    let mut initial = size;
+    let mut has_full = true;
+
+    if initial > META_DATA_READ_DEFAULT {
+        initial = META_DATA_READ_DEFAULT;
+        has_full = false;
+    }
+
+    let mut buf = vec![0u8; initial];
+    reader.read_exact(&mut buf)?;
+
+    let (tmp_buf, major, minor) = FileMeta::check_xl2_v1(&buf)?;
+
+    match major {
+        1 => match minor {
+            0 => {
+                read_more_sync(reader, &mut buf, size, size, has_full)?;
+                Ok(buf)
+            }
+            1..=3 => {
+                let (sz, tmp_buf) = FileMeta::read_bytes_header(tmp_buf)?;
+                let mut want = sz as usize + (buf.len() - tmp_buf.len());
+
+                if minor < 2 {
+                    read_more_sync(reader, &mut buf, size, want, has_full)?;
+                    buf.truncate(want);
+                    return Ok(buf);
+                }
+
+                let want_max = usize::min(want + MSGP_UINT32_SIZE, size);
+                read_more_sync(reader, &mut buf, size, want_max, has_full)?;
+
+                if buf.len() < want {
+                    return Err(Error::FileCorrupt);
+                }
+
+                // The metadata block is followed by a 5-byte msgp uint32 CRC trailer;
+                // a file truncated inside the trailer is corrupt, not a shorter meta.
+                let crc_size = 5;
+                if buf.len() - want < crc_size {
+                    return Err(Error::FileCorrupt);
+                }
+
+                want += crc_size;
+
+                buf.truncate(want);
+                Ok(buf)
+            }
+            _ => Err(Error::other(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Unknown minor metadata version",
+            ))),
+        },
+        _ => Err(Error::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Unknown major metadata version",
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4378,5 +4485,185 @@ mod tests {
 
         assert_eq!(decoded, stat);
         assert!(decoded.mod_time.is_none(), "absent mod_time must not become Some(UNIX_EPOCH)");
+    }
+}
+
+/// Equivalence tests proving `read_xl_meta_no_data_sync` returns byte-for-byte
+/// identical `Result`s to the async `read_xl_meta_no_data` for every code path.
+///
+/// This is the critical guard for HP-12 item 1: the ecstore metadata read path
+/// folds open+fstat+read into one `spawn_blocking` closure that calls the sync
+/// twin, and it MUST NOT drift from the async version in either the Ok bytes or
+/// the Err variant.
+#[cfg(test)]
+mod read_xl_meta_sync_equivalence_tests {
+    use super::*;
+    use std::io::Cursor as StdCursor;
+    // tokio implements `AsyncRead` for `std::io::Cursor`, so the same type
+    // drives both the async and the sync readers.
+    use std::io::Cursor as TokioCursor;
+
+    /// 8-byte xl.meta header: "XL2 " magic + LE major + LE minor.
+    fn header(major: u16, minor: u16) -> Vec<u8> {
+        let mut v = Vec::with_capacity(8);
+        v.extend_from_slice(&XL_FILE_HEADER);
+        v.extend_from_slice(&major.to_le_bytes());
+        v.extend_from_slice(&minor.to_le_bytes());
+        v
+    }
+
+    /// 5-byte msgpack `bin32` length prefix (marker 0xc6 + 4-byte BE length),
+    /// matching what `read_bytes_header` decodes via `read_bin_len`.
+    fn bin32_prefix(len: u32) -> [u8; 5] {
+        let mut p = [0u8; 5];
+        p[0] = 0xc6;
+        p[1..].copy_from_slice(&len.to_be_bytes());
+        p
+    }
+
+    /// Build a v1.x xl.meta buffer: header + bin32(meta_len) + meta payload +
+    /// `crc_bytes` trailer bytes + `inline` trailing inline-data bytes. The meta
+    /// payload content is irrelevant: `read_xl_meta_no_data` never parses it.
+    fn build_v1x(minor: u16, meta_len: usize, crc_bytes: usize, inline: usize) -> Vec<u8> {
+        let mut v = header(1, minor);
+        v.extend_from_slice(&bin32_prefix(meta_len as u32));
+        v.extend(std::iter::repeat_n(0xABu8, meta_len));
+        v.extend(std::iter::repeat_n(0xC1u8, crc_bytes));
+        v.extend(std::iter::repeat_n(0xCDu8, inline));
+        v
+    }
+
+    async fn run_async(buf: &[u8], size: usize) -> Result<Vec<u8>> {
+        let mut r = TokioCursor::new(buf.to_vec());
+        read_xl_meta_no_data(&mut r, size).await
+    }
+
+    fn run_sync(buf: &[u8], size: usize) -> Result<Vec<u8>> {
+        let mut r = StdCursor::new(buf.to_vec());
+        read_xl_meta_no_data_sync(&mut r, size)
+    }
+
+    /// Drive both implementations with the same input and assert the results
+    /// are equivalent (Ok bytes equal, or Err variant equal per `Error`'s
+    /// `PartialEq`, which compares io kind + message for `Error::Io`).
+    async fn assert_equivalent(label: &str, buf: &[u8], size: usize) -> Result<Vec<u8>> {
+        let a = run_async(buf, size).await;
+        let s = run_sync(buf, size);
+        match (&a, &s) {
+            (Ok(ab), Ok(sb)) => assert_eq!(ab, sb, "[{label}] Ok bytes must match"),
+            (Err(ae), Err(se)) => assert_eq!(ae, se, "[{label}] Err variant must match"),
+            _ => panic!("[{label}] async/sync disagree on Ok vs Err: async={a:?} sync={s:?}"),
+        }
+        a
+    }
+
+    #[tokio::test]
+    async fn equivalence_across_all_paths() {
+        // (a) v1.0: whole-file read path.
+        {
+            let mut buf = header(1, 0);
+            buf.extend(std::iter::repeat_n(0x11u8, 24));
+            let len = buf.len();
+            let out = assert_equivalent("v1.0", &buf, len).await.unwrap();
+            assert_eq!(out, buf, "v1.0 returns the whole file");
+        }
+
+        // (b) v1.1 / v1.2 / v1.3, each a clean well-formed buffer.
+        // v1.1: minor < 2, no CRC trailer; returns header+prefix+meta.
+        {
+            let buf = build_v1x(1, 10, 0, 0);
+            let len = buf.len();
+            let out = assert_equivalent("v1.1", &buf, len).await.unwrap();
+            assert_eq!(out.len(), 8 + 5 + 10, "v1.1 -> header+prefix+meta");
+        }
+        // v1.2: minor >= 2, 5-byte CRC trailer retained.
+        {
+            let buf = build_v1x(2, 15, 5, 0);
+            let len = buf.len();
+            let out = assert_equivalent("v1.2", &buf, len).await.unwrap();
+            assert_eq!(out.len(), 8 + 5 + 15 + 5, "v1.2 -> header+prefix+meta+crc");
+        }
+        // v1.3: minor >= 2, 5-byte CRC trailer retained.
+        {
+            let buf = build_v1x(3, 20, 5, 0);
+            let len = buf.len();
+            let out = assert_equivalent("v1.3", &buf, len).await.unwrap();
+            assert_eq!(out.len(), 8 + 5 + 20 + 5, "v1.3 -> header+prefix+meta+crc");
+        }
+
+        // (c) size > META_DATA_READ_DEFAULT: initial 4KiB read then read_more.
+        {
+            let meta_len = 5000; // total = 8 + 5 + 5000 + 5 = 5018 > 4096
+            let buf = build_v1x(3, meta_len, 5, 0);
+            assert!(buf.len() > META_DATA_READ_DEFAULT);
+            let len = buf.len();
+            let out = assert_equivalent("v1.3-large", &buf, len).await.unwrap();
+            assert_eq!(out.len(), 8 + 5 + meta_len + 5);
+        }
+
+        // (d) truncated inside the header -> UnexpectedEof (initial read_exact
+        // fails because the reader holds fewer bytes than the claimed size).
+        {
+            let buf = XL_FILE_HEADER.to_vec(); // only 4 bytes present
+            assert_equivalent("truncated-header", &buf, 8).await.unwrap_err();
+        }
+
+        // (e) truncated inside the CRC trailer -> FileCorrupt (v1.3 with only
+        // 2 of the 5 trailer bytes present; size matches the buffer).
+        {
+            let buf = build_v1x(3, 10, 2, 0); // want=23, buf.len()=25, 25-23=2 < 5
+            let len = buf.len();
+            let e = assert_equivalent("truncated-crc", &buf, len).await.unwrap_err();
+            assert_eq!(e, Error::FileCorrupt);
+        }
+
+        // (f) unknown major / unknown minor -> InvalidData.
+        // Unknown major: major=0 passes check_xl2_v1 (0 <= MAJOR) but misses the
+        // `1 =>` arm.
+        {
+            let buf = header(0, 0);
+            let e = assert_equivalent("unknown-major", &buf, buf.len()).await.unwrap_err();
+            assert_eq!(
+                e,
+                Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown major metadata version"))
+            );
+        }
+        // Unknown minor: major=1, minor=4 misses the `0` and `1..=3` arms.
+        {
+            let buf = header(1, 4);
+            let e = assert_equivalent("unknown-minor", &buf, buf.len()).await.unwrap_err();
+            assert_eq!(
+                e,
+                Error::other(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown minor metadata version"))
+            );
+        }
+
+        // (g) want boundaries.
+        // Exact fit: size == want + crc, no inline data.
+        {
+            let buf = build_v1x(3, 20, 5, 0); // size == want+5 exactly
+            let len = buf.len();
+            let out = assert_equivalent("want-exact-fit", &buf, len).await.unwrap();
+            assert_eq!(out, buf);
+        }
+        // Inline data past the trailer: truncate drops it, want_max clamps below size.
+        {
+            let buf = build_v1x(3, 20, 5, 100); // size = want+5+100
+            let len = buf.len();
+            let out = assert_equivalent("want-with-inline", &buf, len).await.unwrap();
+            assert_eq!(out.len(), 8 + 5 + 20 + 5, "inline data is dropped by truncate");
+        }
+
+        // (h) read_more's own read_exact hits EOF (has_full=false, read_size
+        // within claimed size but the reader is physically shorter).
+        {
+            // prefix claims a 5000-byte meta so size=5018, but only 4100 bytes exist.
+            let mut buf = header(1, 3);
+            buf.extend_from_slice(&bin32_prefix(5000));
+            buf.extend(std::iter::repeat_n(0xABu8, 4100 - buf.len()));
+            assert_eq!(buf.len(), 4100);
+            let e = assert_equivalent("read_more-eof", &buf, 5018).await.unwrap_err();
+            assert_eq!(e, Error::Unexpected, "short read surfaces as Unexpected");
+        }
     }
 }
