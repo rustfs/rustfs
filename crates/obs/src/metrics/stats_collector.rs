@@ -514,13 +514,9 @@ fn build_system_cpu_stats(system: &System) -> CpuStats {
 
     CpuStats {
         avg_idle: (100.0 - cpu_usage).max(0.0),
-        avg_iowait: 0.0,
         load_avg,
         load_avg_perc: (load_avg / cpu_count) * 100.0,
-        nice: 0.0,
-        steal: 0.0,
-        system: cpu_usage,
-        user: 0.0,
+        usage_perc: cpu_usage,
     }
 }
 
