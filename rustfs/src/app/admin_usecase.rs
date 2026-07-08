@@ -253,6 +253,7 @@ impl DefaultAdminUsecase {
         replace_bucket_usage_memory_from_info(&info).await;
         apply_bucket_usage_memory_overlay(&mut info).await;
         Self::refresh_live_bucket_usage_for_data_usage_info(store.clone(), &mut info).await;
+        apply_bucket_usage_memory_overlay(&mut info).await;
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
