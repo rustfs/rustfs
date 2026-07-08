@@ -22,6 +22,7 @@ use crate::admin::storage_api::data_usage::{
     apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_bucket_usage_from_object_layer,
     refresh_versioned_bucket_usage_from_object_layer, replace_bucket_usage_memory_from_info,
 };
+use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
@@ -31,6 +32,7 @@ use rustfs_data_usage::BucketUsageInfo;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
+use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, ReplicationRuleStatus};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -72,6 +74,34 @@ fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAcce
     bucket_info.objects = usage.objects_count;
     bucket_info.object_sizes_histogram = usage.object_size_histogram.clone();
     bucket_info.object_versions_histogram = usage.object_versions_histogram.clone();
+}
+
+fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
+    config
+        .object_lock_enabled
+        .as_ref()
+        .is_some_and(|enabled| enabled.as_str() == ObjectLockEnabled::ENABLED)
+}
+
+fn replication_config_enabled(config: &ReplicationConfiguration) -> bool {
+    config
+        .rules
+        .iter()
+        .any(|rule| rule.status.as_str() == ReplicationRuleStatus::ENABLED)
+}
+
+async fn bucket_locking_enabled(bucket: &str) -> bool {
+    metadata_sys::get_object_lock_config(bucket)
+        .await
+        .ok()
+        .is_some_and(|(config, _)| object_lock_config_enabled(&config))
+}
+
+async fn bucket_replication_enabled(bucket: &str) -> bool {
+    metadata_sys::get_replication_config(bucket)
+        .await
+        .ok()
+        .is_some_and(|(config, _)| replication_config_enabled(&config))
 }
 
 #[async_trait::async_trait]
@@ -229,13 +259,13 @@ impl Operation for AccountInfoHandler {
             let (rd, wr) = is_allow(bucket.name.clone()).await;
             if rd || wr {
                 // TODO: BucketQuotaSys
-                // TODO: other attributes
                 let mut bucket_info = rustfs_madmin::BucketAccessInfo {
                     name: bucket.name.clone(),
                     details: Some(rustfs_madmin::BucketDetails {
                         versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
                         versioning_suspended: BucketVersioningSys::suspended(bucket.name.as_str()).await,
-                        ..Default::default()
+                        locking: bucket_locking_enabled(bucket.name.as_str()).await,
+                        replication: bucket_replication_enabled(bucket.name.as_str()).await,
                     }),
                     created: bucket.created,
                     access: rustfs_madmin::AccountAccess { read: rd, write: wr },
@@ -270,6 +300,7 @@ mod tests {
     use super::*;
     use rustfs_madmin::BackendInfo;
     use rustfs_policy::policy::BucketPolicy;
+    use s3s::dto::{Destination, ReplicationRule};
 
     #[test]
     fn test_account_info_structure() {
@@ -338,5 +369,47 @@ mod tests {
 
         assert_eq!(bucket_info.size, 5);
         assert_eq!(bucket_info.objects, 2);
+    }
+
+    #[test]
+    fn accountinfo_bucket_details_marks_object_lock_enabled() {
+        let enabled = ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            ..Default::default()
+        };
+        let disabled = ObjectLockConfiguration::default();
+
+        assert!(object_lock_config_enabled(&enabled));
+        assert!(!object_lock_config_enabled(&disabled));
+    }
+
+    #[test]
+    fn accountinfo_bucket_details_marks_replication_enabled_rules() {
+        let enabled = replication_config_with_status(ReplicationRuleStatus::ENABLED);
+        let disabled = replication_config_with_status(ReplicationRuleStatus::DISABLED);
+
+        assert!(replication_config_enabled(&enabled));
+        assert!(!replication_config_enabled(&disabled));
+    }
+
+    fn replication_config_with_status(status: &'static str) -> ReplicationConfiguration {
+        ReplicationConfiguration {
+            role: "arn:aws:iam::123456789012:role/replication".to_string(),
+            rules: vec![ReplicationRule {
+                delete_marker_replication: None,
+                delete_replication: None,
+                destination: Destination {
+                    bucket: "arn:aws:s3:::target".to_string(),
+                    ..Default::default()
+                },
+                existing_object_replication: None,
+                filter: None,
+                id: None,
+                prefix: None,
+                priority: None,
+                source_selection_criteria: None,
+                status: ReplicationRuleStatus::from_static(status),
+            }],
+        }
     }
 }
