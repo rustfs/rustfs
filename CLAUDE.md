@@ -36,12 +36,7 @@ make build-docker BUILD_OS=ubuntu22.04
 
 ## Domain conventions worth knowing up front
 
-- Internal object metadata is written under **both** `x-rustfs-internal-<suffix>`
-  and `x-minio-internal-<suffix>` keys for MinIO interop
-  (`crates/utils/src/http/metadata_compat.rs`; `get_bytes` prefers the RustFS
-  key). Never write only one of the two.
-- Binary metadata values (UUIDs) must be read defensively:
-  `.and_then(|v| Uuid::from_slice(&v).ok()).filter(|u| !u.is_nil())` —
-  absent/empty/nil all mean "no value", not `Uuid::nil()`.
-- A remote-tier version of `None`/`""` means the tier bucket is unversioned:
-  send **no** `versionId` on tier GET/DELETE.
+Repo-wide domain invariants (dual internal metadata keys, defensive UUID
+reads, unversioned tier buckets) live in [AGENTS.md](AGENTS.md) under
+"Cross-Cutting Domain Invariants" — read them before touching metadata or
+tiering code.

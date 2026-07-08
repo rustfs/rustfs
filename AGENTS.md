@@ -19,7 +19,7 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - If a task has multiple plausible interpretations, list the options briefly and choose the narrowest reasonable path; ask when the ambiguity would make the change risky.
 - For multi-step work, keep the plan minimal and tied to verifiable outcomes.
 - Avoid redundant file reads, repeated commands, and unnecessary exploratory work once enough context is available.
-- A good result is a minimal diff with clear assumptions, no over-engineering, and independent verification.
+- A good result is a minimal diff with clear assumptions, no over-engineering, and independent verification that survives Adversarial Validation (below).
 
 ## Communication and Language
 
@@ -60,9 +60,13 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Migration guardrails, readiness contracts, support matrices:
   `docs/architecture/README.md` (routes by audience)
 - Historical implementation plans and trackers: `docs/superpowers/plans/`
-- Shared agent skills (all tools): `.agents/skills/` — Claude Code reads them
-  through the `.claude/skills` symlink; add new skills to `.agents/skills/`
-  only, never as separate copies per tool
+- Shared agent skills (all tools): `.agents/skills/` — each `SKILL.md` carries
+  a frontmatter `description` stating when it applies. Scan the descriptions
+  before starting a task and follow any skill that matches, even if your tool
+  does not auto-load skills:
+  `grep -m1 '^description:' .agents/skills/*/SKILL.md`
+  Claude Code reads them through the `.claude/skills` symlink; add new skills
+  to `.agents/skills/` only, never as separate copies per tool
 
 Avoid duplicating long crate lists or command matrices in instruction files.
 Reference the source files above instead.
@@ -70,6 +74,7 @@ Reference the source files above instead.
 ## Verification Before PR
 
 Convert changes into independently verifiable outcomes. Prefer focused tests for behavior changes and run the relevant checks before declaring completion.
+Non-exempt changes must also pass Adversarial Validation (next section) before the checks below count as completion.
 
 For code changes, run and pass the following before opening a PR:
 
@@ -94,19 +99,114 @@ Before pushing code changes, make sure formatting is clean:
 - Run `cargo fmt --all --check` and ensure no files are modified unexpectedly.
 
 If `make` is unavailable, run the equivalent checks defined under `.config/make/`.
-Documentation-only or instruction-only changes are exempt from the verification commands above (including the `.config/make/` equivalents), though any installed git pre-commit hooks (for example, from `make setup-hooks`) may still run on commit unless explicitly skipped.
+Documentation-only or instruction-only changes are exempt from the verification commands above (including the `.config/make/` equivalents), though any locally installed git pre-commit hooks may still run on commit unless explicitly skipped.
 After build-based verification completes, clean generated build artifacts before wrapping up to avoid unnecessary disk usage.
 Do not open a PR with code changes when the required checks fail.
+Make a failing check pass by fixing the cause, never by weakening the gate:
+do not loosen or skip a guard script, add entries to a baseline or allowance
+list, suppress a lint with `#[allow]`, mark a failing test `#[ignore]`, or
+delete or relax a failing assertion to get green. If a check itself is wrong,
+change it deliberately and state the rationale in the PR.
+
+## Adversarial Validation (Default On)
+
+Every non-exempt output (see Risk tiers) — code change, bug fix, or
+design/solution proposal — passes multi-role adversarial review before it
+counts as done.
+Author confidence is not evidence: each role's job is to refute the change,
+not to bless it.
+
+### Risk tiers
+
+Pick the tier from the riskiest file touched; when in doubt, pick the higher.
+
+- **Exempt:** docs/comments/instruction-only changes, formatting, typos with
+  no runtime surface. Skip this section.
+- **Mechanical:** pure renames, file moves, test-only or tooling changes —
+  correctness adversary only.
+- **Standard (the default):** any change that affects behavior.
+- **High risk:** touches locking, erasure coding, quorum/heal, replication,
+  multipart, RPC, lifecycle/tiering, metadata formats (`xl.meta`),
+  persistence/fsync, IAM/KMS/auth, on-disk or on-wire formats, or
+  S3 API-visible behavior.
+
+### Roles
+
+Run each applicable role as an independent pass over the final diff (or
+proposal text) — parallel reviewer agents where the tooling supports them,
+otherwise sequential passes that each start fresh from the diff and the
+nearest scoped `AGENTS.md`, discarding the writing session's assumptions.
+Each role either produces findings or reports "attacked X, Y, Z — no break
+found"; a bare pass is not a result. Repo-specific attack probes for every
+role live in `.agents/skills/adversarial-validation/` — run them, they
+encode this repo's shipped bugs.
+
+- **Correctness adversary** — construct a concrete input/state/interleaving
+  that yields wrong output, data loss, or a crash. Probe error paths and edge
+  values (empty, nil UUID, zero-length, quorum−1, missing version). For code
+  diffs, a materially smaller or more idiomatic diff achieving the same
+  behavior is also a finding (see Change Style for Existing Logic).
+- **Security reviewer** — authn/authz bypass, injection, secret leakage,
+  untrusted deserialization (see Serde Safety), path traversal, timing leaks.
+- **Concurrency/durability reviewer** — lock ordering, races, cancellation,
+  partial failure, retry/idempotency, crash and power-loss ordering.
+- **Compatibility reviewer** — S3 API surface, MinIO interop, on-disk and
+  on-wire formats, mixed-version upgrade/downgrade paths.
+- **Performance reviewer** — allocation and cloning on hot paths, lock hold
+  time across IO, sync or CPU-heavy work on async runtime threads, added
+  fsync/flush outside the durability gate, hot-path logging noise. A
+  measurable regression on a per-request or per-object path is a finding.
+- **Test-coverage skeptic** — for each claimed behavior, name the test that
+  fails if the change is reverted; then name a changed line that could be
+  wrong while all tests stay green — if one exists, coverage is insufficient.
+  A missing test is a finding, not a note.
+
+Standard tier: correctness adversary + test-coverage skeptic, plus every
+role whose domain the diff touches (async or shared-state code →
+concurrency; parsing of untrusted input → security; public crate API shape
+→ compatibility; per-request or per-object hot paths → performance).
+High risk: all six roles.
+
+### Protocol
+
+1. A finding states a concrete failure scenario (input/state → wrong
+   outcome) or names a missing test, with severity and file:line. "Looks
+   risky" is not a finding.
+2. Resolve every finding: fix it, or rebut it with evidence — a test, a
+   traced code path, or a cited invariant. Restated intent and "unlikely"
+   are not rebuttals.
+3. After non-trivial fixes, re-run the roles whose domain the fix touched.
+4. For proposals with no diff, roles attack assumptions, failure modes,
+   migration/rollback, and testability instead — including the simplest
+   rejected alternative and the blast radius when the design fails.
+
+### Exit criteria
+
+- Every applicable role has run; every finding is fixed or rebutted with
+  evidence.
+- Every behavior change has a test that fails without it.
+- The Verification Before PR gates pass — adversarial review supplements
+  those gates, never replaces them.
+- High risk only: record a one-line verdict per role in the PR description.
 
 ## Git and PR Baseline
 
 - Use feature branches based on the latest `main`.
+- Assume other agent sessions work this repository concurrently. Never commit
+  in a shared checkout; do all work on a dedicated feature branch, preferably
+  in a dedicated worktree.
+- Immediately before branching, fetch `origin/main` and branch from it;
+  confirm the target issue is not already fixed there before writing code.
 - Follow Conventional Commits, with subject length <= 72 characters.
 - Keep PR title and description in English.
 - Use `.github/pull_request_template.md` and keep all section headings.
 - Use `N/A` for non-applicable template sections.
 - Include verification commands in the PR description.
-- When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
+- When using `gh pr create`/`gh pr edit`, write the markdown body to a file
+  and pass `--body-file`; multiline inline `--body` is unsafe — backticks and
+  shell expansion can corrupt content or trigger unintended commands.
+  Pattern: `cat > /tmp/pr_body.md <<'EOF' ... EOF`, then
+  `--body-file /tmp/pr_body.md` (keep the file outside the checkout).
 - Do not include the literal sequence `\n` in any GitHub issue, pull request, or discussion comment.
 - Do not hard-wrap prose in PR/issue/discussion bodies; write each paragraph as a
   single line and let it reflow. GitHub renders single newlines inside a paragraph
@@ -138,11 +238,23 @@ cargo run -p rustfs-filemeta --example dump_fileinfo -- "/path/to/file/xl.meta"
 - When `deny_unknown_fields` is impractical (backward compatibility), at minimum log unknown fields at `warn` level.
 - Never use `#[serde(default)]` on security-critical fields without explicit validation of the resulting value.
 
+## Cross-Cutting Domain Invariants
+
+- Write internal object metadata under **both** `x-rustfs-internal-<suffix>`
+  and `x-minio-internal-<suffix>` keys (MinIO interop). Use the helpers in
+  `crates/utils/src/http/metadata_compat.rs` (`get_bytes` prefers the RustFS
+  key); never write only one of the two.
+- Read binary UUID metadata defensively:
+  `.and_then(|v| Uuid::from_slice(&v).ok()).filter(|u| !u.is_nil())` —
+  absent, empty, and nil all mean "no value", never `Uuid::nil()`.
+- A remote-tier version of `None`/`""` means the tier bucket is unversioned:
+  send **no** `versionId` on tier GET/DELETE.
+
 ## Naming Conventions
 
 - Follow Rust API Guidelines for naming: `SCREAMING_SNAKE_CASE` for statics and constants, `snake_case` for functions and variables, `PascalCase` for types.
 - Do not use camelCase or Hungarian notation (e.g., `globalDeploymentIDPtr` → `GLOBAL_DEPLOYMENT_ID`).
-- If existing code violates naming conventions, do not widen the violation in new code. Fix opportunistically when touching the surrounding area.
+- If existing code violates naming conventions, do not widen the violation in new code. Do not rename existing symbols as part of an unrelated task; mention the violation instead (see Change Style for Existing Logic).
 
 ## Scoped Guidance in This Repository
 
