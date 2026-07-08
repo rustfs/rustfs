@@ -40,6 +40,7 @@
 //! single-instance behavior is byte-for-byte unchanged.
 
 use crate::layout::endpoints::SetupType;
+use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
@@ -58,15 +59,38 @@ pub struct InstanceContext {
     /// drift out of sync). Stored as one value so the three predicates can
     /// never observe a torn intermediate state.
     erasure_kind: RwLock<SetupType>,
+    /// This instance's namespace lock manager (Phase 5 Slice 3, backlog#939).
+    ///
+    /// Owned per-instance so two instances no longer share a lock namespace
+    /// (which would make same-named objects in different instances falsely
+    /// contend). Single-instance aliases the process singleton, so behavior is
+    /// unchanged; see [`bootstrap_ctx`].
+    lock_manager: Arc<GlobalLockManager>,
 }
 
 impl InstanceContext {
     /// Create a fresh instance context in the initial [`SetupType::Unknown`]
-    /// state — byte-for-byte equivalent to the old all-`false` erasure globals.
+    /// state with its own lock manager — byte-for-byte equivalent to the old
+    /// all-`false` erasure globals.
     pub fn new() -> Self {
+        Self::with_lock_manager(Arc::new(GlobalLockManager::new()))
+    }
+
+    /// Build a context bound to a specific lock manager.
+    ///
+    /// [`bootstrap_ctx`] uses this to alias the process-global lock manager so
+    /// single-instance deployments keep one shared namespace; `new` mints a
+    /// fresh manager for a genuinely independent instance.
+    fn with_lock_manager(lock_manager: Arc<GlobalLockManager>) -> Self {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
+            lock_manager,
         }
+    }
+
+    /// This instance's namespace lock manager.
+    pub fn lock_manager(&self) -> Arc<GlobalLockManager> {
+        self.lock_manager.clone()
     }
 
     /// Update this instance's erasure setup type.
@@ -116,7 +140,9 @@ static BOOTSTRAP_CTX: OnceLock<Arc<InstanceContext>> = OnceLock::new();
 /// falls back to before an `ECStore` is published, and the `Arc` that
 /// `ECStore::new` adopts as its own `ctx`.
 pub fn bootstrap_ctx() -> Arc<InstanceContext> {
-    BOOTSTRAP_CTX.get_or_init(|| Arc::new(InstanceContext::new())).clone()
+    BOOTSTRAP_CTX
+        .get_or_init(|| Arc::new(InstanceContext::with_lock_manager(get_global_lock_manager())))
+        .clone()
 }
 
 #[cfg(test)]
@@ -179,5 +205,28 @@ mod tests {
 
         assert!(ctx_b.is_erasure_sd().await);
         assert!(!ctx_b.is_erasure().await && !ctx_b.is_dist_erasure().await);
+    }
+
+    // Single-instance zero-change: the bootstrap context's lock manager is the
+    // very same Arc the process singleton hands out, so the lock namespace is
+    // unchanged from before Slice 3.
+    #[tokio::test]
+    async fn bootstrap_lock_manager_aliases_process_singleton() {
+        assert!(
+            Arc::ptr_eq(&bootstrap_ctx().lock_manager(), &get_global_lock_manager()),
+            "bootstrap context must alias the process lock-manager singleton"
+        );
+    }
+
+    // Two independent contexts own distinct lock managers — the property that
+    // stops two instances from falsely contending on same-named objects.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_lock_managers() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        assert!(
+            !Arc::ptr_eq(&ctx_a.lock_manager(), &ctx_b.lock_manager()),
+            "fresh contexts must not share a lock manager"
+        );
     }
 }

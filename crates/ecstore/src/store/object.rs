@@ -1991,6 +1991,25 @@ mod tests {
         );
     }
 
+    // Phase 5 Slice 3 (backlog#939): a SetDisks sources its lock manager from
+    // its instance context (not an independent process lookup), and in a
+    // single-instance build that context aliases the process lock-manager
+    // singleton — so the lock namespace is unchanged.
+    #[tokio::test]
+    async fn set_disks_lock_manager_comes_from_instance_context() {
+        let store = new_read_lock_test_store().await;
+        let set_disks = store.pools[0].disk_set.first().expect("pool has one set");
+
+        assert!(
+            std::sync::Arc::ptr_eq(set_disks.local_lock_manager_for_test(), &set_disks.instance_ctx().lock_manager()),
+            "SetDisks lock manager must be sourced from its instance context"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(set_disks.local_lock_manager_for_test(), &rustfs_lock::get_global_lock_manager()),
+            "single-instance lock manager must alias the process singleton"
+        );
+    }
+
     #[tokio::test]
     async fn acquired_read_lock_marks_metadata_cache_safe_for_set_layer() {
         let store = new_read_lock_test_store().await;

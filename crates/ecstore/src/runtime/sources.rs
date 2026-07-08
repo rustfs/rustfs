@@ -288,10 +288,6 @@ pub(crate) fn ensure_deployment_id(deployment_id: Uuid) {
     }
 }
 
-pub(crate) fn global_lock_manager() -> Arc<rustfs_lock::GlobalLockManager> {
-    rustfs_lock::get_global_lock_manager()
-}
-
 pub fn global_lock_client() -> Option<Arc<dyn LockClient>> {
     get_global_lock_client()
 }
