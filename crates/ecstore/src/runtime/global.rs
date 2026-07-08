@@ -47,12 +47,12 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 //   GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_LIFECYCLE_SYS, GLOBAL_EVENT_NOTIFIER, etc.
 // Tier B (keep as static): GLOBAL_RUSTFS_PORT, env var caches, etc.
 //
-// Phase 5 (backlog#939): the erasure setup type and the S3 region moved into
-// the per-instance `InstanceContext` (see `super::instance`); their facades
-// below now forward to the current instance's context.
+// Phase 5 (backlog#939): the erasure setup type, the S3 region, and the
+// deployment id moved into the per-instance `InstanceContext` (see
+// `super::instance`); their facades below now forward to the current instance's
+// context.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
-    static ref GLOBAL_DEPLOYMENT_ID: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -125,9 +125,7 @@ pub fn set_global_rustfs_port(value: u16) {
 /// * None
 ///
 pub fn set_global_deployment_id(id: Uuid) {
-    GLOBAL_DEPLOYMENT_ID
-        .set(id)
-        .expect("GLOBAL_DEPLOYMENT_ID should be initialized once during startup");
+    current_ctx().set_deployment_id(id);
 }
 
 /// Get the global deployment id
@@ -136,7 +134,7 @@ pub fn set_global_deployment_id(id: Uuid) {
 /// * `Option<String>` - The global deployment id as a string, if set
 ///
 pub fn get_global_deployment_id() -> Option<String> {
-    GLOBAL_DEPLOYMENT_ID.get().map(|v| v.to_string())
+    current_ctx().deployment_id().map(|v| v.to_string())
 }
 /// Set the global endpoints
 ///
