@@ -2504,6 +2504,71 @@ mod put_object_tmp_cleanup_tests {
 }
 
 #[cfg(test)]
+mod put_object_tags_early_stop_regression_tests {
+    //! Regression coverage for backlog#881: read-before-write tagging under GET
+    //! metadata early-stop. backlog#872 enabled metadata early-stop by default;
+    //! an early-stopped metadata fanout returns only a read-quorum subset of
+    //! disks, and `put_object_tags` reuses that disk set as its write target, so
+    //! it shrank the write set and failed write quorum with SlowDown. The fix
+    //! forces a full-quorum fanout (allow_early_stop=false) inside
+    //! `put_object_tags`. This multi-disk integration test pins that end to end:
+    //! with early-stop enabled, the tag must land on EVERY online disk's xl.meta,
+    //! not a read-quorum subset.
+
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::disk::{DiskAPI as _, ReadOptions};
+
+    #[tokio::test]
+    async fn put_object_tags_writes_all_online_disks_under_early_stop() {
+        // Early-stop defaults to on; pin it explicitly (enabled + full rollout)
+        // so the regression scenario holds regardless of default/rollout drift.
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT", Some("100")),
+            ],
+            async {
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = "backlog881-early-stop-bucket";
+                let object = "read-before-write-tagged-object";
+                for disk in &disk_stores {
+                    disk.make_volume(bucket).await.expect("bucket volume should be created");
+                }
+
+                let mut reader = PutObjReader::from_vec(vec![5u8; 1024]);
+                set_disks
+                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                    .await
+                    .expect("put_object should succeed");
+
+                let tags = "unit=backlog881&stage=regression";
+                set_disks
+                    .put_object_tags(bucket, object, tags, &ObjectOptions::default())
+                    .await
+                    .expect("put_object_tags must not fail write quorum (SlowDown) under early-stop");
+
+                // Core assertion: the tag must be present on EVERY online disk,
+                // proving the write target was the full set and not an
+                // early-stopped read-quorum subset.
+                for (idx, disk) in disk_stores.iter().enumerate() {
+                    let fi = disk
+                        .read_version("", bucket, object, "", &ReadOptions::default())
+                        .await
+                        .unwrap_or_else(|e| panic!("disk {idx} must hold xl.meta for the tagged object: {e}"));
+                    assert_eq!(
+                        fi.metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str),
+                        Some(tags),
+                        "disk {idx} must carry the tag written under early-stop (write set not shrunk to a read-quorum subset)"
+                    );
+                }
+            },
+        )
+        .await;
+    }
+}
+
+#[cfg(test)]
 mod delete_objects_lock_gating_tests {
     //! Regression coverage for backlog#929 (HP-8): the batch-delete per-object
     //! stat is gated on the bucket object-lock configuration. For buckets whose
