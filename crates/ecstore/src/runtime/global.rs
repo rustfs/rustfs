@@ -53,9 +53,6 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-    pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
-    pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
-    pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_ROOT_DISK_THRESHOLD: RwLock<u64> = RwLock::new(0);
     pub static ref GLOBAL_LIFECYCLE_SYS: Arc<LifecycleSys> = LifecycleSys::new();
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
@@ -158,9 +155,10 @@ pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
 
 #[cfg(test)]
 pub async fn reset_local_disk_test_state() {
-    GLOBAL_LOCAL_DISK_MAP.write().await.clear();
-    GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
-    GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
+    let ctx = current_ctx();
+    ctx.local_disk_map().write().await.clear();
+    ctx.local_disk_id_map().write().await.clear();
+    ctx.local_disk_set_drives().write().await.clear();
 }
 
 pub async fn is_first_cluster_node_local() -> bool {

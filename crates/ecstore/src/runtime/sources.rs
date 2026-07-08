@@ -29,13 +29,12 @@ use crate::{
     error::Result,
     layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
-        GLOBAL_BOOT_TIME, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES,
-        GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD, TypeLocalDiskSetDrives,
-        get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
-        get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
-        global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local,
-        resolve_object_store_handle, set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer,
-        update_erasure_type,
+        GLOBAL_BOOT_TIME, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD,
+        TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
+        get_global_endpoints, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region,
+        get_global_tier_config_mgr, global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd,
+        is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id, set_global_lock_client,
+        set_global_lock_clients, set_object_layer, update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::event_notification::EventNotifier,
@@ -371,7 +370,7 @@ pub fn bucket_monitor() -> Option<Arc<Monitor>> {
 /// `InstanceContext` (Phase 5 disk-registry migration, backlog#939) without a
 /// cross-crate signature change. Single-instance behavior is unchanged.
 pub async fn local_disk_map_read() -> OwnedRwLockReadGuard<HashMap<String, Option<DiskStore>>> {
-    GLOBAL_LOCAL_DISK_MAP.clone().read_owned().await
+    local_disk_map_handle().read_owned().await
 }
 
 pub(crate) fn init_bucket_monitor_for_current_endpoints() {
@@ -380,15 +379,15 @@ pub(crate) fn init_bucket_monitor_for_current_endpoints() {
 }
 
 pub(crate) fn local_disk_map_handle() -> Arc<RwLock<HashMap<String, Option<DiskStore>>>> {
-    GLOBAL_LOCAL_DISK_MAP.clone()
+    crate::runtime::global::current_ctx().local_disk_map()
 }
 
 pub(crate) fn local_disk_id_map_handle() -> Arc<RwLock<HashMap<Uuid, String>>> {
-    GLOBAL_LOCAL_DISK_ID_MAP.clone()
+    crate::runtime::global::current_ctx().local_disk_id_map()
 }
 
 pub(crate) fn local_disk_set_drives_handle() -> Arc<RwLock<TypeLocalDiskSetDrives>> {
-    GLOBAL_LOCAL_DISK_SET_DRIVES.clone()
+    crate::runtime::global::current_ctx().local_disk_set_drives()
 }
 
 pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
@@ -408,24 +407,25 @@ pub(crate) fn event_notifier_handle() -> Arc<RwLock<EventNotifier>> {
 }
 
 pub(crate) async fn local_disk_by_path(path: &str) -> Option<DiskStore> {
-    GLOBAL_LOCAL_DISK_MAP.read().await.get(path).cloned().flatten()
+    local_disk_map_handle().read().await.get(path).cloned().flatten()
 }
 
 pub(crate) async fn local_disk_path_by_id(disk_id: &Uuid) -> Option<String> {
-    GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(disk_id).cloned()
+    local_disk_id_map_handle().read().await.get(disk_id).cloned()
 }
 
 #[cfg(test)]
 pub(crate) async fn clear_local_disk_id_map_for_test() {
-    GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+    local_disk_id_map_handle().write().await.clear();
 }
 
 pub(crate) async fn record_local_disk_id(disk_id: Uuid, endpoint: String) {
-    GLOBAL_LOCAL_DISK_ID_MAP.write().await.insert(disk_id, endpoint);
+    local_disk_id_map_handle().write().await.insert(disk_id, endpoint);
 }
 
 pub(crate) async fn replace_local_disk_id(previous: Option<Uuid>, current: Option<Uuid>, endpoint: String) {
-    let mut disk_id_map = GLOBAL_LOCAL_DISK_ID_MAP.write().await;
+    let id_map = local_disk_id_map_handle();
+    let mut disk_id_map = id_map.write().await;
     if let Some(previous_id) = previous {
         disk_id_map.remove(&previous_id);
     }
@@ -435,7 +435,8 @@ pub(crate) async fn replace_local_disk_id(previous: Option<Uuid>, current: Optio
 }
 
 pub(crate) async fn record_local_disks(disks: Vec<DiskStore>) {
-    let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
+    let map = local_disk_map_handle();
+    let mut global_local_disk_map = map.write().await;
     for disk in disks {
         let path = disk.endpoint().to_string();
         global_local_disk_map.insert(path, Some(disk.clone()));
@@ -443,13 +444,14 @@ pub(crate) async fn record_local_disks(disks: Vec<DiskStore>) {
 }
 
 pub(crate) async fn local_disk_set_drive(pool_idx: usize, set_idx: usize, disk_idx: usize) -> Option<DiskStore> {
-    GLOBAL_LOCAL_DISK_SET_DRIVES.read().await[pool_idx][set_idx][disk_idx].clone()
+    local_disk_set_drives_handle().read().await[pool_idx][set_idx][disk_idx].clone()
 }
 
 pub(crate) async fn local_disk_for_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
-    let global_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.read().await;
+    let set_drives = local_disk_set_drives_handle();
+    let global_set_drives = set_drives.read().await;
     if global_set_drives.is_empty() {
-        return GLOBAL_LOCAL_DISK_MAP
+        return local_disk_map_handle()
             .read()
             .await
             .get(&endpoint.to_string())
@@ -470,11 +472,11 @@ pub(crate) async fn local_disk_for_endpoint(endpoint: &Endpoint) -> Option<DiskS
 }
 
 pub(crate) async fn local_disk_paths() -> Vec<String> {
-    GLOBAL_LOCAL_DISK_MAP.read().await.keys().cloned().collect()
+    local_disk_map_handle().read().await.keys().cloned().collect()
 }
 
 pub(crate) async fn local_disks() -> Vec<DiskStore> {
-    GLOBAL_LOCAL_DISK_MAP
+    local_disk_map_handle()
         .read()
         .await
         .values()
@@ -483,11 +485,12 @@ pub(crate) async fn local_disks() -> Vec<DiskStore> {
 }
 
 pub(crate) async fn local_disk_entries() -> Vec<Option<DiskStore>> {
-    GLOBAL_LOCAL_DISK_MAP.read().await.values().cloned().collect()
+    local_disk_map_handle().read().await.values().cloned().collect()
 }
 
 pub(crate) async fn initialize_local_disk_maps(endpoint_pools: EndpointServerPools, opt: &DiskOption) -> Result<()> {
-    let mut global_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.write().await;
+    let set_drives = local_disk_set_drives_handle();
+    let mut global_set_drives = set_drives.write().await;
     for pool_eps in endpoint_pools.as_ref().iter() {
         let mut set_count_drives = Vec::with_capacity(pool_eps.set_count);
         for _ in 0..pool_eps.set_count {
@@ -497,7 +500,8 @@ pub(crate) async fn initialize_local_disk_maps(endpoint_pools: EndpointServerPoo
         global_set_drives.push(set_count_drives);
     }
 
-    let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
+    let map = local_disk_map_handle();
+    let mut global_local_disk_map = map.write().await;
 
     for pool_eps in endpoint_pools.as_ref().iter() {
         for ep in pool_eps.endpoints.as_ref().iter() {

@@ -39,14 +39,17 @@
 //! startup writes and post-construction reads hit the same cell and
 //! single-instance behavior is byte-for-byte unchanged.
 
+use super::global::TypeLocalDiskSetDrives;
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState};
 use crate::bucket::replication::{DynReplicationPool, ReplicationStats};
+use crate::disk::DiskStore;
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OnceCell, RwLock};
 use uuid::Uuid;
@@ -125,6 +128,16 @@ pub struct InstanceContext {
     /// Async set-once, built with the live storage during init. Replaces the
     /// process-global static.
     replication_pool: OnceCell<Arc<DynReplicationPool>>,
+    /// This instance's local disk registry (Phase 5 Slice 12, backlog#939).
+    ///
+    /// Populated during storage startup (before the `ECStore` exists) via the
+    /// bootstrap context that the store then adopts, so startup writes and later
+    /// reads share one registry. Replaces the three `GLOBAL_LOCAL_DISK_*`
+    /// statics: the path→disk map, the disk-id→endpoint map, and the
+    /// pool/set/drive layout.
+    local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+    local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
+    local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
 }
 
 impl InstanceContext {
@@ -154,6 +167,9 @@ impl InstanceContext {
             bucket_monitor: OnceLock::new(),
             replication_stats: OnceCell::new(),
             replication_pool: OnceCell::new(),
+            local_disk_map: Arc::new(RwLock::new(HashMap::new())),
+            local_disk_id_map: Arc::new(RwLock::new(HashMap::new())),
+            local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -268,6 +284,21 @@ impl InstanceContext {
     /// owner to `get_or_init`. Exposed to the replication module only.
     pub(crate) fn replication_pool_cell(&self) -> &OnceCell<Arc<DynReplicationPool>> {
         &self.replication_pool
+    }
+
+    /// Handle to this instance's local path→disk map.
+    pub(crate) fn local_disk_map(&self) -> Arc<RwLock<HashMap<String, Option<DiskStore>>>> {
+        self.local_disk_map.clone()
+    }
+
+    /// Handle to this instance's local disk-id→endpoint map.
+    pub(crate) fn local_disk_id_map(&self) -> Arc<RwLock<HashMap<Uuid, String>>> {
+        self.local_disk_id_map.clone()
+    }
+
+    /// Handle to this instance's local pool/set/drive layout.
+    pub(crate) fn local_disk_set_drives(&self) -> Arc<RwLock<TypeLocalDiskSetDrives>> {
+        self.local_disk_set_drives.clone()
     }
 
     /// Update this instance's erasure setup type.
