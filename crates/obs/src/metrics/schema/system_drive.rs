@@ -31,7 +31,7 @@ pub const DRIVE_INDEX_LABEL: &str = "drive_index";
 pub const API_LABEL: &str = "api";
 
 /// All drive-related labels
-pub const ALL_DRIVE_LABELS: [&str; 4] = [DRIVE_LABEL, POOL_INDEX_LABEL, SET_INDEX_LABEL, DRIVE_INDEX_LABEL];
+pub const ALL_DRIVE_LABELS: [&str; 2] = [SERVER_LABEL, DRIVE_LABEL];
 
 pub static DRIVE_USED_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
@@ -145,7 +145,7 @@ pub static DRIVE_API_LATENCY_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::DriveAPILatencyMicros,
         "Average last minute latency in µs for drive API storage operations",
-        &[&ALL_DRIVE_LABELS[..], &[API_LABEL]].concat(),
+        &ALL_DRIVE_LABELS[..],
         subsystems::SYSTEM_DRIVE,
     )
 });

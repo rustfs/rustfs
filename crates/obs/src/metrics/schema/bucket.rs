@@ -14,13 +14,13 @@
 
 #![allow(dead_code)]
 
-use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, new_histogram_md, subsystems};
+use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
 
 pub static BUCKET_API_TRAFFIC_SENT_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ApiTrafficSentBytes,
-        "Total number of bytes received for a bucket",
+        "Total number of bytes sent for a bucket",
         &["bucket", "type"],
         subsystems::BUCKET_API,
     )
@@ -29,7 +29,7 @@ pub static BUCKET_API_TRAFFIC_SENT_BYTES_MD: LazyLock<MetricDescriptor> = LazyLo
 pub static BUCKET_API_TRAFFIC_RECV_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ApiTrafficRecvBytes,
-        "Total number of bytes sent for a bucket",
+        "Total number of bytes received for a bucket",
         &["bucket", "type"],
         subsystems::BUCKET_API,
     )
@@ -81,10 +81,31 @@ pub static BUCKET_API_REQUESTS_5XX_ERRORS_MD: LazyLock<MetricDescriptor> = LazyL
 });
 
 pub static BUCKET_API_REQUESTS_TTFB_SECONDS_DISTRIBUTION_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
-    new_histogram_md(
+    new_counter_md(
         MetricName::ApiRequestsTTFBSecondsDistribution,
         "Distribution of time to first byte across API calls for a bucket",
-        &["bucket", "name", "le", "type"],
+        &["bucket", "name", "type", "le"],
         subsystems::BUCKET_API,
     )
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MetricType;
+
+    #[test]
+    fn bucket_traffic_help_matches_direction() {
+        assert_eq!(BUCKET_API_TRAFFIC_SENT_BYTES_MD.help, "Total number of bytes sent for a bucket");
+        assert_eq!(BUCKET_API_TRAFFIC_RECV_BYTES_MD.help, "Total number of bytes received for a bucket");
+    }
+
+    #[test]
+    fn bucket_ttfb_distribution_uses_counter_bucket_contract() {
+        assert_eq!(BUCKET_API_REQUESTS_TTFB_SECONDS_DISTRIBUTION_MD.metric_type, MetricType::Counter);
+        assert_eq!(
+            BUCKET_API_REQUESTS_TTFB_SECONDS_DISTRIBUTION_MD.variable_labels,
+            vec!["bucket".to_string(), "name".to_string(), "type".to_string(), "le".to_string(),]
+        );
+    }
+}
