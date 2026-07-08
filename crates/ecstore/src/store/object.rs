@@ -1971,6 +1971,26 @@ mod tests {
         }
     }
 
+    // Phase 5 Slice 2 (backlog#939): the instance context flows down the whole
+    // object graph — ECStore, its Sets, and their SetDisks must all carry the
+    // same `Arc<InstanceContext>` in a single-instance deployment.
+    #[tokio::test]
+    async fn instance_context_flows_through_object_graph() {
+        let store = new_read_lock_test_store().await;
+
+        let sets = store.pools.first().expect("test store has one pool");
+        assert!(
+            std::sync::Arc::ptr_eq(&store.ctx, sets.instance_ctx()),
+            "Sets must carry the store's instance context"
+        );
+
+        let set_disks = sets.disk_set.first().expect("pool has one set");
+        assert!(
+            std::sync::Arc::ptr_eq(sets.instance_ctx(), set_disks.instance_ctx()),
+            "SetDisks must carry the Sets' instance context"
+        );
+    }
+
     #[tokio::test]
     async fn acquired_read_lock_marks_metadata_cache_safe_for_set_layer() {
         let store = new_read_lock_test_store().await;

@@ -33,6 +33,7 @@ use crate::{
     error::StorageError,
     layout::endpoints::{Endpoints, PoolEndpoints},
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    runtime::instance::{InstanceContext, bootstrap_ctx},
     runtime::sources as runtime_sources,
     set_disk::SetDisks,
     store::init_format::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
@@ -77,6 +78,12 @@ pub struct Sets {
     pub default_parity_count: usize,
     pub distribution_algo: DistributionAlgoVersion,
     exit_signal: Option<Sender<()>>,
+    /// Per-instance runtime context (Phase 5, backlog#939).
+    ///
+    /// Carried down the object graph (ECStore → Sets → SetDisks) so that
+    /// instance-scoped state resolves through the owning instance rather than a
+    /// process global. Consumed starting Slice 3 (lock-namespace isolation).
+    ctx: Arc<InstanceContext>,
 }
 
 impl Drop for Sets {
@@ -186,6 +193,10 @@ impl Sets {
             default_parity_count: parity_count,
             distribution_algo: fm.erasure.distribution_algo.clone(),
             exit_signal: Some(tx),
+            // Single-instance: same bootstrap context the owning ECStore adopts
+            // (constructed before the store, so sourced here directly). Slice 8
+            // threads a per-instance context in for true multi-instance.
+            ctx: bootstrap_ctx(),
         });
 
         let asets = sets.clone();
@@ -198,6 +209,12 @@ impl Sets {
 
     pub fn set_drive_count(&self) -> usize {
         self.set_drive_count
+    }
+
+    /// This pool's per-instance runtime context (Phase 5, backlog#939).
+    #[allow(dead_code)] // Consumed starting Slice 3 (lock-namespace isolation).
+    pub(crate) fn instance_ctx(&self) -> &Arc<InstanceContext> {
+        &self.ctx
     }
 
     pub async fn monitor_and_connect_endpoints(&self, mut rx: Receiver<()>) {
@@ -1165,6 +1182,7 @@ mod tests {
             default_parity_count: 1,
             distribution_algo: DistributionAlgoVersion::V1,
             exit_signal: None,
+            ctx: bootstrap_ctx(),
         };
 
         let result = sets
@@ -1244,6 +1262,7 @@ mod tests {
             default_parity_count: 1,
             distribution_algo: DistributionAlgoVersion::V1,
             exit_signal: None,
+            ctx: bootstrap_ctx(),
         });
 
         let bucket = format!("bucket-{}", Uuid::new_v4().simple());
@@ -1290,6 +1309,7 @@ mod tests {
             default_parity_count: 0,
             distribution_algo: DistributionAlgoVersion::V1,
             exit_signal: None,
+            ctx: bootstrap_ctx(),
         };
 
         let err = sets
