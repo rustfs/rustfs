@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use wildmatch::WildMatch;
-
 /// Create new pattern string based on prefix and suffix。
 ///
 /// The rule is similar to event.NewPattern in the Go version:
@@ -71,7 +69,54 @@ pub fn match_simple(pattern_str: &str, object_name: &str) -> bool {
         return false; // Or true if an empty pattern means "match all" in some contexts.
         // Given Go's NewRulesMap defaults to "*", an empty pattern from Filter is unlikely to mean "match all".
     }
-    WildMatch::new(pattern_str).matches(object_name)
+    glob_match_star_only(pattern_str, object_name)
+}
+
+/// Matches `object_name` against a glob `pattern` using **S3 filter semantics**:
+/// only `*` is a wildcard (matching any run of characters, including none), and
+/// every other character — crucially including `?` — is matched literally.
+///
+/// S3 event notification prefix/suffix filters treat `*` as the only wildcard;
+/// AWS does not assign any special meaning to `?`. Earlier this matcher delegated
+/// to `wildmatch`, which interprets `?` as a single-character wildcard, so a
+/// literal `?` in a prefix/suffix filter (or object key) would over-match and
+/// misroute events (backlog#979). This hand-rolled matcher keeps `?` literal.
+fn glob_match_star_only(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+
+    let mut p = 0usize; // cursor into `pattern`
+    let mut t = 0usize; // cursor into `text`
+    // Backtracking state: the last `*` we saw and where in `text` we matched it.
+    let mut star_at: Option<usize> = None;
+    let mut star_match_t = 0usize;
+
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            // Record the star and tentatively let it consume nothing.
+            star_at = Some(p);
+            star_match_t = t;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            // Literal match (any non-`*` char, including `?`).
+            p += 1;
+            t += 1;
+        } else if let Some(star_p) = star_at {
+            // Mismatch: let the previous `*` absorb one more character and retry.
+            p = star_p + 1;
+            star_match_t += 1;
+            t = star_match_t;
+        } else {
+            return false;
+        }
+    }
+
+    // Consume any trailing `*` in the pattern.
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+
+    p == pattern.len()
 }
 
 #[cfg(test)]
@@ -107,5 +152,32 @@ mod tests {
         assert!(match_simple("a*b*c", "axbyc"));
         assert!(match_simple("a*b*c", "abc"));
         assert!(match_simple("a*b*c", "axbc"));
+    }
+
+    /// Regression test for backlog#979 (c): S3 filter semantics treat `*` as the
+    /// only wildcard. `?` must be matched literally, not as a single-character
+    /// wildcard (which is how the previous `wildmatch`-based matcher behaved).
+    #[test]
+    fn question_mark_is_literal_not_single_char_wildcard() {
+        // `?` is a literal: it only matches a literal `?`, never an arbitrary char.
+        assert!(!match_simple("a?c", "abc"));
+        assert!(match_simple("a?c", "a?c"));
+
+        // Prefix-derived pattern containing a literal `?`.
+        let prefix_pattern = new_pattern(Some("foo?"), None);
+        assert_eq!(prefix_pattern, "foo?*");
+        assert!(!match_simple(&prefix_pattern, "fooX/bar")); // `?` must not match `X`
+        assert!(match_simple(&prefix_pattern, "foo?bar")); // literal `?` matches
+        assert!(!match_simple(&prefix_pattern, "foobar")); // `?` is required literally
+
+        // Suffix-derived pattern containing a literal `?`.
+        let suffix_pattern = new_pattern(None, Some("?.log"));
+        assert_eq!(suffix_pattern, "*?.log");
+        assert!(match_simple(&suffix_pattern, "app?.log"));
+        assert!(!match_simple(&suffix_pattern, "appX.log"));
+
+        // `*` continues to work as a multi-character wildcard alongside literal `?`.
+        assert!(match_simple("a?*c", "a?bbbc"));
+        assert!(!match_simple("a?*c", "aXbbbc"));
     }
 }

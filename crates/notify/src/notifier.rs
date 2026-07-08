@@ -206,9 +206,18 @@ impl EventNotifier {
                             "Failed to dispatch notify event"
                         );
                     } else {
-                        if is_deferred {
-                            metrics.decrement_processing();
-                        } else {
+                        // Counting lifecycle (backlog#979): `increment_processing` above marks
+                        // the event as in-flight exactly once. For a non-deferred target, `save`
+                        // performs synchronous delivery, so the event is fully processed here and
+                        // we transition it from processing to processed. For a deferred
+                        // (store-backed) target, `save` only enqueues the event to the store: it
+                        // stays in-flight until the replay worker actually delivers it and emits
+                        // `ReplayEvent::Delivered`, which is the single place that calls
+                        // `increment_processed` for that event. Decrementing `processing_events`
+                        // here as well would double-count the completion and underflow the
+                        // counter back to `usize::MAX`, corrupting metrics and any in-flight
+                        // backpressure decisions.
+                        if !is_deferred {
                             metrics.increment_processed();
                         }
                         debug!(
@@ -417,7 +426,7 @@ mod tests {
     use rustfs_targets::StoreError;
     use rustfs_targets::{
         TargetError,
-        store::{Key, Store},
+        store::{Key, QueueStore, Store},
         target::{EntityTarget, QueuedPayload, QueuedPayloadMeta},
     };
     use std::sync::{
@@ -608,5 +617,114 @@ mod tests {
             .await;
 
         assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A store-backed (deferred) target. `save` only enqueues to the store, so
+    /// the actual delivery happens later in the replay worker.
+    #[derive(Clone)]
+    struct DeferredTestTarget {
+        id: TargetID,
+        save_calls: Arc<AtomicUsize>,
+        store: QueueStore<QueuedPayload>,
+    }
+
+    impl DeferredTestTarget {
+        fn new(id: &str, name: &str) -> Self {
+            Self {
+                id: TargetID::new(id.to_string(), name.to_string()),
+                save_calls: Arc::new(AtomicUsize::new(0)),
+                // The store is never actually written to here: `save` below only bumps a
+                // counter. It just has to exist so the notifier treats this target as
+                // store-backed (deferred delivery), exercising the deferred counting path.
+                store: QueueStore::new(std::env::temp_dir().join("rustfs-notify-979-noop-store"), 0, ""),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<E> Target<E> for DeferredTestTarget
+    where
+        E: rustfs_targets::PluginEvent,
+    {
+        fn id(&self) -> TargetID {
+            self.id.clone()
+        }
+
+        async fn is_active(&self) -> Result<bool, TargetError> {
+            Ok(true)
+        }
+
+        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+            self.save_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
+            Some(&self.store)
+        }
+
+        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
+            Box::new(self.clone())
+        }
+
+        async fn init(&self) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression test for backlog#979 (a): dispatching to a store-backed
+    /// (deferred) target must count the event as in-flight exactly once and must
+    /// not decrement `processing_events` at enqueue time. The replay worker is the
+    /// single owner of the completion decrement (`increment_processed`); an extra
+    /// decrement here previously double-counted and underflowed the counter back
+    /// to `usize::MAX`.
+    #[tokio::test]
+    async fn deferred_target_dispatch_does_not_underflow_processing_counter() {
+        let metrics = Arc::new(NotificationMetrics::new());
+        let rule_engine = NotifyRuleEngine::new();
+        let notifier = EventNotifier::new(metrics.clone(), rule_engine.clone());
+
+        let target = DeferredTestTarget::new("deferred-target", "webhook");
+        let mut rules_map = RulesMap::new();
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rule_engine.set_bucket_rules("bucket", rules_map).await;
+        notifier.target_list().write().await.add(Arc::new(target.clone())).unwrap();
+
+        // Dispatch enqueues to the store; the event stays in-flight (processing == 1).
+        notifier
+            .send(Arc::new(Event::new_test_event("bucket", "object", EventName::ObjectCreatedPut)))
+            .await;
+
+        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            metrics.processing_count(),
+            1,
+            "a queued deferred event must remain counted as in-flight after enqueue"
+        );
+        assert_eq!(metrics.processed_count(), 0);
+
+        // Simulate the replay worker delivering the queued event (runtime_facade
+        // maps `ReplayEvent::Delivered` to `increment_processed`).
+        metrics.increment_processed();
+
+        assert_eq!(
+            metrics.processing_count(),
+            0,
+            "processing counter must return to zero, not underflow to usize::MAX"
+        );
+        assert_ne!(metrics.processing_count(), usize::MAX);
+        assert_eq!(metrics.processed_count(), 1);
     }
 }
