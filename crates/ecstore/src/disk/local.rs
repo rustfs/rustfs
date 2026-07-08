@@ -4977,28 +4977,40 @@ impl DiskAPI for LocalDisk {
             } else {
                 SyncMode::None
             };
-            self.write_all_private(
-                src_volume,
-                &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE),
-                new_dst_buf.into(),
-                tmp_meta_sync,
-                src_file_parent,
-            )
-            .await?;
-
-            // Make shard files durable before the commit rename: once rename_data
-            // succeeds the write is acknowledged, so data must not live only in the
-            // page cache. Multipart parts were already synced during rename_part, so
-            // their fdatasync here is a cheap no-op. A missing source dir is left for
-            // the rename below to report through the existing rollback path.
-            // Payload durability: kept by both strict and relaxed.
-            if durability.syncs_data_shards()
-                && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
-                && let Err(err) = os::sync_dir_files(src_data_path).await
-                && err.kind() != ErrorKind::NotFound
-            {
-                return Err(to_file_error(err).into());
-            }
+            // The tmp xl.meta write and the shard-file fdatasync are independent
+            // (disjoint paths) and both only need to be durable before the commit
+            // renames below, so run them concurrently to drop a blocking
+            // round-trip from the PUT commit critical path (rustfs/backlog#922
+            // step 2). The "contents durable -> rename -> dst dir fsync" ordering
+            // is unchanged — both futures complete before any rename — which the
+            // rename_data crash-consistency harness (backlog#935) exercises.
+            //
+            // Shard durability: once rename_data succeeds the write is
+            // acknowledged, so data must not live only in the page cache.
+            // Multipart parts were already synced during rename_part, so their
+            // fdatasync here is a cheap no-op. A missing source dir is left for the
+            // rename below to report through the existing rollback path. Payload
+            // durability is kept by both strict and relaxed.
+            // Bound to a local so the borrow lives across the join! below.
+            let tmp_meta_rel_path = format!("{}/{}", &src_path, STORAGE_FORMAT_FILE);
+            let tmp_meta_write =
+                self.write_all_private(src_volume, &tmp_meta_rel_path, new_dst_buf.into(), tmp_meta_sync, src_file_parent);
+            let shard_sync = async {
+                if durability.syncs_data_shards()
+                    && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
+                    && let Err(err) = os::sync_dir_files(src_data_path).await
+                    && err.kind() != ErrorKind::NotFound
+                {
+                    return Err::<(), DiskError>(to_file_error(err).into());
+                }
+                Ok(())
+            };
+            let (tmp_meta_res, shard_sync_res) = tokio::join!(tmp_meta_write, shard_sync);
+            // Surface a tmp-meta failure first (its prior serial position), then a
+            // shard-sync failure; either aborts before any rename, exactly as the
+            // sequential version did.
+            tmp_meta_res?;
+            shard_sync_res?;
 
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
                 && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await
