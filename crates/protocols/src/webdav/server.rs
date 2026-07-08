@@ -32,6 +32,7 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::TlsAcceptor;
@@ -441,7 +442,15 @@ where
             WebDavInitError::Server("User not found".to_string())
         })?;
 
-        if !identity.credentials.secret_key.eq(&s3_creds.secret_key) {
+        // Constant-time secret comparison to prevent timing side-channel
+        // attacks. Same primitive used by the SFTP handler and rustfs/src/auth.rs.
+        let secret_matches: bool = identity
+            .credentials
+            .secret_key
+            .as_bytes()
+            .ct_eq(s3_creds.secret_key.as_bytes())
+            .into();
+        if !secret_matches {
             warn!(
                 event = EVENT_WEBDAV_AUTH_STATE,
                 component = LOG_COMPONENT_PROTOCOLS,
