@@ -254,6 +254,13 @@ impl ObjectLockDiagGuard {
             acquired_at: Instant::now(),
         }
     }
+
+    /// Whether the underlying namespace lock's heartbeat has observed a
+    /// refresh-quorum loss (backlog#899 Phase 2). Callers fence their commit
+    /// point on this so a stale lock holder does not race a double-write.
+    fn is_lock_lost(&self) -> bool {
+        self.guard.is_lock_lost()
+    }
 }
 
 impl Drop for ObjectLockDiagGuard {
