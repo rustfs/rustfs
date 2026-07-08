@@ -28,6 +28,7 @@ fn create_test_auth_provider() -> Arc<KeystoneAuthProvider> {
         Some("admin".to_string()),
         "Default".to_string(),
         false, // Don't verify SSL for tests
+        std::time::Duration::from_secs(30),
     );
 
     Arc::new(KeystoneAuthProvider::new(client, 1000, std::time::Duration::from_secs(300), true))
@@ -256,6 +257,7 @@ fn test_auth_provider_configuration() {
         Some("test-project".to_string()),
         "TestDomain".to_string(),
         true,
+        std::time::Duration::from_secs(30),
     );
 
     // Test with caching enabled

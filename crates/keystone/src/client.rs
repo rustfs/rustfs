@@ -33,6 +33,8 @@ pub struct KeystoneClient {
     admin_domain: String,
     #[allow(dead_code)]
     verify_ssl: bool,
+    /// Request timeout applied to the underlying HTTP client.
+    timeout: std::time::Duration,
 }
 
 #[derive(Clone)]
@@ -49,6 +51,7 @@ impl AdminToken {
 
 impl KeystoneClient {
     /// Create new Keystone client
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth_url: String,
         version: KeystoneVersion,
@@ -57,6 +60,7 @@ impl KeystoneClient {
         admin_project: Option<String>,
         admin_domain: String,
         verify_ssl: bool,
+        timeout: std::time::Duration,
     ) -> Self {
         if !verify_ssl {
             warn!(
@@ -67,7 +71,7 @@ impl KeystoneClient {
 
         let client = Client::builder()
             .danger_accept_invalid_certs(!verify_ssl)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(timeout)
             .build()
             .unwrap();
 
@@ -81,7 +85,13 @@ impl KeystoneClient {
             admin_project,
             admin_domain,
             verify_ssl,
+            timeout,
         }
+    }
+
+    /// Request timeout applied to the underlying HTTP client.
+    pub fn timeout(&self) -> std::time::Duration {
+        self.timeout
     }
 
     /// Validate a Keystone token
@@ -209,53 +219,22 @@ impl KeystoneClient {
     }
 
     /// Validate EC2 credentials
+    ///
+    /// This path is intentionally not implemented and fails closed. A correct
+    /// implementation must derive the identity (user, project, roles, expiry)
+    /// from the Keystone `/v3/ec2tokens` response, not from client-supplied
+    /// input. The previous implementation discarded the response body and
+    /// fabricated an identity by splitting the client access key on `:`, which
+    /// let a caller shape their own user_id/project_id. Until the response
+    /// schema is modeled against a live server, refuse to produce credentials.
     pub async fn validate_ec2_credentials(
         &self,
-        access_key: &str,
-        signature: &str,
-        string_to_sign: &str,
+        _access_key: &str,
+        _signature: &str,
+        _string_to_sign: &str,
     ) -> Result<EC2Credential> {
-        let url = format!("{}/v3/ec2tokens", self.auth_url);
-
-        debug!("Validating EC2 credentials: access_key={}", access_key);
-
-        let payload = json!({
-            "auth": {
-                "identity": {
-                    "methods": ["ec2"],
-                    "ec2": {
-                        "access": access_key,
-                        "signature": signature,
-                        "data": string_to_sign
-                    }
-                }
-            }
-        });
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| KeystoneError::HttpError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(KeystoneError::InvalidCredentials);
-        }
-
-        let _body: serde_json::Value = response.json().await.map_err(|e| KeystoneError::ParseError(e.to_string()))?;
-
-        // Parse access key to extract user_id and project_id
-        let (user_id, project_id) = EC2Credential::parse_access_key(access_key).unwrap_or_else(|| (access_key.to_string(), None));
-
-        Ok(EC2Credential {
-            access: access_key.to_string(),
-            secret: String::new(), // Secret not returned in validation
-            user_id,
-            project_id,
-            trust_id: None,
-        })
+        warn!("EC2/SigV4 credential authentication is not supported; refusing to fabricate identity from client input");
+        Err(KeystoneError::Ec2AuthUnsupported)
     }
 
     /// Get EC2 credentials for a user
@@ -436,6 +415,7 @@ mod tests {
             Some("admin".to_string()),
             "Default".to_string(),
             true,
+            std::time::Duration::from_secs(30),
         );
 
         assert_eq!(client.auth_url, "http://keystone:5000");

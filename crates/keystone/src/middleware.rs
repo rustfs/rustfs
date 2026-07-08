@@ -242,6 +242,7 @@ mod tests {
             None,
             "Default".to_string(),
             true,
+            Duration::from_secs(30),
         );
         let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
         let layer = KeystoneAuthLayer::new(Some(Arc::new(provider)));

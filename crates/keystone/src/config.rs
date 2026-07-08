@@ -268,6 +268,22 @@ mod tests {
                 assert!(!config.enable_tenant_prefix);
                 assert!(!config.implicit_tenants);
                 assert_eq!(config.timeout_seconds, 99);
+
+                // The configured timeout must actually be forwarded to the
+                // client, not silently dropped in favour of a hardcoded value.
+                assert_eq!(config.get_timeout(), Duration::from_secs(99));
+
+                let client = crate::KeystoneClient::new(
+                    config.auth_url.clone(),
+                    KeystoneVersion::V3,
+                    config.admin_user.clone(),
+                    config.admin_password.clone(),
+                    config.admin_project.clone(),
+                    config.get_admin_domain(),
+                    config.verify_ssl,
+                    config.get_timeout(),
+                );
+                assert_eq!(client.timeout(), Duration::from_secs(99));
             },
         );
     }

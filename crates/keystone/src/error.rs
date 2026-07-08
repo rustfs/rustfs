@@ -51,6 +51,13 @@ pub enum KeystoneError {
     #[error("Unsupported Keystone version")]
     UnsupportedVersion,
 
+    /// EC2/SigV4 credential authentication is not supported
+    ///
+    /// The EC2 path deliberately fails closed rather than fabricating an
+    /// identity from client-supplied input.
+    #[error("EC2 credential authentication is not supported")]
+    Ec2AuthUnsupported,
+
     /// Project not found
     #[error("Project not found")]
     ProjectNotFound,
