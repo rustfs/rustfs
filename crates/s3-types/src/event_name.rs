@@ -185,7 +185,9 @@ impl EventName {
             "s3:Scanner:ManyVersions" => Ok(EventName::ScannerManyVersions),
             "s3:Scanner:LargeVersions" => Ok(EventName::ScannerLargeVersions),
             "s3:Scanner:BigPrefix" => Ok(EventName::ScannerBigPrefix),
-            // ObjectScannerAll and Everything cannot be parsed from strings, because the Go version also does not define their string representation.
+            "s3:Scanner:*" => Ok(EventName::ObjectScannerAll),
+            // `Everything` has no string representation (`as_str` yields ""), so it
+            // cannot be parsed back from a string. Every other variant round-trips.
             _ => Err(ParseEventNameError(s.to_string())),
         }
     }
@@ -244,9 +246,8 @@ impl EventName {
             EventName::ScannerManyVersions => "s3:Scanner:ManyVersions",
             EventName::ScannerLargeVersions => "s3:Scanner:LargeVersions",
             EventName::ScannerBigPrefix => "s3:Scanner:BigPrefix",
-            // Go's String() returns "" for ObjectScannerAll and Everything
-            EventName::ObjectScannerAll => "s3:Scanner:*", // Follow the pattern in Go Expand
-            EventName::Everything => "",                   // Go String() returns "" to unprocessed
+            EventName::ObjectScannerAll => "s3:Scanner:*", // round-trips via `parse`
+            EventName::Everything => "",                   // no string form; cannot be parsed back
             EventName::ObjectRemovedAbortMultipartUpload => "s3:ObjectRemoved:AbortMultipartUpload",
             EventName::ObjectCreatedCreateMultipartUpload => "s3:ObjectCreated:CreateMultipartUpload",
             EventName::ObjectRemovedDeleteObjects => "s3:ObjectRemoved:DeleteObjects",
@@ -333,6 +334,24 @@ impl EventName {
             mask |= n.mask();
         }
         mask
+    }
+
+    /// Returns `true` for every object-removal event variant.
+    ///
+    /// Covers all `ObjectRemoved*` leaf events, including the internal
+    /// (metrics-only) ones, so callers can categorize removals without
+    /// enumerating each variant by hand.
+    #[inline]
+    pub fn is_removed(&self) -> bool {
+        matches!(
+            self,
+            EventName::ObjectRemovedDelete
+                | EventName::ObjectRemovedDeleteMarkerCreated
+                | EventName::ObjectRemovedDeleteAllVersions
+                | EventName::ObjectRemovedNoOP
+                | EventName::ObjectRemovedAbortMultipartUpload
+                | EventName::ObjectRemovedDeleteObjects
+        )
     }
 }
 
@@ -578,6 +597,75 @@ mod tests {
             assert_eq!(seen & m, 0, "internal event {ev} mask overlaps another internal event");
             assert_eq!(everything & m, 0, "internal event {ev} mask collides with a single-type bit");
             seen |= m;
+        }
+    }
+
+    /// Every S3-notification variant must round-trip through `as_str` ->
+    /// `parse`. Regression for the missing `ObjectScannerAll` parse arm
+    /// ("s3:Scanner:*").
+    ///
+    /// Two groups are deliberately excluded:
+    /// - `Everything` has no string form (`as_str` yields "").
+    /// - The internal metrics-only events are not exposed to S3 notifications
+    ///   and intentionally have no `parse` arm.
+    #[test]
+    fn test_as_str_parse_round_trip_for_notification_variants() {
+        // Internal, metrics-only events: serialized but never parsed back.
+        let internal = [
+            EventName::ObjectRemovedAbortMultipartUpload,
+            EventName::ObjectCreatedCreateMultipartUpload,
+            EventName::ObjectRemovedDeleteObjects,
+        ];
+
+        for ev in ALL_EVENT_NAMES {
+            if *ev == EventName::Everything {
+                // `Everything` intentionally serializes to "" and cannot be parsed back.
+                assert_eq!(ev.as_str(), "");
+                assert!(EventName::parse(ev.as_str()).is_err());
+                continue;
+            }
+            if internal.contains(ev) {
+                continue;
+            }
+            let parsed = EventName::parse(ev.as_str());
+            assert_eq!(parsed.as_ref(), Ok(ev), "round-trip failed for {ev} (as_str = {:?})", ev.as_str());
+        }
+    }
+
+    /// `ObjectScannerAll` specifically must round-trip via "s3:Scanner:*".
+    #[test]
+    fn test_object_scanner_all_round_trips() {
+        assert_eq!(EventName::ObjectScannerAll.as_str(), "s3:Scanner:*");
+        assert_eq!(EventName::parse("s3:Scanner:*").unwrap(), EventName::ObjectScannerAll);
+    }
+
+    /// `is_removed` must be true for every `ObjectRemoved*` variant and false
+    /// for everything else.
+    #[test]
+    fn test_is_removed_covers_all_object_removed_variants() {
+        let removed = [
+            EventName::ObjectRemovedDelete,
+            EventName::ObjectRemovedDeleteMarkerCreated,
+            EventName::ObjectRemovedDeleteAllVersions,
+            EventName::ObjectRemovedNoOP,
+            EventName::ObjectRemovedAbortMultipartUpload,
+            EventName::ObjectRemovedDeleteObjects,
+        ];
+        for ev in removed {
+            assert!(ev.is_removed(), "{ev} should be classified as a removal event");
+        }
+
+        let not_removed = [
+            EventName::ObjectCreatedPut,
+            EventName::ObjectCreatedPost,
+            EventName::ObjectCreatedAll,
+            EventName::ObjectTaggingPut,
+            EventName::ObjectTaggingDelete,
+            EventName::ObjectAclPut,
+            EventName::ObjectAccessedGet,
+        ];
+        for ev in not_removed {
+            assert!(!ev.is_removed(), "{ev} should not be classified as a removal event");
         }
     }
 
