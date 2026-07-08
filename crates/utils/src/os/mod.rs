@@ -125,12 +125,17 @@ mod tests {
         // Test passes if the function doesn't panic - the actual result depends on test environment
     }
 
-    #[ignore] // FIXME: failed in github actions
     #[test]
-    fn test_get_drive_stats_default() {
+    fn test_get_drive_stats_missing_device_or_default() {
+        #[cfg(target_os = "linux")]
+        {
+            let err = get_drive_stats(0, 0).expect_err("linux block device 0:0 should not exist");
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        }
+
         #[cfg(not(target_os = "linux"))]
         {
-            let stats = get_drive_stats(0, 0).unwrap();
+            let stats = get_drive_stats(0, 0).expect("non-linux drive stats fallback should return defaults");
             assert_eq!(stats, IOStats::default());
         }
     }
