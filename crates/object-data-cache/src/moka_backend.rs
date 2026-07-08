@@ -16,19 +16,19 @@ use crate::cache::{ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectData
 use crate::config::ObjectDataCacheConfig;
 use crate::entry::ObjectDataCacheEntry;
 use crate::index::{ObjectDataCacheIdentityIndex, ObjectDataCacheIndexInsertResult};
-use crate::key::ObjectDataCacheIdentity;
+use crate::key::{ObjectDataCacheIdentity, ObjectDataCacheKey};
 use crate::memory::ObjectDataCacheMemoryGate;
 use crate::singleflight::{ObjectDataCacheSingleflight, ObjectDataCacheSingleflightAcquire};
 use crate::stats::ObjectDataCacheStats;
 use bytes::Bytes;
-use moka::future::Cache;
+use moka::future::{Cache, FutureExt};
 use std::sync::Arc;
 
 /// Weighted Moka backend for reusable object bodies.
 #[derive(Debug)]
 pub struct MokaBackend {
-    cache: Cache<crate::key::ObjectDataCacheKey, Arc<ObjectDataCacheEntry>>,
-    index: ObjectDataCacheIdentityIndex,
+    cache: Cache<ObjectDataCacheKey, Arc<ObjectDataCacheEntry>>,
+    index: Arc<ObjectDataCacheIdentityIndex>,
     singleflight: ObjectDataCacheSingleflight,
     memory_gate: ObjectDataCacheMemoryGate,
 }
@@ -42,16 +42,43 @@ impl MokaBackend {
         let max_capacity = config.resolved_max_bytes()?;
         let ttl = config.ttl;
         let time_to_idle = config.time_to_idle;
+
+        // The identity index tracks the keys cached per object so that
+        // invalidation can find them without a full-cache scan. Moka evicts
+        // entries on its own (TTL, time-to-idle, capacity-LRU) without going
+        // through `invalidate_object`, so without a listener those evicted keys
+        // would linger in the index forever and leak memory. Hold only a `Weak`
+        // reference in the listener to avoid an Arc cycle keeping the index (and
+        // thus the cache) alive.
+        let index = Arc::new(ObjectDataCacheIdentityIndex::new(usize::from(config.identity_keys_max)));
+        let index_for_eviction = Arc::downgrade(&index);
+
         let cache = Cache::builder()
             .max_capacity(max_capacity)
             .weigher(|key, value: &Arc<ObjectDataCacheEntry>| value.estimated_weight(key))
             .time_to_live(ttl)
             .time_to_idle(time_to_idle)
+            .async_eviction_listener(move |key, _value, cause| {
+                let index_for_eviction = index_for_eviction.clone();
+                async move {
+                    // Explicit removals and replacements are already reconciled
+                    // with the index by the caller; only true evictions leak.
+                    if !cause.was_evicted() {
+                        return;
+                    }
+                    let Some(index) = index_for_eviction.upgrade() else {
+                        return;
+                    };
+                    let identity = ObjectDataCacheIdentity::new(Arc::clone(&key.bucket), Arc::clone(&key.object));
+                    index.remove_key(&identity, &key).await;
+                }
+                .boxed()
+            })
             .build();
 
         Ok(Self {
             cache,
-            index: ObjectDataCacheIdentityIndex::new(usize::from(config.identity_keys_max)),
+            index,
             singleflight: ObjectDataCacheSingleflight::new(Arc::clone(&stats)),
             memory_gate: ObjectDataCacheMemoryGate::new(config, stats),
         })
@@ -226,6 +253,31 @@ mod tests {
         let lookup = backend.lookup_body(&plan).await;
 
         assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
+    }
+
+    #[tokio::test]
+    async fn moka_backend_eviction_prunes_identity_index() {
+        let backend =
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+
+        // Cache several distinct identities under the short TTL from the config.
+        for i in 0..8 {
+            let plan = cacheable_plan(&format!("object-{i}"), "etag-a");
+            let _ = backend.fill_body(&plan, Bytes::from_static(b"hello")).await;
+        }
+        assert_eq!(backend.index.identity_count().await, 8);
+
+        // Let every entry expire, then let moka process the expirations so the
+        // eviction listener runs and prunes the identity index.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        backend.cache.run_pending_tasks().await;
+
+        assert_eq!(backend.cache.entry_count(), 0, "all entries should have expired");
+        assert_eq!(
+            backend.index.identity_count().await,
+            0,
+            "identity index must not outlive evicted cache entries"
+        );
     }
 
     #[tokio::test]

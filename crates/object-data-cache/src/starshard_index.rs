@@ -118,6 +118,12 @@ impl StarshardIdentityIndex {
             .is_some_and(|key_set| key_set.contains(key))
     }
 
+    /// Returns the number of tracked identities.
+    #[cfg(test)]
+    pub(crate) async fn identity_count(&self) -> usize {
+        self.by_object.len().await
+    }
+
     /// Removes index keys that no longer exist in the cache.
     pub async fn prune_missing<F>(&self, identity: &ObjectDataCacheIdentity, mut key_exists: F)
     where
