@@ -45,9 +45,6 @@ pub const ENV_CAPACITY_METRICS_INTERVAL: &str = "RUSTFS_CAPACITY_METRICS_INTERVA
 /// Environment variable for following symbolic links during capacity calculation
 pub const ENV_CAPACITY_FOLLOW_SYMLINKS: &str = "RUSTFS_CAPACITY_FOLLOW_SYMLINKS";
 
-/// Environment variable for maximum symlink follow depth
-pub const ENV_CAPACITY_MAX_SYMLINK_DEPTH: &str = "RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH";
-
 /// Environment variable for enabling dynamic timeout calculation
 pub const ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT: &str = "RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT";
 
@@ -97,10 +94,6 @@ pub const DEFAULT_CAPACITY_METRICS_INTERVAL_SECS: u64 = 600;
 /// Default: false (disabled for safety)
 pub const DEFAULT_CAPACITY_FOLLOW_SYMLINKS: bool = false;
 
-/// Maximum symlink follow depth
-/// Default: 3 levels
-pub const DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH: u8 = 3;
-
 /// Enable dynamic timeout calculation based on directory characteristics
 /// Default: true (enabled)
 pub const DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT: bool = true;
@@ -132,7 +125,6 @@ mod tests {
         assert_eq!(ENV_CAPACITY_SAMPLE_RATE, "RUSTFS_CAPACITY_SAMPLE_RATE");
         assert_eq!(ENV_CAPACITY_METRICS_INTERVAL, "RUSTFS_CAPACITY_METRICS_INTERVAL");
         assert_eq!(ENV_CAPACITY_FOLLOW_SYMLINKS, "RUSTFS_CAPACITY_FOLLOW_SYMLINKS");
-        assert_eq!(ENV_CAPACITY_MAX_SYMLINK_DEPTH, "RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH");
         assert_eq!(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, "RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT");
         assert_eq!(ENV_CAPACITY_MIN_TIMEOUT, "RUSTFS_CAPACITY_MIN_TIMEOUT");
         assert_eq!(ENV_CAPACITY_MAX_TIMEOUT, "RUSTFS_CAPACITY_MAX_TIMEOUT");

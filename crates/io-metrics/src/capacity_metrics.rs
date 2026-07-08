@@ -113,13 +113,6 @@ pub fn record_capacity_write_operation(write_frequency: usize) {
     gauge!("rustfs_capacity_write_frequency").set(write_frequency as f64);
 }
 
-/// Record symlink accounting.
-#[inline(always)]
-pub fn record_capacity_symlink(size_bytes: u64) {
-    counter!("rustfs_capacity_symlinks_encountered").increment(1);
-    histogram!("rustfs_capacity_symlinks_size_bytes").record(size_bytes as f64);
-}
-
 /// Record timeout fallback event.
 #[inline(always)]
 pub fn record_capacity_timeout_fallback() {
