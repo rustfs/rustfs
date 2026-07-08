@@ -1040,6 +1040,21 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<
                 metadata.insert(SSEC_ORIGINAL_SIZE_HEADER.to_string(), original_size.to_string());
             }
 
+            // Persist the random base nonce for the SSE-C Direct scheme (default,
+            // non-`rio-v2` build) so decrypt can read it back instead of recomputing a
+            // deterministic value. Written under both the RustFS and MinIO keys per repo
+            // convention. This covers single-PUT persistence and multipart-session
+            // persistence (CreateMultipartUpload builds session metadata here). Under
+            // `rio-v2` the SSE-C path uses `EncryptionKeyKind::Object` and the sealed-key
+            // block below, so this branch is not taken.
+            if material.key_kind == EncryptionKeyKind::Direct {
+                metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(material.base_nonce));
+                metadata.insert(
+                    MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+                    BASE64_STANDARD.encode(material.base_nonce),
+                );
+            }
+
             #[cfg(feature = "rio-v2")]
             if let Some(sealed) = &material.managed_sealed_key {
                 metadata.insert(MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealed.iv));
@@ -1387,7 +1402,15 @@ async fn apply_ssec_prepare_encryption_material(
     #[cfg(not(feature = "rio-v2"))]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
         let _ = (bucket, key, sse_key);
-        ([0; 32], [0; 12], EncryptionKeyKind::Direct, None)
+        // Generate a real random nonce for the multipart session and persist it (see
+        // `encryption_material_to_metadata`). Every part of this upload reads the same
+        // persisted nonce back via `apply_ssec_decryption_material`, so all parts share one
+        // nonce without reintroducing the deterministic (bucket, key) reuse hazard.
+        // key_bytes stays a placeholder here: it is neither used for encryption nor persisted;
+        // the real customer key is validated per part on upload.
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut base_nonce);
+        ([0; 32], base_nonce, EncryptionKeyKind::Direct, None)
     };
 
     Ok(EncryptionMaterial {
@@ -1431,7 +1454,14 @@ async fn apply_ssec_encryption_material(
 
     #[cfg(not(feature = "rio-v2"))]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let base_nonce = generate_ssec_nonce(bucket, key);
+        // Use a fresh random nonce per encryption. A deterministic nonce derived from
+        // (bucket, key) would repeat whenever the same object is overwritten under the same
+        // SSE-C key, reusing an identical (key, nonce) pair and catastrophically breaking
+        // AES-256-GCM. The nonce is persisted (see `encryption_material_to_metadata`) and read
+        // back on decrypt (see `apply_ssec_decryption_material`).
+        let _ = (bucket, key);
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut base_nonce);
         (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct, None)
     };
 
@@ -1450,6 +1480,23 @@ async fn apply_ssec_encryption_material(
         managed_kms_context: None,
         managed_sealed_key,
     })
+}
+
+/// Resolve the SSE-C Direct base nonce for decryption.
+///
+/// New objects persist a random nonce at encryption time (see
+/// `encryption_material_to_metadata`) under `INTERNAL_ENCRYPTION_IV_HEADER` (preferred) or,
+/// for MinIO interop, `MINIO_INTERNAL_ENCRYPTION_IV_HEADER`. Legacy objects written before
+/// random nonces were persisted carry no stored IV; for those we fall back to the
+/// deterministic `generate_ssec_nonce(bucket, key)` value they were originally encrypted
+/// with, so previously stored objects still decrypt correctly.
+fn read_stored_ssec_nonce(metadata: &HashMap<String, String>, bucket: &str, key: &str) -> [u8; 12] {
+    metadata
+        .get(INTERNAL_ENCRYPTION_IV_HEADER)
+        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER))
+        .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+        .and_then(|bytes| <[u8; 12]>::try_from(bytes.as_slice()).ok())
+        .unwrap_or_else(|| generate_ssec_nonce(bucket, key))
 }
 
 async fn apply_ssec_decryption_material(
@@ -1481,13 +1528,13 @@ async fn apply_ssec_decryption_material(
             EncryptionKeyKind::Object,
         )
     } else {
-        let base_nonce = generate_ssec_nonce(bucket, key);
+        let base_nonce = read_stored_ssec_nonce(metadata, bucket, key);
         (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct)
     };
 
     #[cfg(not(feature = "rio-v2"))]
     let (key_bytes, base_nonce, key_kind) = {
-        let base_nonce = generate_ssec_nonce(bucket, key);
+        let base_nonce = read_stored_ssec_nonce(metadata, bucket, key);
         (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct)
     };
 
@@ -2830,6 +2877,212 @@ mod tests {
             .expect("ssec metadata should be generated");
         assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
         assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
+    }
+
+    // ------------------------------------------------------------------------
+    // SSE-C Direct (default, non-`rio-v2` build) random-nonce persistence
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(feature = "rio-v2"))]
+    async fn ssec_direct_put_metadata(
+        bucket: &str,
+        key: &str,
+        customer_key: &str,
+        customer_key_md5: &str,
+    ) -> HashMap<String, String> {
+        let material = sse_encryption(EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key.to_string()),
+            sse_customer_key_md5: Some(customer_key_md5.to_string()),
+            content_size: 128,
+        })
+        .await
+        .expect("sse-c encryption")
+        .expect("sse-c material");
+        assert_eq!(material.key_kind, EncryptionKeyKind::Direct);
+        encryption_material_to_metadata(&material).expect("sse-c metadata should serialize")
+    }
+
+    // (a) Overwriting the same bucket/key under the same SSE-C key must persist a DIFFERENT
+    // random IV each time, and each stored IV must be read back on decrypt. This is the core
+    // of the fix: no (key, nonce) reuse across overwrites.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn test_ssec_direct_random_nonce_is_unique_per_put_and_read_back() {
+        let bucket = "bucket";
+        let key = "object";
+        let customer_key_bytes = [0x24u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+
+        let metadata_one = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
+        let metadata_two = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
+
+        let iv_one = metadata_one
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
+            .expect("first put persists a random IV");
+        let iv_two = metadata_two
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
+            .expect("second put persists a random IV");
+
+        assert_ne!(iv_one, iv_two, "overwriting the same object must not reuse the nonce");
+
+        // Dual-key persistence for MinIO interop: both headers carry the same value.
+        assert_eq!(metadata_one.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER), Some(iv_one));
+        assert_eq!(metadata_two.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER), Some(iv_two));
+
+        for (metadata, iv) in [(&metadata_one, iv_one), (&metadata_two, iv_two)] {
+            let decrypted = super::apply_ssec_decryption_material(bucket, key, metadata, &customer_key, &customer_key_md5)
+                .await
+                .expect("sse-c decryption material");
+            assert_eq!(
+                BASE64_STANDARD.encode(decrypted.base_nonce),
+                *iv,
+                "decrypt must read the persisted random nonce back"
+            );
+            assert_eq!(decrypted.key_bytes, customer_key_bytes);
+        }
+    }
+
+    // (b) Legacy compatibility: objects encrypted before this change carry no IV header. Decrypt
+    // must fall back to the deterministic `generate_ssec_nonce(bucket, key)` they were encrypted
+    // with, so previously stored objects keep decrypting.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn test_ssec_direct_legacy_object_without_iv_falls_back_to_deterministic_nonce() {
+        let bucket = "bucket";
+        let key = "object";
+        let customer_key_bytes = [0x24u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
+        assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(!metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_IV_HEADER));
+
+        let decrypted = super::apply_ssec_decryption_material(bucket, key, &metadata, &customer_key, &customer_key_md5)
+            .await
+            .expect("sse-c decryption material");
+
+        assert_eq!(
+            decrypted.base_nonce,
+            generate_ssec_nonce(bucket, key),
+            "legacy objects must decrypt via the deterministic nonce fallback"
+        );
+    }
+
+    // (c) Byte-level round trip: data encrypted with the material's key + persisted nonce must
+    // decrypt with the key + nonce resolved from the stored metadata.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn test_ssec_direct_persisted_nonce_round_trips_plaintext() {
+        use aes_gcm::{
+            Aes256Gcm, Nonce,
+            aead::{Aead, KeyInit},
+        };
+
+        let bucket = "bucket";
+        let key = "object";
+        let customer_key_bytes = [0x51u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let plaintext = b"attack at dawn - sse-c round trip".to_vec();
+
+        let metadata = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
+
+        // Encrypt with the key + nonce that were persisted at PUT time.
+        let enc_iv = BASE64_STANDARD
+            .decode(metadata.get(INTERNAL_ENCRYPTION_IV_HEADER).expect("persisted IV"))
+            .expect("valid base64 IV");
+        let cipher = Aes256Gcm::new_from_slice(&customer_key_bytes).expect("cipher");
+        let ciphertext = cipher
+            .encrypt(&Nonce::try_from(enc_iv.as_slice()).expect("nonce"), plaintext.as_ref())
+            .expect("encrypt");
+
+        // Resolve key + nonce purely from stored metadata (as decrypt does in production).
+        let decrypted_material = super::apply_ssec_decryption_material(bucket, key, &metadata, &customer_key, &customer_key_md5)
+            .await
+            .expect("sse-c decryption material");
+        let dec_cipher = Aes256Gcm::new_from_slice(&decrypted_material.key_bytes).expect("cipher");
+        let recovered = dec_cipher
+            .decrypt(
+                &Nonce::try_from(decrypted_material.base_nonce.as_slice()).expect("nonce"),
+                ciphertext.as_ref(),
+            )
+            .expect("decrypt with resolved key + nonce");
+
+        assert_eq!(recovered, plaintext);
+    }
+
+    // (d) Multipart: the random nonce generated at CreateMultipartUpload is persisted in the
+    // session metadata, and every part resolves the SAME nonce via `sse_decryption` on that
+    // session metadata. Parts must never diverge, and the value must not be deterministic.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn test_ssec_direct_multipart_all_parts_share_one_persisted_nonce() {
+        let bucket = "bucket";
+        let key = "object";
+        let customer_key_bytes = [0x33u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+
+        let material = sse_prepare_encryption(PrepareEncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key.clone()),
+            sse_customer_key_md5: Some(customer_key_md5.clone()),
+        })
+        .await
+        .expect("prepare ssec")
+        .expect("prepare material");
+        assert_eq!(material.key_kind, EncryptionKeyKind::Direct);
+
+        let session_metadata = encryption_material_to_metadata(&material).expect("session metadata should serialize");
+        let session_iv = session_metadata
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
+            .expect("multipart session persists a random IV")
+            .clone();
+        // Random, not the deterministic bucket/key derivation.
+        assert_ne!(
+            BASE64_STANDARD.decode(&session_iv).expect("valid IV")[..],
+            generate_ssec_nonce(bucket, key)[..]
+        );
+
+        let resolve_part_nonce = |part_number: usize| {
+            let session_metadata = session_metadata.clone();
+            let customer_key = customer_key.clone();
+            let customer_key_md5 = customer_key_md5.clone();
+            async move {
+                let _ = part_number;
+                sse_decryption(DecryptionRequest {
+                    bucket,
+                    key,
+                    metadata: &session_metadata,
+                    sse_customer_key: Some(&customer_key),
+                    sse_customer_key_md5: Some(&customer_key_md5),
+                })
+                .await
+                .expect("part decryption")
+                .expect("part material")
+                .base_nonce
+            }
+        };
+
+        let part_one_nonce = resolve_part_nonce(1).await;
+        let part_two_nonce = resolve_part_nonce(2).await;
+
+        assert_eq!(part_one_nonce, part_two_nonce, "all parts of one upload must share the persisted nonce");
+        assert_eq!(BASE64_STANDARD.encode(part_one_nonce), session_iv);
     }
 
     #[cfg(feature = "rio-v2")]
