@@ -398,6 +398,8 @@ pub struct DiskCapacityUpdate {
 #[derive(Clone, Debug)]
 struct CachedDiskCapacity {
     used_bytes: u64,
+    file_count: usize,
+    is_estimated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Copy, Eq)]
@@ -659,39 +661,60 @@ impl HybridCapacityManager {
         cache.clone()
     }
 
-    /// Update capacity
-    pub async fn update_capacity(&self, update: CapacityUpdate, source: DataSource) {
+    /// Update capacity.
+    ///
+    /// Returns the update with its cluster-level aggregates (`total_used`, `file_count`,
+    /// `is_estimated`) reconciled against the per-disk cache. A dirty-subset refresh carries
+    /// only the scanned subset's totals; callers that publish or return this value (e.g. the
+    /// `refresh_or_join` leader and joiners, admin used-capacity) must use the reconciled copy
+    /// so they never report the subset bytes as the whole-cluster total.
+    pub async fn update_capacity(&self, mut update: CapacityUpdate, source: DataSource) -> CapacityUpdate {
         let start = Instant::now();
-        let mut total_used = update.total_used;
 
         if !update.per_disk.is_empty() {
             let mut disk_cache = self.disk_cache.write().await;
             let mut disk_cache_complete = self.disk_cache_complete.write().await;
 
-            if update.replaces_disk_cache && update.expected_disk_count == Some(update.per_disk.len()) {
+            let recompute = if update.replaces_disk_cache && update.expected_disk_count == Some(update.per_disk.len()) {
                 disk_cache.clear();
                 for entry in &update.per_disk {
                     disk_cache.insert(
                         entry.disk.clone(),
                         CachedDiskCapacity {
                             used_bytes: entry.used_bytes,
+                            file_count: entry.file_count,
+                            is_estimated: entry.is_estimated,
                         },
                     );
                 }
                 *disk_cache_complete = true;
-                total_used = disk_cache.values().map(|entry| entry.used_bytes).sum();
+                true
             } else if *disk_cache_complete {
                 for entry in &update.per_disk {
                     disk_cache.insert(
                         entry.disk.clone(),
                         CachedDiskCapacity {
                             used_bytes: entry.used_bytes,
+                            file_count: entry.file_count,
+                            is_estimated: entry.is_estimated,
                         },
                     );
                 }
-                total_used = disk_cache.values().map(|entry| entry.used_bytes).sum();
+                true
+            } else {
+                false
+            };
+
+            if recompute {
+                // Reconcile cluster-wide aggregates from the full per-disk cache so a
+                // dirty-subset refresh reports the merged cluster totals, not the subset sum.
+                update.total_used = disk_cache.values().map(|entry| entry.used_bytes).sum();
+                update.file_count = disk_cache.values().map(|entry| entry.file_count).sum();
+                update.is_estimated = disk_cache.values().any(|entry| entry.is_estimated);
             }
         }
+
+        let total_used = update.total_used;
 
         let mut cache = self.cache.write().await;
         *cache = Some(CachedCapacity {
@@ -724,6 +747,7 @@ impl HybridCapacityManager {
         );
         record_capacity_current_bytes(total_used);
         record_capacity_update_completed(source.as_metric_label(), start.elapsed(), total_used, update.is_estimated);
+        update
     }
 
     /// Record write operation
@@ -913,9 +937,13 @@ impl HybridCapacityManager {
             );
             Err("capacity refresh panicked".to_string())
         });
-        if let Ok(update) = &result {
-            self.update_capacity(update.clone(), source).await;
-        }
+        // Commit the update and rebind `result` to the reconciled copy so both the value
+        // returned to this caller and the one published to joiners carry the cluster totals
+        // rather than a dirty-subset's partial bytes.
+        let result = match result {
+            Ok(update) => Ok(self.update_capacity(update, source).await),
+            Err(err) => Err(err),
+        };
         let refresh_duration = refresh_start.elapsed();
         if result.is_err() {
             record_capacity_update_failed(source.as_metric_label());
@@ -974,9 +1002,12 @@ impl HybridCapacityManager {
                 );
                 Err("capacity refresh panicked".to_string())
             });
-            if let Ok(update) = &result {
-                self.update_capacity(update.clone(), source).await;
-            }
+            // Publish the reconciled update to joiners so a dirty-subset refresh does not
+            // broadcast a subset's partial bytes as the cluster total.
+            let result = match result {
+                Ok(update) => Ok(self.update_capacity(update, source).await),
+                Err(err) => Err(err),
+            };
             let refresh_duration = refresh_start.elapsed();
             if result.is_err() {
                 record_capacity_update_failed(source.as_metric_label());
@@ -1672,12 +1703,12 @@ mod tests {
             )
             .await;
 
-        manager
+        let returned = manager
             .update_capacity(
                 CapacityUpdate {
                     total_used: 150,
                     file_count: 1,
-                    is_estimated: false,
+                    is_estimated: true,
                     per_disk: vec![DiskCapacityUpdate {
                         disk: CapacityScopeDisk {
                             endpoint: "node-a".to_string(),
@@ -1685,7 +1716,7 @@ mod tests {
                         },
                         used_bytes: 150,
                         file_count: 1,
-                        is_estimated: false,
+                        is_estimated: true,
                     }],
                     expected_disk_count: Some(1),
                     replaces_disk_cache: false,
@@ -1695,8 +1726,93 @@ mod tests {
             )
             .await;
 
+        // The returned update must carry the reconciled cluster totals (node-a 150 + node-b 200),
+        // not the dirty-subset's own bytes (150). file_count merges the full cache (1 + 2), and
+        // is_estimated is true because node-a is now estimated.
+        assert_eq!(returned.total_used, 350);
+        assert_eq!(returned.file_count, 3);
+        assert!(returned.is_estimated);
+
         let cached = manager.get_capacity().await.unwrap();
         assert_eq!(cached.total_used, 350);
+        assert_eq!(cached.file_count, 3);
+        assert!(cached.is_estimated);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_refresh_or_join_returns_cluster_total_for_dirty_subset() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+
+        // Seed a complete two-disk cache: cluster total 300, 3 files, exact.
+        manager
+            .update_capacity(
+                CapacityUpdate {
+                    total_used: 300,
+                    file_count: 3,
+                    is_estimated: false,
+                    per_disk: vec![
+                        DiskCapacityUpdate {
+                            disk: CapacityScopeDisk {
+                                endpoint: "node-a".to_string(),
+                                drive_path: "/tmp/disk-a".to_string(),
+                            },
+                            used_bytes: 100,
+                            file_count: 1,
+                            is_estimated: false,
+                        },
+                        DiskCapacityUpdate {
+                            disk: CapacityScopeDisk {
+                                endpoint: "node-b".to_string(),
+                                drive_path: "/tmp/disk-b".to_string(),
+                            },
+                            used_bytes: 200,
+                            file_count: 2,
+                            is_estimated: false,
+                        },
+                    ],
+                    expected_disk_count: Some(2),
+                    replaces_disk_cache: true,
+                    clear_dirty_disks: Vec::new(),
+                },
+                DataSource::RealTime,
+            )
+            .await;
+
+        // A dirty-subset refresh re-scans only node-a; its raw update carries subset-only totals.
+        let subset_update = CapacityUpdate {
+            total_used: 150,
+            file_count: 1,
+            is_estimated: true,
+            per_disk: vec![DiskCapacityUpdate {
+                disk: CapacityScopeDisk {
+                    endpoint: "node-a".to_string(),
+                    drive_path: "/tmp/disk-a".to_string(),
+                },
+                used_bytes: 150,
+                file_count: 1,
+                is_estimated: true,
+            }],
+            expected_disk_count: Some(1),
+            replaces_disk_cache: false,
+            clear_dirty_disks: Vec::new(),
+        };
+
+        let returned = manager
+            .refresh_or_join(DataSource::WriteTriggered, || async { Ok(subset_update) })
+            .await
+            .unwrap();
+
+        // The leader must return the merged cluster total (150 + 200), not the subset sum (150).
+        assert_eq!(returned.total_used, 350);
+        assert_eq!(returned.file_count, 3);
+        assert!(returned.is_estimated);
+
+        // The cache the joiners read from must agree with the returned value.
+        let cached = manager.get_capacity().await.unwrap();
+        assert_eq!(cached.total_used, returned.total_used);
+        assert_eq!(cached.file_count, returned.file_count);
+        assert_eq!(cached.is_estimated, returned.is_estimated);
     }
 
     #[tokio::test]
