@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::instance::{InstanceContext, bootstrap_ctx};
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
@@ -42,16 +43,17 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 // These should be migrated to AppContext over time.
 // See issue #730 for migration plan.
 //
-// Tier A (needs migration): GLOBAL_OBJECT_API, GLOBAL_IS_ERASURE*, GLOBAL_LOCAL_DISK_*,
+// Tier A (needs migration): GLOBAL_OBJECT_API, GLOBAL_LOCAL_DISK_*,
 //   GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_LIFECYCLE_SYS, GLOBAL_EVENT_NOTIFIER, etc.
 // Tier B (keep as static): GLOBAL_RUSTFS_PORT, GLOBAL_REGION, env var caches, etc.
+//
+// Phase 5 (backlog#939): the erasure setup type moved into the per-instance
+// `InstanceContext` (see `super::instance`); the erasure predicates below now
+// forward to the current instance's context.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     static ref GLOBAL_DEPLOYMENT_ID: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-    pub static ref GLOBAL_IS_ERASURE: RwLock<bool> = RwLock::new(false);
-    pub static ref GLOBAL_IS_DIST_ERASURE: RwLock<bool> = RwLock::new(false);
-    pub static ref GLOBAL_IS_ERASURE_SD: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
@@ -207,6 +209,19 @@ pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
         .or_else(new_object_layer_fn)
 }
 
+/// Resolve the instance context for the legacy free-function facade.
+///
+/// Prefers the currently-published `ECStore`'s own context; before any store
+/// is published (e.g. during storage startup, or in unit tests) it falls back
+/// to the process-level [`bootstrap_ctx`]. Because `ECStore::new` adopts the
+/// bootstrap `Arc`, single-instance callers always observe one and the same
+/// context — behavior is unchanged from the previous process-global bools.
+pub(crate) fn current_ctx() -> Arc<InstanceContext> {
+    resolve_object_store_handle()
+        .map(|store| store.ctx.clone())
+        .unwrap_or_else(bootstrap_ctx)
+}
+
 /// Set the global object layer
 ///
 /// # Arguments
@@ -226,8 +241,7 @@ pub async fn set_object_layer(o: Arc<ECStore>) {
 /// * `bool` - True if the setup type is distributed erasure coding, false otherwise
 ///
 pub async fn is_dist_erasure() -> bool {
-    let lock = GLOBAL_IS_DIST_ERASURE.read().await;
-    *lock
+    current_ctx().is_dist_erasure().await
 }
 
 /// Check if the setup type is erasure coding with single data center
@@ -236,8 +250,7 @@ pub async fn is_dist_erasure() -> bool {
 /// * `bool` - True if the setup type is erasure coding with single data center, false otherwise
 ///
 pub async fn is_erasure_sd() -> bool {
-    let lock = GLOBAL_IS_ERASURE_SD.read().await;
-    *lock
+    current_ctx().is_erasure_sd().await
 }
 
 /// Check if the setup type is erasure coding
@@ -246,8 +259,7 @@ pub async fn is_erasure_sd() -> bool {
 /// * `bool` - True if the setup type is erasure coding, false otherwise
 ///
 pub async fn is_erasure() -> bool {
-    let lock = GLOBAL_IS_ERASURE.read().await;
-    *lock
+    current_ctx().is_erasure().await
 }
 
 /// Update the global erasure type based on the setup type
@@ -258,18 +270,7 @@ pub async fn is_erasure() -> bool {
 /// # Returns
 /// * None
 pub async fn update_erasure_type(setup_type: SetupType) {
-    let mut is_erasure = GLOBAL_IS_ERASURE.write().await;
-    *is_erasure = setup_type == SetupType::Erasure;
-
-    let mut is_dist_erasure = GLOBAL_IS_DIST_ERASURE.write().await;
-    *is_dist_erasure = setup_type == SetupType::DistErasure;
-
-    if *is_dist_erasure {
-        *is_erasure = true
-    }
-
-    let mut is_erasure_sd = GLOBAL_IS_ERASURE_SD.write().await;
-    *is_erasure_sd = setup_type == SetupType::ErasureSD;
+    current_ctx().update_erasure_type(setup_type).await;
 }
 
 // pub fn is_legacy() -> bool {

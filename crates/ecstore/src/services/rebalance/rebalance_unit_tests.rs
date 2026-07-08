@@ -2421,6 +2421,7 @@ async fn test_init_and_start_rebalance_rejects_second_start_after_gate() {
         decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
         start_gate: tokio::sync::Mutex::new(()),
         pool_meta_save_gate: tokio::sync::Mutex::new(()),
+        ctx: crate::runtime::instance::bootstrap_ctx(),
     });
 
     let err = store

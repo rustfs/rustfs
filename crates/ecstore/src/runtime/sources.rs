@@ -32,13 +32,13 @@ use crate::{
     error::Result,
     layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
-        GLOBAL_BOOT_TIME, GLOBAL_EVENT_NOTIFIER, GLOBAL_IS_ERASURE_SD, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_DISK_ID_MAP,
-        GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD,
-        GLOBAL_TIER_CONFIG_MGR, TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor,
-        get_global_deployment_id, get_global_endpoints, get_global_endpoints_opt, get_global_lock_client,
-        get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port, init_global_bucket_monitor,
-        is_dist_erasure, is_erasure, is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id,
-        set_global_lock_client, set_global_lock_clients, set_object_layer, update_erasure_type,
+        GLOBAL_BOOT_TIME, GLOBAL_EVENT_NOTIFIER, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
+        GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_TIER_CONFIG_MGR,
+        TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
+        get_global_endpoints, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region,
+        get_global_tier_config_mgr, global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd,
+        is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id, set_global_lock_client,
+        set_global_lock_clients, set_object_layer, update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::event_notification::EventNotifier,
@@ -148,7 +148,7 @@ pub async fn setup_is_dist_erasure() -> bool {
 }
 
 pub async fn setup_is_erasure_sd() -> bool {
-    *GLOBAL_IS_ERASURE_SD.read().await
+    is_erasure_sd().await
 }
 
 pub(crate) async fn current_setup_type() -> SetupType {
@@ -215,7 +215,7 @@ pub(crate) async fn scanner_init_time() -> Option<chrono::DateTime<chrono::Utc>>
 }
 
 pub(crate) async fn root_disk_threshold_for_erasure_disk() -> Option<u64> {
-    if *GLOBAL_IS_ERASURE_SD.read().await {
+    if is_erasure_sd().await {
         None
     } else {
         Some(*GLOBAL_ROOT_DISK_THRESHOLD.read().await)

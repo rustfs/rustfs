@@ -334,6 +334,9 @@ impl ECStore {
             decommission_cancelers,
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
+            // Adopt the process bootstrap context so startup writes (erasure
+            // type recorded before this point) and later reads share one cell.
+            ctx: crate::runtime::instance::bootstrap_ctx(),
         });
 
         // Only set it when the global deployment ID is not yet configured
