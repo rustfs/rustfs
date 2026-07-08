@@ -73,6 +73,7 @@ use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 #[cfg(test)]
 use s3s::dto::ReplicationConfiguration;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -94,6 +95,21 @@ const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
 const ERR_REPLICATION_METADATA_COPY_UNSUPPORTED: &str = "metadata-only replication is not implemented";
+const REPLICATION_TARGET_OFFLINE_ERROR_MARKERS: &[&str] = &[
+    "dispatch failure",
+    "timeouterror",
+    "timed out",
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "connection aborted",
+    "broken pipe",
+    "dns error",
+    "failed to lookup address",
+    "name or service not known",
+    "deadline has elapsed",
+    "tcp connect error",
+];
 
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
@@ -169,6 +185,19 @@ fn is_version_id_format_mismatch(err: &SdkError<HeadObjectError>) -> bool {
     let code = err.as_service_error().and_then(|se| se.code());
     let raw_status = err.raw_response().map(|r| r.status().as_u16());
     is_version_id_mismatch(code, raw_status)
+}
+
+fn is_replication_target_offline_error(err: &(impl Display + ?Sized)) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    REPLICATION_TARGET_OFFLINE_ERROR_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+async fn mark_replication_target_offline_if_needed(target_client: &TargetClient, err: &(impl Display + ?Sized)) {
+    if is_replication_target_offline_error(err) {
+        ReplicationTargetStore::mark_target_offline(target_client).await;
+    }
 }
 
 async fn head_object_fallback(
@@ -1845,7 +1874,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             } else {
                 rinfo.version_purge_status = VersionPurgeStatusType::Failed;
             }
-            // TODO: check offline
+            mark_replication_target_offline_if_needed(&tgt_client, &e).await;
         }
     }
 
@@ -2406,7 +2435,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 "Replication target operation failed"
             );
 
-            // TODO: check offline
+            mark_replication_target_offline_if_needed(&tgt_client, &err).await;
             return rinfo;
         }
 
@@ -2835,7 +2864,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 );
                 rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
 
-                // TODO: check offline
+                mark_replication_target_offline_if_needed(&tgt_client, &err).await;
                 return rinfo;
             }
         }
@@ -3017,6 +3046,65 @@ mod tests {
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    fn test_target_client(endpoint: String) -> TargetClient {
+        let config = aws_sdk_s3::Config::builder()
+            .endpoint_url(endpoint.clone())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::SharedCredentialsProvider::new(
+                aws_credential_types::Credentials::new("access", "secret", None, None, "test"),
+            ))
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build();
+
+        TargetClient {
+            endpoint,
+            credentials: None,
+            bucket: "target-bucket".to_string(),
+            storage_class: String::new(),
+            disable_proxy: false,
+            arn: format!("arn:rustfs:replication:us-east-1:target:{}", Uuid::new_v4()),
+            reset_id: String::new(),
+            secure: false,
+            health_check_duration: std::time::Duration::from_secs(5),
+            replicate_sync: false,
+            client: Arc::new(aws_sdk_s3::Client::from_conf(config)),
+        }
+    }
+
+    #[test]
+    fn replication_target_offline_error_classifier_is_network_scoped() {
+        assert!(is_replication_target_offline_error(&"put_object dispatch failure: connector error"));
+        assert!(is_replication_target_offline_error(&"request TimeoutError after retry"));
+        assert!(is_replication_target_offline_error(&"tcp connect error: connection refused"));
+        assert!(!is_replication_target_offline_error(&"put_object failed: AccessDenied: denied"));
+        assert!(!is_replication_target_offline_error(&"put_object failed: NoSuchBucket"));
+    }
+
+    #[tokio::test]
+    async fn replication_target_network_failure_marks_target_offline() {
+        let endpoint = format!("http://network-failure-{}.example:9000", Uuid::new_v4());
+        let target_client = test_target_client(endpoint);
+
+        assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
+
+        let err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        mark_replication_target_offline_if_needed(&target_client, &err).await;
+
+        assert!(ReplicationTargetStore::target_is_offline(&target_client).await);
+    }
+
+    #[tokio::test]
+    async fn replication_target_service_failure_keeps_target_online() {
+        let endpoint = format!("http://service-failure-{}.example:9000", Uuid::new_v4());
+        let target_client = test_target_client(endpoint);
+
+        assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
+
+        mark_replication_target_offline_if_needed(&target_client, &"put_object failed: AccessDenied: denied").await;
+
+        assert!(!ReplicationTargetStore::target_is_offline(&target_client).await);
+    }
 
     #[test]
     fn test_unmarshal_resync_payload() {
