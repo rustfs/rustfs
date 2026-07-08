@@ -108,6 +108,20 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
     caller_parent == target_parent_user
 }
 
+/// Fail-closed ownership check used by DeleteServiceAccount for a caller that
+/// lacks the RemoveServiceAccount admin action.
+///
+/// Returns `true` only when the target service account was successfully loaded
+/// AND is owned by the caller. A `None` target — meaning `get_service_account`
+/// failed with a non-not-found error (e.g. a stored-credential decode error) so
+/// ownership could not be verified — denies, as does an owner mismatch. The
+/// previous `svc_account.is_some_and(|v| v.parent_user != user)` form returned
+/// `false` for a `None` target and thus fell through to the delete, an authz
+/// bypass (backlog#806).
+fn non_admin_may_delete_service_account(caller_user: &str, target_parent_user: Option<&str>) -> bool {
+    matches!(target_parent_user, Some(parent) if parent == caller_user)
+}
+
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
     debug!(
         component = LOG_COMPONENT_ADMIN,
@@ -1288,12 +1302,20 @@ impl Operation for DeleteServiceAccount {
             .await
         {
             let user = if cred.parent_user.is_empty() {
-                &cred.access_key
+                cred.access_key.as_str()
             } else {
-                &cred.parent_user
+                cred.parent_user.as_str()
             };
 
-            if svc_account.is_some_and(|v| &v.parent_user != user) {
+            // Fail closed: a caller without the RemoveServiceAccount admin action
+            // may only delete a service account it OWNS. If the target could not be
+            // loaded (svc_account is None because get_service_account failed with a
+            // non-not-found error — e.g. a credential decode error), ownership cannot
+            // be verified, so deny rather than fall through to the delete. The
+            // previous `is_some_and(parent != user)` form skipped the guard on a
+            // None target, an authz bypass (backlog#806).
+            let target_parent = svc_account.as_ref().map(|v| v.parent_user.as_str());
+            if !non_admin_may_delete_service_account(user, target_parent) {
                 return Err(s3_error!(InvalidRequest, "service account not exist"));
             }
         }
@@ -1359,6 +1381,26 @@ mod tests {
     fn access_key_query_supports_external_alias() {
         let query: AccessKeyQuery = from_bytes(b"access-key=test-access-key").expect("parse query");
         assert_eq!(query.access_key, "test-access-key");
+    }
+
+    #[test]
+    fn non_admin_delete_is_fail_closed_on_unloadable_target() {
+        // Regression (backlog#806): a non-admin caller may delete ONLY a service
+        // account it owns; a None target (get_service_account failed to load /
+        // decode) must DENY, not fall through to the delete.
+        assert!(
+            non_admin_may_delete_service_account("alice", Some("alice")),
+            "owner may delete own service account"
+        );
+        assert!(!non_admin_may_delete_service_account("alice", Some("bob")), "non-owner must be denied");
+        assert!(
+            !non_admin_may_delete_service_account("alice", None),
+            "unloadable target (None) must be denied (fail-closed), not bypass the owner check"
+        );
+        assert!(
+            !non_admin_may_delete_service_account("", None),
+            "empty caller + unloadable target must still deny"
+        );
     }
 
     #[test]
