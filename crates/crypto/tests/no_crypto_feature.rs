@@ -1,3 +1,5 @@
+#![cfg(not(feature = "crypto"))]
+
 use rustfs_crypto::{Error, decrypt_data, encrypt_data};
 
 #[test]
