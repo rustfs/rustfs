@@ -59,6 +59,13 @@ use std::sync::{Mutex, OnceLock};
 
 const LEGACY_ENV_OBS_PROFILING_ENABLED: &str = "RUSTFS_OBS_PROFILING_ENABLED";
 
+fn get_env_nonempty_str(name: &str, default: &str) -> String {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => default.to_string(),
+    }
+}
+
 /// Full observability configuration used by all telemetry backends.
 ///
 /// Fields are grouped into three logical sections:
@@ -304,7 +311,7 @@ impl OtelConfig {
             logger_level: Some(get_env_str(ENV_OBS_LOGGER_LEVEL, DEFAULT_LOG_LEVEL)),
             log_stdout_enabled: Some(get_env_bool(ENV_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOG_STDOUT_ENABLED)),
             log_directory,
-            log_filename: Some(get_env_str(ENV_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_FILENAME)),
+            log_filename: Some(get_env_nonempty_str(ENV_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_FILENAME)),
             log_rotation_time,
             log_keep_files,
             // Log cleanup
@@ -474,6 +481,16 @@ mod tests {
                 temp_env::with_var(ENV_OBS_PROFILING_EXPORT_ENABLED, Some("false"), || {
                     assert_eq!(extract_profiling_export_enabled(), Some(false));
                 });
+            });
+        });
+    }
+
+    #[test]
+    fn empty_log_filename_falls_back_to_default() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var(ENV_OBS_LOG_FILENAME, Some(""), || {
+                let config = OtelConfig::extract_otel_config_from_env(None);
+                assert_eq!(config.log_filename.as_deref(), Some(DEFAULT_OBS_LOG_FILENAME));
             });
         });
     }
