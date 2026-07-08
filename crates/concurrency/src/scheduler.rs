@@ -49,12 +49,16 @@ impl Default for SchedulerPolicy {
 impl SchedulerPolicy {
     /// Convert facade policy to io-core scheduler config.
     pub fn to_core_config(&self) -> rustfs_io_core::IoSchedulerConfig {
+        let default = rustfs_io_core::IoSchedulerConfig::default();
         rustfs_io_core::IoSchedulerConfig {
             base_buffer_size: self.base_buffer_size,
             max_buffer_size: self.max_buffer_size,
+            // Keep min <= base <= max: the io-core default min (4KB) would make
+            // `clamp(min, max)` panic for policies with a smaller max_buffer_size.
+            min_buffer_size: default.min_buffer_size.min(self.base_buffer_size).min(self.max_buffer_size),
             high_priority_size_threshold: self.high_priority_threshold,
             low_priority_size_threshold: self.low_priority_threshold,
-            ..rustfs_io_core::IoSchedulerConfig::default()
+            ..default
         }
     }
 }
@@ -264,6 +268,16 @@ mod tests {
         let manager = SchedulerManager::new(1024, 4096, 512, 2048);
         let priority = manager.get_priority(100);
         assert!(priority.is_high());
+    }
+
+    #[test]
+    fn test_small_max_buffer_size_does_not_panic() {
+        // Regression: max_buffer_size below the io-core default min (4KB) used to
+        // panic in the core clamp (min > max) on the first buffer-size calculation.
+        let manager = SchedulerManager::new(1024, 2048, 512, 2048);
+        let size = manager.calculate_buffer_size(1024, StorageMedia::Ssd, AccessPattern::Sequential, IoLoadLevel::Medium, 1);
+        assert!(size > 0 && size <= 2048);
+        assert!(manager.core_config().validate().is_ok());
     }
 
     #[test]

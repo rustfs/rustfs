@@ -223,7 +223,18 @@ impl BackpressureMonitor {
 
     /// Release a slot after operation completes.
     pub fn release(&self) {
-        let prev = self.current.fetch_sub(1, Ordering::Relaxed);
+        // Guard against underflow: an unpaired release at 0 must not wrap to
+        // usize::MAX, which would permanently reject all future acquisitions.
+        let prev = match self
+            .current
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
+        {
+            Ok(prev) => prev,
+            Err(_) => {
+                tracing::warn!("BackpressureMonitor::release called with no outstanding acquisition; ignoring");
+                0
+            }
+        };
         let low_threshold = self.config.low_threshold();
 
         // Update state if needed
@@ -360,6 +371,22 @@ mod tests {
         monitor.release();
         // State should be Normal (1 < low_threshold=2)
         assert_eq!(monitor.state(), BackpressureState::Normal);
+    }
+
+    #[test]
+    fn test_release_underflow_stays_at_zero() {
+        // An unpaired release at current==0 must not wrap to usize::MAX,
+        // which would make try_acquire reject everything forever.
+        let monitor = BackpressureMonitor::with_defaults();
+
+        monitor.release();
+        assert_eq!(monitor.current(), 0);
+
+        // The monitor must still be usable.
+        assert!(monitor.try_acquire());
+        assert_eq!(monitor.current(), 1);
+        monitor.release();
+        assert_eq!(monitor.current(), 0);
     }
 
     #[test]
