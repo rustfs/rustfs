@@ -31,17 +31,171 @@ use rustfs_config::{
     ENV_RUNTIME_DIAL9_ROTATION_COUNT, ENV_RUNTIME_DIAL9_S3_BUCKET, ENV_RUNTIME_DIAL9_S3_PREFIX, ENV_RUNTIME_DIAL9_SAMPLING_RATE,
 };
 use rustfs_utils::get_env_bool;
-use rustfs_utils::get_env_f64;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::get_env_opt_u64;
 use rustfs_utils::get_env_opt_usize;
 use rustfs_utils::get_env_str;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{info, warn};
 
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_DIAL9: &str = "dial9";
 const EVENT_DIAL9_STATE: &str = "dial9_state";
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Dial9RuntimeSnapshot {
+    pub active_sessions: u64,
+    pub errors_total: u64,
+    pub disk_usage_bytes: u64,
+}
+
+#[derive(Debug)]
+struct Dial9RuntimeState {
+    enabled: AtomicBool,
+    active_sessions: AtomicU64,
+    errors_total: AtomicU64,
+    output_dir: RwLock<Option<PathBuf>>,
+    file_prefix: RwLock<Option<String>>,
+}
+
+impl Dial9RuntimeState {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            active_sessions: AtomicU64::new(0),
+            errors_total: AtomicU64::new(0),
+            output_dir: RwLock::new(None),
+            file_prefix: RwLock::new(None),
+        }
+    }
+
+    fn record_config(&self, config: &Dial9Config) {
+        self.enabled.store(config.enabled, Ordering::Relaxed);
+        *self.output_dir.write().expect("dial9 output_dir lock should not be poisoned") = Some(PathBuf::from(&config.output_dir));
+        *self
+            .file_prefix
+            .write()
+            .expect("dial9 file_prefix lock should not be poisoned") = Some(config.file_prefix.clone());
+        if !config.enabled {
+            self.active_sessions.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn record_runtime_started(&self, config: &Dial9Config) {
+        self.record_config(config);
+        self.active_sessions.store(1, Ordering::Relaxed);
+    }
+
+    fn record_runtime_error(&self, config: &Dial9Config) {
+        self.record_config(config);
+        self.active_sessions.store(0, Ordering::Relaxed);
+        self.errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Dial9RuntimeSnapshot {
+        Dial9RuntimeSnapshot {
+            active_sessions: self.active_sessions.load(Ordering::Relaxed),
+            errors_total: self.errors_total.load(Ordering::Relaxed),
+            disk_usage_bytes: self.current_disk_usage_bytes(),
+        }
+    }
+
+    fn current_disk_usage_bytes(&self) -> u64 {
+        let output_dir = self
+            .output_dir
+            .read()
+            .expect("dial9 output_dir lock should not be poisoned")
+            .clone();
+        let file_prefix = self
+            .file_prefix
+            .read()
+            .expect("dial9 file_prefix lock should not be poisoned")
+            .clone();
+
+        let Some(output_dir) = output_dir else {
+            return 0;
+        };
+        let Some(file_prefix) = file_prefix else {
+            return 0;
+        };
+
+        std::fs::read_dir(output_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let filename = entry.file_name();
+                let filename = filename.to_str()?;
+                filename
+                    .starts_with(&file_prefix)
+                    .then(|| entry.metadata().ok().map(|meta| meta.len()))
+            })
+            .flatten()
+            .sum()
+    }
+}
+
+fn dial9_runtime_state() -> &'static Dial9RuntimeState {
+    static STATE: OnceLock<Dial9RuntimeState> = OnceLock::new();
+    STATE.get_or_init(Dial9RuntimeState::new)
+}
+
+fn resolve_sampling_rate() -> (f64, bool) {
+    match std::env::var(ENV_RUNTIME_DIAL9_SAMPLING_RATE) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return (DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE, false);
+            }
+
+            match trimmed.parse::<f64>() {
+                Ok(value) if value.is_finite() => (value.clamp(0.0, 1.0), true),
+                _ => {
+                    warn!(
+                        event = EVENT_DIAL9_STATE,
+                        component = LOG_COMPONENT_OBS,
+                        subsystem = LOG_SUBSYSTEM_DIAL9,
+                        result = "invalid_sampling_rate",
+                        provided = trimmed,
+                        fallback = DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE,
+                        "dial9 state changed"
+                    );
+                    (DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE, true)
+                }
+            }
+        }
+        Err(_) => (DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE, false),
+    }
+}
+
+fn warn_ignored_runtime_knobs(config: &Dial9Config, sampling_rate_explicit: bool) {
+    if config.s3_bucket.is_some() || config.s3_prefix.is_some() {
+        warn!(
+            event = EVENT_DIAL9_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_DIAL9,
+            result = "unsupported_s3_upload_knobs_ignored",
+            s3_bucket = config.s3_bucket.as_deref().unwrap_or(""),
+            s3_prefix = config.s3_prefix.as_deref().unwrap_or(""),
+            "dial9 state changed"
+        );
+    }
+
+    if sampling_rate_explicit {
+        warn!(
+            event = EVENT_DIAL9_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_DIAL9,
+            result = "unsupported_sampling_rate_ignored",
+            sampling_rate = config.sampling_rate,
+            "dial9 state changed"
+        );
+    }
+}
 
 fn sanitize_dial9_max_file_size(bytes: u64) -> u64 {
     bytes.max(1)
@@ -104,11 +258,14 @@ impl Dial9Config {
         let enabled = get_env_bool(ENV_RUNTIME_DIAL9_ENABLED, DEFAULT_RUNTIME_DIAL9_ENABLED);
 
         if !enabled {
-            return Self::default();
+            let config = Self::default();
+            dial9_runtime_state().record_config(&config);
+            return config;
         }
 
         let raw_max_file_size = get_env_opt_u64(ENV_RUNTIME_DIAL9_MAX_FILE_SIZE);
         let raw_rotation_count = get_env_opt_usize(ENV_RUNTIME_DIAL9_ROTATION_COUNT);
+        let (sampling_rate, sampling_rate_explicit) = resolve_sampling_rate();
         let max_file_size = sanitize_dial9_max_file_size(raw_max_file_size.unwrap_or(DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE));
         let rotation_count = sanitize_dial9_rotation_count(raw_rotation_count.unwrap_or(DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT));
         if raw_max_file_size == Some(0) {
@@ -132,7 +289,7 @@ impl Dial9Config {
             );
         }
 
-        Self {
+        let config = Self {
             enabled,
             output_dir: get_env_str(ENV_RUNTIME_DIAL9_OUTPUT_DIR, DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR),
             file_prefix: get_env_str(ENV_RUNTIME_DIAL9_FILE_PREFIX, DEFAULT_RUNTIME_DIAL9_FILE_PREFIX),
@@ -140,8 +297,11 @@ impl Dial9Config {
             rotation_count,
             s3_bucket: get_env_opt_str(ENV_RUNTIME_DIAL9_S3_BUCKET).filter(|s| !s.is_empty()),
             s3_prefix: get_env_opt_str(ENV_RUNTIME_DIAL9_S3_PREFIX).filter(|s| !s.is_empty()),
-            sampling_rate: get_env_f64(ENV_RUNTIME_DIAL9_SAMPLING_RATE, DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE).clamp(0.0, 1.0),
-        }
+            sampling_rate,
+        };
+        warn_ignored_runtime_knobs(&config, sampling_rate_explicit);
+        dial9_runtime_state().record_config(&config);
+        config
     }
 
     /// Get the base path for trace files.
@@ -218,6 +378,7 @@ impl Dial9SessionGuard {
             "dial9 state changed"
         );
 
+        dial9_runtime_state().record_config(&config);
         Ok(Some(Self { _guard: None, config }))
     }
 
@@ -225,24 +386,25 @@ impl Dial9SessionGuard {
     #[allow(dead_code)]
     pub(crate) fn set_guard(&mut self, guard: Dial9TelemetryGuard) {
         self._guard = Some(guard);
+        dial9_runtime_state().record_runtime_started(&self.config);
     }
 
     /// Check if this guard has an active session.
     pub fn is_active(&self) -> bool {
-        self._guard.is_some()
+        dial9_runtime_state().snapshot().active_sessions > 0
     }
 
     /// Flush any pending telemetry data.
     pub async fn shutdown(&self) {
-        if let Some(_guard) = &self._guard {
+        if self.is_active() {
             info!(
                 event = EVENT_DIAL9_STATE,
                 component = LOG_COMPONENT_OBS,
                 subsystem = LOG_SUBSYSTEM_DIAL9,
                 state = "shutdown_requested",
+                result = "runtime_guard_managed_elsewhere",
                 "dial9 state"
             );
-            // TelemetryGuard handles flushing automatically when dropped
         }
     }
 }
@@ -312,10 +474,13 @@ pub fn build_traced_runtime(
     }
 
     let config = Dial9Config::from_env();
+    dial9_runtime_state().record_config(&config);
 
     // Ensure the output directory exists before creating the writer
-    std::fs::create_dir_all(&config.output_dir)
-        .map_err(|e| TelemetryError::Io(format!("Failed to create dial9 output directory '{}': {}", config.output_dir, e)))?;
+    std::fs::create_dir_all(&config.output_dir).map_err(|e| {
+        dial9_runtime_state().record_runtime_error(&config);
+        TelemetryError::Io(format!("Failed to create dial9 output directory '{}': {}", config.output_dir, e))
+    })?;
 
     // Create rotating writer (synchronous for runtime building)
     let base_path = config.base_path();
@@ -324,20 +489,63 @@ pub fn build_traced_runtime(
         config.max_file_size,
         dial9_total_rotation_size(config.max_file_size, config.rotation_count),
     )
-    .map_err(|e| TelemetryError::Io(format!("Failed to create RotatingWriter: {}", e)))?;
+    .map_err(|e| {
+        dial9_runtime_state().record_runtime_error(&config);
+        TelemetryError::Io(format!("Failed to create RotatingWriter: {}", e))
+    })?;
 
     // Build traced runtime
     // Note: sampling_rate and S3 upload settings are reserved for future use
     // once the dial9 library provides support for those configuration options.
-    dial9_tokio_telemetry::telemetry::TracedRuntime::builder()
+    let (runtime, guard) = dial9_tokio_telemetry::telemetry::TracedRuntime::builder()
         .with_task_tracking(true)
         .build(builder, writer)
-        .map_err(|e| TelemetryError::Io(format!("Failed to build TracedRuntime: {}", e)))
+        .map_err(|e| {
+            dial9_runtime_state().record_runtime_error(&config);
+            TelemetryError::Io(format!("Failed to build TracedRuntime: {}", e))
+        })?;
+
+    dial9_runtime_state().record_runtime_started(&config);
+    Ok((runtime, guard))
+}
+
+pub(crate) fn runtime_stats_snapshot() -> Dial9RuntimeSnapshot {
+    dial9_runtime_state().snapshot()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    static DIAL9_ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_dial9_env_lock<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = DIAL9_ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("dial9 env test lock should not be poisoned");
+        f();
+    }
+
+    fn reset_dial9_runtime_state_for_test() {
+        let state = dial9_runtime_state();
+        state.enabled.store(false, Ordering::Relaxed);
+        state.active_sessions.store(0, Ordering::Relaxed);
+        state.errors_total.store(0, Ordering::Relaxed);
+        *state
+            .output_dir
+            .write()
+            .expect("dial9 output_dir lock should not be poisoned") = None;
+        *state
+            .file_prefix
+            .write()
+            .expect("dial9 file_prefix lock should not be poisoned") = None;
+    }
 
     #[test]
     fn test_dial9_config_default() {
@@ -379,5 +587,54 @@ mod tests {
             return;
         }
         assert!(!is_enabled());
+    }
+
+    #[test]
+    fn sampling_rate_rejects_nan_and_falls_back_to_default() {
+        reset_dial9_runtime_state_for_test();
+        with_dial9_env_lock(|| {
+            temp_env::with_var(ENV_RUNTIME_DIAL9_ENABLED, Some("true"), || {
+                temp_env::with_var(ENV_RUNTIME_DIAL9_SAMPLING_RATE, Some("NaN"), || {
+                    let config = Dial9Config::from_env();
+                    assert_eq!(config.sampling_rate, DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE);
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn session_guard_is_active_when_runtime_state_reports_an_active_session() {
+        reset_dial9_runtime_state_for_test();
+        let config = Dial9Config {
+            enabled: true,
+            ..Dial9Config::default()
+        };
+        dial9_runtime_state().record_runtime_started(&config);
+
+        let guard = Dial9SessionGuard { _guard: None, config };
+
+        assert!(guard.is_active());
+    }
+
+    #[test]
+    fn runtime_stats_snapshot_reports_disk_usage_and_errors() {
+        reset_dial9_runtime_state_for_test();
+        let dir = tempdir().expect("create temp dir");
+        let trace_path = dir.path().join("dial9-trace.segment");
+        std::fs::write(&trace_path, vec![0_u8; 128]).expect("write fake dial9 trace");
+
+        let config = Dial9Config {
+            enabled: true,
+            output_dir: dir.path().to_string_lossy().into_owned(),
+            file_prefix: "dial9-trace".to_string(),
+            ..Dial9Config::default()
+        };
+        dial9_runtime_state().record_runtime_started(&config);
+        dial9_runtime_state().record_runtime_error(&config);
+
+        let snapshot = runtime_stats_snapshot();
+        assert_eq!(snapshot.active_sessions, 0);
+        assert_eq!(snapshot.errors_total, 1);
+        assert_eq!(snapshot.disk_usage_bytes, 128);
     }
 }
