@@ -411,7 +411,7 @@ fn build_meter_provider(
         .build()
         .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
 
-    let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
+    let meter_interval = resolve_meter_interval(config);
 
     let (provider, recorder) = Recorder::builder(service_name.to_string())
         .with_meter_provider(|b: opentelemetry_sdk::metrics::MeterProviderBuilder| {
@@ -595,6 +595,22 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
         .build()
 }
 
+fn resolve_meter_interval(config: &OtelConfig) -> u64 {
+    match config.meter_interval {
+        Some(0) => {
+            warn!(
+                result = "invalid_meter_interval",
+                configured_seconds = 0_u64,
+                fallback_seconds = METER_INTERVAL,
+                "Metrics export interval is invalid; using default interval"
+            );
+            METER_INTERVAL
+        }
+        Some(interval) => interval,
+        None => METER_INTERVAL,
+    }
+}
+
 fn resolve_signal_headers(common_headers: Option<&str>, signal_headers: Option<&str>) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     if let Some(raw_headers) = common_headers {
@@ -721,6 +737,16 @@ mod tests {
         assert!(!resolve_otlp_use_stdout(Some(false), false));
         assert!(resolve_otlp_use_stdout(None, false));
         assert!(!resolve_otlp_use_stdout(None, true));
+    }
+
+    #[test]
+    fn test_resolve_meter_interval_rejects_zero() {
+        let config = OtelConfig {
+            meter_interval: Some(0),
+            ..OtelConfig::default()
+        };
+
+        assert_eq!(resolve_meter_interval(&config), METER_INTERVAL);
     }
 
     #[test]

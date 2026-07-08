@@ -102,8 +102,8 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
     ) {
         metrics.push(
             PrometheusMetric::from_descriptor(descriptor, value)
-                .with_label_owned(DRIVE_LABEL, drive_label.to_string())
-                .with_label_owned(SERVER_LABEL, server_label.to_string()),
+                .with_label_owned(SERVER_LABEL, server_label.to_string())
+                .with_label_owned(DRIVE_LABEL, drive_label.to_string()),
         );
     }
 
@@ -129,8 +129,8 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
                     &DRIVE_CAPACITY_OBSERVATION_STATE_MD,
                     if state == stat.capacity_observation_state { 1.0 } else { 0.0 },
                 )
-                .with_label_owned(DRIVE_LABEL, drive_label.to_string())
                 .with_label_owned(SERVER_LABEL, server_label.to_string())
+                .with_label_owned(DRIVE_LABEL, drive_label.to_string())
                 .with_label_owned("state", state.to_string()),
             );
         }
@@ -238,6 +238,23 @@ pub fn collect_process_disk_metrics(
 mod tests {
     use super::*;
     use crate::metrics::report::report_metrics;
+    use std::collections::BTreeSet;
+
+    fn assert_metric_label_keys(
+        metrics: &[PrometheusMetric],
+        descriptor: &'static crate::metrics::schema::MetricDescriptor,
+        value: f64,
+        expected_keys: &[&str],
+    ) {
+        let metric_name = descriptor.get_full_metric_name();
+        let metric = metrics
+            .iter()
+            .find(|metric| metric.name == metric_name && metric.value == value)
+            .expect("expected metric with matching descriptor and value");
+        let actual: BTreeSet<&str> = metric.labels.iter().map(|(key, _)| *key).collect();
+        let expected: BTreeSet<&str> = expected_keys.iter().copied().collect();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_collect_drive_detailed_metrics() {
@@ -277,6 +294,14 @@ mod tests {
         let total_bytes = metrics.iter().find(|m| m.name == total_bytes_name);
         assert!(total_bytes.is_some());
         assert_eq!(total_bytes.map(|m| m.value), Some(1024.0 * 1024.0 * 1024.0 * 100.0));
+        assert_metric_label_keys(
+            &metrics,
+            &DRIVE_TOTAL_BYTES_MD,
+            1024.0 * 1024.0 * 1024.0 * 100.0,
+            &[SERVER_LABEL, DRIVE_LABEL],
+        );
+        assert_metric_label_keys(&metrics, &DRIVE_API_LATENCY_MD, 1500.0, &[SERVER_LABEL, DRIVE_LABEL]);
+        assert_metric_label_keys(&metrics, &DRIVE_CAPACITY_OBSERVATION_STATE_MD, 1.0, &[SERVER_LABEL, DRIVE_LABEL, "state"]);
     }
 
     #[test]

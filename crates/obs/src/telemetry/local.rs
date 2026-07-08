@@ -74,6 +74,25 @@ const STDERR_WARNING_PREFIX: &str = "[WARN]";
 const REQUEST_ID_CANONICAL: &str = "request_id";
 const REQUEST_ID_COMPAT: &str = "request-id";
 
+fn resolve_log_cleanup_interval_seconds(config: &OtelConfig) -> u64 {
+    match config.log_cleanup_interval_seconds {
+        Some(0) => {
+            warn!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+                result = "invalid_cleanup_interval",
+                configured_seconds = 0_u64,
+                fallback_seconds = DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS,
+                "log cleaner state changed"
+            );
+            DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS
+        }
+        Some(seconds) => seconds,
+        None => DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RequestIdJsonFormat<T> {
     inner: Format<Json, T>,
@@ -549,9 +568,7 @@ pub fn spawn_cleanup_task(
         .log_min_file_age_seconds
         .unwrap_or(DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS);
     let dry_run = config.log_dry_run.unwrap_or(DEFAULT_OBS_LOG_DRY_RUN);
-    let cleanup_interval = config
-        .log_cleanup_interval_seconds
-        .unwrap_or(DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS);
+    let cleanup_interval = resolve_log_cleanup_interval_seconds(config);
 
     let cleaner = Arc::new(
         LogCleaner::builder(log_dir, file_pattern, active_filename)
@@ -872,5 +889,15 @@ mod tests {
             span.get("name").and_then(Value::as_str) == Some("request-span")
                 && span.get("request_id").and_then(Value::as_str) == Some("req-parent")
         }));
+    }
+
+    #[test]
+    fn test_resolve_log_cleanup_interval_seconds_rejects_zero() {
+        let config = OtelConfig {
+            log_cleanup_interval_seconds: Some(0),
+            ..OtelConfig::default()
+        };
+
+        assert_eq!(resolve_log_cleanup_interval_seconds(&config), DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS);
     }
 }
