@@ -1925,6 +1925,33 @@ pub(crate) struct TestSseDekProvider {
     master_key: [u8; 32],
 }
 
+/// Parse the base64-encoded 32-byte master key from `__RUSTFS_SSE_SIMPLE_CMK`.
+///
+/// Returns an error (never crashes) for a missing, non-base64, wrong-length, or
+/// all-zero key so callers on the request path can fail the request instead of
+/// taking the whole server down (backlog#806).
+fn parse_simple_sse_cmk(cmk_value: &str) -> Result<[u8; 32], ApiError> {
+    let trimmed = cmk_value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::from(StorageError::other(
+            "SSE simple mode requires __RUSTFS_SSE_SIMPLE_CMK to be set to a base64-encoded 32-byte key",
+        )));
+    }
+    let decoded = BASE64_STANDARD
+        .decode(trimmed)
+        .map_err(|e| ApiError::from(StorageError::other(format!("__RUSTFS_SSE_SIMPLE_CMK must be valid base64: {e}"))))?;
+    let master_key: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+        ApiError::from(StorageError::other(format!(
+            "__RUSTFS_SSE_SIMPLE_CMK must decode to exactly 32 bytes, got {} bytes",
+            v.len()
+        )))
+    })?;
+    if master_key == [0u8; 32] {
+        return Err(ApiError::from(StorageError::other("__RUSTFS_SSE_SIMPLE_CMK must not be an all-zero key")));
+    }
+    Ok(master_key)
+}
+
 impl TestSseDekProvider {
     /// Create a SimpleSseDekProvider with a predefined key (for testing)
     #[cfg(test)]
@@ -1932,41 +1959,15 @@ impl TestSseDekProvider {
         Self { master_key }
     }
 
-    pub fn new() -> Self {
-        let cmk_value = std::env::var("__RUSTFS_SSE_SIMPLE_CMK").unwrap_or_else(|_| "".to_string());
-
-        let master_key = if !cmk_value.is_empty() {
-            match BASE64_STANDARD.decode(cmk_value.trim()) {
-                Ok(v) => {
-                    let decoded_len = v.len();
-                    match v.try_into() {
-                        Ok(arr) => {
-                            tracing::info!("Successfully loaded SSE master key (32 bytes)");
-                            arr
-                        }
-                        Err(_) => {
-                            tracing::error!("Failed to load master key: decoded key is not 32 bytes (got {decoded_len} bytes)");
-                            [0u8; 32]
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to load master key: invalid base64 encoding: {e}");
-                    [0u8; 32]
-                }
-            }
-        } else {
-            [0u8; 32]
-        };
-
-        if master_key == [0u8; 32] {
-            tracing::error!(
-                "No valid SSE master key loaded. Set __RUSTFS_SSE_SIMPLE_CMK environment variable to a base64-encoded 32-byte key."
-            );
-            std::process::exit(1);
-        }
-
-        Self { master_key }
+    pub fn new() -> Result<Self, ApiError> {
+        let cmk_value = std::env::var("__RUSTFS_SSE_SIMPLE_CMK").unwrap_or_default();
+        // A missing/invalid key must surface as a request error, never crash the
+        // whole server: `TestSseDekProvider::new` is reached from the SSE request
+        // path (get_sse_dek_provider), so `process::exit(1)` here turned a bad
+        // `__RUSTFS_SSE_SIMPLE_CMK` into a process crash-loop DoS (backlog#806).
+        let master_key = parse_simple_sse_cmk(&cmk_value)?;
+        tracing::info!("Successfully loaded SSE master key (32 bytes)");
+        Ok(Self { master_key })
     }
 
     /// Create a local SSE DEK provider for SSE-S3 when KMS is not configured.
@@ -2128,7 +2129,7 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
     // Determine provider: KMS when available, else test env, else local SSE-S3 fallback (no KMS)
     let provider: Arc<dyn SseDekProvider> = if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
         debug!("Using SimpleSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK");
-        Arc::new(TestSseDekProvider::new())
+        Arc::new(TestSseDekProvider::new()?)
     } else {
         debug!("Using local SSE-S3 provider (KMS not configured)");
         Arc::new(TestSseDekProvider::new_for_local_sse()?)
@@ -2460,6 +2461,30 @@ mod tests {
         validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params,
         verify_ssec_key_match,
     };
+
+    #[test]
+    fn parse_simple_sse_cmk_rejects_bad_keys_without_crashing() {
+        // Empty / whitespace-only.
+        assert!(super::parse_simple_sse_cmk("").is_err());
+        assert!(super::parse_simple_sse_cmk("   ").is_err());
+        // Not valid base64.
+        assert!(super::parse_simple_sse_cmk("@@@not-base64@@@").is_err());
+        // Valid base64 but wrong length (16 bytes).
+        let short = BASE64_STANDARD.encode([1u8; 16]);
+        assert!(super::parse_simple_sse_cmk(&short).is_err());
+        // All-zero 32-byte key is rejected.
+        let zero = BASE64_STANDARD.encode([0u8; 32]);
+        assert!(super::parse_simple_sse_cmk(&zero).is_err());
+    }
+
+    #[test]
+    fn parse_simple_sse_cmk_accepts_valid_32_byte_key() {
+        let mut key = [0u8; 32];
+        key[0] = 7;
+        let encoded = BASE64_STANDARD.encode(key);
+        let got = super::parse_simple_sse_cmk(&encoded).expect("valid 32-byte key must parse");
+        assert_eq!(got, key);
+    }
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Key, Nonce};
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};

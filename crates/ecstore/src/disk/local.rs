@@ -924,6 +924,22 @@ fn is_bitrot_size_mismatch_error(err: &std::io::Error) -> bool {
     err.to_string().contains("bitrot shard file size mismatch")
 }
 
+fn metacache_write_error(err: rustfs_filemeta::Error) -> DiskError {
+    let err = DiskError::from(err);
+    if err.contains_io_error_kind(ErrorKind::BrokenPipe) {
+        DiskError::metacache_output_stream_closed()
+    } else {
+        err
+    }
+}
+
+async fn write_metacache_obj<W>(out: &mut MetacacheWriter<W>, obj: &MetaCacheEntry) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    out.write_obj(obj).await.map_err(metacache_write_error)
+}
+
 impl FileCacheReclaimReader {
     fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
         #[cfg(target_os = "macos")]
@@ -3095,11 +3111,14 @@ impl LocalDisk {
                     *objs_returned += 1;
                 }
 
-                out.write_obj(&MetaCacheEntry {
-                    name: name.clone(),
-                    metadata: metadata.to_vec(),
-                    ..Default::default()
-                })
+                write_metacache_obj(
+                    out,
+                    &MetaCacheEntry {
+                        name: name.clone(),
+                        metadata: metadata.to_vec(),
+                        ..Default::default()
+                    },
+                )
                 .await?;
 
                 continue;
@@ -3155,10 +3174,13 @@ impl LocalDisk {
                 && *last_name < name
             {
                 let (pop, skip_object, dir_to_skip) = dir_stack.pop().expect("operation should succeed");
-                out.write_obj(&MetaCacheEntry {
-                    name: pop.clone(),
-                    ..Default::default()
-                })
+                write_metacache_obj(
+                    out,
+                    &MetaCacheEntry {
+                        name: pop.clone(),
+                        ..Default::default()
+                    },
+                )
                 .await?;
 
                 let scan_path = pop.clone();
@@ -3166,15 +3188,17 @@ impl LocalDisk {
                     && let Err(er) =
                         Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
                 {
-                    error!(
-                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        path = %scan_path,
-                        operation = "scan_dir",
-                        error = ?er,
-                        "Disk local scan failed"
-                    );
+                    if !er.is_metacache_output_stream_closed() {
+                        error!(
+                            event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = %scan_path,
+                            operation = "scan_dir",
+                            error = ?er,
+                            "Disk local scan failed"
+                        );
+                    }
                     return Err(er);
                 }
             }
@@ -3204,7 +3228,7 @@ impl LocalDisk {
 
                     meta.metadata = res.to_vec();
 
-                    out.write_obj(&meta).await?;
+                    write_metacache_obj(out, &meta).await?;
 
                     let file_meta = if opts.limit > 0 || opts.recursive {
                         FileMeta::load(&res).ok()
@@ -3273,10 +3297,13 @@ impl LocalDisk {
                 return Ok(());
             }
 
-            out.write_obj(&MetaCacheEntry {
-                name: dir.clone(),
-                ..Default::default()
-            })
+            write_metacache_obj(
+                out,
+                &MetaCacheEntry {
+                    name: dir.clone(),
+                    ..Default::default()
+                },
+            )
             .await?;
 
             let scan_path = dir.clone();
@@ -3284,15 +3311,17 @@ impl LocalDisk {
                 && let Err(er) =
                     Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
-                error!(
-                    event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    path = %scan_path,
-                    operation = "scan_dir",
-                    error = ?er,
-                    "Disk local recursive scan failed"
-                );
+                if !er.is_metacache_output_stream_closed() {
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %scan_path,
+                        operation = "scan_dir",
+                        error = ?er,
+                        "Disk local recursive scan failed"
+                    );
+                }
                 return Err(er);
             }
         }
@@ -4291,7 +4320,7 @@ impl DiskAPI for LocalDisk {
                     metadata: data.to_vec(),
                     ..Default::default()
                 };
-                out.write_obj(&meta).await?;
+                write_metacache_obj(&mut out, &meta).await?;
                 objs_returned += 1;
             } else {
                 let fpath =
@@ -6516,6 +6545,49 @@ mod test {
         tokio::time::advance(Duration::from_secs(2)).await;
 
         assert!(!wait.await.expect("operation should succeed"));
+    }
+
+    #[test]
+    fn metacache_write_obj_classifies_closed_output_stream() {
+        struct BrokenPipeWriter;
+
+        impl AsyncWrite for BrokenPipeWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed")))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut writer = BrokenPipeWriter;
+        let mut out = MetacacheWriter::new(&mut writer);
+
+        let err = futures::executor::block_on(write_metacache_obj(
+            &mut out,
+            &MetaCacheEntry {
+                name: "object".to_string(),
+                ..Default::default()
+            },
+        ))
+        .expect_err("closed metacache output stream should fail");
+
+        assert!(err.is_metacache_output_stream_closed());
     }
 
     #[tokio::test]

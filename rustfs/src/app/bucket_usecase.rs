@@ -1766,14 +1766,21 @@ impl DefaultBucketUsecase {
 
         let replication_configuration = match metadata_sys::get_replication_config(&bucket).await {
             Ok((cfg, _created)) => cfg,
+            Err(StorageError::ConfigNotFound) => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::ReplicationConfigurationNotFoundError,
+                    "replication not found".to_string(),
+                ));
+            }
             Err(err) => {
-                error!("get_replication_config err {:?}", err);
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::ReplicationConfigurationNotFoundError,
-                        "replication not found".to_string(),
-                    ));
-                }
+                warn!(
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                    event = "bucket_replication_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket replication configuration"
+                );
                 return Err(ApiError::from(err).into());
             }
         };
