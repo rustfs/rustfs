@@ -368,28 +368,33 @@ impl LogCleaner {
                     }
                 });
             }
+            drop(tx);
+
+            let mut deletable = Vec::with_capacity(files.len());
+            for result in rx {
+                if result.compressed {
+                    deletable.push(result.file);
+                }
+            }
+
+            deletable
         });
-        drop(tx);
 
         // Any worker panic triggers deterministic fallback behavior.
-        if scope_result.is_err() {
-            warn!(
-                event = EVENT_LOG_CLEANER_STATE,
-                component = LOG_COMPONENT_OBS,
-                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
-                result = "parallel_worker_panicked",
-                fallback = "serial",
-                "log cleaner state changed"
-            );
-            return self.serial_compress_and_delete(files);
-        }
-
-        let mut deletable = Vec::with_capacity(files.len());
-        for result in rx {
-            if result.compressed {
-                deletable.push(result.file);
+        let deletable = match scope_result {
+            Ok(deletable) => deletable,
+            Err(_) => {
+                warn!(
+                    event = EVENT_LOG_CLEANER_STATE,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                    result = "parallel_worker_panicked",
+                    fallback = "serial",
+                    "log cleaner state changed"
+                );
+                return self.serial_compress_and_delete(files);
             }
-        }
+        };
 
         let (deleted, freed) = self.delete_files(&deletable)?;
         let elapsed = started_at.elapsed().as_secs_f64();
