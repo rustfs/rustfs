@@ -3902,6 +3902,21 @@ mod tests {
         )
     }
 
+    fn test_deferred_object_bitrot_reader() -> (ObjectBitrotReader, DeferredReaderStripeHandle) {
+        create_deferred_bitrot_reader_with_stripe_handle(
+            Some(Bytes::from_static(&[1, 2, 3, 4])),
+            None,
+            "bucket",
+            "object/part.1",
+            0,
+            4,
+            4,
+            HashAlgorithm::None,
+            false,
+            false,
+        )
+    }
+
     #[test]
     fn dangling_delete_grace_defaults_to_one_hour() {
         temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, None::<&str>, || {
@@ -4179,7 +4194,8 @@ mod tests {
         assert_eq!(verification_setup.setup_target(3, 2, BitrotReaderSetupMode::VerifyReconstruction), 4);
         assert!(verification_setup.has_setup_quorum(3, 2, BitrotReaderSetupMode::ReadQuorum));
 
-        setup.retain_deferred_reader(3, test_object_bitrot_reader());
+        let (deferred_reader, stripe_handle) = test_deferred_object_bitrot_reader();
+        setup.retain_deferred_reader(3, deferred_reader, stripe_handle);
         assert_eq!(setup.deferred_shards(), 1);
         assert!(setup.readers[3].is_some());
         assert!(setup.errors[3].is_none());
@@ -4248,24 +4264,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_rename_data_dir_deletes_committed_data_dir_and_fails_closed() {
+    async fn commit_rename_data_dir_reclaims_old_data_dir_and_reports_receipt() {
         let bucket = "commit-rename-bucket";
         let object = "object";
-        let data_dir = "11111111-1111-1111-1111-111111111111";
-        let path = format!("{object}/{data_dir}/part.1");
+        let old_data_dir = "11111111-1111-1111-1111-111111111111";
+        let committed_data_dir = "22222222-2222-2222-2222-222222222222";
+        let path = format!("{object}/{old_data_dir}/part.1");
         let (_dir1, disk1) = read_multiple_test_disk(bucket, &[(&path, b"one".as_slice())]).await;
         let (_dir2, disk2) = read_multiple_test_disk(bucket, &[(&path, b"two".as_slice())]).await;
         let set = io_primitives_test_set(vec![Some(disk1.clone()), Some(disk2.clone())], 1).await;
 
-        set.commit_rename_data_dir(&[Some(disk1.clone()), Some(disk2.clone())], bucket, object, data_dir, 2)
-            .await
-            .expect("both disks should delete the committed data dir");
+        let cleanup = set
+            .commit_rename_data_dir(
+                &[Some(disk1.clone()), Some(disk2.clone())],
+                bucket,
+                object,
+                old_data_dir,
+                committed_data_dir,
+                2,
+            )
+            .await;
+        assert_eq!(cleanup.attempted, 2);
+        assert_eq!(cleanup.reclaimed, 2);
+        assert!(!cleanup.has_residue());
 
         assert!(matches!(disk1.read_all(bucket, &path).await, Err(DiskError::FileNotFound)));
         assert!(matches!(disk2.read_all(bucket, &path).await, Err(DiskError::FileNotFound)));
 
-        let missing = set.commit_rename_data_dir(&[None, None], bucket, object, data_dir, 1).await;
-        assert!(missing.is_err(), "missing disk slots must fail closed when cleanup quorum is required");
+        let missing = set
+            .commit_rename_data_dir(&[None, None], bucket, object, old_data_dir, committed_data_dir, 1)
+            .await;
+        assert_eq!(missing.attempted, 0);
+        assert_eq!(missing.reclaimed, 0);
+        assert!(!missing.has_residue(), "missing disk slots must not be counted as cleanup residue");
+        assert!(missing.below_quorum, "missing disk slots should remain visible in the quorum lens");
     }
 
     #[tokio::test]

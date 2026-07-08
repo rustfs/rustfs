@@ -9417,10 +9417,22 @@ mod test {
         });
 
         temp_env::with_var_unset(ENV_RUSTFS_DRIVE_SYNC_ENABLE, || {
-            assert!(drive_sync_enabled());
+            assert_eq!(
+                resolve_durability_mode(
+                    None,
+                    rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
+                ),
+                DurabilityMode::Strict
+            );
         });
         temp_env::with_var(ENV_RUSTFS_DRIVE_SYNC_ENABLE, Some("false"), || {
-            assert!(!drive_sync_enabled());
+            assert_eq!(
+                resolve_durability_mode(
+                    None,
+                    rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
+                ),
+                DurabilityMode::LegacyOff
+            );
         });
 
         temp_env::with_var_unset(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, || {

@@ -660,25 +660,27 @@ mod tests {
     }
 
     #[test]
-    fn rustfs_codec_decode_engine_rejects_missing_source_after_reconstruction() {
+    fn rustfs_codec_decode_engine_rebuilds_missing_parity_for_source_verification() {
         let erasure = Erasure::new(2, 3, 32);
         let encoded = erasure
             .encode_data(&(0u8..64u8).collect::<Vec<_>>())
             .expect("test stripe should encode");
         let mut shards = encoded.into_iter().map(|shard| Some(shard.to_vec())).collect::<Vec<_>>();
         shards[0] = None;
-        shards[erasure.data_shards + erasure.parity_shards - 1] = None;
+        let missing_parity_index = erasure.data_shards + erasure.parity_shards - 1;
+        shards[missing_parity_index] = None;
 
         let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
         let mut workspace = engine
             .prepare_workspace(erasure.shard_size())
             .expect("workspace should be prepared");
-        let err = engine
+        let outcome = engine
             .reconstruct_into(&mut shards, &mut workspace)
-            .expect_err("source verification must reject a missing parity shard");
+            .expect("missing data plus missing parity should be recoverable");
 
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("missing shard"));
+        assert_eq!(outcome, GET_RECONSTRUCT_OUTCOME_RUSTFS_CALLED);
+        assert!(shards[0].is_some());
+        assert!(shards[missing_parity_index].is_some());
     }
 
     #[test]
