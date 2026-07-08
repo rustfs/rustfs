@@ -491,10 +491,7 @@ mod tests {
         let _ = recorder.register_counter(&first, &meta);
         let second_metadata = recorder.get_metadata_for_builder("shared_counter");
         assert!(second_metadata.is_some());
-        assert_eq!(
-            second_metadata.as_ref().and_then(|metadata| metadata.unit.clone()),
-            Unit::from_string("bytes")
-        );
+        assert_eq!(second_metadata.as_ref().and_then(|metadata| metadata.unit), Unit::from_string("bytes"));
         assert_eq!(
             second_metadata.as_ref().map(|metadata| metadata.description.to_string()),
             Some("shared description".to_string())
