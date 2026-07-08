@@ -38,7 +38,7 @@ use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::global_metrics;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use sysinfo::{Networks, System};
 use tracing::{instrument, warn};
 
@@ -49,6 +49,7 @@ const EVENT_METRICS_COLLECTOR_STATE: &str = "metrics_collector_state";
 type ObsStorageInfo = <ObsStore as StorageAdminApi>::StorageInfo;
 
 struct ObsDataUsageInfo {
+    last_update: Option<SystemTime>,
     buckets_count: u64,
     objects_total_count: u64,
     versions_total_count: u64,
@@ -82,6 +83,7 @@ async fn load_obs_data_usage_from_backend(store: Arc<ObsStore>) -> ObsEcstoreRes
     let data_usage = obs_load_data_usage_from_backend(store).await?;
 
     Ok(ObsDataUsageInfo {
+        last_update: data_usage.last_update,
         buckets_count: data_usage.buckets_count,
         objects_total_count: data_usage.objects_total_count,
         versions_total_count: data_usage.versions_total_count,
@@ -882,10 +884,15 @@ pub async fn collect_cluster_usage_metric_stats() -> Option<(ClusterUsageStats, 
 
     Some((
         ClusterUsageStats {
+            since_last_update_seconds: crate::metrics::collectors::cluster_usage::usage_since_last_update_seconds(
+                data_usage.last_update,
+                SystemTime::now(),
+            ),
             total_bytes: data_usage.objects_total_size,
             objects_count: data_usage.objects_total_count,
             versions_count: data_usage.versions_total_count,
             delete_markers_count: data_usage.delete_markers_total_count,
+            buckets_count: data_usage.buckets_count,
             object_size_distribution: data_usage
                 .buckets_usage
                 .values()
