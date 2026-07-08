@@ -1419,7 +1419,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
 
         let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
-        self.cleanup_multipart_path(&parts).await;
 
         let (online_disks, versions, op_old_dir, cleanup_disks) = Self::rename_data(
             &shuffle_disks,
@@ -1431,6 +1430,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             write_quorum,
         )
         .await?;
+
+        // backlog#946: reclaim the stale per-part metadata (and any superfluous
+        // part.N data files no longer in the completed set) only *after* the
+        // authoritative rename_data commit above has succeeded. If rename_data
+        // fails write quorum and returns via `?`, the upload directory must keep
+        // its part.N.meta so a retried CompleteMultipartUpload can still read the
+        // parts; deleting them before the commit would strand the upload
+        // permanently. This mirrors the "clean up only after commit" pattern
+        // already used for the old data-dir GC and the upload-dir delete_all below.
+        self.cleanup_multipart_path(&parts).await;
 
         if let Some(old_dir) = op_old_dir {
             let committed_dir = fi.data_dir.unwrap_or_default().to_string();
@@ -1839,6 +1848,135 @@ mod tests {
         assert_eq!(
             seen, created,
             "single-upload pagination must enumerate every upload with no loss or duplication"
+        );
+    }
+
+    /// Recursively collect every file named `file_name` under the multipart
+    /// staging bucket on a single disk. Used to observe whether a failed commit
+    /// left the per-part metadata intact for a retry.
+    async fn multipart_meta_files_on_disk(temp_dir: &TempDir, file_name: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![temp_dir.path().join(RUSTFS_META_MULTIPART_BUCKET)];
+        while let Some(dir) = stack.pop() {
+            let mut read_dir = match tokio::fs::read_dir(&dir).await {
+                Ok(read_dir) => read_dir,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => panic!("multipart dir {dir:?} should be listable: {err}"),
+            };
+            while let Some(entry) = read_dir.next_entry().await.expect("multipart dir entry should be readable") {
+                let file_type = entry.file_type().await.expect("dir entry file type should be readable");
+                if file_type.is_dir() {
+                    stack.push(entry.path());
+                } else if entry.file_name().to_string_lossy() == file_name {
+                    found.push(entry.path().display().to_string());
+                }
+            }
+        }
+        found
+    }
+
+    /// Total number of `part.1.meta` files across every disk's multipart staging area.
+    async fn total_part1_meta(temp_dirs: &[TempDir]) -> usize {
+        let mut n = 0;
+        for dir in temp_dirs {
+            n += multipart_meta_files_on_disk(dir, "part.1.meta").await.len();
+        }
+        n
+    }
+
+    /// backlog#946: `complete_multipart_upload` must clean up the stale
+    /// `part.N.meta` files only *after* the authoritative `rename_data` commit
+    /// succeeds. If the commit fails write quorum, the upload directory has to
+    /// keep its `part.N.meta` so a retried CompleteMultipartUpload can still read
+    /// the parts; deleting them beforehand permanently strands the upload.
+    ///
+    /// The commit is forced to fail *at rename_data* (not earlier): the multipart
+    /// staging dir stays readable on every disk so `check_upload_id_exists` and
+    /// `read_parts` pass write/read quorum, while the destination bucket
+    /// directory is made unwritable on *every* disk so `rename_data` fails the
+    /// commit on all disks (never moving the staging data) and returns below
+    /// write quorum. That reproduces the issue's real failure mode, where the
+    /// staging `part.N.meta` would still be present if not deleted prematurely.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_multipart_keeps_part_meta_when_commit_fails_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-commit-retry-bucket";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        // Upload one full, valid part while every disk is online. A single part
+        // is the last part, so the minimum-part-size gate does not apply and a
+        // small payload keeps the test fast.
+        let part_size = 4096usize;
+        let mut reader = PutObjReader::new(
+            HashReader::from_stream(Cursor::new(vec![9u8; part_size]), part_size as i64, part_size as i64, None, None, false)
+                .expect("hash reader should be constructed"),
+        );
+        let part_info = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("uploading the part should succeed");
+
+        // Every disk must hold part.1.meta in the staging area now.
+        let before = total_part1_meta(&temp_dirs).await;
+        assert_eq!(before, temp_dirs.len(), "the uploaded part must write part.1.meta to every disk");
+
+        // Lock the destination bucket directory on *all* disks so the commit's
+        // rename into `bucket/object` fails everywhere: rename_data cannot reach
+        // write quorum and no disk moves the readable staging metadata.
+        let locked_buckets: Vec<std::path::PathBuf> = temp_dirs.iter().map(|d| d.path().join(bucket)).collect();
+        for path in &locked_buckets {
+            let mut perms = std::fs::metadata(path).expect("bucket dir metadata").permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(path, perms).expect("bucket dir should be made read-only");
+        }
+
+        let completed = set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part_info.part_num,
+                    etag: part_info.etag.clone(),
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await;
+
+        // Restore write permission so the temp dirs can be cleaned up and the
+        // staging metadata re-read below.
+        for path in &locked_buckets {
+            let mut perms = std::fs::metadata(path).expect("bucket dir metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("bucket dir should be made writable again");
+        }
+
+        assert!(
+            completed.is_err(),
+            "commit must fail once the destination is unwritable on every disk, got {completed:?}"
+        );
+
+        // Regression assertion: the failed commit must NOT have deleted the
+        // staging part.1.meta. Old code cleaned up before rename_data and would
+        // leave zero here, permanently breaking a retried CompleteMultipartUpload.
+        let after = total_part1_meta(&temp_dirs).await;
+        assert_eq!(
+            after,
+            temp_dirs.len(),
+            "part.1.meta must survive a failed commit so CompleteMultipartUpload stays retryable"
         );
     }
 
