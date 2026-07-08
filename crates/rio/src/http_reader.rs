@@ -62,7 +62,17 @@ pub enum InternodeHttpErrorKind {
 impl InternodeHttpErrorKind {
     pub fn is_retryable(self) -> bool {
         match self {
-            Self::ConnectTimeout | Self::ConnectionRefused | Self::ConnectionReset | Self::BodyStreamAborted => true,
+            // `DnsResolutionFailed` is retryable: MinIO's `IsNetworkOrHostDown`
+            // treats `*net.DNSError` as network-or-host-down (=> retryable), and
+            // RustFS already retries transient DNS failures at
+            // `crates/ecstore/src/layout/endpoints.rs:580` (`is_retryable_dns_error`).
+            // Consumers apply bounded retries, so a permanent NXDOMAIN costs at
+            // most one extra attempt while transient resolution failures recover.
+            Self::ConnectTimeout
+            | Self::ConnectionRefused
+            | Self::ConnectionReset
+            | Self::BodyStreamAborted
+            | Self::DnsResolutionFailed => true,
             Self::HttpStatus(status) => matches!(
                 status,
                 reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -70,7 +80,7 @@ impl InternodeHttpErrorKind {
                     | reqwest::StatusCode::SERVICE_UNAVAILABLE
                     | reqwest::StatusCode::GATEWAY_TIMEOUT
             ),
-            Self::DnsResolutionFailed | Self::Unknown => false,
+            Self::Unknown => false,
         }
     }
 
@@ -578,32 +588,100 @@ fn internode_request_context(method: &Method, url: &str, operation: Option<&'sta
     }
 }
 
-fn classify_reqwest_error(err: &reqwest::Error) -> InternodeHttpErrorKind {
-    if err.is_timeout() {
+/// Classify a transport-level error into an [`InternodeHttpErrorKind`].
+///
+/// Strategy is "typed-first, string-only-for-DNS", mirroring MinIO's
+/// `xnet.IsNetworkOrHostDown`: we trust structured signals (reqwest flags and
+/// the `io::Error` chain) and only fall back to fragile message matching for
+/// DNS detection, which reqwest/hyper do not expose as a typed error kind.
+///
+/// Ordering matters:
+/// 1. A caller-reported timeout wins outright (`ConnectTimeout`).
+/// 2. A typed `io::ErrorKind` anywhere in the source chain wins over any
+///    string or body signal — a real `ConnectionRefused` must never be
+///    mislabeled `DnsResolutionFailed` just because "dns" appears in the text.
+/// 3. Only for connect-phase failures with no typed kind do we consult the
+///    DNS string heuristic, then default to `ConnectionRefused`.
+/// 4. Body-phase failures map to `BodyStreamAborted`.
+/// 5. Anything else is `Unknown`.
+fn classify_transport_error(
+    err: &(dyn std::error::Error + 'static),
+    is_timeout: bool,
+    is_connect: bool,
+    is_body: bool,
+) -> InternodeHttpErrorKind {
+    if is_timeout {
         return InternodeHttpErrorKind::ConnectTimeout;
     }
 
-    let message = err.to_string().to_ascii_lowercase();
-    if err.is_connect() {
-        if message.contains("dns")
-            || message.contains("name or service not known")
-            || message.contains("failed to lookup address")
-        {
-            return InternodeHttpErrorKind::DnsResolutionFailed;
-        }
-        if message.contains("refused") {
-            return InternodeHttpErrorKind::ConnectionRefused;
-        }
+    if let Some(kind) = find_io_error_kind_in_chain(err) {
+        return kind;
     }
 
-    if message.contains("connection reset") || message.contains("broken pipe") || message.contains("connection aborted") {
-        return InternodeHttpErrorKind::ConnectionReset;
+    if is_connect {
+        if chain_contains_dns_marker(err) {
+            return InternodeHttpErrorKind::DnsResolutionFailed;
+        }
+        return InternodeHttpErrorKind::ConnectionRefused;
     }
-    if message.contains("body") || message.contains("stream") {
+
+    if is_body {
         return InternodeHttpErrorKind::BodyStreamAborted;
     }
 
     InternodeHttpErrorKind::Unknown
+}
+
+/// Walk the error source chain looking for a `std::io::Error` and map its
+/// [`io::ErrorKind`] onto our typed classification. Returns `None` when no
+/// `io::Error` is present or its kind carries no actionable signal.
+fn find_io_error_kind_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<InternodeHttpErrorKind> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        if let Some(io_err) = current.downcast_ref::<io::Error>() {
+            match io_err.kind() {
+                io::ErrorKind::ConnectionRefused => return Some(InternodeHttpErrorKind::ConnectionRefused),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionAborted => {
+                    return Some(InternodeHttpErrorKind::ConnectionReset);
+                }
+                io::ErrorKind::TimedOut => return Some(InternodeHttpErrorKind::ConnectTimeout),
+                io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable => {
+                    return Some(InternodeHttpErrorKind::ConnectionRefused);
+                }
+                _ => {}
+            }
+        }
+        source = current.source();
+    }
+    None
+}
+
+/// The SOLE remaining string heuristic, gated behind `is_connect`: reqwest and
+/// hyper surface DNS resolution failures only as opaque messages, so we walk the
+/// source chain and match well-known DNS wordings across OS locales/resolvers.
+fn chain_contains_dns_marker(err: &(dyn std::error::Error + 'static)) -> bool {
+    const DNS_MARKERS: [&str; 6] = [
+        "dns",
+        "failed to lookup address",
+        "name or service not known",
+        "nodename nor servname",
+        "no such host",
+        "temporary failure in name resolution",
+    ];
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        let message = current.to_string().to_ascii_lowercase();
+        if DNS_MARKERS.iter().any(|marker| message.contains(marker)) {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+fn classify_reqwest_error(err: &reqwest::Error) -> InternodeHttpErrorKind {
+    classify_transport_error(err, err.is_timeout(), err.is_connect(), err.is_body())
 }
 
 fn classify_http_status(status: reqwest::StatusCode) -> InternodeHttpErrorKind {
@@ -1317,6 +1395,172 @@ mod tests {
         net::TcpListener,
         sync::{Mutex, Notify},
     };
+
+    /// Minimal error wrapper whose `source()` returns a boxed inner error, used
+    /// to exercise `classify_transport_error` (reqwest::Error cannot be built by
+    /// hand). The inner error may itself be an `io::Error` or another wrapper.
+    #[derive(Debug)]
+    struct WrapperError {
+        message: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    }
+
+    impl WrapperError {
+        fn new(message: &str, source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>) -> Self {
+            Self {
+                message: message.to_string(),
+                source,
+            }
+        }
+    }
+
+    impl std::fmt::Display for WrapperError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for WrapperError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_ref().map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn io_source(kind: io::ErrorKind) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        Box::new(io::Error::new(kind, "io"))
+    }
+
+    #[test]
+    fn classify_io_connection_refused() {
+        let err = WrapperError::new("transport", Some(io_source(io::ErrorKind::ConnectionRefused)));
+        let kind = classify_transport_error(&err, false, true, false);
+        assert_eq!(kind, InternodeHttpErrorKind::ConnectionRefused);
+        assert!(kind.is_retryable());
+    }
+
+    #[test]
+    fn classify_io_reset_variants() {
+        for io_kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            let err = WrapperError::new("transport", Some(io_source(io_kind)));
+            assert_eq!(
+                classify_transport_error(&err, false, false, false),
+                InternodeHttpErrorKind::ConnectionReset,
+                "{io_kind:?} should map to ConnectionReset"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_io_unreachable_variants() {
+        for io_kind in [io::ErrorKind::HostUnreachable, io::ErrorKind::NetworkUnreachable] {
+            let err = WrapperError::new("transport", Some(io_source(io_kind)));
+            assert_eq!(
+                classify_transport_error(&err, false, true, false),
+                InternodeHttpErrorKind::ConnectionRefused,
+                "{io_kind:?} should map to ConnectionRefused"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_io_timed_out_without_timeout_flag() {
+        let err = WrapperError::new("transport", Some(io_source(io::ErrorKind::TimedOut)));
+        assert_eq!(
+            classify_transport_error(&err, false, false, false),
+            InternodeHttpErrorKind::ConnectTimeout
+        );
+    }
+
+    #[test]
+    fn classify_timeout_flag_short_circuits() {
+        // Even with an io ConnectionRefused in the chain, is_timeout wins.
+        let err = WrapperError::new("transport", Some(io_source(io::ErrorKind::ConnectionRefused)));
+        assert_eq!(classify_transport_error(&err, true, true, false), InternodeHttpErrorKind::ConnectTimeout);
+    }
+
+    #[test]
+    fn classify_connect_dns_marker_without_io_kind() {
+        let err = WrapperError::new("connect error: nodename nor servname provided", None);
+        assert_eq!(
+            classify_transport_error(&err, false, true, false),
+            InternodeHttpErrorKind::DnsResolutionFailed
+        );
+    }
+
+    #[test]
+    fn classify_connect_no_dns_marker_defaults_refused() {
+        let err = WrapperError::new("connect error", None);
+        assert_eq!(
+            classify_transport_error(&err, false, true, false),
+            InternodeHttpErrorKind::ConnectionRefused
+        );
+    }
+
+    #[test]
+    fn classify_body_only() {
+        let err = WrapperError::new("body error", None);
+        assert_eq!(
+            classify_transport_error(&err, false, false, true),
+            InternodeHttpErrorKind::BodyStreamAborted
+        );
+    }
+
+    #[test]
+    fn classify_nothing_is_unknown() {
+        let err = WrapperError::new("mystery", None);
+        assert_eq!(classify_transport_error(&err, false, false, false), InternodeHttpErrorKind::Unknown);
+    }
+
+    #[test]
+    fn classify_typed_wins_over_body() {
+        // io ConnectionReset present AND is_body: typed classification wins.
+        let err = WrapperError::new("stream body error", Some(io_source(io::ErrorKind::ConnectionReset)));
+        assert_eq!(
+            classify_transport_error(&err, false, false, true),
+            InternodeHttpErrorKind::ConnectionReset
+        );
+    }
+
+    #[test]
+    fn classify_typed_wins_over_dns_message() {
+        // Message says "dns" but a real io ConnectionRefused is in the chain and
+        // is_connect is set: typed signal wins, never mislabeled as DNS.
+        let err = WrapperError::new("dns lookup failure", Some(io_source(io::ErrorKind::ConnectionRefused)));
+        assert_eq!(
+            classify_transport_error(&err, false, true, false),
+            InternodeHttpErrorKind::ConnectionRefused
+        );
+    }
+
+    #[test]
+    fn is_retryable_table() {
+        use InternodeHttpErrorKind::*;
+        for kind in [
+            ConnectTimeout,
+            ConnectionRefused,
+            ConnectionReset,
+            BodyStreamAborted,
+            DnsResolutionFailed,
+            HttpStatus(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            HttpStatus(reqwest::StatusCode::BAD_GATEWAY),
+            HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            HttpStatus(reqwest::StatusCode::GATEWAY_TIMEOUT),
+        ] {
+            assert!(kind.is_retryable(), "{kind:?} should be retryable");
+        }
+        for kind in [
+            Unknown,
+            HttpStatus(reqwest::StatusCode::NOT_FOUND),
+            HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            HttpStatus(reqwest::StatusCode::BAD_REQUEST),
+        ] {
+            assert!(!kind.is_retryable(), "{kind:?} should not be retryable");
+        }
+    }
 
     #[derive(Clone, Default)]
     struct TestState {

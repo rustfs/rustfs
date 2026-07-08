@@ -3687,7 +3687,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_disk_append_file_does_not_retry_non_retryable_open_write_error() {
         let transport = RetryingOpenWriteInternodeDataTransport::with_steps(vec![OpenWriteTestStep::Error(DiskError::from(
-            rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::DnsResolutionFailed),
+            rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::Unknown),
         ))]);
         let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
 
@@ -3696,10 +3696,7 @@ mod tests {
             Err(err) => err,
         };
 
-        assert_eq!(
-            err.internode_http_error_kind(),
-            Some(rustfs_rio::InternodeHttpErrorKind::DnsResolutionFailed)
-        );
+        assert_eq!(err.internode_http_error_kind(), Some(rustfs_rio::InternodeHttpErrorKind::Unknown));
         assert_eq!(transport.calls().len(), 1, "append_file should not retry non-retryable errors");
     }
 
