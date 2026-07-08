@@ -83,7 +83,6 @@ checked_files=(
   "crates/protocols/src/swift/expiration_worker.rs"
   "crates/protocols/src/swift/versioning.rs"
   "crates/protocols/src/swift/bulk.rs"
-  "crates/protocols/src/swift/encryption.rs"
   "crates/protocols/src/swift/handler.rs"
   "crates/protocols/src/swift/staticweb.rs"
   "crates/protocols/src/swift/acl.rs"
@@ -108,6 +107,19 @@ checked_files=(
   "crates/obs/src/telemetry/recorder.rs"
   "crates/obs/src/metrics/collectors/system_gpu.rs"
 )
+
+missing_files=()
+for file in "${checked_files[@]}"; do
+  if [[ ! -f "$file" ]]; then
+    missing_files+=("$file")
+  fi
+done
+
+if ((${#missing_files[@]} > 0)); then
+  echo "❌ logging guardrail checked file is missing:" >&2
+  printf '  %s\n' "${missing_files[@]}" >&2
+  exit 1
+fi
 
 forbidden_patterns=(
   'access_key={}'
