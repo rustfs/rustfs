@@ -904,7 +904,13 @@ impl FileMetaVersionHeader {
             return self.mod_time > o.mod_time;
         }
 
-        match self.mod_time.cmp(&o.mod_time) {
+        // The following doesn't make too much sense, but we want sort to be consistent nonetheless.
+        // Prefer lower types
+        if self.version_type != o.version_type {
+            return self.version_type < o.version_type;
+        }
+        // Consistent sort on signature
+        match self.signature.cmp(&o.signature) {
             Ordering::Greater => {
                 return true;
             }
@@ -913,13 +919,7 @@ impl FileMetaVersionHeader {
             }
             _ => {}
         }
-
-        // The following doesn't make too much sense, but we want sort to be consistent nonetheless.
-        // Prefer lower types
-        if self.version_type != o.version_type {
-            return self.version_type < o.version_type;
-        }
-        // Consistent sort on signature
+        // Consistent sort on version_id
         match self.version_id.cmp(&o.version_id) {
             Ordering::Greater => {
                 return true;
@@ -3947,6 +3947,49 @@ mod tests {
 
         // A header never sorts before an identical header.
         assert!(!a.sorts_before(&a.clone()));
+    }
+
+    #[test]
+    fn version_header_sorts_before_breaks_signature_tie_before_version_id() {
+        // Two same-type Object headers with equal mod_time but differing
+        // signature and version_id. Matching MinIO's sortsBefore, the higher
+        // signature wins the tie ahead of the version_id comparison, even when
+        // version_id would order the two the other way.
+        let lower_sig_higher_id = FileMetaVersionHeader {
+            version_id: Some(Uuid::from_u128(2)),
+            mod_time: Some(sample_mod_time()),
+            version_type: VersionType::Object,
+            signature: [0x00, 0x00, 0x00, 0x01],
+            ..Default::default()
+        };
+        let higher_sig_lower_id = FileMetaVersionHeader {
+            version_id: Some(Uuid::from_u128(1)),
+            signature: [0x00, 0x00, 0x00, 0x02],
+            ..lower_sig_higher_id.clone()
+        };
+
+        assert!(higher_sig_lower_id.sorts_before(&lower_sig_higher_id));
+        assert!(!lower_sig_higher_id.sorts_before(&higher_sig_lower_id));
+    }
+
+    #[test]
+    fn version_header_sorts_before_version_id_only_breaks_signature_tie() {
+        // Equal mod_time, version_type, and signature: only then does version_id
+        // decide, and the higher version_id sorts first.
+        let a = FileMetaVersionHeader {
+            version_id: Some(Uuid::from_u128(1)),
+            mod_time: Some(sample_mod_time()),
+            version_type: VersionType::Object,
+            signature: [0x0a, 0x0b, 0x0c, 0x0d],
+            ..Default::default()
+        };
+        let b = FileMetaVersionHeader {
+            version_id: Some(Uuid::from_u128(2)),
+            ..a.clone()
+        };
+
+        assert!(b.sorts_before(&a));
+        assert!(!a.sorts_before(&b));
     }
 
     #[test]
