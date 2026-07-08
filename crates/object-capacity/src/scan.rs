@@ -312,6 +312,12 @@ pub async fn select_capacity_refresh_disks(
     capacity_manager: &HybridCapacityManager,
     disks: &[CapacityDiskRef],
 ) -> (Vec<CapacityDiskRef>, bool) {
+    // The write side marks every disk of an EC set dirty, including remote
+    // peers, but only local disks are ever scanned and cleared — drop ghost
+    // entries so the dirty gauge reflects local pending work (backlog#1020).
+    let local_set: HashSet<CapacityScopeDisk> = disks.iter().map(disk_scope_key).collect();
+    capacity_manager.retain_dirty_disks_within(&local_set).await;
+
     if !capacity_manager.can_refresh_dirty_subset().await {
         return (disks.to_vec(), false);
     }
@@ -336,6 +342,7 @@ pub async fn select_capacity_refresh_disks(
 }
 
 pub async fn refresh_capacity_with_scope(disks: Vec<CapacityDiskRef>, dirty_subset: bool) -> Result<CapacityUpdate, String> {
+    let scan_started_at = Instant::now();
     let report = calculate_data_dir_used_capacity_report(&disks)
         .await
         .map_err(|e| e.to_string())?;
@@ -344,7 +351,9 @@ pub async fn refresh_capacity_with_scope(disks: Vec<CapacityDiskRef>, dirty_subs
         return Err("dirty subset refresh had partial errors".to_string());
     }
 
-    Ok(report.into_capacity_update(disks.len(), !dirty_subset))
+    let mut update = report.into_capacity_update(disks.len(), !dirty_subset);
+    update.scan_started_at = Some(scan_started_at);
+    Ok(update)
 }
 
 /// Scan the provided local disk roots and return a summarized used-capacity result.
@@ -1564,6 +1573,7 @@ mod tests {
                     expected_disk_count: Some(2),
                     replaces_disk_cache: true,
                     clear_dirty_disks: Vec::new(),
+                    scan_started_at: None,
                 },
                 DataSource::RealTime,
             )
