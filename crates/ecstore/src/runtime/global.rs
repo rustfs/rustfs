@@ -47,17 +47,16 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 //   GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_LIFECYCLE_SYS, GLOBAL_EVENT_NOTIFIER, etc.
 // Tier B (keep as static): GLOBAL_RUSTFS_PORT, env var caches, etc.
 //
-// Phase 5 (backlog#939): the erasure setup type, the S3 region, and the
-// deployment id moved into the per-instance `InstanceContext` (see
-// `super::instance`); their facades below now forward to the current instance's
-// context.
+// Phase 5 (backlog#939): the erasure setup type, the S3 region, the deployment
+// id, and the endpoint topology moved into the per-instance `InstanceContext`
+// (see `super::instance`); their facades below now forward to the current
+// instance's context.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
-    pub static ref GLOBAL_ENDPOINTS: OnceLock<EndpointServerPools> = OnceLock::new();
     pub static ref GLOBAL_ROOT_DISK_THRESHOLD: RwLock<u64> = RwLock::new(0);
     pub static ref GLOBAL_TIER_CONFIG_MGR: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
     pub static ref GLOBAL_LIFECYCLE_SYS: Arc<LifecycleSys> = LifecycleSys::new();
@@ -145,9 +144,7 @@ pub fn get_global_deployment_id() -> Option<String> {
 /// * None
 ///
 pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
-    GLOBAL_ENDPOINTS
-        .set(EndpointServerPools::from(eps))
-        .expect("GLOBAL_ENDPOINTS should be initialized once during storage startup")
+    current_ctx().set_endpoints(EndpointServerPools::from(eps));
 }
 
 /// Get the global endpoints
@@ -156,15 +153,11 @@ pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
 /// * `EndpointServerPools` - The global endpoints
 ///
 pub fn get_global_endpoints() -> EndpointServerPools {
-    if let Some(eps) = GLOBAL_ENDPOINTS.get() {
-        eps.clone()
-    } else {
-        EndpointServerPools::default()
-    }
+    current_ctx().endpoints().unwrap_or_default()
 }
 
 pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
-    GLOBAL_ENDPOINTS.get().cloned()
+    current_ctx().endpoints()
 }
 
 #[cfg(test)]

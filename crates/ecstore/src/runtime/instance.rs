@@ -39,7 +39,7 @@
 //! startup writes and post-construction reads hit the same cell and
 //! single-instance behavior is byte-for-byte unchanged.
 
-use crate::layout::endpoints::SetupType;
+use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
 use std::sync::{Arc, OnceLock};
@@ -78,6 +78,11 @@ pub struct InstanceContext {
     /// Write-once identity, mirrored by `ECStore::id` (both come from the same
     /// startup value). Replaces the process-global deployment-id static.
     deployment_id: OnceLock<Uuid>,
+    /// This instance's endpoint topology (Phase 5 Slice 6, backlog#939).
+    ///
+    /// Write-once: storage startup publishes the server pools exactly once.
+    /// Replaces the process-global endpoints static.
+    endpoints: OnceLock<EndpointServerPools>,
 }
 
 impl InstanceContext {
@@ -99,6 +104,7 @@ impl InstanceContext {
             lock_manager,
             region: OnceLock::new(),
             deployment_id: OnceLock::new(),
+            endpoints: OnceLock::new(),
         }
     }
 
@@ -135,6 +141,21 @@ impl InstanceContext {
     /// This instance's deployment id, if it has been set.
     pub fn deployment_id(&self) -> Option<Uuid> {
         self.deployment_id.get().copied()
+    }
+
+    /// Set this instance's endpoint topology.
+    ///
+    /// Write-once: panics on a second write, preserving the startup fail-fast
+    /// contract of the process global it replaces.
+    pub fn set_endpoints(&self, endpoints: EndpointServerPools) {
+        self.endpoints
+            .set(endpoints)
+            .expect("instance endpoints should be initialized once during storage startup");
+    }
+
+    /// This instance's endpoint topology, if it has been set.
+    pub fn endpoints(&self) -> Option<EndpointServerPools> {
+        self.endpoints.get().cloned()
     }
 
     /// Update this instance's erasure setup type.
@@ -338,5 +359,48 @@ mod tests {
         let ctx = InstanceContext::new();
         ctx.set_deployment_id(Uuid::new_v4());
         ctx.set_deployment_id(Uuid::new_v4());
+    }
+
+    fn endpoints_with_pools(n: usize) -> EndpointServerPools {
+        use crate::layout::endpoint::Endpoint;
+        use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+        let pool = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![Endpoint::try_from("http://127.0.0.1:9000/data0").expect("valid endpoint")]),
+            cmd_line: "test".to_string(),
+            platform: "test".to_string(),
+        };
+        EndpointServerPools((0..n).map(|_| pool.clone()).collect())
+    }
+
+    // A fresh context has no endpoints until set; set-then-get round-trips.
+    #[tokio::test]
+    async fn endpoints_set_and_get() {
+        let ctx = InstanceContext::new();
+        assert!(ctx.endpoints().is_none());
+        ctx.set_endpoints(endpoints_with_pools(1));
+        assert_eq!(ctx.endpoints().expect("endpoints set").0.len(), 1);
+    }
+
+    // Two contexts hold independent endpoint topologies.
+    #[tokio::test]
+    async fn distinct_contexts_have_distinct_endpoints() {
+        let ctx_a = InstanceContext::new();
+        let ctx_b = InstanceContext::new();
+        ctx_a.set_endpoints(endpoints_with_pools(1));
+        ctx_b.set_endpoints(endpoints_with_pools(2));
+        assert_eq!(ctx_a.endpoints().expect("a").0.len(), 1);
+        assert_eq!(ctx_b.endpoints().expect("b").0.len(), 2);
+    }
+
+    // Endpoints are write-once: a second set fails fast.
+    #[tokio::test]
+    #[should_panic(expected = "initialized once")]
+    async fn set_endpoints_twice_panics() {
+        let ctx = InstanceContext::new();
+        ctx.set_endpoints(endpoints_with_pools(1));
+        ctx.set_endpoints(endpoints_with_pools(2));
     }
 }
