@@ -995,7 +995,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         target_statuses,
         target_purge_statuses,
         replication_timestamp: None,
-        ssec: false, // TODO: add ssec support
+        ssec: rustfs_replication::is_ssec_encrypted(&user_defined),
         user_tags: (*oi.user_tags).clone(),
         checksum: oi.checksum.clone(),
         retry_count: 0,
@@ -3403,6 +3403,27 @@ mod tests {
             roi.dsc.replicate_any() || roi.dsc.targets_map.is_empty(),
             "With no replication config, dsc may be empty; with config, replicate_any() would be true and queueing would occur"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_heal_replicate_object_info_preserves_ssec_checksum() {
+        let checksum = bytes::Bytes::from_static(b"ssec-checksum");
+        let oi = ObjectInfo {
+            bucket: "test-bucket".to_string(),
+            name: "key".to_string(),
+            user_defined: Arc::new(HashMap::from([(
+                rustfs_utils::http::SSEC_ALGORITHM_HEADER.to_string(),
+                "AES256".to_string(),
+            )])),
+            checksum: Some(checksum.clone()),
+            ..Default::default()
+        };
+        let rcfg = ReplicationConfig::new(None, None);
+
+        let roi = get_heal_replicate_object_info(&oi, &rcfg).await;
+
+        assert!(roi.ssec);
+        assert_eq!(roi.checksum, Some(checksum));
     }
 
     #[tokio::test]

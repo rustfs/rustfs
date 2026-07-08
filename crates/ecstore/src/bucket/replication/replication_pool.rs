@@ -1332,6 +1332,21 @@ pub(crate) async fn schedule_replication<S: ReplicationStorage>(
     dsc: ReplicateDecision,
     op_type: ReplicationType,
 ) {
+    let synchronous = dsc.is_synchronous();
+    let ri = replicate_object_info_from_object_info(oi, dsc, op_type);
+
+    if synchronous {
+        replicate_object(ri, o).await
+    } else if let Some(pool) = runtime_sources::replication_pool() {
+        let _ = pool.queue_replica_task(ri).await;
+    }
+}
+
+fn replicate_object_info_from_object_info(
+    oi: ObjectInfo,
+    dsc: ReplicateDecision,
+    op_type: ReplicationType,
+) -> ReplicateObjectInfo {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
     let tm = get_str(&oi.user_defined, SUFFIX_REPLICATION_TIMESTAMP)
@@ -1339,8 +1354,10 @@ pub(crate) async fn schedule_replication<S: ReplicationStorage>(
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
     let asz = oi.get_actual_size().unwrap_or_default();
+    let ssec = rustfs_replication::is_ssec_encrypted(&oi.user_defined);
+    let checksum = if ssec { oi.checksum.clone() } else { None };
 
-    let mut ri = ReplicateObjectInfo {
+    ReplicateObjectInfo {
         name: oi.name,
         size: oi.size,
         actual_size: asz,
@@ -1356,25 +1373,16 @@ pub(crate) async fn schedule_replication<S: ReplicationStorage>(
 
         replication_state: Some(rstate),
         op_type,
-        dsc: dsc.clone(),
+        dsc,
         target_statuses: tgt_statuses,
         target_purge_statuses: purge_statuses,
         replication_timestamp: tm,
         user_tags: (*oi.user_tags).clone(),
-        checksum: None,
+        checksum,
         retry_count: 0,
         event_type: "".to_string(),
         existing_obj_resync: ResyncDecision::default(),
-        ssec: false,
-    };
-
-    if ri.ssec {
-        ri.checksum = oi.checksum
-    }
-    if dsc.is_synchronous() {
-        replicate_object(ri, o).await
-    } else if let Some(pool) = runtime_sources::replication_pool() {
-        let _ = pool.queue_replica_task(ri).await;
+        ssec,
     }
 }
 
@@ -1529,6 +1537,7 @@ mod tests {
         StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageNamespaceLocking, StorageObjectInfoOrErr, WalkOptions,
     };
     use super::*;
+    use std::collections::HashMap;
     use std::fmt::{Debug, Formatter};
     use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
@@ -1855,6 +1864,26 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Missed);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[test]
+    fn replicate_object_info_from_object_info_preserves_ssec_checksum() {
+        let checksum = bytes::Bytes::from_static(b"ssec-checksum");
+        let oi = ObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            user_defined: Arc::new(HashMap::from([(
+                rustfs_utils::http::SSEC_ALGORITHM_HEADER.to_string(),
+                "AES256".to_string(),
+            )])),
+            checksum: Some(checksum.clone()),
+            ..Default::default()
+        };
+
+        let ri = replicate_object_info_from_object_info(oi, ReplicateDecision::default(), ReplicationType::Object);
+
+        assert!(ri.ssec);
+        assert_eq!(ri.checksum, Some(checksum));
     }
 
     #[tokio::test]
