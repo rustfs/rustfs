@@ -1727,6 +1727,102 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn scanner_snapshot_can_reduce_object_layer_refreshed_memory_usage() {
+        clear_usage_memory_cache_for_test().await;
+
+        let now = SystemTime::now();
+        replace_bucket_usage_memory_from_authoritative(
+            "bucket-a",
+            BucketUsageInfo {
+                objects_count: 100,
+                versions_count: 100,
+                size: 1_000,
+                ..Default::default()
+            },
+            now,
+        )
+        .await;
+
+        let scanner_decrease = data_usage_info_for_test("bucket-a", 60, 600, now + Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&scanner_decrease).await;
+
+        let mut response = scanner_decrease.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 60);
+        assert_eq!(response.objects_total_size, 600);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((60, 600))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_backend_snapshot_can_reduce_backend_memory_usage() {
+        clear_usage_memory_cache_for_test().await;
+
+        let now = SystemTime::now();
+        let complete_snapshot = data_usage_info_for_test("bucket-a", 100, 1_000, now);
+        replace_bucket_usage_memory_from_info(&complete_snapshot).await;
+
+        let scanner_decrease = data_usage_info_for_test("bucket-a", 60, 600, now + Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&scanner_decrease).await;
+
+        let mut response = scanner_decrease.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 60);
+        assert_eq!(response.objects_total_size, 600);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((60, 600))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn authoritative_refresh_can_reduce_memory_usage() {
+        clear_usage_memory_cache_for_test().await;
+
+        let now = SystemTime::now();
+        let complete_snapshot = data_usage_info_for_test("bucket-a", 100, 1_000, now);
+        replace_bucket_usage_memory_from_info(&complete_snapshot).await;
+
+        replace_bucket_usage_memory_from_authoritative(
+            "bucket-a",
+            BucketUsageInfo {
+                objects_count: 60,
+                versions_count: 60,
+                size: 600,
+                ..Default::default()
+            },
+            now + Duration::from_secs(10),
+        )
+        .await;
+
+        let mut response = data_usage_info_for_test("bucket-a", 60, 600, now + Duration::from_secs(10));
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 60);
+        assert_eq!(response.objects_total_size, 600);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((60, 600))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn scanner_sync_preserves_newer_memory_update() {
         clear_usage_memory_cache_for_test().await;
 
