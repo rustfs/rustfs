@@ -8872,6 +8872,125 @@ mod test {
         assert_eq!(names.iter().filter(|name| *name == "marker/file.txt").count(), 1);
     }
 
+    // The per-disk walk stream must be sorted by name so the k-way merge across
+    // sets (which assumes each channel is non-decreasing, see
+    // `merge_entry_channels`, backlog#1046) never reorders keys. An explicit
+    // directory-marker object (`folder/` on disk as `folder__XLDIR__/xl.meta`)
+    // coexisting with real children under the same prefix is the case most
+    // likely to break that invariant: the marker and the real directory resolve
+    // to the same stacked name, and the marker must still be emitted at that
+    // sorted position rather than after the recursion into its children.
+    // Empirically the stream stays sorted; this pins it (backlog#1068
+    // investigation — the suspected out-of-order emission does not occur).
+    #[tokio::test]
+    async fn test_scan_dir_marker_with_children_emits_sorted_stream() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        async fn scan_sequence(layout: &[(&str, &[u8])], base: &str, recursive: bool) -> Vec<(String, bool)> {
+            let dir = tempdir().expect("tempdir should be created");
+            let bucket = "test-bucket";
+            let bucket_dir = dir.path().join(bucket);
+            for (path, body) in layout {
+                let full = bucket_dir.join(path);
+                fs::create_dir_all(full.parent().expect("child path has a parent"))
+                    .await
+                    .expect("layout dir should be created");
+                fs::write(full, body).await.expect("layout metadata should be written");
+            }
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            let (reader, mut writer) = tokio::io::duplex(16384);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: base.to_string(),
+                recursive,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+            disk.scan_dir(base.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| (entry.name, !entry.metadata.is_empty()))
+                .collect()
+        }
+
+        fn assert_marker_stream_sorted(label: &str, seq: &[(String, bool)]) {
+            let names: Vec<&str> = seq.iter().map(|(name, _)| name.as_str()).collect();
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(names, sorted, "[{label}] scan stream must be sorted, got {seq:?}");
+            // A marker object (metadata-bearing, trailing-slash name) must not
+            // trail its own children.
+            for (i, (name, has_meta)) in seq.iter().enumerate() {
+                if *has_meta && name.ends_with(SLASH_SEPARATOR) {
+                    let later_child = seq[..i]
+                        .iter()
+                        .any(|(other, _)| other.starts_with(name.as_str()) && other != name);
+                    assert!(!later_child, "[{label}] marker {name} emitted after its own child, seq={seq:?}");
+                }
+            }
+        }
+
+        let suffix = GLOBAL_DIR_SUFFIX;
+
+        assert_marker_stream_sorted(
+            "marker + direct children",
+            &scan_sequence(
+                &[
+                    (&format!("folder{suffix}/xl.meta"), b"m"),
+                    ("folder/a/xl.meta", b"c"),
+                    ("folder/b/xl.meta", b"c"),
+                ],
+                "",
+                true,
+            )
+            .await,
+        );
+        assert_marker_stream_sorted(
+            "nested marker",
+            &scan_sequence(
+                &[
+                    (&format!("folder/sub{suffix}/xl.meta"), b"m"),
+                    ("folder/sub/a/xl.meta", b"c"),
+                    ("folder/sub/z/xl.meta", b"c"),
+                ],
+                "",
+                true,
+            )
+            .await,
+        );
+        assert_marker_stream_sorted(
+            "marker with a deep child chain",
+            &scan_sequence(&[(&format!("folder{suffix}/xl.meta"), b"m"), ("folder/a/b/c/xl.meta", b"c")], "", true).await,
+        );
+        assert_marker_stream_sorted(
+            "two sibling markers",
+            &scan_sequence(
+                &[
+                    (&format!("a{suffix}/xl.meta"), b"m"),
+                    ("a/x/xl.meta", b"c"),
+                    (&format!("b{suffix}/xl.meta"), b"m"),
+                    ("b/y/xl.meta", b"c"),
+                ],
+                "",
+                true,
+            )
+            .await,
+        );
+    }
+
     #[tokio::test]
     async fn test_scan_dir_forward_to_repeated_prefix_component() {
         use rustfs_filemeta::MetacacheReader;
