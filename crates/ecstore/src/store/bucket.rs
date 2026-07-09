@@ -328,6 +328,7 @@ mod tests {
         disk::endpoint::Endpoint,
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
+    use serial_test::serial;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use time::OffsetDateTime;
@@ -479,7 +480,19 @@ mod tests {
         );
     }
 
+    // #[serial] with the crate-wide default key: these tests drive make_bucket /
+    // delete_bucket through the process-global local-disk registry and lock
+    // client (see crates/ecstore/src/runtime/global.rs), and through Sets::new
+    // which reads the process-global erasure mode. Running them concurrently with
+    // other tests that touch those globals races make_bucket into
+    // InsufficientWriteQuorum under `cargo test` (single process). serial_test
+    // serializes them across the
+    // in-process suite; nextest's per-test processes are covered separately by the
+    // ecstore-serial-flaky test-group in .config/nextest.toml (backlog #937).
+    // Full instance-level isolation is blocked on the InstanceContext migration
+    // (backlog #939) and is not attempted here.
     #[tokio::test]
+    #[serial]
     async fn bucket_delete_mark_delete_marks_metadata_deleted_without_physical_object_delete() {
         let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
         let bucket = format!("bucket-mark-delete-{}", Uuid::new_v4().simple());
@@ -514,6 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn bucket_delete_purge_removes_bucket_data_and_internal_metadata() {
         let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
         let bucket = format!("bucket-purge-{}", Uuid::new_v4().simple());
@@ -548,6 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn bucket_delete_default_s3_delete_still_rejects_non_empty_bucket() {
         let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
         let bucket = format!("bucket-s3-delete-{}", Uuid::new_v4().simple());
