@@ -35,6 +35,13 @@ const CANCEL_BIT: u64 = 1 << 63;
 /// semantics); required for pipes/sockets where pread returns ESPIPE.
 const CURRENT_POSITION: u64 = u64::MAX;
 
+/// Kernel single-read cap: `MAX_RW_COUNT = INT_MAX & PAGE_MASK` (2 GiB − 4 KiB
+/// on 4 KiB pages). io_uring's READ length field is a u32, and any request
+/// above this short-reads. We reject beyond it in `submit` so a `len as u32`
+/// truncation can never silently turn a huge read into a 0-byte "EOF" (C6,
+/// rustfs/backlog#1057); P2 must chunk reads larger than this.
+const MAX_READ_LEN: usize = 0x7fff_f000;
+
 /// Why the probe refused to start the io_uring driver.
 ///
 /// Mirrors the P2 degradation contract (backlog#894): a restricted
@@ -246,6 +253,26 @@ impl UringDriver {
             let _ = done.send(Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "offset exceeds i64::MAX (kernel loff_t is signed)",
+            )));
+            return ReadHandle {
+                id,
+                rx,
+                tx: self.tx.clone(),
+                finished: false,
+                cancel_on_drop: false,
+            };
+        }
+
+        // Reject a length the kernel would short-read past MAX_RW_COUNT and
+        // that the SQE's u32 `len` field would silently truncate: len == 2^32
+        // becomes a 0-byte read the caller decodes as a false EOF (C6,
+        // rustfs/backlog#1057). Failing fast here also removes the caller-
+        // controlled `vec![0u8; len]` capacity-overflow panic that made the
+        // unwind-UAF (rustfs/backlog#1054) reachable. P2 must chunk instead.
+        if len > MAX_READ_LEN {
+            let _ = done.send(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read length exceeds MAX_RW_COUNT (2 GiB - 4 KiB); caller must chunk",
             )));
             return ReadHandle {
                 id,
@@ -485,7 +512,8 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                     let mut buf = vec![0u8; len];
                     // The raw pointer is captured before `buf` moves into the
                     // table; moving the Vec never relocates its heap block,
-                    // and the entry is only removed at the CQE.
+                    // and the entry is only removed at the CQE. `len as u32`
+                    // is lossless: `submit` rejected anything > MAX_READ_LEN.
                     let sqe = opcode::Read::new(types::Fd(file.as_raw_fd()), buf.as_mut_ptr(), len as u32)
                         .offset(offset)
                         .build()
