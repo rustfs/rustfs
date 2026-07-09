@@ -16,6 +16,7 @@ use crate::{
     server::ShutdownHandle,
     startup_lifecycle::{
         EmbeddedStartupGuard, embedded_endpoint_address, log_embedded_server_ready, publish_embedded_startup_ready,
+        release_embedded_startup_guard,
     },
     startup_runtime_hooks::init_embedded_runtime_hooks,
     startup_server::{
@@ -114,7 +115,15 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
     // EMBEDDED_SERVER_STARTED guard); once the request path and app subsystems
     // are per-server too (backlog#1052 S2–S4), each server constructs its own
     // context here instead.
-    let instance_ctx = bootstrap_instance_ctx();
+    // The first embedded server adopts the process bootstrap context so the
+    // process-wide facades (current_ctx()) see live state; a second embedded
+    // server constructs its own context to avoid the write-once panics on
+    // region/endpoints/deployment id (backlog#1052 S5).
+    let instance_ctx = if bootstrap_instance_ctx().region().is_some() {
+        crate::storage_api::startup::storage::new_instance_ctx()
+    } else {
+        bootstrap_instance_ctx()
+    };
     // This server's request-path context slot (backlog#1052 S2).
     let server_ctx = ServerContextSlot::new();
 
@@ -185,6 +194,10 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         })?;
 
     log_embedded_server_ready(embedded_endpoint_address(bound_addr));
+
+    // Startup handed off successfully — release the guard so a second server
+    // in this process can begin its own startup (backlog#1052 S5).
+    release_embedded_startup_guard();
 
     Ok(EmbeddedStartedServer {
         bound_addr,

@@ -16,7 +16,7 @@ use crate::license::license_status;
 use crate::startup_runtime_sources;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::future::Future;
-use std::io::{Error, Result};
+use std::io::Result;
 use tracing::{debug, info};
 
 const LOG_COMPONENT_EMBEDDED: &str = "embedded";
@@ -105,10 +105,33 @@ pub(crate) fn install_default_crypto_provider() {
 }
 
 pub(crate) async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<()> {
-    let guard = startup_runtime_sources::init_observability_guard(obs_endpoint)
-        .await
-        .map_err(|err| Error::other(format!("init_obs: {err}")))?;
-    startup_runtime_sources::set_observability_guard(guard).map_err(|err| Error::other(format!("set_global_guard: {err}")))?;
+    // Observability is a process-global tracing subscriber and can only be
+    // installed once. A second embedded server in the same process reuses the
+    // first server's subscriber — try to publish anyway (first server wins),
+    // and treat both an init failure and a set failure as "already set" so a
+    // second startup does not abort (backlog#1052 S5).
+    match startup_runtime_sources::init_observability_guard(obs_endpoint).await {
+        Ok(guard) => {
+            if let Err(err) = startup_runtime_sources::set_observability_guard(guard) {
+                debug!(
+                    component = LOG_COMPONENT_EMBEDDED,
+                    subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                    event = "observability_guard_reused",
+                    error = %err,
+                    "process already has an observability guard installed; second server reuses it"
+                );
+            }
+        }
+        Err(err) => {
+            debug!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "observability_init_skipped",
+                error = %err,
+                "observability already initialized; second server reuses the process subscriber"
+            );
+        }
+    }
 
     install_embedded_default_crypto_provider();
     rustfs_trusted_proxies::init();
