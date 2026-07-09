@@ -390,7 +390,9 @@ impl RustFSTestEnvironment {
 
         let binary_path = rustfs_binary_path();
         let mut command = Command::new(&binary_path);
-        command.env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+        command
+            .env("RUSTFS_CONSOLE_ENABLE", "false")
+            .env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
         for (key, value) in extra_env {
             command.env(key, value);
         }

@@ -102,6 +102,7 @@ pub async fn test_ftps_core_operations() -> Result<()> {
     info!("Starting FTPS server on {}", FTPS_ADDRESS);
     let binary_path = rustfs_binary_path_with_features(Some("ftps,webdav"));
     let mut server_process = Command::new(&binary_path)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_FTPS_ENABLE", "true")
         .env("RUSTFS_FTPS_ADDRESS", FTPS_ADDRESS)
         .env("RUSTFS_FTPS_CERTS_DIR", cert_dir.to_str().unwrap())
