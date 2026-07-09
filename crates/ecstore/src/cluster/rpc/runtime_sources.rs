@@ -14,8 +14,8 @@
 
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_DIRECTION_RESPONSE, INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
-    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_TRANSPORT_BACKEND_GRPC,
-    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM,
+    INTERNODE_TRANSPORT_BACKEND_GRPC, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
 
 #[cfg(test)]
@@ -32,6 +32,22 @@ pub(crate) fn record_remote_disk_open_write_retry(classification: &'static str) 
 pub(crate) fn record_remote_disk_open_write_retry_success(classification: &'static str) {
     global_internode_metrics().record_retry_success_for_operation_and_backend(
         INTERNODE_OPERATION_PUT_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        classification,
+    );
+}
+
+pub(crate) fn record_remote_disk_open_read_retry(classification: &'static str) {
+    global_internode_metrics().record_retry_for_operation_and_backend(
+        INTERNODE_OPERATION_READ_FILE_STREAM,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        classification,
+    );
+}
+
+pub(crate) fn record_remote_disk_open_read_retry_success(classification: &'static str) {
+    global_internode_metrics().record_retry_success_for_operation_and_backend(
+        INTERNODE_OPERATION_READ_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
         classification,
     );
