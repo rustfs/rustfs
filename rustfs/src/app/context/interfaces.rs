@@ -87,7 +87,7 @@ pub trait NotifyInterface: Send + Sync {
 
 /// Notification system handle interface for admin peer orchestration.
 pub trait NotificationSystemInterface: Send + Sync {
-    fn handle(&self) -> Option<&'static NotificationSys>;
+    fn handle(&self) -> Option<Arc<NotificationSys>>;
 }
 
 /// Bucket metadata interface for application-layer use-cases.

@@ -1305,7 +1305,7 @@ pub(crate) fn set_workload_admission_snapshot_provider(
     rustfs_ecstore::set_workload_admission_snapshot_provider(provider)
 }
 
-pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
+pub(crate) fn get_global_notification_sys() -> Option<Arc<NotificationSys>> {
     ecstore_notification::get_global_notification_sys()
 }
 

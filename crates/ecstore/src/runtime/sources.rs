@@ -306,7 +306,7 @@ pub(crate) async fn publish_object_store(store: Arc<ECStore>) {
     set_object_layer(store).await;
 }
 
-pub(crate) fn notification_sys() -> Option<&'static NotificationSys> {
+pub(crate) fn notification_sys() -> Option<Arc<NotificationSys>> {
     get_global_notification_sys()
 }
 

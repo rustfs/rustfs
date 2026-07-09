@@ -529,7 +529,7 @@ impl Operation for RebalanceStart {
                 );
 
                 let start_err = err.to_string();
-                let rollback_result = rollback_cluster_rebalance_start(&store, Some(notification_sys), &id).await;
+                let rollback_result = rollback_cluster_rebalance_start(&store, Some(&notification_sys), &id).await;
                 let rollback_label = rollback_result_label(&rollback_result);
                 match &rollback_result {
                     Ok(_) => info!(
@@ -754,7 +754,7 @@ impl Operation for RebalanceStop {
         let notification_sys = current_notification_system();
         let stop_attempt_at = OffsetDateTime::now_utc();
         let mut stop_failures = Vec::new();
-        if let Some(notification_sys) = notification_sys {
+        if let Some(notification_sys) = notification_sys.as_ref() {
             stop_failures = notification_sys
                 .stop_rebalance_failures(expected_rebalance_id.as_deref())
                 .await

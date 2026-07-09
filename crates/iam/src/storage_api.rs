@@ -77,7 +77,7 @@ pub(crate) async fn is_iam_first_cluster_node_local() -> bool {
     ecstore_first_cluster_node_is_local().await
 }
 
-pub(crate) fn notification_sys() -> Option<&'static IamNotificationSys> {
+pub(crate) fn notification_sys() -> Option<std::sync::Arc<IamNotificationSys>> {
     get_global_notification_sys()
 }
 

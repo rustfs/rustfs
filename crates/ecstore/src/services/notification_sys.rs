@@ -31,7 +31,7 @@ use rustfs_utils::XHost;
 use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -72,18 +72,21 @@ impl PeerAdminCache {
 const SERVER_INFO_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 
 lazy_static! {
-    pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<NotificationSys> = OnceLock::new();
+    pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<Arc<NotificationSys>> = OnceLock::new();
 }
 
 pub async fn new_global_notification_sys(eps: EndpointServerPools) -> Result<()> {
     let _ = GLOBAL_NOTIFICATION_SYS
-        .set(NotificationSys::new(eps).await)
+        .set(Arc::new(NotificationSys::new(eps).await))
         .map_err(|_| Error::other("init notification_sys fail"));
     Ok(())
 }
 
-pub fn get_global_notification_sys() -> Option<&'static NotificationSys> {
-    GLOBAL_NOTIFICATION_SYS.get()
+// Owned handle rather than `&'static` (backlog#1052 S3): per-server contexts
+// need to hold their own notification system, which a process-lifetime
+// borrow cannot express.
+pub fn get_global_notification_sys() -> Option<Arc<NotificationSys>> {
+    GLOBAL_NOTIFICATION_SYS.get().cloned()
 }
 
 pub struct NotificationSys {

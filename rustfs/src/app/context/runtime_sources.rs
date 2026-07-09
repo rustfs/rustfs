@@ -92,7 +92,7 @@ pub async fn clear_bucket_notification_rules(bucket_name: &str) -> Result<(), No
     notifier_global::clear_bucket_notification_rules(bucket_name).await
 }
 
-pub fn notification_system() -> Option<&'static NotificationSys> {
+pub fn notification_system() -> Option<Arc<NotificationSys>> {
     get_global_notification_sys()
 }
 

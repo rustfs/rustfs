@@ -242,7 +242,7 @@ impl ECStore {
 /// service singletons. The globals remain the source of truth.
 impl ECStore {
     /// Get the notification system
-    pub fn notification_system(&self) -> Option<&'static crate::services::notification_sys::NotificationSys> {
+    pub fn notification_system(&self) -> Option<std::sync::Arc<crate::services::notification_sys::NotificationSys>> {
         runtime_sources::notification_sys()
     }
 

@@ -178,7 +178,7 @@ impl NotifyInterface for NotifyHandle {
 pub struct NotificationSystemHandle;
 
 impl NotificationSystemInterface for NotificationSystemHandle {
-    fn handle(&self) -> Option<&'static NotificationSys> {
+    fn handle(&self) -> Option<Arc<NotificationSys>> {
         runtime_sources::notification_system()
     }
 }
@@ -395,15 +395,31 @@ impl TransitionStateInterface for TransitionStateHandle {
 }
 
 /// Default server config interface adapter.
+///
+/// Holds this context's own copy of the server config (backlog#1052 S3): a
+/// `set` lands on the owning context *and* on the process global, so ambient
+/// readers (the config loader path, the scanner) keep working; a `get`
+/// prefers the owned copy and falls back to the process global while the
+/// initial load still publishes there — the single-instance legacy default.
 #[derive(Default)]
-pub struct ServerConfigHandle;
+pub struct ServerConfigHandle {
+    config: StdRwLock<Option<Config>>,
+}
 
 impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
+        if let Ok(guard) = self.config.read()
+            && guard.is_some()
+        {
+            return guard.clone();
+        }
         runtime_sources::server_config()
     }
 
     fn set(&self, config: Config) {
+        if let Ok(mut guard) = self.config.write() {
+            *guard = Some(config.clone());
+        }
         runtime_sources::set_server_config(config);
     }
 }
@@ -537,7 +553,7 @@ pub fn default_transition_state_interface() -> Arc<dyn TransitionStateInterface>
 }
 
 pub fn default_server_config_interface() -> Arc<dyn ServerConfigInterface> {
-    Arc::new(ServerConfigHandle)
+    Arc::new(ServerConfigHandle::default())
 }
 
 pub fn default_storage_class_interface() -> Arc<dyn StorageClassInterface> {
@@ -546,4 +562,39 @@ pub fn default_storage_class_interface() -> Arc<dyn StorageClassInterface> {
 
 pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
     Arc::new(BufferConfigHandle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerConfigHandle, runtime_sources};
+    use crate::app::context::interfaces::ServerConfigInterface;
+    use rustfs_config::server_config::Config;
+    use std::collections::HashMap;
+
+    // backlog#1052 S3: each context's server-config handle keeps its own copy,
+    // so two handles that both published stay isolated even though the shared
+    // process global only remembers the last write.
+    #[test]
+    fn server_config_handle_prefers_its_own_copy_over_the_shared_global() {
+        let mut config_a = Config::new();
+        config_a.0.insert("handle-a-marker".to_string(), HashMap::new());
+        let mut config_b = Config::new();
+        config_b.0.insert("handle-b-marker".to_string(), HashMap::new());
+
+        let handle_a = ServerConfigHandle::default();
+        let handle_b = ServerConfigHandle::default();
+        handle_a.set(config_a.clone());
+        handle_b.set(config_b.clone());
+
+        assert_eq!(handle_a.get(), Some(config_a), "handle A must serve its own copy");
+        assert_eq!(handle_b.get(), Some(config_b), "handle B must serve its own copy");
+    }
+
+    // Before anything is published through the handle, it answers exactly like
+    // the ambient global — the single-instance legacy default.
+    #[test]
+    fn unset_server_config_handle_falls_back_to_the_ambient_global() {
+        let handle = ServerConfigHandle::default();
+        assert_eq!(handle.get(), runtime_sources::server_config());
+    }
 }

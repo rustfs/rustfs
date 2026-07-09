@@ -155,12 +155,12 @@ pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Opt
 }
 
 /// Resolve notification system handle using AppContext-first precedence.
-pub fn resolve_notification_system() -> Option<&'static NotificationSys> {
+pub fn resolve_notification_system() -> Option<Arc<NotificationSys>> {
     resolve_notification_system_with(get_global_app_context())
 }
 
 /// Resolve notification system handle using an explicit AppContext.
-pub fn resolve_notification_system_for_context(context: Option<&AppContext>) -> Option<&'static NotificationSys> {
+pub fn resolve_notification_system_for_context(context: Option<&AppContext>) -> Option<Arc<NotificationSys>> {
     context.and_then(|context| context.notification_system().handle())
 }
 
@@ -353,7 +353,7 @@ fn resolve_bucket_metadata_handle_with(context: Option<Arc<AppContext>>) -> Opti
     context.and_then(|context| context.bucket_metadata().handle())
 }
 
-fn resolve_notification_system_with(context: Option<Arc<AppContext>>) -> Option<&'static NotificationSys> {
+fn resolve_notification_system_with(context: Option<Arc<AppContext>>) -> Option<Arc<NotificationSys>> {
     context.and_then(|context| context.notification_system().handle())
 }
 
