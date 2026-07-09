@@ -93,7 +93,7 @@ pub(crate) mod server {
     }
 
     pub(crate) mod http {
-        pub(crate) use crate::storage::storage_api::{TONIC_RPC_PREFIX, verify_rpc_signature};
+        pub(crate) use crate::storage::storage_api::{ServerContextSlot, TONIC_RPC_PREFIX, verify_rpc_signature};
 
         pub(crate) mod ecfs {
             pub(crate) type FS = crate::storage::storage_api::FS;
@@ -211,11 +211,11 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod runtime_sources {
-        pub(crate) use crate::storage::storage_api::{DynReplicationPool, set_global_region, set_global_rustfs_port};
+        pub(crate) use crate::storage::storage_api::{DynReplicationPool, InstanceContext, set_global_rustfs_port};
     }
 
     pub(crate) mod services {
-        pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
+        pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools, ServerContextSlot};
     }
 
     pub(crate) mod shutdown {
@@ -226,9 +226,10 @@ pub(crate) mod startup {
 
     pub(crate) mod storage {
         pub(crate) use crate::storage::storage_api::{
-            ECStore, EndpointServerPools, global_config_init_error_is_deterministic, init_background_replication,
-            init_compression_total_memory_from_backend, init_ecstore_config, init_global_config_sys, init_local_disks,
-            init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, try_migrate_server_config, update_erasure_type,
+            ECStore, EndpointServerPools, InstanceContext, bootstrap_instance_ctx, global_config_init_error_is_deterministic,
+            init_background_replication, init_compression_total_memory_from_backend, init_ecstore_config, init_global_config_sys,
+            init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
+            try_migrate_server_config,
         };
     }
 }

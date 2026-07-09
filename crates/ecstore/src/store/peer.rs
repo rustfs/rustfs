@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
 use tracing::{debug, error};
 
@@ -22,8 +23,12 @@ const EVENT_LOCAL_DISK_ID_PREWARM_SKIPPED: &str = "local_disk_id_prewarm_skipped
 const EVENT_LOCK_CLIENT_INITIALIZATION_FAILED: &str = "lock_client_initialization_failed";
 
 async fn remember_local_disk_id(disk: &DiskStore) -> Option<Uuid> {
+    remember_local_disk_id_with_instance_ctx(&crate::runtime::global::current_ctx(), disk).await
+}
+
+async fn remember_local_disk_id_with_instance_ctx(instance_ctx: &Arc<InstanceContext>, disk: &DiskStore) -> Option<Uuid> {
     let disk_id = disk.get_disk_id().await.ok().flatten()?;
-    runtime_sources::record_local_disk_id(disk_id, disk.endpoint().to_string()).await;
+    runtime_sources::record_local_disk_id(instance_ctx, disk_id, disk.endpoint().to_string()).await;
     Some(disk_id)
 }
 
@@ -69,7 +74,21 @@ pub async fn all_local_disk() -> Vec<DiskStore> {
 }
 
 pub async fn prewarm_local_disk_id_map() {
-    for disk in all_local_disk().await {
+    prewarm_local_disk_id_map_with_instance_ctx(&crate::runtime::global::current_ctx()).await
+}
+
+/// Prewarm the disk-id map of an explicit instance context (Phase 5 follow-up,
+/// backlog#1052): startup passes the context whose disk map it just populated
+/// instead of resolving the process-level default.
+pub async fn prewarm_local_disk_id_map_with_instance_ctx(instance_ctx: &Arc<InstanceContext>) {
+    let disks: Vec<DiskStore> = instance_ctx
+        .local_disk_map()
+        .read()
+        .await
+        .values()
+        .filter_map(|v| v.as_ref().cloned())
+        .collect();
+    for disk in disks {
         if let Err(err) = disk.get_disk_id().await {
             debug!(
                 event = EVENT_LOCAL_DISK_ID_PREWARM_SKIPPED,
@@ -82,17 +101,28 @@ pub async fn prewarm_local_disk_id_map() {
             continue;
         }
 
-        let _ = remember_local_disk_id(&disk).await;
+        let _ = remember_local_disk_id_with_instance_ctx(instance_ctx, &disk).await;
     }
 }
 
 pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
+    init_local_disks_with_instance_ctx(&crate::runtime::global::current_ctx(), endpoint_pools).await
+}
+
+/// Register the pools' local disks into an explicit instance context (Phase 5
+/// follow-up, backlog#1052). The legacy [`init_local_disks`] entry resolves the
+/// process-level default context; startup paths that own a context pass it here
+/// so a future second instance's disks cannot leak into the first one's registry.
+pub async fn init_local_disks_with_instance_ctx(
+    instance_ctx: &Arc<InstanceContext>,
+    endpoint_pools: EndpointServerPools,
+) -> Result<()> {
     let opt = &DiskOption {
         cleanup: true,
         health_check: true,
     };
 
-    runtime_sources::initialize_local_disk_maps(endpoint_pools, opt).await
+    runtime_sources::initialize_local_disk_maps(instance_ctx, endpoint_pools, opt).await
 }
 
 pub fn init_lock_clients(endpoint_pools: EndpointServerPools) {
@@ -181,4 +211,64 @@ pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>
     }
 
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+
+    fn single_local_disk_pools(dir: &std::path::Path) -> EndpointServerPools {
+        let mut endpoint = Endpoint::try_from(dir.to_str().expect("temp dir path should be utf-8")).expect("local endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+
+        EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint]),
+            cmd_line: "instance-ctx-disk-registry-test".to_string(),
+            platform: "test".to_string(),
+        }])
+    }
+
+    // Phase 5 follow-up (backlog#1052): registering local disks through the
+    // ctx-explicit entry writes the passed context's registry only — the
+    // process bootstrap context (and any other instance) stays clean, so a
+    // future second server's disks cannot leak into the first one's registry.
+    #[tokio::test]
+    async fn init_local_disks_with_instance_ctx_isolates_disk_registry() {
+        let temp_dir = tempfile::tempdir().expect("create temp disk dir");
+        let endpoint_pools = single_local_disk_pools(temp_dir.path());
+        let instance_ctx = Arc::new(InstanceContext::new());
+
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools)
+            .await
+            .expect("local disks should register into the passed context");
+
+        let registered: Vec<String> = instance_ctx.local_disk_map().read().await.keys().cloned().collect();
+        assert_eq!(registered.len(), 1, "the passed context must hold exactly the one local disk");
+        assert_eq!(
+            instance_ctx.local_disk_set_drives().read().await.len(),
+            1,
+            "the passed context must hold the pool/set/drive layout"
+        );
+
+        let bootstrap = crate::runtime::instance::bootstrap_ctx();
+        let bootstrap_map = bootstrap.local_disk_map();
+        let bootstrap_map = bootstrap_map.read().await;
+        let sibling = InstanceContext::new();
+        for key in &registered {
+            assert!(
+                !bootstrap_map.contains_key(key),
+                "bootstrap context must not absorb a disk registered into an explicit context"
+            );
+            assert!(
+                !sibling.local_disk_map().read().await.contains_key(key),
+                "a sibling context must not observe another instance's disks"
+            );
+        }
+    }
 }

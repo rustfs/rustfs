@@ -15,6 +15,7 @@
 use super::*;
 use crate::core::pools::local_decommission_queue_prefix;
 use crate::error::is_err_decommission_running;
+use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::object::EcstoreObjectIO;
 use tracing::{debug, error, info, warn};
@@ -165,6 +166,24 @@ impl ECStore {
     #[allow(clippy::new_ret_no_self)]
     #[instrument(level = "debug", skip(endpoint_pools))]
     pub async fn new(address: SocketAddr, endpoint_pools: EndpointServerPools, ctx: CancellationToken) -> Result<Arc<Self>> {
+        Self::new_with_instance_ctx(address, endpoint_pools, ctx, crate::runtime::instance::bootstrap_ctx()).await
+    }
+
+    /// Build a store around an explicit instance context (Phase 5 follow-up,
+    /// backlog#1052). The legacy [`ECStore::new`] entry adopts the process
+    /// bootstrap context, keeping single-instance startup byte-for-byte
+    /// unchanged; a caller that owns its own context (a future second embedded
+    /// server) passes it here so every construction-time write — pool sets,
+    /// local-disk registry, deployment id — lands on that context instead of
+    /// the shared bootstrap one.
+    #[allow(clippy::new_ret_no_self)]
+    #[instrument(level = "debug", skip(endpoint_pools, instance_ctx))]
+    pub async fn new_with_instance_ctx(
+        address: SocketAddr,
+        endpoint_pools: EndpointServerPools,
+        ctx: CancellationToken,
+        instance_ctx: Arc<InstanceContext>,
+    ) -> Result<Arc<Self>> {
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
 
         let mut deployment_id = None;
@@ -308,15 +327,16 @@ impl ECStore {
                 }
             }
 
-            let sets = Sets::new(disks.clone(), pool_eps, &fm, i, common_parity_drives).await?;
+            let sets =
+                Sets::new_with_instance_ctx(disks.clone(), pool_eps, &fm, i, common_parity_drives, instance_ctx.clone()).await?;
             pools.push(sets);
 
             disk_map.insert(i, disks);
         }
 
         // Replace the local disk
-        if !runtime_sources::setup_is_dist_erasure().await {
-            runtime_sources::record_local_disks(local_disks).await;
+        if !instance_ctx.is_dist_erasure().await {
+            runtime_sources::record_local_disks(&instance_ctx, local_disks).await;
         }
 
         let peer_sys = S3PeerSys::new(&endpoint_pools);
@@ -334,14 +354,17 @@ impl ECStore {
             decommission_cancelers,
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(()),
-            // Adopt the process bootstrap context so startup writes (erasure
-            // type recorded before this point) and later reads share one cell.
-            ctx: crate::runtime::instance::bootstrap_ctx(),
+            // Adopt the caller's context (the process bootstrap one on the
+            // legacy path) so startup writes (erasure type recorded before
+            // this point) and later reads share one cell.
+            ctx: instance_ctx.clone(),
         });
 
-        // Only set it when the global deployment ID is not yet configured
-        if let Some(dep_id) = deployment_id {
-            runtime_sources::ensure_deployment_id(dep_id);
+        // Only set it when this instance's deployment ID is not yet configured
+        if let Some(dep_id) = deployment_id
+            && instance_ctx.deployment_id().is_none()
+        {
+            instance_ctx.set_deployment_id(dep_id);
         }
 
         let wait_sec = 5;
@@ -758,5 +781,85 @@ mod tests {
             pool_first_endpoint_is_local(endpoints.as_ref().get(1).expect("second pool should exist")),
             "the expanded pool should be initialized by its own first local endpoint"
         );
+    }
+
+    // Phase 5 follow-up (backlog#1052): building a real store through the
+    // ctx-explicit constructor lands every construction-time write — object
+    // graph adoption, local-disk registry, deployment id — on the passed
+    // context, not on the process bootstrap one. This is the storage-layer
+    // seam a future second embedded server needs to stay isolated.
+    #[tokio::test]
+    async fn new_with_instance_ctx_threads_context_through_store_graph() {
+        use crate::runtime::instance::InstanceContext;
+
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let disk_paths: Vec<_> = (1..=4).map(|i| temp_dir.path().join(format!("disk{i}"))).collect();
+        for path in &disk_paths {
+            tokio::fs::create_dir_all(path).await.expect("create disk dir");
+        }
+
+        let mut endpoints = Vec::new();
+        for (i, path) in disk_paths.iter().enumerate() {
+            let mut endpoint = Endpoint::try_from(path.to_str().expect("disk path should be utf-8")).expect("local endpoint");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(i);
+            endpoints.push(endpoint);
+        }
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "instance-ctx-store-graph-test".to_string(),
+            platform: "test".to_string(),
+        }]);
+
+        let instance_ctx = Arc::new(InstanceContext::new());
+        crate::store::init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("register local disks into the fresh context");
+
+        let store = crate::store::ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address"),
+            endpoint_pools,
+            CancellationToken::new(),
+            instance_ctx.clone(),
+        )
+        .await
+        .expect("store should build around the fresh context");
+
+        assert!(
+            Arc::ptr_eq(&store.ctx, &instance_ctx),
+            "the store must adopt the explicitly passed instance context"
+        );
+        for sets in &store.pools {
+            assert!(
+                Arc::ptr_eq(sets.instance_ctx(), &instance_ctx),
+                "every pool's Sets must carry the passed instance context"
+            );
+        }
+        assert_eq!(
+            instance_ctx.deployment_id(),
+            Some(store.id),
+            "the deployment id must land on the passed context and mirror the store id"
+        );
+
+        let registered: Vec<String> = instance_ctx.local_disk_map().read().await.keys().cloned().collect();
+        assert_eq!(registered.len(), 4, "the passed context must register all four local disks");
+        let bootstrap = crate::runtime::instance::bootstrap_ctx();
+        assert_ne!(
+            bootstrap.deployment_id(),
+            Some(store.id),
+            "the bootstrap context must not absorb the fresh store's deployment id"
+        );
+        let bootstrap_map = bootstrap.local_disk_map();
+        let bootstrap_map = bootstrap_map.read().await;
+        for key in &registered {
+            assert!(
+                !bootstrap_map.contains_key(key),
+                "the bootstrap context must not absorb the fresh store's disks"
+            );
+        }
     }
 }

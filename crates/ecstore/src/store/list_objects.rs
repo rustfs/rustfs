@@ -3721,7 +3721,7 @@ impl ECStore {
     ) -> Result<ListObjectsInfo> {
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -3732,6 +3732,11 @@ impl ECStore {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
+        // The request marker still carries the `[rustfs_cache:...]` cursor tag;
+        // strip it before any name comparison (notably `forward_past`), or every
+        // key sorting between `<marker>` and `<marker>[` is silently skipped on
+        // the continuation page (backlog#1047).
+        opts.parse_marker();
         if let Some(mode) = list_objects_index_mode_from_env()
             && let Some(result) = self
                 .clone()
@@ -3846,7 +3851,7 @@ impl ECStore {
 
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         // Always request max_keys + 1 to detect if there are more results
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -3858,6 +3863,9 @@ impl ECStore {
             include_marker: has_version_marker,
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         let mut list_result = self
             .list_path(&opts)
@@ -4720,24 +4728,42 @@ async fn gather_results(
 
 /// Head entry of one input channel inside the k-way merge.
 ///
-/// `cleaned` caches `path::clean(name)` only when it differs from the raw
-/// name, so heap comparisons never allocate (walker-produced names are
-/// already clean in the common case).
+/// The entry name is canonicalized once at construction (see `new`), so heap
+/// comparisons never allocate; walker-produced names are already canonical,
+/// making the rewrite a no-op in the common case.
 struct MergeHead {
     entry: MetaCacheEntry,
-    cleaned: Option<String>,
     idx: usize,
 }
 
 impl MergeHead {
     fn new(entry: MetaCacheEntry, idx: usize) -> Self {
+        let mut entry = entry;
+        // Canonicalize the name at intake: collapse redundant internal
+        // segments (`a//b` → `a/b`) but keep one trailing slash, since it is
+        // what distinguishes a prefix dir / dir-marker from a plain object.
+        // Ordering, grouping, and the emitted stream then all use the same
+        // canonical byte order that downstream marker filtering and S3
+        // pagination compare with — ordering by the *cleaned* key while
+        // markers compare raw names let a prefix dir `a/` jump ahead of a
+        // sibling like `a.txt`, and a page boundary there dropped the sibling
+        // on the continuation (backlog#1046).
         let cleaned = path::clean(&entry.name);
-        let cleaned = if cleaned == entry.name { None } else { Some(cleaned) };
-        Self { entry, cleaned, idx }
+        if !cleaned.is_empty() && cleaned != "." && cleaned != entry.name {
+            let canonical = if entry.name.ends_with(SLASH_SEPARATOR) {
+                format!("{cleaned}{SLASH_SEPARATOR}")
+            } else {
+                cleaned
+            };
+            if canonical != entry.name {
+                entry.name = canonical;
+            }
+        }
+        Self { entry, idx }
     }
 
     fn sort_key(&self) -> &str {
-        self.cleaned.as_deref().unwrap_or(&self.entry.name)
+        &self.entry.name
     }
 }
 
@@ -4823,8 +4849,10 @@ async fn merge_entry_channels(
     }
 
     // K-way merge across per-channel sorted streams via a min-heap keyed by
-    // the path-cleaned entry name: advancing the merge costs O(log channels)
-    // per entry and comparisons are allocation-free (see `MergeHead`).
+    // the canonical entry name (see `MergeHead::new`): advancing the merge
+    // costs O(log channels) per entry and comparisons are allocation-free.
+    // The output byte order must match what markers and `forward_past`
+    // compare with, or pagination drops keys at page boundaries.
     //
     // Note on same-name resolution: prefix-dir groups collapse into a single
     // emission and objects shadow same-named prefix dirs. The legacy
@@ -4844,22 +4872,18 @@ async fn merge_entry_channels(
         }
     }
 
-    // Cross-iteration dedup state. Because the heap orders by the *cleaned*
-    // key, a plain object `a` and its same-named prefix dir `a/` share one key.
-    // They are distinct S3 keys (Contents `a` vs CommonPrefix `a/`), so both
-    // must survive — yet each kind may legitimately appear at most once per
-    // cleaned key. We therefore remember, per cleaned key, whether an object
-    // and/or a prefix dir has already been emitted so redundant heads from
-    // other drives (or later polls of the same drive) collapse.
-    let mut last_key = String::new();
-    let mut emitted_object = false;
-    let mut emitted_dir = false;
+    // Cross-iteration dedup state. Per-channel streams are sorted by name and
+    // the heap orders by the same canonical names, so equal names are always
+    // contiguous in pop order: a single last-emitted slot suffices to collapse
+    // a lagging channel's duplicate that missed its group (its head cannot pop
+    // after anything greater has been emitted).
+    let mut last_emitted = String::new();
     let mut group: Vec<Box<MergeHead>> = Vec::new();
     let mut refill: Vec<usize> = Vec::with_capacity(in_channels.len());
 
     while let Some(Reverse(first)) = heap.pop() {
-        // Collect every channel head that resolves to the same cleaned key so
-        // the duplicate rules below see the whole same-name group at once.
+        // Collect every channel head with the same canonical name so the
+        // duplicate rules below see the whole same-name group at once.
         group.clear();
         refill.clear();
         refill.push(first.idx);
@@ -4869,15 +4893,20 @@ async fn merge_entry_channels(
             group.push(next);
         }
 
-        // Resolve the same-cleaned-key group into at most one prefix-dir winner
-        // and at most one object winner (heads arrive in ascending channel
-        // order). Unlike the legacy rule, an object no longer *discards* a
-        // same-named prefix dir: a plain object `a` and a prefix dir `a/` are
-        // different S3 keys and both are emitted below. Only genuine duplicates
-        // of the same kind collapse:
-        //  - prefix dir vs prefix dir: the first (lowest channel) wins, and the
-        //    rest collapse (all prefix dirs share the trailing-slash suffix);
-        //  - object vs object: the later channel wins (legacy authority rule).
+        // Resolve the same-name group to one winner (heads arrive in ascending
+        // channel order):
+        //  - prefix dir vs prefix dir: the first (lowest channel) wins;
+        //  - object vs object: the later channel wins (legacy authority rule);
+        //  - object vs prefix dir: same-name means both end with the separator,
+        //    i.e. the object is an explicit "directory marker" for the same S3
+        //    key — it shadows the prefix dir so the key does not surface as
+        //    both Contents and a CommonPrefix (issue #1797). A marker arriving
+        //    a round late (after its channel's prefix dir was emitted) is
+        //    collapsed by `last_emitted` instead — same single S3 key, the
+        //    already-sent representation wins.
+        // A plain object `a` and a prefix dir `a/` have different names and
+        // therefore different groups: both are emitted, each at its own sorted
+        // position (backlog#880 / #4563 coexistence).
         let mut dir_winner: Option<Box<MergeHead>> = None;
         let mut object_winner: Option<Box<MergeHead>> = None;
         for head in std::iter::once(first).chain(group.drain(..)) {
@@ -4890,49 +4919,11 @@ async fn merge_entry_channels(
             }
         }
 
-        // An object whose raw name ends with the separator (an explicit
-        // "directory marker" object such as `folder/`) denotes the *same* S3
-        // key as the prefix dir `folder/`, not a distinct one. Preserve the
-        // legacy behavior there: the object shadows the prefix dir (they must
-        // not both surface as Contents + CommonPrefix). A plain object `a`
-        // (no trailing slash) is a different key from `a/` and coexists with it.
-        let object_shadows_dir = object_winner
-            .as_ref()
-            .is_some_and(|head| head.entry.name.ends_with(SLASH_SEPARATOR));
-
-        // Reset the per-key emission flags when the cleaned key advances. The
-        // heap pops in non-decreasing cleaned order, so a differing key is
-        // always strictly greater; comparing the cleaned key (not the raw name)
-        // keeps redundant-slash variants such as `a//b` and `a/b` collapsed.
-        let key = object_winner.as_deref().or(dir_winner.as_deref()).map(MergeHead::sort_key);
-        if let Some(key) = key
-            && key != last_key.as_str()
+        if let Some(head) = object_winner.or(dir_winner)
+            && head.entry.name != last_emitted
         {
-            last_key.clear();
-            last_key.push_str(key);
-            emitted_object = false;
-            emitted_dir = false;
-        }
-
-        // Emit the object first (raw `a` sorts before `a/`), then the prefix
-        // dir. A directory-marker object also consumes the prefix-dir slot so a
-        // later same-key prefix dir cannot re-emit the same key as a prefix.
-        if let Some(head) = object_winner
-            && !emitted_object
-        {
-            emitted_object = true;
-            if object_shadows_dir {
-                emitted_dir = true;
-            }
-            let MergeHead { entry, .. } = *head;
-            if !send_or_cancel(&rx, &out_channel, entry).await? {
-                return Ok(());
-            }
-        }
-        if let Some(head) = dir_winner
-            && !emitted_dir
-        {
-            emitted_dir = true;
+            last_emitted.clear();
+            last_emitted.push_str(&head.entry.name);
             let MergeHead { entry, .. } = *head;
             if !send_or_cancel(&rx, &out_channel, entry).await? {
                 return Ok(());
@@ -4996,7 +4987,7 @@ impl Sets {
     ) -> Result<ListObjectsInfo> {
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -5006,6 +4997,9 @@ impl Sets {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
             match self
@@ -5106,7 +5100,7 @@ impl Sets {
         };
 
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -5118,6 +5112,9 @@ impl Sets {
             include_marker: has_version_marker,
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         let mut list_result = self
             .list_path(&opts)
@@ -5798,7 +5795,7 @@ impl SetDisks {
     ) -> Result<ListObjectsInfo> {
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -5808,6 +5805,9 @@ impl SetDisks {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
             match self
@@ -5907,7 +5907,7 @@ impl SetDisks {
         };
 
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -5919,6 +5919,9 @@ impl SetDisks {
             include_marker: has_version_marker,
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         let mut list_result = self
             .list_path_result(&opts)
@@ -9642,11 +9645,11 @@ mod test {
 
     #[tokio::test]
     async fn merge_entry_channels_emits_when_cleaned_order_differs_from_raw_order() {
-        // Regression: `a//c` cleans to `a/c` and `a/b` is already clean. In
-        // cleaned order `a/b` < `a/c`, but raw byte order is the opposite
-        // (`a//c` < `a/b` because '/' < 'b'). The heap pops in cleaned order,
-        // so gating emission on the raw name would drop `a//c` after `a/b` is
-        // emitted. Both distinct keys must survive.
+        // `a//c` canonicalizes to `a/c` at merge intake and `a/b` is already
+        // canonical. Both distinct keys must survive, in canonical byte order
+        // (`a/b` < `a/c`) with the canonical spelling — emitting the raw
+        // `a//c` spelling would break downstream marker comparisons, which use
+        // the emitted names (backlog#1046).
         let (tx_a, rx_a) = mpsc::channel(4);
         let (tx_b, rx_b) = mpsc::channel(4);
         let (out_tx, mut out_rx) = mpsc::channel(8);
@@ -9667,19 +9670,120 @@ mod test {
 
         assert_eq!(
             results,
-            vec!["a/b", "a//c"],
-            "distinct cleaned keys must both be emitted in cleaned order"
+            vec!["a/b", "a/c"],
+            "distinct keys must both be emitted, canonicalized, in canonical order"
         );
     }
 
     #[tokio::test]
+    async fn merge_entry_channels_prefix_dir_sorts_after_sibling_keys() {
+        // Regression for backlog#1046. Walker streams are sorted by raw byte
+        // order, where a sibling like `a.txt` ('.' = 0x2E) sorts between the
+        // object `a` and the prefix dir `a/` ('/' = 0x2F). The old cleaned-key
+        // heap grouped channel B's `a/` (cleaned "a") with `a` and emitted it
+        // BEFORE `a.txt`; a page boundary right after that `a/` made the next
+        // page's marker filter drop `a.txt` (silent key loss), and channel A's
+        // own late `a/` was then emitted a second time (duplicate prefix).
+        // The merged stream must be `a`, `a.txt`, `a/` with exactly one `a/`.
+        let (tx_a, rx_a) = mpsc::channel(8);
+        let (tx_b, rx_b) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+
+        // Set 1 holds object `a`, sibling `a.txt`, and children under `a/`.
+        tx_a.send(test_object_meta_entry("a")).await.unwrap();
+        tx_a.send(test_object_meta_entry("a.txt")).await.unwrap();
+        tx_a.send(test_dir_meta_entry("a/")).await.unwrap();
+        drop(tx_a);
+        // Set 2 holds only children under `a/`, so its stream is just `a/`.
+        tx_b.send(test_dir_meta_entry("a/")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push((entry.name.clone(), entry.is_dir()));
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            results,
+            vec![("a".to_owned(), false), ("a.txt".to_owned(), false), ("a/".to_owned(), true),],
+            "the prefix dir must sort after raw-smaller siblings and be emitted exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_collapses_canonical_duplicates_from_one_channel_across_rounds() {
+        // A raw-ascending stream `a//b`, `a/b` ('/' < 'b') canonicalizes to two
+        // consecutive `a/b` heads in consecutive merge rounds — they never meet
+        // in one group, so only the cross-round `last_emitted` guard collapses
+        // the duplicate. The second channel keeps the k-way path (not the
+        // single-channel passthrough) engaged.
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        tx_a.send(test_meta_entry("a//b")).await.unwrap();
+        tx_a.send(test_meta_entry("a/b")).await.unwrap();
+        drop(tx_a);
+        tx_b.send(test_meta_entry("z")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            results,
+            vec!["a/b", "z"],
+            "canonical duplicates arriving in consecutive rounds must collapse to one emission"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entry_channels_lagging_dir_marker_collapses_into_emitted_prefix() {
+        // A non-recursive walk emits the prefix dir `folder/` and the marker
+        // object `folder/` adjacently on one channel. When another channel's
+        // `folder/` groups with the dir first, the marker pops one round late
+        // and must collapse into the already-emitted prefix (one S3 key, one
+        // emission) rather than surfacing the same name twice — the old code
+        // emitted both, and a page boundary between them dropped one.
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        tx_a.send(test_dir_meta_entry("folder/")).await.unwrap();
+        tx_a.send(test_object_meta_entry("folder/")).await.unwrap();
+        drop(tx_a);
+        tx_b.send(test_dir_meta_entry("folder/")).await.unwrap();
+        drop(tx_b);
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(merge_entry_channels(cancel, vec![rx_a, rx_b], out_tx, 1));
+
+        let mut results = Vec::new();
+        while let Some(entry) = out_rx.recv().await {
+            results.push(entry.name.clone());
+        }
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(results, vec!["folder/"], "the same S3 key must be emitted exactly once");
+    }
+
+    #[tokio::test]
     async fn merge_entry_channels_object_and_same_named_prefix_dir_coexist() {
-        // Regression for backlog #880. `path::clean("a/") == "a"`, so a plain
-        // object `a` and the prefix dir `a/` group under the same cleaned key.
-        // Per S3 delimiter semantics they are *distinct* keys: `a` belongs in
-        // Contents and `a/` rolls up into CommonPrefixes. The old rule let the
+        // Regression for backlog #880. A plain object `a` and the prefix dir
+        // `a/` are *distinct* S3 keys: `a` belongs in Contents and `a/` rolls up
+        // into CommonPrefixes. The old cleaned-key rule grouped them and let the
         // object shadow the prefix dir, dropping the CommonPrefix — that was the
-        // bug. Both must now be emitted (object first, since raw `a` < `a/`).
+        // bug. Both must be emitted (object first, since raw `a` < `a/`).
         let (tx_a, rx_a) = mpsc::channel(4);
         let (tx_b, rx_b) = mpsc::channel(4);
         let (out_tx, mut out_rx) = mpsc::channel(8);

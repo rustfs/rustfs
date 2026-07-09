@@ -48,7 +48,39 @@ impl DnsCacheEntry {
 }
 
 static DNS_CACHE: LazyLock<Mutex<HashMap<String, DnsCacheEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-const DNS_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Environment variable to tune the DNS resolver cache TTL, in seconds.
+///
+/// Rust has no runtime-level DNS cache or global TTL knob (unlike the JVM's
+/// `networkaddress.cache.ttl`), so this application cache is the only cache in the stack on
+/// musl-based images. On orchestrated networks (Docker Swarm, Kubernetes) a peer's DNS name is
+/// its only durable identity while its IP changes on reschedule; a fixed cache can keep a member
+/// dialing a dead IP after a peer restarts. Making the TTL tunable removes an invisible,
+/// unconfigurable cache between rustfs and the platform DNS.
+///
+/// `0` disables caching entirely (every `get_host_ip` consults the system resolver).
+const ENV_DNS_CACHE_TTL_SECS: &str = "RUSTFS_DNS_CACHE_TTL_SECS";
+const DEFAULT_DNS_CACHE_TTL_SECS: u64 = 300; // 5 minutes
+
+/// Resolved DNS cache TTL, read once from `RUSTFS_DNS_CACHE_TTL_SECS` at first use.
+///
+/// A value of `Duration::ZERO` means caching is disabled. The configured value is logged once so
+/// operators debugging cluster membership on dynamic networks can rule the cache in or out from
+/// the logs alone.
+static DNS_CACHE_TTL: LazyLock<Duration> = LazyLock::new(|| {
+    let secs = crate::envs::get_env_u64(ENV_DNS_CACHE_TTL_SECS, DEFAULT_DNS_CACHE_TTL_SECS);
+    if secs == 0 {
+        info!("DNS resolver cache disabled ({ENV_DNS_CACHE_TTL_SECS}=0); every lookup consults the system resolver");
+    } else {
+        info!("DNS resolver cache TTL set to {secs}s ({ENV_DNS_CACHE_TTL_SECS})");
+    }
+    Duration::from_secs(secs)
+});
+
+/// Whether the DNS resolver cache is enabled (TTL greater than zero).
+fn dns_cache_enabled() -> bool {
+    !DNS_CACHE_TTL.is_zero()
+}
 type DynDnsResolver = dyn Fn(&str) -> std::io::Result<HashSet<IpAddr>> + Send + Sync + 'static;
 static CUSTOM_DNS_RESOLVER: LazyLock<RwLock<Option<Arc<DynDnsResolver>>>> = LazyLock::new(|| RwLock::new(None));
 
@@ -219,34 +251,35 @@ fn get_local_ips_with_fallback() -> Vec<IpAddr> {
 pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
+            // The cache is bypassed entirely when a custom resolver is installed or when the TTL
+            // is configured to 0 (disabled), in which case every lookup consults the resolver.
+            let cache_enabled = dns_cache_enabled() && !has_custom_dns_resolver();
+
             // Check cache first
-            if !has_custom_dns_resolver()
+            if cache_enabled
                 && let Ok(mut cache) = DNS_CACHE.lock()
                 && let Some(entry) = cache.get(domain)
             {
-                if !entry.is_expired(DNS_CACHE_TTL) {
+                if !entry.is_expired(*DNS_CACHE_TTL) {
                     return Ok(entry.ips.clone());
                 }
                 // Remove expired entry
                 cache.remove(domain);
             }
 
-            info!("Cache miss for domain {domain}, querying system resolver.");
-
             // Fallback to standard resolution when DNS resolver is not available
             match resolve_domain(domain) {
                 Ok(ips) => {
-                    if !has_custom_dns_resolver() {
+                    if cache_enabled {
                         // Cache the result
                         if let Ok(mut cache) = DNS_CACHE.lock() {
                             cache.insert(domain.to_string(), DnsCacheEntry::new(ips.clone()));
                             // Limit cache size to prevent memory bloat
                             if cache.len() > 1000 {
-                                cache.retain(|_, v| !v.is_expired(DNS_CACHE_TTL));
+                                cache.retain(|_, v| !v.is_expired(*DNS_CACHE_TTL));
                             }
                         }
                     }
-                    info!("System query for domain {domain}: {:?}", ips);
                     Ok(ips)
                 }
                 Err(err) => {
@@ -573,6 +606,25 @@ mod test {
         // Test invalid domain
         let invalid_host = Host::Domain("invalid.nonexistent.domain.example");
         assert!(get_host_ip(invalid_host).await.is_err());
+    }
+
+    #[test]
+    fn test_dns_cache_entry_expiry() {
+        let ips: HashSet<IpAddr> = [IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))].into_iter().collect();
+
+        // A freshly cached entry is not expired under a normal TTL.
+        let fresh = DnsCacheEntry::new(ips.clone());
+        assert!(!fresh.is_expired(Duration::from_secs(300)));
+
+        // An entry whose age exceeds the TTL is expired; a longer TTL keeps it valid.
+        let aged = DnsCacheEntry {
+            ips,
+            cached_at: Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .expect("instant in range"),
+        };
+        assert!(aged.is_expired(Duration::from_secs(300)));
+        assert!(!aged.is_expired(Duration::from_secs(900)));
     }
 
     #[test]

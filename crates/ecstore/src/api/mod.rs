@@ -261,9 +261,9 @@ pub mod data_usage {
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend,
         load_compression_total_from_memory, load_data_usage_from_backend, record_bucket_delete_marker_memory,
         record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
-        record_compression_total_memory, refresh_bucket_usage_from_object_layer,
-        refresh_versioned_bucket_usage_from_object_layer, remove_bucket_usage_from_backend,
-        replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
+        record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
+        refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
+        remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
     };
 }
 
@@ -273,9 +273,9 @@ pub mod disk {
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
         CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
-        ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
-        validate_batch_read_version_item_count,
+        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, OldCurrentSize, RUSTFS_META_BUCKET, ReadMultipleReq,
+        ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        new_disk, validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
@@ -326,6 +326,7 @@ pub mod global {
 }
 
 pub mod runtime {
+    pub use crate::runtime::instance::{InstanceContext, bootstrap_ctx};
     pub use crate::runtime::sources::{
         boot_time, bucket_monitor, deployment_id, endpoint_pools, expiry_state_handle, first_cluster_node_is_local,
         global_lock_client, global_lock_clients, global_tier_config_mgr, local_disk_map_read, object_store_handle, region,
@@ -389,8 +390,9 @@ pub mod store_list {
 pub mod storage {
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
-        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_lock_clients,
-        prewarm_local_disk_id_map,
+        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,
+        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+        prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 

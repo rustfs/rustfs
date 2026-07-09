@@ -16,7 +16,7 @@ use crate::config::RustFSBufferConfig;
 use crate::runtime_sources::{
     current_outbound_tls_generation as runtime_current_outbound_tls_generation, current_replication_pool_handle,
 };
-use crate::storage_api::startup::runtime_sources::{DynReplicationPool, set_global_region, set_global_rustfs_port};
+use crate::storage_api::startup::runtime_sources::{DynReplicationPool, InstanceContext, set_global_rustfs_port};
 use rustfs_kms::KmsServiceManager;
 use rustfs_obs::{GlobalError as ObservabilityError, OtelGuard};
 use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration};
@@ -30,8 +30,8 @@ pub(crate) fn init_action_credentials(
     rustfs_credentials::init_global_action_credentials(Some(access_key), Some(secret_key))
 }
 
-pub(crate) fn publish_region(region: s3s::region::Region) {
-    set_global_region(region);
+pub(crate) fn publish_region(instance_ctx: &Arc<InstanceContext>, region: s3s::region::Region) {
+    instance_ctx.set_region(region);
 }
 
 pub(crate) fn publish_server_port(port: u16) {

@@ -390,9 +390,11 @@ impl RustFSTestEnvironment {
 
         let binary_path = rustfs_binary_path();
         let mut command = Command::new(&binary_path);
-        command
-            .env("RUSTFS_CONSOLE_ENABLE", "false")
-            .env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+        command.env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+        // The embedded console would bind the fixed default port :9001, which
+        // collides with unrelated local services (e.g. Docker Desktop). Tests
+        // that need the console can still override this via extra_env.
+        command.env("RUSTFS_CONSOLE_ENABLE", "false");
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -437,11 +439,20 @@ impl RustFSTestEnvironment {
     /// connections before the S3 stack is fully initialized, which causes
     /// early requests to fail intermittently. Treat readiness as "S3 API
     /// responds successfully" instead.
-    pub async fn wait_for_server_ready(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// Fails immediately if the spawned server process has already exited
+    /// (e.g. a port bind failure) instead of polling out the full timeout.
+    pub async fn wait_for_server_ready(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Waiting for RustFS server to be ready on {}", self.address);
         let client = self.create_s3_client();
 
         for i in 0..60 {
+            if let Some(process) = self.process.as_mut()
+                && let Ok(Some(status)) = process.try_wait()
+            {
+                return Err(format!("RustFS server process exited before becoming ready: {status}").into());
+            }
+
             if TcpStream::connect(&self.address).await.is_ok() && client.list_buckets().send().await.is_ok() {
                 info!("✅ RustFS server is ready after {} attempts", i + 1);
                 return Ok(());

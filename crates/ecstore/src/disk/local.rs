@@ -18,7 +18,7 @@ use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
+    FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
     RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE,
     STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
@@ -3773,7 +3773,7 @@ impl LocalDisk {
 
                     write_metacache_obj(out, &meta).await?;
 
-                    let file_meta = if opts.limit > 0 || opts.recursive {
+                    let file_meta = if opts.limit > 0 || opts.recursive || !is_dir_obj {
                         FileMeta::load(&res).ok()
                     } else {
                         None
@@ -3783,15 +3783,16 @@ impl LocalDisk {
                         *objs_returned += 1;
                     }
 
-                    if opts.recursive {
-                        let mut dir_to_skip = HashSet::new();
-                        if let Some(file_meta) = file_meta.as_ref()
-                            && let Ok(data_dirs) = file_meta.get_data_dirs()
-                        {
-                            for data_dir in data_dirs.iter().flatten() {
-                                dir_to_skip.insert(data_dir.to_string());
-                            }
+                    let mut dir_to_skip = HashSet::new();
+                    if let Some(file_meta) = file_meta.as_ref()
+                        && let Ok(data_dirs) = file_meta.get_data_dirs()
+                    {
+                        for data_dir in data_dirs.iter().flatten() {
+                            dir_to_skip.insert(data_dir.to_string());
                         }
+                    }
+
+                    if opts.recursive {
                         let mut dir_name = meta.name.clone();
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
@@ -3802,23 +3803,20 @@ impl LocalDisk {
                             true,
                             if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
                         );
-                    } else if !is_dir_obj {
-                        // backlog#1042: in a non-recursive (delimiter) listing a plain
-                        // object `a` can ALSO be a prefix `a/` when sibling objects such
-                        // as `a/b` live under it. The object was emitted above (it becomes
-                        // Contents); emit the prefix dir `a/` too so the upstream fold
-                        // surfaces it as a CommonPrefix (matching S3 delimiter semantics).
-                        // The probe only reports true when `a/` holds a listing entry
-                        // other than object `a` itself, so leaf objects (the common case)
-                        // schedule nothing and pay a single list_dir.
-                        if self
-                            .object_prefix_has_sibling_listing_entry(&opts.bucket, &meta.name, res.as_ref())
+                    } else if !is_dir_obj
+                        && self
+                            .object_dir_has_listable_child(&opts.bucket, &meta.name, &dir_to_skip, opts.incl_deleted)
                             .await?
-                        {
-                            let mut dir_name = meta.name.clone();
-                            dir_name.push_str(SLASH_SEPARATOR);
-                            schedule_dir(&mut dir_stack, dir_name, true, None);
-                        }
+                    {
+                        // A plain object `a` shares its backing directory with any
+                        // children `a/...`, and non-recursive walks never descend into
+                        // it — so the prefix `a/` must be produced here or delimiter
+                        // listings lose the CommonPrefix (backlog#1042). Dir-marker
+                        // objects are excluded: their logical children live in a
+                        // separate real directory entry handled above.
+                        let mut dir_name = meta.name.clone();
+                        dir_name.push_str(SLASH_SEPARATOR);
+                        schedule_dir(&mut dir_stack, dir_name, true, None);
                     }
                 }
                 Err(err) => {
@@ -3829,7 +3827,9 @@ impl LocalDisk {
                             meta.name.push_str(SLASH_SEPARATOR);
                             if opts.recursive
                                 || opts.incl_deleted
-                                || self.directory_has_visible_listing_entry(&opts.bucket, &meta.name).await?
+                                || self
+                                    .directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted)
+                                    .await?
                             {
                                 schedule_dir(&mut dir_stack, meta.name, false, None);
                             }
@@ -3889,7 +3889,71 @@ impl LocalDisk {
         Ok(())
     }
 
-    async fn directory_has_visible_listing_entry(&self, bucket: &str, dir_name: &str) -> Result<bool> {
+    /// Whether the backing directory of plain object `object_name` also holds
+    /// listable children (`object_name/...`), beyond the object's own storage
+    /// internals: its `xl.meta` and the version data dirs in `data_dirs`.
+    ///
+    /// With `incl_deleted`, a child subtree counts as soon as it holds any
+    /// object metadata (versioned listings surface delete markers too);
+    /// otherwise the child must have a visible listing entry.
+    async fn object_dir_has_listable_child(
+        &self,
+        bucket: &str,
+        object_name: &str,
+        data_dirs: &HashSet<String>,
+        incl_deleted: bool,
+    ) -> Result<bool> {
+        // The backing dir usually holds only the xl.meta plus the version data
+        // dirs, so a read bounded just past that count decides the common case
+        // without materializing large child sets: an under-filled batch proves
+        // the listing is complete. Only an inconclusive full batch (candidates
+        // present but none listable yet) falls back to the unbounded read.
+        let bounded = i32::try_from(data_dirs.len() + 2).unwrap_or(-1);
+        let mut probed = HashSet::new();
+
+        for count in [bounded, -1] {
+            let entries = match self.list_dir("", bucket, object_name, count).await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    if err == DiskError::VolumeNotFound || err == Error::FileNotFound {
+                        return Ok(false);
+                    }
+
+                    return Err(err);
+                }
+            };
+
+            let complete = count < 0 || entries.len() < count as usize;
+
+            for entry in entries {
+                let Some(child) = entry.strip_suffix(SLASH_SEPARATOR) else {
+                    // Plain files (the object's own xl.meta) can never hold children.
+                    continue;
+                };
+
+                if child.is_empty() || data_dirs.contains(child) || !probed.insert(child.to_owned()) {
+                    continue;
+                }
+
+                let child_path = path_join_buf(&[object_name, child]);
+                if self.directory_has_listing_entry(bucket, &child_path, incl_deleted).await? {
+                    return Ok(true);
+                }
+            }
+
+            if complete {
+                break;
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Whether anything under `dir_name` would appear in a listing. With
+    /// `incl_deleted`, any `xl.meta` counts (versioned listings surface
+    /// delete-marker-only objects too); otherwise the metadata must hold a
+    /// visible version.
+    async fn directory_has_listing_entry(&self, bucket: &str, dir_name: &str, incl_deleted: bool) -> Result<bool> {
         let mut stack = vec![dir_name.trim_matches('/').to_owned()];
 
         while let Some(current) = stack.pop() {
@@ -3913,6 +3977,10 @@ impl LocalDisk {
 
             for entry in entries {
                 if entry == STORAGE_FORMAT_FILE {
+                    if incl_deleted {
+                        return Ok(true);
+                    }
+
                     let metadata_path = path_join_buf(&[current.as_str(), STORAGE_FORMAT_FILE]);
                     match self.read_metadata(bucket, metadata_path.as_str()).await {
                         Ok(metadata) => {
@@ -3953,48 +4021,6 @@ impl LocalDisk {
                 if !data_dirs_to_skip.contains(&child) {
                     stack.push(path_join_buf(&[current.as_str(), child.as_str()]));
                 }
-            }
-        }
-
-        Ok(false)
-    }
-
-    /// backlog#1042 helper for non-recursive (delimiter) listings. Given an object
-    /// directory `obj_dir` (e.g. `a`, which holds `a/xl.meta`), decide whether it
-    /// ALSO acts as a prefix — i.e. contains a listing entry other than the object
-    /// itself, such as a sibling object `a/b`. The object's own `xl.meta` and data
-    /// dirs belong to the object, not to a child prefix, so they are skipped.
-    /// Returns false for leaf objects (the common case), so they incur only a
-    /// single `list_dir` and no descent.
-    async fn object_prefix_has_sibling_listing_entry(&self, bucket: &str, obj_dir: &str, metadata: &[u8]) -> Result<bool> {
-        let mut data_dirs_to_skip = HashSet::new();
-        if let Ok(file_meta) = FileMeta::load(metadata)
-            && let Ok(data_dirs) = file_meta.get_data_dirs()
-        {
-            for data_dir in data_dirs.iter().flatten() {
-                data_dirs_to_skip.insert(data_dir.to_string());
-            }
-        }
-
-        let entries = match self.list_dir("", bucket, obj_dir, -1).await {
-            Ok(entries) => entries,
-            Err(err) if err == DiskError::VolumeNotFound || err == Error::FileNotFound => return Ok(false),
-            Err(err) => return Err(err),
-        };
-
-        for entry in entries {
-            // Only child directories can introduce a sibling listing entry; the
-            // object's own `xl.meta` (a plain file) is not a child prefix.
-            if !entry.ends_with(SLASH_SEPARATOR) {
-                continue;
-            }
-            let child = entry.trim_end_matches(SLASH_SEPARATOR);
-            if child.is_empty() || data_dirs_to_skip.contains(child) {
-                continue;
-            }
-            let child_path = path_join_buf(&[obj_dir, child]);
-            if self.directory_has_visible_listing_entry(bucket, &child_path).await? {
-                return Ok(true);
             }
         }
 
@@ -4048,6 +4074,50 @@ fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
         signature.extend_from_slice(version.header.version_id.unwrap_or_default().as_bytes());
     }
     Some(signature)
+}
+
+/// rustfs/backlog#1009: observe the destination key's *current* (latest)
+/// version in the dst `xl.meta` that `rename_data` already loaded, before
+/// `add_version` commits the incoming one. Replicates the pre-PUT
+/// `get_object_info` outcome bit for bit, as the per-disk `read_version`
+/// pipeline (`get_file_info`) would report it:
+///
+/// - `dst_meta_existed == false` (no dst xl.meta on this disk): the lookup
+///   errors FileNotFound → app-level `None` → `Absent`.
+/// - Existing meta whose versions are all hidden free versions: the lookup
+///   errors FileNotFound the same way → `Absent`.
+/// - Existing meta with zero versions: `get_file_info` synthesizes a deleted
+///   `FileInfo` with size 0 and the lookup returns `Ok` → `Present(0)`.
+/// - A resolvable latest version — live object, delete marker, or a
+///   purge-pending version flagged `deleted` — returns `Ok` with
+///   `ObjectInfo.size == fi.size` (0 for markers) → `Present(fi.size)`.
+///   Delete markers deliberately do NOT map to `Absent`: today's lookup
+///   returns `Ok(size 0)` for them, and delete-marker creation never
+///   decrements `objects_count`, so `Some(0)` is what keeps versioned
+///   accounting bit-identical.
+/// - A latest version that fails to decode — including the part-array length
+///   guard that `all_parts=true` enables, the same flag the per-disk lookup
+///   uses — yields `None` (unknown): the old lookup surfaced a per-disk error
+///   there, so this disk must not vote in the set-level quorum reduction.
+///
+/// One deliberate divergence: `read_data` stays `false` (the lookup used
+/// `true`), so a corrupt inline-data map that would have errored the old
+/// lookup votes the version's own `size` here instead of abstaining. The
+/// size field decodes independently of the inline data, so the vote carries
+/// the same value healthy disks report, and skipping the lookup's inline
+/// bytes clone keeps the observation allocation-light.
+fn observe_old_current_size(dst_meta_existed: bool, xlmeta: &FileMeta) -> Option<OldCurrentSize> {
+    if !dst_meta_existed {
+        return Some(OldCurrentSize::Absent);
+    }
+    if xlmeta.versions.is_empty() {
+        return Some(OldCurrentSize::Present(0));
+    }
+    match xlmeta.into_fileinfo("", "", "", false, false, true) {
+        Ok(fi) => Some(OldCurrentSize::Present(fi.size)),
+        Err(rustfs_filemeta::Error::FileNotFound) => Some(OldCurrentSize::Absent),
+        Err(_) => None,
+    }
 }
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
@@ -5082,12 +5152,26 @@ impl DiskAPI for LocalDisk {
             };
 
             let mut xlmeta = FileMeta::new();
-            if let Some(dst_buf) = has_dst_buf.as_ref()
-                && FileMeta::is_xl2_v1_format(dst_buf)
-                && let Ok(nmeta) = FileMeta::load(dst_buf)
-            {
-                xlmeta = nmeta
+            // An existing dst xl.meta that fails to parse leaves `xlmeta` empty
+            // and gets overwritten by the commit below (pre-existing behavior);
+            // track that so the old-size observation reports unknown instead of
+            // a false `Absent` (rustfs/backlog#1009).
+            let mut dst_meta_unparsable = false;
+            if let Some(dst_buf) = has_dst_buf.as_ref() {
+                if FileMeta::is_xl2_v1_format(dst_buf)
+                    && let Ok(nmeta) = FileMeta::load(dst_buf)
+                {
+                    xlmeta = nmeta
+                } else {
+                    dst_meta_unparsable = true;
+                }
             }
+
+            let old_current_size = if dst_meta_unparsable {
+                None
+            } else {
+                observe_old_current_size(has_dst_buf.is_some(), &xlmeta)
+            };
 
             let mut skip_parent = dst_volume_dir.clone();
             if has_dst_buf.as_ref().is_some()
@@ -5299,6 +5383,7 @@ impl DiskAPI for LocalDisk {
             Ok(RenameDataResp {
                 old_data_dir: has_old_data_dir,
                 sign: version_signature,
+                old_current_size,
             })
         } else {
             // Inline: merge read + parse + write + rename into single spawn_blocking
@@ -5312,7 +5397,7 @@ impl DiskAPI for LocalDisk {
                 None
             };
 
-            let (old_data_dir, version_signature) = tokio::task::spawn_blocking(move || {
+            let (old_data_dir, version_signature, old_current_size) = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -5321,12 +5406,25 @@ impl DiskAPI for LocalDisk {
                 };
 
                 let mut xlmeta = FileMeta::new();
-                if let Some(ref buf) = has_dst_buf
-                    && FileMeta::is_xl2_v1_format(buf)
-                    && let Ok(nmeta) = FileMeta::load(buf)
-                {
-                    xlmeta = nmeta
+                // Same as the non-inline branch: an unparsable existing dst
+                // xl.meta must surface as unknown, not `Absent`
+                // (rustfs/backlog#1009).
+                let mut dst_meta_unparsable = false;
+                if let Some(ref buf) = has_dst_buf {
+                    if FileMeta::is_xl2_v1_format(buf)
+                        && let Ok(nmeta) = FileMeta::load(buf)
+                    {
+                        xlmeta = nmeta
+                    } else {
+                        dst_meta_unparsable = true;
+                    }
                 }
+
+                let old_current_size = if dst_meta_unparsable {
+                    None
+                } else {
+                    observe_old_current_size(has_dst_buf.is_some(), &xlmeta)
+                };
 
                 let version_id = fi.version_id.unwrap_or_default();
                 let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
@@ -5424,7 +5522,11 @@ impl DiskAPI for LocalDisk {
                     }
                 }
 
-                Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>), std::io::Error>((old_data_dir, version_signature))
+                Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>, Option<OldCurrentSize>), std::io::Error>((
+                    old_data_dir,
+                    version_signature,
+                    old_current_size,
+                ))
             })
             .await
             .map_err(DiskError::from)??;
@@ -5439,6 +5541,7 @@ impl DiskAPI for LocalDisk {
             Ok(RenameDataResp {
                 old_data_dir,
                 sign: version_signature,
+                old_current_size,
             })
         }
     }
@@ -7643,6 +7746,266 @@ mod test {
                 .join(STORAGE_FORMAT_FILE)
                 .exists()
         );
+        // rustfs/backlog#1009: the overwritten live current version (size 1
+        // from `test_file_info`) must be surfaced through the backfill.
+        assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(1)));
+    }
+
+    /// rustfs/backlog#1009: `observe_old_current_size` must mirror the pre-PUT
+    /// `get_object_info` semantics bit for bit — latest version's
+    /// `ObjectInfo.size` (0 for a delete-marker latest, which that lookup
+    /// returns as `Ok`, not as not-found), missing key → `Absent` — and
+    /// `rename_data` must report it for both the inline and non-inline commit
+    /// branches.
+    mod old_current_size_backfill {
+        use super::*;
+        use tempfile::tempdir;
+
+        fn live_file_info(name: &str, version_id: Uuid, size: i64, mod_time: OffsetDateTime) -> FileInfo {
+            FileInfo {
+                name: name.to_string(),
+                version_id: Some(version_id),
+                size,
+                mod_time: Some(mod_time),
+                ..Default::default()
+            }
+        }
+
+        fn delete_marker_file_info(name: &str, version_id: Uuid, mod_time: OffsetDateTime) -> FileInfo {
+            FileInfo {
+                name: name.to_string(),
+                version_id: Some(version_id),
+                deleted: true,
+                mod_time: Some(mod_time),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn observe_reports_absent_for_missing_key() {
+            assert_eq!(observe_old_current_size(false, &FileMeta::default()), Some(OldCurrentSize::Absent));
+        }
+
+        /// An existing xl.meta with zero versions reads back through
+        /// `get_file_info` as a synthetic deleted FileInfo of size 0, so the
+        /// pre-PUT lookup reported `Some(0)`, not not-found.
+        #[test]
+        fn observe_reports_present_zero_for_existing_versionless_meta() {
+            assert_eq!(observe_old_current_size(true, &FileMeta::default()), Some(OldCurrentSize::Present(0)));
+        }
+
+        #[test]
+        fn observe_reports_latest_live_version_size() {
+            let now = OffsetDateTime::now_utc();
+            let mut meta = FileMeta::new();
+            meta.add_version(live_file_info("object", Uuid::new_v4(), 10, now - time::Duration::seconds(10)))
+                .expect("older live version should be added");
+            meta.add_version(live_file_info("object", Uuid::new_v4(), 42, now))
+                .expect("newer live version should be added");
+
+            assert_eq!(observe_old_current_size(true, &meta), Some(OldCurrentSize::Present(42)));
+        }
+
+        /// The pre-PUT lookup returns `Ok(size 0)` for a delete-marker latest
+        /// (RustFS's `SetDisks::get_object_info` does not convert markers to
+        /// not-found), and delete-marker creation never decrements
+        /// objects_count — so the backfill must report `Present(0)` here, not
+        /// `Absent`, to keep versioned accounting bit-identical.
+        #[test]
+        fn observe_reports_present_zero_for_delete_marker_latest() {
+            let now = OffsetDateTime::now_utc();
+            let mut meta = FileMeta::new();
+            meta.add_version(live_file_info("object", Uuid::new_v4(), 42, now - time::Duration::seconds(10)))
+                .expect("live version should be added");
+            meta.add_version(delete_marker_file_info("object", Uuid::new_v4(), now))
+                .expect("delete marker should be added");
+
+            assert_eq!(observe_old_current_size(true, &meta), Some(OldCurrentSize::Present(0)));
+        }
+
+        /// A latest version whose part arrays are corrupt (lengths disagree)
+        /// made the old per-disk lookup error out — this disk must abstain
+        /// (`None`), never vote. Pins the `all_parts=true` flag that enables
+        /// the part-array length guard.
+        #[test]
+        fn observe_abstains_for_corrupt_part_arrays() {
+            let now = OffsetDateTime::now_utc();
+            let mut fi = live_file_info("object", Uuid::new_v4(), 42, now);
+            fi.add_object_part(1, "etag".to_string(), 42, Some(now), 42, None, None);
+            let mut version = rustfs_filemeta::FileMetaVersion::from(fi);
+            version
+                .object
+                .as_mut()
+                .expect("object version should carry a MetaObject")
+                .part_sizes
+                .clear();
+
+            let mut meta = FileMeta::new();
+            meta.add_version_filemata(version)
+                .expect("corrupt-part version should still insert");
+
+            assert_eq!(observe_old_current_size(true, &meta), None);
+        }
+
+        async fn test_disk(dir: &tempfile::TempDir) -> LocalDisk {
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            ensure_test_volume(&disk, "bucket").await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+            disk
+        }
+
+        #[tokio::test]
+        async fn inline_rename_data_reports_absent_for_fresh_key() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            let new_fi = test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"inline-new")));
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-fresh", new_fi, "bucket", "object")
+                .await
+                .expect("inline rename_data should commit");
+
+            assert_eq!(resp.old_current_size, Some(OldCurrentSize::Absent));
+        }
+
+        #[tokio::test]
+        async fn inline_rename_data_reports_present_zero_for_delete_marker_latest() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            let now = OffsetDateTime::now_utc();
+            let mut old_meta = FileMeta::new();
+            old_meta
+                .add_version(live_file_info("object", Uuid::new_v4(), 42, now - time::Duration::seconds(10)))
+                .expect("live version should be added");
+            old_meta
+                .add_version(delete_marker_file_info("object", Uuid::new_v4(), now))
+                .expect("delete marker should be added");
+            let dst_object_dir = dir.path().join("bucket").join("object");
+            fs::create_dir_all(&dst_object_dir).await.expect("dst dir should be created");
+            fs::write(
+                dst_object_dir.join(STORAGE_FORMAT_FILE),
+                old_meta.marshal_msg().expect("old metadata should encode"),
+            )
+            .await
+            .expect("old metadata should be written");
+
+            let new_fi = test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"inline-new")));
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-marker", new_fi, "bucket", "object")
+                .await
+                .expect("inline rename_data should commit");
+
+            // The pre-PUT lookup returns Ok(size 0) for a marker latest, so
+            // the backfill must match it (see observe_old_current_size docs).
+            assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(0)));
+        }
+
+        #[tokio::test]
+        async fn inline_rename_data_reports_unknown_for_unparsable_dst_meta() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            let dst_object_dir = dir.path().join("bucket").join("object");
+            fs::create_dir_all(&dst_object_dir).await.expect("dst dir should be created");
+            fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), b"not-an-xl-meta")
+                .await
+                .expect("garbage metadata should be written");
+
+            let new_fi = test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"inline-new")));
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-garbage", new_fi, "bucket", "object")
+                .await
+                .expect("inline rename_data should commit");
+
+            assert_eq!(resp.old_current_size, None);
+        }
+
+        #[tokio::test]
+        async fn non_inline_rename_data_reports_absent_then_previous_size() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            // First non-inline commit: fresh key must report Absent.
+            let first_data_dir = Uuid::new_v4();
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join("tmp-first")
+                .join(first_data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("tmp data dir should be created");
+            fs::write(tmp_data_dir.join("part.1"), b"first")
+                .await
+                .expect("part should be written");
+            let mut first_fi = test_file_info("object", Uuid::new_v4(), Some(first_data_dir), None);
+            first_fi.size = 5;
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-first", first_fi, "bucket", "object")
+                .await
+                .expect("first non-inline rename_data should commit");
+            assert_eq!(resp.old_current_size, Some(OldCurrentSize::Absent));
+
+            // Overwrite: the committed live version (size 5) must be reported.
+            let second_data_dir = Uuid::new_v4();
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join("tmp-second")
+                .join(second_data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("tmp data dir should be created");
+            fs::write(tmp_data_dir.join("part.1"), b"second-longer")
+                .await
+                .expect("part should be written");
+            let mut second_fi = test_file_info("object", Uuid::new_v4(), Some(second_data_dir), None);
+            second_fi.size = 13;
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-second", second_fi, "bucket", "object")
+                .await
+                .expect("second non-inline rename_data should commit");
+            assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(5)));
+        }
+
+        /// Twin of the inline unparsable-dst test: the `dst_meta_unparsable`
+        /// tracking is duplicated per branch, so the non-inline copy needs its
+        /// own regression coverage.
+        #[tokio::test]
+        async fn non_inline_rename_data_reports_unknown_for_unparsable_dst_meta() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            let dst_object_dir = dir.path().join("bucket").join("object");
+            fs::create_dir_all(&dst_object_dir).await.expect("dst dir should be created");
+            fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), b"not-an-xl-meta")
+                .await
+                .expect("garbage metadata should be written");
+
+            let data_dir = Uuid::new_v4();
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join("tmp-garbage-noninline")
+                .join(data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("tmp data dir should be created");
+            fs::write(tmp_data_dir.join("part.1"), b"payload")
+                .await
+                .expect("part should be written");
+            let mut new_fi = test_file_info("object", Uuid::new_v4(), Some(data_dir), None);
+            new_fi.size = 7;
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-garbage-noninline", new_fi, "bucket", "object")
+                .await
+                .expect("non-inline rename_data should commit over garbage metadata");
+
+            assert_eq!(resp.old_current_size, None);
+        }
     }
 
     #[tokio::test]
@@ -8771,6 +9134,348 @@ mod test {
         assert!(
             !entries.iter().any(|(name, _)| name == "c/"),
             "leaf object `c` must not produce a spurious prefix `c/`, got {entries:?}"
+        );
+    }
+
+    // Regression for backlog#1042: on a single disk, a plain object `a` and its
+    // children `a/...` share one backing directory, so the non-recursive scan
+    // must produce both the object entry `a` and the prefix entry `a/` — while
+    // an object whose directory only holds its own xl.meta and data dirs must
+    // not grow a phantom prefix.
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_object_with_children_emits_prefix() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str, data_dir: Option<&str>) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.data_dir = data_dir.map(|dir| Uuid::parse_str(dir).expect("test data dir should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        fn hidden_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version(FileInfo {
+                name: name.to_owned(),
+                deleted: true,
+                version_id: Some(Uuid::parse_str(version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("hidden metadata should encode")
+        }
+
+        async fn scan_entries(disk: &LocalDisk, bucket: &str, incl_deleted: bool) -> Vec<(String, bool)> {
+            let (reader, mut writer) = tokio::io::duplex(65536);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: "".to_string(),
+                recursive: false,
+                incl_deleted,
+                limit: 1000,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| (entry.name, !entry.metadata.is_empty()))
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        // `alpha` object with a data dir, plus a real child `alpha/beta`.
+        let alpha_data_dir = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        fs::create_dir_all(bucket_dir.join("alpha").join(alpha_data_dir))
+            .await
+            .expect("alpha data dir should be created");
+        fs::write(bucket_dir.join("alpha").join(alpha_data_dir).join("part.1"), b"data")
+            .await
+            .expect("alpha part should be written");
+        fs::write(
+            bucket_dir.join("alpha").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("alpha", "11111111-1111-1111-1111-111111111111", Some(alpha_data_dir)),
+        )
+        .await
+        .expect("alpha metadata should be written");
+        fs::create_dir_all(bucket_dir.join("alpha/beta"))
+            .await
+            .expect("alpha child dir should be created");
+        fs::write(
+            bucket_dir.join("alpha/beta").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("alpha/beta", "22222222-2222-2222-2222-222222222222", None),
+        )
+        .await
+        .expect("alpha child metadata should be written");
+
+        // `gamma` object whose only extra child is hidden by a delete marker.
+        fs::create_dir_all(bucket_dir.join("gamma/hidden"))
+            .await
+            .expect("gamma child dir should be created");
+        fs::write(
+            bucket_dir.join("gamma").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("gamma", "33333333-3333-3333-3333-333333333333", None),
+        )
+        .await
+        .expect("gamma metadata should be written");
+        fs::write(
+            bucket_dir.join("gamma/hidden").join(STORAGE_FORMAT_FILE),
+            hidden_object_metadata("gamma/hidden", "44444444-4444-4444-4444-444444444444"),
+        )
+        .await
+        .expect("gamma child metadata should be written");
+
+        // `plain` object with only its own storage internals: no prefix expected.
+        let plain_data_dir = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        fs::create_dir_all(bucket_dir.join("plain").join(plain_data_dir))
+            .await
+            .expect("plain data dir should be created");
+        fs::write(bucket_dir.join("plain").join(plain_data_dir).join("part.1"), b"data")
+            .await
+            .expect("plain part should be written");
+        // Data dirs can hold xl.meta-bearing subdirectories (multipart layout);
+        // the probe must skip the whole data dir, not just non-metadata files.
+        fs::create_dir_all(bucket_dir.join("plain").join(plain_data_dir).join("seg"))
+            .await
+            .expect("plain data subdir should be created");
+        fs::write(
+            bucket_dir
+                .join("plain")
+                .join(plain_data_dir)
+                .join("seg")
+                .join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("plain-part", "88888888-8888-8888-8888-888888888888", None),
+        )
+        .await
+        .expect("plain data subdir metadata should be written");
+        fs::write(
+            bucket_dir.join("plain").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("plain", "55555555-5555-5555-5555-555555555555", Some(plain_data_dir)),
+        )
+        .await
+        .expect("plain metadata should be written");
+
+        // `zeta` sorts last so its prefix is flushed by the final drain, not the
+        // in-loop flush that `alpha/` exercises.
+        fs::create_dir_all(bucket_dir.join("zeta/child"))
+            .await
+            .expect("zeta child dir should be created");
+        fs::write(
+            bucket_dir.join("zeta").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("zeta", "66666666-6666-6666-6666-666666666666", None),
+        )
+        .await
+        .expect("zeta metadata should be written");
+        fs::write(
+            bucket_dir.join("zeta/child").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("zeta/child", "77777777-7777-7777-7777-777777777777", None),
+        )
+        .await
+        .expect("zeta child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let entries = scan_entries(&disk, bucket, false).await;
+        let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(names, vec!["alpha", "alpha/", "gamma", "plain", "zeta", "zeta/"]);
+        assert!(entries.iter().any(|(name, has_meta)| name == "alpha" && *has_meta));
+        assert!(entries.iter().any(|(name, has_meta)| name == "alpha/" && !*has_meta));
+        assert!(entries.iter().any(|(name, has_meta)| name == "zeta/" && !*has_meta));
+
+        // Versioned listings surface delete-marker-only children, so `gamma/`
+        // appears; data dirs still never masquerade as prefixes.
+        let versioned_entries = scan_entries(&disk, bucket, true).await;
+        let versioned_names: Vec<&str> = versioned_entries.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(versioned_names, vec!["alpha", "alpha/", "gamma", "gamma/", "plain", "zeta", "zeta/"]);
+    }
+
+    // Preserve the explicit dir-marker semantics: a marker object `folder/` and
+    // the real directory `folder/` still collapse to a single prefix entry; the
+    // marker itself must not trigger the object-dir child probe.
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_dir_marker_prefix_not_duplicated() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join(format!("folder{GLOBAL_DIR_SUFFIX}")))
+            .await
+            .expect("marker dir should be created");
+        fs::write(
+            bucket_dir
+                .join(format!("folder{GLOBAL_DIR_SUFFIX}"))
+                .join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("folder/", "11111111-1111-1111-1111-111111111111"),
+        )
+        .await
+        .expect("marker metadata should be written");
+        fs::create_dir_all(bucket_dir.join("folder/nested"))
+            .await
+            .expect("real child dir should be created");
+        fs::write(
+            bucket_dir.join("folder/nested").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("folder/nested", "22222222-2222-2222-2222-222222222222"),
+        )
+        .await
+        .expect("real child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let (reader, mut writer) = tokio::io::duplex(65536);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: false,
+            limit: 1000,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .expect("scan_dir should succeed");
+        out.close().await.expect("metacache writer should close");
+        drop(out);
+        drop(writer);
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.expect("scan output should decode");
+
+        let marker_objects = entries
+            .iter()
+            .filter(|entry| entry.name == "folder/" && !entry.metadata.is_empty())
+            .count();
+        let prefix_dirs = entries
+            .iter()
+            .filter(|entry| entry.name == "folder/" && entry.metadata.is_empty())
+            .count();
+
+        assert_eq!(marker_objects, 1, "dir marker object should be reported exactly once");
+        assert_eq!(prefix_dirs, 1, "prefix dir should be reported exactly once");
+        // No other entries may leak from the marker (e.g. a malformed `folder//`
+        // from probing the marker's encoded directory).
+        assert_eq!(entries.len(), 2, "scan must emit exactly the marker object and the prefix dir");
+    }
+
+    // The prefix synthesized for an object with children is dropped when the
+    // page limit is hit on the object itself, and must be re-derived on the
+    // forward_to resume of the next page.
+    #[tokio::test]
+    async fn test_scan_dir_limit_boundary_resumes_synthesized_prefix() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, limit: i32, forward_to: Option<String>) -> Vec<String> {
+            let (reader, mut writer) = tokio::io::duplex(65536);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: "".to_string(),
+                recursive: false,
+                limit,
+                forward_to,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("a/b"))
+            .await
+            .expect("object dirs should be created");
+        fs::write(
+            bucket_dir.join("a").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a", "11111111-1111-1111-1111-111111111111"),
+        )
+        .await
+        .expect("object metadata should be written");
+        fs::write(
+            bucket_dir.join("a/b").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a/b", "22222222-2222-2222-2222-222222222222"),
+        )
+        .await
+        .expect("child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        // Page 1: `a` consumes the whole limit, the pending `a/` is dropped.
+        let first_page = scan_names(&disk, bucket, 1, None).await;
+        assert_eq!(first_page, vec!["a".to_string()]);
+
+        // Page 2: resuming at `a/` re-derives the prefix from the object entry.
+        let resumed = scan_names(&disk, bucket, 1000, Some("a/".to_string())).await;
+        assert!(
+            resumed.contains(&"a/".to_string()),
+            "resumed scan must re-derive the synthesized prefix, got {resumed:?}"
         );
     }
 

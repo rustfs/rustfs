@@ -147,6 +147,20 @@ impl PeerRestClient {
         evict_failed_connection(&self.grid_host).await;
     }
 
+    /// Prepare this client for an immediate fresh-connection retry.
+    ///
+    /// On a network-like failure `finalize_result` both evicts the channel and
+    /// sets the offline gate, after which `get_client` fast-fails with
+    /// "temporarily offline" and only the async background recovery monitor
+    /// would clear the gate (not within this call). So a plain `evict_connection`
+    /// is not enough to make an in-call retry actually re-dial: the gate still
+    /// short-circuits it. This drops the cached channel AND clears the gate so
+    /// the very next `get_client` re-dials. See rustfs/backlog#1049 (P1-B).
+    pub async fn prepare_retry(&self) {
+        self.evict_connection().await;
+        self.offline.store(false, Ordering::Release);
+    }
+
     fn is_network_like_error(err: &Error) -> bool {
         let message = err.to_string().to_ascii_lowercase();
         [
@@ -1161,6 +1175,22 @@ mod tests {
             .expect_err("offline peer should fast-fail before dialing");
 
         assert!(err.to_string().contains("temporarily offline"));
+    }
+
+    #[tokio::test]
+    async fn peer_rest_client_prepare_retry_clears_offline_gate() {
+        // finalize_result sets the offline gate on a network error; without
+        // clearing it, an in-call retry would fast-fail on the gate instead of
+        // re-dialing (rustfs/backlog#1049 P1-B). prepare_retry must clear it.
+        let client = test_peer_client();
+        client.offline.store(true, Ordering::Release);
+
+        client.prepare_retry().await;
+
+        assert!(
+            !client.offline.load(Ordering::Acquire),
+            "prepare_retry must clear the offline gate so the next get_client re-dials"
+        );
     }
 
     #[tokio::test]

@@ -46,6 +46,7 @@ use crate::diagnostics::get::{
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
+use crate::disk::OldCurrentSize;
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
     BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics,
@@ -2490,7 +2491,13 @@ impl SetDisks {
         dst_bucket: &str,
         dst_object: &str,
         write_quorum: usize,
-    ) -> disk::error::Result<(Vec<Option<DiskStore>>, Option<Vec<u8>>, Option<Uuid>, Vec<Option<DiskStore>>)> {
+    ) -> disk::error::Result<(
+        Vec<Option<DiskStore>>,
+        Option<Vec<u8>>,
+        Option<Uuid>,
+        Vec<Option<DiskStore>>,
+        Option<OldCurrentSize>,
+    )> {
         let mut futures = Vec::with_capacity(disks.len());
 
         let mut errs = Vec::with_capacity(disks.len());
@@ -2528,6 +2535,7 @@ impl SetDisks {
 
         let mut disk_versions = vec![None; disks.len()];
         let mut data_dirs = vec![None; disks.len()];
+        let mut old_current_sizes = vec![None; disks.len()];
 
         let results = join_all(futures).await;
 
@@ -2536,6 +2544,7 @@ impl SetDisks {
                 Ok(res) => {
                     data_dirs[idx] = res.old_data_dir;
                     disk_versions[idx].clone_from(&res.sign);
+                    old_current_sizes[idx] = res.old_current_size;
                     errs.push(None);
                 }
                 Err(e) => {
@@ -2639,6 +2648,7 @@ impl SetDisks {
 
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
         let versions = Self::select_rename_data_versions(&disk_versions, &errs, write_quorum);
+        let old_current_size = Self::reduce_common_old_current_size(&old_current_sizes, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
@@ -2657,7 +2667,35 @@ impl SetDisks {
             vec![None; disks.len()]
         };
 
-        Ok((online_disks, versions, data_dir, cleanup_disks))
+        Ok((online_disks, versions, data_dir, cleanup_disks, old_current_size))
+    }
+
+    /// rustfs/backlog#1009: reduce the per-disk observations of the
+    /// destination's previous current version to one set-level value, mirroring
+    /// `reduce_common_data_dir`: the observation reported by at least
+    /// `write_quorum` disks wins; anything short of that (disk errors, unknown
+    /// votes from pre-#1009 peers or unparsable metadata, genuine divergence)
+    /// yields `None` (unknown). Unknown per-disk entries never vote.
+    pub(in crate::set_disk) fn reduce_common_old_current_size(
+        old_current_sizes: &[Option<OldCurrentSize>],
+        write_quorum: usize,
+    ) -> Option<OldCurrentSize> {
+        let mut counts: HashMap<OldCurrentSize, usize> = HashMap::new();
+
+        for observation in old_current_sizes.iter().flatten().copied() {
+            *counts.entry(observation).or_insert(0) += 1;
+        }
+
+        let mut max = 0;
+        let mut old_current_size = None;
+        for (observation, count) in counts {
+            if count > max {
+                max = count;
+                old_current_size = Some(observation);
+            }
+        }
+
+        if max >= write_quorum { old_current_size } else { None }
     }
 
     pub(in crate::set_disk) fn reduce_common_versions(disk_versions: &[Option<Vec<u8>>], write_quorum: usize) -> Option<Vec<u8>> {
@@ -4662,6 +4700,76 @@ mod tests {
         assert!(r.unreclaimed_disks.is_empty());
         assert!(!r.below_quorum);
         assert!(!r.has_residue());
+    }
+
+    // rustfs/backlog#1009: quorum reduction of the per-disk old-current-size
+    // observations returned by rename_data.
+    mod reduce_common_old_current_size {
+        use super::*;
+
+        #[test]
+        fn agreement_at_quorum_wins() {
+            let observations = vec![
+                Some(OldCurrentSize::Present(5)),
+                Some(OldCurrentSize::Present(5)),
+                Some(OldCurrentSize::Present(5)),
+                Some(OldCurrentSize::Absent),
+            ];
+            assert_eq!(
+                SetDisks::reduce_common_old_current_size(&observations, 3),
+                Some(OldCurrentSize::Present(5))
+            );
+        }
+
+        #[test]
+        fn absent_is_a_definite_vote() {
+            let observations = vec![
+                Some(OldCurrentSize::Absent),
+                Some(OldCurrentSize::Absent),
+                Some(OldCurrentSize::Absent),
+                None,
+            ];
+            assert_eq!(SetDisks::reduce_common_old_current_size(&observations, 3), Some(OldCurrentSize::Absent));
+        }
+
+        #[test]
+        fn divergence_below_quorum_is_unknown() {
+            let observations = vec![
+                Some(OldCurrentSize::Present(5)),
+                Some(OldCurrentSize::Present(7)),
+                Some(OldCurrentSize::Absent),
+                Some(OldCurrentSize::Absent),
+            ];
+            assert_eq!(SetDisks::reduce_common_old_current_size(&observations, 3), None);
+        }
+
+        #[test]
+        fn unknown_disks_do_not_vote() {
+            // Two agreeing disks plus two unknowns must not fabricate quorum.
+            let observations = vec![Some(OldCurrentSize::Present(5)), Some(OldCurrentSize::Present(5)), None, None];
+            assert_eq!(SetDisks::reduce_common_old_current_size(&observations, 3), None);
+        }
+
+        /// Kills the "unknown counts as an Absent vote" mutant: a full set of
+        /// unknowns (rolling upgrade, every peer pre-#1009) must stay unknown —
+        /// fabricating `Absent` would record "new object" on every overwrite
+        /// and inflate objects_count.
+        #[test]
+        fn all_unknown_is_unknown() {
+            let observations: Vec<Option<OldCurrentSize>> = vec![None; 4];
+            assert_eq!(SetDisks::reduce_common_old_current_size(&observations, 3), None);
+        }
+
+        #[test]
+        fn unknown_majority_does_not_become_absent_quorum() {
+            let observations = vec![Some(OldCurrentSize::Present(5)), None, None, None];
+            assert_eq!(SetDisks::reduce_common_old_current_size(&observations, 3), None);
+        }
+
+        #[test]
+        fn empty_observations_are_unknown() {
+            assert_eq!(SetDisks::reduce_common_old_current_size(&[], 2), None);
+        }
     }
 
     // A2: not-found normalized to success (parity with MinIO commitRenameDataDir).

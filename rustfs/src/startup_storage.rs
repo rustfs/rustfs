@@ -14,9 +14,9 @@
 
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use crate::storage_api::startup::storage::{
-    ECStore, EndpointServerPools, global_config_init_error_is_deterministic, init_background_replication, init_ecstore_config,
-    init_global_config_sys, init_local_disks, init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints,
-    try_migrate_server_config, update_erasure_type,
+    ECStore, EndpointServerPools, InstanceContext, global_config_init_error_is_deterministic, init_background_replication,
+    init_ecstore_config, init_global_config_sys, init_local_disks_with_instance_ctx, init_lock_clients,
+    prewarm_local_disk_id_map_with_instance_ctx, try_migrate_server_config,
 };
 use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{
@@ -44,7 +44,11 @@ pub(crate) struct StartupStorageRuntime {
     pub(crate) shutdown_token: CancellationToken,
 }
 
-pub(crate) async fn init_startup_storage_foundation(server_address: &str, volumes: &[String]) -> Result<EndpointServerPools> {
+pub(crate) async fn init_startup_storage_foundation(
+    server_address: &str,
+    volumes: &[String],
+    instance_ctx: &Arc<InstanceContext>,
+) -> Result<EndpointServerPools> {
     info!(
         target: "rustfs::main::run",
         event = EVENT_ENDPOINT_PARSING_STARTED,
@@ -71,8 +75,8 @@ pub(crate) async fn init_startup_storage_foundation(server_address: &str, volume
         .map_err(Error::other)?;
     enforce_unsupported_fs_policy(&endpoint_pools)?;
 
-    set_global_endpoints(endpoint_pools.as_ref().clone());
-    update_erasure_type(setup_type).await;
+    instance_ctx.set_endpoints(endpoint_pools.clone());
+    instance_ctx.update_erasure_type(setup_type).await;
 
     debug!(
         target: "rustfs::main::run",
@@ -83,7 +87,7 @@ pub(crate) async fn init_startup_storage_foundation(server_address: &str, volume
         state = "starting",
         "starting local disk initialization"
     );
-    init_local_disks(endpoint_pools.clone())
+    init_local_disks_with_instance_ctx(instance_ctx, endpoint_pools.clone())
         .await
         .inspect_err(|err| {
             error!(
@@ -98,7 +102,7 @@ pub(crate) async fn init_startup_storage_foundation(server_address: &str, volume
             );
         })
         .map_err(Error::other)?;
-    prewarm_local_disk_id_map().await;
+    prewarm_local_disk_id_map_with_instance_ctx(instance_ctx).await;
     init_lock_clients(endpoint_pools.clone());
 
     log_storage_pool_layout(&endpoint_pools);
@@ -109,16 +113,17 @@ pub(crate) async fn init_startup_storage_foundation(server_address: &str, volume
 pub(crate) async fn init_embedded_startup_storage_foundation(
     server_address: &str,
     volumes: &[String],
+    instance_ctx: &Arc<InstanceContext>,
 ) -> Result<EndpointServerPools> {
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address, volumes.to_vec())
         .await
         .map_err(|err| Error::other(format!("endpoints: {err}")))?;
     enforce_unsupported_fs_policy(&endpoint_pools).map_err(|err| Error::other(format!("unsupported fs guard: {err}")))?;
 
-    set_global_endpoints(endpoint_pools.as_ref().clone());
-    update_erasure_type(setup_type).await;
+    instance_ctx.set_endpoints(endpoint_pools.clone());
+    instance_ctx.update_erasure_type(setup_type).await;
 
-    init_local_disks(endpoint_pools.clone())
+    init_local_disks_with_instance_ctx(instance_ctx, endpoint_pools.clone())
         .await
         .map_err(|err| Error::other(format!("local disks: {err}")))?;
     init_lock_clients(endpoint_pools.clone());
@@ -130,6 +135,7 @@ pub(crate) async fn init_startup_storage_runtime(
     server_addr: SocketAddr,
     endpoint_pools: &EndpointServerPools,
     readiness: Arc<GlobalReadiness>,
+    instance_ctx: Arc<InstanceContext>,
 ) -> Result<StartupStorageRuntime> {
     let ctx = CancellationToken::new();
 
@@ -142,7 +148,7 @@ pub(crate) async fn init_startup_storage_runtime(
         state = "starting",
         "starting ECStore initialization"
     );
-    let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
+    let store = ECStore::new_with_instance_ctx(server_addr, endpoint_pools.clone(), ctx.clone(), instance_ctx)
         .await
         .inspect_err(|err| {
             error!(
@@ -172,21 +178,23 @@ pub(crate) async fn init_embedded_startup_storage_runtime(
     endpoint_pools: &EndpointServerPools,
     readiness: Arc<GlobalReadiness>,
     shutdown_token: CancellationToken,
+    instance_ctx: Arc<InstanceContext>,
 ) -> Result<StartupStorageRuntime> {
-    let store = match ECStore::new(server_addr, endpoint_pools.clone(), shutdown_token.clone()).await {
-        Ok(store) => store,
-        Err(err) => {
-            error!(
-                component = LOG_COMPONENT_EMBEDDED,
-                subsystem = LOG_SUBSYSTEM_EMBEDDED,
-                event = EVENT_EMBEDDED_STORAGE_INIT_FAILED,
-                stage = "ecstore_new",
-                error = ?err,
-                "Embedded storage initialization failed"
-            );
-            return Err(Error::other(format!("ECStore: {err}")));
-        }
-    };
+    let store =
+        match ECStore::new_with_instance_ctx(server_addr, endpoint_pools.clone(), shutdown_token.clone(), instance_ctx).await {
+            Ok(store) => store,
+            Err(err) => {
+                error!(
+                    component = LOG_COMPONENT_EMBEDDED,
+                    subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                    event = EVENT_EMBEDDED_STORAGE_INIT_FAILED,
+                    stage = "ecstore_new",
+                    error = ?err,
+                    "Embedded storage initialization failed"
+                );
+                return Err(Error::other(format!("ECStore: {err}")));
+            }
+        };
 
     init_embedded_startup_storage_global_config(store.clone()).await?;
     readiness.mark_stage(SystemStage::StorageReady);
@@ -324,13 +332,54 @@ fn global_config_retry_exhausted(retry_count: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{global_config_retry_exhausted, storage_pool_has_host_failure_risk};
+    use super::{global_config_retry_exhausted, init_embedded_startup_storage_foundation, storage_pool_has_host_failure_risk};
+    use crate::storage_api::startup::storage::{InstanceContext, bootstrap_instance_ctx};
+    use std::sync::Arc;
 
     #[test]
     fn reports_host_failure_risk_only_for_multi_drive_sets() {
         assert!(!storage_pool_has_host_failure_risk(0));
         assert!(!storage_pool_has_host_failure_risk(1));
         assert!(storage_pool_has_host_failure_risk(2));
+    }
+
+    // Phase 5 follow-up (backlog#1052): the embedded storage foundation writes
+    // its topology (endpoints, erasure kind) into the explicitly passed
+    // instance context, leaving the process bootstrap context untouched — the
+    // seam a future second embedded server needs to avoid the write-once
+    // panics on shared startup state.
+    #[tokio::test]
+    async fn embedded_foundation_writes_land_on_passed_instance_ctx() {
+        let temp_dir = tempfile::tempdir().expect("create temp volume");
+        let volume = temp_dir.path().display().to_string();
+        let instance_ctx = Arc::new(InstanceContext::new());
+
+        init_embedded_startup_storage_foundation("127.0.0.1:29123", &[volume], &instance_ctx)
+            .await
+            .expect("embedded storage foundation should initialize");
+
+        assert!(
+            instance_ctx.endpoints().is_some(),
+            "the passed context must hold the parsed endpoint topology"
+        );
+        assert!(
+            instance_ctx.is_erasure_sd().await,
+            "a single local volume must record single-drive erasure on the passed context"
+        );
+
+        let bootstrap = bootstrap_instance_ctx();
+        assert!(
+            !Arc::ptr_eq(&instance_ctx, &bootstrap),
+            "the test context must be distinct from the process bootstrap context"
+        );
+        assert!(
+            bootstrap.endpoints().is_none(),
+            "the bootstrap context must not absorb topology written to an explicit context"
+        );
+        assert!(
+            !bootstrap.is_erasure_sd().await,
+            "the bootstrap context must not absorb the erasure kind written to an explicit context"
+        );
     }
 
     #[test]

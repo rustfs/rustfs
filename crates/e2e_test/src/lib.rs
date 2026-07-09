@@ -46,6 +46,10 @@ mod list_objects_duplicates_test;
 #[cfg(test)]
 mod quota_test;
 
+// Harness regression tests: console port isolation + fail-fast startup
+#[cfg(test)]
+mod server_startup_failfast_test;
+
 #[cfg(test)]
 mod bucket_policy_check_test;
 

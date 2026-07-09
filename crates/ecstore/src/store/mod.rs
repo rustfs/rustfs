@@ -164,8 +164,9 @@ pub(crate) mod utils;
 
 use peer::init_local_peer;
 pub use peer::{
-    all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks, init_lock_clients,
-    prewarm_local_disk_id_map,
+    all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks,
+    init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+    prewarm_local_disk_id_map_with_instance_ctx,
 };
 
 pub struct ECStore {
@@ -241,7 +242,7 @@ impl ECStore {
 /// service singletons. The globals remain the source of truth.
 impl ECStore {
     /// Get the notification system
-    pub fn notification_system(&self) -> Option<&'static crate::services::notification_sys::NotificationSys> {
+    pub fn notification_system(&self) -> Option<std::sync::Arc<crate::services::notification_sys::NotificationSys>> {
         runtime_sources::notification_sys()
     }
 
@@ -386,9 +387,31 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let result =
-            enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject)
-                .await;
+        self.put_object_with_old_current_size(bucket, object, data, opts)
+            .await
+            .map(|(object_info, _)| object_info)
+    }
+}
+
+impl ECStore {
+    /// `put_object` plus the rename_data old-size backfill
+    /// (rustfs/backlog#1009); see `SetDisks::put_object_with_old_current_size`.
+    /// Post-write hooks (immediate ILM transition enqueue, list-cache
+    /// invalidation) match the plain `put_object` path exactly.
+    #[instrument(level = "debug", skip(self, data))]
+    pub async fn put_object_with_old_current_size(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        let result = match self.handle_put_object(bucket, object, data, opts).await {
+            Ok((object_info, old_current_size)) => enqueue_transition_after_write(Ok(object_info), LcEventSrc::S3PutObject)
+                .await
+                .map(|object_info| (object_info, old_current_size)),
+            Err(err) => Err(err),
+        };
         if result.is_ok() {
             list_objects::observe_list_objects_mutation(self, bucket).await;
         }

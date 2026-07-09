@@ -24,6 +24,8 @@ use crate::{
     startup_services::init_embedded_startup_runtime_services,
     startup_shutdown::signal_embedded_startup_shutdown,
     startup_storage::{init_embedded_startup_storage_foundation, init_embedded_startup_storage_runtime},
+    storage_api::server::http::ServerContextSlot,
+    storage_api::startup::storage::bootstrap_instance_ctx,
 };
 use std::{io, net::SocketAddr, path::PathBuf};
 use tokio_util::sync::CancellationToken;
@@ -108,6 +110,14 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
     // case callers can retry.
     let mut startup_guard = EmbeddedStartupGuard::new();
 
+    // The embedded server still shares the process bootstrap context (see the
+    // EMBEDDED_SERVER_STARTED guard); once the request path and app subsystems
+    // are per-server too (backlog#1052 S2–S4), each server constructs its own
+    // context here instead.
+    let instance_ctx = bootstrap_instance_ctx();
+    // This server's request-path context slot (backlog#1052 S2).
+    let server_ctx = ServerContextSlot::new();
+
     let EmbeddedStartupConfig {
         config,
         identity,
@@ -120,17 +130,19 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         .await
         .map_err(init_error)?;
 
-    let listen_context = init_embedded_startup_listen_context(&config).await.map_err(init_error)?;
+    let listen_context = init_embedded_startup_listen_context(&config, &instance_ctx)
+        .await
+        .map_err(init_error)?;
 
     startup_guard
         .mark_global_init_started()
         .map_err(|_| EmbeddedStartupError::AlreadyStarted)?;
 
-    let endpoint_pools = init_embedded_startup_storage_foundation(&listen_context.server_address, &config.volumes)
+    let endpoint_pools = init_embedded_startup_storage_foundation(&listen_context.server_address, &config.volumes, &instance_ctx)
         .await
         .map_err(init_error)?;
 
-    let http_server = start_embedded_http_server(&config, listen_context.readiness.clone()).await?;
+    let http_server = start_embedded_http_server(&config, listen_context.readiness.clone(), server_ctx.clone()).await?;
     let shutdown_handle = http_server.shutdown_handle;
     let bound_addr = http_server.bound_addr;
     let cancel_token = CancellationToken::new();
@@ -140,6 +152,7 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         &endpoint_pools,
         listen_context.readiness.clone(),
         cancel_token.clone(),
+        instance_ctx,
     )
     .await
     {
@@ -156,6 +169,7 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         storage_runtime.store,
         cancel_token.clone(),
         listen_context.readiness.clone(),
+        server_ctx,
     )
     .await
     .map_err(|err| {

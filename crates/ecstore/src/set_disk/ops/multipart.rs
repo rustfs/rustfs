@@ -1420,7 +1420,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-        let (online_disks, versions, op_old_dir, cleanup_disks) = Self::rename_data(
+        // The trailing `_` drops the rename_data old-size backfill
+        // (rustfs/backlog#1009): CompleteMultipartUpload keeps its pre-commit
+        // `get_object_info` lookup, so the backfill has no consumer here yet.
+        let (online_disks, versions, op_old_dir, cleanup_disks, _) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_MULTIPART_BUCKET,
             &upload_id_path,

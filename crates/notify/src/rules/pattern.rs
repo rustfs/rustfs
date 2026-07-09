@@ -61,10 +61,10 @@ pub fn match_simple(pattern_str: &str, object_name: &str) -> bool {
         // AWS S3 docs: A single asterisk (*) in the rule matches all objects.
         return true;
     }
-    // WildMatch considers an empty pattern to not match anything, which is usually desired.
-    // If pattern_str is empty, it means no specific filter, so it depends on interpretation.
-    // Go's wildcard.MatchSimple might treat empty pattern differently.
-    // For now, assume empty pattern means no match unless it's explicitly "*".
+    // An empty pattern matches nothing, which is usually desired: an empty
+    // pattern_str means no specific filter was supplied. Go's NewRulesMap
+    // defaults to "*", so an empty pattern reaching here is unlikely to mean
+    // "match all" — treat it as no match unless it is explicitly "*".
     if pattern_str.is_empty() {
         return false; // Or true if an empty pattern means "match all" in some contexts.
         // Given Go's NewRulesMap defaults to "*", an empty pattern from Filter is unlikely to mean "match all".
@@ -77,10 +77,10 @@ pub fn match_simple(pattern_str: &str, object_name: &str) -> bool {
 /// every other character — crucially including `?` — is matched literally.
 ///
 /// S3 event notification prefix/suffix filters treat `*` as the only wildcard;
-/// AWS does not assign any special meaning to `?`. Earlier this matcher delegated
-/// to `wildmatch`, which interprets `?` as a single-character wildcard, so a
-/// literal `?` in a prefix/suffix filter (or object key) would over-match and
-/// misroute events (backlog#979). This hand-rolled matcher keeps `?` literal.
+/// AWS does not assign any special meaning to `?`. A generic glob matcher that
+/// interprets `?` as a single-character wildcard would let a literal `?` in a
+/// prefix/suffix filter (or object key) over-match and misroute events
+/// (backlog#979), so this matcher is hand-rolled to keep `?` literal.
 fn glob_match_star_only(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
@@ -156,7 +156,7 @@ mod tests {
 
     /// Regression test for backlog#979 (c): S3 filter semantics treat `*` as the
     /// only wildcard. `?` must be matched literally, not as a single-character
-    /// wildcard (which is how the previous `wildmatch`-based matcher behaved).
+    /// wildcard (the way a generic glob matcher would treat it).
     #[test]
     fn question_mark_is_literal_not_single_char_wildcard() {
         // `?` is a literal: it only matches a literal `?`, never an arbitrary char.

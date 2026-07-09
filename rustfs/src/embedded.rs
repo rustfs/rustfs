@@ -44,7 +44,8 @@
 //!
 //! Only **one `RustFSServer`** may exist per process because the underlying
 //! storage engine uses process-global singletons (`OnceLock`). Attempting to
-//! start a second server will return an error.
+//! start a second server will return an error. Removing this limitation is
+//! tracked in [backlog#1052](https://github.com/rustfs/backlog/issues/1052).
 
 use crate::server::ShutdownHandle;
 use crate::startup_embedded::{EmbeddedStartedServer, EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};

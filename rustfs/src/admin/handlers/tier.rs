@@ -13,15 +13,14 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
+use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::tier::{
     AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
     ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
     ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType, storageclass,
 };
 use crate::{
-    admin::runtime_sources::{
-        current_daily_tier_stats, current_notification_system, current_object_store_handle, current_tier_config_handle,
-    },
+    admin::runtime_sources::{current_daily_tier_stats, current_notification_system, current_tier_config_handle},
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
@@ -328,7 +327,7 @@ impl Operation for AddTier {
             &_ => (),
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -475,7 +474,7 @@ impl Operation for EditTier {
             "admin tier state"
         );
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -645,7 +644,7 @@ impl Operation for RemoveTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 

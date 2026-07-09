@@ -48,7 +48,6 @@ const DEFAULT_SSE_ALGORITHM: &str = "AES256";
 const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
 #[cfg(feature = "rio-v2")]
 const DARE_PACKAGE_SIZE: i64 = DARE_PAYLOAD_SIZE + 32;
-#[cfg(feature = "rio-v2")]
 const MINIO_INTERNAL_ENCRYPTION_IV_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Iv";
 #[cfg(feature = "rio-v2")]
 const MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER: &str = "X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm";
@@ -1293,10 +1292,28 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
 
     Ok(EncryptionMaterial {
         key_bytes,
-        base_nonce: generate_ssec_nonce(&oi.bucket, &oi.name),
+        base_nonce: read_stored_ssec_nonce(&oi.user_defined, &oi.bucket, &oi.name),
         key_kind: EncryptionKeyKind::Direct,
         reader_backend: crate::io_support::rio::ReadEncryptionBackend::Legacy,
     })
+}
+
+/// Resolve the SSE-C Direct base nonce for decryption.
+///
+/// Since #4576 the encrypt side uses a fresh random nonce per encryption and
+/// persists it under `x-rustfs-encryption-iv` (plus the MinIO interop key);
+/// this reader-side resolver must read that stored value back or every SSE-C
+/// GET fails its first AEAD block. Legacy objects written before random
+/// nonces were persisted carry no stored IV and were encrypted with the
+/// deterministic `(bucket, key)` nonce, so fall back to recomputing it. Must
+/// stay in lockstep with `read_stored_ssec_nonce` in rustfs/src/storage/sse.rs
+/// (the API-layer twin of this resolver).
+fn read_stored_ssec_nonce(metadata: &HashMap<String, String>, bucket: &str, key: &str) -> [u8; 12] {
+    metadata_get(metadata, INTERNAL_ENCRYPTION_IV_HEADER)
+        .or_else(|| metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_IV_HEADER))
+        .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+        .and_then(|bytes| <[u8; 12]>::try_from(bytes.as_slice()).ok())
+        .unwrap_or_else(|| generate_ssec_nonce(bucket, key))
 }
 
 async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap<String, String>) -> Result<EncryptionMaterial> {
@@ -1611,6 +1628,38 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(&digest);
         bytes
+    }
+
+    /// Regression for the #4576 fallout: the encrypt side persists a random
+    /// SSE-C nonce, and this reader-side resolver must read it back — falling
+    /// back to the deterministic legacy nonce only when no IV was stored.
+    /// Reverting the stored-nonce lookup breaks the first two cases.
+    #[test]
+    fn read_stored_ssec_nonce_prefers_persisted_iv_and_falls_back_for_legacy() {
+        let stored = [7u8; 12];
+        let deterministic = generate_ssec_nonce("bucket", "object");
+        assert_ne!(stored, deterministic, "test nonce must differ from the deterministic value");
+
+        let mut metadata = HashMap::new();
+        metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(stored));
+        assert_eq!(read_stored_ssec_nonce(&metadata, "bucket", "object"), stored);
+
+        // MinIO interop key only, in non-canonical casing: the lookup is
+        // case-insensitive like every other internal-metadata read here.
+        let mut metadata = HashMap::new();
+        metadata.insert(MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_ascii_lowercase(), BASE64_STANDARD.encode(stored));
+        assert_eq!(read_stored_ssec_nonce(&metadata, "bucket", "object"), stored);
+
+        // Legacy object: no stored IV → deterministic fallback.
+        assert_eq!(read_stored_ssec_nonce(&HashMap::new(), "bucket", "object"), deterministic);
+
+        // Corrupt values (bad base64 / wrong length) also fall back instead of erroring.
+        let mut metadata = HashMap::new();
+        metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "not-base64!!".to_string());
+        assert_eq!(read_stored_ssec_nonce(&metadata, "bucket", "object"), deterministic);
+        let mut metadata = HashMap::new();
+        metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([1u8; 8]));
+        assert_eq!(read_stored_ssec_nonce(&metadata, "bucket", "object"), deterministic);
     }
 
     fn ssec_headers_from_key(key_bytes: [u8; 32]) -> HeaderMap<HeaderValue> {
