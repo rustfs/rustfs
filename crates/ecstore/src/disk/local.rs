@@ -3984,7 +3984,7 @@ fn local_disk_scan_lock_key(bucket: &str, base_dir: &str, filter_prefix: Option<
 /// accounting can reuse it instead of a separate pre-PUT metadata fanout
 /// (rustfs/backlog#1009). Must mirror what `get_object_info` without a
 /// version id reports: latest live version → its size; missing key,
-/// unparseable version meta, or delete-marker latest → `None`.
+/// unparsable version meta, or delete-marker latest → `None`.
 /// `into_fileinfo` with an empty version id is the same latest-version
 /// selection the read path uses (free versions excluded).
 fn rename_data_old_current_size(dst_meta: &FileMeta, dst_volume: &str, dst_path: &str) -> RenameOldCurrentSize {
