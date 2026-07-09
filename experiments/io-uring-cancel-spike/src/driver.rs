@@ -15,7 +15,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::io::Write as _;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
@@ -470,26 +472,11 @@ impl Drop for UringDriver {
 }
 
 fn probe_real_read(ring: &mut IoUring) -> io::Result<()> {
-    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     let pattern: Vec<u8> = (0..512u32).map(|i| (i * 7 + 13) as u8).collect();
-    let path = std::env::temp_dir().join(format!(
-        "uring-spike-probe-{}-{}",
-        std::process::id(),
-        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
 
-    // File setup runs BEFORE any SQE is submitted, so its errors early-return
-    // safely — nothing is in flight yet.
-    let file = match (|| -> io::Result<File> {
-        std::fs::write(&path, &pattern)?;
-        File::open(&path)
-    })() {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(e);
-        }
-    };
+    // Open an anonymous probe file seeded with the pattern. File setup runs
+    // BEFORE any SQE, so its errors early-return safely — nothing is in flight.
+    let file = open_probe_file(&pattern)?;
 
     let mut buf = vec![0u8; pattern.len()];
     let sqe = opcode::Read::new(types::Fd(file.as_raw_fd()), buf.as_mut_ptr(), buf.len() as u32)
@@ -500,44 +487,90 @@ fn probe_real_read(ring: &mut IoUring) -> io::Result<()> {
     // SAFETY: a push failure means the kernel never accepted the SQE, so
     // `buf`/`file` may be dropped safely on this early return.
     if unsafe { ring.submission().push(&sqe) }.is_err() {
-        let _ = std::fs::remove_file(&path);
         return Err(io::Error::other("probe: submission queue full"));
     }
 
-    // C1 (backlog#1053): once the SQE is handed to the kernel, the read may be
-    // punted to io-wq and write into `buf` at ANY later point. Until its CQE
-    // arrives, `buf`/`file` must NOT be dropped and the ring must NOT be
-    // unmapped — otherwise the kernel writes into freed memory (UAF). The
-    // probe path has no pending-table backstop, so we must drain to the CQE
-    // here, and any early exit first leaks the buffer ("leak over UAF").
+    // C1 (rustfs/backlog#1053): once the SQE is handed to the kernel, the read
+    // may be punted to io-wq and write into `buf` at ANY later point. Until its
+    // CQE arrives, `buf`/`file` must NOT be dropped and the ring must NOT be
+    // unmapped — otherwise the kernel writes into freed memory (UAF). The probe
+    // path has no pending-table backstop, so we must drain to the CQE here, and
+    // any early exit first leaks the buffer ("leak over UAF").
     let res = match drain_probe_cqe(ring) {
         Ok(res) => res,
         Err(e) => {
-            // We could not confirm the op terminated. Leak `buf` (the actual
-            // UAF hazard: the kernel may still write 512 bytes into it) and,
-            // defensively, `file`. Leaking one 512-byte startup-probe buffer
-            // is trivially cheaper than a silent heap corruption. The ring is
-            // dropped by the caller's `?`; unmapping the ring is safe on its
-            // own (closing the ring fd triggers kernel-side teardown) — only
-            // the user buffer must survive.
+            // Could not confirm the op terminated: leak `buf` (the real UAF
+            // hazard — the kernel may still write 512 bytes into it) and,
+            // defensively, `file`. Leaking one 512-byte startup-probe buffer is
+            // trivially cheaper than a silent heap corruption.
             std::mem::forget(buf);
             std::mem::forget(file);
-            let _ = std::fs::remove_file(&path);
             return Err(e);
         }
     };
 
     // The CQE has arrived: the kernel is done with `buf`, so dropping it and
     // `file` below is now safe.
-    let outcome = if res < 0 {
+    if res < 0 {
         Err(io::Error::from_raw_os_error(-res))
     } else if res as usize != pattern.len() || buf != pattern {
         Err(io::Error::other("probe: read completed but data mismatched"))
     } else {
         Ok(())
+    }
+}
+
+/// Open a probe file seeded with `pattern`, avoiding the symlink/TOCTOU/
+/// leftover hazards of a predictable temp path (C3, rustfs/backlog#1061).
+///
+/// Primary: `O_TMPFILE` — an anonymous inode with no name at all, so there is
+/// nothing for an attacker to pre-plant a symlink at, no TOCTOU window, and no
+/// leftover file. Fallback (filesystems without O_TMPFILE): create in the temp
+/// dir with `O_CREAT|O_EXCL|O_NOFOLLOW` + 0600 + a per-process nonce, then
+/// unlink immediately so no attacker-planted symlink is followed and no named
+/// file survives.
+fn open_probe_file(pattern: &[u8]) -> io::Result<File> {
+    let dir = std::env::temp_dir();
+    let c_dir =
+        std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| io::Error::other("probe dir path has NUL"))?;
+    // SAFETY: `c_dir` is a valid NUL-terminated path; O_TMPFILE requires a
+    // directory and O_RDWR/O_WRONLY. On success we own the returned fd.
+    let fd = unsafe { libc::open(c_dir.as_ptr(), libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
+    if fd >= 0 {
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(pattern)?;
+        return Ok(file);
+    }
+    open_probe_file_exclusive(&dir, pattern)
+}
+
+fn open_probe_file_exclusive(dir: &std::path::Path, pattern: &[u8]) -> io::Result<File> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("uring-spike-probe-{}-{}", std::process::id(), nonce));
+    let c_path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("probe path has NUL"))?;
+    // O_EXCL refuses a pre-existing file; O_NOFOLLOW refuses a symlink; 0600 is
+    // owner-only. SAFETY: `c_path` is a valid NUL-terminated path; on success
+    // we own the fd.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
     };
-    let _ = std::fs::remove_file(&path);
-    outcome
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(pattern)?;
+    // Unlink now: the fd stays valid, no named leftover remains.
+    // SAFETY: `c_path` is still a valid NUL-terminated path.
+    unsafe {
+        libc::unlink(c_path.as_ptr());
+    }
+    Ok(file)
 }
 
 /// Wait for the probe SQE's CQE and return its raw result.
