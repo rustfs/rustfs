@@ -20,11 +20,13 @@ mod global;
 mod handles;
 mod interfaces;
 mod runtime_sources;
+mod server_slot;
 mod startup;
 
 pub use global::*;
 pub use handles::*;
 pub use interfaces::*;
+pub use server_slot::ServerContextSlot;
 
 use super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::storage_api::context::runtime::{
@@ -1216,6 +1218,7 @@ mod tests {
         assert_eq!(context_server_config_published.load(Ordering::SeqCst), 1);
         assert!(publish_storage_class_config_with(Some(context.clone()), StorageClassConfig::default()));
         assert_eq!(context_storage_class_published.load(Ordering::SeqCst), 1);
+        let slot_context = context.clone();
         assert_eq!(
             resolve_buffer_config_with(Some(context))
                 .expect("context buffer config")
@@ -1258,5 +1261,19 @@ mod tests {
         assert!(!publish_server_config_with(None, Config::new()));
         assert!(!publish_storage_class_config_with(None, StorageClassConfig::default()));
         assert!(resolve_buffer_config_with(None).is_none());
+
+        // backlog#1052 S2: a per-server context slot resolves its *installed*
+        // context — not whatever another server installed — and the first
+        // installation wins.
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(slot_context.clone()), "first install must succeed");
+        assert!(!slot.install(slot_context.clone()), "the slot is install-once");
+        let resolved = slot.app_context().expect("installed slot must resolve its context");
+        assert!(Arc::ptr_eq(&resolved, &slot_context), "the slot must hand back the installed context");
+        let resolved_store = slot.object_store().expect("installed slot must resolve the store");
+        assert!(
+            Arc::ptr_eq(&resolved_store, &slot_context.object_store()),
+            "the slot must dispatch to the installed context's store"
+        );
     }
 }

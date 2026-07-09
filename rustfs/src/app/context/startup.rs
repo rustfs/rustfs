@@ -15,6 +15,7 @@
 use super::super::storage_api::context::ECStore;
 use super::global::{AppContext, get_global_app_context, init_global_app_context};
 use super::runtime_sources;
+use super::server_slot::ServerContextSlot;
 use rustfs_kms::KmsServiceManager;
 use std::io::{Error, Result};
 use std::sync::Arc;
@@ -30,7 +31,11 @@ impl AppContext {
         ensure_startup_kms_interface_with(runtime_sources::kms_service_manager, runtime_sources::init_kms_service_manager)
     }
 
-    pub(crate) fn ensure_startup_after_iam(store: Arc<ECStore>, kms_interface: Arc<KmsServiceManager>) -> Result<()> {
+    pub(crate) fn ensure_startup_after_iam(
+        store: Arc<ECStore>,
+        kms_interface: Arc<KmsServiceManager>,
+        server_ctx: &ServerContextSlot,
+    ) -> Result<()> {
         ensure_startup_app_context_after_iam_with(
             || get_global_app_context().is_some(),
             || {
@@ -40,6 +45,12 @@ impl AppContext {
                 Ok(())
             },
         )?;
+        // Install this server's context slot (backlog#1052 S2). Today the
+        // context is still the process singleton, so the slot mirrors it;
+        // once contexts become per-server (S3) this hands each server its own.
+        if let Some(context) = get_global_app_context() {
+            let _ = server_ctx.install(context);
+        }
         Ok(())
     }
 }

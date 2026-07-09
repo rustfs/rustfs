@@ -93,7 +93,7 @@ pub(crate) mod server {
     }
 
     pub(crate) mod http {
-        pub(crate) use crate::storage::storage_api::{TONIC_RPC_PREFIX, verify_rpc_signature};
+        pub(crate) use crate::storage::storage_api::{ServerContextSlot, TONIC_RPC_PREFIX, verify_rpc_signature};
 
         pub(crate) mod ecfs {
             pub(crate) type FS = crate::storage::storage_api::FS;
@@ -215,7 +215,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod services {
-        pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
+        pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools, ServerContextSlot};
     }
 
     pub(crate) mod shutdown {

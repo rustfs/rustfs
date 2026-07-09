@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::runtime_sources::AppContext;
+use crate::runtime_sources::{AppContext, ServerContextSlot};
 use crate::server::{ServiceStateManager, publish_ready_when_runtime_ready};
 use crate::storage_api::startup::iam::ECStore;
 use rustfs_common::{GlobalReadiness, SystemStage};
@@ -76,8 +76,9 @@ async fn finalize_iam_recovery(
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
+    server_ctx: Arc<ServerContextSlot>,
 ) -> Result<()> {
-    AppContext::ensure_startup_after_iam(store, kms_interface)?;
+    AppContext::ensure_startup_after_iam(store, kms_interface, &server_ctx)?;
 
     readiness.mark_stage(SystemStage::IamReady);
     publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
@@ -90,6 +91,7 @@ fn compute_backoff_interval(attempt: u64, initial: Duration, max: Duration) -> D
     if backoff > max { max } else { backoff }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_iam_recovery_task(
     initial_interval: Duration,
     max_interval: Duration,
@@ -98,12 +100,14 @@ fn spawn_iam_recovery_task(
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
+    server_ctx: Arc<ServerContextSlot>,
 ) {
     let init_store = store.clone();
     let finalize_store = store;
     let finalize_kms_interface = kms_interface;
     let finalize_readiness = readiness;
     let finalize_state_manager = state_manager;
+    let finalize_server_ctx = server_ctx;
     tokio::spawn(async move {
         run_iam_recovery_loop(
             initial_interval,
@@ -118,7 +122,8 @@ fn spawn_iam_recovery_task(
                 let kms_interface = finalize_kms_interface.clone();
                 let readiness = finalize_readiness.clone();
                 let state_manager = finalize_state_manager.clone();
-                Box::pin(async move { finalize_iam_recovery(store, kms_interface, readiness, state_manager).await })
+                let server_ctx = finalize_server_ctx.clone();
+                Box::pin(async move { finalize_iam_recovery(store, kms_interface, readiness, state_manager, server_ctx).await })
             },
         )
         .await;
@@ -333,10 +338,11 @@ pub(crate) async fn bootstrap_or_defer_iam_init(
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
+    server_ctx: Arc<ServerContextSlot>,
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(()) => {
-            AppContext::ensure_startup_after_iam(store, kms_interface)?;
+            AppContext::ensure_startup_after_iam(store, kms_interface, &server_ctx)?;
             readiness.mark_stage(SystemStage::IamReady);
             return Ok(IamBootstrapDisposition::ReadyInline);
         }
@@ -362,6 +368,7 @@ pub(crate) async fn bootstrap_or_defer_iam_init(
                 kms_interface,
                 readiness,
                 state_manager,
+                server_ctx,
             );
         }
     }
@@ -374,17 +381,19 @@ pub(crate) async fn bootstrap_or_defer_iam_init_with_startup_kms(
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
+    server_ctx: Arc<ServerContextSlot>,
 ) -> Result<IamBootstrapDisposition> {
     let kms_interface = AppContext::ensure_startup_kms_interface();
-    bootstrap_or_defer_iam_init(store, kms_interface, readiness, state_manager, shutdown_token).await
+    bootstrap_or_defer_iam_init(store, kms_interface, readiness, state_manager, shutdown_token, server_ctx).await
 }
 
 pub(crate) async fn init_embedded_iam_runtime(
     store: Arc<ECStore>,
     ctx: tokio_util::sync::CancellationToken,
     readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
 ) -> Result<IamBootstrapDisposition> {
-    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx)).await
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx), server_ctx).await
 }
 
 pub(crate) async fn init_iam_runtime(
@@ -392,8 +401,9 @@ pub(crate) async fn init_iam_runtime(
     ctx: tokio_util::sync::CancellationToken,
     readiness: Arc<GlobalReadiness>,
     state_manager: Arc<ServiceStateManager>,
+    server_ctx: Arc<ServerContextSlot>,
 ) -> Result<IamBootstrapDisposition> {
-    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, Some(state_manager), Some(ctx)).await
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, Some(state_manager), Some(ctx), server_ctx).await
 }
 
 #[cfg(test)]
