@@ -5327,6 +5327,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9169,6 +9180,7 @@ dependencies = [
  "rustfs-signer",
  "rustfs-storage-api",
  "rustfs-tls-runtime",
+ "rustfs-uring",
  "rustfs-utils",
  "rustix 1.1.4",
  "rustls",
@@ -10013,6 +10025,16 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "rustfs-uring"
+version = "0.1.0"
+source = "git+https://github.com/rustfs/uring?rev=39018c09cde98b380658f1a1511349a3574daddf#39018c09cde98b380658f1a1511349a3574daddf"
+dependencies = [
+ "io-uring",
+ "libc",
+ "tokio",
 ]
 
 [[package]]

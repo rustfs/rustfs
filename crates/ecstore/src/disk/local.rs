@@ -276,6 +276,27 @@ fn is_direct_io_write_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE)
 }
 
+/// Enable the runtime-probed io_uring read backend (backlog#1104). Default:
+/// false (gray-off). The backend is used only when this is set AND the per-disk
+/// probe succeeds; otherwise, and on any per-read driver error, reads fall back
+/// to `StdBackend` byte-for-byte.
+#[cfg(target_os = "linux")]
+const ENV_RUSTFS_IO_URING_READ_ENABLE: &str = "RUSTFS_IO_URING_READ_ENABLE";
+#[cfg(target_os = "linux")]
+const DEFAULT_RUSTFS_IO_URING_READ_ENABLE: bool = false;
+
+/// io_uring submission-queue depth used when probing a disk (backlog#1104).
+/// Backpressure caps in-flight at this value, below CQ capacity (2×), so CQ
+/// overflow is structurally unreachable.
+#[cfg(target_os = "linux")]
+const URING_QUEUE_DEPTH: u32 = 128;
+
+/// Check if the runtime-probed io_uring read backend is enabled.
+#[cfg(target_os = "linux")]
+fn is_io_uring_read_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_IO_URING_READ_ENABLE, DEFAULT_RUSTFS_IO_URING_READ_ENABLE)
+}
+
 const EVENT_DISK_LOCAL_DURABILITY_MODE: &str = "disk_local_durability_mode";
 
 /// Process-wide durability tier for commit-point fsync work on the local disk.
@@ -2253,6 +2274,176 @@ impl LocalIoBackend for StdBackend {
     }
 }
 
+/// Runtime-probed io_uring read backend (backlog#1104).
+///
+/// Wraps a [`StdBackend`] for everything except positioned reads, which go
+/// through rustfs-uring's cancel-safe `UringDriver`. Constructed only when
+/// `RUSTFS_IO_URING_READ_ENABLE` is set AND the per-disk probe succeeds; on any
+/// per-read driver error a read falls back to the inner `StdBackend`, so
+/// behavior never regresses. The read preamble (path resolution, access checks,
+/// bounds) mirrors `StdBackend::pread_bytes` exactly — only the raw byte read
+/// differs.
+#[cfg(target_os = "linux")]
+pub(crate) struct UringBackend {
+    root: PathBuf,
+    inner: StdBackend,
+    driver: Arc<rustfs_uring::UringDriver>,
+    fallback_logged: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for UringBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UringBackend")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl UringBackend {
+    /// Probe io_uring on `root`; `Some(backend)` if usable, `None` to fall back
+    /// to `StdBackend`. A restricted-environment errno degrades quietly; an
+    /// unexpected errno is surfaced as a warning (both still fall back).
+    pub(crate) fn try_new(root: PathBuf) -> Option<Self> {
+        match rustfs_uring::UringDriver::probe_and_start(URING_QUEUE_DEPTH) {
+            Ok(driver) => {
+                info!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    root = %root.display(),
+                    "io_uring read backend enabled"
+                );
+                Some(Self {
+                    inner: StdBackend::new(root.clone()),
+                    root,
+                    driver: Arc::new(driver),
+                    fallback_logged: std::sync::atomic::AtomicBool::new(false),
+                })
+            }
+            Err(err) => {
+                if err.is_expected_restriction() {
+                    debug!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        root = %root.display(),
+                        error = ?err,
+                        "io_uring unavailable (restricted environment); using StdBackend"
+                    );
+                } else {
+                    warn!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        root = %root.display(),
+                        error = ?err,
+                        "io_uring probe failed unexpectedly; using StdBackend"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Positioned read via io_uring. Mirrors `StdBackend::pread_bytes`'s
+    /// resolution/access/bounds preamble, then reads the range with the driver
+    /// (whole-range: the driver resubmits short reads for positioned reads).
+    async fn pread_uring(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        let Some(end_offset) = offset.checked_add(length) else {
+            return Err(DiskError::FileCorrupt);
+        };
+        let root = self.root.clone();
+        let volume_owned = volume.to_owned();
+        let path_owned = path.to_owned();
+
+        let (file, offset_u64) = tokio::task::spawn_blocking(move || -> Result<(std::fs::File, u64)> {
+            let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
+            if !skip_access_checks(&volume_owned) {
+                access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+            }
+            let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
+            let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
+            let meta = file.metadata().map_err(DiskError::from)?;
+            let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
+            if meta.len() < end_offset_u64 {
+                return Err(DiskError::FileCorrupt);
+            }
+            let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
+            Ok((file, offset_u64))
+        })
+        .await
+        .map_err(|e| DiskError::other(format!("uring pread join error: {e}")))??;
+
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let bytes = self
+            .driver
+            .read_at(Arc::new(file), offset_u64, length)
+            .await
+            .map_err(DiskError::from)?;
+        if bytes.len() != length {
+            return Err(DiskError::other("io_uring returned a short read"));
+        }
+        Ok(Bytes::from(bytes))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait::async_trait]
+impl LocalIoBackend for UringBackend {
+    async fn pread_bytes(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        match self.pread_uring(volume, path, offset, length).await {
+            Ok(bytes) => Ok(bytes),
+            Err(err) => {
+                if !self.fallback_logged.swap(true, Ordering::Relaxed) {
+                    debug!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        error = ?err,
+                        "io_uring read fell back to StdBackend (logged once per disk)"
+                    );
+                }
+                self.inner.pread_bytes(volume, path, offset, length, metrics).await
+            }
+        }
+    }
+
+    async fn open_read_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        self.inner.open_read_stream(volume, path, offset, length).await
+    }
+
+    async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader> {
+        self.inner.open_full_read(volume, path).await
+    }
+
+    async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
+        self.inner.open_write(volume, path, mode).await
+    }
+}
+
+/// Select the local read backend: the runtime-probed io_uring backend when
+/// enabled and the per-disk probe succeeds, otherwise the default
+/// [`StdBackend`] (backlog#1104). Enabling io_uring is opt-in and falls back
+/// byte-for-byte, so the default build is unchanged.
+fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
+    #[cfg(target_os = "linux")]
+    if is_io_uring_read_enabled()
+        && let Some(backend) = UringBackend::try_new(root.clone())
+    {
+        return Arc::new(backend);
+    }
+    Arc::new(StdBackend::new(root))
+}
+
 pub struct LocalDisk {
     pub root: PathBuf,
     pub format_path: PathBuf,
@@ -2513,7 +2704,7 @@ impl LocalDisk {
             startup_cleanup_ready,
             startup_cleanup_notify,
             exit_signal: None,
-            io_backend: Arc::new(StdBackend::new(root.clone())),
+            io_backend: build_local_io_backend(root.clone()),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
             log_startup_disk_error("get_disk_info", &root, err);
@@ -10912,6 +11103,64 @@ mod test {
         let mut all = Vec::new();
         full.read_to_end(&mut all).await.expect("operation should succeed");
         assert_eq!(Bytes::from(all), content, "open_full_read mismatch");
+    }
+
+    /// io_uring read backend (backlog#1104): with `RUSTFS_IO_URING_READ_ENABLE`
+    /// set, every positioned read returns byte-identical data (the driver serves
+    /// it when io_uring is available; on a restricted host the backend degrades
+    /// to `StdBackend` and the bytes still match).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_backend_reads_match_std() {
+        use tempfile::tempdir;
+
+        const FILE_LEN: usize = 64 * 1024;
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let content: Vec<u8> = (0..FILE_LEN)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let content = Bytes::from(content);
+
+        let page = mmap_page_size().expect("page size should be available") as usize;
+        let ranges = [
+            (0usize, FILE_LEN),
+            (1, 17),
+            (page - 1, 2),
+            (page, page),
+            (2 * page - 1, page + 2),
+            (FILE_LEN - 7, 7),
+            (0, 0),
+        ];
+
+        // The env var must be set before LocalDisk::new (the backend is chosen
+        // at construction).
+        let got_ranges = temp_env::async_with_vars([(ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true"))], async {
+            let root_dir = tempdir().expect("operation should succeed");
+            let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+            disk.make_volume("test-volume").await.expect("operation should succeed");
+            disk.write_all("test-volume", "blob.bin", content.clone())
+                .await
+                .expect("operation should succeed");
+            let mut out = Vec::new();
+            for (offset, length) in ranges {
+                out.push(
+                    disk.read_file_mmap_copy("test-volume", "blob.bin", offset, length)
+                        .await
+                        .expect("io_uring-enabled read must succeed (driver or fallback)"),
+                );
+            }
+            out
+        })
+        .await;
+
+        for ((offset, length), got) in ranges.into_iter().zip(got_ranges) {
+            let expected = content.slice(offset..offset + length);
+            assert_eq!(got, expected, "uring read mismatch at offset={offset} length={length}");
+        }
     }
 
     /// The O_DIRECT read path must return the same bytes as the buffered
