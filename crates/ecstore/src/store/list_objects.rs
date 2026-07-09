@@ -3721,7 +3721,7 @@ impl ECStore {
     ) -> Result<ListObjectsInfo> {
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -3732,6 +3732,11 @@ impl ECStore {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
+        // The request marker still carries the `[rustfs_cache:...]` cursor tag;
+        // strip it before any name comparison (notably `forward_past`), or every
+        // key sorting between `<marker>` and `<marker>[` is silently skipped on
+        // the continuation page (backlog#1047).
+        opts.parse_marker();
         if let Some(mode) = list_objects_index_mode_from_env()
             && let Some(result) = self
                 .clone()
@@ -3846,7 +3851,7 @@ impl ECStore {
 
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         // Always request max_keys + 1 to detect if there are more results
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -3858,6 +3863,9 @@ impl ECStore {
             include_marker: has_version_marker,
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         let mut list_result = self
             .list_path(&opts)
@@ -4996,7 +5004,7 @@ impl Sets {
     ) -> Result<ListObjectsInfo> {
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -5006,6 +5014,9 @@ impl Sets {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
             match self
@@ -5106,7 +5117,7 @@ impl Sets {
         };
 
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -5118,6 +5129,9 @@ impl Sets {
             include_marker: has_version_marker,
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         let mut list_result = self
             .list_path(&opts)
@@ -5798,7 +5812,7 @@ impl SetDisks {
     ) -> Result<ListObjectsInfo> {
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -5808,6 +5822,9 @@ impl SetDisks {
             ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         if !opts.prefix.is_empty() && max_keys == 1 && opts.marker.is_none() {
             match self
@@ -5907,7 +5924,7 @@ impl SetDisks {
         };
 
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
-        let opts = ListPathOptions {
+        let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
@@ -5919,6 +5936,9 @@ impl SetDisks {
             include_marker: has_version_marker,
             ..Default::default()
         };
+        // Strip the `[rustfs_cache:...]` cursor tag before any name comparison
+        // (notably `forward_past`) — see backlog#1047.
+        opts.parse_marker();
 
         let mut list_result = self
             .list_path_result(&opts)
