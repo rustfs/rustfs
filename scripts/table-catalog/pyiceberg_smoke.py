@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
+import shlex
 import ssl
 import sys
 import time
@@ -14,6 +16,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import engine_compatibility
@@ -27,6 +31,11 @@ REQUIRED_STORAGE_CREDENTIAL_KEYS = (
     "s3.secret-access-key",
     "s3.session-token",
 )
+SENSITIVE_COMMAND_FLAGS = {
+    "--access-key",
+    "--secret-key",
+    "--session-token",
+}
 TABLE_MAINTENANCE_CONFIG_VERSION = 1
 IDENTIFIER_SEGMENT_MAX_LEN = 64
 
@@ -264,6 +273,14 @@ class StorageCredential:
     config: dict[str, str]
 
 
+@dataclass(frozen=True)
+class SmokeResult:
+    metadata_location: str
+    row_count: int
+    cleanup_result: str
+    table_warehouse_location: str
+
+
 class RestRequestError(RuntimeError):
     def __init__(self, method: str, path: str, status_code: int, response_body: str) -> None:
         super().__init__(f"{method} {path} failed with HTTP {status_code}: {response_body}")
@@ -404,6 +421,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=float(os.getenv("RUSTFS_TABLE_SMOKE_TIMEOUT", "20")))
     parser.add_argument("--cleanup", action="store_true", help="Drop the smoke table and namespace before exiting.")
     parser.add_argument("--replace", action="store_true", help="Drop an existing table with the same identifier first.")
+    parser.add_argument(
+        "--live-evidence-output",
+        help="Write a validated live conformance evidence JSON record after a successful PyIceberg smoke run.",
+    )
+    parser.add_argument("--rustfs-build", default=os.getenv("RUSTFS_BUILD", "operator-recorded"))
+    parser.add_argument("--git-sha", default=os.getenv("RUSTFS_GIT_SHA", "operator-recorded"))
+    parser.add_argument("--catalog-backing", default=os.getenv("RUSTFS_TABLE_CATALOG_BACKING", "operator-recorded"))
+    parser.add_argument("--operator", default=os.getenv("USER", "operator-recorded"))
+    parser.add_argument("--run-timestamp-utc", default=env_or_none("RUSTFS_TABLE_LIVE_RUN_TIMESTAMP_UTC"))
+    parser.add_argument("--client-version", default=env_or_none("RUSTFS_TABLE_CLIENT_VERSION"))
     parser.add_argument(
         "--skip-catalog-api-probes",
         action="store_true",
@@ -701,6 +728,21 @@ def table_warehouse_location(table: Any) -> str:
     raise RuntimeError("created table did not expose a warehouse location")
 
 
+def table_metadata_location(table: Any) -> str | None:
+    for source in (table, getattr(table, "metadata", None)):
+        if callable(source):
+            source = source()
+        if source is None:
+            continue
+        if isinstance(source, dict):
+            location = string_value(source.get("metadata-location") or source.get("metadata_location"))
+        else:
+            location = string_value(getattr(source, "metadata_location", None) or getattr(source, "metadataLocation", None))
+        if location is not None:
+            return location
+    return None
+
+
 def safe_probe_segment(namespace: str, table: str) -> str:
     source = f"{namespace}-{table}"
     return "".join(char if char.isalnum() or char in {"-", "_", "."} else "-" for char in source)
@@ -862,6 +904,98 @@ def printed_metadata(args: argparse.Namespace) -> bool:
         print_json_document({"production_readiness": production_readiness_inventory()})
         printed = True
     return printed
+
+
+def current_utc_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def pyiceberg_client_version(args: argparse.Namespace) -> str:
+    if args.client_version:
+        return args.client_version
+    try:
+        return importlib.metadata.version("pyiceberg")
+    except importlib.metadata.PackageNotFoundError:
+        return "operator-recorded"
+
+
+def redacted_command(argv: list[str]) -> str:
+    redacted: list[str] = []
+    redact_next = False
+    for arg in argv:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        flag, separator, value = arg.partition("=")
+        if flag in SENSITIVE_COMMAND_FLAGS:
+            if separator:
+                redacted.append(f"{flag}=<redacted>")
+            else:
+                redacted.append(flag)
+                redact_next = True
+            continue
+        redacted.append(arg)
+    return shlex.join(redacted)
+
+
+def pyiceberg_live_evidence_record(
+    args: argparse.Namespace,
+    result: SmokeResult,
+    *,
+    client_version: str,
+    rustfs_build: str,
+    git_sha: str,
+    catalog_backing: str,
+    run_timestamp_utc: str,
+    operator: str,
+    command: str,
+) -> dict[str, Any]:
+    return engine_compatibility.live_conformance_evidence_record(
+        client_name="PyIceberg",
+        client_version=client_version,
+        scenario="create-append-reload-scan-direct-rest-probes",
+        rustfs_build=rustfs_build,
+        git_sha=git_sha,
+        catalog_backing=catalog_backing,
+        endpoint=args.endpoint,
+        warehouse=profile_warehouse(args),
+        rest_path=args.rest_path,
+        namespace=args.namespace,
+        table=args.table,
+        metadata_location=result.metadata_location,
+        run_timestamp_utc=run_timestamp_utc,
+        operator=operator,
+        expected_status="pass",
+        observed_status="pass",
+        row_count=result.row_count,
+        cleanup_result=result.cleanup_result,
+        claim="automated-smoke",
+        command=command,
+    )
+
+
+def write_live_evidence(args: argparse.Namespace, result: SmokeResult) -> None:
+    if not args.live_evidence_output:
+        return
+    record = pyiceberg_live_evidence_record(
+        args,
+        result,
+        client_version=pyiceberg_client_version(args),
+        rustfs_build=args.rustfs_build,
+        git_sha=args.git_sha,
+        catalog_backing=args.catalog_backing,
+        run_timestamp_utc=args.run_timestamp_utc or current_utc_timestamp(),
+        operator=args.operator,
+        command=redacted_command(sys.argv),
+    )
+    validation = engine_compatibility.validate_live_conformance_evidence(record)
+    document = {
+        "live_conformance_evidence": record,
+        "validation": validation,
+    }
+    output_path = Path(args.live_evidence_output)
+    output_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def install_rustfs_rest_sigv4_adapter(catalog: Any, args: argparse.Namespace, deps: RuntimeDeps) -> None:
@@ -1120,7 +1254,7 @@ def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
         raise RuntimeError("maintenance worker endpoint did not return audit events")
 
 
-def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps) -> dict[str, Any]:
     table_response = signed_rest_request(args, deps, "GET", table_endpoint_path(args))
     snapshot_id = current_snapshot_id_from_table_response(table_response)
     run_metadata_location_probe(args, deps, table_response)
@@ -1130,9 +1264,10 @@ def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     diagnostics = signed_rest_request(args, deps, "GET", table_endpoint_path(args, "/catalog/diagnostics"))
     if not isinstance(diagnostics, dict) or not diagnostics:
         raise RuntimeError("catalog diagnostics endpoint returned an empty response")
+    return table_response
 
 
-def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
+def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
     endpoint = normalized_endpoint(args.endpoint)
     ensure_local_proxy_bypass(endpoint)
     ensure_aws_env(args.access_key, args.secret_key, args.region)
@@ -1197,18 +1332,37 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     scanned = loaded.scan().to_arrow()
     if scanned.num_rows != 2:
         raise RuntimeError(f"expected 2 rows after append, got {scanned.num_rows}")
+    loaded_table_location = table_warehouse_location(loaded)
+    loaded_metadata_location = table_metadata_location(loaded)
+    table_response = None
 
     if args.skip_catalog_api_probes:
         print("[10/10] skipping direct REST catalog API probes")
+        if args.live_evidence_output and loaded_metadata_location is None:
+            table_response = signed_rest_request(args, deps, "GET", table_endpoint_path(args))
     else:
         print("[10/10] probing direct REST catalog APIs")
-        run_catalog_api_probes(args, deps)
+        table_response = run_catalog_api_probes(args, deps)
+
+    metadata_location = loaded_metadata_location
+    if isinstance(table_response, dict):
+        response_metadata_location = table_response.get("metadata-location")
+        if isinstance(response_metadata_location, str) and response_metadata_location:
+            metadata_location = response_metadata_location
+    if args.live_evidence_output and metadata_location is None:
+        raise RuntimeError("live evidence output requires a metadata location from PyIceberg or loadTable")
 
     if args.cleanup:
         print(f"cleanup: dropping table and namespace {'.'.join(identifier)}")
         cleanup_catalog(catalog, identifier)
 
     print(f"PASS: PyIceberg smoke test completed for {'.'.join(identifier)}")
+    return SmokeResult(
+        metadata_location=metadata_location or "operator-recorded",
+        row_count=scanned.num_rows,
+        cleanup_result="dropped-table-and-namespace" if args.cleanup else "not-requested",
+        table_warehouse_location=loaded_table_location,
+    )
 
 
 def main() -> int:
@@ -1217,7 +1371,8 @@ def main() -> int:
         if printed_metadata(args):
             return 0
         deps = load_runtime_deps()
-        run_smoke(args, deps)
+        result = run_smoke(args, deps)
+        write_live_evidence(args, result)
         return 0
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
