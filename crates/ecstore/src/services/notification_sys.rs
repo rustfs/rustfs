@@ -14,6 +14,7 @@
 
 use crate::cluster::rpc::PeerRestClient;
 use crate::diagnostics::admin_server_info::get_commit_id;
+use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
 use crate::layout::endpoints::EndpointServerPools;
 use crate::runtime::sources as runtime_sources;
@@ -377,12 +378,14 @@ impl NotificationSys {
                     }
                     Ok(Err(err)) => {
                         warn!("peer {host} server_info failed after retry: {err}");
-                        handle_server_info_failure(cache, &host, &endpoints)
+                        let health = peer_disk_health(&host).await;
+                        handle_server_info_failure(cache, &host, &endpoints, health.as_ref())
                     }
                     Err(_) => {
                         warn!("peer {host} server_info timed out after retry ({peer_timeout:?})");
                         client.evict_connection().await;
-                        handle_server_info_failure(cache, &host, &endpoints)
+                        let health = peer_disk_health(&host).await;
+                        handle_server_info_failure(cache, &host, &endpoints, health.as_ref())
                     }
                 }
             });
@@ -1099,19 +1102,88 @@ fn update_storage_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, 
     c.storage_failures = 0;
 }
 
-/// Handle a peer failure for server_info: return cached data if available,
-/// or mark the member unknown/offline depending on how many consecutive
-/// probes have failed.
+/// Independent liveness evidence for a peer, gathered from the local disk-health
+/// heartbeat rather than the admin RPC path. `any_online` is true when at least
+/// one of the peer's drives is still answering the ~15s health check; `disks`
+/// carries a per-drive entry (state `"ok"` when online, `"offline"` when the
+/// heartbeat marks it faulty) so a `degraded` member's drives are counted for
+/// real. See rustfs/backlog#1049 (P0-B).
+struct PeerDiskHealth {
+    any_online: bool,
+    disks: Vec<rustfs_madmin::Disk>,
+}
+
+/// Consult the local disk-health state for `host` without issuing any RPC.
 ///
-/// Below the failure threshold with no cached snapshot the member is reported
-/// as `unknown` (not `offline`, and not the misleading `initializing` used
-/// previously): the probe missed this cycle but the member is not confirmed
-/// down. The synthesized entry still carries one drive per endpoint so the
-/// pool's drive totals stay balanced (rustfs/backlog#1049).
+/// On the aggregating node a peer's drives are remote-disk handles whose
+/// `is_online()` is a pure atomic read of the heartbeat tracker (independent of
+/// the admin `server_info` RPC that just failed). Returns `None` when the store
+/// is not initialized or the host owns no drives in the topology.
+async fn peer_disk_health(host: &str) -> Option<PeerDiskHealth> {
+    let store = runtime_sources::object_store_handle()?;
+
+    let mut disks = Vec::new();
+    let mut any_online = false;
+    for sets in store.pools.iter() {
+        for set in sets.disk_set.iter() {
+            let guard = set.disks.read().await;
+            for (idx, slot) in guard.iter().enumerate() {
+                let Some(ep) = set.set_endpoints.get(idx) else {
+                    continue;
+                };
+                if host != ep.host_port() {
+                    continue;
+                }
+                let online = match slot {
+                    Some(disk) => disk.is_online().await,
+                    None => false,
+                };
+                any_online |= online;
+                // A live drive is counted online via the DriveState "ok" string;
+                // a faulty one is counted offline. This keeps a degraded member's
+                // drives in the real online/offline buckets.
+                disks.push(rustfs_madmin::Disk {
+                    endpoint: ep.to_string(),
+                    state: if online {
+                        rustfs_common::heal_channel::DriveState::Ok.to_string()
+                    } else {
+                        ItemState::Offline.to_string().to_owned()
+                    },
+                    pool_index: ep.pool_idx,
+                    set_index: ep.set_idx,
+                    disk_index: ep.disk_idx,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    if disks.is_empty() {
+        None
+    } else {
+        Some(PeerDiskHealth { any_online, disks })
+    }
+}
+
+/// Handle a peer failure for server_info: return cached data if available, or
+/// classify the member as `unknown` / `degraded` / `offline` depending on how
+/// many consecutive probes have failed and whether the peer's drives are still
+/// answering the local disk-health heartbeat.
+///
+/// - Below the failure threshold with no cached snapshot: `unknown` (probe
+///   missed this cycle but the member is not confirmed down).
+/// - At/after the threshold with drives still online: `degraded` (the admin RPC
+///   is stuck but the node is alive and serving data) — this is what stops a
+///   healthy node from rotating through a false `offline` (rustfs/backlog#1049).
+/// - At/after the threshold with drives also offline: `offline` (confirmed).
+///
+/// Synthesized entries always carry one drive per endpoint so the pool's drive
+/// totals stay balanced.
 fn handle_server_info_failure(
     cache: Option<&Mutex<PeerAdminCache>>,
     host: &str,
     endpoints: &EndpointServerPools,
+    peer_health: Option<&PeerDiskHealth>,
 ) -> ServerProperties {
     let Some(cache) = cache else {
         return unknown_server_properties(host, endpoints);
@@ -1140,6 +1212,29 @@ fn handle_server_info_failure(
     }
 
     if c.server_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
+        // Drives still answering the heartbeat: the node is alive, only its
+        // admin surface is unreachable — report `degraded`, not `offline`, so a
+        // stuck admin path does not read as an ejected node.
+        if let Some(health) = peer_health.filter(|h| h.any_online) {
+            if c.server_failures == CONSECUTIVE_FAILURE_THRESHOLD {
+                warn!(
+                    event = "peer_marked_degraded",
+                    peer = host,
+                    consecutive_failures = c.server_failures,
+                    threshold = CONSECUTIVE_FAILURE_THRESHOLD,
+                    "peer admin server_info keeps failing but its drives are online; reporting degraded (not offline)"
+                );
+            } else {
+                debug!(
+                    event = "peer_still_degraded",
+                    peer = host,
+                    consecutive_failures = c.server_failures,
+                    "peer admin server_info still failing while its drives remain online"
+                );
+            }
+            return degraded_server_properties(host, &health.disks);
+        }
+
         // Log the transition exactly once (at the crossing) so the console's
         // "node offline" verdict has a matching WARN in the observer's logs
         // (rustfs/backlog#888: nodes were marked offline with no log naming
@@ -1211,6 +1306,20 @@ fn offline_server_properties(host: &str, endpoints: &EndpointServerPools) -> Ser
         endpoint: host.to_string(),
         state: ItemState::Offline.to_string().to_owned(),
         disks: synthesized_disks(host, endpoints, ItemState::Offline),
+        ..Default::default()
+    }
+}
+
+/// A member whose admin RPC is unreachable but whose drives are still online.
+/// Carries the per-drive health observed from the local heartbeat so the drives
+/// land in the real online/offline buckets while the member reads as degraded.
+fn degraded_server_properties(host: &str, disks: &[rustfs_madmin::Disk]) -> ServerProperties {
+    ServerProperties {
+        uptime: runtime_sources::boot_uptime_secs(),
+        version: get_commit_id(),
+        endpoint: host.to_string(),
+        state: ItemState::Degraded.to_string().to_owned(),
+        disks: disks.to_vec(),
         ..Default::default()
     }
 }
@@ -1500,7 +1609,7 @@ mod tests {
         });
         let endpoints = EndpointServerPools::default();
 
-        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, None);
         assert_eq!(result.endpoint, "peer-1");
         assert_eq!(result.state, "online");
         assert_eq!(cache.lock().unwrap().server_failures, 1);
@@ -1511,7 +1620,7 @@ mod tests {
         let cache = Mutex::new(PeerAdminCache::new());
         let endpoints = EndpointServerPools::default();
 
-        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, None);
         assert_eq!(result.endpoint, "peer-1");
         // A probe miss below the threshold is "unknown" (not confirmed down,
         // and not the misleading "initializing"): rustfs/backlog#1049.
@@ -1540,9 +1649,61 @@ mod tests {
         });
         let endpoints = EndpointServerPools::default();
 
-        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, None);
         assert_eq!(result.state, ItemState::Offline.to_string());
         assert_eq!(cache.lock().unwrap().server_failures, CONSECUTIVE_FAILURE_THRESHOLD);
+    }
+
+    #[test]
+    fn handle_server_info_failure_returns_degraded_when_disks_online_past_threshold() {
+        // Past the threshold but the peer's drives still answer the heartbeat:
+        // the node is alive, only its admin RPC is stuck — report degraded (with
+        // the real per-drive health), not offline (rustfs/backlog#1049 P0-B).
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: None,
+            last_server_info: None,
+            storage_failures: 0,
+            server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+        });
+        let endpoints = EndpointServerPools::default();
+        let health = PeerDiskHealth {
+            any_online: true,
+            disks: vec![rustfs_madmin::Disk {
+                endpoint: "http://peer-1:9000/data".to_string(),
+                state: "ok".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, Some(&health));
+        assert_eq!(result.state, ItemState::Degraded.to_string());
+        assert_eq!(result.disks.len(), 1);
+        assert_eq!(result.disks[0].state, "ok");
+        assert_eq!(cache.lock().unwrap().server_failures, CONSECUTIVE_FAILURE_THRESHOLD);
+    }
+
+    #[test]
+    fn handle_server_info_failure_stays_offline_when_disks_also_offline() {
+        // Past the threshold and the heartbeat also reports the drives down:
+        // this is a genuine offline, degraded must not mask it.
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: None,
+            last_server_info: None,
+            storage_failures: 0,
+            server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+        });
+        let endpoints = EndpointServerPools::default();
+        let health = PeerDiskHealth {
+            any_online: false,
+            disks: vec![rustfs_madmin::Disk {
+                endpoint: "http://peer-1:9000/data".to_string(),
+                state: ItemState::Offline.to_string().to_owned(),
+                ..Default::default()
+            }],
+        };
+
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, Some(&health));
+        assert_eq!(result.state, ItemState::Offline.to_string());
     }
 
     #[test]
@@ -1582,7 +1743,7 @@ mod tests {
         let storage_result = handle_peer_failure(Some(&cache), "peer-1", &endpoints);
         assert!(storage_result.is_some());
 
-        let server_result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
+        let server_result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, None);
         assert_eq!(server_result.state, "online");
         assert_eq!(cache.lock().unwrap().server_failures, 1);
     }
@@ -1605,7 +1766,7 @@ mod tests {
         let storage_result = handle_peer_failure(Some(&storage_cache), "peer-1", &endpoints);
         assert!(storage_result.is_none());
 
-        let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints);
+        let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints, None);
         assert_eq!(server_result.endpoint, "peer-1");
         assert_eq!(server_result.state, ItemState::Unknown.to_string());
     }
@@ -1661,7 +1822,7 @@ mod tests {
         assert!(storage_result.is_some());
         assert_eq!(storage_result.unwrap().disks[0].state, "ok");
 
-        let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints);
+        let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints, None);
         assert_eq!(server_result.state, "online");
     }
 }
