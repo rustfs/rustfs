@@ -827,6 +827,11 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>, bp: Ar
 
             match step {
                 ReapStep::Finish(outcome) => {
+                    // Content hygiene (C12, rustfs/backlog#1062): the delivered
+                    // bytes are ⊆ [0, res) — buf was freshly zeroed per op and
+                    // truncated to res. When P3 reuses a driver-owned slab
+                    // across requests, this ⊆ [0, res) property MUST be
+                    // preserved or a previous tenant's object bytes leak.
                     let mut p = state.pending.remove(&ud).expect("checked above");
                     match p.done.take().expect("done sender set at submit").send(outcome) {
                         Ok(()) => stats.delivered.fetch_add(1, Ordering::SeqCst),
