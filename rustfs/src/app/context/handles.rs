@@ -344,12 +344,37 @@ impl LocalNodeNameInterface for LocalNodeNameHandle {
 }
 
 /// Default action credentials interface adapter.
+///
+/// Holds this context's own copy of the action credentials (backlog#1052 S3).
+/// `publish` lands on the owning context *and* attempts to publish the process
+/// global; readers prefer the owned copy and fall back to the global — so
+/// ambient callers (iam, S3 auth) keep working, and two contexts that both
+/// published stay isolated even though the global remembers only the first.
 #[derive(Default)]
-pub struct ActionCredentialHandle;
+pub struct ActionCredentialHandle {
+    credentials: StdRwLock<Option<Credentials>>,
+}
 
 impl ActionCredentialInterface for ActionCredentialHandle {
     fn get(&self) -> Option<Credentials> {
+        if let Ok(guard) = self.credentials.read()
+            && let Some(credentials) = guard.as_ref()
+        {
+            return Some(credentials.clone());
+        }
         runtime_sources::action_credentials()
+    }
+
+    fn publish(&self, credentials: Credentials) -> bool {
+        let Ok(mut guard) = self.credentials.write() else {
+            return false;
+        };
+        let already_held = guard.is_some();
+        *guard = Some(credentials.clone());
+        let global_published =
+            rustfs_credentials::init_global_action_credentials(Some(credentials.access_key), Some(credentials.secret_key))
+                .is_ok();
+        !already_held || global_published
     }
 }
 
@@ -528,7 +553,7 @@ pub fn default_local_node_name_interface() -> Arc<dyn LocalNodeNameInterface> {
 }
 
 pub fn default_action_credential_interface() -> Arc<dyn ActionCredentialInterface> {
-    Arc::new(ActionCredentialHandle)
+    Arc::new(ActionCredentialHandle::default())
 }
 
 pub fn default_oidc_interface() -> Arc<dyn OidcInterface> {
@@ -599,5 +624,42 @@ mod tests {
     fn unset_server_config_handle_falls_back_to_the_ambient_global() {
         let handle = ServerConfigHandle::default();
         assert_eq!(handle.get(), runtime_sources::server_config());
+    }
+
+    // backlog#1052 S3: two contexts' credential handles keep their own copies,
+    // so they stay isolated even though the process global is init-once and
+    // will only remember the first publish.
+    #[test]
+    fn credential_handle_prefers_its_own_copy_over_the_shared_global() {
+        use super::ActionCredentialHandle;
+        use crate::app::context::interfaces::ActionCredentialInterface;
+        use rustfs_credentials::Credentials;
+
+        let cred_a = Credentials {
+            access_key: "handle-a-access".to_string(),
+            secret_key: "handle-a-secret".to_string(),
+            ..Default::default()
+        };
+        let cred_b = Credentials {
+            access_key: "handle-b-access".to_string(),
+            secret_key: "handle-b-secret".to_string(),
+            ..Default::default()
+        };
+
+        let handle_a = ActionCredentialHandle::default();
+        let handle_b = ActionCredentialHandle::default();
+        handle_a.publish(cred_a.clone());
+        handle_b.publish(cred_b.clone());
+
+        assert_eq!(
+            handle_a.get().map(|c| c.access_key),
+            Some(cred_a.access_key),
+            "handle A must serve its own credentials"
+        );
+        assert_eq!(
+            handle_b.get().map(|c| c.access_key),
+            Some(cred_b.access_key),
+            "handle B must serve its own credentials"
+        );
     }
 }
