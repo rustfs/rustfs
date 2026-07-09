@@ -115,6 +115,7 @@ use s3s::xml;
 use s3s::xml::{SerResult, SerializeContent};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt::Display,
     io::Write,
@@ -302,13 +303,53 @@ impl SerializeContent for ObjectMetadataEntry {
     }
 }
 
+/// Whether `name` is a legal XML 1.0 element name.
+///
+/// User metadata keys are emitted as XML *element names* in the `metadata=true`
+/// listing (`<key>value</key>`). Keys derived from HTTP headers can legally
+/// contain characters that are illegal in an XML `Name` (spaces, `$`, `%`, `#`,
+/// leading digits, control bytes, ...). Emitting such a key verbatim as a tag
+/// produces a malformed document that the console's XML parser rejects wholesale,
+/// blanking the entire prefix in the Web UI while plain `ListObjectsV2` (which
+/// never serializes user metadata) keeps working. See issue #2743.
+fn is_valid_xml_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let is_name_start = |c: char| c == '_' || c == ':' || c.is_alphabetic();
+    let is_name_char = |c: char| is_name_start(c) || c == '-' || c == '.' || c.is_numeric();
+    is_name_start(first) && chars.all(is_name_char)
+}
+
+/// Drop characters that are illegal in XML 1.0 text content.
+///
+/// XML 1.0 permits tab/newline/carriage-return but forbids the other C0 control
+/// characters. The serializer escapes `< > & ' "` but does not strip these, so a
+/// metadata value carrying e.g. a `\u{1}` byte would still emit an unparseable
+/// document. Returns a borrowed slice when nothing needs stripping.
+fn sanitize_xml_text(value: &str) -> Cow<'_, str> {
+    let is_illegal = |c: char| (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r';
+    if value.contains(is_illegal) {
+        Cow::Owned(value.chars().filter(|c| !is_illegal(*c)).collect())
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
 impl SerializeContent for ObjectMetadataExtension {
     fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
         if let Some(metadata) = &self.user_metadata {
             s.element("UserMetadata", |s| {
                 for entry in metadata {
                     if let (Some(name), Some(value)) = (&entry.name, &entry.value) {
-                        s.content(name, value)?;
+                        // Skip entries whose key is not a valid XML element name and strip
+                        // XML-illegal control characters from the value, so a single poison
+                        // object can never corrupt the whole listing document. See issue #2743.
+                        if is_valid_xml_name(name) {
+                            let sanitized = sanitize_xml_text(value);
+                            s.content(name, sanitized.as_ref())?;
+                        }
                     }
                 }
                 Ok(())
@@ -3580,6 +3621,89 @@ mod tests {
         assert!(xml.contains("<UserTags>env=prod&amp;project=alpha</UserTags>"));
         assert!(xml.contains("<Internal><K>4</K><M>2</M></Internal>"));
         assert!(!xml.contains("<MetadataEntry>"));
+    }
+
+    #[test]
+    fn is_valid_xml_name_rejects_non_name_keys() {
+        // Regression for #2743: keys that are illegal as XML element names.
+        for good in ["project", "_x", "a-b.c", "Content_Type", "ns:key", "键名"] {
+            assert!(is_valid_xml_name(good), "{good:?} should be a valid XML name");
+        }
+        for bad in ["", "bad key", "1abc", "a$b", "a%b", "a#b", "a*b", "a|b", "a\u{1}b", "-lead"] {
+            assert!(!is_valid_xml_name(bad), "{bad:?} should be rejected as an XML name");
+        }
+    }
+
+    #[test]
+    fn sanitize_xml_text_strips_illegal_control_chars() {
+        // Regression for #2743: XML 1.0 forbids C0 controls other than tab/newline/CR.
+        assert_eq!(sanitize_xml_text("clean value").as_ref(), "clean value");
+        assert_eq!(sanitize_xml_text("keep\ttab\nnl\rcr").as_ref(), "keep\ttab\nnl\rcr");
+        assert_eq!(sanitize_xml_text("bad\u{1}\u{7}\u{1b}chars").as_ref(), "badchars");
+    }
+
+    #[test]
+    fn list_objects_v2_metadata_output_survives_poison_metadata_key() {
+        // Regression for #2743: a single object carrying an XML-unsafe user-metadata key
+        // (space in the key) or an illegal control char in the value must not corrupt the
+        // whole listing document. The offending key is dropped; well-formed siblings remain.
+        use time::macros::datetime;
+
+        let object_infos = ListObjectsV2Info {
+            is_truncated: false,
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs/obj-a.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-03 00:00 UTC)),
+                size: 11,
+                user_defined: Arc::new(HashMap::from([
+                    ("project".to_string(), "alpha".to_string()),
+                    ("bad key".to_string(), "should-be-dropped".to_string()),
+                    ("note".to_string(), "line1\u{1}line2".to_string()),
+                ])),
+                parity_blocks: 2,
+                data_blocks: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let permissions = HashMap::from([(
+            "logs/obj-a.txt".to_string(),
+            ObjectMetadataPermissions {
+                metadata_allowed: true,
+                tags_allowed: true,
+            },
+        )]);
+        let params = ListObjectsV2Params {
+            prefix: "logs/".to_string(),
+            max_keys: 1000,
+            delimiter: None,
+            response_start_after: None,
+            start_after_for_query: None,
+            response_continuation_token: None,
+            decoded_continuation_token: None,
+        };
+
+        let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
+        let xml = String::from_utf8(serialize_config(&output).expect("metadata output should serialize"))
+            .expect("metadata output should be UTF-8");
+
+        // Good sibling metadata survives.
+        assert!(xml.contains("<project>alpha</project>"), "well-formed key must remain: {xml}");
+        // The XML-unsafe key is dropped entirely (never emitted as a malformed tag).
+        assert!(!xml.contains("bad key"), "poison key must not appear: {xml}");
+        // The control char is stripped from the value.
+        assert!(xml.contains("<note>line1line2</note>"), "control char must be stripped: {xml}");
+        assert!(!xml.contains('\u{1}'), "no raw control chars in output");
+        // The document is well-formed and re-parses cleanly.
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(err) => panic!("serialized listing must be well-formed XML, got {err} in {xml}"),
+            }
+        }
     }
 
     #[test]

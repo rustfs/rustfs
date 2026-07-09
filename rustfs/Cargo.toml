@@ -206,6 +206,7 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+quick-xml = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
