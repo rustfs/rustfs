@@ -1029,4 +1029,67 @@ mod tests {
 
         env.stop_server();
     }
+
+    /// Test that continuation pages do not skip keys sorting between the marker
+    /// and the marker plus the cursor tag.
+    ///
+    /// Bug Reference: backlog#1047
+    /// The V2 continuation token appends a `[rustfs_cache:...]` cursor tag to the
+    /// last returned key. The orchestration layer passed that raw string to
+    /// `forward_past`, so any key whose byte after the shared stem sorts below
+    /// `[` (0x5B) — `.`, `/`, `-`, digits, uppercase — was silently dropped on
+    /// the next page: with keys `a`, `a.txt`, `zz` and max_keys=1, page 2
+    /// returned `zz` and `a.txt` was never listed.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_continuation_keeps_keys_after_marker_stem() {
+        init_logging();
+        info!("Starting test: continuation must not skip keys sorting below the cursor tag");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+            .await
+            .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-continuation-marker-stem";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let expected_keys = ["a", "a.txt", "zz"];
+        for key in expected_keys {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"content"))
+                .send()
+                .await
+                .unwrap_or_else(|err| panic!("Failed to create test object {key}: {err}"));
+        }
+
+        let mut collected: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = client.list_objects_v2().bucket(bucket).max_keys(1);
+            if let Some(continuation) = token.take() {
+                request = request.continuation_token(continuation);
+            }
+            let page = request.send().await.expect("Failed to list objects");
+            collected.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|object| object.key().map(ToOwned::to_owned)),
+            );
+            token = page.next_continuation_token().map(ToOwned::to_owned);
+            if token.is_none() {
+                break;
+            }
+            assert!(collected.len() <= expected_keys.len() + 1, "pagination did not converge: {collected:?}");
+        }
+
+        assert_eq!(collected, expected_keys, "every key must survive pagination in order");
+
+        env.stop_server();
+    }
 }
