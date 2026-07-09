@@ -17,6 +17,7 @@ use crate::{
     config::Config,
     server::{ServiceState, ServiceStateManager, ShutdownHandle, start_http_server},
     startup_runtime_sources,
+    storage_api::server::http::ServerContextSlot,
     storage_api::startup::runtime_sources::InstanceContext,
 };
 use rustfs_common::GlobalReadiness;
@@ -231,9 +232,13 @@ pub(crate) async fn init_embedded_startup_listen_context(
     })
 }
 
-pub(crate) async fn start_embedded_http_server(config: &Config, readiness: Arc<GlobalReadiness>) -> Result<EmbeddedHttpServer> {
+pub(crate) async fn start_embedded_http_server(
+    config: &Config,
+    readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<EmbeddedHttpServer> {
     let s3_config = s3_http_server_config(config);
-    let (shutdown_handle, bound_addr) = start_http_server(&s3_config, readiness).await?;
+    let (shutdown_handle, bound_addr) = start_http_server(&s3_config, readiness, server_ctx).await?;
 
     Ok(EmbeddedHttpServer {
         shutdown_handle,
@@ -241,16 +246,22 @@ pub(crate) async fn start_embedded_http_server(config: &Config, readiness: Arc<G
     })
 }
 
-pub(crate) async fn init_startup_http_servers(config: &Config, readiness: Arc<GlobalReadiness>) -> Result<StartupHttpServers> {
+pub(crate) async fn init_startup_http_servers(
+    config: &Config,
+    readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<StartupHttpServers> {
     init_capacity_management().await;
     let state_manager = Arc::new(ServiceStateManager::new());
     state_manager.update(ServiceState::Starting);
 
     let s3_config = s3_http_server_config(config);
-    let (s3_shutdown_tx, _) = start_http_server(&s3_config, readiness.clone()).await?;
+    let (s3_shutdown_tx, _) = start_http_server(&s3_config, readiness.clone(), server_ctx.clone()).await?;
 
     let console_shutdown_tx = match console_http_server_config(config) {
-        Some(console_config) => Some(start_http_server(&console_config, readiness).await?.0),
+        // The console shares the S3 server's context slot: it is the same
+        // logical server on a second listener.
+        Some(console_config) => Some(start_http_server(&console_config, readiness, server_ctx).await?.0),
         None => None,
     };
 

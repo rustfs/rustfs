@@ -19,6 +19,7 @@ use crate::{
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
     startup_services::init_startup_runtime_services,
     startup_storage::{StartupStorageRuntime, init_startup_storage_foundation, init_startup_storage_runtime},
+    storage_api::server::http::ServerContextSlot,
     storage_api::startup::storage::bootstrap_instance_ctx,
 };
 use std::io::{Error, Result};
@@ -108,6 +109,9 @@ async fn run(config: Config) -> Result<()> {
     // the storage path explicitly (Phase 5 follow-up, backlog#1052); a future
     // multi-instance server constructs its own context here instead.
     let instance_ctx = bootstrap_instance_ctx();
+    // This server's request-path context slot (backlog#1052 S2): handed to the
+    // HTTP service now, installed once IAM bootstrap completes.
+    let server_ctx = ServerContextSlot::new();
 
     let StartupListenContext {
         readiness,
@@ -120,7 +124,7 @@ async fn run(config: Config) -> Result<()> {
         state_manager,
         s3_shutdown_tx,
         console_shutdown_tx,
-    } = init_startup_http_servers(&config, readiness.clone()).await?;
+    } = init_startup_http_servers(&config, readiness.clone(), server_ctx.clone()).await?;
 
     let StartupStorageRuntime {
         store,
@@ -134,6 +138,7 @@ async fn run(config: Config) -> Result<()> {
         ctx.clone(),
         readiness.clone(),
         state_manager.clone(),
+        server_ctx,
     )
     .await?;
 
