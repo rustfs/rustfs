@@ -45,14 +45,17 @@ const EVENT_EMBEDDED_SERVER_STATE: &str = "embedded_server_state";
 ///
 /// Phase 5 (backlog#939) moved per-instance runtime state (erasure setup,
 /// region, deployment id, endpoints, service handles, disk registry, cancel
-/// token) into `ECStore`'s `InstanceContext`, so two `ECStore` object graphs
-/// can now stay isolated. This guard is intentionally **retained**: the startup
-/// path still publishes into the process-level *bootstrap* context (write-once
-/// region/endpoints/deployment id) and the single `GLOBAL_OBJECT_API` handle,
-/// so a second startup would fail-fast on that shared state. Lifting the guard
-/// requires threading a per-instance context through storage startup (so each
-/// server constructs its own context instead of sharing the bootstrap); until
-/// then, rejecting the second start is safer than the panic it would become.
+/// token) into `ECStore`'s `InstanceContext`, and backlog#1052 S1 threads an
+/// explicit context through the storage startup path, so a second server's
+/// *storage-layer* state could now stay isolated. This guard is still
+/// intentionally **retained**: embedded startup shares the bootstrap context
+/// (see `run_embedded_startup`), the request path resolves the store per
+/// request through the process-level `GLOBAL_OBJECT_API`/`AppContext`
+/// singletons (a second listener would serve the first instance's data), and
+/// IAM/bucket-metadata/config/credentials remain process singletons. Lifting
+/// the guard is staged in backlog#1052 (S2 per-server dispatch, S3 app
+/// subsystems, S4 node-identity globals, then S5 removes this guard); until
+/// then, rejecting the second start is safer than the failure it would become.
 static EMBEDDED_SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

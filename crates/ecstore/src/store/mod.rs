@@ -164,8 +164,9 @@ pub(crate) mod utils;
 
 use peer::init_local_peer;
 pub use peer::{
-    all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks, init_lock_clients,
-    prewarm_local_disk_id_map,
+    all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks,
+    init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+    prewarm_local_disk_id_map_with_instance_ctx,
 };
 
 pub struct ECStore {

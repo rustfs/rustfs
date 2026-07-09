@@ -19,6 +19,7 @@ use crate::{
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
     startup_services::init_startup_runtime_services,
     startup_storage::{StartupStorageRuntime, init_startup_storage_foundation, init_startup_storage_runtime},
+    storage_api::startup::storage::bootstrap_instance_ctx,
 };
 use std::io::{Error, Result};
 use tracing::{error, instrument};
@@ -103,13 +104,18 @@ async fn async_main() -> Result<()> {
 
 #[instrument(skip(config))]
 async fn run(config: Config) -> Result<()> {
+    // Single-instance startup threads the process bootstrap context through
+    // the storage path explicitly (Phase 5 follow-up, backlog#1052); a future
+    // multi-instance server constructs its own context here instead.
+    let instance_ctx = bootstrap_instance_ctx();
+
     let StartupListenContext {
         readiness,
         server_addr,
         server_address,
-    } = init_startup_listen_context(&config).await?;
+    } = init_startup_listen_context(&config, &instance_ctx).await?;
 
-    let endpoint_pools = init_startup_storage_foundation(&server_address, &config.volumes).await?;
+    let endpoint_pools = init_startup_storage_foundation(&server_address, &config.volumes, &instance_ctx).await?;
     let StartupHttpServers {
         state_manager,
         s3_shutdown_tx,
@@ -119,7 +125,7 @@ async fn run(config: Config) -> Result<()> {
     let StartupStorageRuntime {
         store,
         shutdown_token: ctx,
-    } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone()).await?;
+    } = init_startup_storage_runtime(server_addr, &endpoint_pools, readiness.clone(), instance_ctx).await?;
 
     let service_runtime = init_startup_runtime_services(
         &config,
