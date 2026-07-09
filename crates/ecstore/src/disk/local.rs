@@ -72,6 +72,7 @@ const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
 const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 const INLINE_METADATA_ROLLBACK_DIR_XOR: u128 = 0x7275737466735f696e6c696e655f7262;
+const DELETE_MARKER_ROLLBACK_FILE: &str = "xl.meta.delete-marker.rollback";
 const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_COUNT";
 const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS";
@@ -147,19 +148,23 @@ async fn restore_metadata_backup(object_dir: &Path, xl_path: &Path, rollback_dir
 async fn restore_delete_rollback(object_dir: &Path, xl_path: &Path, rollback_dir: Uuid) -> Result<()> {
     let rollback_path = object_dir.join(rollback_dir.to_string());
     let mut staged_paths = Vec::new();
+    let mut remove_new_metadata = false;
     match fs::read_dir(&rollback_path).await {
         Ok(mut entries) => {
             while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
                 let name = entry.file_name();
-                if name != STORAGE_FORMAT_FILE_BACKUP {
+                if name == DELETE_MARKER_ROLLBACK_FILE {
+                    remove_new_metadata = true;
+                } else if name != STORAGE_FORMAT_FILE_BACKUP {
                     staged_paths.push((entry.path(), object_dir.join(name)));
                 }
             }
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(to_file_error(err).into()),
     }
 
+    let had_staged_paths = !staged_paths.is_empty();
     for (src, dst) in staged_paths {
         rename_all(&src, &dst, object_dir).await?;
     }
@@ -170,15 +175,28 @@ async fn restore_delete_rollback(object_dir: &Path, xl_path: &Path, rollback_dir
             let _ = fs::remove_dir(&rollback_path).await;
             Ok(())
         }
-        Err(DiskError::FileNotFound) => match fs::remove_file(xl_path).await {
+        // A missing backup only means "remove the newly-created delete marker"
+        // when the marker proves there was no old metadata to restore.
+        Err(DiskError::FileNotFound) if remove_new_metadata => match fs::remove_file(xl_path).await {
             Ok(()) => {
+                let _ = fs::remove_file(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE)).await;
                 let _ = fs::remove_dir(&rollback_path).await;
                 Ok(())
             }
             Err(err) if err.kind() == ErrorKind::NotFound => {
+                let _ = fs::remove_file(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE)).await;
                 let _ = fs::remove_dir(&rollback_path).await;
                 Ok(())
             }
+            Err(err) => Err(to_file_error(err).into()),
+        },
+        Err(DiskError::FileNotFound) if had_staged_paths => Err(DiskError::FileNotFound),
+        Err(DiskError::FileNotFound) => match fs::metadata(xl_path).await {
+            Ok(_) => {
+                let _ = fs::remove_dir(&rollback_path).await;
+                Ok(())
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => Err(DiskError::FileNotFound),
             Err(err) => Err(to_file_error(err).into()),
         },
         Err(err) => Err(err),
@@ -6248,6 +6266,13 @@ impl DiskAPI for LocalDisk {
                 }
 
                 if fi.deleted && force_del_marker {
+                    if let Some(rollback_dir) = rollback_dir {
+                        let rollback_path = file_path.join(rollback_dir.to_string());
+                        fs::create_dir_all(&rollback_path).await.map_err(to_file_error)?;
+                        fs::write(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE), [])
+                            .await
+                            .map_err(to_file_error)?;
+                    }
                     if let Err(err) = self.write_metadata("", volume, path, fi).await {
                         if let Some(rollback_dir) = rollback_dir
                             && let Err(restore_err) = restore_delete_rollback(file_path.as_path(), &xl_path, rollback_dir).await
@@ -8795,7 +8820,7 @@ mod test {
         disk.delete_version(
             bucket,
             object,
-            old_fi,
+            old_fi.clone(),
             false,
             DeleteOptions {
                 undo_write: true,
@@ -8815,6 +8840,62 @@ mod test {
             fs::read(data_path.join("part.1"))
                 .await
                 .expect("part data should be restored"),
+            b"old-data"
+        );
+        assert!(!object_dir.join(rollback_dir.to_string()).exists());
+
+        disk.delete_version(
+            bucket,
+            object,
+            old_fi.clone(),
+            false,
+            DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("repeated undo should be a no-op after rollback state is consumed");
+
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("metadata should remain restored after repeated undo");
+        assert_eq!(restored_meta, old_meta);
+        assert_eq!(
+            fs::read(data_path.join("part.1"))
+                .await
+                .expect("part data should remain restored after repeated undo"),
+            b"old-data"
+        );
+
+        fs::create_dir_all(object_dir.join(rollback_dir.to_string()))
+            .await
+            .expect("stale empty rollback dir should be created");
+        disk.delete_version(
+            bucket,
+            object,
+            old_fi,
+            false,
+            DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("undo with consumed backup and no delete-marker marker should be a no-op");
+
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("metadata should remain restored after stale-dir undo");
+        assert_eq!(restored_meta, old_meta);
+        assert_eq!(
+            fs::read(data_path.join("part.1"))
+                .await
+                .expect("part data should remain restored after stale-dir undo"),
             b"old-data"
         );
         assert!(!object_dir.join(rollback_dir.to_string()).exists());
@@ -8974,6 +9055,28 @@ mod test {
         .await
         .expect("delete marker should be written");
         assert!(object_dir.join(STORAGE_FORMAT_FILE).exists());
+        let rollback_path = object_dir.join(rollback_dir.to_string());
+        assert!(
+            rollback_path.join(DELETE_MARKER_ROLLBACK_FILE).exists(),
+            "delete-marker rollback should carry an explicit no-backup marker"
+        );
+
+        disk.delete_version(
+            bucket,
+            object,
+            delete_marker.clone(),
+            true,
+            DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("undo should remove new delete marker metadata");
+        assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
+        assert!(!rollback_path.exists());
 
         disk.delete_version(
             bucket,
@@ -8988,7 +9091,7 @@ mod test {
             },
         )
         .await
-        .expect("undo should remove new delete marker metadata");
+        .expect("repeated delete-marker undo should be a no-op");
         assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
     }
 
