@@ -402,16 +402,55 @@ fn drain_probe_cqe(ring: &mut IoUring) -> io::Result<i32> {
     Err(io::Error::other("probe: no CQE after bounded wait"))
 }
 
-fn drive(mut ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
-    let mut pending: HashMap<u64, Pending> = HashMap::new();
-    let mut backlog: VecDeque<io_uring::squeue::Entry> = VecDeque::new();
+/// Owns everything the kernel can still be writing into: the ring, the
+/// pending (orphan) table of in-flight buffers, and the SQE backlog.
+///
+/// C2 (rustfs/backlog#1054): the "CQE is the only reclamation point"
+/// invariant holds only while the driver thread does NOT unwind. On a panic,
+/// Rust would drop the pending table (freeing every in-flight buffer) while
+/// the kernel may still write into them → mass UAF; reversing drop order does
+/// not help because io_uring teardown on ring drop is asynchronous and does
+/// not wait for in-flight ops. So this type's `Drop` refuses to run field
+/// destructors during an unwind: it aborts the process first, leaving the
+/// ring mapped and the buffers allocated (leak over UAF). A storage read path
+/// silently corrupting memory is worse than a crash.
+struct DriverState {
+    ring: IoUring,
+    pending: HashMap<u64, Pending>,
+    backlog: VecDeque<io_uring::squeue::Entry>,
+}
+
+impl Drop for DriverState {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Abort BEFORE any field destructor runs: the ring stays mapped
+            // and the in-flight buffers stay allocated, so the kernel can
+            // never write into freed memory.
+            eprintln!(
+                "uring-spike driver thread panicked with {} ops in flight; \
+                 aborting to avoid UAF of in-flight buffers",
+                self.pending.len()
+            );
+            std::process::abort();
+        }
+        // Normal drop: the shutdown invariant guarantees pending/backlog are
+        // empty and in_flight == 0, so unmapping the ring here is safe.
+    }
+}
+
+fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
+    let mut state = DriverState {
+        ring,
+        pending: HashMap::new(),
+        backlog: VecDeque::new(),
+    };
     let mut shutting_down = false;
 
     loop {
         // 1. Intake. Block (with timeout) only when fully idle; once ops are
         //    in flight we must keep reaping, so only try_recv.
         loop {
-            let idle = pending.is_empty() && backlog.is_empty() && !shutting_down;
+            let idle = state.pending.is_empty() && state.backlog.is_empty() && !shutting_down;
             let msg = if idle {
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(m) => m,
@@ -451,7 +490,7 @@ fn drive(mut ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                         .offset(offset)
                         .build()
                         .user_data(id);
-                    pending.insert(
+                    state.pending.insert(
                         id,
                         Pending {
                             buf,
@@ -461,17 +500,21 @@ fn drive(mut ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                     );
                     stats.submitted.fetch_add(1, Ordering::SeqCst);
                     stats.in_flight.fetch_add(1, Ordering::SeqCst);
-                    backlog.push_back(sqe);
+                    state.backlog.push_back(sqe);
                 }
                 Msg::Cancel { id } => {
-                    if pending.contains_key(&id) {
-                        backlog.push_back(opcode::AsyncCancel::new(id).build().user_data(id | CANCEL_BIT));
+                    if state.pending.contains_key(&id) {
+                        state
+                            .backlog
+                            .push_back(opcode::AsyncCancel::new(id).build().user_data(id | CANCEL_BIT));
                     }
                 }
                 Msg::Shutdown => {
                     shutting_down = true;
-                    for id in pending.keys() {
-                        backlog.push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
+                    for id in state.pending.keys() {
+                        state
+                            .backlog
+                            .push_back(opcode::AsyncCancel::new(*id).build().user_data(*id | CANCEL_BIT));
                     }
                 }
             }
@@ -479,33 +522,33 @@ fn drive(mut ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
 
         // 2. Push backlog into the SQ (stop when full; retry next turn).
         {
-            let mut sq = ring.submission();
-            while let Some(sqe) = backlog.pop_front() {
+            let mut sq = state.ring.submission();
+            while let Some(sqe) = state.backlog.pop_front() {
                 // SAFETY: read SQEs point into `pending`-owned buffers that
                 // live until their CQE; cancel SQEs carry no pointers.
                 if unsafe { sq.push(&sqe) }.is_err() {
-                    backlog.push_front(sqe);
+                    state.backlog.push_front(sqe);
                     break;
                 }
             }
         }
-        if ring.submit().is_err() {
+        if state.ring.submit().is_err() {
             // EINTR and friends: retry on the next loop turn.
         }
 
         // 3. Reap. This is the ONLY place a Pending entry (and thus its
         //    buffer) is dropped.
-        while let Some(cqe) = ring.completion().next() {
+        while let Some(cqe) = state.ring.completion().next() {
             let ud = cqe.user_data();
             if ud & CANCEL_BIT != 0 {
                 // Result of the AsyncCancel op itself; the read's own CQE
                 // (ECANCELED or success) still arrives separately.
                 continue;
             }
-            let Some(mut p) = pending.remove(&ud) else {
+            let res = cqe.result();
+            let Some(mut p) = state.pending.remove(&ud) else {
                 continue;
             };
-            let res = cqe.result();
             let outcome = if res < 0 {
                 Err(io::Error::from_raw_os_error(-res))
             } else {
@@ -523,13 +566,13 @@ fn drive(mut ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
 
         // 4. Exit only when drained: kernel no longer references any buffer,
         //    so dropping the ring (unmap) is safe.
-        if shutting_down && pending.is_empty() && backlog.is_empty() {
+        if shutting_down && state.pending.is_empty() && state.backlog.is_empty() {
             return;
         }
 
         // Spike-grade pacing: production replaces this poll with eventfd +
         // tokio AsyncFd reaping (backlog#894).
-        if !pending.is_empty() {
+        if !state.pending.is_empty() {
             std::thread::sleep(Duration::from_micros(200));
         }
     }
