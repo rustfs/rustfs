@@ -65,7 +65,10 @@ impl IamInterface for IamHandle {
     }
 
     fn is_ready(&self) -> bool {
-        runtime_sources::ready_iam_handle().is_ok()
+        // The handle owns a fully initialized system (contexts are only built
+        // after IAM bootstrap), so readiness is a property of the held Arc —
+        // not of the process singleton (backlog#1052 S3).
+        self.iam.is_ready()
     }
 
     fn token_signing_key(&self) -> Option<String> {

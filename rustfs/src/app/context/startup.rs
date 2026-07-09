@@ -17,7 +17,7 @@ use super::global::{AppContext, get_global_app_context, init_global_app_context}
 use super::runtime_sources;
 use super::server_slot::ServerContextSlot;
 use rustfs_kms::KmsServiceManager;
-use std::io::{Error, Result};
+use std::io::Result;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,13 +35,15 @@ impl AppContext {
         store: Arc<ECStore>,
         kms_interface: Arc<KmsServiceManager>,
         server_ctx: &ServerContextSlot,
+        iam: Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>,
     ) -> Result<()> {
         ensure_startup_app_context_after_iam_with(
             || get_global_app_context().is_some(),
             || {
-                let iam_interface =
-                    runtime_sources::ready_iam_handle().map_err(|_| Error::other("IAM is initialized but unavailable"))?;
-                init_global_app_context(AppContext::with_default_interfaces(store, iam_interface, kms_interface));
+                // The caller hands over the IAM system it just built for this
+                // server (backlog#1052 S3) — no read-back through the process
+                // singleton, so a future second server's context owns its own.
+                init_global_app_context(AppContext::with_default_interfaces(store, iam, kms_interface));
                 Ok(())
             },
         )?;
