@@ -106,6 +106,7 @@ struct DriverStats {
     cancel_succeeded: AtomicU64,
     cancel_not_found: AtomicU64,
     cancel_already: AtomicU64,
+    cq_overflow: AtomicU64,
 }
 
 /// Point-in-time copy of the driver counters.
@@ -131,6 +132,10 @@ pub struct StatsSnapshot {
     /// signal that makes drain-to-zero non-terminating (C4,
     /// rustfs/backlog#1055).
     pub cancel_already: u64,
+    /// Kernel CQ-ring overflow counter. MUST stay 0: a non-zero value means
+    /// CQEs were lost, so their pending entries are never reclaimed and drain
+    /// never completes. Treated as fatal (C5, rustfs/backlog#1056).
+    pub cq_overflow: u64,
 }
 
 enum Msg {
@@ -236,6 +241,13 @@ impl UringDriver {
     /// fail with ENOSYS/EINVAL (backlog#894 probe design).
     pub fn probe_and_start(entries: u32) -> Result<Self, ProbeFailure> {
         let mut ring = IoUring::new(entries).map_err(ProbeFailure::Setup)?;
+        // Require the NODROP feature (kernel >= 5.5). Without it, CQ overflow
+        // silently drops CQEs, stranding pending entries forever and hanging
+        // shutdown (C5, rustfs/backlog#1056). ENOSYS is in the expected-
+        // restriction class, so this degrades to the std backend cleanly.
+        if !ring.params().is_feature_nodrop() {
+            return Err(ProbeFailure::Setup(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
         probe_real_read(&mut ring).map_err(ProbeFailure::ReadOp)?;
 
         let (tx, rx) = mpsc::channel();
@@ -338,6 +350,7 @@ impl UringDriver {
             cancel_succeeded: self.stats.cancel_succeeded.load(Ordering::SeqCst),
             cancel_not_found: self.stats.cancel_not_found.load(Ordering::SeqCst),
             cancel_already: self.stats.cancel_already.load(Ordering::SeqCst),
+            cq_overflow: self.stats.cq_overflow.load(Ordering::SeqCst),
         }
     }
 
@@ -612,8 +625,17 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                 }
             }
         }
-        if state.ring.submit().is_err() {
-            // EINTR and friends: retry on the next loop turn.
+        match state.ring.submit() {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+                // CQ-overflow backpressure on pre-5.19 NODROP kernels: the
+                // kernel refuses new submissions until we reap. Keep the
+                // backlog and reap this turn instead of spinning (C5,
+                // rustfs/backlog#1056).
+            }
+            Err(_) => {
+                // EINTR and friends: retry on the next loop turn.
+            }
         }
 
         // 3. Reap. A Pending entry (and thus its buffer) is dropped ONLY when
@@ -699,6 +721,17 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                 }
                 ReapStep::Resubmit(sqe) => state.backlog.push_back(sqe),
             }
+        }
+
+        // Monitor CQ overflow. With NODROP (asserted at probe) the crate's
+        // submit() auto-flushes the kernel overflow list, so this should stay
+        // 0; any non-zero value means CQEs were lost — pending entries would
+        // never be reclaimed. Record it as a fatal signal (C5,
+        // rustfs/backlog#1056).
+        let overflow = state.ring.completion().overflow();
+        if overflow != 0 {
+            stats.cq_overflow.store(overflow as u64, Ordering::SeqCst);
+            eprintln!("uring-spike driver: CQ overflow = {overflow}; CQEs lost — treat as fatal in P2");
         }
 
         // 4. Exit when drained: the kernel no longer references any buffer, so
