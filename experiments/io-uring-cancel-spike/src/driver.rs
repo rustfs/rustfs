@@ -128,21 +128,30 @@ enum Msg {
     Shutdown,
 }
 
-/// One in-flight read. This struct — not the caller — owns everything the
-/// kernel touches:
+/// One in-flight LOGICAL read. This struct — not the caller — owns everything
+/// the kernel touches:
 ///
 /// - `buf`: the destination buffer. Its heap allocation must stay put until
-///   the CQE; the `Vec` itself may move (HashMap rehash) since that never
-///   relocates the heap block. It is never read, resized, or dropped before
+///   the final CQE; the `Vec` itself may move (HashMap rehash) since that
+///   never relocates the heap block. It is never resized or dropped before
 ///   the CQE handler removes this entry.
-/// - `_file`: keeps the fd open even if every caller-side clone is dropped.
-///   Without this, dropping the future could close the fd mid-read and a
-///   recycled fd number would receive the kernel's write (spike finding:
-///   the orphan table must own the file handle, not just the buffer).
+/// - `file`: keeps the fd open even if every caller-side clone is dropped, and
+///   supplies the fd for short-read resubmission. Without it, dropping the
+///   future could close the fd while an SQE built from that fd still sits in
+///   the backlog (SQE construction → io_uring_enter window), and a recycled
+///   fd number would make the kernel read the WRONG file (spike finding, with
+///   the corrected mechanism per rustfs/backlog#1063).
+/// - `offset`/`nread`: track a short-read resubmit loop (C9,
+///   rustfs/backlog#1058). io_uring may legally short-read a regular file;
+///   the driver resubmits the remainder into `buf[nread..]` until the request
+///   is fully satisfied or a real EOF (res == 0) is seen, so reclamation
+///   happens only at the FINAL CQE of the logical read.
 struct Pending {
     buf: Vec<u8>,
-    _file: Arc<File>,
+    file: Arc<File>,
     done: Option<oneshot::Sender<io::Result<Vec<u8>>>>,
+    offset: u64,
+    nread: usize,
 }
 
 /// Handle to a submitted read. Await it for the result.
@@ -465,6 +474,14 @@ impl Drop for DriverState {
     }
 }
 
+/// What to do with a pending entry after its CQE (C9, rustfs/backlog#1058).
+enum ReapStep {
+    /// The logical read is done: remove the entry and deliver this result.
+    Finish(io::Result<Vec<u8>>),
+    /// Short read, not EOF: re-queue this SQE for the remainder; keep the entry.
+    Resubmit(io_uring::squeue::Entry),
+}
+
 fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
     let mut state = DriverState {
         ring,
@@ -522,8 +539,10 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                         id,
                         Pending {
                             buf,
-                            _file: file,
+                            file,
                             done: Some(done),
+                            offset,
+                            nread: 0,
                         },
                     );
                     stats.submitted.fetch_add(1, Ordering::SeqCst);
@@ -564,8 +583,9 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
             // EINTR and friends: retry on the next loop turn.
         }
 
-        // 3. Reap. This is the ONLY place a Pending entry (and thus its
-        //    buffer) is dropped.
+        // 3. Reap. A Pending entry (and thus its buffer) is dropped ONLY when
+        //    the logical read finishes; a short read is resubmitted for the
+        //    remainder and the entry stays put (C9, rustfs/backlog#1058).
         while let Some(cqe) = state.ring.completion().next() {
             let ud = cqe.user_data();
             if ud & CANCEL_BIT != 0 {
@@ -574,22 +594,68 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                 continue;
             }
             let res = cqe.result();
-            let Some(mut p) = state.pending.remove(&ud) else {
+            if !state.pending.contains_key(&ud) {
                 continue;
+            }
+
+            // Decide the next step while borrowing the entry, then act after
+            // the borrow ends (finish removes it; resubmit re-queues an SQE).
+            let step = {
+                let p = state.pending.get_mut(&ud).expect("checked above");
+                if res < 0 {
+                    // Error (incl. ECANCELED) terminates the logical read.
+                    ReapStep::Finish(Err(io::Error::from_raw_os_error(-res)))
+                } else if res == 0 {
+                    // Real EOF: deliver what was read so far.
+                    p.buf.truncate(p.nread);
+                    ReapStep::Finish(Ok(std::mem::take(&mut p.buf)))
+                } else {
+                    p.nread += res as usize;
+                    // Only POSITIONED reads (read_at, whole-range pread
+                    // contract) resubmit a short read. CURRENT_POSITION reads
+                    // (read_current on pipes/streams) follow read(2) semantics:
+                    // a short read is a valid final result and must be
+                    // delivered as-is — resubmitting would block forever
+                    // waiting for stream data that may never come.
+                    let is_stream = p.offset == CURRENT_POSITION;
+                    if is_stream || p.nread >= p.buf.len() {
+                        p.buf.truncate(p.nread);
+                        ReapStep::Finish(Ok(std::mem::take(&mut p.buf)))
+                    } else {
+                        // Positioned short read, not EOF: resubmit the
+                        // remainder into buf[nread..]. The buffer stays owned by
+                        // the driver and in_flight is unchanged — one logical op.
+                        let remaining = p.buf.len() - p.nread;
+                        // SAFETY: buf[nread..] is in bounds (nread < len) and
+                        // stays alive in the pending table until the CQE.
+                        let ptr = unsafe { p.buf.as_mut_ptr().add(p.nread) };
+                        let next_off = if p.offset == CURRENT_POSITION {
+                            CURRENT_POSITION
+                        } else {
+                            p.offset + p.nread as u64
+                        };
+                        let sqe = opcode::Read::new(types::Fd(p.file.as_raw_fd()), ptr, remaining as u32)
+                            .offset(next_off)
+                            .build()
+                            .user_data(ud);
+                        ReapStep::Resubmit(sqe)
+                    }
+                }
             };
-            let outcome = if res < 0 {
-                Err(io::Error::from_raw_os_error(-res))
-            } else {
-                p.buf.truncate(res as usize);
-                Ok(std::mem::take(&mut p.buf))
-            };
-            match p.done.take().expect("done sender set at submit").send(outcome) {
-                Ok(()) => stats.delivered.fetch_add(1, Ordering::SeqCst),
-                // Caller dropped the future: the buffer survived in the
-                // table until this very CQE and is reclaimed here.
-                Err(_) => stats.orphan_reclaimed.fetch_add(1, Ordering::SeqCst),
-            };
-            stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            match step {
+                ReapStep::Finish(outcome) => {
+                    let mut p = state.pending.remove(&ud).expect("checked above");
+                    match p.done.take().expect("done sender set at submit").send(outcome) {
+                        Ok(()) => stats.delivered.fetch_add(1, Ordering::SeqCst),
+                        // Caller dropped the future: the buffer survived in
+                        // the table until this final CQE and is reclaimed here.
+                        Err(_) => stats.orphan_reclaimed.fetch_add(1, Ordering::SeqCst),
+                    };
+                    stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                ReapStep::Resubmit(sqe) => state.backlog.push_back(sqe),
+            }
         }
 
         // 4. Exit only when drained: kernel no longer references any buffer,
