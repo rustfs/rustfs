@@ -22,9 +22,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
+
+/// Upper bound on how long shutdown waits for in-flight ops to drain before
+/// leaking the ring+buffers and exiting (C4, rustfs/backlog#1055). ASYNC_CANCEL
+/// cannot interrupt an in-execution regular-file read on a D-state/NFS-hung
+/// disk, so drain-to-zero can be non-terminating; this bounds it.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 use tokio::sync::oneshot;
 
 /// user_data bit marking the CQE of an `AsyncCancel` SQE itself (as opposed
@@ -97,6 +103,9 @@ struct DriverStats {
     delivered: AtomicU64,
     orphan_reclaimed: AtomicU64,
     in_flight: AtomicU64,
+    cancel_succeeded: AtomicU64,
+    cancel_not_found: AtomicU64,
+    cancel_already: AtomicU64,
 }
 
 /// Point-in-time copy of the driver counters.
@@ -112,6 +121,16 @@ pub struct StatsSnapshot {
     /// Ops submitted but not yet completed. The kernel may still write into
     /// their buffers.
     pub in_flight: u64,
+    /// ASYNC_CANCEL CQEs that reported the target op was canceled (res == 0).
+    pub cancel_succeeded: u64,
+    /// ASYNC_CANCEL CQEs that reported the target was not found (-ENOENT):
+    /// the op had already completed.
+    pub cancel_not_found: u64,
+    /// ASYNC_CANCEL CQEs that reported the target was already executing and
+    /// could not be interrupted (-EALREADY). A rising count is the hung-disk
+    /// signal that makes drain-to-zero non-terminating (C4,
+    /// rustfs/backlog#1055).
+    pub cancel_already: u64,
 }
 
 enum Msg {
@@ -316,6 +335,9 @@ impl UringDriver {
             delivered: self.stats.delivered.load(Ordering::SeqCst),
             orphan_reclaimed: self.stats.orphan_reclaimed.load(Ordering::SeqCst),
             in_flight: self.stats.in_flight.load(Ordering::SeqCst),
+            cancel_succeeded: self.stats.cancel_succeeded.load(Ordering::SeqCst),
+            cancel_not_found: self.stats.cancel_not_found.load(Ordering::SeqCst),
+            cancel_already: self.stats.cancel_already.load(Ordering::SeqCst),
         }
     }
 
@@ -328,7 +350,17 @@ impl UringDriver {
             let _ = h.join();
         }
         let snap = self.stats();
-        assert_eq!(snap.in_flight, 0, "driver exited with ops still in flight");
+        // A clean drain leaves in_flight == 0. A non-zero count here means the
+        // bounded drain bailed out on a hung device and leaked the ring+buffers
+        // to stay memory-safe (C4, rustfs/backlog#1055) — a degraded but safe
+        // outcome, not a panic. Callers/tests that require a clean drain assert
+        // on the returned snapshot themselves.
+        if snap.in_flight != 0 {
+            eprintln!(
+                "uring-spike shutdown: {} ops still in flight (bounded-drain bailout on a hung device)",
+                snap.in_flight
+            );
+        }
         snap
     }
 }
@@ -489,6 +521,7 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
         backlog: VecDeque::new(),
     };
     let mut shutting_down = false;
+    let mut drain_deadline: Option<Instant> = None;
 
     loop {
         // 1. Intake. Block (with timeout) only when fully idle; once ops are
@@ -590,7 +623,17 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
             let ud = cqe.user_data();
             if ud & CANCEL_BIT != 0 {
                 // Result of the AsyncCancel op itself; the read's own CQE
-                // (ECANCELED or success) still arrives separately.
+                // (ECANCELED or success) still arrives separately. Record the
+                // three-state outcome for diagnosability (C4,
+                // rustfs/backlog#1055): EALREADY means the read is executing
+                // and cannot be interrupted, i.e. its CQE may never come on a
+                // hung device — the signal the bounded drain below relies on.
+                match cqe.result() {
+                    0 => stats.cancel_succeeded.fetch_add(1, Ordering::SeqCst),
+                    r if r == -libc::ENOENT => stats.cancel_not_found.fetch_add(1, Ordering::SeqCst),
+                    r if r == -libc::EALREADY => stats.cancel_already.fetch_add(1, Ordering::SeqCst),
+                    _ => 0,
+                };
                 continue;
             }
             let res = cqe.result();
@@ -658,10 +701,28 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
             }
         }
 
-        // 4. Exit only when drained: kernel no longer references any buffer,
-        //    so dropping the ring (unmap) is safe.
-        if shutting_down && state.pending.is_empty() && state.backlog.is_empty() {
-            return;
+        // 4. Exit when drained: the kernel no longer references any buffer, so
+        //    dropping the ring (unmap) is safe. If a hung device keeps a CQE
+        //    from ever arriving, bail out under a bounded deadline instead of
+        //    blocking forever (C4, rustfs/backlog#1055).
+        if shutting_down {
+            if state.pending.is_empty() && state.backlog.is_empty() {
+                return; // clean drain: DriverState drops normally, ring unmaps.
+            }
+            let deadline = *drain_deadline.get_or_insert_with(|| Instant::now() + DRAIN_TIMEOUT);
+            if Instant::now() >= deadline {
+                // A CQE may never arrive (ASYNC_CANCEL cannot interrupt an
+                // in-execution regular-file read on a hung disk). We must NOT
+                // unmap the ring or free the still-in-flight buffers — leak the
+                // whole state (leak over UAF) and exit so shutdown() returns.
+                eprintln!(
+                    "uring-spike driver: bounded drain timed out with {} ops still in flight; \
+                     leaking ring + buffers to stay memory-safe",
+                    state.pending.len()
+                );
+                std::mem::forget(state);
+                return;
+            }
         }
 
         // Spike-grade pacing: production replaces this poll with eventfd +
