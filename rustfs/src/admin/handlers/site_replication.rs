@@ -5391,7 +5391,7 @@ pub struct SRPeerEditHandler {}
 #[async_trait::async_trait]
 impl Operation for SRPeerEditHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
+        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let state = load_site_replication_state().await?;
@@ -5823,6 +5823,27 @@ mod tests {
             ..operation_args
         };
         assert!(!policy.is_allowed(&put_policy_args).await);
+    }
+
+    #[test]
+    fn test_sr_peer_edit_handler_uses_site_replication_operation_action() {
+        let src = include_str!("site_replication.rs");
+        let handler_block = src
+            .split("impl Operation for SRPeerEditHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SRPeerRemoveHandler").next())
+            .expect("SRPeerEditHandler block should exist");
+
+        assert!(
+            handler_block
+                .contains("validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;"),
+            "SRPeerEditHandler should authorize internal peer edits with SiteReplicationOperationAction"
+        );
+        assert!(
+            !handler_block
+                .contains("validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;"),
+            "SRPeerEditHandler must not require SiteReplicationAddAction for internal peer edits"
+        );
     }
 
     #[test]
