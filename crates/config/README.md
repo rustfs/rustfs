@@ -62,6 +62,10 @@ Current guidance:
 - `RUSTFS_CORS_ALLOWED_ORIGINS` defaults to empty, so the S3 endpoint emits no generic CORS headers unless configured. Set `*` for wildcard origins without credentials, or a comma-separated allow-list for credentialed explicit origins.
 - `RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS` defaults to `*` for the console service.
 
+## Browser redirect environment variables
+
+- `RUSTFS_BROWSER_REDIRECT_URL` sets the externally reachable browser origin used for OIDC callback, console success redirect, and logout fallback URLs. Configure it to the public scheme and authority without a path, for example `https://console.example.com`. In load-balancer deployments, keep OIDC authorize and callback requests on the same backend node because the in-flight OIDC `state` is local to the RustFS node.
+
 ## Scanner environment aliases
 
 - `RUSTFS_SCANNER_SPEED` (canonical, also accepts `MINIO_SCANNER_SPEED`)

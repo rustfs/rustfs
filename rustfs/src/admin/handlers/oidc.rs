@@ -20,7 +20,7 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::config::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
+use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -31,7 +31,7 @@ use rustfs_config::oidc::{
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::server_config::Config as ServerConfig;
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_RUSTFS_BROWSER_REDIRECT_URL, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::egress::validate_outbound_url;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -49,6 +49,10 @@ const OIDC_PUBLIC_PROVIDERS_SUFFIX: &str = "/v3/oidc/providers";
 const OIDC_AUTHORIZE_SUFFIX: &str = "/v3/oidc/authorize/";
 const OIDC_CALLBACK_SUFFIX: &str = "/v3/oidc/callback/";
 const OIDC_LOGOUT_SUFFIX: &str = "/v3/oidc/logout";
+const CONSOLE_OIDC_CALLBACK_SUFFIX: &str = "/auth/oidc-callback/";
+const CONSOLE_LOGIN_SUFFIX: &str = "/auth/login";
+const OIDC_STATE_LB_HINT: &str =
+    "check load balancer session affinity for OIDC authorize/callback requests or configure RUSTFS_BROWSER_REDIRECT_URL";
 
 /// Validate that a provider ID contains only safe characters (alphanumeric, underscore, hyphen).
 fn is_valid_provider_id(id: &str) -> bool {
@@ -538,6 +542,11 @@ impl Operation for OidcCallbackHandler {
         // Exchange authorization code for tokens and extract claims
         let (claims, actual_provider_id, session, id_token) =
             oidc_sys.exchange_code(&state, &code, &redirect_uri).await.map_err(|e| {
+                let lb_hint = if is_invalid_oidc_state_error(&e) {
+                    OIDC_STATE_LB_HINT
+                } else {
+                    ""
+                };
                 error!(
                     event = EVENT_ADMIN_OIDC_STATE,
                     component = LOG_COMPONENT_ADMIN,
@@ -550,6 +559,7 @@ impl Operation for OidcCallbackHandler {
                     code_len = code.len(),
                     state_len = state.len(),
                     error = %e,
+                    lb_hint = %lb_hint,
                     "admin oidc state"
                 );
                 S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
@@ -654,16 +664,31 @@ impl Operation for OidcLogoutHandler {
 /// from request headers. For production deployments behind a reverse proxy, configuring
 /// an explicit redirect_uri is recommended to prevent header manipulation.
 fn derive_callback_uri(req: &S3Request<Body>, provider_id: &str) -> S3Result<String> {
-    // Use explicitly configured redirect_uri if available
     if let Some(oidc_sys) = current_oidc_handle()
         && let Some(config) = oidc_sys.get_provider_config(provider_id)
     {
+        return derive_callback_uri_with_provider_config(req, provider_id, Some(config));
+    }
+
+    derive_callback_uri_with_provider_config(req, provider_id, None)
+}
+
+fn derive_callback_uri_with_provider_config(
+    req: &S3Request<Body>,
+    provider_id: &str,
+    config: Option<&rustfs_iam::oidc::OidcProviderConfig>,
+) -> S3Result<String> {
+    if let Some(config) = config {
         if let Some(ref uri) = config.redirect_uri {
             let parsed = Url::parse(uri).map_err(|_| s3_error!(InvalidRequest, "invalid configured redirect_uri"))?;
             if !is_valid_scheme(parsed.scheme()) || parsed.host_str().is_none() {
                 return Err(s3_error!(InvalidRequest, "configured redirect_uri must be absolute http/https URL"));
             }
             return Ok(uri.clone());
+        }
+
+        if let Some(url) = browser_redirect_url(&oidc_callback_path(provider_id))? {
+            return Ok(url);
         }
 
         if !config.redirect_uri_dynamic {
@@ -674,10 +699,18 @@ fn derive_callback_uri(req: &S3Request<Body>, provider_id: &str) -> S3Result<Str
         }
     }
 
+    if let Some(url) = browser_redirect_url(&oidc_callback_path(provider_id))? {
+        return Ok(url);
+    }
+
     let scheme = extract_request_scheme(req)?;
     let host = extract_request_host(req)?;
 
-    Ok(format!("{scheme}://{host}/rustfs/admin/v3/oidc/callback/{provider_id}"))
+    Ok(format!("{scheme}://{host}{}", oidc_callback_path(provider_id)))
+}
+
+fn oidc_callback_path(provider_id: &str) -> String {
+    format!("{ADMIN_PREFIX}{OIDC_CALLBACK_SUFFIX}{provider_id}")
 }
 
 /// Extract a query parameter from the URI.
@@ -755,19 +788,29 @@ fn build_console_redirect(
     redirect_after: Option<&str>,
     logout_token: Option<&str>,
 ) -> S3Result<String> {
-    let scheme = extract_request_scheme(req)?;
-    let host = extract_request_host(req)?;
-    let console_prefix = "/rustfs/console";
     let fragment =
         build_console_callback_fragment(access_key, secret_key, session_token, expiration, redirect_after, logout_token);
 
-    Ok(format!("{scheme}://{host}{console_prefix}/auth/oidc-callback/#{fragment}"))
+    let callback_path = format!("{CONSOLE_PREFIX}{CONSOLE_OIDC_CALLBACK_SUFFIX}");
+    if let Some(base_url) = browser_redirect_url(&callback_path)? {
+        return Ok(format!("{base_url}#{fragment}"));
+    }
+
+    let scheme = extract_request_scheme(req)?;
+    let host = extract_request_host(req)?;
+
+    Ok(format!("{scheme}://{host}{callback_path}#{fragment}"))
 }
 
 fn build_console_login_redirect(req: &S3Request<Body>) -> S3Result<String> {
+    let login_path = format!("{CONSOLE_PREFIX}{CONSOLE_LOGIN_SUFFIX}");
+    if let Some(url) = browser_redirect_url(&login_path)? {
+        return Ok(url);
+    }
+
     let scheme = extract_request_scheme(req)?;
     let host = extract_request_host(req)?;
-    Ok(format!("{scheme}://{host}/rustfs/console/auth/login"))
+    Ok(format!("{scheme}://{host}{login_path}"))
 }
 
 fn redirect_response(location: &str) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -1163,9 +1206,101 @@ fn parse_host_authority(raw_host: &str) -> S3Result<String> {
     Ok(parsed.authority().to_string())
 }
 
+fn browser_redirect_url(path: &str) -> S3Result<Option<String>> {
+    let Some(base) = browser_redirect_base()? else {
+        return Ok(None);
+    };
+    Ok(Some(format!("{base}{path}")))
+}
+
+fn browser_redirect_base() -> S3Result<Option<String>> {
+    let Some(raw) = rustfs_utils::get_env_opt_str(ENV_RUSTFS_BROWSER_REDIRECT_URL) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    validate_browser_redirect_base(trimmed).map(Some)
+}
+
+fn validate_browser_redirect_base(raw_url: &str) -> S3Result<String> {
+    let parsed = Url::parse(raw_url).map_err(|_| s3_error!(InvalidRequest, "invalid browser redirect URL"))?;
+    if !is_valid_scheme(parsed.scheme()) || parsed.host_str().is_none() {
+        return Err(s3_error!(InvalidRequest, "browser redirect URL must be an absolute http/https URL"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(s3_error!(InvalidRequest, "browser redirect URL must not contain userinfo"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(s3_error!(InvalidRequest, "browser redirect URL must not contain query or fragment"));
+    }
+    if !matches!(parsed.path(), "" | "/") {
+        return Err(s3_error!(InvalidRequest, "browser redirect URL must not contain a path"));
+    }
+
+    Ok(format!("{}://{}", parsed.scheme(), parsed.authority()))
+}
+
+fn is_invalid_oidc_state_error(error: &str) -> bool {
+    error.contains("invalid or expired OIDC state")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::{Extensions, HeaderMap, HeaderValue, Uri};
+    use temp_env::with_var;
+
+    fn build_oidc_request(
+        uri: &'static str,
+        host: Option<&'static str>,
+        forwarded_proto: Option<&'static str>,
+    ) -> S3Request<Body> {
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(http::header::HOST, HeaderValue::from_static(host));
+        }
+        if let Some(proto) = forwarded_proto {
+            headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
+        }
+
+        S3Request {
+            input: Body::empty(),
+            method: Method::GET,
+            uri: Uri::from_static(uri),
+            headers,
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn test_provider_config(redirect_uri: Option<&str>, redirect_uri_dynamic: bool) -> rustfs_iam::oidc::OidcProviderConfig {
+        rustfs_iam::oidc::OidcProviderConfig {
+            id: "default".to_string(),
+            enabled: true,
+            config_url: "https://idp.example.com/.well-known/openid-configuration".to_string(),
+            client_id: "rustfs-console".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string()],
+            other_audiences: Vec::new(),
+            redirect_uri: redirect_uri.map(ToString::to_string),
+            redirect_uri_dynamic,
+            claim_name: OIDC_DEFAULT_CLAIM_NAME.to_string(),
+            claim_prefix: String::new(),
+            role_policy: String::new(),
+            display_name: "default".to_string(),
+            groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
+            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
+            email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
+            username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
+            hide_from_ui: false,
+        }
+    }
 
     #[test]
     fn test_is_oidc_path() {
@@ -1261,6 +1396,134 @@ mod tests {
         assert!(fragment.contains("accessKey=access"));
         assert!(fragment.contains("redirect=%2Fdashboard"));
         assert!(fragment.contains("logoutToken=logout-token"));
+    }
+
+    #[test]
+    fn test_validate_browser_redirect_base_accepts_origin() {
+        assert_eq!(
+            validate_browser_redirect_base("https://console.example.com/").expect("browser redirect origin should be valid"),
+            "https://console.example.com"
+        );
+        assert_eq!(
+            validate_browser_redirect_base("http://20.78.1.4:9000").expect("browser redirect origin should be valid"),
+            "http://20.78.1.4:9000"
+        );
+    }
+
+    #[test]
+    fn test_validate_browser_redirect_base_rejects_unsafe_parts() {
+        assert!(validate_browser_redirect_base("ftp://console.example.com").is_err());
+        assert!(validate_browser_redirect_base("https://user:pass@console.example.com").is_err());
+        assert!(validate_browser_redirect_base("https://console.example.com/proxy").is_err());
+        assert!(validate_browser_redirect_base("https://console.example.com?next=/").is_err());
+        assert!(validate_browser_redirect_base("https://console.example.com/#fragment").is_err());
+    }
+
+    #[test]
+    fn test_derive_callback_uri_uses_browser_redirect_url() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/authorize/default", Some("internal:9000"), None);
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com"), || {
+            derive_callback_uri(&req, "default").expect("callback URI should use browser redirect URL")
+        });
+
+        assert_eq!(callback, "https://console.example.com/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn test_derive_callback_uri_falls_back_to_request_headers() {
+        let req = build_oidc_request(
+            "http://internal/rustfs/admin/v3/oidc/authorize/default",
+            Some("internal:9000"),
+            Some("https"),
+        );
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, None::<&str>, || {
+            derive_callback_uri(&req, "default").expect("callback URI should fall back to request headers")
+        });
+
+        assert_eq!(callback, "https://internal:9000/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn test_derive_callback_uri_configured_redirect_uri_wins() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/authorize/default", Some("internal:9000"), None);
+        let config = test_provider_config(Some("https://configured.example.com/rustfs/admin/v3/oidc/callback/default"), false);
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com"), || {
+            derive_callback_uri_with_provider_config(&req, "default", Some(&config))
+                .expect("configured redirect_uri should be preferred")
+        });
+
+        assert_eq!(callback, "https://configured.example.com/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn test_derive_callback_uri_browser_redirect_url_satisfies_static_provider() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/authorize/default", Some("internal:9000"), None);
+        let config = test_provider_config(None, false);
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com"), || {
+            derive_callback_uri_with_provider_config(&req, "default", Some(&config))
+                .expect("browser redirect URL should satisfy a non-dynamic provider")
+        });
+
+        assert_eq!(callback, "https://console.example.com/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn test_derive_callback_uri_static_provider_requires_redirect_source() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/authorize/default", Some("internal:9000"), None);
+        let config = test_provider_config(None, false);
+
+        let err = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, None::<&str>, || {
+            derive_callback_uri_with_provider_config(&req, "default", Some(&config))
+                .expect_err("non-dynamic provider without redirect source should fail")
+        });
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_derive_callback_uri_dynamic_provider_falls_back_to_request_headers() {
+        let req = build_oidc_request(
+            "http://internal/rustfs/admin/v3/oidc/authorize/default",
+            Some("internal:9000"),
+            Some("https"),
+        );
+        let config = test_provider_config(None, true);
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, None::<&str>, || {
+            derive_callback_uri_with_provider_config(&req, "default", Some(&config))
+                .expect("dynamic provider should fall back to request headers")
+        });
+
+        assert_eq!(callback, "https://internal:9000/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn test_build_console_redirect_uses_browser_redirect_url() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/callback/default", Some("internal:9000"), None);
+
+        let redirect = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com/"), || {
+            build_console_redirect(&req, "access", "secret", "token", None, Some("/buckets"), Some("logout-token"))
+                .expect("console redirect should use browser redirect URL")
+        });
+
+        assert!(redirect.starts_with("https://console.example.com/rustfs/console/auth/oidc-callback/#"));
+        assert!(redirect.contains("redirect=%2Fbuckets"));
+        assert!(redirect.contains("logoutToken=logout-token"));
+    }
+
+    #[test]
+    fn test_build_console_login_redirect_uses_browser_redirect_url() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/logout", Some("internal:9000"), None);
+
+        let redirect = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com"), || {
+            build_console_login_redirect(&req).expect("login redirect should use browser redirect URL")
+        });
+
+        assert_eq!(redirect, "https://console.example.com/rustfs/console/auth/login");
     }
 
     #[test]
