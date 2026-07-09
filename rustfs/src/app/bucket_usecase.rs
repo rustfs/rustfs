@@ -326,7 +326,7 @@ fn is_valid_xml_name(name: &str) -> bool {
 ///
 /// XML 1.0 permits tab/newline/carriage-return but forbids the other C0 control
 /// characters. The serializer escapes `< > & ' "` but does not strip these, so a
-/// metadata value carrying e.g. a `\u{1}` byte would still emit an unparseable
+/// metadata value carrying e.g. a `\u{1}` byte would still emit an unparsable
 /// document. Returns a borrowed slice when nothing needs stripping.
 fn sanitize_xml_text(value: &str) -> Cow<'_, str> {
     let is_illegal = |c: char| (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r';
