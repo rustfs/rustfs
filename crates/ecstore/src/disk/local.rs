@@ -3773,7 +3773,7 @@ impl LocalDisk {
 
                     write_metacache_obj(out, &meta).await?;
 
-                    let file_meta = if opts.limit > 0 || opts.recursive {
+                    let file_meta = if opts.limit > 0 || opts.recursive || !is_dir_obj {
                         FileMeta::load(&res).ok()
                     } else {
                         None
@@ -3783,15 +3783,16 @@ impl LocalDisk {
                         *objs_returned += 1;
                     }
 
-                    if opts.recursive {
-                        let mut dir_to_skip = HashSet::new();
-                        if let Some(file_meta) = file_meta.as_ref()
-                            && let Ok(data_dirs) = file_meta.get_data_dirs()
-                        {
-                            for data_dir in data_dirs.iter().flatten() {
-                                dir_to_skip.insert(data_dir.to_string());
-                            }
+                    let mut dir_to_skip = HashSet::new();
+                    if let Some(file_meta) = file_meta.as_ref()
+                        && let Ok(data_dirs) = file_meta.get_data_dirs()
+                    {
+                        for data_dir in data_dirs.iter().flatten() {
+                            dir_to_skip.insert(data_dir.to_string());
                         }
+                    }
+
+                    if opts.recursive {
                         let mut dir_name = meta.name.clone();
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
@@ -3802,23 +3803,20 @@ impl LocalDisk {
                             true,
                             if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
                         );
-                    } else if !is_dir_obj {
-                        // backlog#1042: in a non-recursive (delimiter) listing a plain
-                        // object `a` can ALSO be a prefix `a/` when sibling objects such
-                        // as `a/b` live under it. The object was emitted above (it becomes
-                        // Contents); emit the prefix dir `a/` too so the upstream fold
-                        // surfaces it as a CommonPrefix (matching S3 delimiter semantics).
-                        // The probe only reports true when `a/` holds a listing entry
-                        // other than object `a` itself, so leaf objects (the common case)
-                        // schedule nothing and pay a single list_dir.
-                        if self
-                            .object_prefix_has_sibling_listing_entry(&opts.bucket, &meta.name, res.as_ref())
+                    } else if !is_dir_obj
+                        && self
+                            .object_dir_has_listable_child(&opts.bucket, &meta.name, &dir_to_skip, opts.incl_deleted)
                             .await?
-                        {
-                            let mut dir_name = meta.name.clone();
-                            dir_name.push_str(SLASH_SEPARATOR);
-                            schedule_dir(&mut dir_stack, dir_name, true, None);
-                        }
+                    {
+                        // A plain object `a` shares its backing directory with any
+                        // children `a/...`, and non-recursive walks never descend into
+                        // it — so the prefix `a/` must be produced here or delimiter
+                        // listings lose the CommonPrefix (backlog#1042). Dir-marker
+                        // objects are excluded: their logical children live in a
+                        // separate real directory entry handled above.
+                        let mut dir_name = meta.name.clone();
+                        dir_name.push_str(SLASH_SEPARATOR);
+                        schedule_dir(&mut dir_stack, dir_name, true, None);
                     }
                 }
                 Err(err) => {
@@ -3829,7 +3827,9 @@ impl LocalDisk {
                             meta.name.push_str(SLASH_SEPARATOR);
                             if opts.recursive
                                 || opts.incl_deleted
-                                || self.directory_has_visible_listing_entry(&opts.bucket, &meta.name).await?
+                                || self
+                                    .directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted)
+                                    .await?
                             {
                                 schedule_dir(&mut dir_stack, meta.name, false, None);
                             }
@@ -3889,7 +3889,71 @@ impl LocalDisk {
         Ok(())
     }
 
-    async fn directory_has_visible_listing_entry(&self, bucket: &str, dir_name: &str) -> Result<bool> {
+    /// Whether the backing directory of plain object `object_name` also holds
+    /// listable children (`object_name/...`), beyond the object's own storage
+    /// internals: its `xl.meta` and the version data dirs in `data_dirs`.
+    ///
+    /// With `incl_deleted`, a child subtree counts as soon as it holds any
+    /// object metadata (versioned listings surface delete markers too);
+    /// otherwise the child must have a visible listing entry.
+    async fn object_dir_has_listable_child(
+        &self,
+        bucket: &str,
+        object_name: &str,
+        data_dirs: &HashSet<String>,
+        incl_deleted: bool,
+    ) -> Result<bool> {
+        // The backing dir usually holds only the xl.meta plus the version data
+        // dirs, so a read bounded just past that count decides the common case
+        // without materializing large child sets: an under-filled batch proves
+        // the listing is complete. Only an inconclusive full batch (candidates
+        // present but none listable yet) falls back to the unbounded read.
+        let bounded = i32::try_from(data_dirs.len() + 2).unwrap_or(-1);
+        let mut probed = HashSet::new();
+
+        for count in [bounded, -1] {
+            let entries = match self.list_dir("", bucket, object_name, count).await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    if err == DiskError::VolumeNotFound || err == Error::FileNotFound {
+                        return Ok(false);
+                    }
+
+                    return Err(err);
+                }
+            };
+
+            let complete = count < 0 || entries.len() < count as usize;
+
+            for entry in entries {
+                let Some(child) = entry.strip_suffix(SLASH_SEPARATOR) else {
+                    // Plain files (the object's own xl.meta) can never hold children.
+                    continue;
+                };
+
+                if child.is_empty() || data_dirs.contains(child) || !probed.insert(child.to_owned()) {
+                    continue;
+                }
+
+                let child_path = path_join_buf(&[object_name, child]);
+                if self.directory_has_listing_entry(bucket, &child_path, incl_deleted).await? {
+                    return Ok(true);
+                }
+            }
+
+            if complete {
+                break;
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Whether anything under `dir_name` would appear in a listing. With
+    /// `incl_deleted`, any `xl.meta` counts (versioned listings surface
+    /// delete-marker-only objects too); otherwise the metadata must hold a
+    /// visible version.
+    async fn directory_has_listing_entry(&self, bucket: &str, dir_name: &str, incl_deleted: bool) -> Result<bool> {
         let mut stack = vec![dir_name.trim_matches('/').to_owned()];
 
         while let Some(current) = stack.pop() {
@@ -3913,6 +3977,10 @@ impl LocalDisk {
 
             for entry in entries {
                 if entry == STORAGE_FORMAT_FILE {
+                    if incl_deleted {
+                        return Ok(true);
+                    }
+
                     let metadata_path = path_join_buf(&[current.as_str(), STORAGE_FORMAT_FILE]);
                     match self.read_metadata(bucket, metadata_path.as_str()).await {
                         Ok(metadata) => {
@@ -3953,48 +4021,6 @@ impl LocalDisk {
                 if !data_dirs_to_skip.contains(&child) {
                     stack.push(path_join_buf(&[current.as_str(), child.as_str()]));
                 }
-            }
-        }
-
-        Ok(false)
-    }
-
-    /// backlog#1042 helper for non-recursive (delimiter) listings. Given an object
-    /// directory `obj_dir` (e.g. `a`, which holds `a/xl.meta`), decide whether it
-    /// ALSO acts as a prefix — i.e. contains a listing entry other than the object
-    /// itself, such as a sibling object `a/b`. The object's own `xl.meta` and data
-    /// dirs belong to the object, not to a child prefix, so they are skipped.
-    /// Returns false for leaf objects (the common case), so they incur only a
-    /// single `list_dir` and no descent.
-    async fn object_prefix_has_sibling_listing_entry(&self, bucket: &str, obj_dir: &str, metadata: &[u8]) -> Result<bool> {
-        let mut data_dirs_to_skip = HashSet::new();
-        if let Ok(file_meta) = FileMeta::load(metadata)
-            && let Ok(data_dirs) = file_meta.get_data_dirs()
-        {
-            for data_dir in data_dirs.iter().flatten() {
-                data_dirs_to_skip.insert(data_dir.to_string());
-            }
-        }
-
-        let entries = match self.list_dir("", bucket, obj_dir, -1).await {
-            Ok(entries) => entries,
-            Err(err) if err == DiskError::VolumeNotFound || err == Error::FileNotFound => return Ok(false),
-            Err(err) => return Err(err),
-        };
-
-        for entry in entries {
-            // Only child directories can introduce a sibling listing entry; the
-            // object's own `xl.meta` (a plain file) is not a child prefix.
-            if !entry.ends_with(SLASH_SEPARATOR) {
-                continue;
-            }
-            let child = entry.trim_end_matches(SLASH_SEPARATOR);
-            if child.is_empty() || data_dirs_to_skip.contains(child) {
-                continue;
-            }
-            let child_path = path_join_buf(&[obj_dir, child]);
-            if self.directory_has_visible_listing_entry(bucket, &child_path).await? {
-                return Ok(true);
             }
         }
 
@@ -8771,6 +8797,348 @@ mod test {
         assert!(
             !entries.iter().any(|(name, _)| name == "c/"),
             "leaf object `c` must not produce a spurious prefix `c/`, got {entries:?}"
+        );
+    }
+
+    // Regression for backlog#1042: on a single disk, a plain object `a` and its
+    // children `a/...` share one backing directory, so the non-recursive scan
+    // must produce both the object entry `a` and the prefix entry `a/` — while
+    // an object whose directory only holds its own xl.meta and data dirs must
+    // not grow a phantom prefix.
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_object_with_children_emits_prefix() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str, data_dir: Option<&str>) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.data_dir = data_dir.map(|dir| Uuid::parse_str(dir).expect("test data dir should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        fn hidden_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version(FileInfo {
+                name: name.to_owned(),
+                deleted: true,
+                version_id: Some(Uuid::parse_str(version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("hidden metadata should encode")
+        }
+
+        async fn scan_entries(disk: &LocalDisk, bucket: &str, incl_deleted: bool) -> Vec<(String, bool)> {
+            let (reader, mut writer) = tokio::io::duplex(65536);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: "".to_string(),
+                recursive: false,
+                incl_deleted,
+                limit: 1000,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| (entry.name, !entry.metadata.is_empty()))
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        // `alpha` object with a data dir, plus a real child `alpha/beta`.
+        let alpha_data_dir = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        fs::create_dir_all(bucket_dir.join("alpha").join(alpha_data_dir))
+            .await
+            .expect("alpha data dir should be created");
+        fs::write(bucket_dir.join("alpha").join(alpha_data_dir).join("part.1"), b"data")
+            .await
+            .expect("alpha part should be written");
+        fs::write(
+            bucket_dir.join("alpha").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("alpha", "11111111-1111-1111-1111-111111111111", Some(alpha_data_dir)),
+        )
+        .await
+        .expect("alpha metadata should be written");
+        fs::create_dir_all(bucket_dir.join("alpha/beta"))
+            .await
+            .expect("alpha child dir should be created");
+        fs::write(
+            bucket_dir.join("alpha/beta").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("alpha/beta", "22222222-2222-2222-2222-222222222222", None),
+        )
+        .await
+        .expect("alpha child metadata should be written");
+
+        // `gamma` object whose only extra child is hidden by a delete marker.
+        fs::create_dir_all(bucket_dir.join("gamma/hidden"))
+            .await
+            .expect("gamma child dir should be created");
+        fs::write(
+            bucket_dir.join("gamma").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("gamma", "33333333-3333-3333-3333-333333333333", None),
+        )
+        .await
+        .expect("gamma metadata should be written");
+        fs::write(
+            bucket_dir.join("gamma/hidden").join(STORAGE_FORMAT_FILE),
+            hidden_object_metadata("gamma/hidden", "44444444-4444-4444-4444-444444444444"),
+        )
+        .await
+        .expect("gamma child metadata should be written");
+
+        // `plain` object with only its own storage internals: no prefix expected.
+        let plain_data_dir = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        fs::create_dir_all(bucket_dir.join("plain").join(plain_data_dir))
+            .await
+            .expect("plain data dir should be created");
+        fs::write(bucket_dir.join("plain").join(plain_data_dir).join("part.1"), b"data")
+            .await
+            .expect("plain part should be written");
+        // Data dirs can hold xl.meta-bearing subdirectories (multipart layout);
+        // the probe must skip the whole data dir, not just non-metadata files.
+        fs::create_dir_all(bucket_dir.join("plain").join(plain_data_dir).join("seg"))
+            .await
+            .expect("plain data subdir should be created");
+        fs::write(
+            bucket_dir
+                .join("plain")
+                .join(plain_data_dir)
+                .join("seg")
+                .join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("plain-part", "88888888-8888-8888-8888-888888888888", None),
+        )
+        .await
+        .expect("plain data subdir metadata should be written");
+        fs::write(
+            bucket_dir.join("plain").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("plain", "55555555-5555-5555-5555-555555555555", Some(plain_data_dir)),
+        )
+        .await
+        .expect("plain metadata should be written");
+
+        // `zeta` sorts last so its prefix is flushed by the final drain, not the
+        // in-loop flush that `alpha/` exercises.
+        fs::create_dir_all(bucket_dir.join("zeta/child"))
+            .await
+            .expect("zeta child dir should be created");
+        fs::write(
+            bucket_dir.join("zeta").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("zeta", "66666666-6666-6666-6666-666666666666", None),
+        )
+        .await
+        .expect("zeta metadata should be written");
+        fs::write(
+            bucket_dir.join("zeta/child").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("zeta/child", "77777777-7777-7777-7777-777777777777", None),
+        )
+        .await
+        .expect("zeta child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let entries = scan_entries(&disk, bucket, false).await;
+        let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(names, vec!["alpha", "alpha/", "gamma", "plain", "zeta", "zeta/"]);
+        assert!(entries.iter().any(|(name, has_meta)| name == "alpha" && *has_meta));
+        assert!(entries.iter().any(|(name, has_meta)| name == "alpha/" && !*has_meta));
+        assert!(entries.iter().any(|(name, has_meta)| name == "zeta/" && !*has_meta));
+
+        // Versioned listings surface delete-marker-only children, so `gamma/`
+        // appears; data dirs still never masquerade as prefixes.
+        let versioned_entries = scan_entries(&disk, bucket, true).await;
+        let versioned_names: Vec<&str> = versioned_entries.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(versioned_names, vec!["alpha", "alpha/", "gamma", "gamma/", "plain", "zeta", "zeta/"]);
+    }
+
+    // Preserve the explicit dir-marker semantics: a marker object `folder/` and
+    // the real directory `folder/` still collapse to a single prefix entry; the
+    // marker itself must not trigger the object-dir child probe.
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_dir_marker_prefix_not_duplicated() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join(format!("folder{GLOBAL_DIR_SUFFIX}")))
+            .await
+            .expect("marker dir should be created");
+        fs::write(
+            bucket_dir
+                .join(format!("folder{GLOBAL_DIR_SUFFIX}"))
+                .join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("folder/", "11111111-1111-1111-1111-111111111111"),
+        )
+        .await
+        .expect("marker metadata should be written");
+        fs::create_dir_all(bucket_dir.join("folder/nested"))
+            .await
+            .expect("real child dir should be created");
+        fs::write(
+            bucket_dir.join("folder/nested").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("folder/nested", "22222222-2222-2222-2222-222222222222"),
+        )
+        .await
+        .expect("real child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let (reader, mut writer) = tokio::io::duplex(65536);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: false,
+            limit: 1000,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .expect("scan_dir should succeed");
+        out.close().await.expect("metacache writer should close");
+        drop(out);
+        drop(writer);
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.expect("scan output should decode");
+
+        let marker_objects = entries
+            .iter()
+            .filter(|entry| entry.name == "folder/" && !entry.metadata.is_empty())
+            .count();
+        let prefix_dirs = entries
+            .iter()
+            .filter(|entry| entry.name == "folder/" && entry.metadata.is_empty())
+            .count();
+
+        assert_eq!(marker_objects, 1, "dir marker object should be reported exactly once");
+        assert_eq!(prefix_dirs, 1, "prefix dir should be reported exactly once");
+        // No other entries may leak from the marker (e.g. a malformed `folder//`
+        // from probing the marker's encoded directory).
+        assert_eq!(entries.len(), 2, "scan must emit exactly the marker object and the prefix dir");
+    }
+
+    // The prefix synthesized for an object with children is dropped when the
+    // page limit is hit on the object itself, and must be re-derived on the
+    // forward_to resume of the next page.
+    #[tokio::test]
+    async fn test_scan_dir_limit_boundary_resumes_synthesized_prefix() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, limit: i32, forward_to: Option<String>) -> Vec<String> {
+            let (reader, mut writer) = tokio::io::duplex(65536);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: "".to_string(),
+                recursive: false,
+                limit,
+                forward_to,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("a/b"))
+            .await
+            .expect("object dirs should be created");
+        fs::write(
+            bucket_dir.join("a").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a", "11111111-1111-1111-1111-111111111111"),
+        )
+        .await
+        .expect("object metadata should be written");
+        fs::write(
+            bucket_dir.join("a/b").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a/b", "22222222-2222-2222-2222-222222222222"),
+        )
+        .await
+        .expect("child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        // Page 1: `a` consumes the whole limit, the pending `a/` is dropped.
+        let first_page = scan_names(&disk, bucket, 1, None).await;
+        assert_eq!(first_page, vec!["a".to_string()]);
+
+        // Page 2: resuming at `a/` re-derives the prefix from the object entry.
+        let resumed = scan_names(&disk, bucket, 1000, Some("a/".to_string())).await;
+        assert!(
+            resumed.contains(&"a/".to_string()),
+            "resumed scan must re-derive the synthesized prefix, got {resumed:?}"
         );
     }
 
