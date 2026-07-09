@@ -140,6 +140,13 @@ aws-smithy-http-client.workspace = true
 # Observability and Metrics
 metrics = { workspace = true }
 
+# Runtime-probed io_uring read backend (backlog#1104). Linux-only, git
+# dependency until rustfs-uring is production-ready and published. The guard
+# scripts/check_no_tokio_io_uring.sh allows an explicit io-uring integration;
+# only the tokio "io-uring" runtime feature is banned.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustfs-uring = { git = "https://github.com/rustfs/uring", rev = "39018c09cde98b380658f1a1511349a3574daddf" }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 criterion = { workspace = true, features = ["html_reports"] }

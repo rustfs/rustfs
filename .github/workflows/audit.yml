@@ -112,4 +112,9 @@ jobs:
         with:
           fail-on-severity: moderate
           allow-ghsas: GHSA-2f9f-gq7v-9h6m
+          # rustfs-uring is a first-party Apache-2.0 crate pulled as a git
+          # dependency (backlog#1104); its license cannot be read from the git
+          # source, so allow it explicitly to avoid a spurious unknown-license
+          # warning on every Cargo.lock change.
+          allow-dependencies-licenses: pkg:cargo/rustfs-uring
           comment-summary-in-pr: always
