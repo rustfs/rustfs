@@ -172,6 +172,7 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         }
     };
 
+    let credentials_slot = server_ctx.clone();
     let service_runtime = init_embedded_startup_runtime_services(
         &config,
         endpoint_pools,
@@ -185,6 +186,12 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         signal_embedded_startup_shutdown(&shutdown_handle, &cancel_token);
         init_error(err)
     })?;
+
+    // Publish this server's root credentials into its own application context
+    // (backlog#1052 S6) so its request path authenticates against its own
+    // identity — a second embedded server no longer falls back to the first
+    // server's process-global credentials.
+    publish_embedded_server_credentials(&credentials_slot, &identity.access_key, &identity.secret_key);
 
     publish_embedded_startup_ready(service_runtime.iam_bootstrap, listen_context.readiness.as_ref())
         .await
@@ -212,6 +219,18 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
 
 fn init_error(err: impl std::fmt::Display) -> EmbeddedStartupError {
     EmbeddedStartupError::Init(err.to_string())
+}
+
+/// Seed a server's own root credentials into its application context so its
+/// request path validates keys against its own identity (backlog#1052 S6).
+fn publish_embedded_server_credentials(server_ctx: &ServerContextSlot, access_key: &str, secret_key: &str) {
+    if let Some(app_context) = server_ctx.app_context() {
+        app_context.publish_action_credentials(rustfs_credentials::Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            ..Default::default()
+        });
+    }
 }
 
 #[cfg(test)]

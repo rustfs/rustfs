@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::runtime_sources::{current_action_credentials, current_ready_iam_handle};
+use crate::runtime_sources::{AppContext, current_action_credentials, current_ready_iam_handle};
 use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::Credentials;
@@ -243,6 +243,21 @@ fn iam_lookup_error_to_s3_error(_err: &IamError) -> S3Error {
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
 pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
+    check_key_valid_with_context(session_token, access_key, None).await
+}
+
+/// Validate an access key, resolving the root credentials and IAM system from
+/// an explicit application context when one is given (backlog#1052 S6).
+///
+/// A per-server request path passes its own context so a second embedded
+/// server authenticates against its own root identity and IAM domain instead
+/// of the process defaults; `None` falls back to the ambient globals — the
+/// single-instance legacy behavior that all existing callers keep.
+pub async fn check_key_valid_with_context(
+    session_token: &str,
+    access_key: &str,
+    ctx: Option<&AppContext>,
+) -> S3Result<(Credentials, bool)> {
     // KEYSTONE INTEGRATION: Check if Keystone credentials are present in task-local storage
     // This handles both:
     // 1. Pure X-Auth-Token requests (access_key may be empty)
@@ -331,7 +346,13 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
     }
 
-    let Some(mut cred) = current_action_credentials() else {
+    // Prefer this server's context (backlog#1052 S6); fall back to the ambient
+    // process credentials when no context was threaded in.
+    let root_cred = match ctx {
+        Some(context) => context.action_credentials().get(),
+        None => current_action_credentials(),
+    };
+    let Some(mut cred) = root_cred else {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,
             format!("get_global_action_cred {:?}", IamError::IamSysNotInitialized),
@@ -341,7 +362,12 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     let sys_cred = cred.clone();
 
     if !constant_time_eq(&cred.access_key, access_key) {
-        let Ok(iam_store) = current_ready_iam_handle() else {
+        let iam_store = match ctx {
+            Some(context) if context.iam().is_ready() => Ok(context.iam().handle()),
+            Some(_) => Err(()),
+            None => current_ready_iam_handle().map_err(|_| ()),
+        };
+        let Ok(iam_store) = iam_store else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
