@@ -888,7 +888,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
 
             let rename_stage_start = Instant::now();
-            let (online_disks, _, op_old_dir, cleanup_disks) = Self::rename_data(
+            let (online_disks, _, op_old_dir, cleanup_disks, old_current_vote) = Self::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_TMP_BUCKET,
                 tmp_dir.as_str(),
@@ -898,6 +898,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 write_quorum,
             )
             .await?;
+            // Surface the old-current-size vote to the PUT usecase so it can
+            // account for the overwritten object without a pre-PUT lookup
+            // (rustfs/backlog#1009). The commit above is already durable, so a
+            // consumer-side fallback never affects the write itself.
+            if let Some(slot) = &opts.put_old_current_vote {
+                let _ = slot.set(old_current_vote);
+            }
             let rename_stage_ms = rename_stage_start.elapsed().as_millis() as u64;
             rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", rename_stage_ms as f64);
             if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
@@ -2500,6 +2507,168 @@ mod put_object_tmp_cleanup_tests {
         );
 
         drop(temp_dirs);
+    }
+}
+
+#[cfg(test)]
+mod put_object_old_current_backfill_tests {
+    //! End-to-end coverage for rustfs/backlog#1009: `put_object` must deposit
+    //! the quorum-voted old-current-size of the destination into
+    //! `opts.put_old_current_vote`, matching exactly what `get_object_info`
+    //! reported before the write, so the PUT usecase can skip its pre-PUT
+    //! lookup without changing usage accounting.
+
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::disk::{DiskAPI as _, RenameOldCurrentSize};
+    use crate::object_api::RenameOldCurrentVote;
+    use std::sync::OnceLock;
+
+    fn opts_with_slot(versioned: bool) -> (ObjectOptions, Arc<OnceLock<RenameOldCurrentVote>>) {
+        let slot = Arc::new(OnceLock::new());
+        let opts = ObjectOptions {
+            versioned,
+            put_old_current_vote: Some(slot.clone()),
+            ..Default::default()
+        };
+        (opts, slot)
+    }
+
+    fn quorum_live_size(slot: &OnceLock<RenameOldCurrentVote>) -> Option<i64> {
+        match slot.get().copied() {
+            Some(RenameOldCurrentVote::Quorum(observed)) => observed.live_size,
+            other => panic!("expected a quorum old-current-size vote, got {other:?}"),
+        }
+    }
+
+    /// Non-versioned PUTs: a fresh key votes "no live current version"; an
+    /// overwrite votes exactly the size `get_object_info` reported before the
+    /// write, for both the inline and the non-inline commit branch.
+    #[tokio::test]
+    async fn put_object_backfills_old_current_size_inline_and_non_inline() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "backlog1009-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        // (object, first write size, overwrite size); 1 MiB payloads take the
+        // non-inline branch, small payloads the inline branch.
+        let cases = [
+            ("inline-object", 1024_usize, 2048_usize),
+            ("non-inline-object", 1 << 20, (1 << 20) + 512),
+        ];
+        for (object, first_size, overwrite_size) in cases {
+            let (opts, slot) = opts_with_slot(false);
+            let mut reader = PutObjReader::from_vec(vec![1u8; first_size]);
+            set_disks
+                .put_object(bucket, object, &mut reader, &opts)
+                .await
+                .expect("fresh put_object should succeed");
+            assert_eq!(quorum_live_size(&slot), None, "{object}: fresh key must vote no live current version");
+
+            let previous = set_disks
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("get_object_info should see the first write");
+
+            let (opts, slot) = opts_with_slot(false);
+            let mut reader = PutObjReader::from_vec(vec![2u8; overwrite_size]);
+            set_disks
+                .put_object(bucket, object, &mut reader, &opts)
+                .await
+                .expect("overwrite put_object should succeed");
+            assert_eq!(
+                quorum_live_size(&slot),
+                Some(previous.size),
+                "{object}: overwrite must vote exactly the pre-lookup size"
+            );
+        }
+    }
+
+    /// Versioned PUTs: the second write creates a new version, and the vote
+    /// must report the previous latest live version's size (what decides
+    /// objects_count in the versioned accounting path).
+    #[tokio::test]
+    async fn put_object_backfills_old_current_size_for_versioned_writes() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "backlog1009-versioned-bucket";
+        let object = "versioned-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let (opts, slot) = opts_with_slot(true);
+        let mut reader = PutObjReader::from_vec(vec![1u8; 1024]);
+        let first = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("first versioned put_object should succeed");
+        assert_eq!(quorum_live_size(&slot), None, "fresh versioned key must vote no live current version");
+
+        let (opts, slot) = opts_with_slot(true);
+        let mut reader = PutObjReader::from_vec(vec![2u8; 4096]);
+        let second = set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("second versioned put_object should succeed");
+        assert_ne!(first.version_id, second.version_id, "versioned writes must create distinct versions");
+        assert_eq!(
+            quorum_live_size(&slot),
+            Some(first.size),
+            "a new version must vote the previous latest live version's size"
+        );
+
+        // A default-opts PUT must not panic or deposit anywhere: the slot is
+        // simply absent.
+        let mut reader = PutObjReader::from_vec(vec![3u8; 64]);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("slot-less put_object should succeed");
+    }
+
+    /// A delete-marker-latest destination must vote "no live current version"
+    /// through the real commit path — the pre-lookup this replaces reported
+    /// the resurrecting PUT as a fresh key (objects_count +1), and the
+    /// backfill has to preserve that.
+    #[tokio::test]
+    async fn put_object_over_delete_marker_votes_no_live_current() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "backlog1009-marker-bucket";
+        let object = "resurrected-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let versioned_opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        let mut reader = PutObjReader::from_vec(vec![1u8; 1024]);
+        set_disks
+            .put_object(bucket, object, &mut reader, &versioned_opts)
+            .await
+            .expect("versioned put_object should succeed");
+
+        let marker = set_disks
+            .delete_object(bucket, object, versioned_opts.clone())
+            .await
+            .expect("versioned delete should create a delete marker");
+        assert!(marker.delete_marker, "versioned delete without a version id must create a marker");
+
+        let (opts, slot) = opts_with_slot(true);
+        let mut reader = PutObjReader::from_vec(vec![2u8; 2048]);
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("put_object over the delete marker should succeed");
+        assert_eq!(
+            quorum_live_size(&slot),
+            None,
+            "a delete-marker latest must vote no live current version, like the pre-lookup's ObjectNotFound"
+        );
     }
 }
 

@@ -839,10 +839,30 @@ pub struct DiskOption {
     pub health_check: bool,
 }
 
+/// Size of the destination's "current object" observed by `rename_data` while
+/// it re-reads the destination xl.meta anyway, so PUT accounting can reuse it
+/// instead of issuing its own pre-PUT metadata fanout (rustfs/backlog#1009).
+///
+/// `live_size` mirrors what `get_object_info` without a version id would have
+/// reported just before the commit: `Some(size)` when the latest version was a
+/// live object, `None` when the key did not exist or its latest version was a
+/// delete marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameOldCurrentSize {
+    pub live_size: Option<i64>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RenameDataResp {
     pub old_data_dir: Option<Uuid>,
     pub sign: Option<Vec<u8>>,
+    /// `None` means the disk did not report the observation (a pre-upgrade
+    /// peer whose wire payload lacks the field), which is why this is not
+    /// flattened into `Option<i64>`: "not reported" must stay distinguishable
+    /// from "no live current version". `#[serde(default)]` keeps both msgpack
+    /// and JSON wire formats compatible in mixed-version clusters.
+    #[serde(default)]
+    pub old_current_size: Option<RenameOldCurrentSize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1229,10 +1249,12 @@ mod tests {
         let resp = RenameDataResp {
             old_data_dir: Some(uuid),
             sign: Some(signature.clone()),
+            old_current_size: Some(RenameOldCurrentSize { live_size: Some(9) }),
         };
 
         assert_eq!(resp.old_data_dir, Some(uuid));
         assert_eq!(resp.sign, Some(signature));
+        assert_eq!(resp.old_current_size, Some(RenameOldCurrentSize { live_size: Some(9) }));
     }
 
     /// Test constants

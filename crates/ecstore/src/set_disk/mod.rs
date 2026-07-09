@@ -6152,6 +6152,47 @@ mod tests {
         assert_eq!(result, Some(uuid1)); // Ignore None votes; uuid1 should still meet quorum
     }
 
+    #[test]
+    fn test_reduce_rename_old_current_vote() {
+        use crate::disk::RenameOldCurrentSize;
+        use crate::object_api::RenameOldCurrentVote;
+
+        fn reported(live_size: Option<i64>) -> Option<Option<RenameOldCurrentSize>> {
+            Some(Some(RenameOldCurrentSize { live_size }))
+        }
+
+        // Quorum agreement on an overwrite; the failed disk (outer None) is
+        // excluded from the vote.
+        let observations = vec![reported(Some(42)), reported(Some(42)), reported(Some(42)), None];
+        assert_eq!(
+            SetDisks::reduce_rename_old_current_vote(&observations, 3),
+            RenameOldCurrentVote::Quorum(RenameOldCurrentSize { live_size: Some(42) })
+        );
+
+        // Quorum agreement on a fresh key (no live current version).
+        let observations = vec![reported(None), reported(None), reported(None), reported(None)];
+        assert_eq!(
+            SetDisks::reduce_rename_old_current_vote(&observations, 3),
+            RenameOldCurrentVote::Quorum(RenameOldCurrentSize { live_size: None })
+        );
+
+        // Heal-lagged replicas disagree below write quorum.
+        let observations = vec![reported(Some(42)), reported(Some(42)), reported(Some(7)), reported(None)];
+        assert_eq!(SetDisks::reduce_rename_old_current_vote(&observations, 3), RenameOldCurrentVote::NoQuorum);
+
+        // A successful disk that did not report the observation (pre-upgrade
+        // peer) poisons the vote even though the reporters agree at quorum.
+        let observations = vec![reported(Some(42)), reported(Some(42)), reported(Some(42)), Some(None)];
+        assert_eq!(
+            SetDisks::reduce_rename_old_current_vote(&observations, 3),
+            RenameOldCurrentVote::Unsupported
+        );
+
+        // Nothing to vote on at all.
+        let observations = vec![None, None, None, None];
+        assert_eq!(SetDisks::reduce_rename_old_current_vote(&observations, 3), RenameOldCurrentVote::NoQuorum);
+    }
+
     fn rename_versions_signature(first_key: u8, version_count: usize) -> Vec<u8> {
         let mut signature = vec![0; version_count * 16];
         signature[7] = first_key;

@@ -191,8 +191,8 @@ use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
-    StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions, StorageObjectOptions as ObjectOptions,
-    StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+    RenameOldCurrentVote, StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectLockDeleteOptions,
+    StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 use crate::app::object_data_cache::{
     GetObjectBodyCacheLookup, GetObjectBodyCachePlan, GetObjectBodyCacheRequest, ObjectDataCacheAdapter,
@@ -3510,25 +3510,46 @@ impl DefaultObjectUsecase {
         )
         .await?;
 
-        let current_opts: ObjectOptions = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
-        let previous_current_info = {
-            crate::hp_guard!("S3::put_object_prelookup");
-            store.get_object_info(&bucket, &key, &current_opts).await
+        // rustfs/backlog#1009: on buckets without object-lock the pre-PUT
+        // lookup exists only to learn the previous current size for usage
+        // accounting, and rename_data re-reads the destination xl.meta on
+        // every disk anyway. Skip the full-set fanout here and let the commit
+        // backfill that size through `opts.put_old_current_vote`. Fail-closed:
+        // an explicit versionId PUT (different lookup semantics), unreadable
+        // bucket metadata, object-lock enabled, or a cluster peer too old to
+        // report the observation all keep (or permanently restore) the
+        // original pre-lookup path.
+        let put_prelookup_backfill = if version_id.is_none() && put_prelookup_backfill_usable(&bucket).await {
+            let slot = Arc::new(std::sync::OnceLock::new());
+            opts.put_old_current_vote = Some(slot.clone());
+            Some(slot)
+        } else {
+            None
         };
-        let previous_current_size = match previous_current_info {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info, &opts)?;
-                Some(existing_obj_info.size.max(0) as u64)
-            }
-            Err(err) => {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+        let previous_current_size = if put_prelookup_backfill.is_some() {
+            // Resolved from the rename_data backfill after the store write.
+            None
+        } else {
+            let current_opts: ObjectOptions = internal_object_info_lookup_opts(
+                get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+            let previous_current_info = {
+                crate::hp_guard!("S3::put_object_prelookup");
+                store.get_object_info(&bucket, &key, &current_opts).await
+            };
+            match previous_current_info {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&existing_obj_info, &opts)?;
+                    Some(existing_obj_info.size.max(0) as u64)
                 }
-                None
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+                    None
+                }
             }
         };
 
@@ -3762,6 +3783,11 @@ impl DefaultObjectUsecase {
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
         let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
+
+        let previous_current_size = match &put_prelookup_backfill {
+            None => previous_current_size,
+            Some(slot) => resolve_backfilled_previous_current_size(&bucket, &key, slot.get().copied()),
+        };
 
         let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         // Fast in-memory update for immediate quota and admin usage consistency
@@ -6567,6 +6593,81 @@ async fn bucket_object_locking_enabled(bucket: &str) -> bool {
         .is_ok_and(|metadata| metadata.object_locking())
 }
 
+/// Set once a PUT observes that the erasure set cannot report the rename_data
+/// old-current-size (a pre-upgrade peer in a mixed-version cluster). From then
+/// on every PUT in this process keeps the exact pre-lookup accounting path;
+/// the flag clears only on restart, which a rolling upgrade performs anyway
+/// (rustfs/backlog#1009).
+static PUT_PRELOOKUP_BACKFILL_UNAVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Latch so the per-PUT NoQuorum fallback warns once per process and stays at
+/// debug afterwards — a heal-lagged erasure set could otherwise emit one warn
+/// per overwrite PUT on the hot path.
+static PUT_BACKFILL_NO_QUORUM_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the PUT usecase may skip its pre-PUT `get_object_info` fanout and
+/// account with the old-current-size backfilled by `rename_data`
+/// (rustfs/backlog#1009). Fail-closed on every uncertainty: object-lock
+/// enabled keeps the WORM validation pre-lookup (note the deliberate contrast
+/// with `bucket_object_locking_enabled`: unreadable bucket metadata counts as
+/// locked here), and a previously observed pre-upgrade peer disables the skip
+/// for the whole process.
+async fn put_prelookup_backfill_usable(bucket: &str) -> bool {
+    if PUT_PRELOOKUP_BACKFILL_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    put_prelookup_backfill_allowed_by_lock_config(get_bucket_metadata(bucket).await.map(|metadata| metadata.object_locking()))
+}
+
+/// The WORM half of the gate, kept pure so the fail-closed matrix is
+/// unit-testable: only a readable lock config that says "not locked" may skip
+/// the pre-lookup (and with it `validate_existing_object_lock_for_write`).
+fn put_prelookup_backfill_allowed_by_lock_config<E>(object_locking: Result<bool, E>) -> bool {
+    matches!(object_locking, Ok(false))
+}
+
+/// Turn the rename_data old-current-size vote into the
+/// `previous_current_size` the usage accounting expects. Only a quorum vote is
+/// trusted; both degraded outcomes account the write as if the key were fresh,
+/// which over-counts (never under-counts) usage until the next authoritative
+/// scanner refresh reconciles it — fail-closed for quota enforcement.
+fn resolve_backfilled_previous_current_size(bucket: &str, key: &str, vote: Option<RenameOldCurrentVote>) -> Option<u64> {
+    match vote {
+        Some(RenameOldCurrentVote::Quorum(observed)) => observed.live_size.map(|size| size.max(0) as u64),
+        Some(RenameOldCurrentVote::NoQuorum) => {
+            // A heal-lagged set can hit this on every overwrite, so only the
+            // first occurrence per process warns; the rest stay at debug to
+            // keep the PUT hot path off the log (logging governance).
+            if !PUT_BACKFILL_NO_QUORUM_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(
+                    target: "rustfs::app::object_usecase",
+                    bucket = %bucket,
+                    key = %key,
+                    "rename_data old-current-size observations disagreed below write quorum; accounting such PUTs as fresh keys until the scanner reconciles (further occurrences logged at debug)"
+                );
+            } else {
+                debug!(
+                    target: "rustfs::app::object_usecase",
+                    bucket = %bucket,
+                    key = %key,
+                    "rename_data old-current-size vote below write quorum; accounting this PUT as a fresh key"
+                );
+            }
+            None
+        }
+        Some(RenameOldCurrentVote::Unsupported) | None => {
+            PUT_PRELOOKUP_BACKFILL_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                target: "rustfs::app::object_usecase",
+                bucket = %bucket,
+                key = %key,
+                "erasure set did not report the rename_data old-current-size (pre-upgrade peer?); restoring the pre-PUT lookup path for this process"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6593,6 +6694,65 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    /// rustfs/backlog#1009: the WORM half of the pre-lookup skip gate must be
+    /// fail-closed — only a readable lock config that says "not locked" may
+    /// skip the pre-lookup (which is where
+    /// `validate_existing_object_lock_for_write` runs). An inverted branch or
+    /// a weakened error arm here would silently drop WORM validation.
+    #[test]
+    fn put_prelookup_backfill_lock_gate_is_fail_closed() {
+        assert!(put_prelookup_backfill_allowed_by_lock_config::<StorageError>(Ok(false)));
+        assert!(!put_prelookup_backfill_allowed_by_lock_config::<StorageError>(Ok(true)));
+        assert!(!put_prelookup_backfill_allowed_by_lock_config(Err(StorageError::ConfigNotFound)));
+    }
+
+    /// rustfs/backlog#1009: the backfilled vote must translate into the exact
+    /// `previous_current_size` semantics the accounting expects, and only the
+    /// pre-upgrade-peer outcome may flip the process-wide sticky fallback.
+    /// A single test keeps the assertions on the global flag ordered.
+    #[test]
+    fn resolve_backfilled_previous_current_size_matrix_and_sticky_fallback() {
+        use crate::storage::storage_api::ecstore_disk::RenameOldCurrentSize;
+        use std::sync::atomic::Ordering;
+
+        let quorum = |live_size| Some(RenameOldCurrentVote::Quorum(RenameOldCurrentSize { live_size }));
+
+        assert_eq!(resolve_backfilled_previous_current_size("b", "k", quorum(Some(5))), Some(5));
+        assert_eq!(
+            resolve_backfilled_previous_current_size("b", "k", quorum(Some(-1))),
+            Some(0),
+            "negative sizes clamp to zero like the pre-lookup path"
+        );
+        assert_eq!(resolve_backfilled_previous_current_size("b", "k", quorum(None)), None);
+
+        assert!(!PUT_PRELOOKUP_BACKFILL_UNAVAILABLE.load(Ordering::Relaxed));
+        assert_eq!(
+            resolve_backfilled_previous_current_size("b", "k", Some(RenameOldCurrentVote::NoQuorum)),
+            None
+        );
+        assert!(
+            !PUT_PRELOOKUP_BACKFILL_UNAVAILABLE.load(Ordering::Relaxed),
+            "a transient quorum miss must not disable the backfill process-wide"
+        );
+
+        assert_eq!(
+            resolve_backfilled_previous_current_size("b", "k", Some(RenameOldCurrentVote::Unsupported)),
+            None
+        );
+        assert!(
+            PUT_PRELOOKUP_BACKFILL_UNAVAILABLE.load(Ordering::Relaxed),
+            "a pre-upgrade peer must restore the pre-lookup path for the whole process"
+        );
+        PUT_PRELOOKUP_BACKFILL_UNAVAILABLE.store(false, Ordering::Relaxed);
+
+        assert_eq!(resolve_backfilled_previous_current_size("b", "k", None), None);
+        assert!(
+            PUT_PRELOOKUP_BACKFILL_UNAVAILABLE.load(Ordering::Relaxed),
+            "an unset slot after a successful PUT counts as unsupported"
+        );
+        PUT_PRELOOKUP_BACKFILL_UNAVAILABLE.store(false, Ordering::Relaxed);
     }
 
     #[test]

@@ -19,8 +19,8 @@ use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
     FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
-    RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE,
-    STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, RenameOldCurrentSize,
+    STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -3979,6 +3979,23 @@ fn local_disk_scan_lock_key(bucket: &str, base_dir: &str, filter_prefix: Option<
     (bucket.to_owned(), prefix)
 }
 
+/// Observe the destination's "current object" size from the already-parsed
+/// dst xl.meta before `add_version` commits the incoming write, so PUT
+/// accounting can reuse it instead of a separate pre-PUT metadata fanout
+/// (rustfs/backlog#1009). Must mirror what `get_object_info` without a
+/// version id reports: latest live version → its size; missing key,
+/// unparseable version meta, or delete-marker latest → `None`.
+/// `into_fileinfo` with an empty version id is the same latest-version
+/// selection the read path uses (free versions excluded).
+fn rename_data_old_current_size(dst_meta: &FileMeta, dst_volume: &str, dst_path: &str) -> RenameOldCurrentSize {
+    RenameOldCurrentSize {
+        live_size: match dst_meta.into_fileinfo(dst_volume, dst_path, "", false, false, false) {
+            Ok(prev) if !prev.deleted => Some(prev.size),
+            _ => None,
+        },
+    }
+}
+
 fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
     if meta.versions.len() > 10 {
         return None;
@@ -5037,6 +5054,8 @@ impl DiskAPI for LocalDisk {
                 skip_parent = parent.to_path_buf();
             }
 
+            let old_current_size = rename_data_old_current_size(&xlmeta, dst_volume, dst_path);
+
             let version_id = fi.version_id.unwrap_or_default();
             let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
             if let Some(old_data_dir) = has_old_data_dir.as_ref() {
@@ -5240,6 +5259,7 @@ impl DiskAPI for LocalDisk {
             Ok(RenameDataResp {
                 old_data_dir: has_old_data_dir,
                 sign: version_signature,
+                old_current_size: Some(old_current_size),
             })
         } else {
             // Inline: merge read + parse + write + rename into single spawn_blocking
@@ -5252,8 +5272,10 @@ impl DiskAPI for LocalDisk {
             } else {
                 None
             };
+            let dst_volume_owned = dst_volume.to_string();
+            let dst_path_owned = dst_path.to_string();
 
-            let (old_data_dir, version_signature) = tokio::task::spawn_blocking(move || {
+            let (old_data_dir, version_signature, old_current_size) = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -5268,6 +5290,8 @@ impl DiskAPI for LocalDisk {
                 {
                     xlmeta = nmeta
                 }
+
+                let old_current_size = rename_data_old_current_size(&xlmeta, &dst_volume_owned, &dst_path_owned);
 
                 let version_id = fi.version_id.unwrap_or_default();
                 let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
@@ -5365,7 +5389,11 @@ impl DiskAPI for LocalDisk {
                     }
                 }
 
-                Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>), std::io::Error>((old_data_dir, version_signature))
+                Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>, RenameOldCurrentSize), std::io::Error>((
+                    old_data_dir,
+                    version_signature,
+                    old_current_size,
+                ))
             })
             .await
             .map_err(DiskError::from)??;
@@ -5380,6 +5408,7 @@ impl DiskAPI for LocalDisk {
             Ok(RenameDataResp {
                 old_data_dir,
                 sign: version_signature,
+                old_current_size: Some(old_current_size),
             })
         }
     }
@@ -5977,6 +6006,65 @@ mod test {
         match disk.make_volume(volume).await {
             Ok(()) | Err(DiskError::VolumeExists) => {}
             Err(err) => panic!("test volume should be available: {err:?}"),
+        }
+    }
+
+    /// Semantics of the rename_data old-current-size observation
+    /// (rustfs/backlog#1009): it must mirror what `get_object_info` without a
+    /// version id would have reported just before the commit.
+    mod rename_data_old_current_size_semantics {
+        use super::*;
+
+        fn live_version(size: i64, mod_time: OffsetDateTime) -> FileInfo {
+            FileInfo {
+                name: "bucket/object".to_string(),
+                version_id: Some(Uuid::new_v4()),
+                size,
+                mod_time: Some(mod_time),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn missing_destination_meta_reports_no_live_version() {
+            let meta = FileMeta::new();
+            assert_eq!(rename_data_old_current_size(&meta, "bucket", "object").live_size, None);
+        }
+
+        #[test]
+        fn live_latest_reports_its_size() {
+            let mut meta = FileMeta::new();
+            meta.add_version(live_version(111, OffsetDateTime::now_utc()))
+                .expect("live version should be added");
+            assert_eq!(rename_data_old_current_size(&meta, "bucket", "object").live_size, Some(111));
+        }
+
+        #[test]
+        fn newest_live_version_wins_over_older_ones() {
+            let now = OffsetDateTime::now_utc();
+            let mut meta = FileMeta::new();
+            meta.add_version(live_version(111, now - time::Duration::seconds(10)))
+                .expect("older live version should be added");
+            meta.add_version(live_version(222, now))
+                .expect("newer live version should be added");
+            assert_eq!(rename_data_old_current_size(&meta, "bucket", "object").live_size, Some(222));
+        }
+
+        #[test]
+        fn delete_marker_latest_hides_older_live_versions() {
+            let now = OffsetDateTime::now_utc();
+            let mut meta = FileMeta::new();
+            meta.add_version(live_version(111, now - time::Duration::seconds(10)))
+                .expect("live version should be added");
+            let marker = FileInfo {
+                name: "bucket/object".to_string(),
+                version_id: Some(Uuid::new_v4()),
+                deleted: true,
+                mod_time: Some(now),
+                ..Default::default()
+            };
+            meta.add_version(marker).expect("delete marker should be added");
+            assert_eq!(rename_data_old_current_size(&meta, "bucket", "object").live_size, None);
         }
     }
 

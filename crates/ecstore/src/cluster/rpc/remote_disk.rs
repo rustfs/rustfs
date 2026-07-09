@@ -2632,6 +2632,7 @@ impl DiskAPI for RemoteDisk {
 mod tests {
     use super::*;
     use crate::cluster::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
+    use crate::disk::RenameOldCurrentSize;
     use crate::runtime::sources as runtime_sources;
     use serde_json::Value;
     use std::io::{self as std_io, Write};
@@ -3055,11 +3056,74 @@ mod tests {
         );
     }
 
+    /// Wire compatibility for the `old_current_size` backfill field
+    /// (rustfs/backlog#1009) across a mixed-version cluster, in both
+    /// directions and on both wire formats (named msgpack + JSON fallback).
+    #[test]
+    fn rename_data_resp_old_current_size_wire_compat_with_pre_upgrade_peers() {
+        /// The struct shape a pre-upgrade binary serializes and deserializes.
+        #[derive(Debug, Serialize, serde::Deserialize)]
+        struct LegacyRenameDataResp {
+            old_data_dir: Option<Uuid>,
+            sign: Option<Vec<u8>>,
+        }
+
+        // Pre-upgrade peer -> upgraded node: the absent field must decode as
+        // "not reported" (None), never as "no previous version".
+        let legacy = LegacyRenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: Some(vec![3_u8; 16]),
+        };
+        let legacy_msgpack = encode_msgpack_named(&legacy).expect("legacy payload should encode");
+        let decoded = decode_msgpack_or_json::<RenameDataResp>(&legacy_msgpack, "", "RenameDataResp")
+            .expect("upgraded decoder must accept a legacy msgpack payload");
+        assert_eq!(decoded.old_data_dir, legacy.old_data_dir);
+        assert_eq!(decoded.old_current_size, None);
+
+        let legacy_json = serde_json::to_string(&legacy).expect("legacy payload should encode as json");
+        let decoded = decode_msgpack_or_json::<RenameDataResp>(&[], &legacy_json, "RenameDataResp")
+            .expect("upgraded decoder must accept a legacy json payload");
+        assert_eq!(decoded.old_current_size, None);
+
+        // Upgraded node -> pre-upgrade peer: the unknown field must be ignored.
+        let upgraded = RenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: None,
+            old_current_size: Some(RenameOldCurrentSize { live_size: Some(123) }),
+        };
+        let upgraded_msgpack = encode_msgpack_named(&upgraded).expect("upgraded payload should encode");
+        let legacy_view: LegacyRenameDataResp = rmp_serde::from_slice(upgraded_msgpack.as_slice())
+            .expect("pre-upgrade decoder must ignore the unknown msgpack field");
+        assert_eq!(legacy_view.old_data_dir, upgraded.old_data_dir);
+
+        let upgraded_json = serde_json::to_string(&upgraded).expect("upgraded payload should encode as json");
+        let _: LegacyRenameDataResp =
+            serde_json::from_str(&upgraded_json).expect("pre-upgrade decoder must ignore the unknown json field");
+
+        // The third state — reported "no live current version" — must survive
+        // the wire as Some(live_size: None) and never collapse into the outer
+        // "not reported" None on either format.
+        let fresh_key = RenameDataResp {
+            old_data_dir: None,
+            sign: None,
+            old_current_size: Some(RenameOldCurrentSize { live_size: None }),
+        };
+        let fresh_msgpack = encode_msgpack_named(&fresh_key).expect("fresh-key payload should encode");
+        let decoded = decode_msgpack_or_json::<RenameDataResp>(&fresh_msgpack, "", "RenameDataResp")
+            .expect("fresh-key msgpack payload should decode");
+        assert_eq!(decoded.old_current_size, Some(RenameOldCurrentSize { live_size: None }));
+        let fresh_json = serde_json::to_string(&fresh_key).expect("fresh-key payload should encode as json");
+        let decoded = decode_msgpack_or_json::<RenameDataResp>(&[], &fresh_json, "RenameDataResp")
+            .expect("fresh-key json payload should decode");
+        assert_eq!(decoded.old_current_size, Some(RenameOldCurrentSize { live_size: None }));
+    }
+
     #[test]
     fn rename_data_resp_named_msgpack_is_smaller_than_json() {
         let response = RenameDataResp {
             old_data_dir: Some(Uuid::new_v4()),
             sign: Some(vec![1_u8; 32]),
+            old_current_size: Some(RenameOldCurrentSize { live_size: Some(4096) }),
         };
         let json = serde_json::to_vec(&response).expect("rename data response json should encode");
         let named_msgpack = encode_msgpack_named(&response).expect("rename data response named msgpack should encode");

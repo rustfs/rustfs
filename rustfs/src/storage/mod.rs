@@ -53,7 +53,7 @@ pub(crate) use storage_api::{
     FileReader, FileWriter, GetObjectReader, HashReader, LocalPeerS3Client, MetricType, NotificationSys, OBJECT_LOCK_CONFIG,
     ObjectInfo, ObjectLockBlockReason, ObjectOptions, ObjectPartInfo, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PolicySys,
     PoolEndpoints, PutObjReader, QuotaError, RUSTFS_META_BUCKET, RawFileInfo, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    RenameDataResp, ReplicationStats, ReplicationStatusType, Result, SERVICE_SIGNAL_REFRESH_CONFIG,
+    RenameDataResp, RenameOldCurrentVote, ReplicationStats, ReplicationStatusType, Result, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, SetupType, StorageDeletedObject, StorageDiskRpcExt, StorageError, StorageGetObjectReader,
     StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete, StoragePeerS3ClientExt, StoragePutObjReader,
     StorageReplicationConfigExt, StorageVersioningConfigExt, TONIC_RPC_PREFIX, TierConfigMgr, UpdateMetadataOpts, VolumeInfo,

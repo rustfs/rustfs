@@ -371,7 +371,7 @@ pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore,
         FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
+        RenameDataResp, RenameOldCurrentSize, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
         validate_batch_read_version_item_count,
     };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
@@ -442,7 +442,9 @@ pub(crate) mod ecstore_rpc {
 }
 
 pub(crate) mod ecstore_object {
-    pub(crate) use rustfs_ecstore::api::object::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
+    pub(crate) use rustfs_ecstore::api::object::{
+        GetObjectBodyCacheHook, RenameOldCurrentVote, register_get_object_body_cache_hook,
+    };
 }
 
 pub(crate) mod ecstore_set_disk {
@@ -532,6 +534,7 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
+pub(crate) type RenameOldCurrentVote = ecstore_object::RenameOldCurrentVote;
 pub(crate) type ReplicationStatusType = ecstore_bucket::replication::ReplicationStatusType;
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type SetupType = ecstore_layout::SetupType;

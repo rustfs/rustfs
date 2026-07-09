@@ -46,11 +46,13 @@ use crate::diagnostics::get::{
     GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
+use crate::disk::RenameOldCurrentSize;
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{
     BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics,
     create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled,
 };
+use crate::object_api::RenameOldCurrentVote;
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
@@ -2480,6 +2482,34 @@ impl SetDisks {
         data_count
     }
 
+    /// Vote the per-disk `rename_data` old-current-size observations
+    /// (rustfs/backlog#1009). Entries are `None` for disks whose rename
+    /// failed (excluded from the vote); `Some(None)` marks a disk that
+    /// succeeded but did not report the observation — a pre-upgrade peer —
+    /// which poisons the whole vote to `Unsupported` so callers stop relying
+    /// on the backfill instead of misreading "not reported" as "no previous
+    /// version".
+    pub(in crate::set_disk) fn reduce_rename_old_current_vote(
+        observations: &[Option<Option<RenameOldCurrentSize>>],
+        write_quorum: usize,
+    ) -> RenameOldCurrentVote {
+        let mut counts: HashMap<Option<i64>, usize> = HashMap::new();
+        for observation in observations.iter().flatten() {
+            match observation {
+                None => return RenameOldCurrentVote::Unsupported,
+                Some(observed) => *counts.entry(observed.live_size).or_insert(0) += 1,
+            }
+        }
+
+        // Two distinct values can never both reach write quorum (2 * write
+        // quorum > disk count), so ties only occur below quorum and resolve
+        // to NoQuorum regardless of HashMap iteration order.
+        match counts.into_iter().max_by_key(|(_, count)| *count) {
+            Some((live_size, count)) if count >= write_quorum => RenameOldCurrentVote::Quorum(RenameOldCurrentSize { live_size }),
+            _ => RenameOldCurrentVote::NoQuorum,
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(disks, file_infos))]
     #[allow(clippy::type_complexity)]
     pub(in crate::set_disk) async fn rename_data(
@@ -2490,7 +2520,13 @@ impl SetDisks {
         dst_bucket: &str,
         dst_object: &str,
         write_quorum: usize,
-    ) -> disk::error::Result<(Vec<Option<DiskStore>>, Option<Vec<u8>>, Option<Uuid>, Vec<Option<DiskStore>>)> {
+    ) -> disk::error::Result<(
+        Vec<Option<DiskStore>>,
+        Option<Vec<u8>>,
+        Option<Uuid>,
+        Vec<Option<DiskStore>>,
+        RenameOldCurrentVote,
+    )> {
         let mut futures = Vec::with_capacity(disks.len());
 
         let mut errs = Vec::with_capacity(disks.len());
@@ -2528,6 +2564,7 @@ impl SetDisks {
 
         let mut disk_versions = vec![None; disks.len()];
         let mut data_dirs = vec![None; disks.len()];
+        let mut old_current_observations = vec![None; disks.len()];
 
         let results = join_all(futures).await;
 
@@ -2536,6 +2573,7 @@ impl SetDisks {
                 Ok(res) => {
                     data_dirs[idx] = res.old_data_dir;
                     disk_versions[idx].clone_from(&res.sign);
+                    old_current_observations[idx] = Some(res.old_current_size);
                     errs.push(None);
                 }
                 Err(e) => {
@@ -2639,6 +2677,7 @@ impl SetDisks {
 
         let data_dir = Self::reduce_common_data_dir(&data_dirs, write_quorum);
         let versions = Self::select_rename_data_versions(&disk_versions, &errs, write_quorum);
+        let old_current_vote = Self::reduce_rename_old_current_vote(&old_current_observations, write_quorum);
         let online_disks = Self::eval_disks(disks, &errs);
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
@@ -2657,7 +2696,7 @@ impl SetDisks {
             vec![None; disks.len()]
         };
 
-        Ok((online_disks, versions, data_dir, cleanup_disks))
+        Ok((online_disks, versions, data_dir, cleanup_disks, old_current_vote))
     }
 
     pub(in crate::set_disk) fn reduce_common_versions(disk_versions: &[Option<Vec<u8>>], write_quorum: usize) -> Option<Vec<u8>> {

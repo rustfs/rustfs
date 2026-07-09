@@ -1420,7 +1420,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
-        let (online_disks, versions, op_old_dir, cleanup_disks) = Self::rename_data(
+        let (online_disks, versions, op_old_dir, cleanup_disks, _old_current_vote) = Self::rename_data(
             &shuffle_disks,
             RUSTFS_META_MULTIPART_BUCKET,
             &upload_id_path,

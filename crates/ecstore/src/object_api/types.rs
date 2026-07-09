@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use super::*;
+use crate::disk::RenameOldCurrentSize;
+use std::sync::OnceLock;
+
 use crate::storage_api_contracts::{
     list::VersionMarker,
     object::{
@@ -66,6 +69,30 @@ pub struct ObjectOptions {
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
     pub capacity_scope_token: Option<Uuid>,
+
+    /// When set, `SetDisks::put_object` deposits the erasure-set vote over the
+    /// per-disk rename_data old-current-size observations here after the
+    /// commit, so the PUT usecase can account for the overwritten size without
+    /// its own pre-PUT metadata fanout (rustfs/backlog#1009). A pure
+    /// in-process out-parameter: never serialized and never fed into
+    /// `ObjectInfo`, events, replication, or ILM.
+    pub put_old_current_vote: Option<Arc<OnceLock<RenameOldCurrentVote>>>,
+}
+
+/// Outcome of voting the per-disk [`RenameOldCurrentSize`] observations
+/// returned by `rename_data` across an erasure set (rustfs/backlog#1009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameOldCurrentVote {
+    /// At least write-quorum successful disks agreed on the same observation.
+    Quorum(RenameOldCurrentSize),
+    /// Every successful disk reported an observation but no single value
+    /// reached write quorum (e.g. heal-lagged replicas disagree). Transient;
+    /// callers fall back for this write only.
+    NoQuorum,
+    /// At least one successful disk did not report the observation at all — a
+    /// pre-upgrade peer. Callers should stop relying on the backfill until the
+    /// cluster finishes its rolling upgrade.
+    Unsupported,
 }
 
 impl ObjectOptions {

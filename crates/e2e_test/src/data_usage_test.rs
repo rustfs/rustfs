@@ -99,6 +99,57 @@ async fn data_usage_reports_all_objects() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// Regression test for rustfs/backlog#1009: on a non-locked, non-versioned
+/// bucket the PUT usecase skips its pre-PUT lookup and accounts overwrites
+/// with the size backfilled by rename_data. From the moment the bucket shows
+/// up in data usage, an overwrite must report exactly the new size (never
+/// old+new double-counted) and a single object.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[ignore = "Starts a rustfs server and requires awscurl; enable when running full E2E"]
+async fn data_usage_reports_overwrite_size_delta_exactly() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let client = env.create_s3_client();
+    let bucket = "data-usage-overwrite";
+    let first_size = 1024_u64;
+    let overwrite_size = 4096_u64;
+
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("resized")
+        .body(ByteStream::from(vec![1u8; first_size as usize]))
+        .send()
+        .await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("resized")
+        .body(ByteStream::from(vec![2u8; overwrite_size as usize]))
+        .send()
+        .await?;
+
+    // The in-memory record is synchronous with the PUT responses, so the
+    // first poll that knows the bucket must already be exact; a transient
+    // first_size + overwrite_size reading would mean the overwrite was
+    // double-counted and only later repaired by the scanner.
+    let usage = wait_for_bucket_usage(&env, bucket, |usage| usage.buckets_usage.contains_key(bucket)).await?;
+    let bucket_usage = usage.buckets_usage.get(bucket).expect("bucket usage should exist");
+    assert_eq!(
+        bucket_usage.size, overwrite_size,
+        "overwrite must account exactly the new size, not double-count the previous one"
+    );
+    assert_eq!(bucket_usage.objects_count, 1, "overwrite must not create a second object");
+
+    env.stop_server();
+    Ok(())
+}
+
 /// Regression test for issue #3898.
 /// Versioned buckets should expose versions and delete markers through admin data usage.
 #[tokio::test(flavor = "multi_thread")]
