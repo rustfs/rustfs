@@ -79,10 +79,7 @@ static WARNED_ENV_MESSAGES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn log_once(key: &str, message: impl FnOnce() -> String) {
     let seen = WARNED_ENV_MESSAGES.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut seen = match seen.lock() {
-        Ok(seen) => seen,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if seen.insert(key.to_string()) {
         warn!("{}", message());
     }

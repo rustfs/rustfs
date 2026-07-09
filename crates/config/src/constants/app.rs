@@ -143,6 +143,41 @@ pub const ENV_MINIO_CI: &str = "MINIO_CI";
 /// Default flag value for bypassing local physical disk independence checks.
 pub const DEFAULT_UNSAFE_BYPASS_DISK_CHECK: bool = false;
 
+/// Environment variable selecting how startup waits for DNS/topology
+/// convergence in multi-node setups. One of `auto` (default), `orchestrated`,
+/// `bounded`, or `fail-fast`.
+///
+/// - `orchestrated`: wait effectively indefinitely for recoverable DNS/topology
+///   errors so the process stays Running (readiness stays false) instead of
+///   exiting and triggering a Kubernetes pod restart loop.
+/// - `bounded`: wait for a finite window (see
+///   `ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT`) then fail with an actionable error.
+/// - `fail-fast`: fail on the first non-transient resolution error (CI/local).
+/// - `auto`: Kubernetes -> orchestrated, distributed URL endpoints -> bounded,
+///   local path endpoints -> fail-fast.
+pub const ENV_STARTUP_TOPOLOGY_WAIT_MODE: &str = "RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE";
+
+/// Environment variable bounding how long startup waits for topology/DNS
+/// convergence before failing in `bounded` mode. Accepts durations such as
+/// `3m`, `90s`, `500ms`, or a bare number of seconds.
+pub const ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT: &str = "RUSTFS_STARTUP_TOPOLOGY_WAIT_TIMEOUT";
+
+/// Environment variable capping the per-attempt backoff delay while retrying
+/// startup topology/DNS convergence. Accepts durations such as `8s`.
+pub const ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY: &str = "RUSTFS_STARTUP_TOPOLOGY_RETRY_MAX_DELAY";
+
+/// Environment variable injected into every Kubernetes pod; its presence marks
+/// an orchestrated deployment for startup topology auto-detection.
+pub const ENV_KUBERNETES_SERVICE_HOST: &str = "KUBERNETES_SERVICE_HOST";
+
+/// Default bounded-mode wait window (seconds) for non-Kubernetes distributed
+/// deployments before startup topology convergence is declared failed.
+pub const DEFAULT_STARTUP_TOPOLOGY_WAIT_TIMEOUT_SECS: u64 = 180;
+
+/// Default per-attempt backoff cap (seconds) while retrying startup
+/// topology/DNS convergence.
+pub const DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS: u64 = 8;
+
 /// Environment variable for server access key.
 pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
 
