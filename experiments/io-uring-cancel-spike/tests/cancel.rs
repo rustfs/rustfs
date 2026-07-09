@@ -400,7 +400,10 @@ async fn boundary_reads() {
 
     // Read spanning past EOF → the available tail bytes, delivered to a live
     // receiver via the resubmit-then-EOF path.
-    let got = driver.read_at(Arc::clone(&file), (LEN - 10) as u64, 100).await.expect("cross-EOF read");
+    let got = driver
+        .read_at(Arc::clone(&file), (LEN - 10) as u64, 100)
+        .await
+        .expect("cross-EOF read");
     assert_eq!(got, &content[LEN - 10..LEN], "cross-EOF read should return the tail only");
 
     // len > MAX_RW_COUNT → rejected (C6); offset > i64::MAX → rejected (C7).

@@ -122,7 +122,10 @@ struct BpState {
 impl Backpressure {
     fn new(permits: usize) -> Self {
         Self {
-            state: Mutex::new(BpState { permits, shutdown: false }),
+            state: Mutex::new(BpState {
+                permits,
+                shutdown: false,
+            }),
             cv: Condvar::new(),
         }
     }
@@ -406,7 +409,17 @@ impl UringDriver {
         // If the driver shut down between acquire and send, give the permit
         // back — no CQE will ever release it. `done` is dropped with the
         // returned Msg, which the caller observes as a driver-gone error.
-        if self.tx.send(Msg::Read { id, file, offset, len, done }).is_err() {
+        if self
+            .tx
+            .send(Msg::Read {
+                id,
+                file,
+                offset,
+                len,
+                done,
+            })
+            .is_err()
+        {
             self.bp.release();
             return ReadHandle {
                 id,
@@ -531,8 +544,7 @@ fn probe_real_read(ring: &mut IoUring) -> io::Result<()> {
 /// file survives.
 fn open_probe_file(pattern: &[u8]) -> io::Result<File> {
     let dir = std::env::temp_dir();
-    let c_dir =
-        std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| io::Error::other("probe dir path has NUL"))?;
+    let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| io::Error::other("probe dir path has NUL"))?;
     // SAFETY: `c_dir` is a valid NUL-terminated path; O_TMPFILE requires a
     // directory and O_RDWR/O_WRONLY. On success we own the returned fd.
     let fd = unsafe { libc::open(c_dir.as_ptr(), libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
@@ -548,8 +560,7 @@ fn open_probe_file_exclusive(dir: &std::path::Path, pattern: &[u8]) -> io::Resul
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nonce = SEQ.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!("uring-spike-probe-{}-{}", std::process::id(), nonce));
-    let c_path =
-        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("probe path has NUL"))?;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("probe path has NUL"))?;
     // O_EXCL refuses a pre-existing file; O_NOFOLLOW refuses a symlink; 0600 is
     // owner-only. SAFETY: `c_path` is a valid NUL-terminated path; on success
     // we own the fd.
