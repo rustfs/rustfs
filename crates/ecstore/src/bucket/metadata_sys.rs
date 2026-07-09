@@ -23,7 +23,6 @@ use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::store::ECStore;
 use futures::future::join_all;
-use lazy_static::lazy_static;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
 use s3s::dto::ReplicationConfiguration;
@@ -33,7 +32,6 @@ use s3s::dto::{
     Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use std::collections::HashSet;
-use std::sync::OnceLock;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use time::OffsetDateTime;
@@ -42,35 +40,44 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
-lazy_static! {
-    pub static ref GLOBAL_BUCKET_METADATA_SYS: OnceLock<Arc<RwLock<BucketMetadataSys>>> = OnceLock::new();
-}
-
 const BUCKET_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
+    // The metadata system is inherently per-store (it holds the store handle
+    // and that store's bucket cache), so it lives on the store's own instance
+    // context (backlog#1052 S3) — a second instance initializes its own cell
+    // instead of panicking on the process-global one.
+    let instance_ctx = api.ctx.clone();
+    let is_dist_erasure = instance_ctx.is_dist_erasure().await;
+
     let mut sys = BucketMetadataSys::new(api);
     sys.init(buckets).await;
 
     let sys = Arc::new(RwLock::new(sys));
 
-    GLOBAL_BUCKET_METADATA_SYS.set(sys.clone()).unwrap();
+    // Same fail-fast as the old process-global `.set().unwrap()`, scoped to
+    // the owning instance: double-initializing one store's metadata is a bug.
+    assert!(
+        instance_ctx.init_bucket_metadata_sys(sys.clone()),
+        "bucket metadata sys should be initialized once per instance"
+    );
 
-    if runtime_sources::setup_is_dist_erasure().await {
+    if is_dist_erasure {
         start_refresh_buckets_metadata_loop(sys);
     }
 }
 
+/// The current instance's bucket metadata system (legacy free-function
+/// facade: resolves the published store's context, or the bootstrap one).
 pub fn get_global_bucket_metadata_sys() -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    GLOBAL_BUCKET_METADATA_SYS.get().cloned()
+    crate::runtime::global::current_ctx().bucket_metadata_sys()
 }
 
-// panic if not init
 pub(super) fn get_bucket_metadata_sys() -> Result<Arc<RwLock<BucketMetadataSys>>> {
-    if let Some(sys) = GLOBAL_BUCKET_METADATA_SYS.get() {
-        Ok(sys.clone())
+    if let Some(sys) = get_global_bucket_metadata_sys() {
+        Ok(sys)
     } else {
-        Err(Error::other("GLOBAL_BUCKET_METADATA_SYS not init"))
+        Err(Error::other("bucket metadata sys not initialized for this instance"))
     }
 }
 
