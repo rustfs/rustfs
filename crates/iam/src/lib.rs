@@ -163,9 +163,25 @@ pub(crate) async fn notify_iam_load_policy_mapping(
 static IAM_SYS: OnceLock<Arc<IamSys<ObjectStore>>> = OnceLock::new();
 static OIDC_SYS: OnceLock<Arc<OidcSys>> = OnceLock::new();
 
+/// Build an IAM system bound to the given store without touching the process
+/// singleton (backlog#1052 S3): a per-server context can own the returned
+/// handle while the singleton keeps serving ambient readers.
 #[instrument(skip(ecstore))]
-pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<()> {
-    if IAM_SYS.get().is_some() {
+pub async fn build_iam_sys(ecstore: Arc<IamStore>) -> Result<Arc<IamSys<ObjectStore>>> {
+    // 1. Create the persistent storage adapter
+    let storage_adapter = ObjectStore::new(ecstore);
+
+    // 2. Create the cache manager.
+    // The `new` method now performs a blocking initial load from disk.
+    let cache_manager = IamCache::new(storage_adapter).await?;
+
+    // 3. Construct the system interface
+    Ok(Arc::new(IamSys::new(cache_manager)))
+}
+
+#[instrument(skip(ecstore))]
+pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<Arc<IamSys<ObjectStore>>> {
+    if let Some(existing) = IAM_SYS.get() {
         info!(
             event = EVENT_IAM_STATE,
             component = LOG_COMPONENT_IAM,
@@ -173,7 +189,7 @@ pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<()> {
             state = "already_initialized",
             "IAM runtime already initialized"
         );
-        return Ok(());
+        return Ok(existing.clone());
     }
 
     info!(
@@ -184,18 +200,10 @@ pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<()> {
         "IAM runtime starting"
     );
 
-    // 1. Create the persistent storage adapter
-    let storage_adapter = ObjectStore::new(ecstore);
+    let iam_instance = build_iam_sys(ecstore).await?;
 
-    // 2. Create the cache manager.
-    // The `new` method now performs a blocking initial load from disk.
-    let cache_manager = IamCache::new(storage_adapter).await?;
-
-    // 3. Construct the system interface
-    let iam_instance = Arc::new(IamSys::new(cache_manager));
-
-    // 4. Securely set the global singleton
-    if IAM_SYS.set(iam_instance).is_err() {
+    // Securely set the global singleton
+    if IAM_SYS.set(iam_instance.clone()).is_err() {
         error!(
             event = EVENT_IAM_STATE,
             component = LOG_COMPONENT_IAM,
@@ -213,7 +221,7 @@ pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<()> {
         state = "ready",
         "IAM runtime ready"
     );
-    Ok(())
+    Ok(iam_instance)
 }
 
 #[inline]
