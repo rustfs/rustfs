@@ -604,6 +604,7 @@ pub async fn start_http_server(
     let s3_service = {
         // Bind the S3 service to this server's context slot (backlog#1052 S2)
         // so request dispatch resolves the server's own store.
+        let admin_server_ctx = server_ctx.clone();
         let store = storage::ecfs::FS::with_server_ctx(server_ctx);
         let mut b = S3ServiceBuilder::new(store.clone());
 
@@ -636,7 +637,7 @@ pub async fn start_http_server(
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store);
         b.set_route(storage::metadata_route::with_metadata_route(
-            admin::make_admin_route(config.console_enable)?,
+            admin::make_admin_route(config.console_enable, admin_server_ctx)?,
             metadata_route_host,
         ));
 

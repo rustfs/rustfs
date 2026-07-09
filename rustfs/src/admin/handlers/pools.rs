@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::runtime_sources::object_store_from_extensions;
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -26,8 +27,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     admin::runtime_sources::{
-        AdminPoolStatus, QueryPoolStatusRequest, current_endpoints_handle, current_notification_system,
-        current_object_store_handle, default_admin_usecase,
+        AdminPoolStatus, QueryPoolStatusRequest, current_endpoints_handle, current_notification_system, default_admin_usecase,
     },
     admin::{
         auth::validate_admin_request,
@@ -741,7 +741,7 @@ impl Operation for StartDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(decommission_admin_not_initialized_error_with_audit("start decommission", audit));
         };
 
@@ -929,7 +929,7 @@ impl Operation for CancelDecommission {
                 .map_err(ApiError::from)
                 .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
         } else {
-            let Some(store) = current_object_store_handle() else {
+            let Some(store) = object_store_from_extensions(&req.extensions) else {
                 return Err(decommission_admin_not_initialized_error_with_audit("cancel decommission", audit));
             };
 
@@ -1042,7 +1042,7 @@ impl Operation for ClearDecommission {
                 .map_err(ApiError::from)
                 .map_err(|err| contextualize_admin_pool_api_error(err, "clear decommission", format!("pool {idx}")))?;
         } else {
-            let Some(store) = current_object_store_handle() else {
+            let Some(store) = object_store_from_extensions(&req.extensions) else {
                 return Err(decommission_admin_not_initialized_error_with_audit("clear decommission", audit));
             };
 

@@ -21,11 +21,11 @@ pub(crate) use crate::app::admin_usecase::{
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::runtime_sources as root_runtime_sources;
 pub(crate) use crate::runtime_sources::{
-    AppContext, current_action_credentials, current_boot_time, current_bucket_metadata_handle, current_bucket_monitor_handle,
-    current_deployment_id, current_endpoints_handle, current_iam_handle, current_kms_runtime_service_manager,
-    current_notification_system_for_context, current_object_store_handle_for_context, current_oidc_handle,
-    current_ready_iam_handle, current_region, current_replication_pool_handle, current_replication_stats_handle,
-    current_server_config_for_context, current_token_signing_key,
+    AppContext, ServerContextSlot, current_action_credentials, current_boot_time, current_bucket_metadata_handle,
+    current_bucket_monitor_handle, current_deployment_id, current_endpoints_handle, current_iam_handle,
+    current_kms_runtime_service_manager, current_notification_system_for_context, current_object_store_handle_for_context,
+    current_oidc_handle, current_ready_iam_handle, current_region, current_replication_pool_handle,
+    current_replication_stats_handle, current_server_config_for_context, current_token_signing_key,
 };
 use rustfs_config::server_config::Config;
 use rustfs_kms::KmsServiceManager;
@@ -50,6 +50,23 @@ pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
 pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
     let context = current_app_context();
     current_object_store_handle_for_context(context.as_deref())
+}
+
+/// Resolve the object store for an admin request through the server's context
+/// slot injected at router dispatch (backlog#1052 S2). Falls back to the
+/// ambient process context when no slot was injected (direct handler tests,
+/// paths outside the router) — the single-instance legacy default.
+pub(crate) fn object_store_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<ECStore>> {
+    object_store_from_extensions(&req.extensions)
+}
+
+/// Field-borrow form of [`object_store_from_req`] for handlers that have
+/// already moved other request fields (body, credentials) out of the request.
+pub(crate) fn object_store_from_extensions(extensions: &http::Extensions) -> Option<Arc<ECStore>> {
+    extensions
+        .get::<Arc<ServerContextSlot>>()
+        .and_then(|slot| slot.object_store())
+        .or_else(current_object_store_handle)
 }
 
 pub(crate) fn current_notification_system() -> Option<&'static NotificationSys> {

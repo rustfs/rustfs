@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
+use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_api::bucket::{
     metadata::{
@@ -27,7 +28,6 @@ use crate::admin::storage_api::bucket::{
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use crate::admin::storage_api::error::StorageError;
 use crate::{
-    admin::runtime_sources::current_object_store_handle,
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
@@ -133,7 +133,7 @@ impl Operation for ExportBucketMetadata {
         )
         .await?;
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -522,7 +522,7 @@ impl Operation for ImportBucketMetadata {
             };
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 

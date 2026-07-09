@@ -14,7 +14,7 @@
 
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_action_credentials, current_object_store_handle};
+use crate::admin::runtime_sources::{current_action_credentials, object_store_from_req};
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
@@ -114,7 +114,7 @@ async fn bucket_quota_limit(bucket: &str) -> Option<u64> {
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
