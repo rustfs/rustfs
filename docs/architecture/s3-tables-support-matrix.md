@@ -52,7 +52,7 @@ catalog extension.
 
 | Area | Status | Current RustFS claim |
 |---|---|---|
-| Live conformance evidence template | Generated harness | `engine_compatibility.py --print-live-conformance` records required run metadata, per-client result rows, and claim promotion rules before a manual/live result can expand compatibility wording. |
+| Live conformance evidence | Manual/live harness | `engine_compatibility.py --print-live-evidence-schema` defines the required evidence schema and claim promotion boundaries. `pyiceberg_smoke.py --live-evidence-output` writes a validated PyIceberg evidence record after a successful live smoke run. |
 | Production operations guide | Generated harness | `engine_compatibility.py --print-operations-guide` records command, evidence, pass criteria, and fail-closed signals for live conformance, durable backing cutover, maintenance, recovery, permissions, credential vending, and unsupported-claim governance. |
 | Vendor compatibility gap audit | Generated harness | `engine_compatibility.py --print-vendor-audit` records provider source URLs, catalog path and warehouse shapes, signing/auth models, error/permission/maintenance validation categories, and not-claimed boundaries for AWS S3 Tables, MinIO AIStor Tables, Cloudflare R2 Data Catalog, and Alibaba OSS Tables. |
 | Client claim promotion | Documented, not automated | PyIceberg remains the automated claim. Spark can be promoted only with recorded manual/live evidence; Trino and DuckDB read probes do not promote write compatibility; Snowflake and vendor profiles remain reference-only without repeatable live evidence. |
@@ -210,6 +210,16 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --metadata-location s3://rustfs-s3table-smoke/tables/table-id/metadata/v1.metadata.json \
   --print-live-conformance \
   --cleanup
+python3 scripts/table-catalog/engine_compatibility.py --print-live-evidence-schema
+python3 scripts/table-catalog/pyiceberg_smoke.py \
+  --endpoint http://127.0.0.1:9000 \
+  --bucket rustfs-s3table-smoke \
+  --replace \
+  --cleanup \
+  --rustfs-build rustfs-v1.0.0-beta.8 \
+  --git-sha "$(git rev-parse HEAD)" \
+  --catalog-backing durable-strong \
+  --live-evidence-output /tmp/rustfs-pyiceberg-live-evidence.json
 python3 scripts/table-catalog/engine_compatibility.py \
   --warehouse rustfs-s3table-smoke \
   --namespace smoke \

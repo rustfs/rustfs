@@ -410,6 +410,92 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertIn("manual-live", " ".join(evidence["promotion_rules"]))
         self.assertIn("not-claimed", " ".join(evidence["promotion_rules"]))
 
+    def test_live_conformance_evidence_record_validates_claim_promotion(self) -> None:
+        record = engine_compatibility.live_conformance_evidence_record(
+            client_name="PyIceberg",
+            client_version="0.10.0",
+            scenario="create-append-reload-scan-direct-rest-probes",
+            rustfs_build="rustfs-test",
+            git_sha="abc123",
+            catalog_backing="durable-strong",
+            endpoint="http://127.0.0.1:9000",
+            warehouse="rustfs-s3table-smoke",
+            rest_path="/iceberg",
+            namespace="smoke",
+            table="events",
+            metadata_location="s3://rustfs-s3table-smoke/tables/table-id/metadata/v2.metadata.json",
+            run_timestamp_utc="2026-07-09T00:00:00Z",
+            operator="ci",
+            expected_status="pass",
+            observed_status="pass",
+            row_count=2,
+            cleanup_result="dropped-table-and-namespace",
+            claim="automated-smoke",
+            command="python3 scripts/table-catalog/pyiceberg_smoke.py --cleanup",
+        )
+
+        validation = engine_compatibility.validate_live_conformance_evidence(record)
+
+        self.assertEqual(record["schema"], "rustfs-s3tables-live-conformance-evidence")
+        self.assertEqual(record["schema_version"], 1)
+        self.assertEqual(validation["status"], "accepted")
+        self.assertEqual(validation["claim"], "automated-smoke")
+        self.assertEqual(validation["client_name"], "PyIceberg")
+
+    def test_live_conformance_evidence_rejects_missing_or_mismatched_results(self) -> None:
+        record = engine_compatibility.live_conformance_evidence_record(
+            client_name="Spark Iceberg REST catalog",
+            client_version="3.5.4/iceberg-1.7.1",
+            scenario="create-namespace-create-table-append-refresh-count-cleanup",
+            rustfs_build="rustfs-test",
+            git_sha="abc123",
+            catalog_backing="durable-strong",
+            endpoint="http://127.0.0.1:9000",
+            warehouse="rustfs-s3table-smoke",
+            rest_path="/iceberg",
+            namespace="smoke",
+            table="events",
+            metadata_location="s3://rustfs-s3table-smoke/tables/table-id/metadata/v2.metadata.json",
+            run_timestamp_utc="2026-07-09T00:00:00Z",
+            operator="ci",
+            expected_status="pass",
+            observed_status="fail",
+            row_count=0,
+            cleanup_result="not-run",
+            claim="manual-live-verified",
+            command="spark-sql -f /tmp/rustfs-s3tables-smoke-events-spark.sql",
+        )
+
+        with self.assertRaisesRegex(ValueError, "observed_status"):
+            engine_compatibility.validate_live_conformance_evidence(record)
+
+        passing = dict(record, observed_status="pass", row_count=2)
+        del passing["metadata_location"]
+        with self.assertRaisesRegex(ValueError, "metadata_location"):
+            engine_compatibility.validate_live_conformance_evidence(passing)
+
+        overclaim = dict(record, observed_status="pass", row_count=2, client_name="Trino Iceberg REST catalog", claim="manual-live-write-verified")
+        with self.assertRaisesRegex(ValueError, "claim"):
+            engine_compatibility.validate_live_conformance_evidence(overclaim)
+
+        unrecorded = dict(record, expected_status="pass", observed_status="pass", row_count=2, rustfs_build="operator-recorded")
+        with self.assertRaisesRegex(ValueError, "rustfs_build"):
+            engine_compatibility.validate_live_conformance_evidence(unrecorded)
+
+        failed_claim = dict(record, expected_status="fail", observed_status="fail", row_count=0)
+        with self.assertRaisesRegex(ValueError, "expected_status"):
+            engine_compatibility.validate_live_conformance_evidence(failed_claim)
+
+    def test_cli_prints_live_conformance_evidence_schema(self) -> None:
+        payload = engine_compatibility.cli_json(["--print-live-evidence-schema"])
+        document = json.loads(payload)
+
+        schema = document["live_conformance_evidence_schema"]
+        self.assertEqual(schema["schema"], "rustfs-s3tables-live-conformance-evidence")
+        self.assertIn("metadata_location", schema["required_fields"])
+        self.assertIn("claim", schema["required_fields"])
+        self.assertEqual(schema["claim_promotion"]["Trino Iceberg REST catalog"], ["manual-live-read-verified"])
+
     def test_production_operations_guide_covers_release_boundaries(self) -> None:
         guide = engine_compatibility.production_operations_guide(
             endpoint="http://127.0.0.1:9000",

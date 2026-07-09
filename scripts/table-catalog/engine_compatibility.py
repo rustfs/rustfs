@@ -22,6 +22,48 @@ DEFAULT_SNOWFLAKE_CLIENT_VERSION = "operator-recorded"
 DEFAULT_DATABEND_VERSION = "operator-recorded"
 DEFAULT_TRINO_SERVER = "http://127.0.0.1:8080"
 DEFAULT_DATABEND_DSN = "databend://root:@127.0.0.1:8000/default"
+LIVE_EVIDENCE_SCHEMA = "rustfs-s3tables-live-conformance-evidence"
+LIVE_EVIDENCE_SCHEMA_VERSION = 1
+LIVE_EVIDENCE_REQUIRED_FIELDS = [
+    "schema",
+    "schema_version",
+    "client_name",
+    "client_version",
+    "scenario",
+    "rustfs_build",
+    "git_sha",
+    "catalog_backing",
+    "endpoint",
+    "warehouse",
+    "rest_path",
+    "namespace",
+    "table",
+    "metadata_location",
+    "run_timestamp_utc",
+    "operator",
+    "expected_status",
+    "observed_status",
+    "row_count",
+    "cleanup_result",
+    "claim",
+    "command",
+]
+LIVE_EVIDENCE_ALLOWED_CLAIMS = OrderedDict(
+    [
+        ("PyIceberg", ["automated-smoke"]),
+        ("Spark Iceberg REST catalog", ["manual-live-verified"]),
+        ("Trino Iceberg REST catalog", ["manual-live-read-verified"]),
+        ("DuckDB Iceberg", ["manual-live-read-verified"]),
+        ("Databend", ["manual-live-s3-stage-verified"]),
+        ("Snowflake Open Catalog / Iceberg integrations", ["reference-only"]),
+    ]
+)
+LIVE_EVIDENCE_ROW_COUNT_CLIENTS = {
+    "PyIceberg",
+    "Spark Iceberg REST catalog",
+    "Trino Iceberg REST catalog",
+    "DuckDB Iceberg",
+}
 
 VENDOR_SPARK_PROFILES: dict[str, dict[str, str]] = {
     "rustfs": {
@@ -630,6 +672,159 @@ def live_conformance_evidence(
                     ]
                 ),
             ),
+        ]
+    )
+
+
+def live_conformance_evidence_schema() -> OrderedDict[str, Any]:
+    return OrderedDict(
+        [
+            ("schema", LIVE_EVIDENCE_SCHEMA),
+            ("schema_version", LIVE_EVIDENCE_SCHEMA_VERSION),
+            ("required_fields", LIVE_EVIDENCE_REQUIRED_FIELDS.copy()),
+            ("claim_promotion", OrderedDict((client, claims.copy()) for client, claims in LIVE_EVIDENCE_ALLOWED_CLAIMS.items())),
+            (
+                "fail_closed_rules",
+                [
+                    "missing required field rejects the evidence record",
+                    "rustfs_build, git_sha, catalog_backing, and client_version must be recorded before claim promotion",
+                    "observed_status must match expected_status before any claim can be promoted",
+                    "expected_status must be pass before any claim can be promoted",
+                    "read-only probes cannot promote write compatibility",
+                    "PyIceberg, Spark, Trino, and DuckDB pass evidence must record row_count=2",
+                    "reference-only providers remain reference-only without a repeatable live run",
+                ],
+            ),
+        ]
+    )
+
+
+def live_conformance_evidence_record(
+    *,
+    client_name: str,
+    client_version: str,
+    scenario: str,
+    rustfs_build: str,
+    git_sha: str,
+    catalog_backing: str,
+    endpoint: str,
+    warehouse: str,
+    rest_path: str,
+    namespace: str,
+    table: str,
+    metadata_location: str,
+    run_timestamp_utc: str,
+    operator: str,
+    expected_status: str,
+    observed_status: str,
+    row_count: int,
+    cleanup_result: str,
+    claim: str,
+    command: str,
+) -> OrderedDict[str, Any]:
+    return OrderedDict(
+        [
+            ("schema", LIVE_EVIDENCE_SCHEMA),
+            ("schema_version", LIVE_EVIDENCE_SCHEMA_VERSION),
+            ("client_name", client_name),
+            ("client_version", client_version),
+            ("scenario", scenario),
+            ("rustfs_build", rustfs_build),
+            ("git_sha", git_sha),
+            ("catalog_backing", catalog_backing),
+            ("endpoint", normalized_endpoint(endpoint)),
+            ("warehouse", warehouse),
+            ("rest_path", normalized_rest_path(rest_path)),
+            ("namespace", namespace),
+            ("table", table),
+            ("metadata_location", metadata_location),
+            ("run_timestamp_utc", run_timestamp_utc),
+            ("operator", operator),
+            ("expected_status", expected_status),
+            ("observed_status", observed_status),
+            ("row_count", row_count),
+            ("cleanup_result", cleanup_result),
+            ("claim", claim),
+            ("command", command),
+        ]
+    )
+
+
+def require_non_empty_string(record: dict[str, Any], field: str) -> str:
+    value = record.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"live conformance evidence field {field} must be a non-empty string")
+    return value
+
+
+def require_operator_recorded_value(record: dict[str, Any], field: str) -> str:
+    value = require_non_empty_string(record, field)
+    if value == "operator-recorded":
+        raise ValueError(f"live conformance evidence field {field} must be recorded for claim promotion")
+    return value
+
+
+def validate_live_conformance_evidence(record: dict[str, Any]) -> OrderedDict[str, Any]:
+    for field in LIVE_EVIDENCE_REQUIRED_FIELDS:
+        if field not in record:
+            raise ValueError(f"live conformance evidence is missing required field {field}")
+    if record["schema"] != LIVE_EVIDENCE_SCHEMA:
+        raise ValueError("live conformance evidence schema does not match RustFS S3 Tables evidence schema")
+    if record["schema_version"] != LIVE_EVIDENCE_SCHEMA_VERSION:
+        raise ValueError("live conformance evidence schema_version is not supported")
+
+    client_name = require_non_empty_string(record, "client_name")
+    claim = require_non_empty_string(record, "claim")
+    allowed_claims = LIVE_EVIDENCE_ALLOWED_CLAIMS.get(client_name)
+    if allowed_claims is None:
+        raise ValueError(f"live conformance evidence client_name is not recognized: {client_name}")
+    if claim not in allowed_claims:
+        raise ValueError(f"live conformance evidence claim {claim} is not allowed for {client_name}")
+
+    expected_status = require_non_empty_string(record, "expected_status")
+    observed_status = require_non_empty_string(record, "observed_status")
+    if expected_status != "pass":
+        raise ValueError("live conformance evidence expected_status must be pass for claim promotion")
+    if observed_status != expected_status:
+        raise ValueError("live conformance evidence observed_status does not match expected_status")
+
+    for field in [
+        "client_version",
+        "rustfs_build",
+        "git_sha",
+        "catalog_backing",
+    ]:
+        require_operator_recorded_value(record, field)
+
+    for field in [
+        "scenario",
+        "endpoint",
+        "warehouse",
+        "rest_path",
+        "namespace",
+        "table",
+        "metadata_location",
+        "run_timestamp_utc",
+        "operator",
+        "cleanup_result",
+        "command",
+    ]:
+        require_non_empty_string(record, field)
+
+    row_count = record["row_count"]
+    if not isinstance(row_count, int) or row_count < 0:
+        raise ValueError("live conformance evidence row_count must be a non-negative integer")
+    if expected_status == "pass" and client_name in LIVE_EVIDENCE_ROW_COUNT_CLIENTS and row_count != 2:
+        raise ValueError("live conformance evidence row_count must be 2 for successful table smoke/read probes")
+
+    return OrderedDict(
+        [
+            ("status", "accepted"),
+            ("client_name", client_name),
+            ("scenario", record["scenario"]),
+            ("claim", claim),
+            ("metadata_location", record["metadata_location"]),
+            ("row_count", row_count),
         ]
     )
 
@@ -1427,6 +1622,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--print-engine-matrix", action="store_true")
     parser.add_argument("--print-vendor-audit", action="store_true")
     parser.add_argument("--print-live-conformance", action="store_true")
+    parser.add_argument("--print-live-evidence-schema", action="store_true")
     parser.add_argument("--print-operations-guide", action="store_true")
     parser.add_argument("--print-spark-config", action="store_true")
     parser.add_argument("--print-spark-sql", action="store_true")
@@ -1507,6 +1703,9 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
             },
             output,
         )
+        printed = True
+    if args.print_live_evidence_schema:
+        print_json({"live_conformance_evidence_schema": live_conformance_evidence_schema()}, output)
         printed = True
     if args.print_operations_guide:
         print_json(
