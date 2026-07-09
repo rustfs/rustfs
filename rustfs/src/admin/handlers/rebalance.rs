@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
@@ -21,7 +22,7 @@ use crate::admin::storage_api::rebalance::{
 };
 use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 use crate::{
-    admin::runtime_sources::{current_notification_system, current_object_store_handle},
+    admin::runtime_sources::current_notification_system,
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
@@ -446,7 +447,7 @@ impl Operation for RebalanceStart {
             return Err(s3_error!(InvalidArgument, "rebalance start does not accept query parameters"));
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
@@ -630,7 +631,7 @@ impl Operation for RebalanceStatus {
         )
         .await?;
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
@@ -735,7 +736,7 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(InvalidArgument, "rebalance stop does not accept query parameters"));
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 

@@ -15,7 +15,7 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_object_store_handle, current_replication_stats_handle, current_runtime_port};
+use crate::admin::runtime_sources::{current_replication_stats_handle, current_runtime_port, object_store_from_req};
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
@@ -300,7 +300,7 @@ impl Operation for GetReplicationMetricsHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -358,7 +358,7 @@ impl Operation for SetRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -506,7 +506,7 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(s3_error!(InvalidRequest, "bucket is required"));
             }
 
-            let Some(store) = current_object_store_handle() else {
+            let Some(store) = object_store_from_req(&req) else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
@@ -567,7 +567,7 @@ impl Operation for RemoveRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "arn is required"));
         };
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 
@@ -673,7 +673,7 @@ impl Operation for ReplicationDiffHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -835,7 +835,7 @@ impl Operation for ReplicationMrfHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 

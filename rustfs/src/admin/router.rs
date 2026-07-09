@@ -28,7 +28,7 @@ use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::runtime_sources::{
-    current_boot_time, current_bucket_monitor_handle, current_deployment_id, current_notification_system,
+    ServerContextSlot, current_boot_time, current_bucket_monitor_handle, current_deployment_id, current_notification_system,
     current_object_store_handle, current_region, current_replication_pool_handle, current_replication_stats_handle,
     current_server_config, default_object_usecase,
 };
@@ -2295,6 +2295,10 @@ pub struct S3Router<T> {
     router: Router<T>,
     console_enabled: bool,
     console_router: Option<axum::routing::RouterIntoService<Body>>,
+    /// This server's request-path context slot (backlog#1052 S2). Injected
+    /// into every request's extensions at dispatch so the static admin
+    /// operations can resolve their server's store.
+    server_ctx: Option<Arc<ServerContextSlot>>,
     #[cfg(test)]
     registered_routes: Vec<String>,
 }
@@ -2338,9 +2342,16 @@ impl<T: Operation> S3Router<T> {
             router,
             console_enabled,
             console_router,
+            server_ctx: None,
             #[cfg(test)]
             registered_routes: Vec::new(),
         }
+    }
+
+    /// Bind this router to its server's context slot (backlog#1052 S2); the
+    /// slot is handed to every dispatched request via its extensions.
+    pub fn set_server_ctx(&mut self, server_ctx: Arc<ServerContextSlot>) {
+        self.server_ctx = Some(server_ctx);
     }
 
     pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
@@ -2430,6 +2441,9 @@ where
 
     // check_access before call
     async fn check_access(&self, req: &mut S3Request<Body>) -> S3Result<()> {
+        if let Some(server_ctx) = &self.server_ctx {
+            req.extensions.insert(server_ctx.clone());
+        }
         if parse_replication_extension_request(&req.method, &req.uri).is_some()
             || parse_misc_extension_request(&req.method, &req.uri).is_some()
         {
@@ -2495,6 +2509,9 @@ where
     }
 
     async fn call(&self, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        if let Some(server_ctx) = &self.server_ctx {
+            req.extensions.insert(server_ctx.clone());
+        }
         if let Some(ext_req) = parse_replication_extension_request(&req.method, &req.uri) {
             return handle_replication_extension_request(&mut req, &ext_req).await;
         }
@@ -3891,6 +3908,36 @@ mod tests {
             .await
             .expect_err("anonymous extension request must be denied");
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    // backlog#1052 S2: the router hands its server's context slot to every
+    // dispatched request via extensions, so the static admin operations can
+    // resolve their server's store instead of the process default.
+    #[tokio::test]
+    async fn check_access_injects_server_context_slot_into_request_extensions() {
+        let mut router: S3Router<AdminOperation> = S3Router::new(false);
+        let server_ctx = ServerContextSlot::new();
+        router.set_server_ctx(server_ctx.clone());
+
+        let mut req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::GET,
+            uri: "/demo-bucket?replication-metrics".parse().expect("uri should parse"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let _ = router.check_access(&mut req).await;
+
+        let injected = req
+            .extensions
+            .get::<Arc<ServerContextSlot>>()
+            .expect("dispatch must inject the server context slot");
+        assert!(Arc::ptr_eq(injected, &server_ctx), "the injected slot must be this router's slot");
     }
 
     #[tokio::test]

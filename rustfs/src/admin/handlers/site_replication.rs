@@ -18,6 +18,7 @@ use crate::admin::runtime_sources::{
     current_deployment_id, current_endpoints_handle, current_iam_handle, current_object_store_handle, current_oidc_handle,
     current_outbound_tls_generation, current_outbound_tls_state, current_region, current_replication_pool_handle,
     current_replication_stats_handle, current_runtime_port, current_server_config, current_token_signing_key,
+    object_store_from_req,
 };
 use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
@@ -5199,7 +5200,7 @@ impl Operation for SRPeerBucketOpsHandler {
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "operation is required"))?;
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -5450,6 +5451,9 @@ impl Operation for SiteReplicationResyncOpHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationResyncAction).await?;
         let operation = query_pairs(&req.uri).get("operation").cloned().unwrap_or_default();
+        // Resolve before the request body is consumed below; the `else` stays
+        // at its original position so error precedence is unchanged.
+        let resolved_store = object_store_from_req(&req);
         let peer: PeerInfo = read_site_replication_json(req, "", false).await?;
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let mut state = load_site_replication_state().await?;
@@ -5461,7 +5465,7 @@ impl Operation for SiteReplicationResyncOpHandler {
         if !state.peers.contains_key(&peer.deployment_id) {
             return Err(s3_error!(InvalidRequest, "site replication peer not found"));
         }
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = resolved_store else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
