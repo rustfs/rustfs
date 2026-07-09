@@ -16,8 +16,11 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::ecstore::config::com::{read_config, save_config};
-use crate::app::context::{resolve_kms_runtime_service_manager, resolve_object_store_handle};
+use crate::admin::runtime_sources::{
+    current_app_context, current_kms_runtime_service_manager, current_object_store_handle_for_context,
+    current_or_init_kms_runtime_service_manager,
+};
+use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{Method, StatusCode};
@@ -38,7 +41,7 @@ const LOG_SUBSYSTEM_KMS: &str = "kms";
 const EVENT_ADMIN_KMS_DYNAMIC_STATE: &str = "admin_kms_dynamic_state";
 
 fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
-    resolve_kms_runtime_service_manager().unwrap_or_else(|| {
+    current_kms_runtime_service_manager().unwrap_or_else(|| {
         warn!(
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_KMS,
@@ -46,7 +49,7 @@ fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceMa
             result = "service_manager_fallback_initialized",
             "admin kms dynamic state"
         );
-        rustfs_kms::init_global_kms_service_manager()
+        current_or_init_kms_runtime_service_manager()
     })
 }
 
@@ -103,13 +106,14 @@ fn normalize_configure_request_auth(
 /// Save KMS configuration to cluster storage
 #[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
-    let Some(store) = resolve_object_store_handle() else {
+    let context = current_app_context();
+    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
         return Err("Storage layer not initialized".to_string());
     };
 
     let data = serde_json::to_vec(config).map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
 
-    save_config(store, KMS_CONFIG_PATH, data)
+    save_admin_config(store, KMS_CONFIG_PATH, data)
         .await
         .map_err(|e| format!("Failed to save KMS config to storage: {e}"))?;
 
@@ -127,7 +131,8 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
 /// Load KMS configuration from cluster storage
 #[instrument]
 pub async fn load_kms_config() -> Option<KmsConfig> {
-    let Some(store) = resolve_object_store_handle() else {
+    let context = current_app_context();
+    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
         warn!(
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_KMS,
@@ -139,7 +144,7 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
         return None;
     };
 
-    match read_config(store, KMS_CONFIG_PATH).await {
+    match read_admin_config(store, KMS_CONFIG_PATH).await {
         Ok(data) => match serde_json::from_slice::<KmsConfig>(&data) {
             Ok(config) => {
                 info!(

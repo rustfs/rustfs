@@ -42,7 +42,7 @@ tokio-postgres-rustls = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
-uuid = { workspace = true, features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 rustfs-kafka-async = { workspace = true }
 mysql_async = { workspace = true }
@@ -55,6 +55,7 @@ metrics = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = { workspace = true }
+rcgen = { workspace = true }
 
 [[bench]]
 name = "queue_store_benchmark"

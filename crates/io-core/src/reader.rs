@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy object reader implementation.
+//! Bytes-backed object reader implementation.
 
 use bytes::Bytes;
 use std::io;
@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
-/// Errors that can occur during zero-copy read operations.
+/// Errors that can occur during Bytes-backed read operations.
 #[derive(Debug, Clone)]
 pub enum ZeroCopyReadError {
     /// I/O error occurred.
@@ -49,33 +49,41 @@ impl From<io::Error> for ZeroCopyReadError {
     }
 }
 
-/// Zero-copy object reader.
+/// Bytes-backed object reader.
 ///
-/// This reader provides zero-copy access to object data by using:
-/// - Memory-mapped files for on-disk data
-/// - Bytes wrapping for in-memory data
-/// - Reference counting to avoid copies
+/// `from_bytes` wraps existing `Bytes` without copying, but file constructors
+/// copy file data into owned `Bytes` after mmap or normal reads.
 ///
 /// # Example
 ///
 /// ```ignore
-/// // Create from bytes (zero-copy)
+/// use bytes::Bytes;
+/// use rustfs_io_core::BytesBufferedReader;
+///
+/// // Create from bytes without copying the `Bytes` buffer
 /// let data = Bytes::from("hello world");
-/// let reader = ZeroCopyObjectReader::from_bytes(data);
+/// let reader = BytesBufferedReader::from_bytes(data);
 ///
 /// // Read using AsyncRead trait
 /// let mut buf = vec![0u8; 1024];
 /// let n = reader.read(&mut buf[..]).await?;
 /// ```
-pub struct ZeroCopyObjectReader {
+pub struct BytesBufferedReader {
     /// Internal data source (could be mmap or owned bytes)
     data: Bytes,
     /// Current read position
     pos: usize,
 }
 
-impl ZeroCopyObjectReader {
-    /// Create a zero-copy reader from existing bytes.
+/// Historical name for the bytes-backed object reader.
+#[deprecated(
+    since = "1.0.0-beta.8",
+    note = "use BytesBufferedReader; file constructors copy into owned Bytes"
+)]
+pub type ZeroCopyObjectReader = BytesBufferedReader;
+
+impl BytesBufferedReader {
+    /// Create a reader from existing bytes.
     ///
     /// This is a true zero-copy operation - the Bytes are wrapped
     /// without any allocation or copying.
@@ -88,26 +96,26 @@ impl ZeroCopyObjectReader {
     ///
     /// ```ignore
     /// let data = Bytes::from("hello world");
-    /// let reader = ZeroCopyObjectReader::from_bytes(data);
+    /// let reader = BytesBufferedReader::from_bytes(data);
     /// ```
     pub fn from_bytes(data: Bytes) -> Self {
         Self { data, pos: 0 }
     }
 
-    /// Create a zero-copy reader from a file using mmap.
+    /// Create a Bytes-backed reader from a file using mmap-then-copy.
     ///
-    /// This uses memory mapping to avoid loading the entire file into memory.
-    /// Only the accessed pages are loaded on demand.
+    /// This maps the requested file range and copies it into owned `Bytes`
+    /// before returning. It does not expose the mmap as a zero-copy buffer.
     ///
     /// # Arguments
     ///
     /// * `path` - Path to the file to memory map
     /// * `offset` - Offset within the file to start reading
-    /// * `size` - Number of bytes to map
+    /// * `size` - Number of bytes to read
     ///
     /// # Returns
     ///
-    /// A reader that provides zero-copy access to the file data.
+    /// A reader backed by copied file data.
     ///
     /// # Errors
     ///
@@ -116,7 +124,7 @@ impl ZeroCopyObjectReader {
     /// # Example
     ///
     /// ```ignore
-    /// let reader = ZeroCopyObjectReader::from_file_mmap_path("large_file.bin", 0, 1024).await?;
+    /// let reader = BytesBufferedReader::from_file_mmap_path("large_file.bin", 0, 1024).await?;
     /// ```
     #[cfg(unix)]
     // SAFETY: The mmap is created from a read-only file handle for the
@@ -148,37 +156,35 @@ impl ZeroCopyObjectReader {
         .map_err(|e| ZeroCopyReadError::Io(e.to_string()))?
     }
 
-    /// Create a zero-copy reader from a file using mmap.
+    /// Create a Bytes-backed reader from a file using normal reads.
     ///
-    /// This uses memory mapping to avoid loading the entire file into memory.
-    /// Only the accessed pages are loaded on demand.
+    /// This path reads the requested range into an owned buffer and wraps it in
+    /// `Bytes`. It does not perform mmap or zero-copy file I/O.
     ///
     /// # Arguments
     ///
-    /// * `file` - File to memory map
+    /// * `file` - File to read from
     /// * `offset` - Offset within the file to start reading
     /// * `size` - Number of bytes to map
     ///
     /// # Returns
     ///
-    /// A reader that provides zero-copy access to the file data.
+    /// A reader backed by copied file data.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be memory mapped.
+    /// Returns an error if the file cannot be read.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let file = tokio::fs::File::open("large_file.bin").await?;
-    /// let reader = ZeroCopyObjectReader::from_file_mmap(&file, 0, 1024).await?;
+    /// let reader = BytesBufferedReader::from_file_read(&file, 0, 1024).await?;
     /// ```
     #[cfg(unix)]
-    pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
+    pub async fn from_file_read(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
-        // For mmap, we need the file path - fall back to regular read if not available
-        // This is a simplified implementation
         let mut cloned = file.try_clone().await?;
         cloned.seek(SeekFrom::Start(offset)).await?;
 
@@ -191,11 +197,11 @@ impl ZeroCopyObjectReader {
         })
     }
 
-    /// Create a zero-copy reader from a file (non-Unix fallback).
+    /// Create a Bytes-backed reader from a file (non-Unix fallback).
     ///
     /// On platforms that don't support mmap, this falls back to regular file I/O.
     #[cfg(not(unix))]
-    pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
+    pub async fn from_file_read(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
         let mut cloned = file.try_clone().await?;
@@ -208,6 +214,15 @@ impl ZeroCopyObjectReader {
             data: Bytes::from(buffer),
             pos: 0,
         })
+    }
+
+    /// Historical name for `from_file_read`.
+    #[deprecated(
+        since = "1.0.0-beta.8",
+        note = "use from_file_read; this method performs normal reads into owned Bytes"
+    )]
+    pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
+        Self::from_file_read(file, offset, size).await
     }
 
     /// Get the remaining data as Bytes (zero-copy).
@@ -241,7 +256,7 @@ impl ZeroCopyObjectReader {
     }
 }
 
-impl AsyncRead for ZeroCopyObjectReader {
+impl AsyncRead for BytesBufferedReader {
     fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let remaining = self.data.len() - self.pos;
         if remaining == 0 {
@@ -257,9 +272,9 @@ impl AsyncRead for ZeroCopyObjectReader {
     }
 }
 
-impl std::fmt::Debug for ZeroCopyObjectReader {
+impl std::fmt::Debug for BytesBufferedReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ZeroCopyObjectReader")
+        f.debug_struct("BytesBufferedReader")
             .field("data_len", &self.data.len())
             .field("pos", &self.pos)
             .field("remaining", &(self.data.len() - self.pos))
@@ -270,12 +285,21 @@ impl std::fmt::Debug for ZeroCopyObjectReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tokio::io::AsyncReadExt;
+
+    fn temp_file_path(test_name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rustfs-io-core-{test_name}-{}-{nonce}", std::process::id()))
+    }
 
     #[tokio::test]
     async fn test_from_bytes() {
         let data = Bytes::from("hello world");
-        let mut reader = ZeroCopyObjectReader::from_bytes(data.clone());
+        let mut reader = BytesBufferedReader::from_bytes(data.clone());
 
         let mut buf = [0u8; 11];
         let n = reader.read(&mut buf[..]).await.unwrap();
@@ -285,9 +309,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_preferred_reader_alias() {
+        let data = Bytes::from("hello world");
+        let mut reader = BytesBufferedReader::from_bytes(data);
+
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf[..]).await.expect("read bytes from alias");
+
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_from_file_read_reads_requested_range() {
+        let path = temp_file_path("from-file-read");
+        tokio::fs::write(&path, b"hello world")
+            .await
+            .expect("write temp file for reader test");
+
+        let file = tokio::fs::File::open(&path).await.expect("open temp file for reader test");
+        let mut reader = BytesBufferedReader::from_file_read(&file, 6, 5)
+            .await
+            .expect("read requested range into Bytes");
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.expect("drain reader output");
+
+        assert_eq!(output, b"world");
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_from_file_mmap_legacy_alias_reads_requested_range() {
+        let path = temp_file_path("from-file-mmap");
+        tokio::fs::write(&path, b"hello world")
+            .await
+            .expect("write temp file for legacy reader test");
+
+        let file = tokio::fs::File::open(&path)
+            .await
+            .expect("open temp file for legacy reader test");
+        let mut reader = BytesBufferedReader::from_file_mmap(&file, 0, 5)
+            .await
+            .expect("read requested range through legacy alias");
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.expect("drain legacy reader output");
+
+        assert_eq!(output, b"hello");
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
     async fn test_remaining_bytes() {
         let data = Bytes::from("hello world");
-        let reader = ZeroCopyObjectReader::from_bytes(data);
+        let reader = BytesBufferedReader::from_bytes(data);
 
         let remaining = reader.remaining_bytes();
         assert_eq!(remaining.len(), 11);
@@ -297,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn test_position() {
         let data = Bytes::from("hello world");
-        let mut reader = ZeroCopyObjectReader::from_bytes(data);
+        let mut reader = BytesBufferedReader::from_bytes(data);
 
         assert_eq!(reader.position(), 0);
 
@@ -310,11 +389,24 @@ mod tests {
     #[tokio::test]
     async fn test_is_empty() {
         let data = Bytes::from("");
-        let reader = ZeroCopyObjectReader::from_bytes(data);
+        let reader = BytesBufferedReader::from_bytes(data);
         assert!(reader.is_empty());
 
         let data = Bytes::from("hello");
-        let reader = ZeroCopyObjectReader::from_bytes(data);
+        let reader = BytesBufferedReader::from_bytes(data);
         assert!(!reader.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_legacy_reader_alias() {
+        let data = Bytes::from("hello world");
+        let mut reader = ZeroCopyObjectReader::from_bytes(data);
+
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf[..]).await.expect("read bytes through legacy alias");
+
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], b"hello");
     }
 }

@@ -391,7 +391,19 @@ where
             }
 
             let ciphertext_buf = &this.ciphertext_buf[..*this.ciphertext_len];
-            let (plaintext_len, uvarint_len) = rustfs_utils::uvarint(&ciphertext_buf[0..16]);
+            // `ciphertext_buf`'s length derives from the untrusted 24-bit header length field, so
+            // it can be shorter than 16 bytes. `uvarint` is safe on any slice length, so pass the
+            // whole slice instead of a fixed `[0..16]` index that panics on corrupted/truncated
+            // blocks shorter than 16 bytes.
+            // `uvarint_len <= 0` means the length varint was empty/unterminated (0) or overflowed
+            // (negative — as usize it would index far past the buffer). The `> len` bound is
+            // belt-and-suspenders (a positive return is always <= buf.len()).
+            let (plaintext_len, uvarint_len) = rustfs_utils::uvarint(ciphertext_buf);
+            if uvarint_len <= 0 || uvarint_len as usize > ciphertext_buf.len() {
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
+                return Poll::Ready(Err(Error::new(std::io::ErrorKind::InvalidData, "Invalid encrypted block length prefix")));
+            }
             let ciphertext = &ciphertext_buf[uvarint_len as usize..];
             let block_nonce = derive_block_nonce(this.current_nonce_base, *this.block_index);
             let nonce = Nonce::try_from(block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
@@ -636,7 +648,10 @@ mod tests {
         let reader = BufReader::new(Cursor::new(data.to_vec()));
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
         encrypted
     }
 
@@ -674,14 +689,20 @@ mod tests {
         // Encrypt
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         // Decrypt using DecryptReader
         let reader = Cursor::new(encrypted.clone());
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(&decrypted, data);
     }
@@ -700,7 +721,10 @@ mod tests {
         let encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         // Now test DecryptReader
 
@@ -708,7 +732,10 @@ mod tests {
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(&decrypted, data);
     }
@@ -728,13 +755,19 @@ mod tests {
         let encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = std::io::Cursor::new(encrypted.clone());
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(&decrypted, &data);
     }
@@ -752,12 +785,18 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = ChunkedCursor::new(encrypted, 3);
         let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(decrypted, data);
     }
@@ -775,12 +814,18 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = PendingChunkedCursor::new(encrypted, 3);
         let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(decrypted, data);
     }
@@ -798,7 +843,10 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = ChunkedCursor::new(encrypted, 8192);
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
@@ -806,7 +854,7 @@ mod tests {
 
         let mut decrypted = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.unwrap();
+            let bytes = chunk.expect("operation should succeed");
             decrypted.extend_from_slice(&bytes);
         }
 
@@ -826,7 +874,10 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = ChunkedCursor::new(encrypted, 8192);
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
@@ -835,7 +886,7 @@ mod tests {
 
         let mut decrypted = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.unwrap();
+            let bytes = chunk.expect("operation should succeed");
             decrypted.extend_from_slice(&bytes);
         }
 
@@ -857,7 +908,10 @@ mod tests {
             let reader = BufReader::new(Cursor::new(data.to_vec()));
             let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
             let mut encrypted = Vec::new();
-            encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+            encrypt_reader
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("operation should succeed");
             encrypted
         }
 
@@ -871,7 +925,10 @@ mod tests {
         let reader = BufReader::new(Cursor::new(combined));
         let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce, vec![1, 2]);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         let mut expected = Vec::with_capacity(part_one.len() + part_two.len());
         expected.extend_from_slice(&part_one);
@@ -891,7 +948,10 @@ mod tests {
         let reader = Cursor::new(data);
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.unwrap();
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let payloads = extract_encrypted_payloads(&encrypted);
         assert!(payloads.len() >= 2);
@@ -920,7 +980,10 @@ mod tests {
         let reader = Cursor::new(encrypted);
         let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(decrypted, data);
     }
@@ -945,12 +1008,41 @@ mod tests {
         let reader = BufReader::new(Cursor::new(combined));
         let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce, vec![1, 2]);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.unwrap();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         let mut expected = Vec::with_capacity(part_one.len() + part_two.len());
         expected.extend_from_slice(&part_one);
         expected.extend_from_slice(&part_two);
 
         assert_eq!(decrypted, expected);
+    }
+
+    // Regression: a corrupted block header whose length yields a payload shorter than 16 bytes
+    // must not panic. Header (8 bytes): [typ, len_lo, len_mid, len_hi, crc0..crc3]; payload is
+    // `len - 4` bytes. Pre-fix, poll_read sliced `ciphertext_buf[0..16]` unconditionally,
+    // panicking with "range end index 16 out of range for slice of length N" when N < 16.
+    #[tokio::test]
+    async fn test_decrypt_reader_short_block_no_panic() {
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+
+        // len = 8 -> payload_len = 4 (< 16). Provide exactly 4 payload bytes.
+        let len: usize = 8;
+        let mut input = vec![
+            0x00u8, // typ (regular block)
+            (len & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            ((len >> 16) & 0xFF) as u8,
+        ];
+        input.extend_from_slice(&[0u8; 4]); // crc (unused before the panic site)
+        input.extend_from_slice(&[0x01u8, 0x02, 0x03, 0x04]); // 4-byte payload
+
+        let mut decrypt_reader = DecryptReader::new(Cursor::new(input), key, nonce);
+        let mut out = Vec::new();
+        let res = decrypt_reader.read_to_end(&mut out).await;
+        assert!(res.is_err(), "corrupted short encrypted block must return an error, not panic");
     }
 }

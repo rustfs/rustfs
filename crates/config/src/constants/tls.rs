@@ -124,14 +124,47 @@ pub const ENV_H2_KEEP_ALIVE_TIMEOUT: &str = "RUSTFS_H2_KEEP_ALIVE_TIMEOUT";
 pub const DEFAULT_H2_KEEP_ALIVE_TIMEOUT: u64 = 10;
 
 /// Environment variable for HTTP/1.1 header read timeout (seconds)
-/// Default: 5
+/// Default: 75
+///
+/// In hyper's HTTP/1.1 stack this timeout is armed as soon as the connection is
+/// ready to read the *next* request head, so on a keep-alive connection it also
+/// bounds how long an idle upstream connection is allowed to sit before RustFS
+/// closes it. Reverse proxies (Caddy, Nginx) pool upstream connections and keep
+/// them idle far longer than a few seconds (Caddy ≈ 2 min, Nginx = 60 s by
+/// default). A short value here makes RustFS FIN pooled connections while the
+/// proxy still believes they are alive; the proxy then reuses a dead socket and
+/// the client sees `socket hang up` / connection reset — most visibly on
+/// non-idempotent `PUT` uploads, which proxies will not transparently retry
+/// (see issue #3076).
+///
+/// The default is therefore set above common proxy idle-keepalive windows.
+/// Operators fronting RustFS with a proxy should keep this larger than the
+/// proxy's upstream idle-keepalive, or lower the proxy's keepalive below this
+/// value. Environments that expose RustFS directly to untrusted slow clients and
+/// want tighter slowloris protection can lower it via the env var below.
 pub const ENV_HTTP1_HEADER_READ_TIMEOUT: &str = "RUSTFS_HTTP1_HEADER_READ_TIMEOUT";
-pub const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: u64 = 5;
+pub const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: u64 = 75;
 
 /// Environment variable for HTTP/1.1 max buffer size (bytes)
 /// Default: 65536 (64 KB)
 pub const ENV_HTTP1_MAX_BUF_SIZE: &str = "RUSTFS_HTTP1_MAX_BUF_SIZE";
 pub const DEFAULT_HTTP1_MAX_BUF_SIZE: usize = 64 * 1024; // 64 KB
+
+/// Environment variable for the S3 request-body inter-chunk read timeout
+/// (seconds). Default: 300. Set to 0 to disable.
+///
+/// This bounds how long a `PutObject`/upload may wait for the *next* body chunk
+/// while more bytes are still expected. It resets on every chunk, so it does not
+/// penalize slow-but-progressing uploads — it only fires when a peer sends a
+/// partial body and then goes silent *without* closing the connection (no EOF).
+/// A reverse proxy or CDN that forwards a truncated body this way would
+/// otherwise make RustFS wait forever for bytes that never arrive; with this
+/// timeout the stalled read is aborted and logged with the received/expected
+/// byte counts, turning a silent hang into an actionable diagnostic (issue
+/// #3076). A short-body that arrives with a proper EOF is already rejected
+/// promptly and is unaffected by this setting.
+pub const ENV_HTTP_REQUEST_BODY_READ_TIMEOUT: &str = "RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT";
+pub const DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT: u64 = 300;
 
 // ── TLS Hot Reload Parameters ──
 

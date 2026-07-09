@@ -47,6 +47,12 @@ pub struct LiveEventBatch {
     pub events: Vec<Arc<Event>>,
     pub next_sequence: u64,
     pub truncated: bool,
+    /// Set when the consumer's cursor is older than the oldest event still
+    /// retained in the ring buffer: events between the cursor and the oldest
+    /// retained sequence were evicted and can never be delivered. Consumers
+    /// must treat a `gap` as lost events (e.g. trigger a full re-sync/alert)
+    /// instead of assuming the returned batch is contiguous with their cursor.
+    pub gap: bool,
 }
 
 /// Notify the system of monitoring indicators
@@ -438,6 +444,7 @@ mod tests {
 
         assert_eq!(batch.next_sequence, 2);
         assert!(!batch.truncated);
+        assert!(!batch.gap);
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].s3.object.key, "two");
     }
@@ -452,6 +459,7 @@ mod tests {
 
         assert_eq!(batch.next_sequence, 1);
         assert!(batch.truncated);
+        assert!(!batch.gap);
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].s3.object.key, "one");
     }
@@ -473,5 +481,6 @@ mod tests {
         assert_eq!(batch.events[0].s3.object.key, "object");
         assert_eq!(batch.next_sequence, 1);
         assert!(!batch.truncated);
+        assert!(!batch.gap);
     }
 }

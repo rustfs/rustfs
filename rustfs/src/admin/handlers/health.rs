@@ -15,15 +15,19 @@
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::{
-    HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
-    collect_dependency_readiness_report as collect_runtime_dependency_readiness_report,
+    HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, build_health_response_parts,
+    collect_probe_readiness, probe_from_path,
+};
+#[cfg(test)]
+use crate::server::{
+    HealthPayloadContext, HealthProbe, HealthReadinessSource, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH,
+    MINIO_HEALTH_READY_PATH, build_component_details, build_health_payload, health_check_state, readiness_source_for_probe,
 };
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result};
-use serde_json::{Value, json};
 
 pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
@@ -44,189 +48,6 @@ pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
 /// Health check handler for endpoint monitoring
 pub struct HealthCheckHandler {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HealthCheckState {
-    pub(crate) status_code: StatusCode,
-    pub(crate) status: &'static str,
-    pub(crate) ready: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HealthProbe {
-    Liveness,
-    Readiness,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HealthResponseParts {
-    pub(crate) status_code: StatusCode,
-    pub(crate) payload: Option<Value>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HealthPayloadContext<'a> {
-    pub(crate) health: HealthCheckState,
-    pub(crate) storage_ready: bool,
-    pub(crate) iam_ready: bool,
-    pub(crate) lock_quorum_ready: bool,
-    pub(crate) degraded_reasons: &'a [crate::server::ReadinessDegradedReason],
-    pub(crate) service: &'a str,
-    pub(crate) uptime: Option<u64>,
-    pub(crate) kms_ready: Option<bool>,
-}
-
-pub(crate) async fn collect_dependency_readiness() -> crate::server::DependencyReadinessReport {
-    collect_runtime_dependency_readiness_report().await
-}
-
-pub(crate) fn health_check_state(
-    storage_ready: bool,
-    iam_ready: bool,
-    lock_quorum_ready: bool,
-    probe: HealthProbe,
-) -> HealthCheckState {
-    let ready = storage_ready && iam_ready && lock_quorum_ready;
-    let status = if ready { "ok" } else { "degraded" };
-
-    let status_code = match probe {
-        HealthProbe::Liveness => StatusCode::OK,
-        HealthProbe::Readiness if ready => StatusCode::OK,
-        HealthProbe::Readiness => StatusCode::SERVICE_UNAVAILABLE,
-    };
-
-    HealthCheckState {
-        status_code,
-        status,
-        ready,
-    }
-}
-
-pub(crate) fn health_minimal_response_enabled() -> bool {
-    rustfs_utils::get_env_bool(
-        rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE,
-        rustfs_config::DEFAULT_HEALTH_MINIMAL_RESPONSE_ENABLE,
-    )
-}
-
-pub(crate) fn build_component_details(
-    storage_ready: bool,
-    iam_ready: bool,
-    lock_quorum_ready: bool,
-    kms_ready: Option<bool>,
-) -> Value {
-    let mut details = json!({
-        "storage": {
-            "status": if storage_ready { "connected" } else { "disconnected" },
-            "ready": storage_ready,
-        },
-        "iam": {
-            "status": if iam_ready { "connected" } else { "disconnected" },
-            "ready": iam_ready,
-        },
-        "lock": {
-            "status": if lock_quorum_ready { "connected" } else { "disconnected" },
-            "ready": lock_quorum_ready,
-        }
-    });
-
-    if let Some(kms_ready) = kms_ready {
-        details["kms"] = json!({
-            "status": if kms_ready { "connected" } else { "disconnected" },
-            "ready": kms_ready,
-        });
-    }
-
-    details
-}
-
-pub(crate) fn build_degraded_reasons(reasons: &[crate::server::ReadinessDegradedReason]) -> Value {
-    Value::Array(
-        reasons
-            .iter()
-            .map(|reason| Value::String(reason.as_str().to_string()))
-            .collect(),
-    )
-}
-
-pub(crate) fn probe_from_path(path: &str) -> HealthProbe {
-    if path == HEALTH_READY_PATH {
-        HealthProbe::Readiness
-    } else {
-        HealthProbe::Liveness
-    }
-}
-
-pub(crate) fn build_health_response_parts(
-    method: Method,
-    probe: HealthProbe,
-    readiness_report: &crate::server::DependencyReadinessReport,
-    service: &str,
-    uptime: Option<u64>,
-    kms_ready: Option<bool>,
-) -> HealthResponseParts {
-    let storage_ready = readiness_report.readiness.storage_ready;
-    let iam_ready = readiness_report.readiness.iam_ready;
-    let lock_quorum_ready = readiness_report.readiness.lock_quorum_ready;
-    let mut health = health_check_state(storage_ready, iam_ready, lock_quorum_ready, probe);
-    let mut degraded_reasons = readiness_report.degraded_reasons.clone();
-
-    if probe == HealthProbe::Readiness && matches!(kms_ready, Some(false)) {
-        health = HealthCheckState {
-            status_code: StatusCode::SERVICE_UNAVAILABLE,
-            status: "degraded",
-            ready: false,
-        };
-        if !degraded_reasons.contains(&crate::server::ReadinessDegradedReason::KmsNotReady) {
-            degraded_reasons.push(crate::server::ReadinessDegradedReason::KmsNotReady);
-        }
-    }
-
-    let payload = if method == Method::HEAD {
-        None
-    } else {
-        Some(build_health_payload(HealthPayloadContext {
-            health,
-            storage_ready,
-            iam_ready,
-            lock_quorum_ready,
-            degraded_reasons: &degraded_reasons,
-            service,
-            uptime,
-            kms_ready,
-        }))
-    };
-
-    HealthResponseParts {
-        status_code: health.status_code,
-        payload,
-    }
-}
-
-pub(crate) fn build_health_payload(ctx: HealthPayloadContext<'_>) -> Value {
-    if health_minimal_response_enabled() {
-        return json!({
-            "status": ctx.health.status,
-            "ready": ctx.health.ready,
-        });
-    }
-
-    let mut payload = json!({
-        "status": ctx.health.status,
-        "ready": ctx.health.ready,
-        "service": ctx.service,
-        "timestamp": jiff::Zoned::now().to_string(),
-        "version": env!("CARGO_PKG_VERSION"),
-        "details": build_component_details(ctx.storage_ready, ctx.iam_ready, ctx.lock_quorum_ready, ctx.kms_ready),
-        "degradedReasons": build_degraded_reasons(ctx.degraded_reasons),
-    });
-
-    if let Some(uptime) = ctx.uptime {
-        payload["uptime"] = json!(uptime);
-    }
-
-    payload
-}
-
 #[async_trait::async_trait]
 impl Operation for HealthCheckHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -245,9 +66,10 @@ impl Operation for HealthCheckHandler {
         }
 
         let probe = probe_from_path(req.uri.path());
-        let readiness_report = collect_dependency_readiness().await;
+        let readiness_report = collect_probe_readiness(probe).await;
 
-        let response_parts = build_health_response_parts(method.clone(), probe, &readiness_report, "rustfs-endpoint", None, None);
+        let response_parts =
+            build_health_response_parts(method.clone(), probe, readiness_report.as_ref(), "rustfs-endpoint", None, None);
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -270,7 +92,7 @@ mod tests {
 
     #[test]
     fn test_readiness_state_ready() {
-        let state = health_check_state(true, true, true, HealthProbe::Readiness);
+        let state = health_check_state(true, true, true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::OK);
         assert_eq!(state.status, "ok");
         assert!(state.ready);
@@ -278,7 +100,7 @@ mod tests {
 
     #[test]
     fn test_readiness_state_storage_not_ready() {
-        let state = health_check_state(false, true, true, HealthProbe::Readiness);
+        let state = health_check_state(false, true, true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -286,15 +108,15 @@ mod tests {
 
     #[test]
     fn test_liveness_state_iam_not_ready() {
-        let state = health_check_state(true, false, true, HealthProbe::Liveness);
+        let state = health_check_state(true, false, true, true, HealthProbe::Liveness);
         assert_eq!(state.status_code, StatusCode::OK);
-        assert_eq!(state.status, "degraded");
-        assert!(!state.ready);
+        assert_eq!(state.status, "ok");
+        assert!(state.ready);
     }
 
     #[test]
     fn test_readiness_state_iam_not_ready() {
-        let state = health_check_state(true, false, true, HealthProbe::Readiness);
+        let state = health_check_state(true, false, true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -302,7 +124,15 @@ mod tests {
 
     #[test]
     fn test_readiness_state_lock_not_ready() {
-        let state = health_check_state(true, true, false, HealthProbe::Readiness);
+        let state = health_check_state(true, true, false, true, HealthProbe::Readiness);
+        assert_eq!(state.status_code, StatusCode::OK);
+        assert_eq!(state.status, "ok");
+        assert!(state.ready);
+    }
+
+    #[test]
+    fn test_cluster_write_state_lock_not_ready() {
+        let state = health_check_state(true, true, false, true, HealthProbe::ClusterWrite);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -331,6 +161,27 @@ mod tests {
     #[test]
     fn test_probe_from_path_readiness() {
         assert_eq!(probe_from_path(HEALTH_READY_PATH), HealthProbe::Readiness);
+        assert_eq!(probe_from_path(MINIO_HEALTH_READY_PATH), HealthProbe::Readiness);
+        assert_eq!(probe_from_path(MINIO_HEALTH_CLUSTER_PATH), HealthProbe::ClusterWrite);
+        assert_eq!(probe_from_path(MINIO_HEALTH_CLUSTER_READ_PATH), HealthProbe::ClusterRead);
+    }
+
+    #[test]
+    fn test_readiness_probe_uses_node_collector_only() {
+        assert_eq!(readiness_source_for_probe(HealthProbe::Readiness), Some(HealthReadinessSource::Node));
+        assert_eq!(readiness_source_for_probe(HealthProbe::Liveness), None);
+    }
+
+    #[test]
+    fn test_cluster_probes_use_cluster_collectors() {
+        assert_eq!(
+            readiness_source_for_probe(HealthProbe::ClusterWrite),
+            Some(HealthReadinessSource::ClusterWrite)
+        );
+        assert_eq!(
+            readiness_source_for_probe(HealthProbe::ClusterRead),
+            Some(HealthReadinessSource::ClusterRead)
+        );
     }
 
     #[test]
@@ -346,11 +197,18 @@ mod tests {
                 storage_ready: false,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageQuorumUnavailable],
         };
-        let parts =
-            build_health_response_parts(Method::GET, HealthProbe::Readiness, &readiness_report, "rustfs-endpoint", None, None);
+        let parts = build_health_response_parts(
+            Method::GET,
+            HealthProbe::Readiness,
+            Some(&readiness_report),
+            "rustfs-endpoint",
+            None,
+            None,
+        );
         assert_eq!(parts.status_code, StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -361,11 +219,18 @@ mod tests {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
         };
-        let parts =
-            build_health_response_parts(Method::GET, HealthProbe::Readiness, &readiness_report, "rustfs-endpoint", None, None);
+        let parts = build_health_response_parts(
+            Method::GET,
+            HealthProbe::Readiness,
+            Some(&readiness_report),
+            "rustfs-endpoint",
+            None,
+            None,
+        );
         assert_eq!(parts.status_code, StatusCode::OK);
     }
 
@@ -376,12 +241,24 @@ mod tests {
                 storage_ready: false,
                 iam_ready: false,
                 lock_quorum_ready: false,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
         };
-        let parts =
-            build_health_response_parts(Method::GET, HealthProbe::Liveness, &readiness_report, "rustfs-endpoint", None, None);
+        let parts = build_health_response_parts(
+            Method::GET,
+            HealthProbe::Liveness,
+            Some(&readiness_report),
+            "rustfs-endpoint",
+            None,
+            None,
+        );
         assert_eq!(parts.status_code, StatusCode::OK);
+        let payload = parts.payload.expect("GET should include payload");
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["ready"], true);
+        assert!(payload.get("details").is_none());
+        assert!(payload.get("degradedReasons").is_none());
     }
 
     #[test]
@@ -391,18 +268,25 @@ mod tests {
                 storage_ready: false,
                 iam_ready: false,
                 lock_quorum_ready: false,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
         };
-        let parts =
-            build_health_response_parts(Method::HEAD, HealthProbe::Readiness, &readiness_report, "rustfs-endpoint", None, None);
+        let parts = build_health_response_parts(
+            Method::HEAD,
+            HealthProbe::Readiness,
+            Some(&readiness_report),
+            "rustfs-endpoint",
+            None,
+            None,
+        );
         assert_eq!(parts.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert!(parts.payload.is_none());
     }
 
     #[test]
     fn test_build_health_payload_minimal_mode_returns_status_and_ready_only() {
-        let health = health_check_state(true, false, true, HealthProbe::Readiness);
+        let health = health_check_state(true, false, true, true, HealthProbe::Readiness);
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("true"), || {
             let payload = build_health_payload(HealthPayloadContext {
                 health,
@@ -413,6 +297,7 @@ mod tests {
                 service: "rustfs-endpoint",
                 uptime: Some(123),
                 kms_ready: None,
+                include_dependency_details: true,
             });
             assert_eq!(payload["status"], "degraded");
             assert_eq!(payload["ready"], false);
@@ -425,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_build_health_payload_includes_degraded_reasons() {
-        let health = health_check_state(false, false, false, HealthProbe::Readiness);
+        let health = health_check_state(false, false, false, true, HealthProbe::Readiness);
         let payload = build_health_payload(HealthPayloadContext {
             health,
             storage_ready: false,
@@ -435,6 +320,7 @@ mod tests {
             service: "rustfs-endpoint",
             uptime: None,
             kms_ready: None,
+            include_dependency_details: true,
         });
         assert_eq!(payload["degradedReasons"][0], "storage_and_iam_unavailable");
     }
@@ -446,10 +332,12 @@ mod tests {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
         };
-        let parts = build_health_response_parts(Method::HEAD, HealthProbe::Readiness, &report, "rustfs-endpoint", None, None);
+        let parts =
+            build_health_response_parts(Method::HEAD, HealthProbe::Readiness, Some(&report), "rustfs-endpoint", None, None);
         assert_eq!(parts.status_code, StatusCode::OK);
         assert!(parts.payload.is_none());
     }
@@ -461,10 +349,12 @@ mod tests {
                 storage_ready: false,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageQuorumUnavailable],
         };
-        let parts = build_health_response_parts(Method::GET, HealthProbe::Readiness, &report, "rustfs-endpoint", None, None);
+        let parts =
+            build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs-endpoint", None, None);
         assert_eq!(parts.status_code, StatusCode::SERVICE_UNAVAILABLE);
         let payload = parts.payload.expect("GET should include payload");
         assert_eq!(payload["status"], "degraded");
@@ -479,11 +369,12 @@ mod tests {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
         };
         let parts =
-            build_health_response_parts(Method::GET, HealthProbe::Readiness, &report, "rustfs-endpoint", None, Some(false));
+            build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs-endpoint", None, Some(false));
         assert_eq!(parts.status_code, StatusCode::SERVICE_UNAVAILABLE);
         let payload = parts.payload.expect("GET should include payload");
         assert_eq!(payload["ready"], false);

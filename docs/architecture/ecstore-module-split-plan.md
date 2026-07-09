@@ -1,0 +1,320 @@
+# ECStore Module Split Plan
+
+This plan records the remaining ECStore split work after the final audit
+remediation pass. Runtime movement must still wait until each candidate
+boundary has explicit contracts, compatibility coverage, dependency evidence,
+and rollback steps.
+
+## Current Shape
+
+| Area | Current owner | Size | Split status |
+|---|---|---:|---|
+| Bucket lifecycle | `crates/lifecycle/` + `crates/ecstore/src/bucket/lifecycle/` | core contracts + ECStore runtime | Core contract extracted |
+| Bucket replication | `crates/ecstore/src/bucket/replication/` | 8,730 lines | Proposal only |
+| Set disks | `crates/ecstore/src/set_disk/` | state carrier plus operation modules | Keep in ECStore |
+| Public ECStore facade | `crates/ecstore/src/api/mod.rs` | broad compatibility surface | Shrink only through guarded PRs |
+
+The file split inside `set_disk/` is already operation-oriented: read, write,
+list, multipart, lock, heal, and replication code live in separate modules.
+The remaining large surface is the shared `SetDisks` state and cross-cutting
+contracts, not only file layout.
+
+## Non-Negotiable Rules
+
+- Do not split crates in the same PR that moves runtime state or changes
+  startup behavior.
+- Do not change object placement, quorum, reader semantics, lifecycle queues,
+  replication queues, notification dispatch, audit events, or scanner repair
+  behavior during inventory and contract PRs.
+- Do not expose new direct ECStore internals to outer crates; use the existing
+  storage-api and owner-local facade boundaries.
+- Keep `rustfs_ecstore::api` compatibility visible until each consumer path has
+  compile coverage and an explicit replacement.
+
+## SetDisks Split Direction
+
+Do not replace `SetDisks` with several runtime structs in one change. The safe
+path is:
+
+1. Keep `SetDisks` as the shared state carrier while operation modules continue
+   to own read/write/list/multipart/lock/heal/replication behavior.
+2. Extract pure contracts first: shard source, disk error, bitrot IO, namespace
+   lock, metrics labels, and file metadata access.
+3. Move one operation family only after its contracts are covered by focused
+   tests and the facade compatibility path is explicit.
+4. Preserve the old `rustfs_ecstore::api::set_disk` surface until downstream
+   compatibility tests prove no caller depends on removed names.
+
+The first executable SetDisks follow-up should be an inventory or guardrail PR,
+not a runtime split PR.
+
+## Lifecycle Candidate
+
+`rustfs-lifecycle` now owns the pure lifecycle rule, event, evaluator, tag
+filtering, object-lock metadata check, and expiry-time contracts. ECStore keeps
+the object-store runtime, queues, tiering, audit/notification, metadata, and
+replication scheduling adapters.
+
+Current coupling:
+
+- lifecycle workers and transition state read ECStore runtime sources for
+  object-store handles, expiry state, transition state, tier config, deployment
+  IDs, and local node names;
+- stale multipart cleanup depends on `SetDisks` internals and bucket metadata
+  through the lifecycle metadata boundary;
+- lifecycle expiry schedules bucket replication delete work through the
+  replication lifecycle bridge contract;
+- lifecycle evaluation uses S3 DTOs and replication status contracts from the
+  independent `rustfs-lifecycle`/`rustfs-replication` crates, while ECStore maps
+  `ObjectInfo` into lifecycle object options at the compatibility boundary;
+- lifecycle runtime still coordinates scanner metrics, notification/audit side
+  effects, metadata access, replication delete scheduling, and tier services.
+
+Current extracted contracts:
+
+- `LifecycleCrateCoreIndependence`: lifecycle rule validation, filtering,
+  event evaluation, transition/expiration options, tag decoding, object-lock
+  metadata checks, and ILM expiry-time rounding live in `rustfs-lifecycle`.
+  `rustfs-lifecycle` must not import ECStore internals, file metadata, or
+  `rustfs-utils`; ECStore owns the `ObjectInfo` adapter in
+  `crates/ecstore/src/bucket/lifecycle/core.rs`.
+
+Required contracts before crate movement:
+
+- `LifecycleObjectStore`: object stat, delete, transition, restore, multipart
+  cleanup, and version-aware metadata operations needed by lifecycle workers.
+- `LifecycleMetadataStore`: lifecycle, object-lock, replication, bucket
+  versioning, and stale multipart metadata lookups without importing ECStore
+  implementation modules. Current lifecycle config reads are concentrated in
+  `crates/ecstore/src/bucket/lifecycle/metadata_boundary.rs`.
+- `LifecycleRuntime`: expiry state, transition state, tier config, deployment
+  ID, local node name, queue metrics, cancellation, and worker sizing.
+- `LifecycleReplicationSink`: schedule lifecycle-originated replication deletes
+  without depending on the replication implementation module.
+- `LifecycleAuditSink`: lifecycle audit and notification emission boundary.
+
+Next safe PR:
+
+- move one runtime-facing dependency behind a trait or adapter owned by
+  `rustfs-lifecycle` without changing queue, transition, or delete behavior;
+- keep ECStore compatibility shims until scanner and RustFS app consumers stop
+  depending on `rustfs_ecstore::api::bucket::lifecycle` paths;
+- add focused tests for the moved contract and keep architecture guard coverage.
+
+The module-level inventory lives in
+`crates/ecstore/src/bucket/lifecycle/README.md`.
+
+Focused verification for the first code-bearing lifecycle PR:
+
+- `cargo test -p rustfs-ecstore lifecycle --lib`
+- `cargo check -p rustfs-ecstore --tests`
+- `./scripts/check_architecture_migration_rules.sh`
+- `git diff --check`
+
+## Replication Candidate
+
+`rustfs-replication` now owns the resync status contracts and persisted resync
+status wire format. The remaining `bucket/replication` worker runtime is not
+ready for a full standalone crate yet.
+
+Current coupling:
+
+- replication workers depend on `ReplicationStorage`, ECStore object APIs and
+  owner storage-api contracts through the replication storage boundary, bucket
+  target clients, bucket metadata, file metadata replication state through the
+  filemeta boundary, config-derived storage class labels through the config store, scanner repair
+  classification, runtime replication pool/stat handles, bucket monitor and
+  bandwidth reader access through local boundaries, local node names, and
+  notification events;
+- resync and delete replication paths call metadata paths through the metadata
+  boundary, while bucket target system access, target config types, and target
+  operation types are concentrated behind the replication target boundary;
+- lifecycle delete paths schedule replication work through
+  `ReplicationLifecycleBridge`, while scanner heal paths schedule replication
+  work through `ReplicationScannerBridge`, and app/SetDisks object write/delete
+  paths use `ReplicationObjectBridge`;
+- bucket metadata migration and bucket target removal checks use local
+  replication bridges instead of importing resyncer codec or config helper
+  internals;
+- resync options, bucket/target resync status DTOs, status display labels, and
+  the persisted resync status wire format live in `crates/replication`, with
+  ECStore retaining only error mapping and MRF persistence locally;
+- `ReplicationCrateFileMetaIndependence`: replication status, decision, MRF,
+  resync, and target-reset wire contracts are owned inside `rustfs-replication`
+  instead of importing `rustfs-filemeta`;
+- `ReplicationCrateStorageApiIndependence`: delete work DTOs are owned inside
+  `rustfs-replication`; ECStore converts storage-api delete DTOs at the
+  replication storage boundary instead of `rustfs-replication` importing
+  `rustfs-storage-api`;
+- `ReplicationCrateUtilsIndependence`: HTTP metadata keys, S3 header labels,
+  ETag trimming, and case-insensitive prefix matching used by replication wire
+  contracts are owned inside `rustfs-replication` instead of importing
+  `rustfs-utils`;
+- direct ECStore replication imports from `rustfs-replication` are limited to
+  `*_boundary.rs` modules;
+- storage-api delete replication status/state helpers use the local
+  `crates/storage-api/src/replication.rs` contract boundary; ECStore converts
+  those owner DTOs at the replication storage boundary before queueing work;
+- admin replication extension target filtering and resync request construction
+  stay behind the admin storage boundary instead of exposing replication work
+  DTO construction to handlers;
+- scanner, admin, storage-owner, and app storage replication status/DTO/helper
+  consumers import those contracts through the ECStore replication facade;
+- app object and multipart writes call object-replication boundary helpers
+  instead of constructing replication work DTOs or choosing object replication
+  operation types at the use-case layer;
+- RustFS runtime consumers receive replication pool/stat handles through
+  storage-owner wrapper types instead of carrying ECStore replication handles
+  through app, admin, startup, or workload-admission layers;
+- global replication pool/stat initialization still lives with ECStore runtime
+  compatibility state;
+- modules inside `bucket/replication` use local relative paths rather than the
+  ECStore owner path for replication self-imports;
+- replication runtime source access uses storage/bandwidth boundary aliases for
+  ECStore object store and bucket monitor implementation types;
+- the ECStore replication facade in `mod.rs` uses explicit compatibility
+  exports instead of wildcard re-exports from implementation modules.
+
+Required contracts before crate movement:
+
+- `ReplicationObjectIO`: object read/write primitives for config, MRF, resync
+  status, and multipart replication paths. ECStore object API reader/writer
+  types and storage-api object IO contracts are concentrated in
+  `crates/ecstore/src/bucket/replication/replication_storage_boundary.rs`.
+- `ReplicationStorage`: keep the existing trait as the starting point, then
+  split object read/write/delete, walk, and metadata update responsibilities
+  only when call sites prove a narrower shape. ECStore object API,
+  storage-api contracts, and read option types are concentrated in
+  `crates/ecstore/src/bucket/replication/replication_storage_boundary.rs`.
+- `ReplicationMetadataStore`: replication config, target reset headers,
+  MRF/resync state, and status persistence. Metadata sys access and replication
+  metadata path constants are exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_metadata_boundary.rs`.
+- `ReplicationConfigStore`: replication config persistence and config-derived
+  labels used by target options. Config read/save helpers and storage class
+  labels are exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_config_store.rs`.
+- `ReplicationFileMeta`: replication status, decisions, MRF entries, resync
+  decisions, and target reset helpers. ECStore concentrates filemeta-to-
+  replication compatibility conversions in
+  `crates/ecstore/src/bucket/replication/replication_filemeta_boundary.rs`,
+  while `FileInfo` remains in the storage boundary for storage trait bindings
+  and walk options.
+- `ReplicationCrateFileMetaIndependence`: filemeta wire contracts consumed by
+  replication workers are owned in `crates/replication/src/filemeta.rs`, and
+  `rustfs-replication` must not import or depend on `rustfs-filemeta`.
+- `ReplicationCrateStorageApiIndependence`: delete work DTOs consumed by
+  replication delete/queue/operation helpers are owned in
+  `crates/replication/src/storage_api.rs`, and `rustfs-replication` must not
+  import or depend on `rustfs-storage-api`.
+- `ReplicationCrateUtilsIndependence`: replication-specific HTTP metadata,
+  header, ETag, and prefix helper contracts are owned in
+  `crates/replication/src/http.rs`, and `rustfs-replication` must not import or
+  depend on `rustfs-utils`.
+- `EcstoreReplicationBoundaryImports`: ECStore-side imports from
+  `rustfs-replication` are concentrated in replication `*_boundary.rs` modules.
+- `RuntimeReplicationFacadeConsumers`: scanner, admin, storage-owner, and app
+  storage replication status/DTO/helper consumers import through
+  `rustfs-ecstore`; runtime code under `rustfs/src` does not import
+  `rustfs-replication` directly, and the RustFS runtime/scanner crates do not
+  depend on it.
+- `StorageApiReplicationContracts`: owner-facing storage-api delete DTO
+  replication state/status helpers remain concentrated in
+  `crates/storage-api/src/replication.rs`, while replication worker DTOs live in
+  `rustfs-replication`.
+- `ReplicationErrorBoundary`: ECStore error/result contracts and
+  replication-specific error classifiers. `crate::error` imports are
+  concentrated in
+  `crates/ecstore/src/bucket/replication/replication_error_boundary.rs`.
+- `ReplicationTargetStore`: bucket target listing, target client lookup,
+  target offline checks, target config types, and target operation option
+  types. Bucket target sys access, `BucketTargets`, and target operation types
+  are exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_target_boundary.rs`.
+- `ReplicationRuntime`: pool, stats, worker admission, bucket monitor, local
+  node identity, cancellation, and queue sizing. Concrete ECStore object store
+  and bucket monitor types stay behind local storage/bandwidth boundaries.
+- `ReplicationBandwidthLimiter`: target reader wrapping for replication
+  bandwidth accounting and throttling.
+- `ReplicationVersioningStore`, `ReplicationLockTiming`, `ReplicationMsgpCodec`,
+  and `ReplicationTagFilter`: smaller state/codec/filter contracts that keep
+  bucket versioning, SetDisks lock timing, MessagePack helpers, and bucket
+  tagging helper access behind local replication boundary types.
+- `ReplicationEventSink`: notification/audit events for skipped, failed, and
+  completed replication operations, including local event host selection.
+- `ReplicationLifecycleBridge`: lifecycle-originated delete and version-purge
+  scheduling is exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_lifecycle_bridge.rs`.
+- `ReplicationMigrationBridge`: persisted resync status decode/encode access
+  for bucket metadata migration is exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_migration_bridge.rs`.
+- `ReplicationResyncContracts`: resync options, target/bucket resync status,
+  status labels, and persisted status encoding live in `crates/replication`.
+- `ReplicationObjectBridge`: app and SetDisks object write/delete replication
+  decisions and scheduling are exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_object_bridge.rs`.
+- `ObsReplicationStatsSnapshot`: observability reads replication bucket/site
+  metrics through obs-local snapshot DTOs in
+  `crates/obs/src/metrics/storage_api.rs` instead of carrying the ECStore
+  replication stats handle through collectors.
+- `StorageReplicationPoolHandle` / `StorageReplicationStatsHandle`: RustFS app, admin,
+  startup, and workload-admission code use storage-owner wrapper types from
+  `rustfs/src/storage/storage_api.rs` for pool activity, resync, queue counts,
+  proxy stats, and site metrics snapshots.
+- `ReplicationScannerBridge`: scanner-originated replication heal scheduling is
+  exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_scanner_bridge.rs`.
+  Scanner consumers receive scanner-local replication config/admission/heal
+  object DTOs from `crates/scanner/src/storage_api.rs` instead of constructing
+  or inspecting replication queue DTOs directly.
+- `ReplicationTargetConfigBridge`: bucket target removal checks against
+  replication target rules are exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_target_config_bridge.rs`.
+- `ReplicationFacade`: the current `rustfs_ecstore::api::bucket::replication`
+  compatibility surface is an explicit symbol list guarded against wildcard
+  re-exports while downstream owners migrate to narrower contracts.
+
+First safe PR:
+
+- add a replication extraction inventory section or module-level README;
+- list current ECStore/runtime dependencies and the target contract owner for
+  each dependency;
+- keep global pool/stat initialization and queue behavior unchanged.
+
+The module-level inventory lives in
+`crates/ecstore/src/bucket/replication/README.md`.
+
+Focused verification for the first code-bearing replication PR:
+
+- `cargo test -p rustfs-ecstore replication --lib`
+- `cargo check -p rustfs-ecstore --tests`
+- `./scripts/check_architecture_migration_rules.sh`
+- `git diff --check`
+
+## Facade Shrink Plan
+
+The broad `rustfs_ecstore::api` facade remains a compatibility boundary, not a
+new architecture target. The current facade groups and external consumers are
+recorded in
+[`ecstore-api-facade-inventory.md`](ecstore-api-facade-inventory.md).
+Shrinking it must be monotonic:
+
+1. Inventory every public facade group and consumer.
+2. Add compile-time coverage before removing or narrowing a facade item.
+3. Move outer consumers to storage-api or owner-local compatibility boundaries.
+4. Remove one facade group per PR only after downstream compatibility tests pass.
+
+Do not delete facade groups only because the underlying module moved. Keep the
+facade stable until the replacement path is visible and tested.
+
+## Ready-To-Split Checklist
+
+A candidate split is ready for code movement only when all items below are true:
+
+- dependency graph shows no cycle with ECStore, storage-api, runtime sources, or
+  owner-local compatibility modules;
+- contract traits compile without importing ECStore implementation modules;
+- old facade names have compatibility tests or explicit deprecation coverage;
+- focused tests cover the changed owner path before any full gate is attempted;
+- rollback preserves object IO, quorum, lifecycle/replication queues, scanner
+  repair, notification/audit events, and metadata compatibility.

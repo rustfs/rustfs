@@ -45,6 +45,12 @@ impl AuditPipeline {
         Self { registry }
     }
 
+    /// Fans an audit entry out to every configured target concurrently.
+    ///
+    /// Delivery across targets is unordered: the per-target `save()` calls run
+    /// via `join_all` and may complete in any order. Ordering of entries within
+    /// a single target is preserved by that target's own store/queue, not by
+    /// this fan-out.
     pub async fn dispatch(&self, entry: Arc<AuditEntry>) -> AuditResult<()> {
         let start_time = std::time::Instant::now();
 
@@ -114,18 +120,41 @@ impl AuditPipeline {
 
         if errors.is_empty() {
             observability::record_audit_success(dispatch_time);
-        } else {
-            observability::record_audit_failure(dispatch_time);
-            warn!(
+            return Ok(());
+        }
+
+        observability::record_audit_failure(dispatch_time);
+        let error_count = errors.len();
+
+        if success_count == 0 {
+            // Every configured target rejected the event. For store-backed targets a
+            // failed save() means the entry was neither delivered nor persisted for
+            // replay, so it is lost outright. Propagate the failure instead of
+            // returning Ok so the caller can react (alert, degrade, or reject the
+            // request) rather than assume the audit trail is intact.
+            error!(
                 event = EVENT_AUDIT_DISPATCH_FAILED,
                 component = LOG_COMPONENT_AUDIT,
                 subsystem = LOG_SUBSYSTEM_PIPELINE,
-                error_count = errors.len(),
-                success_count = success_count,
+                error_count = error_count,
                 duration_ms = dispatch_time.as_millis() as u64,
-                "Some audit targets failed to receive audit event"
+                "All audit targets failed to receive audit event"
             );
+            // `errors` is non-empty here, so `remove(0)` cannot panic.
+            return Err(crate::AuditError::Target(errors.remove(0)));
         }
+
+        // Partial failure: at least one target accepted the event, so the entry is
+        // not lost. Surface the degradation but let the dispatch succeed.
+        warn!(
+            event = EVENT_AUDIT_DISPATCH_FAILED,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_PIPELINE,
+            error_count = error_count,
+            success_count = success_count,
+            duration_ms = dispatch_time.as_millis() as u64,
+            "Some audit targets failed to receive audit event"
+        );
 
         Ok(())
     }
@@ -167,8 +196,14 @@ impl AuditPipeline {
                         data: (*entry).clone(),
                     };
                     match target.save(Arc::new(entity_target)).await {
-                        Ok(_) => success_count += 1,
-                        Err(e) => errors.push(e),
+                        Ok(_) => {
+                            success_count += 1;
+                            observability::record_target_success();
+                        }
+                        Err(e) => {
+                            observability::record_target_failure();
+                            errors.push(e);
+                        }
                     }
                 }
                 (target.id().to_string(), success_count, errors)
@@ -179,6 +214,7 @@ impl AuditPipeline {
         let results = futures::future::join_all(tasks).await;
         let mut total_success = 0;
         let mut total_errors = 0;
+        let mut first_error: Option<rustfs_targets::TargetError> = None;
         for (target_id, success_count, errors) in results {
             total_success += success_count;
             total_errors += errors.len();
@@ -191,6 +227,9 @@ impl AuditPipeline {
                     error = ?e,
                     "Audit batch dispatch failed"
                 );
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
         }
 
@@ -205,6 +244,30 @@ impl AuditPipeline {
             duration_ms = dispatch_time.as_millis() as u64,
             "Completed audit batch dispatch"
         );
+
+        // No save() across any target/entry succeeded while errors were recorded:
+        // the batch was lost entirely. Propagate rather than silently returning Ok.
+        if total_errors > 0 && total_success == 0 {
+            observability::record_audit_failure(dispatch_time);
+            error!(
+                event = EVENT_AUDIT_BATCH_DISPATCH_FAILED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_PIPELINE,
+                entry_count = entries.len(),
+                error_count = total_errors,
+                duration_ms = dispatch_time.as_millis() as u64,
+                "All audit targets failed to receive audit batch"
+            );
+            return Err(crate::AuditError::Target(
+                first_error.expect("total_errors > 0 guarantees a captured target error"),
+            ));
+        }
+
+        // Record the aggregate event outcome so batch dispatch reports the same
+        // observability signal as single dispatch (backlog#984): full success or
+        // partial failure both count as a delivered audit event here, since at
+        // least one target accepted every entry that reached this point.
+        observability::record_audit_success(dispatch_time);
 
         Ok(())
     }
@@ -247,7 +310,7 @@ impl AuditRuntimeView {
         registry.list_targets()
     }
 
-    pub async fn get_target_values(&self) -> Vec<rustfs_targets::SharedTarget<AuditEntry>> {
+    pub async fn get_target_values(&self) -> Vec<SharedTarget<AuditEntry>> {
         let registry = self.registry.lock().await;
         registry.list_target_values()
     }
@@ -494,5 +557,137 @@ impl AuditRuntimeFacade {
     pub async fn stop_replay_workers(&self) {
         let mut replay_workers = self.replay_workers.write().await;
         self.runtime_adapter.stop_replay_workers(&mut replay_workers).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuditPipeline;
+    use crate::{AuditEntry, AuditError, AuditRegistry};
+    use async_trait::async_trait;
+    use rustfs_targets::arn::TargetID;
+    use rustfs_targets::store::{Key, Store};
+    use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
+    use rustfs_targets::{StoreError, Target, TargetError};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Mock target whose `save()` outcome is fixed at construction so tests can
+    /// force full-success / full-failure / partial-failure fan-outs.
+    #[derive(Clone)]
+    struct MockTarget {
+        id: TargetID,
+        fail: bool,
+    }
+
+    impl MockTarget {
+        fn new(id: &str, fail: bool) -> Self {
+            Self {
+                id: TargetID::new(id.to_string(), "webhook".to_string()),
+                fail,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<E> Target<E> for MockTarget
+    where
+        E: rustfs_targets::PluginEvent,
+    {
+        fn id(&self) -> TargetID {
+            self.id.clone()
+        }
+
+        async fn is_active(&self) -> Result<bool, TargetError> {
+            Ok(true)
+        }
+
+        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+            if self.fail {
+                Err(TargetError::Configuration("forced save failure".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
+            None
+        }
+
+        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
+            Box::new(self.clone())
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    fn pipeline_with(targets: Vec<MockTarget>) -> AuditPipeline {
+        let mut registry = AuditRegistry::new();
+        for target in targets {
+            registry.add_target(target.id.to_string(), Box::new(target));
+        }
+        AuditPipeline::new(Arc::new(Mutex::new(registry)))
+    }
+
+    fn entry() -> Arc<AuditEntry> {
+        Arc::new(AuditEntry::default())
+    }
+
+    // backlog#962: when every target rejects the event it is lost outright, so
+    // dispatch must return Err rather than swallowing the failures as Ok.
+    #[tokio::test]
+    async fn dispatch_returns_err_when_all_targets_fail() {
+        let pipeline = pipeline_with(vec![MockTarget::new("a:webhook", true), MockTarget::new("b:webhook", true)]);
+        let result = pipeline.dispatch(entry()).await;
+        assert!(matches!(result, Err(AuditError::Target(_))), "expected Err, got {result:?}");
+    }
+
+    // A partially-successful fan-out means the entry reached at least one sink,
+    // so dispatch reports success (degradation is logged, not propagated).
+    #[tokio::test]
+    async fn dispatch_returns_ok_on_partial_failure() {
+        let pipeline = pipeline_with(vec![MockTarget::new("ok:webhook", false), MockTarget::new("bad:webhook", true)]);
+        pipeline.dispatch(entry()).await.expect("partial success should return Ok");
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_ok_when_all_targets_succeed() {
+        let pipeline = pipeline_with(vec![MockTarget::new("a:webhook", false), MockTarget::new("b:webhook", false)]);
+        pipeline.dispatch(entry()).await.expect("all-success should return Ok");
+    }
+
+    // No configured targets is a benign no-op, not a failure.
+    #[tokio::test]
+    async fn dispatch_returns_ok_with_no_targets() {
+        let pipeline = pipeline_with(vec![]);
+        pipeline.dispatch(entry()).await.expect("no targets should return Ok");
+    }
+
+    // backlog#962: dispatch_batch must mirror dispatch and propagate a
+    // whole-batch loss instead of returning Ok.
+    #[tokio::test]
+    async fn dispatch_batch_returns_err_when_all_targets_fail() {
+        let pipeline = pipeline_with(vec![MockTarget::new("a:webhook", true)]);
+        let result = pipeline.dispatch_batch(vec![entry(), entry()]).await;
+        assert!(matches!(result, Err(AuditError::Target(_))), "expected Err, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_batch_returns_ok_when_all_targets_succeed() {
+        let pipeline = pipeline_with(vec![MockTarget::new("a:webhook", false), MockTarget::new("b:webhook", false)]);
+        pipeline
+            .dispatch_batch(vec![entry(), entry()])
+            .await
+            .expect("all-success batch should return Ok");
     }
 }

@@ -12,38 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::context::resolve_object_store_handle;
-use crate::app::multipart_usecase::DefaultMultipartUsecase;
-use crate::app::object_usecase::DefaultObjectUsecase;
+use super::{
+    BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
+    BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
+    decode_tags_to_map, delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
+    get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config, get_bucket_website_config,
+    is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
+    update_bucket_metadata_config,
+};
+use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
+use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
-use crate::storage::s3_api::acl;
-use crate::storage::storage_compat::ecstore::{
-    bucket::{
-        metadata::{
-            BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
-            BUCKET_WEBSITE_CONFIG, OBJECT_LOCK_CONFIG,
-        },
-        metadata_sys,
-        object_lock::objectlock_sys::check_retention_for_modification,
-        replication::{GLOBAL_REPLICATION_STATS, ReplicationConfigurationExt},
-        tagging::{decode_tags, decode_tags_to_map, encode_tags},
-        utils::serialize,
-        versioning::VersioningApi,
-        versioning_sys::BucketVersioningSys,
-    },
-    error::{StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
+use crate::storage::s3_api::{self, acl};
+use crate::storage::storage_api::ecfs_consumer::contract::{
+    bucket::{BucketOperations, BucketOptions},
+    object::{ObjectLockRetentionOptions, ObjectOperations as _},
 };
-use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
+use crate::storage::storage_api::ecfs_consumer::object_lock::{
+    parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
+};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rustfs_io_metrics::record_s3_op;
+use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations as _};
 use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -59,7 +56,7 @@ const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
-use crate::storage::StorageObjectOptions as ObjectOptions;
+use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 
 #[derive(Debug, Clone)]
 pub struct FS {
@@ -81,11 +78,12 @@ impl Default for FS {
 impl FS {
     pub fn new() -> Self {
         rustfs_io_metrics::init_s3_metrics();
+        rustfs_io_metrics::init_list_objects_metrics();
         Self {}
     }
 
     async fn replication_tagging_enabled(bucket: &str, object: &str) -> bool {
-        metadata_sys::get_replication_config(bucket)
+        get_bucket_replication_config(bucket)
             .await
             .map(|(cfg, _)| cfg.has_active_rules(object, true))
             .unwrap_or(false)
@@ -95,9 +93,7 @@ impl FS {
         if !Self::replication_tagging_enabled(bucket, object).await {
             return;
         }
-        if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
-            stats.inc_proxy(bucket, api, is_err).await;
-        }
+        record_replication_proxy(bucket, api, is_err).await;
     }
 
     pub async fn get_object_tag_conditions_for_policy(
@@ -106,7 +102,7 @@ impl FS {
         object: &str,
         version_id: Option<&str>,
     ) -> S3Result<std::collections::HashMap<String, Vec<String>>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Ok(std::collections::HashMap::new());
         };
         let opts = ObjectOptions {
@@ -252,7 +248,7 @@ impl S3 for FS {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let usecase = DefaultMultipartUsecase::from_global();
+        let usecase = s3_api::default_multipart_usecase();
         usecase.execute_abort_multipart_upload(req).await
     }
 
@@ -261,14 +257,15 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let usecase = DefaultMultipartUsecase::from_global();
+        crate::hp_guard!("S3::complete_multipart_upload");
+        let usecase = s3_api::default_multipart_usecase();
         Box::pin(usecase.execute_complete_multipart_upload(req)).await
     }
 
     /// Copy an object from one location to another
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        let usecase = s3_api::default_object_usecase();
         Box::pin(usecase.execute_copy_object(req)).await
     }
 
@@ -278,7 +275,7 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_create_bucket(req).await
     }
 
@@ -287,20 +284,21 @@ impl S3 for FS {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let usecase = DefaultMultipartUsecase::from_global();
+        crate::hp_guard!("S3::create_multipart_upload");
+        let usecase = s3_api::default_multipart_usecase();
         usecase.execute_create_multipart_upload(req).await
     }
 
     /// Delete a bucket
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_delete_bucket(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn delete_bucket_cors(&self, req: S3Request<DeleteBucketCorsInput>) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_delete_bucket_cors(req).await
     }
 
@@ -308,7 +306,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_delete_bucket_encryption(req).await
     }
 
@@ -317,7 +315,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_delete_bucket_lifecycle(req).await
     }
 
@@ -325,7 +323,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_delete_bucket_policy(req).await
     }
 
@@ -333,7 +331,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_delete_bucket_replication(req).await
     }
 
@@ -342,7 +340,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_delete_bucket_tagging(req).await
     }
 
@@ -350,7 +348,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketWebsiteInput>,
     ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -359,7 +357,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        metadata_sys::delete(&req.input.bucket, BUCKET_WEBSITE_CONFIG)
+        delete_bucket_metadata_config(&req.input.bucket, BUCKET_WEBSITE_CONFIG)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -371,14 +369,15 @@ impl S3 for FS {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_delete_public_access_block(req).await
     }
 
     /// Delete an object
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        crate::hp_guard!("S3::delete_object");
+        let usecase = s3_api::default_object_usecase();
         Box::pin(usecase.execute_delete_object(req)).await
     }
 
@@ -387,7 +386,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        record_s3_op(S3Operation::DeleteObjectTagging, &req.input.bucket);
+        record_s3_op(S3Operation::DeleteObjectTagging);
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingDelete, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
@@ -399,7 +398,7 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             error!(
                 component = LOG_COMPONENT_STORAGE,
                 subsystem = LOG_SUBSYSTEM_TAGGING,
@@ -464,6 +463,7 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(DeleteObjectTaggingOutput { version_id }));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         let duration = start_time.elapsed();
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "delete").record(duration.as_secs_f64());
         result
@@ -472,15 +472,15 @@ impl S3 for FS {
     /// Delete multiple objects
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        let usecase = s3_api::default_object_usecase();
         usecase.execute_delete_objects(req).await
     }
 
     async fn get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
-        record_s3_op(S3Operation::GetBucketAcl, &req.input.bucket);
+        record_s3_op(S3Operation::GetBucketAcl);
         let GetBucketAclInput { bucket, .. } = req.input;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -496,7 +496,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketAccelerateConfigurationOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -505,7 +505,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        match metadata_sys::get_accelerate_config(&req.input.bucket).await {
+        match get_bucket_accelerate_config(&req.input.bucket).await {
             Ok((accelerate, _)) => Ok(S3Response::new(GetBucketAccelerateConfigurationOutput {
                 status: accelerate.status,
                 ..Default::default()
@@ -517,8 +517,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
-        record_s3_op(S3Operation::GetBucketCors, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketCors);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_cors(req).await
     }
 
@@ -526,8 +526,8 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketEncryptionInput>,
     ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
-        record_s3_op(S3Operation::GetBucketEncryption, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketEncryption);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_encryption(req).await
     }
 
@@ -536,16 +536,16 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
-        record_s3_op(S3Operation::GetBucketLifecycleConfiguration, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketLifecycleConfiguration);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_lifecycle_configuration(req).await
     }
 
     /// Get bucket location
     #[instrument(level = "debug", skip(self, req))]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        record_s3_op(S3Operation::GetBucketLocation, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketLocation);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_location(req).await
     }
 
@@ -553,14 +553,14 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
-        record_s3_op(S3Operation::GetBucketNotificationConfiguration, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketNotificationConfiguration);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_notification_configuration(req).await
     }
 
     async fn get_bucket_policy(&self, req: S3Request<GetBucketPolicyInput>) -> S3Result<S3Response<GetBucketPolicyOutput>> {
-        record_s3_op(S3Operation::GetBucketPolicy, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketPolicy);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_policy(req).await
     }
 
@@ -568,8 +568,8 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketPolicyStatusInput>,
     ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
-        record_s3_op(S3Operation::GetBucketPolicyStatus, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketPolicyStatus);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_policy_status(req).await
     }
 
@@ -577,8 +577,8 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
-        record_s3_op(S3Operation::GetBucketReplication, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketReplication);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_replication(req).await
     }
 
@@ -586,7 +586,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<GetBucketRequestPaymentOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -595,7 +595,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        match metadata_sys::get_request_payment_config(&req.input.bucket).await {
+        match get_bucket_request_payment_config(&req.input.bucket).await {
             Ok((payment, _)) => Ok(S3Response::new(GetBucketRequestPaymentOutput {
                 payer: Some(payment.payer),
             })),
@@ -608,8 +608,8 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-        record_s3_op(S3Operation::GetBucketTagging, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketTagging);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_tagging(req).await
     }
 
@@ -618,8 +618,8 @@ impl S3 for FS {
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
-        record_s3_op(S3Operation::GetPublicAccessBlock, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetPublicAccessBlock);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_public_access_block(req).await
     }
 
@@ -628,13 +628,13 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        record_s3_op(S3Operation::GetBucketVersioning, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::GetBucketVersioning);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_get_bucket_versioning(req).await
     }
 
     async fn get_bucket_website(&self, req: S3Request<GetBucketWebsiteInput>) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -643,7 +643,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        match metadata_sys::get_website_config(&req.input.bucket).await {
+        match get_bucket_website_config(&req.input.bucket).await {
             Ok((website, _)) => Ok(S3Response::new(GetBucketWebsiteOutput {
                 error_document: website.error_document,
                 index_document: website.index_document,
@@ -662,17 +662,18 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        crate::hp_guard!("S3::get_object");
+        let usecase = s3_api::default_object_usecase();
         Box::pin(usecase.execute_get_object(req)).await
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
-        record_s3_op(S3Operation::GetObjectAcl, &req.input.bucket);
+        record_s3_op(S3Operation::GetObjectAcl);
         let GetObjectAclInput {
             bucket, key, version_id, ..
         } = req.input;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -688,7 +689,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        let usecase = s3_api::default_object_usecase();
         usecase.execute_get_object_attributes(req).await
     }
 
@@ -702,7 +703,7 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -760,10 +761,10 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
-        record_s3_op(S3Operation::GetObjectLockConfiguration, &req.input.bucket);
+        record_s3_op(S3Operation::GetObjectLockConfiguration);
         let GetObjectLockConfigurationInput { bucket, .. } = req.input;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -772,7 +773,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
+        let object_lock_configuration = match get_bucket_object_lock_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
@@ -811,7 +812,7 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -858,12 +859,12 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
-        record_s3_op(S3Operation::GetObjectTagging, &req.input.bucket);
+        record_s3_op(S3Operation::GetObjectTagging);
         let start_time = std::time::Instant::now();
         let bucket = req.input.bucket.as_str();
         let object = req.input.key.as_str();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             error!(
                 component = LOG_COMPONENT_STORAGE,
                 subsystem = LOG_SUBSYSTEM_TAGGING,
@@ -929,32 +930,33 @@ impl S3 for FS {
         }))
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    async fn get_object_torrent(&self, req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
+    #[instrument(level = "debug", skip(self, _req))]
+    async fn get_object_torrent(&self, _req: S3Request<GetObjectTorrentInput>) -> S3Result<S3Response<GetObjectTorrentOutput>> {
         // Torrent functionality is not implemented in RustFS
         // Per S3 API test expectations, return 404 NoSuchKey (not 501 Not Implemented)
         // This allows clients to gracefully handle the absence of torrent support
-        record_s3_op(S3Operation::GetObjectTorrent, &req.input.bucket);
+        record_s3_op(S3Operation::GetObjectTorrent);
         Err(S3Error::new(S3ErrorCode::NoSuchKey))
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_head_bucket(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        crate::hp_guard!("S3::head_object");
+        let usecase = s3_api::default_object_usecase();
         usecase.execute_head_object(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
-        record_s3_op(S3Operation::ListBuckets, "*");
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::ListBuckets);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_list_buckets(req).await
     }
 
@@ -962,8 +964,8 @@ impl S3 for FS {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
-        record_s3_op(S3Operation::ListMultipartUploads, &req.input.bucket);
-        let usecase = DefaultMultipartUsecase::from_global();
+        record_s3_op(S3Operation::ListMultipartUploads);
+        let usecase = s3_api::default_multipart_usecase();
         usecase.execute_list_multipart_uploads(req).await
     }
 
@@ -971,45 +973,30 @@ impl S3 for FS {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        record_s3_op(S3Operation::ListObjectVersions, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::ListObjectVersions);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_list_object_versions(req).await
-    }
-
-    async fn list_object_versions_m(
-        &self,
-        req: S3Request<ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
-        record_s3_op(S3Operation::ListObjectVersions, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
-        usecase.execute_list_object_versions_m(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
-        record_s3_op(S3Operation::ListObjects, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        record_s3_op(S3Operation::ListObjects);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_list_objects(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
+        crate::hp_guard!("S3::list_objects_v2");
+        record_s3_op(S3Operation::ListObjectsV2);
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_list_objects_v2(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
-    async fn list_objects_v2m(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2MOutput>> {
-        record_s3_op(S3Operation::ListObjectsV2, &req.input.bucket);
-        let usecase = DefaultBucketUsecase::from_global();
-        usecase.execute_list_objects_v2m(req).await
-    }
-
-    #[instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
-        record_s3_op(S3Operation::ListParts, &req.input.bucket);
-        let usecase = DefaultMultipartUsecase::from_global();
+        record_s3_op(S3Operation::ListParts);
+        let usecase = s3_api::default_multipart_usecase();
         usecase.execute_list_parts(req).await
     }
 
@@ -1019,9 +1006,9 @@ impl S3 for FS {
             access_control_policy,
             ..
         } = req.input;
-        record_s3_op(S3Operation::PutBucketAcl, &bucket);
+        record_s3_op(S3Operation::PutBucketAcl);
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1044,7 +1031,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1054,7 +1041,7 @@ impl S3 for FS {
 
         let accelerate_config = serialize(&req.input.accelerate_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        metadata_sys::update(&req.input.bucket, BUCKET_ACCELERATE_CONFIG, accelerate_config)
+        update_bucket_metadata_config(&req.input.bucket, BUCKET_ACCELERATE_CONFIG, accelerate_config)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1063,13 +1050,13 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_bucket_cors(req).await
     }
 
     async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
-        record_s3_op(S3Operation::GetBucketLogging, &req.input.bucket);
-        let Some(store) = resolve_object_store_handle() else {
+        record_s3_op(S3Operation::GetBucketLogging);
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1077,7 +1064,7 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        match metadata_sys::get_logging_config(&req.input.bucket).await {
+        match get_bucket_logging_config(&req.input.bucket).await {
             Ok((logging, _)) => Ok(S3Response::new(GetBucketLoggingOutput {
                 logging_enabled: logging.logging_enabled,
             })),
@@ -1087,8 +1074,8 @@ impl S3 for FS {
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
-        record_s3_op(S3Operation::PutBucketLogging, &req.input.bucket);
-        let Some(store) = resolve_object_store_handle() else {
+        record_s3_op(S3Operation::PutBucketLogging);
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1098,7 +1085,7 @@ impl S3 for FS {
 
         let logging_config = serialize(&req.input.bucket_logging_status)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        metadata_sys::update(&req.input.bucket, BUCKET_LOGGING_CONFIG, logging_config)
+        update_bucket_metadata_config(&req.input.bucket, BUCKET_LOGGING_CONFIG, logging_config)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1109,7 +1096,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_bucket_encryption(req).await
     }
 
@@ -1118,7 +1105,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_bucket_lifecycle_configuration(req).await
     }
 
@@ -1126,12 +1113,12 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_bucket_notification_configuration(req).await
     }
 
     async fn put_bucket_policy(&self, req: S3Request<PutBucketPolicyInput>) -> S3Result<S3Response<PutBucketPolicyOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_bucket_policy(req).await
     }
 
@@ -1139,7 +1126,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_bucket_replication(req).await
     }
 
@@ -1147,7 +1134,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1157,7 +1144,7 @@ impl S3 for FS {
 
         let payment_config = serialize(&req.input.request_payment_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        metadata_sys::update(&req.input.bucket, BUCKET_REQUEST_PAYMENT_CONFIG, payment_config)
+        update_bucket_metadata_config(&req.input.bucket, BUCKET_REQUEST_PAYMENT_CONFIG, payment_config)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1169,13 +1156,13 @@ impl S3 for FS {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_public_access_block(req).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_bucket_tagging(req).await
     }
 
@@ -1184,12 +1171,12 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
-        let usecase = DefaultBucketUsecase::from_global();
+        let usecase = s3_api::default_bucket_usecase();
         usecase.execute_put_bucket_versioning(req).await
     }
 
     async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1199,7 +1186,7 @@ impl S3 for FS {
 
         let website_config = serialize(&req.input.website_configuration)
             .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        metadata_sys::update(&req.input.bucket, BUCKET_WEBSITE_CONFIG, website_config)
+        update_bucket_metadata_config(&req.input.bucket, BUCKET_WEBSITE_CONFIG, website_config)
             .await
             .map_err(crate::error::ApiError::from)?;
 
@@ -1208,18 +1195,19 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        crate::hp_guard!("S3::put_object");
+        let usecase = s3_api::default_object_usecase();
         Box::pin(usecase.execute_put_object(self, req)).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
-        record_s3_op(S3Operation::PutObjectAcl, &req.input.bucket);
+        record_s3_op(S3Operation::PutObjectAcl);
         let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
         let bucket = &req.input.bucket;
         let key = &req.input.key;
         let version_id = req.input.version_id.clone();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1261,7 +1249,7 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1298,6 +1286,7 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
@@ -1314,7 +1303,7 @@ impl S3 for FS {
 
         let Some(input_cfg) = object_lock_configuration else { return Err(s3_error!(InvalidArgument)) };
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1325,7 +1314,7 @@ impl S3 for FS {
 
         validate_object_lock_configuration_input(&input_cfg)?;
 
-        match metadata_sys::get_object_lock_config(&bucket).await {
+        match get_bucket_object_lock_config(&bucket).await {
             Ok(_) => {}
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
@@ -1346,8 +1335,10 @@ impl S3 for FS {
         };
 
         let data = serialize(&input_cfg).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
+        let object_lock_config =
+            String::from_utf8(data.clone()).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
 
-        metadata_sys::update(&bucket, OBJECT_LOCK_CONFIG, data)
+        let updated_at = update_bucket_metadata_config(&bucket, OBJECT_LOCK_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
 
@@ -1361,11 +1352,33 @@ impl S3 for FS {
             };
             let versioning_data = serialize(&enable_versioning_config)
                 .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
-            metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
+            update_bucket_metadata_config(&bucket, BUCKET_VERSIONING_CONFIG, versioning_data)
                 .await
                 .map_err(ApiError::from)?;
         }
 
+        if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
+            bucket: bucket.clone(),
+            r#type: "object-lock-config".to_string(),
+            object_lock_config: Some(object_lock_config),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "put_object_lock_configuration",
+                bucket = %bucket,
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "storage object lock state"
+            );
+        }
+
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 
@@ -1385,7 +1398,7 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1444,12 +1457,13 @@ impl S3 for FS {
 
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        record_s3_op(S3Operation::PutObjectTagging, &req.input.bucket);
+        record_s3_op(S3Operation::PutObjectTagging);
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {
@@ -1463,7 +1477,7 @@ impl S3 for FS {
 
         crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1521,13 +1535,14 @@ impl S3 for FS {
             version_id: req.input.version_id.clone(),
         }));
         let _ = helper.complete(&result);
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         let duration = start_time.elapsed();
         histogram!("rustfs_object_tagging_operation_duration_seconds", "operation" => "put").record(duration.as_secs_f64());
         result
     }
 
     async fn restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        let usecase = s3_api::default_object_usecase();
         usecase.execute_restore_object(req).await
     }
 
@@ -1535,21 +1550,22 @@ impl S3 for FS {
         &self,
         req: S3Request<SelectObjectContentInput>,
     ) -> S3Result<S3Response<SelectObjectContentOutput>> {
-        let usecase = DefaultObjectUsecase::from_global();
+        let usecase = s3_api::default_object_usecase();
         usecase.execute_select_object_content(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
-        record_s3_op(S3Operation::UploadPart, &req.input.bucket);
-        let usecase = DefaultMultipartUsecase::from_global();
+        crate::hp_guard!("S3::upload_part");
+        record_s3_op(S3Operation::UploadPart);
+        let usecase = s3_api::default_multipart_usecase();
         usecase.execute_upload_part(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        record_s3_op(S3Operation::UploadPartCopy, &req.input.bucket);
-        let usecase = DefaultMultipartUsecase::from_global();
+        record_s3_op(S3Operation::UploadPartCopy);
+        let usecase = s3_api::default_multipart_usecase();
         Box::pin(usecase.execute_upload_part_copy(req)).await
     }
 }

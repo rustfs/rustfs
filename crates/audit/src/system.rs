@@ -89,14 +89,20 @@ impl AuditSystem {
         registry.create_audit_targets_from_config(config).await
     }
 
+    /// Stops any active replay workers and closes the currently installed
+    /// targets without touching the system state. Lock order is `registry`
+    /// then `stream_cancellers` to stay consistent with every other path that
+    /// holds both locks (see `runtime_status_snapshot`, backlog#961).
+    async fn shutdown_runtime_targets(&self) -> AuditResult<()> {
+        let mut registry = self.registry.lock().await;
+        let mut replay_workers = self.stream_cancellers.write().await;
+        self.runtime_facade()
+            .shutdown_runtime(&mut registry, &mut replay_workers)
+            .await
+    }
+
     async fn clear_runtime_targets(&self) -> AuditResult<()> {
-        {
-            let mut registry = self.registry.lock().await;
-            let mut replay_workers = self.stream_cancellers.write().await;
-            self.runtime_facade()
-                .shutdown_runtime(&mut registry, &mut replay_workers)
-                .await?;
-        }
+        self.shutdown_runtime_targets().await?;
 
         let mut state = self.state.write().await;
         *state = AuditSystemState::Stopped;
@@ -123,6 +129,16 @@ impl AuditSystem {
             "audit system state"
         );
 
+        // Stop-before-start (backlog#970): tear down the existing replay workers
+        // and close the currently installed targets *before* activating the new
+        // set. Activation spawns fresh replay workers for store-backed targets,
+        // so if the old workers were still running they would drain the same
+        // persistent queue concurrently with the new ones and re-deliver
+        // entries. Shutting the old runtime down first keeps at most one active
+        // worker per store across a reload. `replace_targets` performs a second
+        // (now no-op) shutdown before installing, which is idempotent.
+        self.shutdown_runtime_targets().await?;
+
         let activation = self.runtime_facade().activate_targets_with_replay(targets).await;
         self.runtime_facade().replace_targets(activation).await?;
 
@@ -139,20 +155,29 @@ impl AuditSystem {
     /// # Returns
     /// * `AuditResult<()>` - Result indicating success or failure
     pub async fn start(&self, config: Config) -> AuditResult<()> {
-        let state = self.state.write().await;
+        // Claim the `Starting` transition atomically while holding the write
+        // lock (backlog#978): the previous code released the lock after the
+        // check and re-acquired it later to set `Starting`, so two concurrent
+        // `start()` calls (or `start()` racing `reload`) could both pass the
+        // check and double-activate. Transitioning to `Starting` before
+        // dropping the guard makes a concurrent caller observe `Starting` and
+        // return early instead.
+        {
+            let mut state = self.state.write().await;
 
-        match *state {
-            AuditSystemState::Running => {
-                return Err(AuditError::AlreadyInitialized);
+            match *state {
+                AuditSystemState::Running => {
+                    return Err(AuditError::AlreadyInitialized);
+                }
+                AuditSystemState::Starting => {
+                    warn_audit_state("starting", Some("already_starting"));
+                    return Ok(());
+                }
+                _ => {}
             }
-            AuditSystemState::Starting => {
-                warn_audit_state("starting", Some("already_starting"));
-                return Ok(());
-            }
-            _ => {}
+
+            *state = AuditSystemState::Starting;
         }
-
-        drop(state);
 
         info!(
             event = EVENT_AUDIT_SYSTEM_STATE,
@@ -173,11 +198,7 @@ impl AuditSystem {
 
         match self.create_targets_from_config(&config).await {
             Ok(targets) => {
-                {
-                    let mut state = self.state.write().await;
-                    *state = AuditSystemState::Starting;
-                }
-
+                // State is already `Starting` (claimed atomically above).
                 self.commit_runtime_targets(targets, AuditSystemState::Running).await?;
                 info_audit_state("running", None, None);
                 Ok(())
@@ -318,7 +339,13 @@ impl AuditSystem {
         match *state {
             AuditSystemState::Running => {}
             AuditSystemState::Paused => {
-                return Ok(());
+                // Do not silently return Ok while paused (backlog#978): the
+                // entry is neither delivered nor persisted, so reporting success
+                // would corrupt the audit trail. Surface an explicit `Paused`
+                // error and let the caller apply its policy (the global helper
+                // treats this as a deliberate skip; direct API callers can
+                // decide otherwise).
+                return Err(AuditError::Paused);
             }
             _ => {
                 return Err(AuditError::NotInitialized("Audit system is not running".to_string()));
@@ -412,8 +439,12 @@ impl AuditSystem {
     }
 
     pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {
-        let replay_workers = self.stream_cancellers.read().await;
+        // Lock order must match every other path that holds both locks
+        // (`clear_runtime_targets`, `AuditRuntimeFacade::replace_targets`):
+        // acquire `registry` first, then `stream_cancellers`. Reversing the
+        // order here would create an ABBA deadlock with those paths.
         let registry = self.registry.lock().await;
+        let replay_workers = self.stream_cancellers.read().await;
         registry.runtime_manager().status_snapshot(&replay_workers)
     }
 
@@ -544,13 +575,13 @@ fn warn_audit_state(state: &str, reason: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{AuditSystem, AuditSystemState};
+    use crate::{AuditEntry, AuditError};
     use async_trait::async_trait;
     use rustfs_targets::ReplayWorkerManager;
     use rustfs_targets::arn::TargetID;
     use rustfs_targets::store::{Key, Store};
     use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
     use rustfs_targets::{StoreError, Target, TargetError};
-    use serde::{Serialize, de::DeserializeOwned};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -574,7 +605,7 @@ mod tests {
     #[async_trait]
     impl<E> Target<E> for TestTarget
     where
-        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+        E: rustfs_targets::PluginEvent,
     {
         fn id(&self) -> TargetID {
             self.id.clone()
@@ -641,5 +672,156 @@ mod tests {
         assert_eq!(system.runtime_status_snapshot().await, ReplayWorkerManager::new().snapshot(0));
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*system.config.read().await, Some(rustfs_config::server_config::Config(HashMap::new())));
+    }
+
+    /// Regression guard for backlog#961: `runtime_status_snapshot` and
+    /// `clear_runtime_targets` both hold `registry` and `stream_cancellers`.
+    /// They previously acquired the two locks in opposite orders (ABBA),
+    /// which could deadlock the whole audit control plane under concurrency.
+    /// Hammer both paths from multiple worker threads and assert the workload
+    /// completes within a timeout instead of hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_status_and_clear_do_not_deadlock() {
+        use std::time::Duration;
+
+        const ITERATIONS: usize = 2_000;
+        const TASKS_PER_PATH: usize = 4;
+
+        let system = AuditSystem::new();
+
+        // Seed a target + replay worker so both critical sections touch real state.
+        {
+            let mut registry = system.registry.lock().await;
+            registry.add_target("primary:webhook".to_string(), Box::new(TestTarget::new("primary", "webhook")));
+        }
+        {
+            let mut replay_workers = system.stream_cancellers.write().await;
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            replay_workers.insert("primary:webhook".to_string(), cancel_tx);
+        }
+
+        let mut handles = Vec::new();
+
+        for _ in 0..TASKS_PER_PATH {
+            let status_system = system.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ITERATIONS {
+                    // registry -> stream_cancellers (read)
+                    let _ = status_system.runtime_status_snapshot().await;
+                }
+            }));
+
+            let clear_system = system.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ITERATIONS {
+                    // registry -> stream_cancellers (write)
+                    clear_system
+                        .clear_runtime_targets()
+                        .await
+                        .expect("clear_runtime_targets should succeed");
+                }
+            }));
+        }
+
+        let workload = async {
+            for handle in handles {
+                handle.await.expect("worker task panicked");
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), workload)
+            .await
+            .expect("audit lock paths deadlocked (backlog#961 regression)");
+    }
+
+    /// backlog#978: a paused system must not report success while silently
+    /// dropping the entry. `dispatch` should surface an explicit `Paused` error.
+    #[tokio::test]
+    async fn dispatch_while_paused_returns_error_not_ok() {
+        let system = AuditSystem::new();
+        {
+            let mut state = system.state.write().await;
+            *state = AuditSystemState::Paused;
+        }
+
+        let result = system.dispatch(Arc::new(AuditEntry::default())).await;
+        assert!(
+            matches!(result, Err(AuditError::Paused)),
+            "paused dispatch must return Err(Paused), got {result:?}"
+        );
+    }
+
+    /// backlog#978: `start()` now claims the `Starting` transition atomically
+    /// under the state lock, so racing `start()` calls cannot both pass the
+    /// check and double-activate. Hammer concurrent starts and assert the
+    /// workload completes (no deadlock/panic) and converges to a consistent
+    /// final state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_start_does_not_hang_or_double_activate() {
+        use std::time::Duration;
+
+        let system = AuditSystem::new();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = system.clone();
+            handles.push(tokio::spawn(async move {
+                // Empty config activates no targets, so a completed start settles
+                // the system back to `Stopped`.
+                let _ = s.start(rustfs_config::server_config::Config(HashMap::new())).await;
+            }));
+        }
+
+        let workload = async {
+            for handle in handles {
+                handle.await.expect("start task panicked");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), workload)
+            .await
+            .expect("concurrent start deadlocked (backlog#978 regression)");
+
+        assert_eq!(system.get_state().await, AuditSystemState::Stopped);
+    }
+
+    /// backlog#970: a reload/commit must tear down the previous replay workers
+    /// and close the old targets before activating the replacement set, so the
+    /// old and new workers never drain the same store concurrently. Seed an old
+    /// target plus a replay worker, commit a new target, and assert the old one
+    /// was closed and its worker stopped while the new one is installed.
+    #[tokio::test]
+    async fn commit_closes_old_targets_before_installing_new() {
+        let system = AuditSystem::new();
+
+        let old = TestTarget::new("old", "webhook");
+        let old_close = Arc::clone(&old.close_calls);
+        {
+            let mut registry = system.registry.lock().await;
+            registry.add_target("old:webhook".to_string(), Box::new(old));
+        }
+        {
+            let mut replay_workers = system.stream_cancellers.write().await;
+            let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+            replay_workers.insert("old:webhook".to_string(), cancel_tx);
+        }
+        {
+            let mut state = system.state.write().await;
+            *state = AuditSystemState::Running;
+        }
+
+        let new = TestTarget::new("new", "webhook");
+        let new_close = Arc::clone(&new.close_calls);
+        system
+            .commit_runtime_targets(vec![Box::new(new)], AuditSystemState::Running)
+            .await
+            .expect("commit should succeed");
+
+        // Old target closed exactly once during the pre-install shutdown.
+        assert_eq!(old_close.load(Ordering::SeqCst), 1);
+        // New target installed and left open.
+        assert_eq!(new_close.load(Ordering::SeqCst), 0);
+        assert_eq!(system.list_targets().await, vec!["new:webhook".to_string()]);
+        // Old replay worker stopped; the store-less new target adds none.
+        assert_eq!(system.runtime_status_snapshot().await.replay_worker_count, 0);
+        assert_eq!(system.get_state().await, AuditSystemState::Running);
     }
 }

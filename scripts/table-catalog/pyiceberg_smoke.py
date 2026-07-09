@@ -16,6 +16,9 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+import engine_compatibility
+import failure_coverage
+
 DEFAULT_PROFILE = "rustfs"
 CATALOG_VENDED_PROFILE = "rustfs-vended-credentials"
 VENDED_CREDENTIAL_PROFILES = {CATALOG_VENDED_PROFILE}
@@ -27,7 +30,7 @@ REQUIRED_STORAGE_CREDENTIAL_KEYS = (
 TABLE_MAINTENANCE_CONFIG_VERSION = 1
 IDENTIFIER_SEGMENT_MAX_LEN = 64
 
-PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
+PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "rustfs": {
         "catalog_uri": "{endpoint}/iceberg",
         "rest_path": "/iceberg",
@@ -35,6 +38,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{bucket}",
         "credential_mode": "static-s3-credentials",
         "status": "automated-smoke-target",
+        "compatibility_stage": "automated",
+        "catalog_uri_shape": "{endpoint}/iceberg",
+        "warehouse_shape": "{bucket}",
+        "namespace_model": "single-level",
+        "pagination_model": "rustfs",
+        "not_claimed": [],
     },
     "rustfs-compat": {
         "catalog_uri": "{endpoint}/_iceberg",
@@ -43,6 +52,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{bucket}",
         "credential_mode": "static-s3-credentials",
         "status": "compatibility-smoke-target",
+        "compatibility_stage": "automated",
+        "catalog_uri_shape": "{endpoint}/_iceberg",
+        "warehouse_shape": "{bucket}",
+        "namespace_model": "single-level",
+        "pagination_model": "rustfs",
+        "not_claimed": ["full MinIO AIStor private extension parity"],
     },
     CATALOG_VENDED_PROFILE: {
         "catalog_uri": "{endpoint}/iceberg",
@@ -51,6 +66,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{bucket}",
         "credential_mode": "catalog-vended-temporary-credentials",
         "status": "automated-credential-smoke-target",
+        "compatibility_stage": "automated-when-enabled",
+        "catalog_uri_shape": "{endpoint}/iceberg",
+        "warehouse_shape": "{bucket}",
+        "namespace_model": "single-level",
+        "pagination_model": "rustfs",
+        "not_claimed": ["no-long-term-data-credential bootstrap"],
     },
     "aws-s3tables": {
         "catalog_uri": "https://s3tables.{region}.amazonaws.com/iceberg",
@@ -59,6 +80,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}",
         "credential_mode": "aws-iam-or-session-credentials",
         "status": "reference-only",
+        "compatibility_stage": "reference-only",
+        "catalog_uri_shape": "https://s3tables.{region}.amazonaws.com/iceberg",
+        "warehouse_shape": "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}",
+        "namespace_model": "single-level",
+        "pagination_model": "vendor-specific",
+        "not_claimed": ["full AWS S3 Tables API parity", "AWS IAM/Lake Formation policy parity"],
     },
     "minio-aistor": {
         "catalog_uri": "{endpoint}/_iceberg",
@@ -67,6 +94,12 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{warehouse}",
         "credential_mode": "policy-scoped-s3-credentials",
         "status": "reference-only",
+        "compatibility_stage": "reference-only-plus-rustfs-alias",
+        "catalog_uri_shape": "{endpoint}/_iceberg",
+        "warehouse_shape": "{warehouse}",
+        "namespace_model": "single-level",
+        "pagination_model": "vendor-specific",
+        "not_claimed": ["full MinIO AIStor private extension parity"],
     },
     "cloudflare-r2-data-catalog": {
         "catalog_uri": "{catalog_uri}",
@@ -75,14 +108,30 @@ PROFILE_DEFAULTS: dict[str, dict[str, str]] = {
         "warehouse": "{warehouse_name}",
         "credential_mode": "catalog-vended",
         "status": "reference-only",
+        "compatibility_stage": "reference-only",
+        "catalog_uri_shape": "{catalog_uri}",
+        "warehouse_shape": "{warehouse_name}",
+        "namespace_model": "provider-defined",
+        "pagination_model": "vendor-specific",
+        "not_claimed": ["live RustFS interoperability", "Cloudflare R2 catalog API parity"],
     },
     "oss-tables": {
         "catalog_uri": "{endpoint}/iceberg",
         "rest_path": "/iceberg",
-        "rest_signing_name": "s3",
-        "warehouse": "{warehouse}",
+        "rest_signing_name": "osstables",
+        "warehouse": "acs:osstables:{region}:{account_id}:bucket/{table_bucket}",
         "credential_mode": "sigv4-s3fileio-credentials",
         "status": "reference-only",
+        "compatibility_stage": "reference-only",
+        "catalog_uri_shape": "{endpoint}/iceberg",
+        "warehouse_shape": "acs:osstables:{region}:{account_id}:bucket/{table_bucket}",
+        "namespace_model": "provider-defined",
+        "pagination_model": "vendor-specific",
+        "not_claimed": [
+            "live RustFS interoperability",
+            "Alibaba OSS Tables API parity",
+            "provider-error-code parity",
+        ],
     },
 }
 
@@ -101,27 +150,27 @@ CLIENT_MATRIX: list[dict[str, str]] = [
     },
     {
         "client": "Trino Iceberg REST catalog",
-        "status": "documented-not-automated",
-        "coverage": "configuration reference only until a repeatable container harness is added",
-        "entrypoint": "scripts/table-catalog/README.md",
+        "status": "manual-live-read-probe",
+        "coverage": "generated catalog properties and read-only SELECT probe for a table created by PyIceberg or Spark; write compatibility is not claimed",
+        "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
     },
     {
         "client": "DuckDB Iceberg",
-        "status": "documented-not-automated",
-        "coverage": "read path reference only; write/commit is not claimed",
-        "entrypoint": "scripts/table-catalog/README.md",
+        "status": "manual-live-read-probe",
+        "coverage": "generated httpfs/iceberg SQL using an operator-supplied current metadata location; write/commit is not claimed",
+        "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
     },
     {
         "client": "Databend",
-        "status": "documented-not-automated",
-        "coverage": "S3 data-plane reference only; Iceberg REST catalog integration is not claimed",
-        "entrypoint": "scripts/table-catalog/README.md",
+        "status": "manual-live-s3-stage-probe",
+        "coverage": "generated S3 stage read probe for table data files; Iceberg REST catalog integration is not claimed",
+        "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
     },
     {
         "client": "Snowflake Open Catalog / Iceberg integrations",
-        "status": "documented-not-automated",
-        "coverage": "reference only; no RustFS automated smoke claim",
-        "entrypoint": "scripts/table-catalog/README.md",
+        "status": "manual-reference-probe",
+        "coverage": "operator-adapted external volume/catalog integration SQL template; no RustFS live interoperability claim",
+        "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
     },
 ]
 
@@ -137,8 +186,8 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "background-maintenance-worker",
         "status": "controlled-run-once-supported",
         "roadmap_area": "maintenance-worker",
-        "catalog_endpoint": "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
-        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint with current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates; built-in periodic scheduling is not claimed",
+        "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+        "expected_behavior": "background-enabled maintenance can be queued by the scheduler run endpoint, claimed by the worker run endpoint, and inspected through the scheduler status endpoint with disabled/paused state, queued-job handoff, current-job backpressure, retry deferral, quarantine boundary, audit timeline, per-job audit events, lease expiry recovery, heartbeat updates, and operator quarantine inspect/release/retry/abandon actions; built-in periodic scheduling is not claimed",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
@@ -156,7 +205,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "compaction-rewrite",
         "status": "controlled-run-once-supported",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe unpartitioned Parquet rewrite through the catalog; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed",
+        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe partition-local and sort-order-preserving Parquet rewrite through the catalog; manifests with position or equality delete files produce machine-readable row-level planning and fail closed before rewrite; built-in periodic scheduling, delete-file rewrite, and row-level compaction execution are not claimed",
     },
     {
         "capability": "row-level-delete-update-merge",
@@ -175,6 +224,24 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "status": "not-planned-short-term",
         "roadmap_area": "transaction-scope",
         "expected_behavior": "RustFS S3 Tables only claims single-table commit atomicity",
+    },
+]
+
+PRODUCTION_READINESS_INVENTORY: list[dict[str, str]] = [
+    {
+        "capability": "strong-catalog-backing",
+        "status": "migration-contract-supported",
+        "validation": "catalog export and diagnostics expose an object-backed manifest, recoverable commit-log WAL state, strong-kv-wal migration target, required migration steps, and recovery blockers before cutover",
+    },
+    {
+        "capability": "single-active-writer-ha",
+        "status": "policy-published",
+        "validation": "diagnostics publish single-active-writer-region semantics, linearizable leader-read requirements for commits, read-only replica limits, and explicit no active-active support",
+    },
+    {
+        "capability": "scale-validation-matrix",
+        "status": "matrix-published",
+        "validation": "required validation scenarios are machine-readable: concurrent commit CAS, commit-log recovery replay, migration snapshot replay, stale replica read guards, and long-running client conformance",
     },
 ]
 
@@ -213,8 +280,30 @@ def env_or_none(key: str) -> str | None:
     return value
 
 
-def vendor_profiles() -> dict[str, dict[str, str]]:
+def vendor_profiles() -> dict[str, dict[str, Any]]:
     return {name: values.copy() for name, values in PROFILE_DEFAULTS.items()}
+
+
+def selected_vendor_profile(args: argparse.Namespace) -> dict[str, Any]:
+    defaults = PROFILE_DEFAULTS[args.profile]
+    not_claimed = defaults.get("not_claimed", [])
+    if not isinstance(not_claimed, list):
+        raise ValueError("profile not_claimed field must be a list")
+    return {
+        "name": args.profile,
+        "status": defaults["status"],
+        "compatibility_stage": defaults["compatibility_stage"],
+        "catalog_uri": profile_catalog_uri(args),
+        "catalog_uri_shape": defaults["catalog_uri_shape"],
+        "warehouse": profile_warehouse(args),
+        "warehouse_shape": defaults["warehouse_shape"],
+        "rest_path": args.rest_path,
+        "rest_signing_name": args.rest_signing_name,
+        "credential_mode": defaults["credential_mode"],
+        "namespace_model": defaults["namespace_model"],
+        "pagination_model": defaults["pagination_model"],
+        "not_claimed": not_claimed.copy(),
+    }
 
 
 def client_matrix() -> list[dict[str, str]]:
@@ -223,6 +312,10 @@ def client_matrix() -> list[dict[str, str]]:
 
 def unsupported_inventory() -> list[dict[str, str]]:
     return [entry.copy() for entry in UNSUPPORTED_INVENTORY]
+
+
+def production_readiness_inventory() -> list[dict[str, str]]:
+    return [entry.copy() for entry in PRODUCTION_READINESS_INVENTORY]
 
 
 def normalized_rest_path(rest_path: str) -> str:
@@ -246,6 +339,43 @@ def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
+def profile_template_context(args: argparse.Namespace) -> dict[str, str]:
+    endpoint = normalized_endpoint(args.endpoint)
+    warehouse = args.warehouse or args.bucket
+    table_bucket = args.table_bucket or args.bucket
+    warehouse_name = args.warehouse_name or warehouse
+    catalog_uri = args.catalog_uri or f"{endpoint}{args.rest_path}"
+    return {
+        "account_id": args.account_id,
+        "bucket": args.bucket,
+        "catalog_uri": catalog_uri,
+        "endpoint": endpoint,
+        "region": args.region,
+        "table_bucket": table_bucket,
+        "warehouse": warehouse,
+        "warehouse_name": warehouse_name,
+    }
+
+
+def formatted_profile_value(args: argparse.Namespace, key: str) -> str:
+    template = PROFILE_DEFAULTS[args.profile][key]
+    if not isinstance(template, str):
+        raise ValueError(f"profile field {key} is not a string")
+    return template.format(**profile_template_context(args))
+
+
+def profile_catalog_uri(args: argparse.Namespace) -> str:
+    if args.catalog_uri:
+        return args.catalog_uri.rstrip("/")
+    return formatted_profile_value(args, "catalog_uri").rstrip("/")
+
+
+def profile_warehouse(args: argparse.Namespace) -> str:
+    if args.warehouse:
+        return args.warehouse
+    return formatted_profile_value(args, "warehouse")
+
+
 def parse_args() -> argparse.Namespace:
     run_id = str(int(time.time()))
     parser = argparse.ArgumentParser(description="Run a PyIceberg smoke test against RustFS table catalog APIs.")
@@ -255,6 +385,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--secret-key", default=os.getenv("RUSTFS_SECRET_KEY", "rustfsadmin"))
     parser.add_argument("--region", default=os.getenv("RUSTFS_REGION", os.getenv("AWS_REGION", "us-east-1")))
     parser.add_argument("--bucket", default=os.getenv("RUSTFS_TABLE_BUCKET", "rustfs-s3table-smoke"))
+    parser.add_argument("--warehouse", default=env_or_none("RUSTFS_TABLE_WAREHOUSE"))
+    parser.add_argument("--table-bucket", default=env_or_none("RUSTFS_TABLE_BUCKET_NAME"))
+    parser.add_argument("--account-id", default=os.getenv("RUSTFS_TABLE_ACCOUNT_ID", "000000000000"))
+    parser.add_argument("--warehouse-name", default=env_or_none("RUSTFS_TABLE_WAREHOUSE_NAME"))
+    parser.add_argument("--catalog-uri", default=env_or_none("RUSTFS_TABLE_CATALOG_URI"))
     parser.add_argument("--namespace", default=os.getenv("RUSTFS_TABLE_NAMESPACE", f"smoke{run_id}"))
     parser.add_argument("--table", default=os.getenv("RUSTFS_TABLE_NAME", f"events{run_id}"))
     parser.add_argument("--catalog-name", default=os.getenv("RUSTFS_TABLE_CATALOG_NAME", "rustfs"))
@@ -276,8 +411,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--insecure", action="store_true", help="Disable TLS verification for HTTPS endpoints.")
     parser.add_argument("--print-client-matrix", action="store_true", help="Print the current client conformance matrix as JSON and exit.")
+    parser.add_argument("--print-engine-compatibility", action="store_true", help="Print the current Iceberg engine compatibility matrix as JSON and exit.")
+    parser.add_argument(
+        "--print-production-failure-coverage",
+        action="store_true",
+        help="Print the current production failure coverage matrix as JSON and exit.",
+    )
     parser.add_argument("--print-vendor-profiles", action="store_true", help="Print vendor connection profile references as JSON and exit.")
     parser.add_argument("--print-unsupported-inventory", action="store_true", help="Print unsupported capability inventory as JSON and exit.")
+    parser.add_argument(
+        "--print-production-readiness",
+        action="store_true",
+        help="Print catalog backing, HA, and scale-readiness inventory as JSON and exit.",
+    )
     return apply_profile_defaults(parser.parse_args())
 
 
@@ -663,11 +809,12 @@ def verify_vended_credential_data_plane_scope(
 
 def catalog_properties(args: argparse.Namespace, storage_credential: StorageCredential | None = None) -> dict[str, str]:
     endpoint = normalized_endpoint(args.endpoint)
+    warehouse = profile_warehouse(args)
     properties = {
         "type": "rest",
-        "uri": f"{endpoint}{args.rest_path}",
-        "warehouse": args.bucket,
-        "prefix": args.bucket,
+        "uri": profile_catalog_uri(args),
+        "warehouse": warehouse,
+        "prefix": warehouse,
         "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
         "s3.endpoint": endpoint,
         "s3.access-key-id": args.access_key,
@@ -694,11 +841,25 @@ def printed_metadata(args: argparse.Namespace) -> bool:
     if args.print_client_matrix:
         print_json_document({"client_matrix": client_matrix()})
         printed = True
+    if args.print_engine_compatibility:
+        print_json_document({"engine_compatibility": engine_compatibility.engine_compatibility_matrix()})
+        printed = True
+    if args.print_production_failure_coverage:
+        print_json_document({"production_failure_coverage": failure_coverage.production_failure_matrix()})
+        printed = True
     if args.print_vendor_profiles:
-        print_json_document({"vendor_profiles": vendor_profiles()})
+        print_json_document(
+            {
+                "selected_vendor_profile": selected_vendor_profile(args),
+                "vendor_profiles": vendor_profiles(),
+            }
+        )
         printed = True
     if args.print_unsupported_inventory:
         print_json_document({"unsupported_inventory": unsupported_inventory()})
+        printed = True
+    if args.print_production_readiness:
+        print_json_document({"production_readiness": production_readiness_inventory()})
         printed = True
     return printed
 
@@ -892,6 +1053,8 @@ def run_view_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
 
 def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     config_path = table_endpoint_path(args, "/maintenance/config")
+    scheduler_path = table_endpoint_path(args, "/maintenance/scheduler")
+    scheduler_run_path = table_endpoint_path(args, "/maintenance/scheduler/run")
     signed_rest_request(args, deps, "PUT", config_path, default_maintenance_config())
     config = signed_rest_request(args, deps, "GET", config_path)
     if config.get("version") != TABLE_MAINTENANCE_CONFIG_VERSION:
@@ -907,13 +1070,54 @@ def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     job = report.get("job")
     if not isinstance(job, dict) or not job.get("job-id"):
         raise RuntimeError("maintenance metadata endpoint did not return a job id")
-    signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}"))
+    audit_events = report.get("audit-events")
+    if not isinstance(audit_events, list) or not audit_events:
+        raise RuntimeError("maintenance metadata endpoint did not return audit events")
+    if not any(isinstance(event, dict) and event.get("action") == "PLANNED" for event in audit_events):
+        raise RuntimeError("maintenance metadata endpoint did not report a planning audit event")
+    job_report = signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}"))
+    if not isinstance(job_report.get("audit-events"), list):
+        raise RuntimeError("maintenance job endpoint did not return audit events")
+    quarantine = signed_rest_request(
+        args,
+        deps,
+        "POST",
+        table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}/quarantine"),
+        {"action": "INSPECT"},
+    )
+    if quarantine.get("action") != "INSPECT" or not isinstance(quarantine.get("report"), dict):
+        raise RuntimeError("maintenance quarantine endpoint did not return an inspection report")
+    scheduler = signed_rest_request(args, deps, "GET", scheduler_path)
+    expected_scheduler_statuses = {"READY", "QUEUED", "DISABLED", "PAUSED", "BACKPRESSURED", "RETRY_DEFERRED", "QUARANTINED"}
+    if scheduler.get("status") not in expected_scheduler_statuses:
+        raise RuntimeError("maintenance scheduler endpoint did not return a stable scheduler status")
+    scheduler_timeline = scheduler.get("audit_timeline")
+    if not isinstance(scheduler_timeline, list):
+        raise RuntimeError("maintenance scheduler endpoint did not return an audit timeline")
+    if scheduler_timeline and not isinstance(scheduler_timeline[0].get("audit-events"), list):
+        raise RuntimeError("maintenance scheduler audit timeline did not include job audit events")
+
+    scheduler_config = default_maintenance_config()
+    scheduler_config["background-enabled"] = True
+    scheduler_config["worker-paused"] = False
+    signed_rest_request(args, deps, "PUT", config_path, scheduler_config)
+    scheduler_run = signed_rest_request(args, deps, "POST", scheduler_run_path, {"scheduler-id": "pyiceberg-smoke-scheduler"})
+    scheduler_run_job = scheduler_run.get("report", {}).get("job")
+    if not isinstance(scheduler_run_job, dict) or scheduler_run_job.get("status") != "QUEUED":
+        raise RuntimeError("maintenance scheduler run endpoint did not queue a maintenance job")
+    if scheduler_run_job.get("scheduler-id") != "pyiceberg-smoke-scheduler":
+        raise RuntimeError("maintenance scheduler run endpoint did not preserve scheduler identity")
+    scheduler_run_report = scheduler_run.get("scheduler")
+    if not isinstance(scheduler_run_report, dict) or scheduler_run_report.get("status") != "QUEUED":
+        raise RuntimeError("maintenance scheduler run endpoint did not return queued scheduler state")
 
     worker = signed_rest_request(args, deps, "POST", table_endpoint_path(args, "/maintenance/worker/run"), {})
     worker_job = worker.get("job")
-    expected_statuses = {"DISABLED", "PAUSED", "FAILED", "SUCCESSFUL", "RUNNING"}
+    expected_statuses = {"DISABLED", "PAUSED", "FAILED", "SUCCESSFUL", "RUNNING", "QUEUED"}
     if not isinstance(worker_job, dict) or worker_job.get("status") not in expected_statuses:
         raise RuntimeError("maintenance worker endpoint did not return a stable job status")
+    if not isinstance(worker.get("audit-events"), list):
+        raise RuntimeError("maintenance worker endpoint did not return audit events")
 
 
 def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps) -> None:

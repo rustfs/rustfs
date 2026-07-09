@@ -55,6 +55,13 @@ pub fn record_capacity_update_completed(source: &'static str, duration: Duration
     .increment(1);
 }
 
+/// Record a committed capacity reading that is degraded: the refresh behind it
+/// had partial disk failures, so some disks kept last-known values.
+#[inline(always)]
+pub fn record_capacity_degraded_reading(source: &'static str) {
+    counter!("rustfs_capacity_degraded_readings_total", "source" => source).increment(1);
+}
+
 /// Record failed capacity update.
 #[inline(always)]
 pub fn record_capacity_update_failed(source: &'static str) {
@@ -106,23 +113,10 @@ pub fn record_capacity_write_operation(write_frequency: usize) {
     gauge!("rustfs_capacity_write_frequency").set(write_frequency as f64);
 }
 
-/// Record symlink accounting.
-#[inline(always)]
-pub fn record_capacity_symlink(size_bytes: u64) {
-    counter!("rustfs_capacity_symlinks_encountered").increment(1);
-    histogram!("rustfs_capacity_symlinks_size_bytes").record(size_bytes as f64);
-}
-
 /// Record timeout fallback event.
 #[inline(always)]
 pub fn record_capacity_timeout_fallback() {
     counter!("rustfs_capacity_timeout_fallback").increment(1);
-}
-
-/// Record stall detection event.
-#[inline(always)]
-pub fn record_capacity_stall_detected() {
-    counter!("rustfs_capacity_timeout_stall").increment(1);
 }
 
 /// Record dynamic timeout usage.
@@ -170,5 +164,24 @@ pub fn record_capacity_scan_disk(
     .increment(1);
     if partial_errors {
         counter!("rustfs_capacity_scan_disk_partial_errors_total", "disk" => disk.to_owned()).increment(1);
+    }
+}
+
+/// Record the outcome of a post-commit old-data-dir cleanup (backlog#898).
+///
+/// This is fired once per committed overwrite that had a previous data dir to
+/// reclaim. `leaked` is the number of disks whose old data dir could not be
+/// removed (a non-ignored, non-not-found failure) and is therefore a residue
+/// that leaks disk space until a heal reclaims it. The leak counter is the
+/// operator-visible backstop for that residue — see backlog#898 §3.4/§5.
+#[inline(always)]
+pub fn record_old_data_dir_cleanup(attempted: usize, reclaimed: usize, leaked: usize, below_quorum: bool) {
+    counter!("rustfs_old_data_dir_cleanup_attempted_total").increment(attempted as u64);
+    counter!("rustfs_old_data_dir_cleanup_reclaimed_total").increment(reclaimed as u64);
+    if leaked > 0 {
+        counter!("rustfs_old_data_dir_leaked_total").increment(leaked as u64);
+    }
+    if below_quorum {
+        counter!("rustfs_old_data_dir_cleanup_below_quorum_total").increment(1);
     }
 }

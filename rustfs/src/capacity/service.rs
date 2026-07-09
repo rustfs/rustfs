@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::disk::DiskAPI;
+use crate::storage_api::capacity::service::{all_local_disk, disk_drive_path, disk_endpoint};
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_cache_served, record_capacity_refresh_request,
     record_capacity_scan_mode,
@@ -33,8 +33,14 @@ pub fn capacity_disk_ref(endpoint: impl Into<String>, drive_path: impl Into<Stri
 }
 
 fn capacity_disk_refs(disks: &[rustfs_madmin::Disk]) -> Vec<CapacityDiskRef> {
+    // Admin callers pass cluster-wide `storage_info` disks. The scan walks
+    // `drive_path` on the local filesystem, so remote disks must be excluded:
+    // scanning them either double-counts local bytes (same mount layout on every
+    // node) or fails with NotFound (per-node layouts), and both poison the
+    // per-disk cache that the scheduled local-only refresh relies on.
     disks
         .iter()
+        .filter(|disk| disk.local)
         .map(|disk| capacity_disk_ref(disk.endpoint.clone(), disk.drive_path.clone()))
         .collect()
 }
@@ -121,8 +127,8 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
         if cache_age < fast_update_threshold {
             record_capacity_cache_served("fresh");
             debug!(
-                "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={})",
-                cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated
+                "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={}, degraded={})",
+                cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated, cached.degraded
             );
             return cached.total_used;
         }
@@ -151,6 +157,7 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
                         duration_ms = elapsed.as_millis() as u64,
                         file_count = update.file_count,
                         is_estimated = update.is_estimated,
+                        degraded = update.degraded,
                         "Capacity refresh completed"
                     );
                     update.total_used
@@ -182,6 +189,7 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
             source = ?cached.source,
             file_count = cached.file_count,
             is_estimated = cached.is_estimated,
+            degraded = cached.degraded,
             needs_update,
             blocking = should_block,
             "Served cached capacity"
@@ -227,6 +235,7 @@ pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback
                 duration_ms = elapsed.as_millis() as u64,
                 file_count = update.file_count,
                 is_estimated = update.is_estimated,
+                degraded = update.degraded,
                 "Capacity refresh completed"
             );
             update.total_used
@@ -263,7 +272,7 @@ pub async fn init_capacity_management_for_local_disks() {
         "Capacity manager state changed"
     );
 
-    let disks = rustfs_ecstore::store::all_local_disk().await;
+    let disks = all_local_disk().await;
     if disks.is_empty() {
         warn!(
             component = LOG_COMPONENT_CAPACITY,
@@ -286,7 +295,7 @@ pub async fn init_capacity_management_for_local_disks() {
 
     let disk_refs = disks
         .iter()
-        .map(|ds| capacity_disk_ref(ds.endpoint().to_string(), ds.to_string()))
+        .map(|ds| capacity_disk_ref(disk_endpoint(ds), disk_drive_path(ds)))
         .collect();
 
     info!(
@@ -325,5 +334,32 @@ fn capacity_source_label(source: capacity_manager::DataSource) -> &'static str {
         capacity_manager::DataSource::Scheduled => "scheduled",
         capacity_manager::DataSource::WriteTriggered => "write-triggered",
         capacity_manager::DataSource::Fallback => "fallback",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_disk_refs_excludes_remote_disks() {
+        let disks = vec![
+            rustfs_madmin::Disk {
+                endpoint: "http://node1:9000/data/rustfs0".to_string(),
+                drive_path: "/data/rustfs0".to_string(),
+                local: true,
+                ..Default::default()
+            },
+            rustfs_madmin::Disk {
+                endpoint: "http://node2:9000/data/rustfs0".to_string(),
+                drive_path: "/data/rustfs0".to_string(),
+                local: false,
+                ..Default::default()
+            },
+        ];
+
+        let refs = capacity_disk_refs(&disks);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].endpoint, "http://node1:9000/data/rustfs0");
     }
 }

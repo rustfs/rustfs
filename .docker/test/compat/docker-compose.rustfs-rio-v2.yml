@@ -1,0 +1,115 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0.
+
+x-rustfs-rio-v2-env: &rustfs-rio-v2-env
+  RUSTFS_VOLUMES: "http://rustfs-rio-v2-node{1...4}:9000/data/disk{1...4}"
+  RUSTFS_ADDRESS: ":9000"
+  RUSTFS_CONSOLE_ADDRESS: ":9001"
+  RUSTFS_CONSOLE_ENABLE: "true"
+  RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: "*"
+  RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+  RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-rustfsadmin}"
+  RUSTFS_OBS_LOGGER_LEVEL: "${RUSTFS_OBS_LOGGER_LEVEL:-info}"
+  RUSTFS_OBS_LOG_DIRECTORY: "/logs"
+  RUSTFS_COMPRESSION_ENABLED: "${RUSTFS_COMPRESSION_ENABLED:-true}"
+  RUSTFS_COMPRESSION_EXTENSIONS: "${RUSTFS_COMPRESSION_EXTENSIONS:-.txt,.log,.csv,.json,.tar,.xml,.bin}"
+  RUSTFS_COMPRESSION_MIME_TYPES: "${RUSTFS_COMPRESSION_MIME_TYPES:-text/*,application/json,application/xml,binary/octet-stream}"
+  RUSTFS_KMS_ENABLE: "${RUSTFS_KMS_ENABLE:-false}"
+  RUSTFS_KMS_BACKEND: "${RUSTFS_KMS_BACKEND:-local}"
+  RUSTFS_KMS_KEY_DIR: "${RUSTFS_KMS_KEY_DIR:-/kms}"
+  RUSTFS_KMS_DEFAULT_KEY_ID: "${RUSTFS_KMS_DEFAULT_KEY_ID:-compat-key}"
+  RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS: "${RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS:-false}"
+  RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
+
+x-rustfs-rio-v2-node: &rustfs-rio-v2-node
+  image: "${RUSTFS_RIO_V2_IMAGE:-rustfs/rustfs:compat-rio-v2}"
+  entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      until getent hosts rustfs-rio-v2-node1 >/dev/null &&
+        getent hosts rustfs-rio-v2-node2 >/dev/null &&
+        getent hosts rustfs-rio-v2-node3 >/dev/null &&
+        getent hosts rustfs-rio-v2-node4 >/dev/null; do
+        sleep 1
+      done
+      exec /entrypoint.sh /usr/bin/rustfs
+  build:
+    context: ../..
+    dockerfile: Dockerfile.source
+    args:
+      RUSTFS_BUILD_FEATURES: "rio-v2"
+  environment: *rustfs-rio-v2-env
+  depends_on:
+    rustfs-rio-v2-permission-helper:
+      condition: service_completed_successfully
+  networks:
+    - rustfs-rio-v2-net
+  restart: unless-stopped
+
+services:
+  rustfs-rio-v2-permission-helper:
+    image: alpine:3.23
+    command: sh -c "mkdir -p /compat-data /kms && chown -R 10001:10001 /compat-data /kms"
+    volumes:
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}:/compat-data
+      - ./kms/rustfs-compat:/kms
+    restart: "no"
+
+  rustfs-rio-v2-node1:
+    <<: *rustfs-rio-v2-node
+    hostname: rustfs-rio-v2-node1
+    volumes:
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node1/disk1:/data/disk1
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node1/disk2:/data/disk2
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node1/disk3:/data/disk3
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node1/disk4:/data/disk4
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/logs/node1:/logs
+      - ./kms/rustfs-compat:/kms
+    ports:
+      - "${RUSTFS_RIO_V2_API_PORT:-9300}:9000"
+      - "${RUSTFS_RIO_V2_CONSOLE_PORT:-9301}:9001"
+
+  rustfs-rio-v2-node2:
+    <<: *rustfs-rio-v2-node
+    hostname: rustfs-rio-v2-node2
+    volumes:
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node2/disk1:/data/disk1
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node2/disk2:/data/disk2
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node2/disk3:/data/disk3
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node2/disk4:/data/disk4
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/logs/node2:/logs
+      - ./kms/rustfs-compat:/kms
+    ports:
+      - "${RUSTFS_RIO_V2_NODE2_PORT:-9302}:9000"
+
+  rustfs-rio-v2-node3:
+    <<: *rustfs-rio-v2-node
+    hostname: rustfs-rio-v2-node3
+    volumes:
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node3/disk1:/data/disk1
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node3/disk2:/data/disk2
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node3/disk3:/data/disk3
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node3/disk4:/data/disk4
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/logs/node3:/logs
+      - ./kms/rustfs-compat:/kms
+    ports:
+      - "${RUSTFS_RIO_V2_NODE3_PORT:-9303}:9000"
+
+  rustfs-rio-v2-node4:
+    <<: *rustfs-rio-v2-node
+    hostname: rustfs-rio-v2-node4
+    volumes:
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node4/disk1:/data/disk1
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node4/disk2:/data/disk2
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node4/disk3:/data/disk3
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/node4/disk4:/data/disk4
+      - ${RUSTFS_RIO_V2_DATASET:-./data/rustfs-rio-v2}/logs/node4:/logs
+      - ./kms/rustfs-compat:/kms
+    ports:
+      - "${RUSTFS_RIO_V2_NODE4_PORT:-9304}:9000"
+
+networks:
+  rustfs-rio-v2-net:
+    driver: bridge

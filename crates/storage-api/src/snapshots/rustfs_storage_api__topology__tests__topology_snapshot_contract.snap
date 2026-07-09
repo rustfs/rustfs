@@ -1,0 +1,83 @@
+---
+source: crates/storage-api/src/topology.rs
+expression: "serde_json::to_value(&snapshot).expect(\"topology snapshot should serialize\")"
+---
+{
+  "capabilities": {
+    "failure_domain_labels": {
+      "state": "supported"
+    },
+    "media_labels": {
+      "state": "supported"
+    },
+    "numa": {
+      "state": "unknown"
+    },
+    "profiling": {
+      "state": "supported"
+    }
+  },
+  "pools": [
+    {
+      "labels": {
+        "additional": {
+          "room": "a"
+        },
+        "media": null,
+        "node": null,
+        "numa_node": null,
+        "rack": null,
+        "zone": null
+      },
+      "pool_id": null,
+      "pool_index": 0,
+      "sets": [
+        {
+          "disks": [
+            {
+              "capabilities": {
+                "failure_domain": {
+                  "state": "unknown"
+                },
+                "media_type": {
+                  "state": "supported"
+                },
+                "numa": {
+                  "reason": "not reported",
+                  "state": "unsupported"
+                },
+                "profiling": {
+                  "state": "disabled"
+                }
+              },
+              "disk_id": "disk-2",
+              "disk_index": 2,
+              "labels": {
+                "additional": {
+                  "slot": "nvme0"
+                },
+                "media": "ssd",
+                "node": null,
+                "numa_node": null,
+                "rack": null,
+                "zone": null
+              },
+              "pool_index": 0,
+              "set_index": 1
+            }
+          ],
+          "labels": {
+            "media": null,
+            "node": null,
+            "numa_node": null,
+            "rack": null,
+            "zone": null
+          },
+          "pool_index": 0,
+          "set_id": null,
+          "set_index": 1
+        }
+      ]
+    }
+  ]
+}

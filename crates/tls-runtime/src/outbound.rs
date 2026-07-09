@@ -16,8 +16,8 @@ use crate::material::OutboundTlsMaterial;
 use crate::metrics::record_outbound_tls_publication;
 use crate::state::TlsGeneration;
 use rustfs_common::{
-    GLOBAL_MTLS_IDENTITY, GLOBAL_ROOT_CERT, MtlsIdentityPem, get_global_outbound_tls_generation, set_global_mtls_identity,
-    set_global_outbound_tls_generation, set_global_root_cert,
+    MtlsIdentityPem, clear_global_root_cert, get_global_mtls_identity, get_global_outbound_tls_generation, get_global_root_cert,
+    set_global_mtls_identity, set_global_outbound_tls_generation, set_global_root_cert,
 };
 
 #[derive(Debug, Clone)]
@@ -38,7 +38,7 @@ pub async fn publish_global_outbound_tls_state(generation: TlsGeneration, materi
     if !material.root_ca_pem.is_empty() {
         set_global_root_cert(material.root_ca_pem.clone()).await;
     } else {
-        *GLOBAL_ROOT_CERT.write().await = None;
+        clear_global_root_cert().await;
     }
     set_global_mtls_identity(material.mtls_identity.clone()).await;
     set_global_outbound_tls_generation(generation.0);
@@ -48,8 +48,8 @@ pub async fn publish_global_outbound_tls_state(generation: TlsGeneration, materi
 pub async fn load_global_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
     GlobalPublishedOutboundTlsState {
         generation: TlsGeneration(get_global_outbound_tls_generation()),
-        root_ca_pem: GLOBAL_ROOT_CERT.read().await.clone(),
-        mtls_identity: GLOBAL_MTLS_IDENTITY.read().await.clone(),
+        root_ca_pem: get_global_root_cert().await,
+        mtls_identity: get_global_mtls_identity().await,
     }
 }
 

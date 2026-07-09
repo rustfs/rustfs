@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::ECStore;
 use super::ecfs::FS;
+use super::{
+    PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
+};
 use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_info, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
 use crate::storage::request_context::RequestContext;
-use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
-use crate::storage::storage_compat::ecstore::bucket::policy_sys::PolicySys;
-use crate::storage::storage_compat::ecstore::error::{StorageError, is_err_bucket_not_found};
-use crate::storage::storage_compat::ecstore::resolve_object_store_handle;
-use crate::storage::storage_compat::ecstore::store::ECStore;
+use crate::storage::storage_api::access_consumer::contract::bucket::BucketOperations;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use metrics::counter;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
@@ -30,7 +31,6 @@ use rustfs_policy::policy::{
     Args, BucketPolicy, BucketPolicyArgs, bucket_policy_needs_existing_object_tag_for_args,
     bucket_policy_uses_existing_object_tag_conditions,
 };
-use rustfs_storage_api::BucketOperations;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
@@ -136,7 +136,7 @@ fn classify_bucket_policy_raw_load_error(err: &StorageError) -> BucketPolicyRawL
 
 /// Load and parse bucket policy once for ExistingObjectTag hint checks.
 async fn load_bucket_policy_existing_object_tag_hint(bucket: &str, action: Action) -> BucketPolicyExistingObjectTagHint {
-    let (policy_str, _) = match metadata_sys::get_bucket_policy_raw(bucket).await {
+    let (policy_str, _) = match get_bucket_policy_raw(bucket).await {
         Ok(v) => v,
         Err(err) => match classify_bucket_policy_raw_load_error(&err) {
             BucketPolicyRawLoadErrorKind::PolicyMissing => {
@@ -327,7 +327,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let version_id = req_info.version_id.clone();
 
     if let Some(cred) = &cred {
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("authorize_request {:?}", IamError::IamSysNotInitialized),
@@ -671,7 +671,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             if policy_allowed {
                 deny_anonymous_table_data_plane_if_needed(action, bucket.as_str(), object.as_str()).await?;
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
-                match metadata_sys::get_public_access_block_config(bucket_name).await {
+                match get_public_access_block_config(bucket_name).await {
                     Ok((config, _)) => {
                         if config.restrict_public_buckets.unwrap_or(false) {
                             return Err(s3_error!(AccessDenied, "Access Denied"));
@@ -784,9 +784,11 @@ fn table_data_plane_admin_action(action: Action) -> Option<AdminAction> {
 }
 
 fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
-    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store =
+        runtime_sources::current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store);
-    Ok(crate::table_catalog::ObjectTableCatalogStore::new(backend))
+    crate::table_catalog::ConfiguredTableCatalogStore::from_env(backend)
+        .map_err(|err| s3_error!(InternalError, "failed to configure table catalog backing: {}", err))
 }
 
 async fn table_data_plane_resource_for_request(
@@ -797,7 +799,7 @@ async fn table_data_plane_resource_for_request(
         return Ok(None);
     }
 
-    match metadata_sys::get(bucket).await {
+    match get_bucket_metadata(bucket).await {
         Ok(metadata) if metadata.table_bucket_enabled() => {}
         Ok(_) | Err(StorageError::ConfigNotFound) => return Ok(None),
         Err(err) if is_err_bucket_not_found(&err) => return Ok(None),
@@ -840,7 +842,7 @@ async fn authorize_table_data_plane_if_needed(
     let Some(resource) = table_data_plane_resource_for_request(bucket, object).await? else {
         return Ok(());
     };
-    let Ok(iam_store) = rustfs_iam::get() else {
+    let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
 
@@ -930,7 +932,7 @@ impl S3Access for FS {
         let req_info = ReqInfo {
             cred,
             is_owner,
-            region: crate::storage::storage_compat::ecstore::global::get_global_region(),
+            region: runtime_sources::current_region(),
             request_context,
             ..Default::default()
         };
@@ -1183,7 +1185,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        if let Some(store) = resolve_object_store_handle()
+        if let Some(store) = runtime_sources::current_object_store_handle()
             && let Err(err) = store.get_bucket_info(&req.input.bucket, &Default::default()).await
             && is_err_bucket_not_found(&err)
         {
@@ -1639,12 +1641,6 @@ impl S3Access for FS {
         authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
     }
 
-    async fn list_object_versions_m(&self, req: &mut S3Request<ListObjectVersionsInput>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await
-    }
-
     /// Checks whether the ListObjects request has accesses to the resources.
     ///
     /// This method returns `Ok(())` by default.
@@ -1659,13 +1655,6 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn list_objects_v2(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-
-        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await
-    }
-
-    async fn list_objects_v2m(&self, req: &mut S3Request<ListObjectsV2Input>) -> S3Result<()> {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
@@ -1880,6 +1869,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
+        crate::hp_guard!("S3Access::put_object");
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -2050,10 +2040,23 @@ impl S3Access for FS {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{
+        AMZ_WRITE_OFFSET_BYTES_HEADER, BucketPolicyArgs, BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, FS,
+        ObjectTagConditions, PostObjectRequestMarker, ReqInfo, S3Access, StorageError,
+        bucket_policy_needs_existing_object_tag_from_hint, classify_bucket_policy_raw_load_error,
+        complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action, has_write_offset_bytes_header,
+        legal_hold_write_requested, list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint,
+        merge_list_bucket_query_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
+        put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested, secondary_tag_hint_action,
+        table_data_plane_admin_action, validate_post_object_success_controls,
+    };
+    use crate::error::ApiError;
     use http::{Extensions, HeaderMap, Method, Uri};
+    use rustfs_policy::policy::action::{Action, S3Action};
     use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
+    use s3s::{S3ErrorCode, S3Request, dto::*};
     use std::collections::HashMap;
     use time::OffsetDateTime;
 

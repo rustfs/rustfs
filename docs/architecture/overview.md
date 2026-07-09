@@ -20,6 +20,11 @@ hot-path behavior must not drift during this migration.
 
 - [`runtime-lifecycle.md`](runtime-lifecycle.md): runtime, AppContext,
   startup/readiness, and shutdown contracts.
+- [`readiness-matrix.md`](readiness-matrix.md): request-surface behavior,
+  runtime dependency readiness, probe semantics, and preservation rules.
+- [`s3-tables-support-matrix.md`](s3-tables-support-matrix.md): supported,
+  preview, reference-only, and not-claimed S3 Tables and Iceberg REST Catalog
+  surfaces.
 - [`storage-control-data-plane.md`](storage-control-data-plane.md): boundaries
   between StorageCore, ECStore, ClusterControlPlane, and BackgroundControllers.
 - [`background-services-inventory.md`](background-services-inventory.md): current
@@ -30,14 +35,23 @@ hot-path behavior must not drift during this migration.
   future read-only BackgroundController work.
 - [`crate-boundaries.md`](crate-boundaries.md): PR types, crate direction,
   compatibility rules, and migration guardrails.
+- [`global-state-crate-split-plan.md`](global-state-crate-split-plan.md): late
+  global-state cleanup, runtime-source boundaries, fallback removal rules, and
+  crate-split evaluation criteria.
+- [`obs-ecstore-dependency-inventory.md`](obs-ecstore-dependency-inventory.md):
+  observability-to-ECStore dependency inventory, classification, and extraction
+  guardrails.
 - [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
   current `ecstore::config::{Config, KV, KVS}` definitions, consumers,
   migration risks, and do-not-change contract.
+- [`ecstore-api-facade-inventory.md`](ecstore-api-facade-inventory.md): current
+  `rustfs_ecstore::api` facade groups, external consumer boundaries, shrink
+  rules, and split dependency inventory.
 - [`config-model-boundary-adr.md`](config-model-boundary-adr.md): target crate,
   module path, dependency rules, and verification gates for moving the pure
   server-config model.
-- [`migration-progress.md`](migration-progress.md): current task state and context
-  handoff.
+- [`migration-progress.md`](../superpowers/plans/migration-progress.md): historical
+  task ledger for the closed migration (execution tracking moved to issue #665).
 - [`compat-cleanup-register.md`](compat-cleanup-register.md): temporary
   compatibility code that must be removed later.
 

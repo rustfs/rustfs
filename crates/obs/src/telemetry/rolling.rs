@@ -23,6 +23,7 @@ use crate::global::{
     METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES, METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS,
     METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL, METRIC_LOG_CLEANER_ROTATION_TOTAL,
 };
+use chrono::{Local, TimeZone as _};
 use jiff::Zoned;
 use metrics::{counter, gauge, histogram};
 use std::fs::{self, File};
@@ -30,7 +31,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Rotation {
@@ -45,6 +46,7 @@ pub enum Rotation {
 /// may otherwise collide when multiple rotations occur within the same
 /// timestamp tick.
 static ROLL_UNIQUIFIER: AtomicU64 = AtomicU64::new(0);
+const ROTATION_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 
 impl Rotation {
     fn check_should_roll(&self, last: i64, now: i64) -> bool {
@@ -52,10 +54,13 @@ impl Rotation {
             Rotation::Minutely => now / 60 != last / 60,
             Rotation::Hourly => now / 3600 != last / 3600,
             Rotation::Daily => {
-                // Align daily rotation with the local day boundary rather than UTC midnight.
-                // We shift both timestamps by the current local offset before bucketing into days.
-                let offset_secs = Zoned::now().offset().seconds() as i64;
-                (now + offset_secs) / 86400 != (last + offset_secs) / 86400
+                let last_day = Local.timestamp_opt(last, 0).single().map(|ts| ts.date_naive());
+                let now_day = Local.timestamp_opt(now, 0).single().map(|ts| ts.date_naive());
+
+                match (last_day, now_day) {
+                    (Some(last_day), Some(now_day)) => last_day != now_day,
+                    _ => now / 86400 != last / 86400,
+                }
             }
             Rotation::Never => false,
         }
@@ -73,6 +78,7 @@ pub struct RollingAppender {
     size: u64,
     // Store as seconds since Unix epoch
     last_roll_ts: i64,
+    rotation_retry_cooldown_until: Option<Instant>,
 }
 
 impl RollingAppender {
@@ -119,6 +125,7 @@ impl RollingAppender {
             file: None,
             size: 0,
             last_roll_ts: Zoned::now().timestamp().as_second(),
+            rotation_retry_cooldown_until: None,
         };
         // Eagerly open the file to validate the path and capture accurate
         // initial size / last-roll timestamp.
@@ -177,6 +184,13 @@ impl RollingAppender {
     }
 
     fn should_roll(&self, write_len: u64) -> bool {
+        if self
+            .rotation_retry_cooldown_until
+            .is_some_and(|deadline| deadline > Instant::now())
+        {
+            return false;
+        }
+
         // 1. Size-based check (Cheap, check first)
         // If max_size is set (non-zero) and writing would exceed it, roll immediately.
         if self.max_size_bytes > 0 && (self.size + write_len) > self.max_size_bytes {
@@ -256,6 +270,7 @@ impl RollingAppender {
                     // This overrides whatever open_file() derived from mtime, ensuring
                     // we stick to the logical rotation time.
                     self.last_roll_ts = now.timestamp().as_second();
+                    self.rotation_retry_cooldown_until = None;
                     counter!(METRIC_LOG_CLEANER_ROTATION_TOTAL).increment(1);
                     histogram!(METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS).record(rotate_started.elapsed().as_secs_f64());
                     gauge!(METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES).set(self.size as f64);
@@ -290,6 +305,7 @@ impl RollingAppender {
             "RollingAppender: Failed to rotate log file after {} retries. Error: {:?}",
             MAX_RETRIES, last_error
         );
+        self.rotation_retry_cooldown_until = Some(Instant::now() + ROTATION_RETRY_COOLDOWN);
         counter!(METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL).increment(1);
         histogram!(METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS).record(rotate_started.elapsed().as_secs_f64());
 
@@ -540,5 +556,33 @@ mod tests {
             b"existing content".len() as u64,
             "size should reflect existing file content"
         );
+    }
+
+    #[test]
+    fn test_daily_rotation_uses_calendar_day_boundaries() {
+        let now = Zoned::now();
+        let same_day_last = now.timestamp().as_second().saturating_sub(60);
+        assert!(!Rotation::Daily.check_should_roll(same_day_last, now.timestamp().as_second()));
+
+        let previous_day_last = now.timestamp().as_second().saturating_sub(86_400);
+        let last_day = Local.timestamp_opt(previous_day_last, 0).single().map(|ts| ts.date_naive());
+        let now_day = Local
+            .timestamp_opt(now.timestamp().as_second(), 0)
+            .single()
+            .map(|ts| ts.date_naive());
+        if last_day != now_day {
+            assert!(Rotation::Daily.check_should_roll(previous_day_last, now.timestamp().as_second()));
+        }
+    }
+
+    #[test]
+    fn test_rotation_cooldown_skips_immediate_retry() {
+        let tmp = TempDir::new().unwrap();
+        let mut appender =
+            RollingAppender::new(tmp.path(), "app.log".to_string(), Rotation::Never, 3, FileMatchMode::Suffix).unwrap();
+        appender.size = 4;
+        appender.rotation_retry_cooldown_until = Some(Instant::now() + Duration::from_secs(1));
+
+        assert!(!appender.should_roll(1));
     }
 }

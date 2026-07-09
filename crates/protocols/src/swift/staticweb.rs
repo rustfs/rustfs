@@ -69,6 +69,7 @@
 
 use super::{SwiftError, SwiftResult, container, object};
 use axum::http::{Response, StatusCode};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials::Credentials;
 use s3s::Body;
 use tracing::debug;
@@ -76,6 +77,58 @@ use tracing::debug;
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_STATICWEB: &str = "swift_staticweb";
 const EVENT_SWIFT_STATICWEB_STATE: &str = "swift_staticweb_state";
+
+/// Restrictive Content-Security-Policy for auto-generated listing pages.
+///
+/// `default-src 'none'` disables script execution (the primary XSS defense);
+/// `style-src` permits the page's own stylesheet plus the inline default CSS.
+const LISTING_CSP: &str =
+    "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'none'";
+
+/// Characters that must be percent-encoded when a dynamic value is placed into
+/// a URL path inside a double-quoted HTML `href` attribute.
+///
+/// Path separators (`/`) are intentionally preserved. Every character that is
+/// significant to HTML attribute parsing (`"`, `<`, `>`, `&`, `'`) or to URL
+/// parsing (`#`, `?`, `%`, space, backtick, braces) is encoded, so the result
+/// is safe in both the URL and the surrounding HTML attribute context.
+const HREF_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}');
+
+/// HTML-entity-encode a dynamic value for safe interpolation into HTML text or
+/// double-quoted attribute contexts. Neutralizes stored/reflected XSS.
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Percent-encode a dynamic value for use as a URL path inside an `href`
+/// attribute. The output contains no HTML-significant characters, so it is
+/// safe to interpolate directly into a double-quoted attribute.
+fn href_encode(input: &str) -> String {
+    utf8_percent_encode(input, HREF_PATH_ENCODE_SET).to_string()
+}
 
 /// Static website configuration for a container
 #[derive(Debug, Clone, Default)]
@@ -247,7 +300,7 @@ pub fn resolve_path(path: &str, config: &StaticWebConfig) -> (String, bool, bool
 /// Generate breadcrumb navigation HTML
 fn generate_breadcrumbs(path: &str, container: &str) -> String {
     let mut html = String::from("<div class=\"breadcrumbs\">\n");
-    html.push_str(&format!("  <a href=\"/\">/{}</a>\n", container));
+    html.push_str(&format!("  <a href=\"/\">/{}</a>\n", html_escape(container)));
 
     if !path.is_empty() {
         let parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
@@ -257,9 +310,9 @@ fn generate_breadcrumbs(path: &str, container: &str) -> String {
             current_path.push_str(part);
             if i < parts.len() - 1 {
                 current_path.push('/');
-                html.push_str(&format!("  / <a href=\"/{}\">{}</a>\n", current_path, part));
+                html.push_str(&format!("  / <a href=\"/{}\">{}</a>\n", href_encode(&current_path), html_escape(part)));
             } else {
-                html.push_str(&format!("  / <strong>{}</strong>\n", part));
+                html.push_str(&format!("  / <strong>{}</strong>\n", html_escape(part)));
             }
         }
     }
@@ -277,10 +330,10 @@ pub fn generate_directory_listing(
 ) -> String {
     let mut html = String::from("<!DOCTYPE html>\n<html>\n<head>\n");
     html.push_str("  <meta charset=\"utf-8\">\n");
-    html.push_str(&format!("  <title>Index of /{}</title>\n", path));
+    html.push_str(&format!("  <title>Index of /{}</title>\n", html_escape(path)));
 
     if let Some(css) = css_path {
-        html.push_str(&format!("  <link rel=\"stylesheet\" href=\"/{}\">\n", css));
+        html.push_str(&format!("  <link rel=\"stylesheet\" href=\"/{}\">\n", href_encode(css)));
     } else {
         // Default inline CSS
         html.push_str("  <style>\n");
@@ -301,7 +354,7 @@ pub fn generate_directory_listing(
     }
 
     html.push_str("</head>\n<body>\n");
-    html.push_str(&format!("  <h1>Index of /{}</h1>\n", path));
+    html.push_str(&format!("  <h1>Index of /{}</h1>\n", html_escape(path)));
     html.push_str(&generate_breadcrumbs(path, container));
 
     html.push_str("  <table>\n");
@@ -324,7 +377,7 @@ pub fn generate_directory_listing(
         };
 
         html.push_str("      <tr>\n");
-        html.push_str(&format!("        <td><a href=\"/{}\">..</a></td>\n", parent_path));
+        html.push_str(&format!("        <td><a href=\"/{}\">..</a></td>\n", href_encode(&parent_path)));
         html.push_str("        <td class=\"size\">-</td>\n");
         html.push_str("        <td class=\"date\">-</td>\n");
         html.push_str("      </tr>\n");
@@ -353,9 +406,13 @@ pub fn generate_directory_listing(
         let date = &obj.last_modified;
 
         html.push_str("      <tr>\n");
-        html.push_str(&format!("        <td><a href=\"/{}\">{}</a></td>\n", obj.name, name));
+        html.push_str(&format!(
+            "        <td><a href=\"/{}\">{}</a></td>\n",
+            href_encode(&obj.name),
+            html_escape(name)
+        ));
         html.push_str(&format!("        <td class=\"size\">{}</td>\n", size));
-        html.push_str(&format!("        <td class=\"date\">{}</td>\n", date));
+        html.push_str(&format!("        <td class=\"date\">{}</td>\n", html_escape(date)));
         html.push_str("      </tr>\n");
     }
 
@@ -435,6 +492,8 @@ pub async fn handle_static_web_get(
             .status(StatusCode::OK)
             .header("content-type", "text/html; charset=utf-8")
             .header("content-length", html.len().to_string())
+            .header("x-content-type-options", "nosniff")
+            .header("content-security-policy", LISTING_CSP)
             .header("x-trans-id", trans_id.clone())
             .header("x-openstack-request-id", trans_id)
             .body(Body::from(html))
@@ -951,6 +1010,70 @@ mod tests {
         assert_eq!(path, "index.html");
         assert!(is_index);
         assert!(!is_listing); // Index wins over listings
+    }
+
+    #[test]
+    fn test_directory_listing_escapes_object_name_xss() {
+        use super::super::types::Object;
+
+        let objects = vec![Object {
+            name: "<script>a</script>".to_string(),
+            hash: "a".to_string(),
+            bytes: 1,
+            content_type: "text/plain".to_string(),
+            last_modified: "2024-01-01T00:00:00Z".to_string(),
+        }];
+
+        // Reflected path and attacker-controlled CSS path are also hostile.
+        let html = generate_directory_listing("c", "<x>", &objects, Some("\"><b>"));
+
+        // Object display name is entity-encoded, never rendered as raw markup.
+        assert!(html.contains("&lt;script&gt;a&lt;/script&gt;"));
+        assert!(!html.contains("<script>"));
+
+        // Reflected path in <title>/<h1> is neutralized.
+        assert!(html.contains("&lt;x&gt;"));
+
+        // The CSS path cannot break out of the href attribute.
+        assert!(!html.contains("href=\"/\"><b>\""));
+        assert!(!html.contains("\"><b>"));
+    }
+
+    #[test]
+    fn test_directory_listing_reflected_path_neutralized() {
+        let objects = vec![];
+        let html = generate_directory_listing("container", "</title><script>", &objects, None);
+
+        // The injected closing tag / script is entity-encoded.
+        assert!(html.contains("&lt;/title&gt;&lt;script&gt;"));
+        assert!(!html.contains("</title><script>"));
+    }
+
+    #[test]
+    fn test_directory_listing_normal_name_ampersand_escaped() {
+        use super::super::types::Object;
+
+        let objects = vec![Object {
+            name: "a&b.txt".to_string(),
+            hash: "a".to_string(),
+            bytes: 1,
+            content_type: "text/plain".to_string(),
+            last_modified: "2024-01-01T00:00:00Z".to_string(),
+        }];
+
+        let html = generate_directory_listing("container", "", &objects, None);
+
+        // Display text renders the ampersand as an HTML entity.
+        assert!(html.contains("a&amp;b.txt"));
+        // href percent-encodes the ampersand so it stays a single path segment.
+        assert!(html.contains("href=\"/a%26b.txt\""));
+    }
+
+    #[test]
+    fn test_breadcrumbs_escapes_segments() {
+        let html = generate_breadcrumbs("<script>/x/", "container");
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]

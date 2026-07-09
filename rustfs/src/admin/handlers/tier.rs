@@ -13,28 +13,19 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
-use crate::admin::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
-use crate::admin::storage_compat::ecstore::{
-    bucket::lifecycle::tier_last_day_stats::DailyAllTierStats,
-    client::admin_handler_utils::AdminError,
-    config::storageclass,
-    notification_sys::get_global_notification_sys,
-    tier::{
-        tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
-        tier_admin::TierCreds,
-        tier_config::{TierConfig, TierType},
-        tier_handlers::{
-            ERR_TIER_ALREADY_EXISTS, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
-            ERR_TIER_NOT_FOUND,
-        },
-    },
+use crate::admin::storage_api::tier::{
+    AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
+    ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
+    ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType, storageclass,
 };
 use crate::{
+    admin::runtime_sources::{
+        current_daily_tier_stats, current_notification_system, current_object_store_handle, current_tier_config_handle,
+    },
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_object_store_handle, resolve_tier_config_handle},
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
     storage::request_context::spawn_traced,
@@ -53,7 +44,7 @@ use s3s::{
     s3_error,
 };
 use serde_urlencoded::from_bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 use tracing::{debug, warn};
 
@@ -90,7 +81,7 @@ pub struct AddTierQuery {
 pub struct AddTier {}
 
 fn spawn_transition_tier_config_propagation(action: &'static str) {
-    if let Some(notification_sys) = get_global_notification_sys() {
+    if let Some(notification_sys) = current_notification_system() {
         spawn_traced(async move {
             for peer_result in notification_sys.load_transition_tier_config().await {
                 if let Some(err) = peer_result.err {
@@ -229,31 +220,67 @@ impl Operation for AddTier {
 
         match args.tier_type {
             TierType::S3 => {
-                args.name = args.s3.clone().unwrap().name;
+                args.name = args
+                    .s3
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing S3 configuration"))?
+                    .name;
             }
             TierType::RustFS => {
-                args.name = args.rustfs.clone().unwrap().name;
+                args.name = args
+                    .rustfs
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing RustFS configuration"))?
+                    .name;
             }
             TierType::MinIO => {
-                args.name = args.minio.clone().unwrap().name;
+                args.name = args
+                    .minio
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing MinIO configuration"))?
+                    .name;
             }
             TierType::Aliyun => {
-                args.name = args.aliyun.clone().unwrap().name;
+                args.name = args
+                    .aliyun
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Aliyun configuration"))?
+                    .name;
             }
             TierType::Tencent => {
-                args.name = args.tencent.clone().unwrap().name;
+                args.name = args
+                    .tencent
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Tencent configuration"))?
+                    .name;
             }
             TierType::Huaweicloud => {
-                args.name = args.huaweicloud.clone().unwrap().name;
+                args.name = args
+                    .huaweicloud
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Huawei Cloud configuration"))?
+                    .name;
             }
             TierType::Azure => {
-                args.name = args.azure.clone().unwrap().name;
+                args.name = args
+                    .azure
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Azure configuration"))?
+                    .name;
             }
             TierType::GCS => {
-                args.name = args.gcs.clone().unwrap().name;
+                args.name = args
+                    .gcs
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing GCS configuration"))?
+                    .name;
             }
             TierType::R2 => {
-                args.name = args.r2.clone().unwrap().name;
+                args.name = args
+                    .r2
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing R2 configuration"))?
+                    .name;
             }
             _ => (),
         }
@@ -301,12 +328,12 @@ impl Operation for AddTier {
             &_ => (),
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
         {
-            let tier_config_mgr_handle = resolve_tier_config_handle();
+            let tier_config_mgr_handle = current_tier_config_handle();
             let mut tier_config_mgr = tier_config_mgr_handle.write().await;
             if let Err(err) = tier_config_mgr.reload(store).await {
                 warn!(
@@ -379,8 +406,8 @@ impl Operation for AddTier {
         spawn_transition_tier_config_propagation("add");
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -448,12 +475,12 @@ impl Operation for EditTier {
             "admin tier state"
         );
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
         {
-            let tier_config_mgr_handle = resolve_tier_config_handle();
+            let tier_config_mgr_handle = current_tier_config_handle();
             let mut tier_config_mgr = tier_config_mgr_handle.write().await;
             if let Err(err) = tier_config_mgr.reload(store).await {
                 warn!(
@@ -511,8 +538,8 @@ impl Operation for EditTier {
         spawn_transition_tier_config_propagation("edit");
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -554,7 +581,7 @@ impl Operation for ListTiers {
         )
         .await?;
 
-        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let tier_config_mgr_handle = current_tier_config_handle();
         let tier_config_mgr = tier_config_mgr_handle.read().await;
         let tiers = tier_config_mgr.list_tiers();
 
@@ -562,7 +589,7 @@ impl Operation for ListTiers {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tiers err {e}")))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -618,12 +645,12 @@ impl Operation for RemoveTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
         {
-            let tier_config_mgr_handle = resolve_tier_config_handle();
+            let tier_config_mgr_handle = current_tier_config_handle();
             let mut tier_config_mgr = tier_config_mgr_handle.write().await;
             if let Err(err) = tier_config_mgr.reload(store).await {
                 warn!(
@@ -682,8 +709,8 @@ impl Operation for RemoveTier {
         spawn_transition_tier_config_propagation("remove");
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -711,13 +738,13 @@ impl Operation for VerifyTier {
         .await?;
 
         let tier = resolve_tier_name(&req.uri, &params)?;
-        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let tier_config_mgr_handle = current_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         tier_config_mgr.verify(&tier).await.map_err(map_tier_verify_error)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -758,13 +785,13 @@ impl Operation for GetTierInfo {
         } else {
             None
         };
-        let info = filter_tier_stats(GLOBAL_TransitionState.get_daily_all_tier_stats(), tier_name);
+        let info = filter_tier_stats(current_daily_tier_stats(), tier_name);
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -821,19 +848,42 @@ pub struct ClearTierQuery {
     pub force: String,
 }
 
+fn parse_clear_tier_query(uri: &Uri) -> S3Result<ClearTierQuery> {
+    let mut parsed = ClearTierQuery::default();
+    let mut seen = HashSet::with_capacity(2);
+    let Some(query) = uri.query() else {
+        return Ok(parsed);
+    };
+
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "rand" => {
+                if !seen.insert("rand") {
+                    return Err(s3_error!(InvalidArgument, "duplicate clear-tier query parameter"));
+                }
+                parsed.rand = Some(value.into_owned());
+            }
+            "force" => {
+                if !seen.insert("force") {
+                    return Err(s3_error!(InvalidArgument, "duplicate clear-tier query parameter"));
+                }
+                match value.as_ref() {
+                    "true" | "false" => parsed.force = value.into_owned(),
+                    _ => return Err(s3_error!(InvalidArgument, "invalid force flag")),
+                }
+            }
+            _ => return Err(s3_error!(InvalidArgument, "unknown clear-tier query parameter")),
+        }
+    }
+
+    Ok(parsed)
+}
+
 pub struct ClearTier {}
 #[async_trait::async_trait]
 impl Operation for ClearTier {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = {
-            if let Some(query) = req.uri.query() {
-                let input: ClearTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
-                input
-            } else {
-                ClearTierQuery::default()
-            }
-        };
+        let query = parse_clear_tier_query(&req.uri)?;
 
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -855,7 +905,9 @@ impl Operation for ClearTier {
         let mut force: bool = false;
         let force_str = query.force;
         if !force_str.is_empty() {
-            force = force_str.parse().unwrap();
+            force = force_str
+                .parse()
+                .map_err(|_e| s3_error!(InvalidArgument, "invalid force flag"))?;
         }
 
         let t = OffsetDateTime::now_utc();
@@ -875,7 +927,7 @@ impl Operation for ClearTier {
             return Err(s3_error!(InvalidRequest, "invalid clear-tier confirmation token"));
         };
 
-        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let tier_config_mgr_handle = current_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.clear_tier(force).await {
@@ -907,8 +959,8 @@ impl Operation for ClearTier {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -916,7 +968,7 @@ impl Operation for ClearTier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::storage_compat::ecstore::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
+    use crate::admin::storage_api::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use http::Uri;
     use matchit::Router;
 
@@ -1058,6 +1110,30 @@ mod tests {
 
         assert_eq!(mapped.code(), &S3ErrorCode::Custom("TierVerificationFailed".into()));
         assert_eq!(mapped.message(), Some("tier verification failed. backend unavailable"));
+    }
+
+    #[test]
+    fn parse_clear_tier_query_rejects_unknown_duplicate_and_invalid_force() {
+        for raw in [
+            "/rustfs/admin/v3/tier?rand=token&force=yes",
+            "/rustfs/admin/v3/tier?rand=token&rand=other",
+            "/rustfs/admin/v3/tier?rand=token&unexpected=true",
+        ] {
+            let uri: Uri = raw.parse().expect("uri should parse");
+            let err = parse_clear_tier_query(&uri).expect_err("strict clear-tier query should reject malformed input");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn parse_clear_tier_query_accepts_valid_force() {
+        let uri: Uri = "/rustfs/admin/v3/tier?rand=token&force=true"
+            .parse()
+            .expect("uri should parse");
+        let query = parse_clear_tier_query(&uri).expect("valid clear-tier query should parse");
+
+        assert_eq!(query.rand.as_deref(), Some("token"));
+        assert_eq!(query.force, "true");
     }
 
     fn sample_daily_stats() -> DailyAllTierStats {

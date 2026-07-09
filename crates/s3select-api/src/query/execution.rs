@@ -228,17 +228,14 @@ impl QueryStateMachine {
     }
 
     pub fn finish(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::FINISHED));
     }
 
     pub fn cancel(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::CANCELLED));
     }
 
     pub fn fail(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::FAILED));
     }
 

@@ -14,6 +14,7 @@
 
 use super::iam_error::iam_error_to_s3_error;
 use crate::{
+    admin::runtime_sources::current_action_credentials,
     admin::{
         auth::validate_admin_request,
         handlers::site_replication::site_replication_iam_change_hook,
@@ -28,7 +29,6 @@ use hyper::Method;
 use matchit::Params;
 use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
 use rustfs_madmin::{GroupAddRemove, GroupStatus, SITE_REPL_API_VERSION, SRGroupInfo, SRIAMItem};
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -115,7 +115,7 @@ impl Operation for ListGroups {
         )
         .await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -135,7 +135,7 @@ impl Operation for ListGroups {
         let body = serde_json::to_vec(&groups).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -180,7 +180,7 @@ impl Operation for GetGroup {
                 GroupQuery::default()
             }
         };
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -201,7 +201,7 @@ impl Operation for GetGroup {
         let body = serde_json::to_vec(&g).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -256,7 +256,7 @@ impl Operation for DeleteGroup {
 
         let group = decode_delete_group_name(&params)?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -317,8 +317,8 @@ impl Operation for DeleteGroup {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -394,7 +394,7 @@ impl Operation for SetGroupStatus {
             return Err(s3_error!(InvalidArgument, "group is required"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -469,8 +469,8 @@ impl Operation for SetGroupStatus {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -537,7 +537,7 @@ impl Operation for UpdateGroupMembers {
             "admin group state"
         );
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -551,7 +551,7 @@ impl Operation for UpdateGroupMembers {
                         ));
                     }
 
-                    get_global_action_cred()
+                    current_action_credentials()
                         .map(|cred| {
                             if constant_time_eq(&cred.access_key, member) {
                                 return Err(S3Error::with_message(
@@ -664,8 +664,8 @@ impl Operation for UpdateGroupMembers {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }

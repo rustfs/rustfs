@@ -13,18 +13,27 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
+use crate::object_api::ObjectInfo;
+use crate::storage_api_contracts::{
+    bucket::{BucketOperations, BucketOptions},
+    list::{ListOperations as _, StorageObjectInfoOrErr, StorageWalkOptions},
+};
 use crate::store::ECStore;
-use crate::store_api::{ObjectInfo, ObjectInfoOrErr, WalkOptions};
-use rustfs_storage_api::{BucketOperations, BucketOptions, ListOperations as _};
+use rustfs_filemeta::FileInfo;
 
 pub const DEFAULT_FREE_VERSION_RECOVERY_LIMIT: usize = 1_000;
 const DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT: usize = 10_000;
+const BACKGROUND_WALKDIR_TIMEOUT: Duration = Duration::from_secs(60);
+
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, crate::error::Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FreeVersionRecoveryStats {
@@ -215,7 +224,8 @@ async fn list_tier_free_versions(
                         limit: walk_scan_limit,
                         marker: object_marker,
                         ..Default::default()
-                    },
+                    }
+                    .with_walkdir_timeouts(BACKGROUND_WALKDIR_TIMEOUT),
                 )
                 .await
             }
@@ -304,10 +314,13 @@ fn mark_scan_truncated_if_needed(
 }
 
 fn is_recoverable_tier_free_version(oi: &ObjectInfo) -> bool {
-    oi.transitioned_object.free_version
-        && !oi.transitioned_object.name.is_empty()
-        && !oi.transitioned_object.version_id.is_empty()
-        && !oi.transitioned_object.tier.is_empty()
+    // A free version transitioned to an unversioned remote tier legally carries an
+    // empty `version_id` (see CLAUDE.md: a tier version of `None`/`""` means the
+    // tier bucket is unversioned). The worker path handles that by issuing a
+    // versionless remote delete, so the recovery gate must not treat an empty
+    // `version_id` as unrecoverable — the object name and tier are sufficient to
+    // identify a free version that still needs remote cleanup.
+    oi.transitioned_object.free_version && !oi.transitioned_object.name.is_empty() && !oi.transitioned_object.tier.is_empty()
 }
 
 #[cfg(test)]
@@ -410,7 +423,33 @@ mod tests {
 
         assert!(is_recoverable_tier_free_version(&oi));
 
+        // An unversioned remote tier records an empty `version_id`; such a free
+        // version must still be recoverable so it can be re-enqueued for a
+        // versionless remote delete instead of leaking forever.
         oi.transitioned_object.version_id.clear();
+        assert!(is_recoverable_tier_free_version(&oi));
+
+        // The object name and tier are the load-bearing fields; missing either
+        // still marks the entry as unrecoverable.
+        let mut missing_name = oi.clone();
+        missing_name.transitioned_object.name.clear();
+        assert!(!is_recoverable_tier_free_version(&missing_name));
+
+        let mut missing_tier = oi.clone();
+        missing_tier.transitioned_object.tier.clear();
+        assert!(!is_recoverable_tier_free_version(&missing_tier));
+    }
+
+    #[test]
+    fn recoverable_tier_free_version_rejects_non_free_version() {
+        // Relaxing the empty-version_id gate must not admit ordinary (non-free)
+        // versions into the remote-cleanup recovery path.
+        let mut oi = ObjectInfo::default();
+        oi.transitioned_object.free_version = false;
+        oi.transitioned_object.name = "remote/object".to_string();
+        oi.transitioned_object.version_id = "remote-version".to_string();
+        oi.transitioned_object.tier = "WARM".to_string();
+
         assert!(!is_recoverable_tier_free_version(&oi));
     }
 

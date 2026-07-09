@@ -14,7 +14,7 @@
 
 use thiserror::Error;
 
-use crate::heal::storage_compat::{DiskError, EcstoreError};
+use super::heal::{DiskError, EcstoreError};
 
 /// Custom error type for heal operations
 /// This enum defines various error variants that can occur during
@@ -39,9 +39,6 @@ pub enum Error {
 
     #[error("Other error: {0}")]
     Other(String),
-
-    #[error(transparent)]
-    Anyhow(#[from] anyhow::Error),
 
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -94,11 +91,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
     /// Create an Other error from any error type
-    pub fn other<E>(error: E) -> Self
-    where
-        E: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        Error::Other(error.into().to_string())
+    pub fn other(error: impl std::fmt::Display) -> Self {
+        Error::Other(error.to_string())
     }
 
     /// Create a transient skip error for retryable background heal checks.

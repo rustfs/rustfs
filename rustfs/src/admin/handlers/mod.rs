@@ -15,14 +15,19 @@
 pub mod account_info;
 pub mod audit;
 mod audit_runtime_config;
+pub mod batch_job;
 pub mod bucket_meta;
+pub mod cluster_snapshot;
 pub mod config_admin;
+pub mod diagnostics;
+pub mod durability;
 pub mod event;
 pub mod extensions;
 pub mod group;
 pub mod heal;
 pub mod health;
 pub(crate) mod iam_error;
+pub mod idp_compat;
 pub mod is_admin;
 pub mod kms;
 pub mod kms_dynamic;
@@ -73,6 +78,7 @@ mod tests {
         let _set_config_handler = config_admin::SetConfigHandler {};
         let _list_audit_targets = audit::ListAuditTargets {};
         let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
+        let _get_cluster_snapshot = cluster_snapshot::GetClusterSnapshotHandler {};
         let _get_extension_catalog = extensions::GetExtensionCatalogHandler {};
         let _list_extension_instances = extensions::ListExtensionInstancesHandler {};
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};

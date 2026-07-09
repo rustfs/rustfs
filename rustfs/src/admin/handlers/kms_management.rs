@@ -17,12 +17,12 @@
 use super::kms_keys::{CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, ListKeysHandler};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_kms_runtime_service_manager;
+use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
-use rustfs_kms::{KmsBackend, init_global_kms_service_manager};
+use rustfs_kms::KmsBackend;
 use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -35,11 +35,11 @@ async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_k
 }
 
 fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
-    match resolve_kms_runtime_service_manager() {
+    match current_kms_runtime_service_manager() {
         Some(manager) => manager,
         None => {
             warn!("KMS service manager not initialized, initializing now as fallback");
-            init_global_kms_service_manager()
+            current_or_init_kms_runtime_service_manager()
         }
     }
 }
@@ -208,7 +208,7 @@ impl Operation for KmsStatusHandler {
         let data = serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
@@ -257,7 +257,7 @@ impl Operation for KmsConfigHandler {
         let data = serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
@@ -302,7 +302,7 @@ impl Operation for KmsClearCacheHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }

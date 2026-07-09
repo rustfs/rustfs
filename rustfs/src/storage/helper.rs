@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::server::{is_audit_module_enabled, is_notify_module_enabled};
+use crate::server::{convert_ecstore_object_info, is_audit_module_enabled, is_notify_module_enabled};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use hashbrown::HashMap;
 use http::StatusCode;
 use metrics::counter;
@@ -23,7 +24,7 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_io_metrics::record_s3_op;
-use rustfs_notify::{EventArgsBuilder, notifier_global};
+use rustfs_notify::EventArgsBuilder;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
 use rustfs_targets::{
@@ -36,7 +37,7 @@ use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 use tracing::{Instrument, info_span, warn};
 
-use crate::storage::StorageObjectInfo as ObjectInfo;
+use crate::storage::storage_api::helper_consumer::StorageObjectInfo as ObjectInfo;
 
 /// Schedules an asynchronous task on the current runtime;
 /// if there is no runtime, creates a minimal runtime execution on a new thread.
@@ -120,8 +121,7 @@ impl OperationHelper {
             .filter(|value| !value.is_empty())
             .unwrap_or(path_bucket);
 
-        let bucket_label = if bucket.is_empty() { "*" } else { &bucket };
-        record_s3_op(op, bucket_label);
+        record_s3_op(op);
 
         // Fast path: when both chains are disabled, avoid all request parsing/builder work.
         if !audit_enabled && !notify_enabled {
@@ -206,7 +206,7 @@ impl OperationHelper {
         // initialize event builder
         // object is a placeholder that must be set later using the `object()` method.
         let event_builder = if notify_enabled {
-            let mut event_builder = EventArgsBuilder::new(event, bucket, event_object)
+            let mut event_builder = EventArgsBuilder::new(event, bucket, convert_ecstore_object_info(event_object))
                 .host(get_request_host(&req.headers))
                 .port(get_request_port(&req.headers))
                 .user_agent(get_request_user_agent(&req.headers))
@@ -236,12 +236,19 @@ impl OperationHelper {
         }))
     }
 
+    /// True when a pending event notification still needs the final ObjectInfo.
+    /// Callers can use this to avoid cloning ObjectInfo when the event chain is
+    /// disabled or suppressed.
+    pub fn wants_object_info(&self) -> bool {
+        matches!(self, Self::Enabled(state) if state.event_builder.is_some())
+    }
+
     /// Sets the ObjectInfo for event notification.
     pub fn object(mut self, object_info: ObjectInfo) -> Self {
         if let Self::Enabled(state) = &mut self
             && let Some(builder) = state.event_builder.take()
         {
-            state.event_builder = Some(builder.object(object_info));
+            state.event_builder = Some(builder.object(convert_ecstore_object_info(object_info)));
         }
         self
     }
@@ -311,8 +318,8 @@ impl OperationHelper {
                 final_builder = final_builder.error(err);
             }
 
-            if let Some(sk) = rustfs_credentials::get_global_access_key_opt() {
-                final_builder = final_builder.access_key(&sk);
+            if let Some(cred) = runtime_sources::current_action_credentials() {
+                final_builder = final_builder.access_key(&cred.access_key);
             }
 
             // Inject OpenTelemetry trace context into audit tags for distributed tracing correlation
@@ -382,7 +389,7 @@ impl Drop for OperationHelper {
             if !event_args.is_replication_request() {
                 let ctx = state.request_context.clone();
                 spawn_background_with_context(ctx, async move {
-                    notifier_global::notify(event_args).await;
+                    runtime_sources::current_notify_interface().notify(event_args).await;
                 });
             }
         }
@@ -390,12 +397,18 @@ impl Drop for OperationHelper {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::OperationHelper;
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
+    use crate::storage::access::ReqInfo;
+    use crate::storage::request_context::RequestContext;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use rustfs_credentials::Credentials;
+    use rustfs_s3_ops::S3Operation;
+    use rustfs_s3_types::EventName;
+    use s3s::S3Request;
     use s3s::dto::DeleteObjectTaggingInput;
     use std::sync::{Arc, Mutex};
     use temp_env::with_vars;
@@ -500,10 +513,10 @@ mod tests {
                 });
 
                 let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
-                let event_args = match &helper {
-                    OperationHelper::Enabled(state) => state.event_builder.clone().expect("event builder should exist").build(),
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
                 };
+                let event_args = state.event_builder.clone().expect("event builder should exist").build();
 
                 assert_eq!(event_args.bucket_name, "issue-2292-bucket");
                 assert_eq!(event_args.object.bucket, "issue-2292-bucket");
@@ -552,13 +565,11 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 // Verify the helper stored the RequestContext
-                match &helper {
-                    OperationHelper::Enabled(state) => {
-                        assert!(state.request_context.is_some());
-                        assert_eq!(state.request_context.as_ref().unwrap().request_id, "ingress-canonical-uuid");
-                    }
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
-                }
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
+                };
+                assert!(state.request_context.is_some());
+                assert_eq!(state.request_context.as_ref().unwrap().request_id, "ingress-canonical-uuid");
             },
         );
     }
@@ -595,10 +606,10 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 // Verify the helper has no RequestContext
-                match &helper {
-                    OperationHelper::Enabled(state) => assert!(state.request_context.is_none()),
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
-                }
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
+                };
+                assert!(state.request_context.is_none());
             },
         );
     }

@@ -12,17 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Backpressure management
+//! Shared backpressure policy type.
+//!
+//! The runtime backpressure implementation (byte-watermark pipes and
+//! monitors) lives in `rustfs/src/storage/backpressure.rs`; this module only
+//! carries the watermark policy type that implementation shares.
 
-use rustfs_io_core::{
-    BackpressureConfig as CoreBackpressureConfig, BackpressureMonitor as CoreBackpressureMonitor, BackpressureState,
-};
-use rustfs_io_metrics::backpressure_metrics;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::io::{DuplexStream, duplex};
+use rustfs_io_core::BackpressureConfig as CoreBackpressureConfig;
 
-/// Facade policy for duplex-pipe watermark backpressure.
+/// Watermark policy for duplex-pipe backpressure.
 #[derive(Debug, Clone, Copy)]
 pub struct PipeBackpressurePolicy {
     /// Buffer size in bytes
@@ -54,9 +52,9 @@ impl PipeBackpressurePolicy {
         (self.buffer_size as u64 * self.low_watermark as u64 / 100) as usize
     }
 
-    /// Convert the facade policy into the reusable io-core admission-pressure config.
+    /// Convert the policy into the reusable io-core admission-pressure config.
     ///
-    /// The concurrency layer still owns duplex buffer sizing, but the shared
+    /// The caller still owns duplex buffer sizing, but the shared
     /// overload/admission primitive lives in `io-core`.
     pub fn to_core_config(&self) -> CoreBackpressureConfig {
         CoreBackpressureConfig {
@@ -69,155 +67,26 @@ impl PipeBackpressurePolicy {
     }
 }
 
-/// Backpressure manager
-pub struct BackpressureManager {
-    config: PipeBackpressurePolicy,
-    core_config: CoreBackpressureConfig,
-    monitor: Arc<CoreBackpressureMonitor>,
-}
-
-impl BackpressureManager {
-    /// Create a new backpressure manager
-    pub fn new(buffer_size: usize, high_watermark: u32, low_watermark: u32) -> Self {
-        Self::from_policy(PipeBackpressurePolicy {
-            buffer_size,
-            high_watermark,
-            low_watermark,
-        })
-    }
-
-    /// Create a new backpressure manager from the facade policy type.
-    pub fn from_policy(config: PipeBackpressurePolicy) -> Self {
-        let core_config = config.to_core_config();
-        Self {
-            config,
-            core_config: core_config.clone(),
-            monitor: Arc::new(CoreBackpressureMonitor::new(core_config)),
-        }
-    }
-
-    /// Get the configuration
-    pub fn config(&self) -> &PipeBackpressurePolicy {
-        &self.config
-    }
-
-    /// Get the derived io-core admission-pressure configuration.
-    pub fn core_config(&self) -> &CoreBackpressureConfig {
-        &self.core_config
-    }
-
-    /// Get the monitor
-    pub fn monitor(&self) -> Arc<CoreBackpressureMonitor> {
-        self.monitor.clone()
-    }
-
-    /// Create a backpressure pipe
-    pub fn create_pipe(&self) -> BackpressurePipe {
-        BackpressurePipe::new(self.config, self.monitor.clone())
-    }
-
-    /// Get current state
-    pub fn state(&self) -> BackpressureState {
-        self.monitor.state()
-    }
-
-    /// Check if backpressure is active
-    pub fn is_active(&self) -> bool {
-        self.monitor.is_active()
-    }
-}
-
-/// Backpressure pipe wrapping tokio's duplex
-pub struct BackpressurePipe {
-    reader: DuplexStream,
-    writer: DuplexStream,
-    config: PipeBackpressurePolicy,
-    monitor: Arc<CoreBackpressureMonitor>,
-    created_at: Instant,
-}
-
-/// Shared pipe metadata snapshot for facade-level backpressure pipes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BackpressurePipeMeta {
-    /// Configured duplex buffer capacity in bytes.
-    pub buffer_capacity: usize,
-    /// Current backpressure state reported by the shared core monitor.
-    pub state: BackpressureState,
-    /// Age of the pipe since creation.
-    pub age: std::time::Duration,
-}
-
-impl BackpressurePipe {
-    fn new(config: PipeBackpressurePolicy, monitor: Arc<CoreBackpressureMonitor>) -> Self {
-        let (reader, writer) = duplex(config.buffer_size);
-
-        Self {
-            reader,
-            writer,
-            config,
-            monitor,
-            created_at: Instant::now(),
-        }
-    }
-
-    /// Get the reader end
-    pub fn reader(&mut self) -> &mut DuplexStream {
-        &mut self.reader
-    }
-
-    /// Get the writer end
-    pub fn writer(&mut self) -> &mut DuplexStream {
-        &mut self.writer
-    }
-
-    /// Split into reader and writer
-    pub fn into_split(self) -> (DuplexStream, DuplexStream) {
-        (self.reader, self.writer)
-    }
-
-    /// Get the configuration
-    pub fn config(&self) -> &PipeBackpressurePolicy {
-        &self.config
-    }
-
-    /// Get current state
-    pub fn state(&self) -> BackpressureState {
-        self.monitor.state()
-    }
-
-    /// Get the age of this pipe
-    pub fn age(&self) -> std::time::Duration {
-        self.created_at.elapsed()
-    }
-
-    /// Get a compact metadata snapshot for the pipe.
-    pub fn meta(&self) -> BackpressurePipeMeta {
-        BackpressurePipeMeta {
-            buffer_capacity: self.config.buffer_size,
-            state: self.state(),
-            age: self.age(),
-        }
-    }
-
-    /// Check if should apply backpressure
-    pub fn should_apply_backpressure(&self) -> bool {
-        let should = self.monitor.should_apply_backpressure();
-        if should {
-            backpressure_metrics::record_backpressure_activation();
-        }
-        should
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_backpressure_config() {
+    fn test_backpressure_policy_defaults() {
         let config = PipeBackpressurePolicy::default();
         assert_eq!(config.buffer_size, 4 * 1024 * 1024);
         assert!(config.high_watermark > config.low_watermark);
+    }
+
+    #[test]
+    fn test_backpressure_policy_watermark_bytes() {
+        let config = PipeBackpressurePolicy {
+            buffer_size: 1000,
+            high_watermark: 80,
+            low_watermark: 50,
+        };
+        assert_eq!(config.high_watermark_bytes(), 800);
+        assert_eq!(config.low_watermark_bytes(), 500);
     }
 
     #[test]
@@ -227,19 +96,5 @@ mod tests {
         assert_eq!(core.high_water_mark, policy.high_watermark as f64 / 100.0);
         assert_eq!(core.low_water_mark, policy.low_watermark as f64 / 100.0);
         assert!(core.enabled);
-    }
-
-    #[test]
-    fn test_backpressure_manager() {
-        let manager = BackpressureManager::new(1024, 80, 50);
-        assert_eq!(manager.state(), BackpressureState::Normal);
-    }
-
-    #[test]
-    fn test_backpressure_pipe() {
-        let manager = BackpressureManager::new(1024, 80, 50);
-        let pipe = manager.create_pipe();
-        assert_eq!(pipe.state(), BackpressureState::Normal);
-        assert_eq!(pipe.meta().buffer_capacity, 1024);
     }
 }

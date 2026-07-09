@@ -338,6 +338,13 @@ pub enum MetricName {
     ScannerPartialCycles,
     ScannerPartialCyclesByReason,
 
+    // Compression-related metrics
+    CompressedBytesTotal,
+    OriginedBytesTotal,
+    SavedBytesTotal,
+    CompressionRatio,
+    CompressionOperationsTotal,
+
     // CPU system-related metrics
     SysCPUAvgIdle,
     SysCPUAvgIOWait,
@@ -736,6 +743,13 @@ impl MetricName {
             Self::ScannerFailedCycles => "failed_cycles".to_string(),
             Self::ScannerPartialCycles => "partial_cycles".to_string(),
             Self::ScannerPartialCyclesByReason => "partial_cycles_by_reason".to_string(),
+
+            // Compression-related metrics
+            Self::CompressedBytesTotal => "compressed_bytes".to_string(),
+            Self::OriginedBytesTotal => "original_bytes".to_string(),
+            Self::SavedBytesTotal => "saved_bytes".to_string(),
+            Self::CompressionRatio => "compression_ratio".to_string(),
+            Self::CompressionOperationsTotal => "compression_operation_total".to_string(),
 
             // CPU system-related metrics
             Self::SysCPUAvgIdle => "avg_idle".to_string(),

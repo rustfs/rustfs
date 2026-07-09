@@ -22,6 +22,7 @@ use crate::types::*;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jiff::Zoned;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -31,11 +32,26 @@ use vaultrs::{
         requests::{CreateKeyRequestBuilder, DecryptDataRequestBuilder, EncryptDataRequestBuilder},
     },
     client::{VaultClient, VaultClientSettingsBuilder},
+    kv2,
     transit::{data, key},
 };
 
 #[derive(Debug, Clone)]
 struct TransitKeyMetadata {
+    key_usage: KeyUsage,
+    description: Option<String>,
+    tags: HashMap<String, String>,
+    key_state: KeyState,
+    created_at: Zoned,
+    deletion_date: Option<Zoned>,
+    origin: String,
+    created_by: Option<String>,
+    current_version: u32,
+}
+
+/// Serializable version of TransitKeyMetadata for KV v2 persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransitKeyMetadataPersisted {
     key_usage: KeyUsage,
     description: Option<String>,
     tags: HashMap<String, String>,
@@ -77,9 +93,45 @@ impl TransitKeyMetadata {
     }
 }
 
+impl From<TransitKeyMetadata> for TransitKeyMetadataPersisted {
+    fn from(m: TransitKeyMetadata) -> Self {
+        Self {
+            key_usage: m.key_usage,
+            description: m.description,
+            tags: m.tags,
+            key_state: m.key_state,
+            created_at: m.created_at,
+            deletion_date: m.deletion_date,
+            origin: m.origin,
+            created_by: m.created_by,
+            current_version: m.current_version,
+        }
+    }
+}
+
+impl From<TransitKeyMetadataPersisted> for TransitKeyMetadata {
+    fn from(m: TransitKeyMetadataPersisted) -> Self {
+        Self {
+            key_usage: m.key_usage,
+            description: m.description,
+            tags: m.tags,
+            key_state: m.key_state,
+            created_at: m.created_at,
+            deletion_date: m.deletion_date,
+            origin: m.origin,
+            created_by: m.created_by,
+            current_version: m.current_version,
+        }
+    }
+}
+
 pub struct VaultTransitKmsClient {
     client: VaultClient,
     config: VaultTransitConfig,
+    /// KV v2 mount path for persisting transit key metadata
+    metadata_kv_mount: String,
+    /// Path prefix under metadata_kv_mount for storing transit key metadata records
+    metadata_key_prefix: String,
     metadata_cache: RwLock<HashMap<String, TransitKeyMetadata>>,
 }
 
@@ -112,6 +164,8 @@ impl VaultTransitKmsClient {
 
         Ok(Self {
             client,
+            metadata_kv_mount: config.metadata_kv_mount.clone(),
+            metadata_key_prefix: config.metadata_key_prefix.clone(),
             config,
             metadata_cache: RwLock::new(HashMap::new()),
         })
@@ -193,23 +247,73 @@ impl VaultTransitKmsClient {
             .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))
     }
 
+    fn metadata_key_path(&self, key_id: &str) -> String {
+        format!("{}/{}", self.metadata_key_prefix, key_id)
+    }
+
+    async fn read_metadata_from_kv(&self, key_id: &str) -> Result<Option<TransitKeyMetadata>> {
+        let path = self.metadata_key_path(key_id);
+        match kv2::read::<TransitKeyMetadataPersisted>(&self.client, &self.metadata_kv_mount, &path).await {
+            Ok(persisted) => Ok(Some(persisted.into())),
+            Err(vaultrs::error::ClientError::ResponseWrapError)
+            | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(None),
+            Err(e) => Err(KmsError::backend_error(format!("Failed to read transit key metadata from Vault KV: {e}"))),
+        }
+    }
+
+    async fn write_metadata_to_kv(&self, key_id: &str, metadata: &TransitKeyMetadata) -> Result<()> {
+        let path = self.metadata_key_path(key_id);
+        let persisted: TransitKeyMetadataPersisted = metadata.clone().into();
+        kv2::set(&self.client, &self.metadata_kv_mount, &path, &persisted)
+            .await
+            .map(|_| ())
+            .map_err(|e| KmsError::backend_error(format!("Failed to write transit key metadata to Vault KV: {e}")))
+    }
+
+    async fn delete_metadata_from_kv(&self, key_id: &str) -> Result<()> {
+        let path = self.metadata_key_path(key_id);
+        match kv2::delete_metadata(&self.client, &self.metadata_kv_mount, &path).await {
+            Ok(_) => Ok(()),
+            Err(vaultrs::error::ClientError::ResponseWrapError)
+            | Err(vaultrs::error::ClientError::APIError { code: 404, .. }) => Ok(()),
+            Err(e) => Err(KmsError::backend_error(format!(
+                "Failed to delete transit key metadata from Vault KV: {e}"
+            ))),
+        }
+    }
+
     async fn get_key_metadata(&self, key_id: &str) -> Result<TransitKeyMetadata> {
+        // Check in-memory cache first.
         if let Some(metadata) = self.metadata_cache.read().await.get(key_id).cloned() {
             return Ok(metadata);
         }
 
+        // On cache miss, try reading from the persistent KV store.
+        if let Some(persisted) = self.read_metadata_from_kv(key_id).await? {
+            self.metadata_cache
+                .write()
+                .await
+                .insert(key_id.to_string(), persisted.clone());
+            return Ok(persisted);
+        }
+
+        // Verify the transit key actually exists in Vault before synthesising.
         self.read_transit_key(key_id).await?;
         let metadata = TransitKeyMetadata::synthesized();
+        // Persist the synthesised metadata so future cache misses pick it up.
+        let _ = self.write_metadata_to_kv(key_id, &metadata).await;
         self.metadata_cache.write().await.insert(key_id.to_string(), metadata.clone());
         Ok(metadata)
     }
 
     async fn store_key_metadata(&self, key_id: &str, metadata: &TransitKeyMetadata) -> Result<()> {
+        self.write_metadata_to_kv(key_id, metadata).await?;
         self.metadata_cache.write().await.insert(key_id.to_string(), metadata.clone());
         Ok(())
     }
 
     async fn delete_key_metadata(&self, key_id: &str) -> Result<()> {
+        self.delete_metadata_from_kv(key_id).await?;
         self.metadata_cache.write().await.remove(key_id);
         Ok(())
     }
@@ -492,6 +596,8 @@ impl VaultTransitKmsBackend {
                 auth_method: vault_config.auth_method.clone(),
                 namespace: vault_config.namespace.clone(),
                 mount_path: vault_config.mount_path.clone(),
+                metadata_kv_mount: vault_config.kv_mount.clone(),
+                metadata_key_prefix: vault_config.key_path_prefix.clone(),
                 tls: vault_config.tls.clone(),
             },
             crate::config::BackendConfig::Local(_) => {
@@ -634,5 +740,150 @@ impl KmsBackend for VaultTransitKmsBackend {
 
     async fn health_check(&self) -> Result<bool> {
         self.client.health_check().await.map(|_| true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT, VaultAuthMethod, VaultTransitConfig,
+    };
+    use crate::types::KeyStatus;
+
+    fn test_vault_transit_config() -> VaultTransitConfig {
+        VaultTransitConfig {
+            address: "http://127.0.0.1:8200".to_string(),
+            auth_method: VaultAuthMethod::Token {
+                token: std::env::var("RUSTFS_KMS_VAULT_TOKEN").unwrap_or_else(|_| "dev-token".to_string()),
+            },
+            namespace: None,
+            mount_path: "transit".to_string(),
+            metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
+            metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
+            tls: None,
+        }
+    }
+
+    /// Regression test for rustfs/backlog#808.
+    ///
+    /// VaultTransit stores key metadata (state, tags, etc.) ONLY in an in-memory
+    /// `metadata_cache`. On a cache miss — including after any server restart —
+    /// `get_key_metadata()` synthesises a fresh record with `key_state: Enabled`.
+    /// This means a disabled/deleted key silently revives as Enabled after restart.
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance with transit engine enabled
+    async fn test_transit_key_state_lost_after_restart_simulation() {
+        let config = test_vault_transit_config();
+
+        // --- First "process": create a key and disable it ---
+        let client1 = VaultTransitKmsClient::new(config.clone())
+            .await
+            .expect("Failed to create VaultTransit client");
+
+        let key_id = format!("regression-808-{}", uuid::Uuid::new_v4());
+
+        // Create key → Enabled
+        let created = client1.create_key(&key_id, "AES_256", None).await.expect("create_key");
+        assert_eq!(created.status, KeyStatus::Active, "newly created key must be Active");
+
+        let info = client1
+            .describe_key(&key_id, None)
+            .await
+            .expect("describe_key before disable");
+        assert_eq!(info.status, KeyStatus::Active, "key must be Active before disable");
+
+        // Disable the key
+        client1.disable_key(&key_id, None).await.expect("disable_key");
+
+        let info_after_disable = client1.describe_key(&key_id, None).await.expect("describe_key after disable");
+        assert_eq!(info_after_disable.status, KeyStatus::Disabled, "key must be Disabled after disable_key");
+
+        // --- Simulate restart: create a brand new client with empty cache ---
+        let client2 = VaultTransitKmsClient::new(config)
+            .await
+            .expect("Failed to create second VaultTransit client (restart simulation)");
+
+        // After "restart", the key must remain Disabled because KV-persisted metadata
+        // survives across client recreation.
+        let info_after_restart = client2
+            .describe_key(&key_id, None)
+            .await
+            .expect("describe_key after restart simulation");
+
+        assert_eq!(
+            info_after_restart.status,
+            KeyStatus::Disabled,
+            "after restart, a disabled key must remain Disabled"
+        );
+
+        // Cleanup: schedule the key for deletion so Vault state is clean for the next run.
+        let _ = client2.schedule_key_deletion(&key_id, 7, None).await;
+    }
+
+    /// Regression test for rustfs/backlog#808.
+    ///
+    /// PendingDeletion must be persisted outside the process-local metadata cache.
+    /// Otherwise, a restart would synthesize Enabled metadata and allow new key use.
+    #[tokio::test]
+    #[ignore] // Requires a running Vault instance with transit engine enabled
+    async fn test_transit_pending_deletion_survives_restart_simulation() {
+        let config = test_vault_transit_config();
+
+        let client1 = VaultTransitKmsClient::new(config.clone())
+            .await
+            .expect("Failed to create VaultTransit client");
+
+        let key_id = format!("regression-808-pending-{}", uuid::Uuid::new_v4());
+
+        let created = client1.create_key(&key_id, "AES_256", None).await.expect("create_key");
+        assert_eq!(created.status, KeyStatus::Active, "newly created key must be Active");
+
+        client1
+            .schedule_key_deletion(&key_id, 7, None)
+            .await
+            .expect("schedule_key_deletion");
+
+        let info_after_schedule = client1
+            .describe_key(&key_id, None)
+            .await
+            .expect("describe_key after schedule_key_deletion");
+        assert_eq!(
+            info_after_schedule.status,
+            KeyStatus::PendingDeletion,
+            "key must be PendingDeletion after schedule_key_deletion"
+        );
+
+        let client2 = VaultTransitKmsClient::new(config)
+            .await
+            .expect("Failed to create second VaultTransit client (restart simulation)");
+
+        let info_after_restart = client2
+            .describe_key(&key_id, None)
+            .await
+            .expect("describe_key after restart simulation");
+
+        assert_eq!(
+            info_after_restart.status,
+            KeyStatus::PendingDeletion,
+            "after restart, a pending-deletion key must remain PendingDeletion"
+        );
+
+        let generate_result = client2
+            .generate_data_key(
+                &GenerateKeyRequest {
+                    master_key_id: key_id,
+                    key_spec: "AES_256".to_string(),
+                    key_length: Some(32),
+                    encryption_context: HashMap::new(),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await;
+        assert!(
+            generate_result.is_err(),
+            "after restart, a pending-deletion key must not be usable for new data keys"
+        );
     }
 }

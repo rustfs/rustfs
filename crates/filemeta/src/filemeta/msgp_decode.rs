@@ -16,6 +16,46 @@ use crate::{Error, Result};
 use rmp::Marker;
 use std::io::Read;
 
+/// Maximum accepted length for a single length-prefixed msgpack element
+/// (map key, string, binary blob, ext payload, or a whole serialized
+/// xl.meta record inside a metacache stream).
+///
+/// Legitimate elements are far smaller: object keys are at most a few KiB
+/// and even an xl.meta record fully populated up to the 10,000-version
+/// object cap serializes to a few MiB (metacache streams carry xl.meta
+/// without inline data), so 16 MiB leaves ample headroom. A larger value
+/// means the length prefix itself is corrupt; decoding must fail with an
+/// error instead of attempting a huge allocation that aborts the whole
+/// process (see rustfs/rustfs#2715).
+pub(crate) const MAX_MSGP_ELEMENT_SIZE: usize = 16 << 20;
+
+/// Reads exactly `len` bytes into a fresh buffer, treating `len` as
+/// untrusted input: lengths above [`MAX_MSGP_ELEMENT_SIZE`] and allocation
+/// failures surface as decode errors instead of aborting the process.
+pub(crate) fn read_exact_vec<R: Read>(rd: &mut R, len: usize) -> Result<Vec<u8>> {
+    if len > MAX_MSGP_ELEMENT_SIZE {
+        return Err(Error::other(format!(
+            "corrupt msgpack element: length {len} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
+        )));
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|e| Error::other(format!("msgpack element allocation of {len} bytes failed: {e}")))?;
+    buf.resize(len, 0);
+    rd.read_exact(&mut buf).map_err(Error::from)?;
+    Ok(buf)
+}
+
+/// Bounds a decoded collection count when it is used only as a
+/// pre-allocation hint. The decode loop still consumes exactly the decoded
+/// number of elements (a corrupt count fails with an EOF decode error once
+/// the input runs out); this merely keeps the speculative reservation from
+/// aborting the process on an absurd count.
+pub(crate) fn prealloc_hint(len: usize) -> usize {
+    const MAX_PREALLOC_ITEMS: usize = 4096;
+    len.min(MAX_PREALLOC_ITEMS)
+}
+
 /// Reader that prepends a single byte to the stream. Used when we've read the marker
 /// and need to pass it to a decoder that expects to read the marker itself.
 pub(crate) struct PrependByteReader<'a, R> {
@@ -179,34 +219,70 @@ pub(crate) fn skip_msgp_value<R: Read>(rd: &mut R) -> Result<()> {
             }
             return Ok(());
         }
-        Marker::FixExt1 => 1,
-        Marker::FixExt2 => 2,
-        Marker::FixExt4 => 4,
-        Marker::FixExt8 => 8,
-        Marker::FixExt16 => 16,
+        // fixext N = marker + 1 type byte + N data bytes
+        Marker::FixExt1 => 2,
+        Marker::FixExt2 => 3,
+        Marker::FixExt4 => 5,
+        Marker::FixExt8 => 9,
+        Marker::FixExt16 => 17,
+        // ext 8/16/32 = marker + length bytes (read here) + 1 type byte + data
         Marker::Ext8 => {
             let mut b = [0u8; 1];
             rd.read_exact(&mut b).map_err(Error::from)?;
             let len = b[0] as usize;
-            1 + len // type byte + data
+            1 + len
         }
         Marker::Ext16 => {
             let mut b = [0u8; 2];
             rd.read_exact(&mut b).map_err(Error::from)?;
             let len = u16::from_be_bytes(b) as usize;
-            2 + len // type bytes + data
+            1 + len
         }
         Marker::Ext32 => {
             let mut b = [0u8; 4];
             rd.read_exact(&mut b).map_err(Error::from)?;
             let len = u32::from_be_bytes(b) as usize;
-            4 + len // type bytes + data
+            1 + len
         }
         Marker::Reserved => 0,
     };
     if skip_len > 0 {
-        let mut buf = vec![0u8; skip_len];
-        rd.read_exact(&mut buf).map_err(Error::from)?;
+        // Discard the payload without allocating a buffer sized by the
+        // untrusted length; a truncated stream surfaces as UnexpectedEof.
+        let copied = std::io::copy(&mut rd.by_ref().take(skip_len as u64), &mut std::io::sink()).map_err(Error::from)?;
+        if copied != skip_len as u64 {
+            return Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated msgpack value",
+            )));
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_exact_vec_rejects_oversized_length() {
+        let mut rd: &[u8] = &[];
+        let err = read_exact_vec(&mut rd, MAX_MSGP_ELEMENT_SIZE + 1).expect_err("oversized length must be rejected");
+        assert!(err.to_string().contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn read_exact_vec_reads_exact_payload() {
+        let mut rd: &[u8] = b"hello";
+        assert_eq!(read_exact_vec(&mut rd, 5).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn skip_msgp_value_rejects_truncated_huge_payload_without_allocating() {
+        // bin32 claiming u32::MAX bytes with no payload behind it.
+        let mut data = vec![0xc6];
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut rd = data.as_slice();
+        assert!(skip_msgp_value(&mut rd).is_err());
+    }
 }

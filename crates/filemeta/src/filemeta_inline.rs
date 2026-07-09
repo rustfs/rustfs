@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
+use crate::filemeta::msgp_decode::{prealloc_hint, read_exact_vec};
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -41,14 +42,20 @@ impl InlineData {
             let str_len = rmp::decode::read_str_len(&mut scan_cur)? as usize;
             let key_start = scan_cur.position() as usize;
             let key_end = key_start + str_len;
+            let key = buf
+                .get(key_start..key_end)
+                .ok_or_else(|| Error::other("InlineData key out of range"))?;
             scan_cur.set_position(key_end as u64);
 
             let bin_len = rmp::decode::read_bin_len(&mut scan_cur)? as usize;
             let value_start = scan_cur.position() as usize;
             let value_end = value_start + bin_len;
+            if value_end > buf.len() {
+                return Err(Error::other("InlineData value out of range"));
+            }
             scan_cur.set_position(value_end as u64);
 
-            if should_remove(&buf[key_start..key_end]) {
+            if should_remove(key) {
                 return Ok(true);
             }
         }
@@ -67,20 +74,22 @@ impl InlineData {
 
         let mut cur = Cursor::new(buf);
         let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
-        let mut keys = Vec::with_capacity(fields_len);
-        let mut values = Vec::with_capacity(fields_len);
+        let mut keys = Vec::with_capacity(prealloc_hint(fields_len));
+        let mut values = Vec::with_capacity(prealloc_hint(fields_len));
         let mut found = false;
 
         while fields_len > 0 {
             fields_len -= 1;
 
             let str_len = rmp::decode::read_str_len(&mut cur)? as usize;
-            let mut field_buf = vec![0u8; str_len];
-            cur.read_exact(&mut field_buf)?;
+            let field_buf = read_exact_vec(&mut cur, str_len)?;
 
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
+            let value = buf
+                .get(start..end)
+                .ok_or_else(|| Error::other("InlineData value out of range"))?;
             cur.set_position(end as u64);
 
             if should_remove(field_buf.as_slice()) {
@@ -89,7 +98,7 @@ impl InlineData {
             }
 
             keys.push(String::from_utf8(field_buf)?);
-            values.push(buf[start..end].to_vec());
+            values.push(value.to_vec());
         }
 
         if !found {
@@ -114,20 +123,22 @@ impl InlineData {
         let same = first_key == second_key;
         let mut cur = Cursor::new(buf);
         let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
-        let mut keys = Vec::with_capacity(fields_len + 1);
-        let mut values = Vec::with_capacity(fields_len + 1);
+        let mut keys = Vec::with_capacity(prealloc_hint(fields_len) + 1);
+        let mut values = Vec::with_capacity(prealloc_hint(fields_len) + 1);
         let mut found = false;
 
         while fields_len > 0 {
             fields_len -= 1;
 
             let str_len = rmp::decode::read_str_len(&mut cur)? as usize;
-            let mut field_buf = vec![0u8; str_len];
-            cur.read_exact(&mut field_buf)?;
+            let field_buf = read_exact_vec(&mut cur, str_len)?;
 
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
+            let value = buf
+                .get(start..end)
+                .ok_or_else(|| Error::other("InlineData value out of range"))?;
             cur.set_position(end as u64);
 
             let should_remove = if same {
@@ -142,7 +153,7 @@ impl InlineData {
             }
 
             keys.push(String::from_utf8(field_buf)?);
-            values.push(buf[start..end].to_vec());
+            values.push(value.to_vec());
         }
 
         if !found {
@@ -209,20 +220,20 @@ impl InlineData {
 
             let str_len = rmp::decode::read_str_len(&mut cur)?;
 
-            let mut field_buff = vec![0u8; str_len as usize];
-
-            cur.read_exact(&mut field_buff)?;
+            let field_buff = read_exact_vec(&mut cur, str_len as usize)?;
 
             let field = String::from_utf8(field_buff)?;
 
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
+            let value = buf
+                .get(start..end)
+                .ok_or_else(|| Error::other("InlineData value out of range"))?;
             cur.set_position(end as u64);
 
             if field.as_str() == key {
-                let buf = &buf[start..end];
-                return Ok(Some(buf.to_vec()));
+                return Ok(Some(value.to_vec()));
             }
         }
 
@@ -234,7 +245,8 @@ impl InlineData {
             return Ok(());
         }
 
-        let mut cur = Cursor::new(self.after_version());
+        let buf = self.after_version();
+        let mut cur = Cursor::new(buf);
 
         let mut fields_len = rmp::decode::read_map_len(&mut cur)?;
 
@@ -243,9 +255,7 @@ impl InlineData {
 
             let str_len = rmp::decode::read_str_len(&mut cur)?;
 
-            let mut field_buff = vec![0u8; str_len as usize];
-
-            cur.read_exact(&mut field_buff)?;
+            let field_buff = read_exact_vec(&mut cur, str_len as usize)?;
 
             let field = String::from_utf8(field_buff)?;
             if field.is_empty() {
@@ -255,6 +265,9 @@ impl InlineData {
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
+            if end > buf.len() {
+                return Err(Error::other("InlineData value out of range"));
+            }
             cur.set_position(end as u64);
         }
 
@@ -276,8 +289,8 @@ impl InlineData {
         let mut cur = Cursor::new(buf);
 
         let mut fields_len = rmp::decode::read_map_len(&mut cur)? as usize;
-        let mut keys = Vec::with_capacity(fields_len + 1);
-        let mut values = Vec::with_capacity(fields_len + 1);
+        let mut keys = Vec::with_capacity(prealloc_hint(fields_len) + 1);
+        let mut values = Vec::with_capacity(prealloc_hint(fields_len) + 1);
 
         let mut replaced = false;
 
@@ -286,18 +299,17 @@ impl InlineData {
 
             let str_len = rmp::decode::read_str_len(&mut cur)?;
 
-            let mut field_buff = vec![0u8; str_len as usize];
-
-            cur.read_exact(&mut field_buff)?;
+            let field_buff = read_exact_vec(&mut cur, str_len as usize)?;
 
             let find_key = String::from_utf8(field_buff)?;
 
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
+            let find_value = buf
+                .get(start..end)
+                .ok_or_else(|| Error::other("InlineData value out of range"))?;
             cur.set_position(end as u64);
-
-            let find_value = &buf[start..end];
 
             if find_key.as_str() == key {
                 values.push(value.clone());

@@ -14,22 +14,21 @@
 
 use std::sync::Arc;
 
-use crate::data_usage_define::{
-    BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, ScannerObjectIO,
-};
+use crate::ScannerObjectIO;
+use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
 use crate::runtime_config::{
-    current_scanner_runtime_config, lookup_scanner_runtime_config, refresh_scanner_runtime_config_from_global,
-    scanner_bitrot_cycle, scanner_cycle_interval, scanner_start_delay, set_scanner_default_cycle_secs,
+    refresh_scanner_runtime_config_from_global, resolve_scanner_runtime_config_from_global, scanner_bitrot_cycle,
+    scanner_cycle_interval, scanner_start_delay, set_scanner_default_cycle_secs,
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
-use crate::scanner_io::ScannerIO;
+use crate::scanner_io::{ScannerIO, dirty_usage_bucket_notified, dirty_usage_buckets_pending};
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError};
 use chrono::{DateTime, Utc};
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerWorkSource, emit_scan_cycle_complete,
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScannerUsageSaveResult, ScannerWorkSource, emit_scan_cycle_complete,
     emit_scan_cycle_partial_with_source, global_metrics,
 };
 use rustfs_config::ScannerSpeed;
@@ -39,16 +38,17 @@ use rustfs_config::{
     ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
-use rustfs_storage_api::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::storage_compat::{
-    ECStore, EcstoreError, Lifecycle as _, RUSTFS_META_BUCKET, ReplicationConfigurationExt as _, get_lifecycle_config,
-    get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
+use crate::storage_api::scan::{BucketOperations, BucketOptions, NamespaceLocking as _};
+use crate::{
+    ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
+    get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
+    scanner_is_erasure_sd,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -59,6 +59,7 @@ const EVENT_SCANNER_LOCK_STATE: &str = "scanner_lock_state";
 const EVENT_SCANNER_PERSIST_STATE: &str = "scanner_persist_state";
 const EVENT_SCANNER_RUNTIME_CONFIG: &str = "scanner_runtime_config";
 const EVENT_SCANNER_BACKGROUND_HEAL_STATE: &str = "scanner_background_heal_state";
+const METRIC_SCANNER_LEADER_LOCK_TOTAL: &str = "rustfs_scanner_leader_lock_total";
 #[cfg(test)]
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
@@ -77,28 +78,21 @@ fn scanner_cycle_budget_config() -> ScannerCycleBudgetConfig {
     resolve_scanner_runtime_config().cycle_budget
 }
 
+fn record_scanner_leader_lock_state(state: &'static str) {
+    metrics::counter!(
+        METRIC_SCANNER_LEADER_LOCK_TOTAL,
+        "state" => state
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 fn scanner_cycle_max_duration() -> Option<Duration> {
     resolve_scanner_runtime_config().cycle_budget.max_duration
 }
 
 fn resolve_scanner_runtime_config() -> crate::runtime_config::ScannerRuntimeConfig {
-    let config = rustfs_config::server_config::get_global_server_config();
-    match lookup_scanner_runtime_config(config.as_ref()) {
-        Ok(config) => config,
-        Err(err) => {
-            warn!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_RUNTIME_CONFIG,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                state = "resolve_failed",
-                error = %err,
-                "Scanner runtime config fallback applied"
-            );
-            current_scanner_runtime_config()
-        }
-    }
+    resolve_scanner_runtime_config_from_global()
 }
 
 fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCyclePartialReason {
@@ -129,6 +123,34 @@ fn randomized_cycle_delay_for(interval: Duration) -> Duration {
     let jitter_factor = (rand::random::<f64>() * 0.2) - 0.1;
     let delay = interval.mul_f64(1.0 + jitter_factor);
     delay.max(Duration::from_secs(1))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerCycleWakeReason {
+    Timer,
+    DirtyUsage,
+    Cancelled,
+}
+
+async fn wait_for_next_scanner_cycle(ctx: &CancellationToken, delay: Duration) -> ScannerCycleWakeReason {
+    if dirty_usage_buckets_pending() {
+        return ScannerCycleWakeReason::DirtyUsage;
+    }
+
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            _ = ctx.cancelled() => return ScannerCycleWakeReason::Cancelled,
+            _ = &mut sleep => return ScannerCycleWakeReason::Timer,
+            _ = dirty_usage_bucket_notified() => {
+                if dirty_usage_buckets_pending() {
+                    return ScannerCycleWakeReason::DirtyUsage;
+                }
+            }
+        }
+    }
 }
 
 fn initial_scanner_delay_for(start_delay_secs: Option<u64>) -> Duration {
@@ -411,7 +433,7 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
 }
 
 async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         let features = detect_scanner_maintenance_features(storeapi).await;
         let default_cycle_secs = single_disk_default_cycle_secs(features);
         set_scanner_default_speed(single_disk_default_speed());
@@ -537,6 +559,18 @@ fn background_heal_info_for_scan_complete(mut info: BackgroundHealInfo, scan_mod
     Some(info)
 }
 
+fn background_heal_info_for_scan_result(
+    info: BackgroundHealInfo,
+    scan_mode: HealScanMode,
+    success: bool,
+) -> Option<BackgroundHealInfo> {
+    if !success {
+        return None;
+    }
+
+    background_heal_info_for_scan_complete(info, scan_mode)
+}
+
 fn retain_recent_cycle_completions(cycle_completed: &mut Vec<DateTime<Utc>>) {
     let keep = data_usage_update_dir_cycles() as usize;
     if cycle_completed.len() > keep {
@@ -560,7 +594,7 @@ pub struct BackgroundHealInfo {
 /// Read background healing information from storage
 pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHealInfo {
     // Skip for ErasureSD setup
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         return BackgroundHealInfo::default();
     }
 
@@ -602,7 +636,7 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
 #[instrument(skip(storeapi))]
 pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundHealInfo) {
     // Skip for ErasureSD setup
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         return;
     }
 
@@ -650,6 +684,48 @@ async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
     cycle_info.current = 0;
     global_metrics().clear_current_scan_mode();
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
+}
+
+async fn persist_scanner_cycle_state(storeapi: Arc<impl ScannerObjectIO>, cycle_info: &CurrentCycle) {
+    let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
+
+    let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
+    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
+    buf.extend_from_slice(&cycle_info_buf);
+
+    if let Err(e) = save_config(storeapi, &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = "failed",
+            error = %e,
+            "Scanner state persistence failed"
+        );
+    } else {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = "saved",
+            "Scanner state saved"
+        );
+    }
+}
+
+async fn finalize_partial_scan_cycle(storeapi: Arc<impl ScannerObjectIO>, cycle_info: &mut CurrentCycle) {
+    // A budget-limited cycle is deliberate pacing, not a failure. The cycle counter
+    // must still advance (and persist) because per-bucket next_cycle is stamped from
+    // it and compacted folders are only rescanned when their hash matches
+    // next_cycle % DATA_USAGE_UPDATE_DIR_CYCLES; a pinned counter starves lifecycle
+    // expiry and usage refresh on every folder outside the stuck window.
+    cycle_info.next += 1;
+    mark_scan_cycle_idle(cycle_info).await;
+    persist_scanner_cycle_state(storeapi, cycle_info).await;
 }
 
 #[instrument(skip_all)]
@@ -751,7 +827,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
                 scan_cycle_partial_reason(budget_reason),
                 scan_cycle_partial_source(budget_reason),
             );
-            mark_scan_cycle_idle(cycle_info).await;
+            finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await;
             return;
         }
         error!(
@@ -767,9 +843,10 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             "Scanner cycle failed"
         );
         emit_scan_cycle_complete(false, cycle_start.elapsed());
-        if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
+        if let Some(new_heal_info) = background_heal_info_for_scan_result(background_heal_info.clone(), scan_mode, false) {
             save_background_heal_info(storeapi.clone(), new_heal_info).await;
         }
+        mark_scan_cycle_idle(cycle_info).await;
         return;
     }
     if cycle_budget.budget_elapsed() && !ctx.is_cancelled() {
@@ -794,13 +871,13 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await;
         return;
     }
     done_cycle();
     global_metrics().finish_scan_cycle_work(cycle_work_start);
     emit_scan_cycle_complete(true, cycle_start.elapsed());
-    if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
+    if let Some(new_heal_info) = background_heal_info_for_scan_result(background_heal_info.clone(), scan_mode, true) {
         save_background_heal_info(storeapi.clone(), new_heal_info).await;
     }
 
@@ -825,34 +902,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 
-    let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
-
-    let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
-    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
-    buf.extend_from_slice(&cycle_info_buf);
-
-    if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
-        error!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-            state = "failed",
-            error = %e,
-            "Scanner state persistence failed"
-        );
-    } else {
-        debug!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-            state = "saved",
-            "Scanner state saved"
-        );
-    }
+    persist_scanner_cycle_state(storeapi.clone(), cycle_info).await;
 }
 
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
@@ -860,6 +910,8 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
         Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
             Ok(guard) => {
+                record_scanner_leader_lock_state("acquired");
+                global_metrics().record_scanner_leader_liveness("acquired", true, "").await;
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_LOCK_STATE,
@@ -872,6 +924,10 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
                 guard
             }
             Err(e) => {
+                record_scanner_leader_lock_state("contended");
+                global_metrics()
+                    .record_scanner_leader_liveness("contended", false, e.to_string())
+                    .await;
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_LOCK_STATE,
@@ -886,6 +942,10 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
             }
         },
         Err(e) => {
+            record_scanner_leader_lock_state("create_failed");
+            global_metrics()
+                .record_scanner_leader_liveness("create_failed", false, e.to_string())
+                .await;
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_LOCK_STATE,
@@ -932,16 +992,27 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
             break;
         }
 
-        // Randomized inter-cycle delay
-        tokio::select! {
-            _ = ctx.cancelled() => break,
-            _ = tokio::time::sleep(randomized_cycle_delay()) => {
+        match wait_for_next_scanner_cycle(&ctx, randomized_cycle_delay()).await {
+            ScannerCycleWakeReason::Cancelled => break,
+            ScannerCycleWakeReason::Timer => {
                 run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
-            },
+            }
+            ScannerCycleWakeReason::DirtyUsage => {
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_CYCLE_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "dirty_usage_wakeup",
+                    "Scanner cycle woke for dirty usage work"
+                );
+                run_data_scanner_cycle(&ctx, &storeapi, &mut cycle_info).await;
+            }
         }
     }
 
     global_metrics().set_cycle(None).await;
+    global_metrics().record_scanner_leader_liveness("stopped", false, "").await;
 
     debug!(
         target: "rustfs::scanner",
@@ -970,6 +1041,14 @@ impl Drop for ScannerScanModeGuard {
     }
 }
 
+fn stale_data_usage_update_reason(incoming: &DataUsageInfo, existing: &DataUsageInfo) -> Option<&'static str> {
+    match (incoming.last_update, existing.last_update) {
+        (Some(new_ts), Some(existing_ts)) if new_ts <= existing_ts => Some("older_or_equal_last_update"),
+        (None, Some(_)) => Some("missing_incoming_last_update"),
+        _ => None,
+    }
+}
+
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.
 #[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
@@ -987,8 +1066,7 @@ pub async fn store_data_usage_in_backend(
 
         if let Ok(buf) = read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await
             && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
-            && let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update)
-            && new_ts <= existing_ts
+            && let Some(reason) = stale_data_usage_update_reason(&data_usage_info, &existing)
         {
             debug!(
                 target: "rustfs::scanner",
@@ -996,11 +1074,13 @@ pub async fn store_data_usage_in_backend(
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
                 path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
-                incoming_last_update = ?new_ts,
-                existing_last_update = ?existing_ts,
+                incoming_last_update = ?data_usage_info.last_update,
+                existing_last_update = ?existing.last_update,
+                reason = reason,
                 state = "skip_stale_update",
                 "Scanner stale data usage update skipped"
             );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::SkippedStale);
             continue;
         }
 
@@ -1018,33 +1098,19 @@ pub async fn store_data_usage_in_backend(
                     error = %e,
                     "Scanner data usage encode failed"
                 );
+                global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::EncodeFailed);
                 continue;
             }
         };
 
-        // Save a backup every 10th update
-        if attempts > 10 {
-            let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
-            let done_save = Metrics::time(Metric::SaveUsage);
-            if let Err(e) = save_config(storeapi.clone(), &backup_path, data.clone()).await {
-                warn!(
-                    target: "rustfs::scanner",
-                    event = EVENT_SCANNER_PERSIST_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    path = %backup_path,
-                    state = "backup_save_failed",
-                    error = %e,
-                    "Scanner data usage backup save failed"
-                );
-            }
-            done_save();
-            attempts = 1;
-        }
+        let backup_data = (attempts > 10).then(|| data.clone());
 
         // Save main configuration
         let done_save = Metrics::time(Metric::SaveUsage);
-        if let Err(e) = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await {
+        let save_result = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await;
+        done_save();
+
+        if let Err(e) = save_result {
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
@@ -1055,10 +1121,31 @@ pub async fn store_data_usage_in_backend(
                 error = %e,
                 "Scanner data usage save failed"
             );
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Failed);
         } else {
             replace_bucket_usage_memory_from_info(&data_usage_info).await;
+            global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+
+            // Save a backup only after the primary usage object is durable.
+            if let Some(data) = backup_data {
+                let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+                let done_save = Metrics::time(Metric::SaveUsage);
+                if let Err(e) = save_config(storeapi.clone(), &backup_path, data).await {
+                    warn!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %backup_path,
+                        state = "backup_save_failed",
+                        error = %e,
+                        "Scanner data usage backup save failed"
+                    );
+                }
+                done_save();
+                attempts = 1;
+            }
         }
-        done_save();
 
         attempts += 1;
     }
@@ -1067,7 +1154,7 @@ pub async fn store_data_usage_in_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_compat::EcstoreResult;
+    use crate::EcstoreResult;
     use crate::{
         ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
         ScannerPutObjReader as PutObjReader,
@@ -1114,6 +1201,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct MemoryConfigStore {
         objects: Mutex<HashMap<String, Vec<u8>>>,
+        fail_put_number: Mutex<HashMap<String, usize>>,
+        put_counts: Mutex<HashMap<String, usize>>,
     }
 
     fn memory_config_key(bucket: &str, object: &str) -> String {
@@ -1121,9 +1210,9 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl rustfs_storage_api::ObjectIO for MemoryConfigStore {
+    impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         type Error = EcstoreError;
-        type RangeSpec = rustfs_storage_api::HTTPRangeSpec;
+        type RangeSpec = crate::storage_api::scanner_io::HTTPRangeSpec;
         type HeaderMap = http::HeaderMap;
         type ObjectOptions = ObjectOptions;
         type ObjectInfo = ObjectInfo;
@@ -1134,7 +1223,7 @@ mod tests {
             &self,
             bucket: &str,
             object: &str,
-            _range: Option<rustfs_storage_api::HTTPRangeSpec>,
+            _range: Option<crate::storage_api::scanner_io::HTTPRangeSpec>,
             _h: http::HeaderMap,
             _opts: &ObjectOptions,
         ) -> EcstoreResult<GetObjectReader> {
@@ -1147,6 +1236,7 @@ mod tests {
             Ok(GetObjectReader {
                 stream: Box::new(Cursor::new(data)),
                 object_info: ObjectInfo::default(),
+                buffered_body: None,
             })
         }
 
@@ -1159,7 +1249,19 @@ mod tests {
         ) -> EcstoreResult<ObjectInfo> {
             let mut buf = Vec::new();
             data.stream.read_to_end(&mut buf).await?;
-            self.objects.lock().await.insert(memory_config_key(bucket, object), buf);
+            let key = memory_config_key(bucket, object);
+            let put_count = {
+                let mut put_counts = self.put_counts.lock().await;
+                let put_count = put_counts.entry(key.clone()).or_insert(0);
+                *put_count += 1;
+                *put_count
+            };
+
+            if self.fail_put_number.lock().await.get(&key) == Some(&put_count) {
+                return Err(EcstoreError::other("injected put failure"));
+            }
+
+            self.objects.lock().await.insert(key, buf);
             Ok(ObjectInfo::default())
         }
     }
@@ -1386,6 +1488,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+
+        finalize_partial_scan_cycle(store.clone(), &mut cycle_info).await;
+
+        assert_eq!(cycle_info.next, 13);
+        assert_eq!(cycle_info.current, 0);
+        assert!(cycle_info.cycle_completed.is_empty());
+
+        let buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("cycle state should be persisted after a partial cycle");
+        assert_eq!(
+            u64::from_le_bytes(buf[0..8].try_into().expect("persisted state should start with the counter")),
+            13
+        );
+        let mut decoded = CurrentCycle::default();
+        decoded.unmarshal(&buf[8..]).expect("persisted cycle info should decode");
+        assert_eq!(decoded.next, 13);
+        assert_eq!(decoded.current, 0);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
     async fn test_store_data_usage_in_backend_preserves_newer_snapshot() {
         let store = Arc::new(MemoryConfigStore::default());
         let (sender, receiver) = mpsc::channel(2);
@@ -1416,6 +1550,88 @@ mod tests {
 
         assert_eq!(saved.buckets_count, 2);
         assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_rejects_untimestamped_stale_snapshot() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(2);
+        let ctx = CancellationToken::new();
+
+        let timestamped = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        let untimestamped = DataUsageInfo {
+            last_update: None,
+            buckets_count: 1,
+            ..Default::default()
+        };
+
+        sender
+            .send(timestamped)
+            .await
+            .expect("timestamped usage snapshot should enqueue");
+        sender
+            .send(untimestamped)
+            .await
+            .expect("untimestamped usage snapshot should enqueue");
+        drop(sender);
+
+        store_data_usage_in_backend(ctx, store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        let saved = objects
+            .get(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()))
+            .expect("data usage config should be saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+
+        assert_eq!(saved.buckets_count, 2);
+        assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_keeps_backup_when_primary_save_fails() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(11);
+        let ctx = CancellationToken::new();
+
+        let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let main_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let backup_key = memory_config_key(RUSTFS_META_BUCKET, &backup_path);
+        let old_backup = b"old-backup".to_vec();
+
+        store.objects.lock().await.insert(backup_key.clone(), old_backup.clone());
+        store.fail_put_number.lock().await.insert(main_key.clone(), 11);
+
+        for idx in 1_u64..=11 {
+            sender
+                .send(DataUsageInfo {
+                    last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(idx)),
+                    buckets_count: idx,
+                    ..Default::default()
+                })
+                .await
+                .expect("usage snapshot should enqueue");
+        }
+        drop(sender);
+
+        store_data_usage_in_backend(ctx, store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        assert_eq!(
+            objects.get(&backup_key),
+            Some(&old_backup),
+            "primary save failure must not overwrite the previous backup"
+        );
+
+        let saved = objects
+            .get(&main_key)
+            .expect("last successful primary usage snapshot should remain saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+        assert_eq!(saved.buckets_count, 10);
+        assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)));
     }
 
     #[test]
@@ -1586,6 +1802,34 @@ mod tests {
         assert!(delay < Duration::from_secs(2), "expected delay < 2s");
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_wait_for_next_scanner_cycle_wakes_for_dirty_usage() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+
+        let ctx = CancellationToken::new();
+        let reason = tokio::time::timeout(Duration::from_secs(1), wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)))
+            .await
+            .expect("dirty usage should wake scanner before timer");
+
+        assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wait_for_next_scanner_cycle_sees_existing_dirty_usage() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+
+        let ctx = CancellationToken::new();
+        let reason = wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)).await;
+
+        assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+    }
+
     #[test]
     #[serial]
     fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
@@ -1676,6 +1920,18 @@ mod tests {
         };
 
         assert!(background_heal_info_for_scan_complete(info, HealScanMode::Normal).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_background_heal_info_for_failed_scan_preserves_deep_mode() {
+        let info = BackgroundHealInfo {
+            bitrot_start_time: Some(Utc::now()),
+            bitrot_start_cycle: 7,
+            current_scan_mode: HealScanMode::Deep,
+        };
+
+        assert!(background_heal_info_for_scan_result(info, HealScanMode::Deep, false).is_none());
     }
 
     #[test]

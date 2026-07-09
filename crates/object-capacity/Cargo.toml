@@ -37,7 +37,7 @@ workspace = true
 [dependencies]
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-io-metrics = { workspace = true }
-rustfs-utils = { workspace = true }
+rustfs-utils = { workspace = true, features = ["os"] }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
@@ -49,4 +49,4 @@ criterion = { workspace = true }
 serial_test = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

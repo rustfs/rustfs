@@ -1,0 +1,716 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_strategy_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{strategy}} / {{mode}}",
+          "refId": "A"
+        }
+      ],
+      "title": "GET Reader Setup Strategy Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (path, strategy, size_bucket) (rate(rustfs_io_get_object_reader_setup_strategy_by_size_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{path}} / {{strategy}} / {{size_bucket}}",
+          "refId": "A"
+        }
+      ],
+      "title": "GET Reader Setup Strategy by Size",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_scheduled_sum[$__rate_interval])) / clamp_min(sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_scheduled_count[$__rate_interval])), 1) or vector(0)",
+          "legendFormat": "scheduled {{strategy}} / {{mode}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_attempted_sum[$__rate_interval])) / clamp_min(sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_attempted_count[$__rate_interval])), 1) or vector(0)",
+          "legendFormat": "attempted {{strategy}} / {{mode}}",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_ready_sum[$__rate_interval])) / clamp_min(sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_ready_count[$__rate_interval])), 1) or vector(0)",
+          "legendFormat": "ready {{strategy}} / {{mode}}",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_deferred_sum[$__rate_interval])) / clamp_min(sum by (strategy, mode) (rate(rustfs_io_get_object_reader_setup_deferred_count[$__rate_interval])), 1) or vector(0)",
+          "legendFormat": "deferred {{strategy}} / {{mode}}",
+          "refId": "D"
+        }
+      ],
+      "title": "GET Reader Setup Fanout Average",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (path, strategy, size_bucket) (rate(rustfs_io_get_object_reader_setup_scheduled_by_size_sum[$__rate_interval])) / clamp_min(sum by (path, strategy, size_bucket) (rate(rustfs_io_get_object_reader_setup_scheduled_by_size_count[$__rate_interval])), 1) or vector(0)",
+          "legendFormat": "scheduled {{path}} / {{strategy}} / {{size_bucket}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (path, strategy, size_bucket) (rate(rustfs_io_get_object_reader_setup_ready_by_size_sum[$__rate_interval])) / clamp_min(sum by (path, strategy, size_bucket) (rate(rustfs_io_get_object_reader_setup_ready_by_size_count[$__rate_interval])), 1) or vector(0)",
+          "legendFormat": "ready {{path}} / {{strategy}} / {{size_bucket}}",
+          "refId": "B"
+        }
+      ],
+      "title": "GET Reader Setup Fanout by Size",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (path, stage, size_bucket, le) (rate(rustfs_io_get_object_stage_duration_seconds_by_size_bucket{stage=~\"reader_setup|reader_setup_schedule|reader_setup_wait_quorum|reader_setup_drop_pending|reader_task_file_open|reader_task_reader_construction|reader_task_bitrot_reader_init\"}[$__rate_interval]))) or vector(0)",
+          "legendFormat": "p95 {{path}} / {{stage}} / {{size_bucket}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (path, stage, size_bucket, le) (rate(rustfs_io_get_object_stage_duration_seconds_by_size_bucket{stage=~\"reader_setup|reader_setup_schedule|reader_setup_wait_quorum|reader_setup_drop_pending|reader_task_file_open|reader_task_reader_construction|reader_task_bitrot_reader_init\"}[$__rate_interval]))) or vector(0)",
+          "legendFormat": "p99 {{path}} / {{stage}} / {{size_bucket}}",
+          "refId": "B"
+        }
+      ],
+      "title": "GET Hot Stage Latency by Size",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (path, stage, le) (rate(rustfs_io_get_object_stage_duration_seconds_bucket{stage=~\"request_context|first_byte|response_handoff|full_body|body_build|output_poll|output_lock_wait|reader_open_mmap_copy_success|reader_open_mmap_copy_fallback|reader_open_stream|reader_stream_first_read|reader_mmap_blocking_wait|reader_mmap_blocking_task|reader_mmap_file_open|reader_mmap_map|reader_mmap_copy_buffer|reader_mmap_direct_read_copy\"}[$__rate_interval]))) or vector(0)",
+          "legendFormat": "p95 {{path}} / {{stage}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (path, stage, le) (rate(rustfs_io_get_object_stage_duration_seconds_bucket{stage=~\"request_context|first_byte|response_handoff|full_body|body_build|output_poll|output_lock_wait|reader_open_mmap_copy_success|reader_open_mmap_copy_fallback|reader_open_stream|reader_stream_first_read|reader_mmap_blocking_wait|reader_mmap_blocking_task|reader_mmap_file_open|reader_mmap_map|reader_mmap_copy_buffer|reader_mmap_direct_read_copy\"}[$__rate_interval]))) or vector(0)",
+          "legendFormat": "p99 {{path}} / {{stage}}",
+          "refId": "B"
+        }
+      ],
+      "title": "GET Reader, Handler and Body Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (subpath) (rate(rustfs_io_get_object_direct_memory_subpath_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{subpath}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (subpath, size_bucket) (rate(rustfs_io_get_object_direct_memory_subpath_by_size_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{subpath}} / {{size_bucket}}",
+          "refId": "B"
+        }
+      ],
+      "title": "GET Direct-Memory Subpath Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (path, stage, kind) (rate(rustfs_io_get_object_mmap_page_faults_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "mmap {{path}} / {{stage}} / {{kind}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (path, stage, kind) (rate(rustfs_io_get_object_direct_read_page_faults_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "direct-read {{path}} / {{stage}} / {{kind}}",
+          "refId": "B"
+        }
+      ],
+      "title": "GET mmap vs Direct-Read Page Fault Rate",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [
+    "rustfs",
+    "get",
+    "performance",
+    "attribution"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "RustFS GET Performance Attribution",
+  "uid": "rustfs-get-performance-attribution",
+  "version": 1,
+  "weekStart": ""
+}

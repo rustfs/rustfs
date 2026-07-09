@@ -112,8 +112,8 @@ pub async fn create_default_key(
     secret_key: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let create_key_body = serde_json::json!({
-        "KeyUsage": "ENCRYPT_DECRYPT",
-        "Description": "Default key for e2e testing"
+        "key_usage": "ENCRYPT_DECRYPT",
+        "description": "Default key for e2e testing"
     })
     .to_string();
 
@@ -296,8 +296,8 @@ pub async fn test_kms_key_management(
 
     // Test CreateKey
     let create_key_body = serde_json::json!({
-        "KeyUsage": "EncryptDecrypt",
-        "Description": "Test key for e2e testing"
+        "key_usage": "EncryptDecrypt",
+        "description": "Test key for e2e testing"
     })
     .to_string();
 
@@ -777,7 +777,9 @@ impl LocalKMSTestEnvironment {
             default_key_id,
         ];
 
-        self.base_env.start_rustfs_server(extra_args).await?;
+        self.base_env
+            .start_rustfs_server_with_env(extra_args, &[("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true")])
+            .await?;
         Ok(default_key_id.to_string())
     }
 

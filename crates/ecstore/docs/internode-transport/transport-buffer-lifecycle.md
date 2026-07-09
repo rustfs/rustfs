@@ -54,7 +54,7 @@ through `ParallelReader` in `crates/ecstore/src/erasure_coding/decode.rs` and
 | Bitrot verification | `BitrotReader::read` | caller `&mut [u8]`, `hash_buf: Vec<u8>` | No additional payload copy | The bitrot reader reads hash bytes into `hash_buf` and payload bytes directly into the supplied output slice. Hash calculation reads the slice. |
 | Erasure shard read | `ParallelReader::read` | `Vec<u8>` per shard | Yes | Each shard read allocates `vec![0u8; shard_size]`; data is filled there before decode/reconstruction. |
 | Object response write | `write_data_blocks` | slices of shard `Vec<u8>` | No extra staging copy | Decoded data block slices are written to the target writer with `write_all`; the target may copy internally. |
-| Remote zero-copy helper | `RemoteDisk::read_file_zero_copy` | `Vec<u8>` then `Bytes` | Yes | The remote implementation reads the full stream into a `Vec` and converts it into `Bytes`. It is a convenience fallback, not network zero-copy. |
+| Remote mmap-copy helper | `RemoteDisk::read_file_mmap_copy` | `Vec<u8>` then `Bytes` | Yes | The remote implementation reads the full stream into a `Vec` and converts it into `Bytes`. It is a convenience fallback, not network zero-copy. |
 
 ## Write Stream
 
@@ -90,7 +90,7 @@ through `ParallelReader` in `crates/ecstore/src/erasure_coding/decode.rs` and
 | 3 | `ParallelReader::read` shard buffers | High on read path | Each shard read allocates and fills a `Vec<u8>` before decode can proceed. This is also where degraded reads wait on quorum. |
 | 4 | `ReaderStream::with_capacity` plus `StreamReader` | Medium on read path | Server file reads create `Bytes` chunks, then client `AsyncRead` copies those chunks into the caller's `ReadBuf`. |
 | 5 | `Erasure::encode` block and shard materialization | Medium on write path | Source data is first read into a block `Vec<u8>`, then encoded into per-shard `Bytes`. This is necessary for the current erasure API. |
-| 6 | `RemoteDisk::read_file_zero_copy` | Medium when used | Remote zero-copy reads buffer the whole stream into memory. The name does not mean zero-copy over the network. |
+| 6 | `RemoteDisk::read_file_mmap_copy` | Medium when used | Remote mmap-copy reads buffer the whole stream into memory. The name does not mean zero-copy over the network. |
 | 7 | URL/query/header/JSON serialization | Low | Metadata copies are small and not on the large payload hot path. |
 
 ## Adapter Ownership Gaps
@@ -117,6 +117,6 @@ through `ParallelReader` in `crates/ecstore/src/erasure_coding/decode.rs` and
 7. The HTTP auth and URL construction boundary is part of the current TCP/HTTP
    backend. A non-HTTP backend would need equivalent peer authentication and
    disk addressing without assuming URL query parameters.
-8. Local disk zero-copy exists only for local reads via `read_file_zero_copy`.
+8. Local disk mmap-copy reads exist only for local reads via `read_file_mmap_copy`.
    Remote disks deliberately fall back to network streaming and full-buffer
-   collection for the zero-copy helper.
+   collection for the legacy zero-copy helper.

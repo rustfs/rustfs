@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compatibility re-export for the legacy `rustfs_ecstore::event::name::EventName` path.
+//! Compatibility re-export for the ECStore event facade.
 //! The canonical event definition now lives in `rustfs_s3_types::EventName`.
 
 pub use rustfs_s3_types::EventName;

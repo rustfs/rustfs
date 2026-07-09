@@ -15,15 +15,15 @@
 use crate::bucket::metadata::BucketMetadata;
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
-use crate::bucket::replication::ObjectOpts;
-use crate::bucket::replication::ReplicationConfigurationExt;
+use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::global::get_global_bucket_monitor;
+use crate::runtime::sources as runtime_sources;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
+use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
@@ -37,10 +37,19 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
 use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls as smithy_tls};
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::http::{
+    HttpConnector as SmithyHttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
+};
+use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_types::body::SdkBody;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use reqwest::Client as HttpClient;
 use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
+use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
     AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header,
@@ -50,6 +59,7 @@ use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
     SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
 };
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -62,6 +72,7 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tower::Service;
 use tracing::error;
 use tracing::warn;
 use url::Url;
@@ -69,8 +80,13 @@ use uuid::Uuid;
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
+const REDACTED_CREDENTIAL: &str = "<redacted>";
 
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
+
+fn replication_target_versioning_enabled(versioning: Option<&BucketVersioningStatus>) -> bool {
+    matches!(versioning, Some(BucketVersioningStatus::Enabled))
+}
 
 #[derive(Debug, Clone)]
 pub struct ArnTarget {
@@ -103,24 +119,43 @@ pub struct ArnErrs {
     pub bucket: String,
 }
 
+/// A single latency sample tagged with the instant it was recorded.
+///
+/// Only `dur` participates in (de)serialization; `at` is not `Serialize`
+/// (`Instant` isn't) and is reconstructed as `Instant::now()` on deserialize.
+/// A reloaded window therefore simply restarts aging, which is acceptable for
+/// the in-memory endpoint health stats this type backs (see backlog#806-16).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LastMinuteLatency {
-    times: Vec<Duration>,
+struct LatencySample {
+    dur: Duration,
     #[serde(skip, default = "instant_now")]
-    start_time: Instant,
+    at: Instant,
 }
 
 fn instant_now() -> Instant {
     Instant::now()
 }
 
-impl Default for LastMinuteLatency {
-    fn default() -> Self {
-        Self {
-            times: Vec::new(),
-            start_time: Instant::now(),
-        }
-    }
+/// A rolling one-minute latency window.
+///
+/// backlog#806-16: the previous implementation stored bare `Vec<Duration>`
+/// samples plus a single, never-updated `start_time`, and its `retain`
+/// predicate ignored the element entirely — it evaluated the constant
+/// `now.duration_since(self.start_time) < 60s`. Once the window had existed
+/// for 60s, that predicate became `false` for every element, so each `add`
+/// dropped ALL samples and the "last minute" average degenerated to the most
+/// recent single sample. Each sample now carries its own timestamp and is
+/// retained by its individual age.
+///
+/// This type is only used for in-memory endpoint health (`EpHealth`) and
+/// admin-API display; it is not persisted or wire-serialized across versions
+/// (the on-the-wire latency shape is `crate::bucket::target::LatencyStat`,
+/// which carries only `curr`/`avg`/`max`). The `Serialize`/`Deserialize`
+/// derives are retained solely so the enclosing `LatencyStat` keeps deriving
+/// them; only the `Duration` part of each sample is serialized.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastMinuteLatency {
+    times: Vec<LatencySample>,
 }
 
 impl LastMinuteLatency {
@@ -129,11 +164,16 @@ impl LastMinuteLatency {
     }
 
     pub fn add(&mut self, duration: Duration) {
-        let now = Instant::now();
-        // Remove entries older than 1 minute
+        self.add_at(Instant::now(), duration);
+    }
+
+    /// Records a sample at an explicit instant, dropping samples older than one
+    /// minute relative to `now`. Split out from `add` so the aging logic can be
+    /// exercised with a synthetic clock in tests.
+    fn add_at(&mut self, now: Instant, duration: Duration) {
         self.times
-            .retain(|_| now.duration_since(self.start_time) < Duration::from_secs(60));
-        self.times.push(duration);
+            .retain(|sample| now.duration_since(sample.at) < Duration::from_secs(60));
+        self.times.push(LatencySample { dur: duration, at: now });
     }
 
     pub fn get_total(&self) -> LatencyAverage {
@@ -142,7 +182,7 @@ impl LastMinuteLatency {
                 avg: Duration::from_secs(0),
             };
         }
-        let total: Duration = self.times.iter().sum();
+        let total: Duration = self.times.iter().map(|sample| sample.dur).sum();
         LatencyAverage {
             avg: total / self.times.len() as u32,
         }
@@ -189,6 +229,7 @@ pub struct EpHealth {
     pub last_online: Option<OffsetDateTime>,
     pub last_hc_at: Option<OffsetDateTime>,
     pub offline_duration: Duration,
+    pub offline_count: u64,
     pub latency: LatencyStat,
 }
 
@@ -201,9 +242,35 @@ impl Default for EpHealth {
             last_online: None,
             last_hc_at: None,
             offline_duration: Duration::from_secs(0),
+            offline_count: 0,
             latency: LatencyStat::new(),
         }
     }
+}
+
+fn endpoint_health_key(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
+}
+
+fn update_endpoint_health(health: &mut EpHealth, online: bool, latency: Duration, now: OffsetDateTime) {
+    let prev_online = health.online;
+    health.online = online;
+    health.last_hc_at = Some(now);
+    health.latency.update(latency);
+
+    if online {
+        health.last_online = Some(now);
+        return;
+    }
+
+    if prev_online {
+        health.offline_count += 1;
+    }
+    health.offline_duration += latency;
 }
 
 #[derive(Debug, Default)]
@@ -233,9 +300,10 @@ impl BucketTargetSys {
     }
 
     pub async fn is_offline(&self, url: &Url) -> bool {
+        let key = endpoint_health_key(url);
         {
             let health_map = self.h_mutex.read().await;
-            if let Some(health) = health_map.get(url.host_str().unwrap_or("")) {
+            if let Some(health) = health_map.get(&key) {
                 return !health.online;
             }
         }
@@ -245,15 +313,16 @@ impl BucketTargetSys {
     }
 
     pub async fn mark_offline(&self, url: &Url) {
+        let key = endpoint_health_key(url);
         let mut health_map = self.h_mutex.write().await;
-        if let Some(health) = health_map.get_mut(url.host_str().unwrap_or("")) {
-            health.online = false;
+        if let Some(health) = health_map.get_mut(&key) {
+            update_endpoint_health(health, false, Duration::from_secs(0), OffsetDateTime::now_utc());
         }
     }
 
     pub async fn init_hc(&self, url: &Url) {
         let mut health_map = self.h_mutex.write().await;
-        let host = url.host_str().unwrap_or("").to_string();
+        let host = endpoint_health_key(url);
         health_map.insert(
             host.clone(),
             EpHealth {
@@ -272,51 +341,35 @@ impl BucketTargetSys {
 
             let endpoints = {
                 let health_map = self.h_mutex.read().await;
-                health_map.keys().cloned().collect::<Vec<_>>()
+                health_map
+                    .iter()
+                    .map(|(endpoint, health)| (endpoint.clone(), health.scheme.clone()))
+                    .collect::<Vec<_>>()
             };
 
-            for endpoint in endpoints {
+            for (endpoint, scheme) in endpoints {
                 // Perform health check
                 let start = Instant::now();
-                let online = self.check_endpoint_health(&endpoint).await;
+                let online = self.check_endpoint_health(&endpoint, &scheme).await;
                 let duration = start.elapsed();
 
                 {
                     let mut health_map = self.h_mutex.write().await;
                     if let Some(health) = health_map.get_mut(&endpoint) {
-                        let prev_online = health.online;
-                        health.online = online;
-                        health.last_hc_at = Some(OffsetDateTime::now_utc());
-                        health.latency.update(duration);
-
-                        if online {
-                            health.last_online = Some(OffsetDateTime::now_utc());
-                        } else if prev_online {
-                            // Just went offline
-                            health.offline_duration += duration;
-                        }
+                        update_endpoint_health(health, online, duration, OffsetDateTime::now_utc());
                     }
                 }
             }
         }
     }
 
-    async fn check_endpoint_health(&self, _endpoint: &str) -> bool {
-        true
-        // TODO: Health check
-
-        // // Simple health check implementation
-        // // In a real implementation, you would make actual HTTP requests
-        // match self
-        //     .hc_client
-        //     .get(format!("https://{}/rustfs/health/ready", endpoint))
-        //     .timeout(Duration::from_secs(3))
-        //     .send()
-        //     .await
-        // {
-        //     Ok(response) => response.status().is_success(),
-        //     Err(_) => false,
-        // }
+    async fn check_endpoint_health(&self, endpoint: &str, scheme: &str) -> bool {
+        let scheme = if scheme.is_empty() { "https" } else { scheme };
+        let url = format!("{scheme}://{endpoint}/");
+        match self.hc_client.head(url).timeout(Duration::from_secs(3)).send().await {
+            Ok(response) => response.status().as_u16() < 500,
+            Err(_) => false,
+        }
     }
 
     pub async fn health_stats(&self) -> HashMap<String, EpHealth> {
@@ -341,6 +394,7 @@ impl BucketTargetSys {
                                 avg: health.latency.avg,
                                 max: health.latency.peak,
                             };
+                            target.offline_count = health.offline_count;
                         }
                         targets.push(target);
                     }
@@ -362,6 +416,7 @@ impl BucketTargetSys {
                             avg: health.latency.avg,
                             max: health.latency.peak,
                         };
+                        target.offline_count = health.offline_count;
                     }
                     targets.push(target);
                 }
@@ -462,7 +517,7 @@ impl BucketTargetSys {
                     error: e.to_string(),
                 })?;
 
-            if versioning.is_none() {
+            if !replication_target_versioning_enabled(versioning.as_ref()) {
                 return Err(BucketTargetError::BucketRemoteTargetNotVersioned {
                     bucket: target.target_bucket.to_string(),
                 });
@@ -519,19 +574,13 @@ impl BucketTargetSys {
 
         if arn.arn_type == BucketTargetType::ReplicationService
             && let Ok((config, _)) = get_replication_config(bucket).await
+            && ReplicationTargetConfigBridge::target_is_used_by_rules(&config, arn_str)
         {
-            for rule in config.filter_target_arns(&ObjectOpts {
-                op_type: ReplicationType::All,
-                ..Default::default()
-            }) {
-                if rule == arn_str || config.role == arn_str {
-                    let arn_remotes_map = self.arn_remotes_map.read().await;
-                    if arn_remotes_map.get(arn_str).is_some() {
-                        return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
-                            bucket: bucket.to_string(),
-                        });
-                    }
-                }
+            let arn_remotes_map = self.arn_remotes_map.read().await;
+            if arn_remotes_map.get(arn_str).is_some() {
+                return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
+                    bucket: bucket.to_string(),
+                });
             }
         }
 
@@ -646,6 +695,16 @@ impl BucketTargetSys {
         } else {
             format!("http://{}", target.endpoint)
         };
+        let parsed_endpoint = Url::parse(&endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
+            bucket: target.target_bucket.clone(),
+            access_key: credentials.access_key.clone(),
+            error: format!("invalid target endpoint: {err}"),
+        })?;
+        validate_replication_target_endpoint(&parsed_endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
+            bucket: target.target_bucket.clone(),
+            access_key: credentials.access_key.clone(),
+            error: format!("target endpoint is not allowed: {err}"),
+        })?;
 
         let mut config_builder = S3Config::builder()
             .endpoint_url(endpoint.clone())
@@ -657,8 +716,14 @@ impl BucketTargetSys {
             config_builder = config_builder.force_path_style(true);
         }
 
-        if target.secure
-            && let Some(http_client) = build_aws_s3_http_client_from_tls_path().await
+        if let Some(http_client) =
+            build_aws_s3_http_client_for_target(target)
+                .await
+                .map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
+                    bucket: target.target_bucket.clone(),
+                    access_key: credentials.access_key.clone(),
+                    error: err.to_string(),
+                })?
         {
             config_builder = config_builder.http_client(http_client);
         }
@@ -687,7 +752,7 @@ impl BucketTargetSys {
     }
 
     fn update_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
-        if let Some(bucket_monitor) = get_global_bucket_monitor() {
+        if let Some(bucket_monitor) = runtime_sources::bucket_monitor() {
             if limit == 0 {
                 bucket_monitor.delete_bucket_throttle(bucket, arn);
                 return;
@@ -810,6 +875,170 @@ impl BucketTargetSys {
     }
 }
 
+#[derive(Debug)]
+struct AcceptAnyServerCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[derive(Clone)]
+struct TargetHyperHttpConnector<C> {
+    client: HyperClient<C, SdkBody>,
+}
+
+impl<C> fmt::Debug for TargetHyperHttpConnector<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TargetHyperHttpConnector")
+            .field("client", &"** hyper client **")
+            .finish()
+    }
+}
+
+impl<C> SmithyHttpConnector for TargetHyperHttpConnector<C>
+where
+    C: Clone + Send + Sync + 'static,
+    C: Service<Uri>,
+    C::Response:
+        hyper::rt::Read + hyper::rt::Write + hyper_util::client::legacy::connect::Connection + Send + Sync + Unpin + 'static,
+    C::Future: Unpin + Send + 'static,
+    C::Error: Into<BoxError>,
+{
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        let request = match request.try_into_http1x() {
+            Ok(request) => request,
+            Err(err) => return HttpConnectorFuture::ready(Err(ConnectorError::user(err.into()))),
+        };
+
+        let mut client = self.client.clone();
+        let fut = client.call(request);
+        HttpConnectorFuture::new(async move {
+            let response = fut
+                .await
+                .map_err(|err| ConnectorError::io(err.into()))?
+                .map(SdkBody::from_body_1_x);
+            HttpResponse::try_from(response).map_err(|err| ConnectorError::other(err.into(), None))
+        })
+    }
+}
+
+fn ensure_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
+fn has_custom_ca_pem(target: &BucketTarget) -> bool {
+    !target.ca_cert_pem.trim().is_empty()
+}
+
+fn validate_replication_target_endpoint(url: &Url) -> Result<(), OutboundUrlError> {
+    match validate_outbound_url(url) {
+        Ok(()) => Ok(()),
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "private address",
+            ..
+        }) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn build_insecure_aws_s3_http_client() -> SharedHttpClient {
+    ensure_rustls_crypto_provider();
+
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
+        .with_no_client_auth();
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let mut client_builder = HyperClient::builder(TokioExecutor::new());
+    client_builder.pool_timer(TokioTimer::new());
+    let client = client_builder.build(https);
+    let connector = SharedHttpConnector::new(TargetHyperHttpConnector { client });
+
+    http_client_fn(move |_settings, _components| connector.clone())
+}
+
+fn build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem: &str) -> Result<SharedHttpClient, BucketTargetError> {
+    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(ca_cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))?;
+
+    if certs.is_empty() {
+        return Err(BucketTargetError::Io(std::io::Error::other(
+            "invalid target CA PEM: no certificates found",
+        )));
+    }
+
+    let mut trust_store = smithy_tls::TrustStore::empty();
+    trust_store.add_pem_certificate(ca_cert_pem.as_bytes());
+
+    let tls_context = smithy_tls::TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))?;
+
+    Ok(SmithyHttpClientBuilder::new()
+        .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
+        .tls_context(tls_context)
+        .build_https())
+}
+
+async fn build_aws_s3_http_client_for_target(target: &BucketTarget) -> Result<Option<SharedHttpClient>, BucketTargetError> {
+    if !target.secure {
+        return Ok(None);
+    }
+
+    if target.skip_tls_verify {
+        return Ok(Some(build_insecure_aws_s3_http_client()));
+    }
+
+    if has_custom_ca_pem(target) {
+        return build_aws_s3_http_client_from_target_ca_pem(&target.ca_cert_pem).map(Some);
+    }
+
+    Ok(build_aws_s3_http_client_from_tls_path().await)
+}
+
 async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::SharedHttpClient> {
     let tls_path = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
     if tls_path.is_empty() {
@@ -817,7 +1046,7 @@ async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::
     }
 
     let tls_dir = Path::new(&tls_path);
-    let mut trust_store = smithy_tls::TrustStore::default();
+    let mut trust_store = smithy_tls::TrustStore::empty();
     let mut has_custom_certs = false;
 
     let ca_path = tls_dir.join(RUSTFS_CA_CERT);
@@ -936,6 +1165,24 @@ fn build_remove_object_headers(version_id: Option<&str>, opts: &RemoveObjectOpti
     headers
 }
 
+/// Resolve the S3 `versionId` query parameter for a target DELETE.
+///
+/// A replication delete omits the `versionId` query param ONLY when it is
+/// propagating a delete-marker CREATION (`replication_delete_marker`), so the
+/// target mints its own marker. A version purge / delete-marker purge / force
+/// delete must address the exact version — otherwise a generic (non-MinIO /
+/// non-RustFS) S3 target ignores the internal `x-*-source-version-id` header
+/// and silently creates a delete marker instead of removing the version, while
+/// the source stamps `VersionPurgeStatus=Complete` (backlog#799 B8 / #857).
+/// Non-replication callers always pass the version through unchanged.
+fn resolve_delete_api_version_id(version_id: Option<String>, opts: &RemoveObjectOptions) -> Option<String> {
+    if opts.replication_request && opts.replication_delete_marker {
+        None
+    } else {
+        version_id
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AdvancedPutOptions {
     pub source_version_id: String,
@@ -1048,6 +1295,17 @@ impl PutObjectOptions {
         }
     }
 
+    /// Insert `value` as header `name`, skipping values that are not valid
+    /// HTTP header values (with a warning) instead of panicking mid-replication.
+    fn insert_checked(header: &mut HeaderMap, name: &'static str, value: &str) {
+        match HeaderValue::from_str(value) {
+            Ok(v) => {
+                header.insert(name, v);
+            }
+            Err(_) => warn!("skipping header {} with invalid value", name),
+        }
+    }
+
     pub fn header(&self) -> HeaderMap {
         let mut header = HeaderMap::new();
 
@@ -1055,66 +1313,75 @@ impl PutObjectOptions {
         if content_type.is_empty() {
             content_type = "application/octet-stream".to_string();
         }
-        header.insert("Content-Type", HeaderValue::from_str(&content_type).expect("err"));
+        match HeaderValue::from_str(&content_type) {
+            Ok(v) => {
+                header.insert("Content-Type", v);
+            }
+            Err(_) => {
+                warn!("invalid Content-Type header value, falling back to application/octet-stream");
+                header.insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
+            }
+        }
 
         if !self.content_encoding.is_empty() {
-            header.insert("Content-Encoding", HeaderValue::from_str(&self.content_encoding).expect("err"));
+            Self::insert_checked(&mut header, "Content-Encoding", &self.content_encoding);
         }
         if !self.content_disposition.is_empty() {
-            header.insert("Content-Disposition", HeaderValue::from_str(&self.content_disposition).expect("err"));
+            Self::insert_checked(&mut header, "Content-Disposition", &self.content_disposition);
         }
         if !self.content_language.is_empty() {
-            header.insert("Content-Language", HeaderValue::from_str(&self.content_language).expect("err"));
+            Self::insert_checked(&mut header, "Content-Language", &self.content_language);
         }
         if !self.cache_control.is_empty() {
-            header.insert("Cache-Control", HeaderValue::from_str(&self.cache_control).expect("err"));
+            Self::insert_checked(&mut header, "Cache-Control", &self.cache_control);
         }
 
         if self.expires.unix_timestamp() != 0 {
-            header.insert("Expires", HeaderValue::from_str(&self.expires.format(&Rfc3339).unwrap()).expect("err")); //rustfs invalid header
+            match self.expires.format(&Rfc3339) {
+                Ok(expires) => Self::insert_checked(&mut header, "Expires", &expires),
+                Err(err) => warn!("skipping Expires header, format failed: {}", err),
+            }
         }
 
         if let Some(mode) = &self.mode {
-            header.insert(AMZ_OBJECT_LOCK_MODE, HeaderValue::from_str(mode.as_str()).expect("err"));
+            Self::insert_checked(&mut header, AMZ_OBJECT_LOCK_MODE, mode.as_str());
         }
 
         if self.retain_until_date.unix_timestamp() != 0 {
-            header.insert(
-                AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-                HeaderValue::from_str(&self.retain_until_date.format(&Rfc3339).unwrap()).expect("err"),
-            );
+            match self.retain_until_date.format(&Rfc3339) {
+                Ok(retain_until) => Self::insert_checked(&mut header, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, &retain_until),
+                Err(err) => warn!("skipping object-lock retain-until-date header, format failed: {}", err),
+            }
         }
 
         if let Some(legalhold) = &self.legalhold {
-            header.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD, HeaderValue::from_str(legalhold.as_str()).expect("err"));
+            Self::insert_checked(&mut header, AMZ_OBJECT_LOCK_LEGAL_HOLD, legalhold.as_str());
         }
 
         if !self.storage_class.is_empty() {
-            header.insert(AMZ_STORAGE_CLASS, HeaderValue::from_str(&self.storage_class).expect("err"));
+            Self::insert_checked(&mut header, AMZ_STORAGE_CLASS, &self.storage_class);
         }
 
         if !self.website_redirect_location.is_empty() {
-            header.insert(
-                AMZ_WEBSITE_REDIRECT_LOCATION,
-                HeaderValue::from_str(&self.website_redirect_location).expect("err"),
-            );
+            Self::insert_checked(&mut header, AMZ_WEBSITE_REDIRECT_LOCATION, &self.website_redirect_location);
         }
 
         if !self.internal.replication_status.as_str().is_empty() {
-            header.insert(
-                AMZ_BUCKET_REPLICATION_STATUS,
-                HeaderValue::from_str(self.internal.replication_status.as_str()).expect("err"),
-            );
+            Self::insert_checked(&mut header, AMZ_BUCKET_REPLICATION_STATUS, self.internal.replication_status.as_str());
         }
 
         for (k, v) in &self.user_metadata {
+            let Ok(header_value) = HeaderValue::from_str(v) else {
+                warn!("skipping user metadata header with invalid value: {}", k);
+                continue;
+            };
             if is_amz_header(k) || is_standard_header(k) || is_storageclass_header(k) || is_rustfs_header(k) || is_minio_header(k)
             {
                 if let Ok(header_name) = HeaderName::from_bytes(k.as_bytes()) {
-                    header.insert(header_name, HeaderValue::from_str(v).unwrap());
+                    header.insert(header_name, header_value);
                 }
             } else if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{k}").as_bytes()) {
-                header.insert(header_name, HeaderValue::from_str(v).unwrap());
+                header.insert(header_name, header_value);
             }
         }
 
@@ -1125,7 +1392,7 @@ impl PutObjectOptions {
         if !self.internal.source_version_id.is_empty() {
             insert_header(&mut header, SUFFIX_SOURCE_VERSION_ID, &self.internal.source_version_id);
         }
-        if self.internal.source_etag.is_empty() {
+        if !self.internal.source_etag.is_empty() {
             insert_header(&mut header, SUFFIX_SOURCE_ETAG, &self.internal.source_etag);
         }
         if self.internal.source_mtime.unix_timestamp() != 0 {
@@ -1332,9 +1599,10 @@ impl TargetClient {
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
-                    let key_str = k.unwrap().as_str().to_string();
-                    let value_str = v.to_str().unwrap_or("").to_string();
-                    req.headers_mut().insert(key_str, value_str);
+                    if let Some(key_str) = k.map(|k| k.as_str().to_string()) {
+                        let value_str = v.to_str().unwrap_or("").to_string();
+                        req.headers_mut().insert(key_str, value_str);
+                    }
                 }
 
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
@@ -1343,7 +1611,30 @@ impl TargetClient {
             .await
         {
             Ok(_) => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => match e {
+                SdkError::ServiceError(service_err) => {
+                    let err = service_err.into_err();
+                    let meta = err.meta();
+                    let error = match (meta.code(), meta.message()) {
+                        (Some(code), Some(message)) => format!("put_object failed: {code}: {message}"),
+                        (Some(code), None) => format!("put_object failed: {code}"),
+                        (None, Some(message)) => format!("put_object failed: {message}"),
+                        (None, None) => format!("put_object failed: {err:?}"),
+                    };
+                    Err(S3ClientError::with_metadata(
+                        error,
+                        None,
+                        meta.code().map(ToOwned::to_owned),
+                        meta.message().map(ToOwned::to_owned),
+                    ))
+                }
+                SdkError::DispatchFailure(dispatch_err) => Err(S3ClientError::new(format!(
+                    "put_object dispatch failure for bucket:{bucket} object:{object}: {dispatch_err:?}"
+                ))),
+                other => Err(S3ClientError::new(format!(
+                    "put_object request failed for bucket:{bucket} object:{object}: {other:?}"
+                ))),
+            },
         }
     }
 
@@ -1370,9 +1661,10 @@ impl TargetClient {
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
-                    let key_str = k.unwrap().as_str().to_string();
-                    let value_str = v.to_str().unwrap_or("").to_string();
-                    req.headers_mut().insert(key_str, value_str);
+                    if let Some(key_str) = k.map(|k| k.as_str().to_string()) {
+                        let value_str = v.to_str().unwrap_or("").to_string();
+                        req.headers_mut().insert(key_str, value_str);
+                    }
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
@@ -1409,9 +1701,10 @@ impl TargetClient {
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
-                    let key_str = k.unwrap().as_str().to_string();
-                    let value_str = v.to_str().unwrap_or("").to_string();
-                    req.headers_mut().insert(key_str, value_str);
+                    if let Some(key_str) = k.map(|k| k.as_str().to_string()) {
+                        let value_str = v.to_str().unwrap_or("").to_string();
+                        req.headers_mut().insert(key_str, value_str);
+                    }
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
@@ -1445,9 +1738,10 @@ impl TargetClient {
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
-                    let key_str = k.unwrap().as_str().to_string();
-                    let value_str = v.to_str().unwrap_or("").to_string();
-                    req.headers_mut().insert(key_str, value_str);
+                    if let Some(key_str) = k.map(|k| k.as_str().to_string()) {
+                        let value_str = v.to_str().unwrap_or("").to_string();
+                        req.headers_mut().insert(key_str, value_str);
+                    }
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
@@ -1467,7 +1761,7 @@ impl TargetClient {
         opts: RemoveObjectOptions,
     ) -> Result<(), S3ClientError> {
         let headers = build_remove_object_headers(version_id.as_deref(), &opts);
-        let api_version_id = if opts.replication_request { None } else { version_id };
+        let api_version_id = resolve_delete_api_version_id(version_id, &opts);
 
         match self
             .client
@@ -1478,9 +1772,10 @@ impl TargetClient {
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
-                    let key_str = k.unwrap().as_str().to_string();
-                    let value_str = v.to_str().unwrap_or("").to_string();
-                    req.headers_mut().insert(key_str, value_str);
+                    if let Some(key_str) = k.map(|k| k.as_str().to_string()) {
+                        let value_str = v.to_str().unwrap_or("").to_string();
+                        req.headers_mut().insert(key_str, value_str);
+                    }
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
@@ -1488,7 +1783,30 @@ impl TargetClient {
             .await
         {
             Ok(_res) => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => match e {
+                SdkError::ServiceError(service_err) => {
+                    let err = service_err.into_err();
+                    let meta = err.meta();
+                    let error = match (meta.code(), meta.message()) {
+                        (Some(code), Some(message)) => format!("remove_object failed: {code}: {message}"),
+                        (Some(code), None) => format!("remove_object failed: {code}"),
+                        (None, Some(message)) => format!("remove_object failed: {message}"),
+                        (None, None) => format!("remove_object failed: {err:?}"),
+                    };
+                    Err(S3ClientError::with_metadata(
+                        error,
+                        None,
+                        meta.code().map(ToOwned::to_owned),
+                        meta.message().map(ToOwned::to_owned),
+                    ))
+                }
+                SdkError::DispatchFailure(dispatch_err) => Err(S3ClientError::new(format!(
+                    "remove_object dispatch failure for bucket:{bucket} object:{object}: {dispatch_err:?}"
+                ))),
+                other => Err(S3ClientError::new(format!(
+                    "remove_object request failed for bucket:{bucket} object:{object}: {other:?}"
+                ))),
+            },
         }
     }
 }
@@ -1542,10 +1860,13 @@ impl fmt::Display for BucketTargetError {
             }
             BucketTargetError::RemoteTargetConnectionErr {
                 bucket,
-                access_key,
+                access_key: _,
                 error,
             } => {
-                write!(f, "Connection error for bucket: {bucket}, access key: {access_key}, error: {error}")
+                write!(
+                    f,
+                    "Connection error for bucket: {bucket}, access key: {REDACTED_CREDENTIAL}, error: {error}"
+                )
             }
             BucketTargetError::BucketReplicationSourceNotVersioned { bucket } => {
                 write!(f, "Replication source bucket not versioned: {bucket}")
@@ -1572,6 +1893,77 @@ impl Error for BucketTargetError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::generate_simple_self_signed;
+
+    #[test]
+    fn replication_target_versioning_enabled_requires_enabled_status() {
+        let enabled = BucketVersioningStatus::Enabled;
+        let suspended = BucketVersioningStatus::Suspended;
+
+        assert!(replication_target_versioning_enabled(Some(&enabled)));
+        assert!(!replication_target_versioning_enabled(Some(&suspended)));
+        assert!(!replication_target_versioning_enabled(None));
+    }
+
+    #[test]
+    fn remote_target_connection_error_display_redacts_access_key() {
+        let err = BucketTargetError::RemoteTargetConnectionErr {
+            bucket: "target".to_string(),
+            access_key: "sensitive-access-key".to_string(),
+            error: "connection refused".to_string(),
+        };
+        let message = err.to_string();
+
+        assert!(message.contains(REDACTED_CREDENTIAL));
+        assert!(!message.contains("sensitive-access-key"));
+        assert!(message.contains("connection refused"));
+    }
+
+    #[test]
+    fn endpoint_health_key_preserves_explicit_port() {
+        let url = Url::parse("https://remote.example:9443").expect("url should parse");
+
+        assert_eq!(endpoint_health_key(&url), "remote.example:9443");
+    }
+
+    #[test]
+    fn update_endpoint_health_counts_offline_transitions() {
+        let mut health = EpHealth::default();
+        let now = OffsetDateTime::now_utc();
+
+        update_endpoint_health(&mut health, false, Duration::from_millis(25), now);
+        update_endpoint_health(&mut health, false, Duration::from_millis(25), now);
+        update_endpoint_health(&mut health, true, Duration::from_millis(10), now);
+        update_endpoint_health(&mut health, false, Duration::from_millis(25), now);
+
+        assert_eq!(health.offline_count, 2);
+        assert_eq!(health.offline_duration, Duration::from_millis(75));
+        assert_eq!(health.last_online, Some(now));
+    }
+
+    #[tokio::test]
+    async fn list_targets_applies_health_stats_for_endpoint_with_port() {
+        let sys = BucketTargetSys::default();
+        let url = Url::parse("https://remote.example:9443").expect("url should parse");
+        sys.init_hc(&url).await;
+        sys.mark_offline(&url).await;
+
+        sys.targets_map.write().await.insert(
+            "bucket".to_string(),
+            vec![BucketTarget {
+                endpoint: "remote.example:9443".to_string(),
+                arn: "arn:rustfs:replication:us-east-1:bucket:id".to_string(),
+                target_type: BucketTargetType::ReplicationService,
+                ..Default::default()
+            }],
+        );
+
+        let targets = sys.list_targets("", "").await;
+
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].online);
+        assert_eq!(targets[0].offline_count, 1);
+    }
 
     #[test]
     fn build_remove_object_headers_includes_internal_version_id_for_replication_delete() {
@@ -1616,5 +2008,226 @@ mod tests {
             rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
             "delete-marker version purges must not masquerade as delete-marker creations"
         );
+    }
+
+    fn remove_opts(replication_request: bool, replication_delete_marker: bool) -> RemoveObjectOptions {
+        RemoveObjectOptions {
+            force_delete: false,
+            governance_bypass: false,
+            replication_delete_marker,
+            replication_mtime: None,
+            replication_status: ReplicationStatusType::Replica,
+            replication_request,
+            replication_validity_check: false,
+        }
+    }
+
+    #[test]
+    fn version_purge_sends_versionid_query_param_to_generic_target() {
+        // A replication VERSION PURGE (delete_marker=false) must carry the S3
+        // `?versionId=` query param so a generic S3 target removes that exact
+        // version instead of silently creating a delete marker (backlog#799 B8).
+        let vid = Uuid::new_v4().to_string();
+        let got = resolve_delete_api_version_id(Some(vid.clone()), &remove_opts(true, false));
+        assert_eq!(got.as_deref(), Some(vid.as_str()));
+    }
+
+    #[test]
+    fn delete_marker_propagation_omits_versionid_query_param() {
+        // Propagating a delete-marker CREATION (delete_marker=true): the target
+        // must mint its own marker, so no `versionId` query param is sent.
+        let vid = Uuid::new_v4().to_string();
+        let got = resolve_delete_api_version_id(Some(vid), &remove_opts(true, true));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn non_replication_delete_passes_version_through() {
+        let vid = Uuid::new_v4().to_string();
+        let got = resolve_delete_api_version_id(Some(vid.clone()), &remove_opts(false, false));
+        assert_eq!(got.as_deref(), Some(vid.as_str()));
+    }
+
+    #[test]
+    fn delete_marker_purge_addresses_exact_version() {
+        // Purging a specific delete-marker version on the target
+        // (replication_delete_marker_purge_remove_options → delete_marker=false)
+        // must target that version, not degenerate to a new marker.
+        let vid = Uuid::new_v4().to_string();
+        let got = resolve_delete_api_version_id(Some(vid.clone()), &remove_opts(true, false));
+        assert_eq!(got.as_deref(), Some(vid.as_str()));
+    }
+
+    #[test]
+    fn put_object_headers_include_non_empty_source_etag_only() {
+        let mut opts = PutObjectOptions::default();
+
+        assert!(
+            rustfs_utils::http::get_header(&opts.header(), SUFFIX_SOURCE_ETAG).is_none(),
+            "empty source etag must not be sent to replication targets"
+        );
+
+        opts.internal.source_etag = "etag-1".to_string();
+
+        assert_eq!(
+            rustfs_utils::http::get_header(&opts.header(), SUFFIX_SOURCE_ETAG).as_deref(),
+            Some("etag-1"),
+            "replication targets need the source etag for idempotency checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_remote_target_client_internal_rejects_loopback_endpoint() {
+        let sys = BucketTargetSys::default();
+        let err = sys
+            .get_remote_target_client_internal(&BucketTarget {
+                endpoint: "127.0.0.1:9000".to_string(),
+                secure: true,
+                target_bucket: "bucket".to_string(),
+                region: "us-east-1".to_string(),
+                credentials: Some(Credentials {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                    expiration: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect_err("loopback endpoint should be rejected");
+
+        assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn get_remote_target_client_internal_allows_private_ip_endpoint() {
+        let sys = BucketTargetSys::default();
+        let client = sys
+            .get_remote_target_client_internal(&BucketTarget {
+                endpoint: "192.168.1.10:9000".to_string(),
+                secure: true,
+                skip_tls_verify: true,
+                target_bucket: "bucket".to_string(),
+                region: "us-east-1".to_string(),
+                credentials: Some(Credentials {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                    expiration: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("private IP endpoints should be allowed for replication targets");
+
+        assert_eq!(client.endpoint, "https://192.168.1.10:9000");
+    }
+
+    #[tokio::test]
+    async fn get_remote_target_client_internal_allows_custom_ca_pem() {
+        let sys = BucketTargetSys::default();
+        let cert = generate_simple_self_signed(vec!["192.168.1.10".to_string()]).expect("certificate should generate");
+        let client = sys
+            .get_remote_target_client_internal(&BucketTarget {
+                endpoint: "192.168.1.10:9000".to_string(),
+                secure: true,
+                target_bucket: "bucket".to_string(),
+                region: "us-east-1".to_string(),
+                ca_cert_pem: cert.cert.pem(),
+                credentials: Some(Credentials {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                    expiration: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("custom CA PEM should build a target client");
+
+        assert_eq!(client.endpoint, "https://192.168.1.10:9000");
+    }
+
+    #[tokio::test]
+    async fn get_remote_target_client_internal_rejects_invalid_custom_ca_pem() {
+        let sys = BucketTargetSys::default();
+        let err = sys
+            .get_remote_target_client_internal(&BucketTarget {
+                endpoint: "192.168.1.10:9000".to_string(),
+                secure: true,
+                target_bucket: "bucket".to_string(),
+                region: "us-east-1".to_string(),
+                ca_cert_pem: "not a pem".to_string(),
+                credentials: Some(Credentials {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                    expiration: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect_err("invalid custom CA PEM should be rejected");
+
+        assert!(err.to_string().contains("invalid target CA PEM"));
+    }
+
+    // backlog#806-16 regression tests for the rolling one-minute latency window.
+
+    #[test]
+    fn last_minute_latency_averages_only_samples_within_window() {
+        let base = Instant::now();
+        let mut window = LastMinuteLatency::new();
+
+        // Two samples that will fall outside the 60s window once the fresh
+        // sample is added, plus one fresh sample.
+        window.add_at(base, Duration::from_millis(100));
+        window.add_at(base + Duration::from_secs(10), Duration::from_millis(200));
+        // 61s after `base`: both earlier samples are now >60s old relative to
+        // the 200ms sample? No — measured against `now`. Add a fresh sample far
+        // in the future so the two old samples age out.
+        window.add_at(base + Duration::from_secs(61), Duration::from_millis(400));
+
+        // Only the fresh sample survives: 100ms (age 61s) and 200ms (age 51s)
+        // vs the fresh one — 51s is still < 60s, so the 200ms sample stays.
+        // Assert the window kept exactly the in-window samples.
+        assert_eq!(window.get_total().avg, Duration::from_millis(300)); // (200 + 400) / 2
+    }
+
+    #[test]
+    fn last_minute_latency_drops_all_stale_samples() {
+        let base = Instant::now();
+        let mut window = LastMinuteLatency::new();
+
+        // Two stale samples, then one sample far enough in the future that both
+        // are strictly older than 60s.
+        window.add_at(base, Duration::from_millis(100));
+        window.add_at(base + Duration::from_secs(5), Duration::from_millis(300));
+        window.add_at(base + Duration::from_secs(120), Duration::from_millis(500));
+
+        // Both old samples aged out (>=60s); only the fresh 500ms remains. Under
+        // the OLD all-or-nothing bug the result would still have been the last
+        // single sample by coincidence, so also verify the mixed-window case below.
+        assert_eq!(window.get_total().avg, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn last_minute_latency_two_fresh_samples_average_both() {
+        let base = Instant::now();
+        let mut window = LastMinuteLatency::new();
+
+        window.add_at(base, Duration::from_millis(100));
+        window.add_at(base + Duration::from_secs(1), Duration::from_millis(300));
+
+        // Both within the window -> average of both. The OLD bug degenerated the
+        // window to a single sample after 60s; here samples are close in time so
+        // the correct behaviour is a genuine two-sample average.
+        assert_eq!(window.get_total().avg, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn last_minute_latency_empty_window_is_zero() {
+        let window = LastMinuteLatency::new();
+        assert_eq!(window.get_total().avg, Duration::from_secs(0));
     }
 }

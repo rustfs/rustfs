@@ -12,36 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_api::test::bucket::{
+    lifecycle,
+    metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
+    metadata_sys,
+    transition_api::{ReadCloser, ReaderImpl},
+};
+use super::storage_api::test::contract::{
+    bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
+    list::ListOperations as _,
+    multipart::MultipartOperations as _,
+    object::{ObjectIO as _, ObjectOperations as _},
+};
+use super::storage_api::test::ecfs::FS;
+use super::storage_api::test::object_utils::to_s3s_etag;
+use super::storage_api::test::runtime::{AppWarmBackend, TierConfig, TierType, WarmBackendGetOpts};
+use super::storage_api::test::{
+    ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+};
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::storage_compat::ecstore::{
-    bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
-    bucket::metadata_sys,
-    client::object_api_utils::to_s3s_etag,
-    client::transition_api::{ReadCloser, ReaderImpl},
-    disk::endpoint::Endpoint,
-    endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-    global::GLOBAL_TierConfigMgr,
-    store::ECStore,
-    tier::{
-        tier_config::{TierConfig, TierType},
-        warm_backend::{WarmBackend, WarmBackendGetOpts},
-    },
-};
-use crate::storage::ecfs::FS;
-use crate::storage::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-};
+use crate::app::runtime_sources::current_tier_config_handle;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
-use rustfs_storage_api::{
-    BucketOperations, BucketOptions, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _,
-    ObjectOperations as _,
-};
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
@@ -63,6 +61,11 @@ use uuid::Uuid;
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
 const TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const ENV_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
+const ENV_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
+const ENV_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED";
+const ENV_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED";
+const ENV_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
 
 fn init_tracing() {
     INIT.call_once(|| {});
@@ -113,7 +116,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    crate::app::storage_compat::ecstore::store::init_local_disks(endpoint_pools.clone())
+    super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();
 
@@ -132,7 +135,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
-    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
 
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
@@ -300,7 +303,7 @@ impl MockWarmBackend {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for MockWarmBackend {
+impl AppWarmBackend for MockWarmBackend {
     async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
         let bytes = self.read_bytes(r).await?;
         Ok(self.put_bytes(object, bytes).await)
@@ -345,7 +348,8 @@ impl WarmBackend for MockWarmBackend {
 
 async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     let backend = MockWarmBackend::default();
-    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+    let tier_config_mgr_handle = current_tier_config_handle();
+    let mut tier_config_mgr = tier_config_mgr_handle.write().await;
     tier_config_mgr.tiers.insert(
         tier_name.to_string(),
         TierConfig {
@@ -401,6 +405,31 @@ where
             env::remove_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
         },
     }
+    if let Err(err) = result {
+        std::panic::resume_unwind(err);
+    }
+}
+
+async fn with_get_codec_streaming_remote_probe_env<F, Fut>(test_fn: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let metrics_was_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+    rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+    let result = std::panic::AssertUnwindSafe(temp_env::async_with_vars(
+        [
+            (ENV_GET_CODEC_STREAMING_ENABLE, Some("true")),
+            (ENV_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+            (ENV_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+            (ENV_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+            (ENV_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+        ],
+        test_fn(),
+    ))
+    .catch_unwind()
+    .await;
+    rustfs_io_metrics::set_get_stage_metrics_enabled(metrics_was_enabled);
     if let Err(err) = result {
         std::panic::resume_unwind(err);
     }
@@ -915,6 +944,66 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "requires isolated global object layer state"]
+async fn get_transitioned_object_uses_remote_codec_fallback_path() {
+    with_get_codec_streaming_remote_probe_env(|| async {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket = format!("test-api-get-remote-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object = "test/remote-codec-fallback.txt";
+        let payload: Vec<u8> = (0..(1024 * 1024))
+            .map(|index| u8::try_from(index % 251).expect("payload byte fits in u8"))
+            .collect();
+
+        create_test_bucket(&ecstore, bucket.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let uploaded = upload_test_object(&ecstore, bucket.as_str(), object, &payload).await;
+        let transition_opts = ObjectOptions {
+            transition: lifecycle::lifecycle_contract::TransitionOptions {
+                status: lifecycle::lifecycle_contract::TRANSITION_PENDING.to_string(),
+                tier: tier_name.clone(),
+                etag: uploaded.etag.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            version_id: uploaded.version_id.map(|version| version.to_string()),
+            versioned: true,
+            mod_time: uploaded.mod_time,
+            ..Default::default()
+        };
+        ecstore
+            .transition_object(bucket.as_str(), object, &transition_opts)
+            .await
+            .expect("Failed to transition object directly");
+
+        let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition before remote fallback GET");
+
+        assert_eq!(transitioned.transitioned_object.status, "complete");
+        assert_eq!(transitioned.transitioned_object.tier, tier_name);
+        assert!(!transitioned.transitioned_object.name.is_empty());
+        assert!(
+            backend
+                .objects
+                .lock()
+                .await
+                .contains_key(&transitioned.transitioned_object.name)
+        );
+
+        let actual = read_object_bytes(&ecstore, bucket.as_str(), object).await;
+        assert_eq!(actual, payload);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "requires isolated global object layer state"]
 async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let usecase = DefaultObjectUsecase::without_context();
@@ -932,12 +1021,9 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
-        ecstore.clone(),
-        bucket.as_str(),
-    )
-    .await
-    .expect("Failed to enqueue transitioned object");
+    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
+        .await
+        .expect("Failed to enqueue transitioned object");
 
     let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
@@ -992,12 +1078,9 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    crate::app::storage_compat::ecstore::bucket::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
-        ecstore.clone(),
-        bucket.as_str(),
-    )
-    .await
-    .expect("Failed to enqueue transitioned object");
+    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
+        .await
+        .expect("Failed to enqueue transitioned object");
 
     let _ = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await

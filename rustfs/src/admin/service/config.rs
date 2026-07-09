@@ -12,21 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_compat::ecstore::config::com::{STORAGE_CLASS_SUB_SYS, read_config_without_migrate};
-use crate::admin::storage_compat::ecstore::config::set_global_storage_class;
-use crate::admin::storage_compat::ecstore::config::storageclass;
-use crate::admin::storage_compat::ecstore::notification_sys::get_global_notification_sys;
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::runtime_sources::{
+    AppContext, current_app_context, current_notification_system_for_context, current_object_store_handle_for_context,
+    publish_server_config, publish_storage_class_config,
+};
+use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
+use crate::admin::storage_api::contract::admin::StorageAdminApi;
+use crate::admin::storage_api::runtime::ECStore;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
-use rustfs_config::server_config::{Config as ServerConfig, KVS, set_global_server_config};
+use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
-use rustfs_storage_api::StorageAdminApi;
 use rustfs_targets::config::{
     validate_amqp_config, validate_kafka_config, validate_mqtt_config, validate_mysql_config, validate_nats_config,
     validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
@@ -66,10 +67,12 @@ fn invalid_request(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidRequest, message.into())
 }
 
-async fn apply_storage_class_runtime_config(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
-        return Err(internal_error("storage layer not initialized"));
-    };
+fn resolve_runtime_config_store_for_context(context: Option<&AppContext>) -> S3Result<std::sync::Arc<ECStore>> {
+    current_object_store_handle_for_context(context).ok_or_else(|| internal_error("storage layer not initialized"))
+}
+
+async fn apply_storage_class_runtime_config_for_context(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
+    let store = resolve_runtime_config_store_for_context(context)?;
 
     let kvs = config.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
     let set_drive_count = StorageAdminApi::set_drive_counts(store.as_ref())
@@ -78,7 +81,7 @@ async fn apply_storage_class_runtime_config(config: &ServerConfig) -> S3Result<(
         .unwrap_or(1);
     let parsed = storageclass::lookup_config(&kvs, set_drive_count)
         .map_err(|err| internal_error(format!("failed to apply storage class config: {err}")))?;
-    set_global_storage_class(parsed);
+    publish_storage_class_config(parsed);
     Ok(())
 }
 
@@ -91,10 +94,8 @@ fn validate_storage_class_kvs(kvs: &KVS, set_drive_counts: &[usize]) -> S3Result
     Ok(())
 }
 
-async fn validate_storage_class_config(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
-        return Err(internal_error("storage layer not initialized"));
-    };
+async fn validate_storage_class_config_for_context(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
+    let store = resolve_runtime_config_store_for_context(context)?;
 
     let kvs = config.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
     let set_drive_counts = StorageAdminApi::set_drive_counts(store.as_ref());
@@ -247,9 +248,13 @@ fn validate_identity_openid_config(config: &ServerConfig) -> S3Result<()> {
     Ok(())
 }
 
-pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&str>) -> S3Result<()> {
+pub async fn validate_server_config_for_context(
+    context: Option<&AppContext>,
+    config: &ServerConfig,
+    sub_system: Option<&str>,
+) -> S3Result<()> {
     match sub_system {
-        Some(STORAGE_CLASS_SUB_SYS) => validate_storage_class_config(config).await,
+        Some(STORAGE_CLASS_SUB_SYS) => validate_storage_class_config_for_context(context, config).await,
         Some(NOTIFY_WEBHOOK_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS),
         Some(NOTIFY_MQTT_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS),
         Some(AUDIT_WEBHOOK_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS),
@@ -259,7 +264,7 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
             .map_err(|err| invalid_request(format!("invalid scanner config: {err}"))),
         Some(_) => Ok(()),
         None => {
-            validate_storage_class_config(config).await?;
+            validate_storage_class_config_for_context(context, config).await?;
             validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS)?;
             validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS)?;
             validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS)?;
@@ -272,13 +277,22 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
     }
 }
 
-pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_system: &str) -> S3Result<bool> {
+pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&str>) -> S3Result<()> {
+    let context = current_app_context();
+    validate_server_config_for_context(context.as_deref(), config, sub_system).await
+}
+
+pub async fn apply_dynamic_config_for_subsystem_for_context(
+    context: Option<&AppContext>,
+    config: &ServerConfig,
+    sub_system: &str,
+) -> S3Result<bool> {
     if dynamic_config_reload_plan(sub_system).is_none() {
         return Ok(false);
     }
 
     match sub_system {
-        STORAGE_CLASS_SUB_SYS => apply_storage_class_runtime_config(config).await?,
+        STORAGE_CLASS_SUB_SYS => apply_storage_class_runtime_config_for_context(context, config).await?,
         AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS => reload_audit_config(config.clone())
             .await
             .map_err(|err| internal_error(format!("failed to reload audit config: {err}")))?,
@@ -292,32 +306,40 @@ pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_syste
     Ok(true)
 }
 
-pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<()> {
+pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_system: &str) -> S3Result<bool> {
+    let context = current_app_context();
+    apply_dynamic_config_for_subsystem_for_context(context.as_deref(), config, sub_system).await
+}
+
+pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
     if !is_dynamic_config_subsystem(sub_system) {
         return Err(internal_error(format!("unsupported dynamic config subsystem: {sub_system}")));
     }
 
-    let Some(store) = resolve_object_store_handle() else {
-        return Err(internal_error("storage layer not initialized"));
-    };
+    let store = resolve_runtime_config_store_for_context(context)?;
 
-    let config = read_config_without_migrate(store).await.map_err(|err| {
+    let config = read_admin_config_without_migrate(store).await.map_err(|err| {
         warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
         internal_error(format!("failed to load server config: {err}"))
     })?;
-    apply_dynamic_config_for_subsystem(&config, sub_system).await.map_err(|err| {
-        warn!("peer reload_dynamic_config: failed to apply {sub_system}: {err}");
-        err
-    })?;
+    apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
+        .await
+        .map_err(|err| {
+            warn!("peer reload_dynamic_config: failed to apply {sub_system}: {err}");
+            err
+        })?;
     Ok(())
 }
 
-pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
-        return Err(internal_error("storage layer not initialized"));
-    };
+pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<()> {
+    let context = current_app_context();
+    reload_dynamic_config_runtime_state_for_context(context.as_deref(), sub_system).await
+}
 
-    let config = read_config_without_migrate(store).await.map_err(|err| {
+pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppContext>) -> S3Result<()> {
+    let store = resolve_runtime_config_store_for_context(context)?;
+
+    let config = read_admin_config_without_migrate(store).await.map_err(|err| {
         warn!("peer reload_runtime_config_snapshot: failed to load server config: {err}");
         internal_error(format!("failed to load server config: {err}"))
     })?;
@@ -331,21 +353,26 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
         SCANNER_SUB_SYS,
         HEAL_SUB_SYS,
     ] {
-        if let Err(err) = apply_dynamic_config_for_subsystem(&config, sub_system).await {
+        if let Err(err) = apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system).await {
             warn!("peer reload_runtime_config_snapshot: failed to apply {sub_system}: {err}");
         }
     }
 
-    set_global_server_config(config);
+    publish_server_config(config);
     Ok(())
 }
 
-pub async fn signal_dynamic_config_reload(sub_system: &str) {
+pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
+    let context = current_app_context();
+    reload_runtime_config_snapshot_for_context(context.as_deref()).await
+}
+
+pub async fn signal_dynamic_config_reload_for_context(context: Option<&AppContext>, sub_system: &str) {
     if !is_dynamic_config_subsystem(sub_system) {
         return;
     }
 
-    let Some(notification_sys) = get_global_notification_sys() else {
+    let Some(notification_sys) = current_notification_system_for_context(context) else {
         return;
     };
 
@@ -356,8 +383,13 @@ pub async fn signal_dynamic_config_reload(sub_system: &str) {
     }
 }
 
-pub async fn signal_config_snapshot_reload() {
-    let Some(notification_sys) = get_global_notification_sys() else {
+pub async fn signal_dynamic_config_reload(sub_system: &str) {
+    let context = current_app_context();
+    signal_dynamic_config_reload_for_context(context.as_deref(), sub_system).await;
+}
+
+pub async fn signal_config_snapshot_reload_for_context(context: Option<&AppContext>) {
+    let Some(notification_sys) = current_notification_system_for_context(context) else {
         return;
     };
 
@@ -368,10 +400,15 @@ pub async fn signal_config_snapshot_reload() {
     }
 }
 
+pub async fn signal_config_snapshot_reload() {
+    let context = current_app_context();
+    signal_config_snapshot_reload_for_context(context.as_deref()).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::storage_compat::ecstore::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
+    use crate::admin::storage_api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
@@ -427,7 +464,7 @@ mod tests {
 
     #[test]
     fn validate_notify_subsystem_config_rejects_invalid_webhook_endpoint() {
-        crate::admin::storage_compat::ecstore::config::init();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -441,7 +478,7 @@ mod tests {
 
     #[test]
     fn validate_audit_subsystem_config_rejects_relative_queue_dir() {
-        crate::admin::storage_compat::ecstore::config::init();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(AUDIT_MQTT_SUB_SYS).expect("audit mqtt defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -456,7 +493,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_missing_openid_scope() {
-        crate::admin::storage_compat::ecstore::config::init();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -473,7 +510,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_invalid_named_provider_id() {
-        crate::admin::storage_compat::ecstore::config::init();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().expect("default target");

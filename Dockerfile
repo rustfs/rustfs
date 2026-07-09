@@ -17,7 +17,7 @@ FROM alpine:3.23.4 AS build
 ARG TARGETARCH
 ARG RELEASE=latest
 
-RUN apk add --no-cache ca-certificates curl unzip
+RUN apk add --no-cache ca-certificates curl jq unzip
 WORKDIR /build
 
 RUN set -eux; \
@@ -27,9 +27,8 @@ RUN set -eux; \
       *) echo "Unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
     if [ "$RELEASE" = "latest" ]; then \
-      TAG="$(curl -fsSL https://api.github.com/repos/rustfs/rustfs/releases \
-              | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4 | head -n 1)"; \
-      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG")"; \
+      RELEASE_JSON="$(curl -fsSL https://api.github.com/repos/rustfs/rustfs/releases | jq -c '.[0]')"; \
+      TAG="$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name // empty')"; \
     else \
       TAG="$RELEASE"; \
       RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" 2>/dev/null || true)"; \
@@ -44,14 +43,19 @@ RUN set -eux; \
         TAG="$ALT_TAG"; \
       fi; \
     fi; \
+    if [ -z "$TAG" ] || [ -z "$RELEASE_JSON" ]; then echo "Failed to resolve release metadata" >&2; exit 1; fi; \
     echo "Using tag: $TAG (arch pattern: $ARCH_SUBSTR)"; \
-    # Find download URL in assets list for this tag that contains arch substring and ends with .zip
-    URL="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" \
-           | grep -o "\"browser_download_url\": \"[^\"]*${ARCH_SUBSTR}[^\"]*\\.zip\"" \
-           | cut -d'"' -f4 | head -n 1)"; \
-    if [ -z "$URL" ]; then echo "Failed to locate release asset for $ARCH_SUBSTR at tag $TAG" >&2; exit 1; fi; \
+    ASSET_JSON="$(printf '%s' "$RELEASE_JSON" | jq -c --arg arch "$ARCH_SUBSTR" '.assets[] | select((.name | contains($arch)) and (.name | endswith(".zip"))) | {name: .name, url: .browser_download_url, digest: .digest}' | head -n 1)"; \
+    if [ -z "$ASSET_JSON" ]; then echo "Failed to locate release asset for $ARCH_SUBSTR at tag $TAG" >&2; exit 1; fi; \
+    ASSET_NAME="$(printf '%s' "$ASSET_JSON" | jq -r '.name // empty')"; \
+    URL="$(printf '%s' "$ASSET_JSON" | jq -r '.url // empty')"; \
+    DIGEST="$(printf '%s' "$ASSET_JSON" | jq -r '.digest // empty')"; \
+    SHA256="$(printf '%s' "$DIGEST" | sed 's/^sha256://')"; \
+    if [ -z "$URL" ] || [ -z "$ASSET_NAME" ]; then echo "Failed to locate release asset for $ARCH_SUBSTR at tag $TAG" >&2; exit 1; fi; \
+    if [ -z "$SHA256" ] || [ "$SHA256" = "$DIGEST" ]; then echo "Release asset $ASSET_NAME is missing a sha256 digest" >&2; exit 1; fi; \
     echo "Downloading: $URL"; \
     curl -fL "$URL" -o rustfs.zip; \
+    printf '%s  rustfs.zip\n' "$SHA256" | sha256sum -c -; \
     unzip -q rustfs.zip -d /build; \
     # If binary is not in root directory, try to locate and move from zip to /build/rustfs
     if [ ! -x /build/rustfs ]; then \

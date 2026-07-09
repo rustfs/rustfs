@@ -136,6 +136,101 @@ mod tests {
         info!("PASSED: PutObject with checksum_sha256 and GetObject content match");
     }
 
+    /// Regression test for issue #4341 (part 1: verify-on-write):
+    /// PutObject with a SHA256 checksum that does NOT match the body must be
+    /// rejected (BadDigest / checksum mismatch), NOT accepted with HTTP 200.
+    #[tokio::test]
+    #[serial]
+    async fn test_put_object_rejects_mismatched_sha256() {
+        init_logging();
+        info!("TEST: PutObject rejects mismatched x-amz-checksum-sha256 (issue #4341)");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-checksum-sha256-mismatch";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let key = "obj-bad-sha256.txt";
+        let content = b"Body bytes that do NOT match the declared checksum";
+        // Checksum of a DIFFERENT payload -> deliberate mismatch.
+        let wrong_checksum = checksum_sha256_base64(b"some other payload entirely");
+
+        let result = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(content))
+            .checksum_sha256(&wrong_checksum)
+            .send()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "PutObject with a mismatched SHA256 must be rejected, but it succeeded (issue #4341)"
+        );
+        let err = result.err().unwrap();
+        let msg = format!("{err:?}");
+        info!("PutObject correctly rejected mismatched checksum: {msg}");
+        assert!(
+            msg.contains("BadDigest") || msg.to_lowercase().contains("digest") || msg.to_lowercase().contains("checksum"),
+            "Expected a BadDigest/checksum error, got: {msg}"
+        );
+
+        // And the object must not have been stored.
+        let head = client.head_object().bucket(bucket).key(key).send().await;
+        assert!(head.is_err(), "Object must not exist after a rejected mismatched-checksum PutObject");
+        info!("PASSED: PutObject rejects mismatched SHA256 and stores nothing");
+    }
+
+    /// Regression test for issue #4341 (part 2: retrieve-on-HEAD):
+    /// After PutObject with a correct SHA256 checksum, HeadObject with
+    /// ChecksumMode=ENABLED must return that stored base64 SHA256 digest.
+    #[tokio::test]
+    #[serial]
+    async fn test_head_object_returns_stored_sha256() {
+        init_logging();
+        info!("TEST: HeadObject returns stored SHA256 with ChecksumMode=ENABLED (issue #4341)");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-checksum-sha256-head";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let key = "obj-head-sha256.txt";
+        let content = b"Retrieve my SHA256 checksum on HEAD";
+        let checksum = checksum_sha256_base64(content);
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(content))
+            .checksum_sha256(&checksum)
+            .send()
+            .await
+            .expect("PutObject with correct SHA256 failed");
+
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("HeadObject failed");
+
+        assert_eq!(
+            head.checksum_sha256(),
+            Some(checksum.as_str()),
+            "HeadObject with ChecksumMode=ENABLED must return the stored base64 SHA256 (issue #4341)"
+        );
+        info!("PASSED: HeadObject returns stored SHA256 digest");
+    }
+
     /// Multipart upload with checksum: CreateMultipartUpload, UploadPart(s) with checksum_sha256, CompleteMultipartUpload; then GetObject verifies content.
     /// Uses part size >= 5MB (server minimum) for two parts.
     #[tokio::test]

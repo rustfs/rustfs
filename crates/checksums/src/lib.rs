@@ -43,8 +43,6 @@ pub enum ChecksumAlgorithm {
     #[default]
     Crc32,
     Crc32c,
-    #[deprecated]
-    Md5,
     Sha1,
     Sha256,
     Crc64Nvme,
@@ -62,9 +60,6 @@ impl FromStr for ChecksumAlgorithm {
             Ok(Self::Sha1)
         } else if checksum_algorithm.eq_ignore_ascii_case(SHA_256_NAME) {
             Ok(Self::Sha256)
-        } else if checksum_algorithm.eq_ignore_ascii_case(MD5_NAME) {
-            // MD5 is now an alias for the default Crc32 since it is deprecated
-            Ok(Self::Crc32)
         } else if checksum_algorithm.eq_ignore_ascii_case(CRC_64_NVME_NAME) {
             Ok(Self::Crc64Nvme)
         } else {
@@ -79,8 +74,6 @@ impl ChecksumAlgorithm {
             Self::Crc32 => Box::<Crc32>::default(),
             Self::Crc32c => Box::<Crc32c>::default(),
             Self::Crc64Nvme => Box::<Crc64Nvme>::default(),
-            #[allow(deprecated)]
-            Self::Md5 => Box::<Crc32>::default(),
             Self::Sha1 => Box::<Sha1>::default(),
             Self::Sha256 => Box::<Sha256>::default(),
         }
@@ -91,8 +84,6 @@ impl ChecksumAlgorithm {
             Self::Crc32 => CRC_32_NAME,
             Self::Crc32c => CRC_32_C_NAME,
             Self::Crc64Nvme => CRC_64_NVME_NAME,
-            #[allow(deprecated)]
-            Self::Md5 => MD5_NAME,
             Self::Sha1 => SHA_1_NAME,
             Self::Sha256 => SHA_256_NAME,
         }
@@ -338,8 +329,7 @@ mod tests {
 
     use crate::ChecksumAlgorithm;
     use crate::http::HttpChecksum;
-
-    use crate::base64;
+    use base64_simd::STANDARD;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
     use std::fmt::Write;
@@ -347,7 +337,9 @@ mod tests {
     const TEST_DATA: &str = r#"test data"#;
 
     fn base64_encoded_checksum_to_hex_string(header_value: &HeaderValue) -> String {
-        let decoded_checksum = base64::decode(header_value.to_str().unwrap()).unwrap();
+        let decoded_checksum = STANDARD
+            .decode_to_vec(header_value.to_str().expect("checksum header value should be ASCII"))
+            .expect("checksum header value should be valid base64");
         let decoded_checksum = decoded_checksum.into_iter().fold(String::new(), |mut acc, byte| {
             write!(acc, "{byte:02X?}").expect("string will always be writable");
             acc
@@ -442,5 +434,24 @@ mod tests {
             .parse::<ChecksumAlgorithm>()
             .expect_err("it should error");
         assert_eq!("some invalid checksum algorithm", error.checksum_algorithm());
+    }
+
+    #[test]
+    fn test_unknown_algorithm_error_message_lists_supported_algorithms() {
+        let error = "nope".parse::<ChecksumAlgorithm>().expect_err("it should error");
+        let message = error.to_string();
+        assert!(message.contains("crc64nvme"), "message should advertise crc64nvme: {message}");
+        assert!(!message.contains("md5"), "message should not advertise the unsupported md5: {message}");
+    }
+
+    #[test]
+    fn test_md5_is_not_a_supported_checksum_algorithm() {
+        // MD5 is not an accepted S3 checksum algorithm here: parsing it must fail
+        // loudly rather than silently substituting a CRC32 hasher.
+        let error = "md5".parse::<ChecksumAlgorithm>().expect_err("md5 should not parse");
+        assert_eq!("md5", error.checksum_algorithm());
+
+        let error = "MD5".parse::<ChecksumAlgorithm>().expect_err("md5 should not parse");
+        assert_eq!("MD5", error.checksum_algorithm());
     }
 }

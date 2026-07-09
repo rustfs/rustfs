@@ -59,7 +59,7 @@ values as labels.
 | --- | --- | --- |
 | Outgoing HTTP stream requests | `crates/rio/src/http_reader.rs` | Outgoing request count, sent bytes for writer bodies, received bytes for reader bodies, and errors for known `/rustfs/rpc/` operations. |
 | Incoming HTTP stream requests | `rustfs/src/storage/rpc/http_service.rs` | Incoming request count, sent bytes for read and walk streams, received bytes for put streams, and route errors. |
-| gRPC `ReadAll` / `WriteAll` | `rustfs/src/storage/rpc/disk.rs` | Incoming request count, sent/received bytes, and errors with the `grpc` backend label. |
+| gRPC `ReadAll` / `WriteAll` | `rustfs/src/storage/rpc/node_service/disk.rs` | Incoming request count, sent/received bytes, and errors with the `grpc` backend label. |
 
 Known gaps:
 

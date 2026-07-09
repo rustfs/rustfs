@@ -1,0 +1,12 @@
+---
+source: crates/concurrency/src/workload.rs
+expression: encoded
+---
+{
+  "active": 0,
+  "class": "foreground_write",
+  "limit": 0,
+  "queued": 0,
+  "reason": "foreground write admission not exposed",
+  "state": "disabled"
+}

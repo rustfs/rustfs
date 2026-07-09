@@ -1,0 +1,88 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0.
+
+x-minio-env: &minio-env
+  MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+  MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+  MINIO_COMPRESSION_ENABLE: "${MINIO_COMPRESSION_ENABLE:-on}"
+  MINIO_COMPRESSION_ALLOW_ENCRYPTION: "${MINIO_COMPRESSION_ALLOW_ENCRYPTION:-on}"
+  MINIO_COMPRESSION_EXTENSIONS: "${MINIO_COMPRESSION_EXTENSIONS:-.txt,.log,.csv,.json,.tar,.xml,.bin}"
+  MINIO_COMPRESSION_MIME_TYPES: "${MINIO_COMPRESSION_MIME_TYPES:-text/*,application/json,application/xml,binary/octet-stream}"
+
+x-minio-node: &minio-node
+  image: "${MINIO_IMAGE:-quay.io/minio/minio:latest}"
+  command: server --console-address ":9001" "http://minio{1...4}:9000/data/disk{1...4}"
+  environment: *minio-env
+  networks:
+    - minio-compat-net
+  restart: unless-stopped
+
+services:
+  minio-permission-helper:
+    image: alpine:3.23
+    command: sh -c "mkdir -p /compat-data && chown -R 1000:1000 /compat-data"
+    volumes:
+      - ./data/minio:/compat-data
+    restart: "no"
+
+  minio1:
+    <<: *minio-node
+    hostname: minio1
+    depends_on:
+      minio-permission-helper:
+        condition: service_completed_successfully
+    volumes:
+      - ./data/minio/node1/disk1:/data/disk1
+      - ./data/minio/node1/disk2:/data/disk2
+      - ./data/minio/node1/disk3:/data/disk3
+      - ./data/minio/node1/disk4:/data/disk4
+    ports:
+      - "${MINIO_API_PORT:-9200}:9000"
+      - "${MINIO_CONSOLE_PORT:-9201}:9001"
+
+  minio2:
+    <<: *minio-node
+    hostname: minio2
+    depends_on:
+      minio-permission-helper:
+        condition: service_completed_successfully
+    volumes:
+      - ./data/minio/node2/disk1:/data/disk1
+      - ./data/minio/node2/disk2:/data/disk2
+      - ./data/minio/node2/disk3:/data/disk3
+      - ./data/minio/node2/disk4:/data/disk4
+    ports:
+      - "${MINIO_NODE2_PORT:-9202}:9000"
+
+  minio3:
+    <<: *minio-node
+    hostname: minio3
+    depends_on:
+      minio-permission-helper:
+        condition: service_completed_successfully
+    volumes:
+      - ./data/minio/node3/disk1:/data/disk1
+      - ./data/minio/node3/disk2:/data/disk2
+      - ./data/minio/node3/disk3:/data/disk3
+      - ./data/minio/node3/disk4:/data/disk4
+    ports:
+      - "${MINIO_NODE3_PORT:-9203}:9000"
+
+  minio4:
+    <<: *minio-node
+    hostname: minio4
+    depends_on:
+      minio-permission-helper:
+        condition: service_completed_successfully
+    volumes:
+      - ./data/minio/node4/disk1:/data/disk1
+      - ./data/minio/node4/disk2:/data/disk2
+      - ./data/minio/node4/disk3:/data/disk3
+      - ./data/minio/node4/disk4:/data/disk4
+    ports:
+      - "${MINIO_NODE4_PORT:-9204}:9000"
+
+networks:
+  minio-compat-net:
+    driver: bridge

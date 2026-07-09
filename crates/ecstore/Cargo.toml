@@ -33,8 +33,10 @@ workspace = true
 [features]
 default = []
 rio-v2 = ["dep:rustfs-rio-v2"]
+hotpath = ["dep:hotpath", "hotpath/hotpath", "rustfs-filemeta/hotpath", "rustfs-rio/hotpath"]
 
 [dependencies]
+hotpath = { workspace = true, optional = true }
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
@@ -44,10 +46,13 @@ rustfs-storage-api.workspace = true
 rustfs-tls-runtime.workspace = true
 rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify", "audit", "server-config-model"] }
+rustfs-concurrency.workspace = true
 rustfs-credentials = { workspace = true }
 rustfs-common.workspace = true
 rustfs-policy.workspace = true
 rustfs-protos.workspace = true
+rustfs-replication.workspace = true
+rustfs-lifecycle.workspace = true
 rustfs-kms.workspace = true
 rustfs-s3-types = { workspace = true }
 rustfs-data-usage.workspace = true
@@ -78,6 +83,7 @@ uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
 reed-solomon-erasure = { workspace = true }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
+moka = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-io-metrics.workspace = true
 regex = { workspace = true }
@@ -110,9 +116,9 @@ memmap2 = { workspace = true }
 libc.workspace = true
 rustix = { workspace = true }
 rustfs-madmin.workspace = true
-rustfs-concurrency.workspace = true
 reqwest = { workspace = true }
 aes-gcm.workspace = true
+chacha20poly1305.workspace = true
 aws-sdk-s3 = { workspace = true }
 urlencoding = { workspace = true }
 smallvec = { workspace = true }
@@ -120,6 +126,7 @@ shadow-rs.workspace = true
 async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
 parking_lot = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
@@ -141,6 +148,9 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 serial_test = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 proptest = "1"
+rcgen.workspace = true
+insta = { workspace = true }
+rustfs-crypto = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
@@ -163,7 +173,3 @@ harness = false
 
 [lib]
 doctest = false
-
-# io-uring is Linux-only. Scope the feature to Linux targets.
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio = { workspace = true, features = ["io-uring"] }

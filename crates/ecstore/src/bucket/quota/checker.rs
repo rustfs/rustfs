@@ -19,6 +19,7 @@ use rustfs_common::metrics::Metric;
 use rustfs_config::QUOTA_CONFIG_FILE;
 use std::sync::Arc;
 use std::time::Instant;
+use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -137,18 +138,18 @@ impl QuotaChecker {
         Ok(quota)
     }
 
-    pub async fn set_quota_config(&mut self, bucket: &str, quota: BucketQuota) -> Result<(), QuotaError> {
+    pub async fn set_quota_config(&mut self, bucket: &str, quota: BucketQuota) -> Result<OffsetDateTime, QuotaError> {
         let json_data = serde_json::to_vec(&quota).map_err(|e| QuotaError::InvalidConfig {
             reason: format!("Failed to serialize quota config: {}", e),
         })?;
         let start_time = Instant::now();
 
-        update(bucket, QUOTA_CONFIG_FILE, json_data)
+        let updated_at = update(bucket, QUOTA_CONFIG_FILE, json_data)
             .await
             .map_err(QuotaError::StorageError)?;
 
         rustfs_common::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
-        Ok(())
+        Ok(updated_at)
     }
 
     pub async fn get_quota_stats(&self, bucket: &str) -> Result<(BucketQuota, Option<u64>), QuotaError> {

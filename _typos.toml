@@ -45,6 +45,8 @@ nonexisted = "nonexisted"
 consts = "consts"
 # Swift API - company/product names
 Hashi = "Hashi"  # HashiCorp
+# Accept alternate spelling used in parser/XML comments.
+unparseable = "unparseable"
 
 [files]
 extend-exclude = []

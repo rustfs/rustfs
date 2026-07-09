@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
+use crate::admin::runtime_sources::{current_oidc_handle, default_admin_usecase};
+use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::{
-    CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, LICENSE, RUSTFS_ADMIN_PREFIX,
-    RequestContextLayer, VERSION,
+    CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX,
+    RequestContextLayer, VERSION, build_health_response_parts, collect_probe_readiness,
 };
-use crate::storage::request_context::RequestContext;
 use crate::version::build;
 use axum::{
     Json, Router,
@@ -134,7 +134,7 @@ impl Config {
         let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
 
         // Collect OIDC provider info if available
-        let oidc = rustfs_iam::get_oidc()
+        let oidc = current_oidc_handle()
             .map(|sys| {
                 sys.list_visible_providers()
                     .into_iter()
@@ -150,6 +150,7 @@ impl Config {
             port,
             api: Api {
                 base_url: build_console_api_base_url(&format!("{http_prefix}{local_ip}:{port}")),
+                discovery: console_api_discovery(),
             },
             s3: S3 {
                 endpoint: format!("{http_prefix}{local_ip}:{port}"),
@@ -207,6 +208,26 @@ fn build_console_api_base_url(base_url: &str) -> String {
 struct Api {
     #[serde(rename = "baseURL")]
     base_url: String,
+    discovery: ApiDiscovery,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ApiDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: String,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: String,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: String,
+}
+
+fn console_api_discovery() -> ApiDiscovery {
+    let usecase = default_admin_usecase();
+    ApiDiscovery {
+        runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+        cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+        extensions_catalog: usecase.extensions_catalog_route().to_string(),
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -573,13 +594,13 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     } else {
         HealthProbe::Liveness
     };
-    let readiness_report = collect_dependency_readiness().await;
+    let readiness_report = collect_probe_readiness(probe).await;
     let uptime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let response_parts =
-        build_health_response_parts(method.clone(), probe, &readiness_report, "rustfs-console", Some(uptime), None);
+        build_health_response_parts(method.clone(), probe, readiness_report.as_ref(), "rustfs-console", Some(uptime), None);
 
     let builder = Response::builder()
         .status(response_parts.status_code)
@@ -788,6 +809,33 @@ mod tests {
             build_console_api_base_url("http://127.0.0.1:9001"),
             "http://127.0.0.1:9001/rustfs/admin/v3"
         );
+    }
+
+    #[test]
+    fn console_config_exposes_admin_discovery_paths() {
+        let cfg = Config::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001, "test", "2026-03-16T00:00:00Z");
+
+        assert_eq!(cfg.api.discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(cfg.api.discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(cfg.api.discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
+    }
+
+    #[tokio::test]
+    async fn console_config_handler_serializes_admin_discovery_paths() {
+        init_console_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001);
+
+        let response = config_handler(Uri::from_static("http://127.0.0.1:9001/rustfs/console/api/v1/config"), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = body.collect().await.expect("collect console config body").to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("console config JSON should deserialize");
+
+        assert_eq!(value["api"]["discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["api"]["discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["api"]["discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
     }
 
     #[test]

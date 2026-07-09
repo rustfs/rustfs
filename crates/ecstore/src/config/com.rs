@@ -12,12 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{audit, notify, oidc, set_global_storage_class, storageclass};
+use crate::config::{audit, notify, oidc, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
-use crate::global::is_first_cluster_node_local;
-use crate::store_api::{ObjectIO, ObjectInfo, ObjectOperations, ObjectOptions, PutObjReader};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::runtime::sources as runtime_sources;
+use crate::storage_api_contracts::{
+    admin::StorageAdminApi,
+    heal::HealOperations,
+    object::{DeletedObject, EcstoreObjectIO, ObjectIO, ObjectOperations, ObjectToDelete},
+    range::HTTPRangeSpec,
+};
 use http::HeaderMap;
+use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
     AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS,
@@ -32,22 +39,96 @@ use rustfs_config::notify::{
 use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_REDIRECT_URI_DYNAMIC};
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
-use rustfs_storage_api::StorageAdminApi;
+use rustfs_filemeta::FileInfo;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, instrument, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";
+
+/// Environment variable gating the startup fallback to the default server
+/// config when the persisted `config.json` object is corrupt beyond repair
+/// (unreadable or undecodable even after a heal attempt).
+///
+/// Enabled by default: `config.json` only holds server settings (storage
+/// class, notify/audit targets, OIDC), never object data, and environment
+/// overrides are re-applied on top of the defaults, so booting with defaults
+/// is safe while a startup crash loop is not. Set to `false`/`off` to fail
+/// startup instead of falling back.
+pub const ENV_CONFIG_RECOVER_ON_CORRUPTION: &str = "RUSTFS_CONFIG_RECOVER_ON_CORRUPTION";
+const DEFAULT_CONFIG_RECOVER_ON_CORRUPTION: bool = true;
+
+const LOG_COMPONENT_CONFIG: &str = "ecstore";
+const LOG_SUBSYSTEM_CONFIG: &str = "config";
+const EVENT_SERVER_CONFIG_DECODE_FAILED: &str = "server_config_decode_failed";
+const EVENT_SERVER_CONFIG_DECRYPT_FAILED: &str = "server_config_decrypt_failed";
+const EVENT_SERVER_CONFIG_READ_FAILED: &str = "server_config_read_failed";
+const EVENT_SERVER_CONFIG_HEAL_RESULT: &str = "server_config_heal_result";
+const EVENT_SERVER_CONFIG_RECOVERED: &str = "server_config_recovered_after_heal";
+const EVENT_SERVER_CONFIG_FALLBACK: &str = "server_config_corruption_fallback";
+
+fn config_corruption_recovery_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_CONFIG_RECOVER_ON_CORRUPTION, DEFAULT_CONFIG_RECOVER_ON_CORRUPTION)
+}
+
+/// Marker wrapped around decode failures of the persisted server config so
+/// callers can tell deterministic corruption (retrying cannot help) apart
+/// from transient read failures; a bare `Error::Io` cannot be classified.
+#[derive(Debug, thiserror::Error)]
+#[error("server config corrupt: {0}")]
+pub struct ServerConfigCorruptError(pub String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("server config decrypt failed: {0}")]
+struct ServerConfigDecryptError(pub String);
+
+/// Returns true when `err` is a [`ServerConfigCorruptError`] produced by the
+/// server config decode path. Such failures are deterministic: the persisted
+/// blob itself is damaged and re-reading it cannot succeed.
+pub fn is_server_config_corrupt_error(err: &Error) -> bool {
+    matches!(err, Error::Io(io_err) if io_err.get_ref().is_some_and(|inner| inner.is::<ServerConfigCorruptError>()))
+}
+
+fn is_server_config_decrypt_error(err: &Error) -> bool {
+    matches!(err, Error::Io(io_err) if io_err.get_ref().is_some_and(|inner| inner.is::<ServerConfigDecryptError>()))
+}
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
 pub const COMMA_SEPARATED_LISTS: &[&str] = &[rustfs_config::oidc::OIDC_SCOPES, rustfs_config::oidc::OIDC_OTHER_AUDIENCES];
 
 static CONFIG_BUCKET: LazyLock<String> = LazyLock::new(|| format!("{RUSTFS_META_BUCKET}{SLASH_SEPARATOR}{CONFIG_PREFIX}"));
+
+type ServerConfigDecryptFn = crate::bucket::migration::LegacyBlobDecryptFn;
+
+static SERVER_CONFIG_DECRYPT_FN: LazyLock<RwLock<Option<ServerConfigDecryptFn>>> = LazyLock::new(|| RwLock::new(None));
+
+pub fn register_server_config_decrypt_fn(decrypt_fn: ServerConfigDecryptFn) {
+    match SERVER_CONFIG_DECRYPT_FN.write() {
+        Ok(mut guard) => {
+            *guard = Some(decrypt_fn);
+        }
+        Err(err) => {
+            warn!("register server config decrypt function failed: {err}");
+        }
+    }
+}
+
+fn server_config_decrypt_fn() -> Option<ServerConfigDecryptFn> {
+    SERVER_CONFIG_DECRYPT_FN.read().ok().and_then(|guard| guard.clone())
+}
+
+#[cfg(test)]
+fn replace_server_config_decrypt_fn_for_test(decrypt_fn: Option<ServerConfigDecryptFn>) -> Option<ServerConfigDecryptFn> {
+    SERVER_CONFIG_DECRYPT_FN
+        .write()
+        .ok()
+        .and_then(|mut guard| std::mem::replace(&mut *guard, decrypt_fn))
+}
 
 static SUB_SYSTEMS_DYNAMIC: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let mut h = HashSet::new();
@@ -182,12 +263,34 @@ fn audit_target_descriptors() -> [TargetConfigDescriptor; 9] {
 }
 
 #[instrument(skip(api))]
-pub async fn read_config<S: ObjectIO>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let (data, _obj) = read_config_with_metadata(api, file, &ObjectOptions::default()).await?;
     Ok(data)
 }
 
-pub async fn read_config_no_lock<S: ObjectIO>(api: Arc<S>, file: &str) -> Result<Vec<u8>> {
+pub async fn read_config_no_lock<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let (data, _obj) = read_config_with_metadata(
         api,
         file,
@@ -200,11 +303,18 @@ pub async fn read_config_no_lock<S: ObjectIO>(api: Arc<S>, file: &str) -> Result
     Ok(data)
 }
 
-pub async fn read_config_with_metadata<S: ObjectIO>(
-    api: Arc<S>,
-    file: &str,
-    opts: &ObjectOptions,
-) -> Result<(Vec<u8>, ObjectInfo)> {
+pub async fn read_config_with_metadata<S>(api: Arc<S>, file: &str, opts: &ObjectOptions) -> Result<(Vec<u8>, ObjectInfo)>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let h = HeaderMap::new();
     let mut rd = api
         .get_object_reader(RUSTFS_META_BUCKET, file, None, h, opts)
@@ -228,7 +338,18 @@ pub async fn read_config_with_metadata<S: ObjectIO>(
 }
 
 #[instrument(skip(api, data))]
-pub async fn save_config<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()> {
+pub async fn save_config<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     save_config_with_opts(
         api,
         file,
@@ -242,7 +363,17 @@ pub async fn save_config<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>) ->
 }
 
 #[instrument(skip(api))]
-pub async fn delete_config<S: ObjectOperations>(api: Arc<S>, file: &str) -> Result<()> {
+pub async fn delete_config<S>(api: Arc<S>, file: &str) -> Result<()>
+where
+    S: ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
+{
     match api
         .delete_object(
             RUSTFS_META_BUCKET,
@@ -266,7 +397,18 @@ pub async fn delete_config<S: ObjectOperations>(api: Arc<S>, file: &str) -> Resu
     }
 }
 
-pub async fn save_config_with_opts<S: ObjectIO>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
+pub async fn save_config_with_opts<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let mut put_data = PutObjReader::from_vec(data);
     if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         error!("save_config_with_opts: err: {:?}, file: {}", err, file);
@@ -281,7 +423,7 @@ fn new_server_config() -> Config {
 
 async fn new_and_save_server_config<S>(api: Arc<S>) -> Result<Config>
 where
-    S: ObjectIO + StorageAdminApi,
+    S: EcstoreObjectIO + StorageAdminApi,
 {
     let mut cfg = new_server_config();
     lookup_configs(&mut cfg, api.clone()).await;
@@ -983,10 +1125,29 @@ fn is_object_not_found(err: &Error) -> bool {
     *err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _) | Error::BucketNotFound(_))
 }
 
-pub async fn try_migrate_server_config<S>(api: Arc<S>)
+pub async fn try_migrate_server_config<S>(api: Arc<S>, decrypt_fn: Option<crate::bucket::migration::LegacyBlobDecryptFn>)
 where
-    S: ObjectIO + ObjectOperations,
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
+    if let Some(decrypt) = &decrypt_fn {
+        register_server_config_decrypt_fn(decrypt.clone());
+    }
+
     let config_file = get_config_file();
     match api
         .get_object_info(
@@ -1041,6 +1202,15 @@ where
         }
     };
 
+    // MinIO encrypts the server config at rest with a key derived from the root
+    // credentials. Decrypt before decoding; fall back to the raw bytes when no key
+    // applies (plaintext configs) so existing behavior holds. The decrypted bytes
+    // also become the fidelity seed for `encode_server_config_blob` below.
+    let data = match &decrypt_fn {
+        Some(decrypt) => decrypt(&data).unwrap_or(data),
+        None => data,
+    };
+
     let cfg = match decode_server_config_blob(&data) {
         Ok(v) => v,
         Err(err) => {
@@ -1069,10 +1239,10 @@ where
 /// Handle the situation where the configuration file does not exist, create and save a new configuration
 async fn handle_missing_config<S>(api: Arc<S>, context: &str) -> Result<Config>
 where
-    S: ObjectIO + StorageAdminApi,
+    S: EcstoreObjectIO + StorageAdminApi,
 {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
-    let cfg = if is_first_cluster_node_local().await {
+    let cfg = if runtime_sources::first_cluster_node_is_local().await {
         new_and_save_server_config(api.clone()).await?
     } else {
         let mut cfg = new_server_config();
@@ -1091,7 +1261,15 @@ fn handle_config_read_error(err: Error, file_path: &str) -> Result<Config> {
 
 pub async fn read_config_without_migrate<S>(api: Arc<S>) -> Result<Config>
 where
-    S: ObjectIO + StorageAdminApi,
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + StorageAdminApi,
 {
     let config_file = get_config_file();
 
@@ -1105,7 +1283,7 @@ where
 
 async fn read_server_config<S>(api: Arc<S>, data: &[u8]) -> Result<Config>
 where
-    S: ObjectIO + StorageAdminApi,
+    S: EcstoreObjectIO + StorageAdminApi,
 {
     // If the provided data is empty, try to read from the file again
     if data.is_empty() {
@@ -1115,8 +1293,7 @@ where
         // Try to read the configuration again
         match read_config_no_lock(api.clone(), &config_file).await {
             Ok(cfg_data) => {
-                // TODO: decrypt
-                let cfg = decode_server_config_blob(&cfg_data)?;
+                let cfg = decode_persisted_server_config(&cfg_data)?;
                 return Ok(cfg.merge());
             }
             Err(Error::ConfigNotFound) => return handle_missing_config(api, "Read alternate configuration").await,
@@ -1125,11 +1302,221 @@ where
     }
 
     // Process non-empty configuration data
-    let cfg = decode_server_config_blob(data)?;
+    let cfg = decode_persisted_server_config(data)?;
     Ok(cfg.merge())
 }
 
-pub async fn save_server_config<S: ObjectIO>(api: Arc<S>, cfg: &Config) -> Result<()> {
+/// Decode the persisted server config blob, marking decode failures as
+/// deterministic corruption (see [`ServerConfigCorruptError`]).
+fn decode_persisted_server_config(data: &[u8]) -> Result<Config> {
+    match decode_server_config_blob(data) {
+        Ok(cfg) => Ok(cfg),
+        Err(raw_decode_err) => {
+            let Some(decrypt) = server_config_decrypt_fn() else {
+                error!(
+                    event = EVENT_SERVER_CONFIG_DECODE_FAILED,
+                    component = LOG_COMPONENT_CONFIG,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    size = data.len(),
+                    error = %raw_decode_err,
+                    "persisted server config cannot be decoded, object is corrupt"
+                );
+                return Err(Error::other(ServerConfigCorruptError(raw_decode_err.to_string())));
+            };
+
+            let Some(decrypted) = decrypt(data) else {
+                error!(
+                    event = EVENT_SERVER_CONFIG_DECRYPT_FAILED,
+                    component = LOG_COMPONENT_CONFIG,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    size = data.len(),
+                    error = %raw_decode_err,
+                    "persisted server config cannot be decoded or decrypted"
+                );
+                return Err(Error::other(ServerConfigDecryptError(raw_decode_err.to_string())));
+            };
+
+            decode_server_config_blob(&decrypted).map_err(|err| {
+                error!(
+                    event = EVENT_SERVER_CONFIG_DECODE_FAILED,
+                    component = LOG_COMPONENT_CONFIG,
+                    subsystem = LOG_SUBSYSTEM_CONFIG,
+                    size = decrypted.len(),
+                    encrypted_size = data.len(),
+                    error = %err,
+                    "decrypted persisted server config cannot be decoded, object is corrupt"
+                );
+                Error::other(ServerConfigCorruptError(err.to_string()))
+            })
+        }
+    }
+}
+
+/// Startup-only read of the server config with layered recovery:
+///
+/// 1. plain read (a missing config is created from defaults as usual);
+/// 2. on failure, heal the config object (reconstructs corrupted shards from
+///    erasure parity) and re-read once;
+/// 3. if the object is still unreadable or undecodable, fall back to the
+///    default config plus environment overrides (gated by
+///    [`ENV_CONFIG_RECOVER_ON_CORRUPTION`], enabled by default) instead of
+///    crash-looping the server.
+///
+/// Availability failures (lost read quorum, offline disks) are still returned
+/// to the caller so the startup retry loop can wait for disks to come back.
+pub(crate) async fn read_config_without_migrate_with_recovery<S>(api: Arc<S>) -> Result<Config>
+where
+    S: EcstoreObjectIO + StorageAdminApi + HealOperations<Error = Error, HealOptions = HealOpts>,
+{
+    let first_err = match read_config_without_migrate(api.clone()).await {
+        Ok(cfg) => return Ok(cfg),
+        Err(err) => err,
+    };
+
+    let config_file = get_config_file();
+    warn!(
+        event = EVENT_SERVER_CONFIG_READ_FAILED,
+        component = LOG_COMPONENT_CONFIG,
+        subsystem = LOG_SUBSYSTEM_CONFIG,
+        config_object = %config_file,
+        error = %first_err,
+        "server config read failed, attempting heal and re-read"
+    );
+
+    heal_server_config_object(api.clone(), &config_file).await;
+
+    let retry_err = match read_config_without_migrate(api.clone()).await {
+        Ok(cfg) => {
+            info!(
+                event = EVENT_SERVER_CONFIG_RECOVERED,
+                component = LOG_COMPONENT_CONFIG,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_object = %config_file,
+                "server config recovered after heal"
+            );
+            return Ok(cfg);
+        }
+        Err(err) => err,
+    };
+
+    fallback_server_config_after_corruption(retry_err, &config_file, config_corruption_recovery_enabled())
+}
+
+/// Best-effort deep heal of the server config object so corrupted shards are
+/// reconstructed from erasure parity. Failures are logged, never propagated:
+/// the caller decides how to proceed based on the follow-up read.
+async fn heal_server_config_object<S>(api: Arc<S>, config_file: &str)
+where
+    S: HealOperations<Error = Error, HealOptions = HealOpts>,
+{
+    let opts = HealOpts {
+        recursive: false,
+        dry_run: false,
+        remove: false,
+        recreate: false,
+        scan_mode: HealScanMode::Deep,
+        update_parity: false,
+        no_lock: false,
+        pool: None,
+        set: None,
+    };
+    match api.heal_object(RUSTFS_META_BUCKET, config_file, "", &opts).await {
+        Ok((_, None)) => {
+            info!(
+                event = EVENT_SERVER_CONFIG_HEAL_RESULT,
+                component = LOG_COMPONENT_CONFIG,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_object = %config_file,
+                result = "completed",
+                "server config heal completed"
+            );
+        }
+        Ok((_, Some(err))) => {
+            warn!(
+                event = EVENT_SERVER_CONFIG_HEAL_RESULT,
+                component = LOG_COMPONENT_CONFIG,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_object = %config_file,
+                result = "partial",
+                error = %err,
+                "server config heal reported an error"
+            );
+        }
+        Err(err) => {
+            warn!(
+                event = EVENT_SERVER_CONFIG_HEAL_RESULT,
+                component = LOG_COMPONENT_CONFIG,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_object = %config_file,
+                result = "failed",
+                error = %err,
+                "server config heal failed"
+            );
+        }
+    }
+}
+
+fn config_read_failure_is_retryable(err: &Error) -> bool {
+    is_server_config_decrypt_error(err)
+        || err.is_quorum_error()
+        || matches!(
+            err,
+            Error::DiskNotFound | Error::FaultyDisk | Error::FaultyRemoteDisk | Error::TooManyOpenFiles | Error::SlowDown
+        )
+}
+
+/// Last recovery layer: the config object survived a heal attempt and is
+/// still unreadable or undecodable, so the failure is deterministic. Boot
+/// with the default config (environment overrides are applied by the caller
+/// via `lookup_configs`) unless the operator disabled the fallback.
+///
+/// The corrupt object is intentionally left in place: nothing is written, so
+/// a later manual heal or inspection can still recover the old settings.
+/// Saving any config change (e.g. via the admin API) rewrites a clean object.
+fn fallback_server_config_after_corruption(err: Error, config_file: &str, recovery_enabled: bool) -> Result<Config> {
+    if config_read_failure_is_retryable(&err) {
+        return Err(err);
+    }
+
+    if !recovery_enabled {
+        error!(
+            event = EVENT_SERVER_CONFIG_FALLBACK,
+            component = LOG_COMPONENT_CONFIG,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            config_object = %config_file,
+            env = ENV_CONFIG_RECOVER_ON_CORRUPTION,
+            result = "disabled",
+            error = %err,
+            "server config is corrupt after heal and the default-config fallback is disabled, startup will fail; unset or enable RUSTFS_CONFIG_RECOVER_ON_CORRUPTION to boot with the default config"
+        );
+        return Err(err);
+    }
+
+    error!(
+        event = EVENT_SERVER_CONFIG_FALLBACK,
+        component = LOG_COMPONENT_CONFIG,
+        subsystem = LOG_SUBSYSTEM_CONFIG,
+        config_object = %config_file,
+        env = ENV_CONFIG_RECOVER_ON_CORRUPTION,
+        result = "default_config",
+        error = %err,
+        "server config is corrupt after heal, booting with the default config plus environment overrides; settings previously saved via the admin API are not applied until the config is saved again"
+    );
+    Ok(new_server_config())
+}
+
+pub async fn save_server_config<S>(api: Arc<S>, cfg: &Config) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
+{
     let config_file = get_config_file();
     let existing = match read_config(api.clone(), &config_file).await {
         Ok(v) => Some(v),
@@ -1191,7 +1578,7 @@ where
             match storageclass::lookup_config(&kvs, *count) {
                 Ok(res) => {
                     if i == 0 {
-                        set_global_storage_class(res);
+                        runtime_sources::set_storage_class_config(res);
                     }
                 }
                 Err(err) => {
@@ -1213,11 +1600,12 @@ mod tests {
     };
     use crate::config::{audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
-    use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
-    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
+    use crate::layout::endpoints::SetupType;
+    use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::runtime::sources as runtime_sources;
     use crate::set_disk::SetDisks;
-    use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, range::HTTPRangeSpec};
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_config::notify::{
@@ -1231,8 +1619,6 @@ mod tests {
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
-    use rustfs_storage_api::NamespaceLocking as _;
-    use rustfs_storage_api::{HTTPRangeSpec, StorageAdminApi};
     use serde_json::Value;
     use serial_test::serial;
     use std::collections::HashMap;
@@ -1316,7 +1702,7 @@ mod tests {
     impl SetupTypeGuard {
         async fn switch_to(next: SetupType) -> Self {
             let previous = current_setup_type().await;
-            update_erasure_type(next).await;
+            runtime_sources::set_setup_type(next).await;
             Self { previous }
         }
     }
@@ -1327,22 +1713,14 @@ mod tests {
             let handle = tokio::runtime::Handle::current();
             tokio::task::block_in_place(|| {
                 handle.block_on(async move {
-                    update_erasure_type(previous).await;
+                    runtime_sources::set_setup_type(previous).await;
                 });
             });
         }
     }
 
     async fn current_setup_type() -> SetupType {
-        if is_dist_erasure().await {
-            SetupType::DistErasure
-        } else if is_erasure_sd().await {
-            SetupType::ErasureSD
-        } else if is_erasure().await {
-            SetupType::Erasure
-        } else {
-            SetupType::Unknown
-        }
+        runtime_sources::current_setup_type().await
     }
 
     impl LockingConfigStorage {
@@ -1409,7 +1787,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl rustfs_storage_api::ObjectIO for LockingConfigStorage {
+    impl crate::storage_api_contracts::object::ObjectIO for LockingConfigStorage {
         type Error = Error;
         type RangeSpec = HTTPRangeSpec;
         type HeaderMap = HeaderMap;
@@ -1445,6 +1823,7 @@ mod tests {
                     _guard: guard,
                 }),
                 object_info: self.object_info(bucket, object),
+                buffered_body: None,
             })
         }
 
@@ -1460,7 +1839,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl rustfs_storage_api::NamespaceLocking for LockingConfigStorage {
+    impl crate::storage_api_contracts::namespace::NamespaceLocking for LockingConfigStorage {
         type Error = crate::error::Error;
         type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
 
@@ -1490,7 +1869,7 @@ mod tests {
 
         async fn disk_set_inventory(
             &self,
-            _selector: rustfs_storage_api::DiskSetSelector,
+            _selector: crate::storage_api_contracts::admin::DiskSetSelector,
         ) -> Result<Vec<Option<crate::disk::DiskStore>>> {
             panic!("unused in test")
         }
@@ -1506,6 +1885,30 @@ mod tests {
         let cfg = decode_server_config_blob(input.as_bytes()).expect("decode should succeed");
         let kvs = cfg.get_value("storage_class", "_").expect("storage_class should exist");
         assert!(kvs.0[0].hidden_if_empty);
+    }
+
+    #[test]
+    fn test_encrypted_server_config_requires_decrypt_before_decode() {
+        // Reproduces the MinIO drop-in migration gap for the server config: MinIO
+        // encrypts config.json at rest, so decode fails outright. The migration's
+        // decrypt callback must run first to recover it.
+        let plaintext = r#"{"storage_class":{"_":[{"key":"standard","value":"EC:2"}]}}"#.as_bytes();
+        let ciphertext = rustfs_crypto::encrypt_data(b"root-secret-key", plaintext).expect("encrypt config blob");
+
+        // Old behavior: decode cannot parse ciphertext -> Err -> migration skipped.
+        assert!(
+            decode_server_config_blob(&ciphertext).is_err(),
+            "ciphertext must not decode as a server config"
+        );
+
+        // With the decrypt callback recovering plaintext first, decode succeeds.
+        let decrypt_fn: crate::bucket::migration::LegacyBlobDecryptFn =
+            std::sync::Arc::new(|data: &[u8]| rustfs_crypto::decrypt_data(b"root-secret-key", data).ok());
+        let recovered = decrypt_fn(&ciphertext).expect("callback should decrypt the config blob");
+        assert_eq!(recovered, plaintext);
+        let cfg = decode_server_config_blob(&recovered).expect("decode should succeed on decrypted plaintext");
+        let kvs = cfg.get_value("storage_class", "_").expect("storage_class should exist");
+        assert_eq!(kvs.0[0].value, "EC:2");
     }
 
     #[test]
@@ -2493,5 +2896,353 @@ mod tests {
         let external_json = r#"{"version":"33","storageclass":{"standard":"EC:4","rrs":"EC:2"}}"#;
         let result = Config::unmarshal(external_json.as_bytes());
         assert!(result.is_err(), "Config::unmarshal should fail on external format, but got: {:?}", result);
+    }
+
+    // ── Corrupted server config recovery (issue #4156) ─────────────────
+
+    use super::{
+        ENV_CONFIG_RECOVER_ON_CORRUPTION, STORAGE_CLASS_SUB_SYS, ServerConfigCorruptError, config_read_failure_is_retryable,
+        decode_persisted_server_config, fallback_server_config_after_corruption, is_server_config_corrupt_error,
+        read_config_without_migrate_with_recovery, replace_server_config_decrypt_fn_for_test,
+    };
+    use rustfs_common::heal_channel::HealOpts;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Bytes mirroring issue #4156: a bitrot-corrupted `config.json` whose
+    /// shards decoded into garbage that is valid neither as the internal nor
+    /// the external config shape.
+    fn corrupt_config_blob() -> Vec<u8> {
+        let mut blob = br#"{"version":"33","credential""#.to_vec();
+        blob.extend_from_slice(&[0u8, 0xFF, 0x13, 0x37]);
+        blob
+    }
+
+    fn corrupt_config_error() -> Error {
+        decode_persisted_server_config(&corrupt_config_blob()).expect_err("corrupt blob must not decode")
+    }
+
+    #[test]
+    fn test_decode_persisted_server_config_marks_corruption() {
+        let err = corrupt_config_error();
+        assert!(is_server_config_corrupt_error(&err), "decode failures must be marked corrupt: {err:?}");
+        assert!(!config_read_failure_is_retryable(&err), "corruption is deterministic, not retryable");
+    }
+
+    #[test]
+    fn test_is_server_config_corrupt_error_ignores_other_errors() {
+        assert!(!is_server_config_corrupt_error(&Error::other("boom")));
+        assert!(!is_server_config_corrupt_error(&Error::ErasureReadQuorum));
+        assert!(!is_server_config_corrupt_error(&Error::ConfigNotFound));
+        assert!(is_server_config_corrupt_error(&Error::other(ServerConfigCorruptError("bad".to_string()))));
+    }
+
+    #[test]
+    fn test_fallback_returns_default_config_when_recovery_enabled() {
+        let cfg = fallback_server_config_after_corruption(corrupt_config_error(), "config/config.json", true)
+            .expect("recovery enabled must fall back to the default config");
+        assert!(
+            configs_semantically_equal(&cfg, &Config::new()),
+            "fallback config should be the default server config"
+        );
+    }
+
+    #[test]
+    fn test_fallback_propagates_error_when_recovery_disabled() {
+        let err = fallback_server_config_after_corruption(corrupt_config_error(), "config/config.json", false)
+            .expect_err("recovery disabled must propagate the corruption error");
+        assert!(is_server_config_corrupt_error(&err));
+    }
+
+    #[test]
+    fn test_fallback_propagates_retryable_availability_errors() {
+        for err in [Error::ErasureReadQuorum, Error::FaultyDisk, Error::DiskNotFound] {
+            let out = fallback_server_config_after_corruption(err, "config/config.json", true)
+                .expect_err("availability errors must stay retryable, not masked by defaults");
+            assert!(config_read_failure_is_retryable(&out));
+        }
+    }
+
+    /// What reads of the config object currently return.
+    enum RecoveryReadState {
+        Blob(Vec<u8>),
+        QuorumError,
+    }
+
+    /// Minimal storage stub for the startup recovery path: serves the config
+    /// object from memory and lets `heal_object` swap in repaired bytes.
+    struct RecoveryMockStore {
+        state: Mutex<RecoveryReadState>,
+        heal_replacement: Option<Vec<u8>>,
+        heal_calls: AtomicUsize,
+    }
+
+    impl RecoveryMockStore {
+        fn new(state: RecoveryReadState, heal_replacement: Option<Vec<u8>>) -> Self {
+            Self {
+                state: Mutex::new(state),
+                heal_replacement,
+                heal_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    struct ServerConfigDecryptHookGuard {
+        previous: Option<crate::bucket::migration::LegacyBlobDecryptFn>,
+    }
+
+    impl ServerConfigDecryptHookGuard {
+        fn replace(decrypt_fn: crate::bucket::migration::LegacyBlobDecryptFn) -> Self {
+            Self {
+                previous: replace_server_config_decrypt_fn_for_test(Some(decrypt_fn)),
+            }
+        }
+    }
+
+    impl Drop for ServerConfigDecryptHookGuard {
+        fn drop(&mut self) {
+            replace_server_config_decrypt_fn_for_test(self.previous.take());
+        }
+    }
+
+    impl Debug for RecoveryMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecoveryMockStore").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for RecoveryMockStore {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _range: Option<HTTPRangeSpec>,
+            _h: HeaderMap,
+            _opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            let data = match &*self.state.lock().expect("state lock poisoned") {
+                RecoveryReadState::Blob(data) => data.clone(),
+                RecoveryReadState::QuorumError => return Err(Error::ErasureReadQuorum),
+            };
+            let object_info = ObjectInfo {
+                size: data.len() as i64,
+                actual_size: data.len() as i64,
+                ..Default::default()
+            };
+            Ok(GetObjectReader {
+                stream: Box::new(Cursor::new(data)),
+                object_info,
+                buffered_body: None,
+            })
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageAdminApi for RecoveryMockStore {
+        type BackendInfo = rustfs_madmin::BackendInfo;
+        type StorageInfo = rustfs_madmin::StorageInfo;
+        type Disk = crate::disk::DiskStore;
+        type Error = Error;
+
+        async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+            panic!("unused in test")
+        }
+
+        async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+            panic!("unused in test")
+        }
+
+        async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+            panic!("unused in test")
+        }
+
+        async fn disk_set_inventory(
+            &self,
+            _selector: crate::storage_api_contracts::admin::DiskSetSelector,
+        ) -> Result<Vec<Option<crate::disk::DiskStore>>> {
+            panic!("unused in test")
+        }
+
+        fn set_drive_counts(&self) -> Vec<usize> {
+            vec![2]
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::heal::HealOperations for RecoveryMockStore {
+        type Error = Error;
+        type HealResultItem = ();
+        type HealOptions = HealOpts;
+
+        async fn heal_format(&self, _dry_run: bool) -> Result<((), Option<Error>)> {
+            panic!("unused in test")
+        }
+
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: &str,
+            _opts: &HealOpts,
+        ) -> Result<((), Option<Error>)> {
+            self.heal_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(repaired) = &self.heal_replacement {
+                *self.state.lock().expect("state lock poisoned") = RecoveryReadState::Blob(repaired.clone());
+            }
+            Ok(((), None))
+        }
+
+        async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
+            panic!("unused in test")
+        }
+
+        async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    fn encrypted_current_server_config_blob() -> Vec<u8> {
+        let mut cfg = Config::new();
+        let kvs = storage_class_kvs_mut(&mut cfg);
+        kvs.insert("standard".to_string(), "EC:4".to_string());
+        kvs.insert("rrs".to_string(), "EC:2".to_string());
+
+        let plain = encode_server_config_blob(&cfg, None).expect("encode current server config");
+        rustfs_crypto::encrypt_data(b"root-secret-key", &plain).expect("encrypt current server config")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_read_config_decrypts_current_server_config_blob() {
+        let store = Arc::new(RecoveryMockStore::new(
+            RecoveryReadState::Blob(encrypted_current_server_config_blob()),
+            None,
+        ));
+        let decrypt_fn: crate::bucket::migration::LegacyBlobDecryptFn =
+            Arc::new(|data: &[u8]| rustfs_crypto::decrypt_data(b"root-secret-key", data).ok());
+        let _decrypt_hook = ServerConfigDecryptHookGuard::replace(decrypt_fn);
+
+        let cfg = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect("encrypted current config should decrypt");
+
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 0, "decrypt should avoid corruption recovery");
+        let kvs = cfg
+            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("decrypted config should preserve storage_class");
+        assert_eq!(kvs.get("standard"), "EC:4");
+        assert_eq!(kvs.get("rrs"), "EC:2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_read_config_decrypt_failure_does_not_fallback_to_default() {
+        let store = Arc::new(RecoveryMockStore::new(
+            RecoveryReadState::Blob(encrypted_current_server_config_blob()),
+            None,
+        ));
+        let decrypt_fn: crate::bucket::migration::LegacyBlobDecryptFn = Arc::new(|_data: &[u8]| None);
+        let _decrypt_hook = ServerConfigDecryptHookGuard::replace(decrypt_fn);
+
+        let err = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect_err("decrypt failure must not fall back to the default config");
+
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal is still attempted before failing");
+        assert!(
+            !is_server_config_corrupt_error(&err),
+            "decrypt failure must not be treated as defaultable corruption"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_uses_healed_config_object() {
+        // Heal reconstructs a valid config from parity: no fallback needed.
+        let valid = br#"{"version":"33","storageclass":{"standard":"EC:4","rrs":"EC:2"}}"#.to_vec();
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(corrupt_config_blob()), Some(valid)));
+
+        let cfg = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect("healed config should be readable");
+
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should run exactly once");
+        let kvs = cfg
+            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("healed config should have storage_class");
+        assert_eq!(kvs.get("standard"), "EC:4", "healed settings must be preserved, not replaced by defaults");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_recovery_falls_back_to_default_config_when_blob_stays_corrupt() {
+        // Heal cannot repair the blob (all shards corrupt): boot with the
+        // default config instead of crash-looping (issue #4156).
+        // RUSTFS_CONFIG_RECOVER_ON_CORRUPTION is unset, so the default (on) applies.
+        // `#[serial]` keeps this off-by-default read from racing the sibling test
+        // that toggles ENV_CONFIG_RECOVER_ON_CORRUPTION via a process-wide env var.
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(corrupt_config_blob()), None));
+
+        let cfg = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect("unrecoverable corruption should fall back to the default config");
+
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should be attempted before falling back");
+        assert!(
+            configs_semantically_equal(&cfg, &Config::new()),
+            "fallback config should be the default server config"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_recovery_respects_disabled_corruption_fallback_env() {
+        temp_env::async_with_vars([(ENV_CONFIG_RECOVER_ON_CORRUPTION, Some("off"))], async {
+            let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(corrupt_config_blob()), None));
+
+            let err = read_config_without_migrate_with_recovery(store.clone())
+                .await
+                .expect_err("disabled fallback must propagate persistent config corruption");
+
+            assert!(is_server_config_corrupt_error(&err), "expected corrupt config error, got {err:?}");
+            assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should run before failing");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_recovery_propagates_persistent_quorum_errors() {
+        // Lost read quorum is an availability problem, not corruption: the
+        // startup retry loop must keep retrying instead of booting defaults.
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::QuorumError, None));
+
+        let err = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect_err("quorum errors must propagate to the startup retry loop");
+
+        assert!(err.is_quorum_error(), "expected quorum error, got {err:?}");
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should still be attempted");
     }
 }

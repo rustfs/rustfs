@@ -28,6 +28,7 @@ categories = ["web-programming", "development-tools", "filesystem"]
 
 [dependencies]
 rustfs-config = { workspace = true }
+rustfs-concurrency = { workspace = true }
 rustfs-ecstore = { workspace = true }
 rustfs-storage-api = { workspace = true }
 rustfs-common = { workspace = true }
@@ -40,10 +41,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 metrics = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

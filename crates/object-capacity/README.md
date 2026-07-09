@@ -99,7 +99,7 @@ This crate is intentionally not "timeout means hard failure":
 
 ### Symlink Handling
 
-- Symlinks are not followed by default: `RUSTFS_CAPACITY_FOLLOW_SYMLINKS=false`.
+- Symlinks are not followed by default: `RUSTFS_CAPACITY_FOLLOW_SYMLINKS=false`. When enabled, symlink targets are counted and cycles are broken by the walker's ancestor-loop detection.
 - If enabled, the scan applies circular-reference detection and a maximum follow depth.
 - The default maximum depth is `3`.
 
@@ -289,7 +289,6 @@ The configuration constants are defined in `crates/config/src/constants/capacity
 | `RUSTFS_CAPACITY_SAMPLE_RATE` | `200` | Overflow-file sampling interval |
 | `RUSTFS_CAPACITY_METRICS_INTERVAL` | `600s` | Runtime summary emission interval |
 | `RUSTFS_CAPACITY_FOLLOW_SYMLINKS` | `false` | Whether to follow symlinks |
-| `RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH` | `3` | Maximum symlink follow depth |
 | `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` | `true` | Whether to enable dynamic timeout scaling |
 | `RUSTFS_CAPACITY_MIN_TIMEOUT` | `2s` | Dynamic-timeout lower bound |
 | `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15s` | Dynamic-timeout upper bound |

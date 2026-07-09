@@ -24,8 +24,11 @@ use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::{extract_claims, extract_claims_allow_missing_exp};
-use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
-use rustfs_ecstore::notification_sys::get_global_notification_sys;
+use crate::{
+    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
+    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
+};
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE};
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
@@ -249,12 +252,9 @@ impl<T: Store> IamSys<T> {
             return Ok(());
         }
 
-        if let Some(notification_sys) = get_global_notification_sys() {
-            let resp = notification_sys.delete_policy(name).await;
-            for r in resp {
-                if let Some(err) = r.err {
-                    warn!("notify delete_policy failed: {}", err);
-                }
+        for r in notify_iam_delete_policy(name).await {
+            if let Some(err) = r.err {
+                warn!("notify delete_policy failed: {}", err);
             }
         }
 
@@ -293,11 +293,8 @@ impl<T: Store> IamSys<T> {
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
         let updated_at = self.store.set_policy(name, policy).await?;
 
-        if !self.has_watcher()
-            && let Some(notification_sys) = get_global_notification_sys()
-        {
-            let resp = notification_sys.load_policy(name).await;
-            for r in resp {
+        if !self.has_watcher() {
+            for r in notify_iam_load_policy(name).await {
                 if let Some(err) = r.err {
                     warn!("notify load_policy failed: {}", err);
                 }
@@ -322,14 +319,31 @@ impl<T: Store> IamSys<T> {
     pub async fn delete_user(&self, name: &str, notify: bool) -> Result<()> {
         self.store.delete_user(name, UserType::Reg).await?;
 
-        if notify
-            && !self.has_watcher()
-            && let Some(notification_sys) = get_global_notification_sys()
-        {
-            let resp = notification_sys.delete_user(name).await;
-            for r in resp {
+        if notify && !self.has_watcher() {
+            for r in notify_iam_delete_user(name).await {
                 if let Some(err) = r.err {
                     warn!("notify delete_user failed: {}", err);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete a single temporary/STS account by its access key.
+    ///
+    /// Unlike [`Self::delete_user`], which operates on regular (`UserType::Reg`)
+    /// identities, this removes an STS credential (`UserType::Sts`) from both the
+    /// in-memory cache and the backing store, immediately invalidating the
+    /// associated session token. This is the primitive used by the admin
+    /// `revoke-tokens` endpoint to revoke STS credentials for a parent user.
+    pub async fn delete_temp_account(&self, access_key: &str, notify: bool) -> Result<()> {
+        self.store.delete_user(access_key, UserType::Sts).await?;
+
+        if notify && !self.has_watcher() {
+            for r in notify_iam_delete_user(access_key).await {
+                if let Some(err) = r.err {
+                    warn!("notify delete_temp_account failed: {}", err);
                 }
             }
         }
@@ -346,12 +360,9 @@ impl<T: Store> IamSys<T> {
         // This is critical for cluster recovery: login should not wait for dead peers
         let name = name.to_string();
         tokio::spawn(async move {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_user(&name, is_temp).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_user failed (non-blocking): {}", err);
-                    }
+            for r in notify_iam_load_user(&name, is_temp).await {
+                if let Some(err) = r.err {
+                    warn!("notify load_user failed (non-blocking): {}", err);
                 }
             }
         });
@@ -365,12 +376,9 @@ impl<T: Store> IamSys<T> {
         // Fire-and-forget notification to peers - don't block service account operations
         let name = name.to_string();
         tokio::spawn(async move {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_service_account(&name).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_service_account failed (non-blocking): {}", err);
-                    }
+            for r in notify_iam_load_service_account(&name).await {
+                if let Some(err) = r.err {
+                    warn!("notify load_service_account failed (non-blocking): {}", err);
                 }
             }
         });
@@ -687,12 +695,8 @@ impl<T: Store> IamSys<T> {
 
         self.store.delete_user(access_key, UserType::Svc).await?;
 
-        if notify
-            && !self.has_watcher()
-            && let Some(notification_sys) = get_global_notification_sys()
-        {
-            let resp = notification_sys.delete_service_account(access_key).await;
-            for r in resp {
+        if notify && !self.has_watcher() {
+            for r in notify_iam_delete_service_account(access_key).await {
                 if let Some(err) = r.err {
                     warn!("notify delete_service_account failed: {}", err);
                 }
@@ -710,12 +714,9 @@ impl<T: Store> IamSys<T> {
         // Fire-and-forget notification to peers - don't block group operations
         let group = group.to_string();
         tokio::spawn(async move {
-            if let Some(notification_sys) = get_global_notification_sys() {
-                let resp = notification_sys.load_group(&group).await;
-                for r in resp {
-                    if let Some(err) = r.err {
-                        warn!("notify load_group failed (non-blocking): {}", err);
-                    }
+            for r in notify_iam_load_group(&group).await {
+                if let Some(err) = r.err {
+                    warn!("notify load_group failed (non-blocking): {}", err);
                 }
             }
         });
@@ -768,7 +769,7 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn check_key(&self, access_key: &str) -> Result<(Option<UserIdentity>, bool)> {
-        if let Some(sys_cred) = get_global_action_cred()
+        if let Some(sys_cred) = crate::root_credentials::credentials()
             && sys_cred.access_key == access_key
         {
             return Ok((Some(UserIdentity::new(sys_cred)), true));
@@ -842,11 +843,8 @@ impl<T: Store> IamSys<T> {
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
         let updated_at = self.store.policy_db_set(name, user_type, is_group, policy).await?;
 
-        if !self.has_watcher()
-            && let Some(notification_sys) = get_global_notification_sys()
-        {
-            let resp = notification_sys.load_policy_mapping(name, user_type.to_u64(), is_group).await;
-            for r in resp {
+        if !self.has_watcher() {
+            for r in notify_iam_load_policy_mapping(name, user_type.to_u64(), is_group).await {
                 if let Some(err) = r.err {
                     warn!("notify load_policy failed: {}", err);
                 }
@@ -1033,7 +1031,7 @@ impl<T: Store> IamSys<T> {
     }
 
     pub(crate) async fn prepare_sts_auth(&self, args: &Args<'_>, parent_user: &str) -> PreparedIamAuth {
-        let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
+        let is_owner = crate::is_root_access_key(parent_user);
         let role_arn = args.get_role_arn();
 
         let (effective_groups, groups_source, policies) = if is_owner {
@@ -1185,7 +1183,7 @@ impl<T: Store> IamSys<T> {
             && matches!(mode, PreparedServicePolicyMode::SessionBound)
             && matches!(session_policy, PreparedSessionPolicy::Policy(_));
 
-        let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
+        let is_owner = crate::is_root_access_key(parent_user);
         let role_arn = args.get_role_arn();
 
         let svc_policies = if is_owner || bypass_parent_policy {
@@ -1375,13 +1373,16 @@ mod tests {
     use crate::error::Error;
     use crate::manager::get_default_policyes;
     use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
-    use rustfs_credentials::{Credentials, get_global_action_cred, init_global_action_credentials};
+    use rustfs_credentials::{Credentials, init_global_action_credentials};
     use rustfs_policy::auth::{UserIdentity, get_new_credentials_with_metadata};
     use rustfs_policy::policy::Args;
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
     use rustfs_policy::policy::policy_uses_existing_object_tag_conditions;
     use serde_json::Value;
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{Arc, Mutex},
+    };
     use time::OffsetDateTime;
 
     #[test]
@@ -1427,6 +1428,16 @@ mod tests {
     struct StsTestMockStore {
         /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
         empty_policies: bool,
+        saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
+    }
+
+    impl StsTestMockStore {
+        fn new(empty_policies: bool) -> Self {
+            Self {
+                empty_policies,
+                saved_sts_users: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1449,11 +1460,15 @@ mod tests {
 
         async fn save_user_identity(
             &self,
-            _name: &str,
+            name: &str,
             _user_type: UserType,
-            _item: UserIdentity,
+            item: UserIdentity,
             _ttl: Option<usize>,
         ) -> Result<()> {
+            self.saved_sts_users
+                .lock()
+                .expect("saved_sts_users mutex poisoned")
+                .insert(name.to_string(), item);
             Ok(())
         }
 
@@ -1461,8 +1476,13 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn load_user_identity(&self, _name: &str, _user_type: UserType) -> Result<UserIdentity> {
-            Err(Error::InvalidArgument)
+        async fn load_user_identity(&self, name: &str, _user_type: UserType) -> Result<UserIdentity> {
+            self.saved_sts_users
+                .lock()
+                .expect("saved_sts_users mutex poisoned")
+                .get(name)
+                .cloned()
+                .ok_or_else(|| Error::NoSuchUser(name.to_string()))
         }
 
         async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
@@ -1661,7 +1681,7 @@ mod tests {
     }
 
     fn ensure_test_global_credentials() {
-        if get_global_action_cred().is_none() {
+        if crate::root_credentials::credentials().is_none() {
             let _ = init_global_action_credentials(Some("TESTROOTACCESSKEY".to_string()), Some("TESTROOTSECRET123".to_string()));
         }
     }
@@ -1670,7 +1690,7 @@ mod tests {
     async fn test_new_service_account_without_expiration_omits_exp_claim() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1693,7 +1713,7 @@ mod tests {
     async fn test_update_service_account_updates_exp_claim() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1747,7 +1767,7 @@ mod tests {
     async fn test_update_service_account_adds_exp_claim_to_non_expiring_account() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1789,7 +1809,7 @@ mod tests {
     async fn test_site_replicator_update_requires_explicit_internal_allowance() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1855,7 +1875,7 @@ mod tests {
     async fn test_created_access_token_authorizes_with_parent_policy() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -1936,14 +1956,13 @@ mod tests {
     async fn test_created_sts_credentials_authorize_with_session_token_claims() {
         ensure_test_global_credentials();
 
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
-        let token_secret = get_global_action_cred()
-            .expect("global action credentials should be initialized")
-            .secret_key;
+        let token_secret = crate::root_credentials::token_signing_key()
+            .unwrap_or_else(|| unreachable!("global action credentials should be initialized"));
         let mut claims = HashMap::new();
         claims.insert("parent".to_string(), Value::String(parent_user.to_string()));
         claims.insert(
@@ -2040,7 +2059,7 @@ mod tests {
     /// would be denied.
     #[tokio::test]
     async fn test_sts_groups_fallback_temp_creds_receive_parent_group_policies() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2069,7 +2088,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_resolves_custom_canned_policy() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2113,7 +2132,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_ignores_unsafe_and_missing_policy_names() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2160,7 +2179,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_custom_canned_policy_does_not_grant_other_actions() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2204,7 +2223,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_builtin_policy_remains_compatible() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2234,7 +2253,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_claim_policy_missing_policy_denies() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2266,7 +2285,7 @@ mod tests {
     /// so session policy Deny cannot be bypassed (see PR #2250 review).
     #[tokio::test]
     async fn test_sts_deny_only_session_policy_deny_blocks_when_iam_policies_empty() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2306,7 +2325,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_deny_only_session_policy_allow_when_no_deny_on_action() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2350,7 +2369,7 @@ mod tests {
     /// may miss users on follower nodes.
     #[tokio::test]
     async fn test_load_user_notification_populates_user_and_policy_caches() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2371,7 +2390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_notification_populates_new_membership_entry() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2393,7 +2412,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sts_policy_mapping_notification_updates_sts_policy_cache() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2412,7 +2431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_user_notification_cleans_related_cache_state() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2478,7 +2497,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_key_propagates_cache_miss_load_failure() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2489,7 +2508,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_auth_eval_matches_prepare_sts_auth_for_parent_policy_fallback() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2517,7 +2536,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_auth_detects_existing_object_tag_in_session_policy() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
         let sts_access_key = "sts-session-tag-test-user";
@@ -2634,7 +2653,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_auth_detects_existing_object_tag_in_encoded_session_policy() {
-        let store = StsTestMockStore { empty_policies: true };
+        let store = StsTestMockStore::new(true);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
         let sts_access_key = "sts-session-tag-encoded-test-user";
@@ -2684,7 +2703,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_auth_service_account_inherited_ignores_session_policy_tag_hint() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2745,7 +2764,7 @@ mod tests {
     /// must still be returned.
     #[tokio::test]
     async fn test_policy_db_get_skips_nonexistent_groups() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
@@ -2766,7 +2785,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_info_policy_returns_policy_as_json_object() {
-        let store = StsTestMockStore { empty_policies: false };
+        let store = StsTestMockStore::new(false);
         let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 

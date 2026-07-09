@@ -39,7 +39,6 @@ pub mod bulk;
 pub mod container;
 pub mod cors;
 pub mod dlo;
-pub mod encryption;
 pub mod errors;
 pub mod expiration;
 pub mod expiration_worker;
@@ -51,7 +50,7 @@ pub mod ratelimit;
 pub mod router;
 pub mod slo;
 pub mod staticweb;
-pub mod storage_compat;
+mod storage_api;
 pub mod symlink;
 pub mod sync;
 pub mod tempurl;
@@ -61,5 +60,9 @@ pub mod versioning;
 pub use errors::{SwiftError, SwiftResult};
 pub use router::{SwiftRoute, SwiftRouter};
 // Note: Container, Object, and SwiftMetadata types used by Swift implementation
+pub use storage_api::public_api::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
+pub(crate) use storage_api::public_api::{
+    get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata,
+};
 #[allow(unused_imports)]
 pub use types::{Container, Object, SwiftMetadata};

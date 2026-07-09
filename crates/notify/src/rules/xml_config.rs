@@ -70,13 +70,18 @@ impl FilterRule {
             return Err(ParseConfigError::InvalidFilterName(self.name.clone()));
         }
         // ValidateFilterRuleValue from Go:
-        // no "." or ".." path segments, <= 1024 chars, valid UTF-8, no '\'.
+        // no "." or ".." path segments, <= 1024 characters, no '\'.
         for segment in self.value.split('/') {
             if segment == "." || segment == ".." {
                 return Err(ParseConfigError::InvalidFilterValue(self.value.clone()));
             }
         }
-        if self.value.len() > 1024 || self.value.contains('\\') || std::str::from_utf8(self.value.as_bytes()).is_err() {
+        // The limit is 1024 *characters* (runes), matching S3/Go semantics. Using the
+        // byte length (`str::len`) would wrongly reject valid keys whose multi-byte
+        // UTF-8 encoding exceeds 1024 bytes while staying under 1024 characters
+        // (backlog#984). `self.value` is a `String`, so it is already valid UTF-8 —
+        // no separate UTF-8 check is needed.
+        if self.value.chars().count() > 1024 || self.value.contains('\\') {
             return Err(ParseConfigError::InvalidFilterValue(self.value.clone()));
         }
         Ok(())
@@ -372,5 +377,45 @@ impl NotificationConfiguration {
         }
         // Note: If LambdaConfigDetail and TopicConfigDetail contain information such as regions in the future,
         // You may also need to set the default value here. But according to the current definition, they only contain ARN strings.
+    }
+}
+
+#[cfg(test)]
+mod filter_rule_length_tests {
+    use super::{FilterRule, ParseConfigError};
+
+    fn prefix(value: String) -> FilterRule {
+        FilterRule {
+            name: "prefix".to_string(),
+            value,
+        }
+    }
+
+    #[test]
+    fn length_limit_counts_characters_not_bytes() {
+        // 1024 multi-byte characters: 3072 bytes but exactly 1024 chars — must pass.
+        // The old byte-length check (`str::len`) would have rejected this valid key
+        // (backlog#984).
+        let multibyte = "中".repeat(1024);
+        assert_eq!(multibyte.chars().count(), 1024);
+        assert!(multibyte.len() > 1024, "test setup: byte length must exceed the char limit");
+        prefix(multibyte).validate().expect("1024-character value must be accepted");
+
+        // 1025 characters must be rejected.
+        let too_long = "a".repeat(1025);
+        assert!(matches!(prefix(too_long).validate(), Err(ParseConfigError::InvalidFilterValue(_))));
+
+        // Exactly 1024 ASCII characters must pass.
+        prefix("a".repeat(1024))
+            .validate()
+            .expect("1024 ASCII chars must be accepted");
+    }
+
+    #[test]
+    fn backslash_is_still_rejected() {
+        assert!(matches!(
+            prefix("bad\\path".to_string()).validate(),
+            Err(ParseConfigError::InvalidFilterValue(_))
+        ));
     }
 }

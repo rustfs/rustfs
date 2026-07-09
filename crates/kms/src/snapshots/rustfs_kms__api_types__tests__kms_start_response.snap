@@ -1,0 +1,9 @@
+---
+source: crates/kms/src/api_types.rs
+expression: "serde_json::to_value(StartKmsResponse\n{\n    success: true, message: \"kms started\".to_string(), status:\n    KmsServiceStatus::Running,\n}).expect(\"start response should serialize\")"
+---
+{
+  "message": "kms started",
+  "status": "Running",
+  "success": true
+}

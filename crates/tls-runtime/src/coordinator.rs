@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{ReloadDetectMode, TlsReloadOptions};
+use crate::config::TlsReloadOptions;
 use crate::error::TlsRuntimeError;
 use crate::material::TlsMaterialSnapshot;
 use crate::metrics::{
@@ -150,15 +150,11 @@ impl TlsReloadCoordinator {
             return None;
         }
 
-        if !matches!(self.options.detect_mode, ReloadDetectMode::Poll | ReloadDetectMode::Hybrid) {
-            debug!(source = %self.source.base_dir.display(), "TLS poll loop skipped for non-poll detect mode");
-            return None;
-        }
-
         let interval_duration = self.options.interval;
         info!(
             source = %self.source.base_dir.display(),
             interval_secs = interval_duration.as_secs(),
+            detect_mode = ?self.options.detect_mode,
             "TLS poll reload loop enabled"
         );
 
@@ -189,6 +185,7 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ReloadDetectMode;
     use crate::source::TlsSource;
     use std::sync::Arc;
 
@@ -222,5 +219,25 @@ mod tests {
         // Fingerprint has not changed → should skip and return Ok(None).
         assert!(result.is_ok(), "reload_once should succeed: {:?}", result.err());
         assert!(result.unwrap().is_none(), "should skip when fingerprint unchanged");
+    }
+
+    #[tokio::test]
+    async fn spawn_poll_loop_starts_for_watch_mode_until_native_watcher_exists() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = TlsSource::from_directory(temp.path().to_path_buf());
+        let options = TlsReloadOptions {
+            detect_mode: ReloadDetectMode::Watch,
+            ..Default::default()
+        };
+        let coordinator = Arc::new(TlsReloadCoordinator::new(source.clone(), options));
+        let initial_snapshot = coordinator.load_initial_snapshot().await.expect("initial load");
+        let initial = coordinator.publish_initial_state(initial_snapshot).await;
+        let runtime_state = Arc::new(TlsReloadRuntimeState::new(initial));
+        let consumer = Arc::new(NopConsumer);
+
+        let handle = coordinator.spawn_poll_loop(runtime_state, consumer);
+
+        assert!(handle.is_some(), "watch mode should fall back to polling");
+        handle.expect("poll loop should start").abort();
     }
 }

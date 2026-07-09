@@ -1,7 +1,9 @@
+use super::storage_api::select_object::contract::object::ObjectOperations as _;
+use super::storage_api::select_object::options::get_opts;
+use super::storage_api::select_object::request_context::spawn_traced;
+use super::storage_api::select_object::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
+use crate::app::runtime_sources::current_s3select_db;
 use crate::error::ApiError;
-use crate::storage::options::get_opts;
-use crate::storage::request_context::spawn_traced;
-use crate::storage::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 use bytes::Bytes;
 use datafusion::arrow::{
     csv::{QuoteStyle, WriterBuilder as CsvWriterBuilder, writer::Terminator},
@@ -15,9 +17,12 @@ use rustfs_s3select_api::{
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
-use rustfs_s3select_query::get_global_db;
-use rustfs_storage_api::ObjectOperations as _;
-use s3s::dto::*;
+use s3s::dto::{
+    CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
+    JSONOutput, JSONType, OutputSerialization, Progress, ProgressEvent, QuoteFields, RecordsEvent, SelectObjectContentEvent,
+    SelectObjectContentEventStream, SelectObjectContentInput, SelectObjectContentOutput, SelectObjectContentRequest, Stats,
+    StatsEvent,
+};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -55,7 +60,9 @@ pub async fn execute_select_object_content(
     validate_scan_range_for_object_size(&input.request, metadata.size)?;
 
     let input = Arc::new(input);
-    let db = get_global_db((*input).clone(), false).await.map_err(map_query_error_to_s3)?;
+    let db = current_s3select_db((*input).clone(), false)
+        .await
+        .map_err(map_query_error_to_s3)?;
     let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
     let output = db
         .execute(&query)
@@ -543,6 +550,7 @@ mod tests {
     use super::*;
     use datafusion::sql::sqlparser::parser::ParserError;
     use http::HeaderMap;
+    use s3s::dto::{CSVInput, ParquetInput, ScanRange};
 
     fn base_input() -> SelectObjectContentInput {
         SelectObjectContentInput {

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::plugin::{
     BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetRequestValidator,
     boxed_target,
@@ -36,8 +37,6 @@ use rustfs_config::{
         AUDIT_POSTGRES_SUB_SYS, AUDIT_PULSAR_SUB_SYS, AUDIT_REDIS_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS,
     },
 };
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 
 use crate::config::{
     build_amqp_args, build_kafka_args, build_mqtt_args, build_mysql_args, build_nats_args, build_postgres_args,
@@ -57,7 +56,7 @@ fn build_descriptor<E, Create, Validate>(
     create_target: Create,
 ) -> BuiltinTargetDescriptor<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
     Create: Fn(String, &KVS) -> Result<BoxedTarget<E>, TargetError> + Send + Sync + 'static,
     Validate: Fn(&KVS) -> Result<(), TargetError> + Send + Sync + 'static,
 {
@@ -145,7 +144,7 @@ pub fn builtin_audit_target_admin_descriptors() -> Vec<BuiltinTargetAdminDescrip
 
 pub fn builtin_audit_target_descriptors<E>() -> Vec<BuiltinTargetDescriptor<E>>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     vec![
         build_descriptor(
@@ -317,7 +316,7 @@ pub fn builtin_notify_target_admin_descriptors() -> Vec<BuiltinTargetAdminDescri
 
 pub fn builtin_notify_target_descriptors<E>() -> Vec<BuiltinTargetDescriptor<E>>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     vec![
         build_descriptor(

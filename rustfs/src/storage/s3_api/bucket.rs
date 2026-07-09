@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
-use percent_encoding::percent_decode_str;
-use rustfs_storage_api::{
-    BucketInfo, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
+use crate::storage::storage_api::s3_api_consumer::bucket::contract::{
+    bucket::BucketInfo,
+    list::{ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info},
 };
+use crate::storage::storage_api::s3_api_consumer::bucket::to_s3s_etag;
+use percent_encoding::percent_decode_str;
 use s3s::dto::{
     Bucket, CommonPrefix, DeleteMarkerEntry, EncodingType, ListBucketsOutput, ListObjectVersionsOutput, ListObjectsOutput,
     ListObjectsV2Output, Object, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, Timestamp,
@@ -26,9 +27,11 @@ use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
 use urlencoding::encode;
 
-use crate::storage::StorageObjectInfo as ObjectInfo;
+use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
 
 const S3_MAX_KEYS: i32 = 1000;
+const LIST_CACHE_MARKER_TAG_PREFIX: &str = "[rustfs_cache:";
+const LIST_CACHE_MARKER_TAG_VERSIONS: &[&str] = &["v1", "v2"];
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
@@ -349,6 +352,13 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
         return None;
     }
 
+    if let Some(marker) = decoded_next_continuation_marker(v2) {
+        return Some(encode_list_output_value(
+            public_list_marker(&marker).to_owned(),
+            v2.encoding_type.as_ref(),
+        ));
+    }
+
     let last_key = v2
         .contents
         .as_ref()
@@ -387,6 +397,48 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
     }
 }
 
+fn public_list_marker(marker: &str) -> &str {
+    let Some(start_idx) = marker.rfind(LIST_CACHE_MARKER_TAG_PREFIX) else {
+        return marker;
+    };
+    let Some(tag_body) = marker[start_idx + 1..].strip_suffix(']') else {
+        return marker;
+    };
+
+    if is_list_cache_marker_tag(tag_body) {
+        &marker[..start_idx]
+    } else {
+        marker
+    }
+}
+
+fn is_list_cache_marker_tag(tag_body: &str) -> bool {
+    let mut has_supported_version = false;
+    let mut has_continuation_field = false;
+
+    for tag in tag_body.split(',') {
+        let Some((key, value)) = tag.split_once(':') else {
+            continue;
+        };
+
+        match key {
+            "rustfs_cache" => has_supported_version = LIST_CACHE_MARKER_TAG_VERSIONS.contains(&value),
+            "id" if !value.is_empty() => has_continuation_field = true,
+            "return" => has_continuation_field = true,
+            "p" | "s" if value.parse::<usize>().is_err() => return false,
+            _ => {}
+        }
+    }
+
+    has_supported_version && has_continuation_field
+}
+
+fn decoded_next_continuation_marker(v2: &ListObjectsV2Output) -> Option<String> {
+    let token = v2.next_continuation_token.as_ref()?;
+    let bytes = base64_simd::STANDARD.decode_to_vec(token.as_bytes()).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -394,9 +446,9 @@ mod tests {
         build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
         parse_list_object_versions_params, parse_list_objects_v2_params,
     };
-    use crate::storage::StorageObjectInfo as ObjectInfo;
     use crate::storage::s3_api::common::rustfs_owner;
-    use rustfs_storage_api::BucketInfo;
+    use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
+    use crate::storage::storage_api::s3_api_consumer::bucket::contract::bucket::BucketInfo;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
     use time::OffsetDateTime;
@@ -473,6 +525,74 @@ mod tests {
 
         let output = build_list_objects_output(v2, None);
         assert_eq!(output.next_marker, Some("zebra/".to_string()));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_removes_internal_continuation_marker() {
+        let marker = "key-998[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            contents: Some(vec![Object {
+                key: Some("key-998".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let output = build_list_objects_output(v2, None);
+        assert_eq!(output.next_marker.as_deref(), Some("key-998"));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_strips_internal_marker_when_url_encoded() {
+        let marker = "dir a/key[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            contents: Some(vec![Object {
+                key: Some("dir%20a/key".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let output = build_list_objects_output(v2, None);
+        assert_eq!(output.next_marker.as_deref(), Some("dir%20a/key"));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_uses_visible_common_prefix_with_internal_token() {
+        let marker = "asdf[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            common_prefixes: Some(vec![CommonPrefix {
+                prefix: Some("asdf".to_string()),
+            }]),
+            ..Default::default()
+        };
+
+        let output = build_list_objects_output(v2, None);
+        assert_eq!(output.next_marker.as_deref(), Some("asdf"));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_preserves_cache_like_key_suffix() {
+        let marker = "key[rustfs_cache:v2]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            contents: Some(vec![Object {
+                key: Some(marker.to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let output = build_list_objects_output(v2, None);
+        assert_eq!(output.next_marker.as_deref(), Some(marker));
     }
 
     #[test]

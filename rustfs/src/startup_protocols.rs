@@ -31,14 +31,14 @@ type ProtocolInitResult = std::result::Result<Option<ShutdownHandle>, Box<dyn st
 
 /// Shutdown channels for every protocol server. None means the protocol was
 /// disabled at startup or not compiled in.
-pub struct ProtocolShutdownSenders {
-    pub ftp: Option<ShutdownHandle>,
-    pub ftps: Option<ShutdownHandle>,
-    pub webdav: Option<ShutdownHandle>,
-    pub sftp: Option<ShutdownHandle>,
+pub(crate) struct ProtocolShutdownSenders {
+    pub(crate) ftp: Option<ShutdownHandle>,
+    pub(crate) ftps: Option<ShutdownHandle>,
+    pub(crate) webdav: Option<ShutdownHandle>,
+    pub(crate) sftp: Option<ShutdownHandle>,
 }
 
-pub async fn init_protocol_shutdown_senders() -> Result<ProtocolShutdownSenders> {
+pub(crate) async fn init_protocol_shutdown_senders() -> Result<ProtocolShutdownSenders> {
     Ok(ProtocolShutdownSenders {
         ftp: init_ftp_protocol().await?,
         ftps: init_ftps_protocol().await?,

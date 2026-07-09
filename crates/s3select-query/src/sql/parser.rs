@@ -20,10 +20,9 @@ use datafusion::sql::sqlparser::{
     tokenizer::{Token, Tokenizer},
 };
 use rustfs_s3select_api::{
-    ParserSnafu,
+    QueryError,
     query::{ast::ExtStatement, parser::Parser as RustFsParser},
 };
-use snafu::ResultExt;
 
 use super::dialect::RustFsDialect;
 
@@ -41,7 +40,7 @@ pub struct DefaultParser {}
 
 impl RustFsParser for DefaultParser {
     fn parse(&self, sql: &str) -> rustfs_s3select_api::QueryResult<VecDeque<ExtStatement>> {
-        ExtParser::parse_sql(sql).context(ParserSnafu)
+        ExtParser::parse_sql(sql).map_err(QueryError::from)
     }
 }
 

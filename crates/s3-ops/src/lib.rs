@@ -337,7 +337,7 @@ pub fn put_event_name_for_post_object(is_post_object: bool) -> EventName {
 /// that should omit size/etag metadata.
 #[inline]
 pub fn is_object_removed_event(event_name: EventName) -> bool {
-    matches!(event_name, EventName::ObjectRemovedDelete | EventName::ObjectRemovedDeleteMarkerCreated)
+    event_name.is_removed()
 }
 
 /// Returns the event mask that matches both PUT and POST object-created events.
@@ -416,9 +416,21 @@ mod tests {
 
     #[test]
     fn test_is_object_removed_event() {
+        // Every ObjectRemoved* variant must be recognized as a removal event.
         assert!(is_object_removed_event(EventName::ObjectRemovedDelete));
         assert!(is_object_removed_event(EventName::ObjectRemovedDeleteMarkerCreated));
+        assert!(is_object_removed_event(EventName::ObjectRemovedDeleteAllVersions));
+        assert!(is_object_removed_event(EventName::ObjectRemovedNoOP));
+        assert!(is_object_removed_event(EventName::ObjectRemovedAbortMultipartUpload));
+        assert!(is_object_removed_event(EventName::ObjectRemovedDeleteObjects));
+
+        // Non-removal events must be rejected.
         assert!(!is_object_removed_event(EventName::ObjectCreatedPut));
+        assert!(!is_object_removed_event(EventName::ObjectCreatedPost));
+        assert!(!is_object_removed_event(EventName::ObjectTaggingPut));
+        assert!(!is_object_removed_event(EventName::ObjectTaggingDelete));
+        assert!(!is_object_removed_event(EventName::ObjectAclPut));
+        assert!(!is_object_removed_event(EventName::ObjectAccessedGet));
     }
 
     #[test]

@@ -35,7 +35,7 @@ chacha20poly1305 = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true }
 base64-simd = { workspace = true }
 pbkdf2 = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
+rand = { workspace = true }
 rsa = { workspace = true, features = ["sha2"] }
 serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true, optional = true }
@@ -55,7 +55,6 @@ crypto = [
     "dep:argon2",
     "dep:chacha20poly1305",
     "dep:pbkdf2",
-    "dep:rand",
     "dep:sha2",
 ]
 

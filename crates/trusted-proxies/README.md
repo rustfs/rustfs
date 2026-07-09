@@ -32,7 +32,7 @@ The module is configured primarily through environment variables:
 | `RUSTFS_TRUSTED_PROXY_ENABLED`                | `true`              | Enable the trusted proxy middleware                     |
 | `RUSTFS_TRUSTED_PROXY_IMPLEMENTATION`         | `simple`            | Select `simple` or `legacy` implementation              |
 | `RUSTFS_TRUSTED_PROXY_VALIDATION_MODE`        | `hop_by_hop`        | Validation strategy (`strict`, `lenient`, `hop_by_hop`) |
-| `RUSTFS_TRUSTED_PROXY_NETWORKS`               | `127.0.0.1,::1,...` | Comma-separated list of trusted CIDR ranges             |
+| `RUSTFS_TRUSTED_PROXY_NETWORKS`               | `127.0.0.1,::1`     | Comma-separated list of trusted CIDR ranges (loopback-only by default) |
 | `RUSTFS_TRUSTED_PROXY_MAX_HOPS`               | `10`                | Maximum allowed proxy hops                              |
 | `RUSTFS_TRUSTED_PROXY_CACHE_CAPACITY`         | `10000`             | Max entries in the validation cache                     |
 | `RUSTFS_TRUSTED_PROXY_METRICS_ENABLED`        | `true`              | Enable Prometheus metrics collection                    |

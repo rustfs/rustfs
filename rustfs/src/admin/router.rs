@@ -12,36 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::console::{is_console_path, make_console_server};
-use crate::admin::handlers::oidc::is_oidc_path;
-use crate::admin::storage_compat::ecstore::bucket::bandwidth::monitor::BandwidthDetails;
-use crate::admin::storage_compat::ecstore::bucket::bucket_target_sys::{
+use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
+use super::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
+use super::storage_api::bucket::metadata_sys;
+use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
+use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
+use super::storage_api::bucket::target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
 };
-use crate::admin::storage_compat::ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
-use crate::admin::storage_compat::ecstore::bucket::metadata_sys;
-use crate::admin::storage_compat::ecstore::bucket::replication::{
-    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ReplicationConfigurationExt, ResyncOpts,
-    get_global_replication_pool,
+use super::storage_api::bucket::versioning_sys::BucketVersioningSys;
+use super::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use super::storage_api::config::read_admin_config_without_migrate;
+use super::storage_api::error::StorageError;
+use super::storage_api::runtime::PeerRestClient;
+use crate::admin::console::{is_console_path, make_console_server};
+use crate::admin::handlers::oidc::is_oidc_path;
+use crate::admin::runtime_sources::{
+    current_boot_time, current_bucket_monitor_handle, current_deployment_id, current_notification_system,
+    current_object_store_handle, current_region, current_replication_pool_handle, current_replication_stats_handle,
+    current_server_config, default_object_usecase,
 };
-use crate::admin::storage_compat::ecstore::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
-use crate::admin::storage_compat::ecstore::bucket::versioning::VersioningApi;
-use crate::admin::storage_compat::ecstore::bucket::versioning_sys::BucketVersioningSys;
-use crate::admin::storage_compat::ecstore::config::com::read_config_without_migrate;
-use crate::admin::storage_compat::ecstore::global::GLOBAL_BOOT_TIME;
-use crate::admin::storage_compat::ecstore::global::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
-use crate::admin::storage_compat::ecstore::notification_sys::get_global_notification_sys;
-use crate::admin::storage_compat::ecstore::rpc::PeerRestClient;
-use crate::app::context::resolve_object_store_handle;
-use crate::app::object_usecase::DefaultObjectUsecase;
+use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
 };
-use crate::storage::access::{ReqInfo, authorize_request};
-use crate::storage::request_context::spawn_traced;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -57,18 +55,15 @@ use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
 use rustfs_config::server_config::Config;
-use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
-use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::{
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST,
@@ -635,8 +630,8 @@ async fn load_current_server_config() -> S3Result<Config> {
         return Ok(system.config.read().await.clone());
     }
 
-    if let Some(store) = resolve_object_store_handle() {
-        match read_config_without_migrate(store).await {
+    if let Some(store) = current_object_store_handle() {
+        match read_admin_config_without_migrate(store).await {
             Ok(config) => return Ok(config),
             Err(err) => {
                 warn!(
@@ -651,7 +646,7 @@ async fn load_current_server_config() -> S3Result<Config> {
         }
     }
 
-    let config = get_global_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
+    let config = current_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
     Ok(config)
 }
 
@@ -754,7 +749,7 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
     let region = req
         .region
         .clone()
-        .or_else(get_global_region)
+        .or_else(current_region)
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "us-east-1".to_string());
     let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
@@ -1193,7 +1188,7 @@ fn serialize_listen_notification_event(event: &NotificationEvent) -> S3Result<By
 }
 
 fn list_remote_live_event_peers() -> Vec<PeerLiveEventCursor> {
-    get_global_notification_sys()
+    current_notification_system()
         .map(|system| {
             system
                 .peer_clients
@@ -1405,7 +1400,7 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
 }
 
 async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
     };
 
@@ -1420,15 +1415,13 @@ async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
 async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     match metadata_sys::get_replication_config(bucket).await {
         Ok(_) => Ok(()),
-        Err(crate::admin::storage_compat::ecstore::error::StorageError::ConfigNotFound) => {
-            Err(s3_error!(ReplicationConfigurationNotFoundError))
-        }
+        Err(StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
 
 async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtRoute) -> S3Result<S3Response<Body>> {
-    let bucket_stats = match GLOBAL_REPLICATION_STATS.get() {
+    let bucket_stats = match current_replication_stats_handle() {
         Some(stats) => stats.get_latest_replication_stats(bucket).await,
         None => BucketStats::default(),
     };
@@ -1444,15 +1437,14 @@ async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtR
 }
 
 fn replication_metrics_uptime_seconds() -> i64 {
-    GLOBAL_BOOT_TIME
-        .get()
-        .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
+    current_boot_time()
+        .and_then(|boot_time| SystemTime::now().duration_since(boot_time).ok())
         .map(|uptime| uptime.as_secs() as i64)
         .unwrap_or_default()
 }
 
 fn collect_replication_metrics_bandwidth(bucket: &str) -> HashMap<String, BandwidthDetails> {
-    get_global_bucket_monitor()
+    current_bucket_monitor_handle()
         .map(|monitor| {
             monitor
                 .get_report(|name| name == bucket)
@@ -1520,7 +1512,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         bucket: Some(ext_req.bucket.clone()),
         object: None,
         version_id: None,
-        region: get_global_region(),
+        region: current_region(),
         ..Default::default()
     });
 
@@ -1539,15 +1531,19 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         }
     })?;
 
-    let action = match ext_req.route {
-        ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 | ReplicationExtRoute::Check => {
+    authorize_request(req, replication_extension_policy_action(ext_req.route)).await
+}
+
+fn replication_extension_policy_action(route: ReplicationExtRoute) -> Action {
+    match route {
+        ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
             Action::S3Action(S3Action::GetReplicationConfigurationAction)
         }
+        ReplicationExtRoute::Check => Action::S3Action(S3Action::PutReplicationConfigurationAction),
         ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
             Action::S3Action(S3Action::ResetBucketReplicationStateAction)
         }
-    };
-    authorize_request(req, action).await
+    }
 }
 
 fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest> {
@@ -1593,17 +1589,17 @@ fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConf
             continue;
         }
 
-        let arn = if config.role.is_empty() {
-            rule.destination.bucket.clone()
+        let arn = if config.role.trim().is_empty() {
+            rule.destination.bucket.trim().to_string()
         } else {
-            config.role.clone()
+            config.role.trim().to_string()
         };
 
         if seen.insert(arn.clone()) {
             arns.push(arn);
         }
 
-        if !config.role.is_empty() {
+        if !config.role.trim().is_empty() {
             break;
         }
     }
@@ -1782,26 +1778,27 @@ fn validate_replication_check_config_targets(
         .map(|target| target.arn.as_str())
         .collect::<HashSet<_>>();
 
+    let role = config.role.trim();
+    if !role.is_empty() {
+        if !configured_arns.contains(role) {
+            return Err(s3_error!(InvalidRequest, "replication config has stale target {role}"));
+        }
+        return Ok(());
+    }
+
     for rule in &config.rules {
         if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
             continue;
         }
 
-        let configured_arn = if config.role.is_empty() {
-            rule.destination.bucket.as_str()
-        } else {
-            config.role.as_str()
-        };
-
-        if configured_arns.contains(configured_arn) {
-            continue;
+        let configured_arn = rule.destination.bucket.trim();
+        if !configured_arn.is_empty() && !configured_arns.contains(configured_arn) {
+            let rule_id = rule.id.as_deref().unwrap_or("<unknown>");
+            return Err(s3_error!(
+                InvalidRequest,
+                "replication rule {rule_id} references stale target {configured_arn}"
+            ));
         }
-
-        return Err(s3_error!(
-            InvalidRequest,
-            "replication config with rule ID {} has a stale target",
-            rule.id.clone().unwrap_or_default()
-        ));
     }
 
     Ok(())
@@ -1809,10 +1806,7 @@ fn validate_replication_check_config_targets(
 
 fn filter_replication_check_targets(targets: BucketTargets, config: &s3s::dto::ReplicationConfiguration) -> Vec<BucketTarget> {
     let referenced_arns = config
-        .filter_target_arns(&ObjectOpts {
-            op_type: ReplicationType::All,
-            ..Default::default()
-        })
+        .filter_all_replication_target_arns()
         .into_iter()
         .collect::<HashSet<_>>();
 
@@ -1835,7 +1829,7 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
 
     if target.target_bucket == bucket
         && !target.deployment_id.is_empty()
-        && get_global_deployment_id().as_deref() == Some(target.deployment_id.as_str())
+        && current_deployment_id().as_deref() == Some(target.deployment_id.as_str())
     {
         result.status = "FAILED".to_string();
         result.error = Some("target bucket must not match source bucket on the same deployment".to_string());
@@ -1947,7 +1941,7 @@ async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) 
 
 fn build_replication_probe_put_options(now: OffsetDateTime) -> PutObjectOptions {
     PutObjectOptions {
-        internal: crate::admin::storage_compat::ecstore::bucket::bucket_target_sys::AdvancedPutOptions {
+        internal: super::storage_api::bucket::target_sys::AdvancedPutOptions {
             source_version_id: Uuid::new_v4().to_string(),
             replication_status: ReplicationStatusType::Replica,
             source_mtime: now,
@@ -2002,7 +1996,7 @@ async fn put_replication_probe_object(
         .customize()
         .map_request(move |mut req| {
             for (key, value) in headers.clone() {
-                req.headers_mut().insert(key.unwrap(), value);
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
             }
             Result::<_, std::io::Error>::Ok(req)
         })
@@ -2046,7 +2040,7 @@ async fn delete_replication_probe_object(
         .customize()
         .map_request(move |mut req| {
             for (key, value) in headers.clone() {
-                req.headers_mut().insert(key.unwrap(), value);
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
             }
             Result::<_, std::io::Error>::Ok(req)
         })
@@ -2062,7 +2056,7 @@ async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
             .object_lock_enabled
             .as_ref()
             .is_some_and(|state| state.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)),
-        Err(crate::admin::storage_compat::ecstore::error::StorageError::ConfigNotFound) => Ok(false),
+        Err(StorageError::ConfigNotFound) => Ok(false),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
@@ -2156,16 +2150,16 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
         .map_err(ApiError::from)?;
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
 
-    let Some(pool) = get_global_replication_pool() else {
+    let Some(pool) = current_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
-    pool.start_bucket_resync(ResyncOpts {
-        bucket: bucket.to_string(),
-        arn: resolved_arn.clone(),
-        resync_id: reset.reset_id.clone(),
-        resync_before: reset.reset_before,
-    })
+    pool.start_bucket_resync(replication::resync_opts(
+        bucket,
+        resolved_arn.clone(),
+        &reset.reset_id,
+        reset.reset_before,
+    ))
     .await
     .map_err(|e| s3_error!(InternalError, "{e}"))?;
 
@@ -2176,7 +2170,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
 }
 
 async fn load_replication_resync_status(bucket: &str) -> S3Result<BucketReplicationResyncStatus> {
-    let Some(pool) = get_global_replication_pool() else {
+    let Some(pool) = current_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
@@ -2249,7 +2243,7 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
         bucket,
         object,
         version_id: None,
-        region: get_global_region(),
+        region: current_region(),
         ..Default::default()
     });
 
@@ -2278,13 +2272,13 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
     match route {
         MiscExtRoute::ObjectLambda { bucket, object } => {
             let get_req = build_object_lambda_get_request(req, bucket, object)?;
-            let usecase = DefaultObjectUsecase::from_global();
+            let usecase = default_object_usecase();
             let get_resp = Box::pin(usecase.execute_get_object(get_req)).await?;
             invoke_object_lambda_target(req, bucket, object, get_resp).await
         }
         MiscExtRoute::ListenNotification { bucket } => {
             if let Some(bucket_name) = bucket {
-                let Some(store) = resolve_object_store_handle() else {
+                let Some(store) = current_object_store_handle() else {
                     return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
                 };
                 store
@@ -2638,6 +2632,22 @@ mod tests {
     }
 
     #[test]
+    fn replication_extension_policy_action_uses_write_permission_for_active_check() {
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::MetricsV1),
+            Action::S3Action(S3Action::GetReplicationConfigurationAction)
+        );
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::Check),
+            Action::S3Action(S3Action::PutReplicationConfigurationAction)
+        );
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::ResetStart),
+            Action::S3Action(S3Action::ResetBucketReplicationStateAction)
+        );
+    }
+
+    #[test]
     fn parse_reset_start_target_defaults_reset_before_and_supports_older_than() {
         let no_window: Uri = "/demo-bucket?replication-reset".parse().expect("uri should parse");
         let before_default = OffsetDateTime::now_utc();
@@ -2776,7 +2786,7 @@ mod tests {
     #[test]
     fn apply_replication_reset_to_targets_updates_matching_target() {
         let mut targets = BucketTargets {
-            targets: vec![crate::admin::storage_compat::ecstore::bucket::target::BucketTarget {
+            targets: vec![crate::admin::storage_api::bucket::target::BucketTarget {
                 arn: "arn:target".to_string(),
                 ..Default::default()
             }],
@@ -2798,10 +2808,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            crate::admin::storage_compat::ecstore::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_api::bucket::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-01-03 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::ecstore::bucket::replication::ResyncStatusType::ResyncFailed,
+                resync_status: crate::admin::storage_api::bucket::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2811,10 +2821,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            crate::admin::storage_compat::ecstore::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_api::bucket::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-01-02 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::ecstore::bucket::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: crate::admin::storage_api::bucket::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),
@@ -2844,10 +2854,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            crate::admin::storage_compat::ecstore::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_api::bucket::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-02-03 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::ecstore::bucket::replication::ResyncStatusType::ResyncFailed,
+                resync_status: crate::admin::storage_api::bucket::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2857,10 +2867,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            crate::admin::storage_compat::ecstore::bucket::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_api::bucket::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-02-02 00:00 UTC)),
-                resync_status: crate::admin::storage_compat::ecstore::bucket::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: crate::admin::storage_api::bucket::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),
@@ -3668,7 +3678,7 @@ mod tests {
                 access_key: "rustfsadmin".to_string(),
                 secret_key: s3s::auth::SecretKey::from("rustfssecret"),
             }),
-            region: get_global_region(),
+            region: current_region(),
             service: None,
             trailing_headers: None,
         };

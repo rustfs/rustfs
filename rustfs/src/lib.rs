@@ -50,12 +50,32 @@
 //! tests where you start one server in a background task, run all your
 //! tests, and then shut it down.
 
+/// Scope-based hotpath measurement for `#[async_trait]` methods, where
+/// `#[hotpath::measure]` would only time the boxed-future construction.
+/// The guard records wall time from this statement until the enclosing
+/// (desugared) async block completes, including early returns via `?`.
+/// With the `hotpath` feature off it expands to nothing.
+#[cfg(feature = "hotpath")]
+#[macro_export]
+macro_rules! hp_guard {
+    ($label:expr) => {
+        let _hotpath_scope_guard = ::hotpath::functions::build_measurement_guard_sync($label, false);
+    };
+}
+
+#[cfg(not(feature = "hotpath"))]
+#[macro_export]
+macro_rules! hp_guard {
+    ($label:expr) => {};
+}
+
 pub mod admin;
 pub mod allocator_reclaim;
 pub mod app;
 pub mod auth;
 pub mod auth_keystone;
 pub mod capacity;
+pub mod cluster_snapshot;
 pub mod config;
 pub mod delete_tail_activity;
 pub mod embedded;
@@ -66,21 +86,40 @@ pub mod memory_observability;
 pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub mod protocols;
+pub mod runtime_capabilities;
+pub(crate) mod runtime_sources;
 pub mod server;
+pub(crate) mod startup_audit;
+pub(crate) mod startup_auth;
+pub(crate) mod startup_background;
+pub(crate) mod startup_bucket_metadata;
+pub(crate) mod startup_deadlock;
+pub(crate) mod startup_embedded;
+pub(crate) mod startup_embedded_optional;
 pub mod startup_entrypoint;
-pub mod startup_fs_guard;
-pub mod startup_iam;
-pub mod startup_preflight;
-pub mod startup_protocols;
-pub mod startup_runtime;
-pub mod startup_server;
-pub mod startup_services;
-pub mod startup_storage;
+pub(crate) mod startup_fs_guard;
+pub(crate) mod startup_iam;
+pub(crate) mod startup_lifecycle;
+pub(crate) mod startup_notification;
+pub(crate) mod startup_observability;
+pub(crate) mod startup_optional_runtime_sidecars;
+pub(crate) mod startup_preflight;
+pub(crate) mod startup_protocols;
+pub(crate) mod startup_runtime;
+pub(crate) mod startup_runtime_hooks;
+pub(crate) mod startup_runtime_sources;
+pub(crate) mod startup_server;
+pub(crate) mod startup_services;
+pub(crate) mod startup_shutdown;
+pub(crate) mod startup_storage;
+pub(crate) mod startup_tls_material;
 pub mod storage;
+pub(crate) mod storage_api;
 pub(crate) mod table_catalog;
 pub mod tls;
 pub mod update;
 pub mod version;
+pub mod workload_admission;
 
 // Re-export from rustfs_utils so that config sub-modules can use
 // `crate::apply_external_env_compat` without breaking.

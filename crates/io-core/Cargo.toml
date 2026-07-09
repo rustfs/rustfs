@@ -20,8 +20,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Zero-copy core reader and writer implementations for RustFS"
-keywords = ["zero-copy", "reader", "writer", "rustfs"]
+description = "Buffered I/O reader and writer implementations for RustFS (mmap-then-copy, aligned pread)"
+keywords = ["io", "reader", "writer", "rustfs", "mmap"]
 categories = ["development-tools", "filesystem"]
 
 [lints]
@@ -33,10 +33,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync"] }
 memmap2 = { workspace = true }
 rustfs-io-metrics = { workspace = true }
-
-# io-uring is Linux-only. Scope the feature to Linux targets.
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio = { workspace = true, features = ["io-uring"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

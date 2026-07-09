@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::storage_compat::ecstore::store::ECStore;
-use rustfs_storage_api::ListOperations as _;
+use super::ECStore;
+use crate::storage::storage_api::head_prefix_consumer::contract::list::ListOperations as _;
 use std::sync::Arc;
 
 /// Determines if the key "looks like a prefix" (ends with `/`).

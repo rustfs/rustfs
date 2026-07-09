@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,59 +12,82 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate core;
+/// Scope-based hotpath measurement for `#[async_trait]` methods, where
+/// `#[cfg_attr(feature = "hotpath", hotpath::measure)]` would only time the boxed-future construction.
+/// The guard records wall time from this statement until the enclosing
+/// (desugared) async block completes, including early returns via `?`.
+#[cfg(feature = "hotpath")]
+#[macro_export]
+macro_rules! hp_guard {
+    ($label:expr) => {
+        let _hotpath_scope_guard = ::hotpath::functions::build_measurement_guard_sync($label, false);
+    };
+}
 
-pub mod admin_server_info;
-pub mod batch_processor;
-pub mod bitrot;
-pub mod bucket;
-pub mod cache_value;
-pub mod compress;
-pub mod config;
+#[cfg(not(feature = "hotpath"))]
+#[macro_export]
+macro_rules! hp_guard {
+    ($label:expr) => {};
+}
+
+pub mod api;
+mod bucket;
+mod cache_value;
+mod cluster;
+mod config;
+mod core;
 mod data_movement;
-pub mod data_usage;
-pub mod disk;
-pub mod disks_layout;
-pub mod endpoints;
-pub mod erasure_coding;
-pub mod error;
-pub mod global;
-pub mod metrics_realtime;
-pub mod notification_sys;
-pub mod pools;
-pub mod rebalance;
-pub mod rio;
-pub mod rpc;
-pub mod set_disk;
-mod sets;
-pub mod store;
-pub mod store_api;
-mod store_init;
-pub mod store_list_objects;
-pub mod store_utils;
+mod data_usage;
+mod diagnostics;
+mod disk;
+mod erasure;
+mod error;
+mod io_support;
+pub(crate) mod layout;
+mod object_api;
+mod runtime;
+mod services;
+mod set_disk;
+mod storage_api_contracts;
+mod store;
 
 // pub mod checksum;
-pub mod client;
-pub mod event;
-pub mod event_notification;
-#[cfg(test)]
-mod pools_test;
-#[cfg(test)]
-mod store_test;
-pub mod tier;
+mod client;
+mod event;
 
-pub use global::set_global_endpoints;
-pub use global::update_erasure_type;
-pub use global::{get_global_lock_client, get_global_lock_clients, set_global_lock_client, set_global_lock_clients};
-pub use global::{new_object_layer_fn, resolve_object_store_handle, set_object_store_resolver};
+use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
+use std::sync::Arc;
 
-pub use global::GLOBAL_Endpoints;
+pub type WorkloadAdmissionSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
+
+pub fn set_workload_admission_snapshot_provider(
+    provider: WorkloadAdmissionSnapshotProviderRef,
+) -> std::result::Result<(), WorkloadAdmissionSnapshotProviderRef> {
+    runtime::sources::set_workload_admission_snapshot_provider(provider)
+}
+
+/// Request shutdown of all long-lived peer/disk background monitor tasks.
+///
+/// Call this during graceful shutdown, *before* the Tokio runtime is dropped, so
+/// each monitor future (and the `tracing::Span` it holds) is dropped while the
+/// runtime and tracing subscriber are still alive. This avoids the
+/// thread-local-storage `on_close` panic that can otherwise abort the process
+/// during worker-thread teardown (issue #4264). Idempotent and cheap.
+pub fn shutdown_background_monitors() {
+    cluster::rpc::shutdown_background_monitors();
+}
 
 #[cfg(test)]
 mod rio_tests {
     #[test]
     fn uses_expected_rio_backend() {
         let expected = if cfg!(feature = "rio-v2") { "rio-v2" } else { "legacy-rio" };
-        assert_eq!(crate::rio::backend_name(), expected);
+        assert_eq!(crate::io_support::rio::backend_name(), expected);
     }
 }
+
+#[cfg(test)]
+mod ecstore_validation_blackbox;
+
+#[cfg(test)]
+pub(crate) mod test_metrics;

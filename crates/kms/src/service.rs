@@ -232,9 +232,26 @@ impl ObjectEncryptionService {
     /// DataKey with decrypted key
     ///
     pub async fn decrypt_data_key(&self, encrypted_key: &[u8], context: &ObjectEncryptionContext) -> Result<DataKey> {
+        self.decrypt_data_key_with_context(encrypted_key, request_encryption_context(context))
+            .await
+    }
+
+    /// Decrypt a data key written by legacy RustFS versions that reused KMS data
+    /// keys across objects with different encryption contexts.
+    ///
+    /// Callers must restrict this to positively identified legacy object metadata.
+    pub async fn decrypt_legacy_data_key(&self, encrypted_key: &[u8]) -> Result<DataKey> {
+        self.decrypt_data_key_with_context(encrypted_key, HashMap::new()).await
+    }
+
+    async fn decrypt_data_key_with_context(
+        &self,
+        encrypted_key: &[u8],
+        encryption_context: HashMap<String, String>,
+    ) -> Result<DataKey> {
         let decrypt_request = DecryptRequest {
             ciphertext: encrypted_key.to_vec(),
-            encryption_context: request_encryption_context(context),
+            encryption_context,
             grant_tokens: Vec::new(),
         };
 
@@ -928,5 +945,11 @@ mod tests {
             .await
             .expect("decrypt should accept matching KMS context");
         assert_ne!(decrypted.plaintext_key, [0u8; 32]);
+
+        let legacy_decrypted = service
+            .decrypt_legacy_data_key(&encrypted_key)
+            .await
+            .expect("legacy decrypt should use the backend compatibility path");
+        assert_eq!(legacy_decrypted.plaintext_key, decrypted.plaintext_key);
     }
 }

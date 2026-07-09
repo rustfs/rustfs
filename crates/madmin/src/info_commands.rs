@@ -24,6 +24,18 @@ pub enum ItemState {
     Offline,
     Initializing,
     Online,
+    /// The peer could not be probed this cycle but is not confirmed down.
+    /// Distinct from `Offline` (confirmed unreachable past the failure
+    /// threshold) and `Initializing` (genuinely still starting up): a
+    /// transient probe miss on an otherwise-healthy member must not read as
+    /// an ejection. See rustfs/backlog#1049.
+    Unknown,
+    /// The peer's admin/properties RPC keeps failing, but its drives are still
+    /// answering the independent disk-health heartbeat — the node is alive and
+    /// serving data, only its admin surface is unreachable. Reported instead of
+    /// `Offline` so a stuck admin path (e.g. a saturated scanner) is not
+    /// mistaken for an ejected node. See rustfs/backlog#1049 (P0-B).
+    Degraded,
 }
 
 impl ItemState {
@@ -32,6 +44,8 @@ impl ItemState {
             ItemState::Offline => "offline",
             ItemState::Initializing => "initializing",
             ItemState::Online => "online",
+            ItemState::Unknown => "unknown",
+            ItemState::Degraded => "degraded",
         }
     }
 
@@ -40,6 +54,8 @@ impl ItemState {
             "offline" => Some(ItemState::Offline),
             "initializing" => Some(ItemState::Initializing),
             "online" => Some(ItemState::Online),
+            "unknown" => Some(ItemState::Unknown),
+            "degraded" => Some(ItemState::Degraded),
             _ => None,
         }
     }
@@ -186,6 +202,8 @@ pub struct BackendInfo {
 pub const ITEM_OFFLINE: &str = "offline";
 pub const ITEM_INITIALIZING: &str = "initializing";
 pub const ITEM_ONLINE: &str = "online";
+pub const ITEM_UNKNOWN: &str = "unknown";
+pub const ITEM_DEGRADED: &str = "degraded";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MemStats {
@@ -326,6 +344,14 @@ pub struct ErasureBackend {
     pub online_disks: usize,
     #[serde(rename = "offlineDisks")]
     pub offline_disks: usize,
+    /// Drives whose owning member could not be probed this cycle and is not
+    /// confirmed offline. Kept as a separate bucket so
+    /// `online + offline + unknown == totalDrivesPerSet` holds even while a
+    /// member is unreachable, instead of the fourth drive silently vanishing
+    /// from the totals (rustfs/backlog#1049). `#[serde(default)]` keeps older
+    /// payloads that predate this field deserializable.
+    #[serde(rename = "unknownDisks", default)]
+    pub unknown_disks: usize,
     #[serde(rename = "standardSCParity")]
     pub standard_sc_parity: Option<usize>,
     #[serde(rename = "rrSCParity")]
@@ -409,6 +435,8 @@ mod tests {
         assert_eq!(ItemState::Offline.to_string(), ITEM_OFFLINE);
         assert_eq!(ItemState::Initializing.to_string(), ITEM_INITIALIZING);
         assert_eq!(ItemState::Online.to_string(), ITEM_ONLINE);
+        assert_eq!(ItemState::Unknown.to_string(), ITEM_UNKNOWN);
+        assert_eq!(ItemState::Degraded.to_string(), ITEM_DEGRADED);
     }
 
     #[test]
@@ -416,6 +444,8 @@ mod tests {
         assert_eq!(ItemState::from_string(ITEM_OFFLINE), Some(ItemState::Offline));
         assert_eq!(ItemState::from_string(ITEM_INITIALIZING), Some(ItemState::Initializing));
         assert_eq!(ItemState::from_string(ITEM_ONLINE), Some(ItemState::Online));
+        assert_eq!(ItemState::from_string(ITEM_UNKNOWN), Some(ItemState::Unknown));
+        assert_eq!(ItemState::from_string(ITEM_DEGRADED), Some(ItemState::Degraded));
     }
 
     #[test]
@@ -1145,6 +1175,7 @@ mod tests {
             backend_type: BackendType::ErasureType,
             online_disks: 8,
             offline_disks: 0,
+            unknown_disks: 0,
             standard_sc_parity: Some(2),
             rr_sc_parity: Some(1),
             total_sets: vec![2],
@@ -1154,6 +1185,7 @@ mod tests {
         assert!(matches!(erasure_backend.backend_type, BackendType::ErasureType));
         assert_eq!(erasure_backend.online_disks, 8);
         assert_eq!(erasure_backend.offline_disks, 0);
+        assert_eq!(erasure_backend.unknown_disks, 0);
         assert_eq!(erasure_backend.standard_sc_parity.unwrap(), 2);
         assert_eq!(erasure_backend.rr_sc_parity.unwrap(), 1);
         assert_eq!(erasure_backend.total_sets.len(), 1);
@@ -1271,5 +1303,7 @@ mod tests {
         assert_eq!(ITEM_OFFLINE, "offline");
         assert_eq!(ITEM_INITIALIZING, "initializing");
         assert_eq!(ITEM_ONLINE, "online");
+        assert_eq!(ITEM_UNKNOWN, "unknown");
+        assert_eq!(ITEM_DEGRADED, "degraded");
     }
 }

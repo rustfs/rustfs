@@ -63,6 +63,67 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Test-only recorder of every directory passed to [`fsync_dir_std`].
+///
+/// Durability regressions are invisible to ordinary behavior tests (the data
+/// is on disk either way), so unit tests assert directly on which directories
+/// were fsynced. Paths are recorded globally; tests must match on paths under
+/// their own unique tempdir to stay robust against parallel test execution.
+#[cfg(test)]
+pub(crate) mod fsync_dir_recorder {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static RECORDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(dir: &Path) {
+        RECORDED.lock().expect("fsync dir recorder poisoned").push(dir.to_path_buf());
+    }
+
+    pub(crate) fn was_fsynced(dir: &Path) -> bool {
+        RECORDED.lock().expect("fsync dir recorder poisoned").iter().any(|p| p == dir)
+    }
+}
+
+/// Fsync a directory so recently created or renamed entries survive power loss.
+/// No-op on non-Unix platforms where directories cannot be opened for syncing.
+pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
+    #[cfg(test)]
+    fsync_dir_recorder::record(dir.as_ref());
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir.as_ref())?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Async wrapper around [`fsync_dir_std`]; runs the blocking fsync off the runtime.
+pub async fn fsync_dir(dir: impl AsRef<Path>) -> io::Result<()> {
+    let dir = dir.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || fsync_dir_std(dir)).await?
+}
+
+/// Fdatasync every regular file directly inside `dir`, then fsync the directory
+/// itself. Used at commit points so erasure shard files written through the page
+/// cache are durable before their directory is renamed into its final location.
+pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir.as_ref())? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::File::open(entry.path())?.sync_data()?;
+        }
+    }
+    fsync_dir_std(dir)
+}
+
+/// Async wrapper around [`sync_dir_files_std`]; runs the blocking syncs off the runtime.
+pub async fn sync_dir_files(dir: impl AsRef<Path>) -> io::Result<()> {
+    let dir = dir.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || sync_dir_files_std(dir)).await?
+}
+
 /// Check if the given disk path is the root disk.
 /// On Windows, always return false.
 /// On Unix, compare the disk paths.
@@ -117,6 +178,10 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec
             volumes.push(name);
         } else if file_type.is_dir() {
             volumes.push(format!("{name}{SLASH_SEPARATOR}"));
+        } else {
+            // Entries we don't return (symlinks, sockets, fifos) must not consume
+            // the limit: is_empty_dir/list_dir(count=1) would misreport otherwise.
+            continue;
         }
         count -= 1;
         if count == 0 {
@@ -176,7 +241,7 @@ async fn reliable_rename_inner(
     let mut i = 0;
     loop {
         if let Err(e) = super::fs::rename_std(src_file_path.as_ref(), dst_file_path.as_ref()) {
-            if i == 0 {
+            if should_retry_rename(&e, i) {
                 i += 1;
                 continue;
             }
@@ -196,6 +261,19 @@ async fn reliable_rename_inner(
     }
 
     Ok(())
+}
+
+/// Whether a failed `rename` in [`reliable_rename_inner`] should be retried.
+///
+/// Only the first failure is retried, and `NotFound` is never retried: the
+/// retry does not recreate the missing source or parent directory, so a second
+/// attempt is guaranteed to fail identically. Skipping it spares speculative
+/// cleanup renames (e.g. `move_to_trash` on an already-removed tmp path) a
+/// pointless second syscall. This predicate is shared by the `rename_data`
+/// commit path via `rename_all`, so any relaxation here must keep genuine
+/// transient errors retryable.
+fn should_retry_rename(err: &io::Error, attempt: usize) -> bool {
+    attempt == 0 && err.kind() != io::ErrorKind::NotFound
 }
 
 pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
@@ -299,5 +377,63 @@ mod tests {
             .expect("missing cleanup source must be ignored");
 
         assert!(!dst.exists());
+    }
+
+    #[test]
+    fn rename_retry_never_retries_not_found() {
+        // NotFound is terminal for the retry loop: the retry does not recreate
+        // the missing source/parent, so a second rename would fail identically.
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "missing");
+        assert!(!should_retry_rename(&not_found, 0));
+        assert!(!should_retry_rename(&not_found, 1));
+    }
+
+    #[test]
+    fn rename_retry_allows_single_retry_for_other_errors() {
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(should_retry_rename(&denied, 0));
+        assert!(!should_retry_rename(&denied, 1));
+    }
+
+    #[tokio::test]
+    async fn rename_all_moves_existing_directory_tree() {
+        // Guards the rename_data commit path, which funnels through
+        // reliable_rename_inner via rename_all.
+        let temp_dir = tempdir().expect("create temp dir");
+        let src = temp_dir.path().join("src-dir");
+        std::fs::create_dir_all(src.join("nested")).expect("create src tree");
+        std::fs::write(src.join("nested").join("part.1"), b"payload").expect("write part");
+        let dst = temp_dir.path().join("dst-parent").join("dst-dir");
+
+        rename_all(&src, &dst, temp_dir.path()).await.expect("rename must succeed");
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(dst.join("nested").join("part.1")).expect("read moved part"), b"payload");
+    }
+
+    #[tokio::test]
+    async fn fsync_dir_succeeds_on_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+
+        fsync_dir(temp_dir.path()).await.expect("fsync dir must succeed");
+    }
+
+    #[tokio::test]
+    async fn sync_dir_files_syncs_regular_files_and_dir() {
+        let temp_dir = tempdir().expect("create temp dir");
+        std::fs::write(temp_dir.path().join("part.1"), b"shard-one").expect("write part.1");
+        std::fs::write(temp_dir.path().join("part.2"), b"shard-two").expect("write part.2");
+        std::fs::create_dir(temp_dir.path().join("subdir")).expect("create subdir");
+
+        sync_dir_files(temp_dir.path()).await.expect("sync dir files must succeed");
+    }
+
+    #[tokio::test]
+    async fn sync_dir_files_missing_dir_returns_not_found() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let missing = temp_dir.path().join("missing");
+
+        let err = sync_dir_files(&missing).await.expect_err("missing dir must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

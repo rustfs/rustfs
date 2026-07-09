@@ -22,6 +22,23 @@ pub const DEFAULT_HEALTH_ENDPOINT_ENABLE: bool = true;
 pub const ENV_HEALTH_READINESS_CACHE_TTL_MS: &str = "RUSTFS_HEALTH_READINESS_CACHE_TTL_MS";
 pub const DEFAULT_HEALTH_READINESS_CACHE_TTL_MS: u64 = 1000;
 
+/// Timeout for cluster health readiness collectors (milliseconds).
+/// This bounds expensive storage and lock quorum checks used by cluster probes.
+pub const ENV_HEALTH_CLUSTER_TIMEOUT_MS: &str = "RUSTFS_HEALTH_CLUSTER_TIMEOUT_MS";
+pub const DEFAULT_HEALTH_CLUSTER_TIMEOUT_MS: u64 = 2000;
+
+/// Maximum time to wait for local node runtime readiness (storage / IAM / lock
+/// quorum) during startup before failing fast (seconds).
+///
+/// On slow or multi-node cold starts — e.g. Docker/Kubernetes/NAS deployments
+/// where peer DNS records and erasure-format quorum take time to converge — this
+/// budget must be large enough to outlast the internal startup DNS-retry window
+/// and the format-load retry loop. Increase it for slow NAS/edge clusters; lower
+/// it for fast single-node setups that should fail fast. A value of `0` is
+/// treated as the default rather than an instant timeout.
+pub const ENV_STARTUP_READINESS_MAX_WAIT_SECS: &str = "RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS";
+pub const DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS: u64 = 120;
+
 /// Enable minimal health payload mode for GET `/health*` responses.
 /// When enabled, only `status` and `ready` fields are returned.
 pub const ENV_HEALTH_MINIMAL_RESPONSE_ENABLE: &str = "RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE";
@@ -43,3 +60,8 @@ pub const DEFAULT_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS: usize = 0;
 /// in running state if a global KMS manager exists.
 pub const ENV_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE";
 pub const DEFAULT_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE: bool = false;
+
+/// Enable peer-health readiness impact.
+/// When disabled, peer-health state is reported but does not affect readiness.
+pub const ENV_HEALTH_PEER_READY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE";
+pub const DEFAULT_HEALTH_PEER_READY_CHECK_ENABLE: bool = false;

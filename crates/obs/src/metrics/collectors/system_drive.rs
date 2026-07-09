@@ -44,38 +44,38 @@ pub struct DriveDetailedStats {
     pub capacity_observation_state: &'static str,
     /// Age in seconds of the current capacity observation
     pub capacity_observation_age_seconds: u64,
-    /// Used inodes
-    pub used_inodes: u64,
-    /// Free inodes
-    pub free_inodes: u64,
-    /// Total inodes
-    pub total_inodes: u64,
-    /// Total timeout errors
-    pub timeout_errors_total: u64,
-    /// Total I/O errors
-    pub io_errors_total: u64,
-    /// Total availability errors
-    pub availability_errors_total: u64,
-    /// Number of I/O operations waiting
-    pub waiting_io: u64,
-    /// API latency in microseconds
-    pub api_latency_micros: u64,
+    /// Used inodes when the platform provides a real inode sample
+    pub used_inodes: Option<u64>,
+    /// Free inodes when the platform provides a real inode sample
+    pub free_inodes: Option<u64>,
+    /// Total inodes when the platform provides a real inode sample
+    pub total_inodes: Option<u64>,
+    /// Total timeout errors when backed by a real error counter
+    pub timeout_errors_total: Option<u64>,
+    /// Total I/O errors when backed by a real error counter
+    pub io_errors_total: Option<u64>,
+    /// Total availability errors when backed by a real error counter
+    pub availability_errors_total: Option<u64>,
+    /// Number of I/O operations waiting when backed by a real queue sample
+    pub waiting_io: Option<u64>,
+    /// API latency in microseconds when backed by a real latency sample
+    pub api_latency_micros: Option<u64>,
     /// Health status (1=healthy, 0=unhealthy)
     pub health: u8,
-    /// Reads per second
-    pub reads_per_sec: f64,
-    /// Kilobytes read per second
-    pub reads_kb_per_sec: f64,
-    /// Average read await time
-    pub reads_await: f64,
-    /// Writes per second
-    pub writes_per_sec: f64,
-    /// Kilobytes written per second
-    pub writes_kb_per_sec: f64,
-    /// Average write await time
-    pub writes_await: f64,
-    /// Percentage utilization
-    pub perc_util: f64,
+    /// Reads per second when backed by a real iostat sample
+    pub reads_per_sec: Option<f64>,
+    /// Kilobytes read per second when backed by a real iostat sample
+    pub reads_kb_per_sec: Option<f64>,
+    /// Average read await time when backed by a real iostat sample
+    pub reads_await: Option<f64>,
+    /// Writes per second when backed by a real iostat sample
+    pub writes_per_sec: Option<f64>,
+    /// Kilobytes written per second when backed by a real iostat sample
+    pub writes_kb_per_sec: Option<f64>,
+    /// Average write await time when backed by a real iostat sample
+    pub writes_await: Option<f64>,
+    /// Drive percent utilization when backed by a real iostat sample
+    pub perc_util: Option<f64>,
 }
 
 /// Aggregate drive count statistics.
@@ -102,8 +102,8 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
     ) {
         metrics.push(
             PrometheusMetric::from_descriptor(descriptor, value)
-                .with_label_owned(DRIVE_LABEL, drive_label.to_string())
-                .with_label_owned(SERVER_LABEL, server_label.to_string()),
+                .with_label_owned(SERVER_LABEL, server_label.to_string())
+                .with_label_owned(DRIVE_LABEL, drive_label.to_string()),
         );
     }
 
@@ -129,51 +129,57 @@ pub fn collect_drive_detailed_metrics(stats: &[DriveDetailedStats]) -> Vec<Prome
                     &DRIVE_CAPACITY_OBSERVATION_STATE_MD,
                     if state == stat.capacity_observation_state { 1.0 } else { 0.0 },
                 )
-                .with_label_owned(DRIVE_LABEL, drive_label.to_string())
                 .with_label_owned(SERVER_LABEL, server_label.to_string())
+                .with_label_owned(DRIVE_LABEL, drive_label.to_string())
                 .with_label_owned("state", state.to_string()),
             );
         }
-        push_drive_metric(&mut metrics, &DRIVE_USED_INODES_MD, stat.used_inodes as f64, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_FREE_INODES_MD, stat.free_inodes as f64, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_TOTAL_INODES_MD, stat.total_inodes as f64, server_label, drive_label);
-        push_drive_metric(
-            &mut metrics,
-            &DRIVE_TIMEOUT_ERRORS_MD,
-            stat.timeout_errors_total as f64,
-            server_label,
-            drive_label,
-        );
-        push_drive_metric(&mut metrics, &DRIVE_IO_ERRORS_MD, stat.io_errors_total as f64, server_label, drive_label);
-        push_drive_metric(
-            &mut metrics,
-            &DRIVE_AVAILABILITY_ERRORS_MD,
-            stat.availability_errors_total as f64,
-            server_label,
-            drive_label,
-        );
-        push_drive_metric(&mut metrics, &DRIVE_WAITING_IO_MD, stat.waiting_io as f64, server_label, drive_label);
-        push_drive_metric(
-            &mut metrics,
-            &DRIVE_API_LATENCY_MD,
-            stat.api_latency_micros as f64,
-            server_label,
-            drive_label,
-        );
+        if let Some(value) = stat.used_inodes {
+            push_drive_metric(&mut metrics, &DRIVE_USED_INODES_MD, value as f64, server_label, drive_label);
+        }
+        if let Some(value) = stat.free_inodes {
+            push_drive_metric(&mut metrics, &DRIVE_FREE_INODES_MD, value as f64, server_label, drive_label);
+        }
+        if let Some(value) = stat.total_inodes {
+            push_drive_metric(&mut metrics, &DRIVE_TOTAL_INODES_MD, value as f64, server_label, drive_label);
+        }
+        if let Some(value) = stat.timeout_errors_total {
+            push_drive_metric(&mut metrics, &DRIVE_TIMEOUT_ERRORS_MD, value as f64, server_label, drive_label);
+        }
+        if let Some(value) = stat.io_errors_total {
+            push_drive_metric(&mut metrics, &DRIVE_IO_ERRORS_MD, value as f64, server_label, drive_label);
+        }
+        if let Some(value) = stat.availability_errors_total {
+            push_drive_metric(&mut metrics, &DRIVE_AVAILABILITY_ERRORS_MD, value as f64, server_label, drive_label);
+        }
+        if let Some(value) = stat.waiting_io {
+            push_drive_metric(&mut metrics, &DRIVE_WAITING_IO_MD, value as f64, server_label, drive_label);
+        }
+        if let Some(value) = stat.api_latency_micros {
+            push_drive_metric(&mut metrics, &DRIVE_API_LATENCY_MD, value as f64, server_label, drive_label);
+        }
         push_drive_metric(&mut metrics, &DRIVE_HEALTH_MD, stat.health as f64, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_READS_PER_SEC_MD, stat.reads_per_sec, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_READS_KB_PER_SEC_MD, stat.reads_kb_per_sec, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_READS_AWAIT_MD, stat.reads_await, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_WRITES_PER_SEC_MD, stat.writes_per_sec, server_label, drive_label);
-        push_drive_metric(
-            &mut metrics,
-            &DRIVE_WRITES_KB_PER_SEC_MD,
-            stat.writes_kb_per_sec,
-            server_label,
-            drive_label,
-        );
-        push_drive_metric(&mut metrics, &DRIVE_WRITES_AWAIT_MD, stat.writes_await, server_label, drive_label);
-        push_drive_metric(&mut metrics, &DRIVE_PERC_UTIL_MD, stat.perc_util, server_label, drive_label);
+        if let Some(value) = stat.reads_per_sec {
+            push_drive_metric(&mut metrics, &DRIVE_READS_PER_SEC_MD, value, server_label, drive_label);
+        }
+        if let Some(value) = stat.reads_kb_per_sec {
+            push_drive_metric(&mut metrics, &DRIVE_READS_KB_PER_SEC_MD, value, server_label, drive_label);
+        }
+        if let Some(value) = stat.reads_await {
+            push_drive_metric(&mut metrics, &DRIVE_READS_AWAIT_MD, value, server_label, drive_label);
+        }
+        if let Some(value) = stat.writes_per_sec {
+            push_drive_metric(&mut metrics, &DRIVE_WRITES_PER_SEC_MD, value, server_label, drive_label);
+        }
+        if let Some(value) = stat.writes_kb_per_sec {
+            push_drive_metric(&mut metrics, &DRIVE_WRITES_KB_PER_SEC_MD, value, server_label, drive_label);
+        }
+        if let Some(value) = stat.writes_await {
+            push_drive_metric(&mut metrics, &DRIVE_WRITES_AWAIT_MD, value, server_label, drive_label);
+        }
+        if let Some(value) = stat.perc_util {
+            push_drive_metric(&mut metrics, &DRIVE_PERC_UTIL_MD, value, server_label, drive_label);
+        }
     }
 
     metrics
@@ -232,6 +238,23 @@ pub fn collect_process_disk_metrics(
 mod tests {
     use super::*;
     use crate::metrics::report::report_metrics;
+    use std::collections::BTreeSet;
+
+    fn assert_metric_label_keys(
+        metrics: &[PrometheusMetric],
+        descriptor: &'static crate::metrics::schema::MetricDescriptor,
+        value: f64,
+        expected_keys: &[&str],
+    ) {
+        let metric_name = descriptor.get_full_metric_name();
+        let metric = metrics
+            .iter()
+            .find(|metric| metric.name == metric_name && metric.value == value)
+            .expect("expected metric with matching descriptor and value");
+        let actual: BTreeSet<&str> = metric.labels.iter().map(|(key, _)| *key).collect();
+        let expected: BTreeSet<&str> = expected_keys.iter().copied().collect();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_collect_drive_detailed_metrics() {
@@ -243,22 +266,22 @@ mod tests {
             free_bytes: 1024 * 1024 * 1024 * 50,   // 50 GB
             capacity_observation_state: "live",
             capacity_observation_age_seconds: 0,
-            used_inodes: 100000,
-            free_inodes: 900000,
-            total_inodes: 1000000,
-            timeout_errors_total: 5,
-            io_errors_total: 10,
-            availability_errors_total: 2,
-            waiting_io: 3,
-            api_latency_micros: 1500,
+            used_inodes: Some(100000),
+            free_inodes: Some(900000),
+            total_inodes: Some(1000000),
+            timeout_errors_total: Some(5),
+            io_errors_total: Some(10),
+            availability_errors_total: Some(2),
+            waiting_io: Some(3),
+            api_latency_micros: Some(1500),
             health: 1,
-            reads_per_sec: 100.0,
-            reads_kb_per_sec: 1024.0,
-            reads_await: 5.5,
-            writes_per_sec: 50.0,
-            writes_kb_per_sec: 512.0,
-            writes_await: 10.2,
-            perc_util: 75.5,
+            reads_per_sec: Some(100.0),
+            reads_kb_per_sec: Some(1024.0),
+            reads_await: Some(5.5),
+            writes_per_sec: Some(50.0),
+            writes_kb_per_sec: Some(512.0),
+            writes_await: Some(10.2),
+            perc_util: Some(75.5),
         }];
 
         let metrics = collect_drive_detailed_metrics(&stats);
@@ -271,6 +294,62 @@ mod tests {
         let total_bytes = metrics.iter().find(|m| m.name == total_bytes_name);
         assert!(total_bytes.is_some());
         assert_eq!(total_bytes.map(|m| m.value), Some(1024.0 * 1024.0 * 1024.0 * 100.0));
+        assert_metric_label_keys(
+            &metrics,
+            &DRIVE_TOTAL_BYTES_MD,
+            1024.0 * 1024.0 * 1024.0 * 100.0,
+            &[SERVER_LABEL, DRIVE_LABEL],
+        );
+        assert_metric_label_keys(&metrics, &DRIVE_API_LATENCY_MD, 1500.0, &[SERVER_LABEL, DRIVE_LABEL]);
+        assert_metric_label_keys(&metrics, &DRIVE_CAPACITY_OBSERVATION_STATE_MD, 1.0, &[SERVER_LABEL, DRIVE_LABEL, "state"]);
+    }
+
+    #[test]
+    fn test_collect_drive_detailed_metrics_skips_unimplemented_placeholders() {
+        let stats = vec![DriveDetailedStats {
+            server: "node1:9000".to_string(),
+            drive: "/data/disk1".to_string(),
+            total_bytes: 1024,
+            used_bytes: 512,
+            free_bytes: 512,
+            capacity_observation_state: "live",
+            capacity_observation_age_seconds: 0,
+            used_inodes: None,
+            free_inodes: None,
+            total_inodes: None,
+            timeout_errors_total: None,
+            io_errors_total: None,
+            availability_errors_total: None,
+            waiting_io: None,
+            api_latency_micros: None,
+            health: 1,
+            reads_per_sec: None,
+            reads_kb_per_sec: None,
+            reads_await: None,
+            writes_per_sec: None,
+            writes_kb_per_sec: None,
+            writes_await: None,
+            perc_util: None,
+        }];
+
+        let metrics = collect_drive_detailed_metrics(&stats);
+
+        assert_eq!(metrics.len(), 8);
+        assert!(
+            metrics
+                .iter()
+                .all(|metric| metric.name != DRIVE_PERC_UTIL_MD.get_full_metric_name())
+        );
+        assert!(
+            metrics
+                .iter()
+                .all(|metric| metric.name != DRIVE_USED_INODES_MD.get_full_metric_name())
+        );
+        assert!(
+            metrics
+                .iter()
+                .all(|metric| metric.name != DRIVE_IO_ERRORS_MD.get_full_metric_name())
+        );
     }
 
     #[test]

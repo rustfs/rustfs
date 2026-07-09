@@ -176,6 +176,11 @@ pub(super) struct FileInfo {
     ///
     /// This value is used for retention accounting and freed-byte metrics.
     pub size: u64,
+    /// Projected bytes reclaimed when this file is deleted.
+    ///
+    /// For source logs that were compressed first, this reflects the original
+    /// size minus the archive bytes that remain on disk.
+    pub projected_freed_bytes: u64,
     /// Last-modification timestamp from the filesystem.
     ///
     /// The selection phase sorts on this timestamp so the oldest files are

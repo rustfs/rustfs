@@ -21,6 +21,11 @@
 # 2. Upload binaries to OSS storage
 # 3. Trigger docker.yml to build and push images using the uploaded binaries
 #
+# Platform scope:
+# - Pushes to main (development builds) build the Linux targets only — they
+#   feed the dev download channel and Docker dev images. Tags, the weekly
+#   schedule and manual dispatch build the full platform matrix.
+#
 # Manual Parameters:
 # - build_docker: Build and push Docker images (default: true)
 # - platforms: Comma-separated platform IDs or 'all' (default: all)
@@ -46,7 +51,7 @@ on:
       - ".gitignore"
       - ".dockerignore"
   schedule:
-    - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
+    - cron: "0 1 * * 0" # Weekly on Sunday 01:00 UTC (staggered after the ci.yml midnight cron)
   workflow_dispatch:
     inputs:
       build_docker:
@@ -62,6 +67,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -82,9 +91,7 @@ jobs:
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Determine build strategy
         id: check
@@ -121,8 +128,7 @@ jobs:
             version="dev-${short_sha}"
             echo "🛠️  Development build detected"
           elif [[ "${{ github.event_name }}" == "schedule" ]] || \
-               [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
-               [[ "${{ contains(github.event.head_commit.message, '--build') }}" == "true" ]]; then
+               [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             # Scheduled or manual build
             should_build=true
             build_type="development"
@@ -146,6 +152,7 @@ jobs:
   # Build RustFS binaries
   prepare-platform-matrix:
     name: Prepare Platform Matrix
+    needs: build-check
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -163,11 +170,23 @@ jobs:
             selected="all"
           fi
 
+          # Per-merge development builds only feed the dev download channel
+          # and the Docker dev images, which consume the Linux binaries; at
+          # the usual merge cadence most per-merge builds are cancelled by the
+          # next merge anyway. macOS and Windows stay covered by tag builds,
+          # the weekly scheduled build and manual dispatch.
+          if [[ "${selected}" == "all" \
+            && "${{ github.event_name }}" == "push" \
+            && "${{ needs.build-check.outputs.build_type }}" == "development" ]]; then
+            selected="linux-x86_64-musl,linux-aarch64-musl,linux-x86_64-gnu,linux-aarch64-gnu"
+            echo "Development (main push) build: restricting to Linux targets"
+          fi
+
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-musl","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
-            {"target_id":"linux-x86_64-gnu","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
-            {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
+            {"target_id":"linux-x86_64-musl","os":"sm-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
+            {"target_id":"linux-aarch64-musl","os":"sm-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
+            {"target_id":"linux-x86_64-gnu","os":"sm-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
+            {"target_id":"linux-aarch64-gnu","os":"sm-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
             {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
             {"target_id":"macos-x86_64","os":"macos-26-intel","target":"x86_64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
             {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
@@ -201,7 +220,7 @@ jobs:
     name: Build RustFS
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform == 'linux' && fromJSON('["self-hosted","linux","sm-standard-2"]') || matrix.os }}
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -215,7 +234,7 @@ jobs:
       matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
 
@@ -224,33 +243,117 @@ jobs:
         with:
           rust-version: stable
           target: ${{ matrix.target }}
-          cache-shared-key: build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          cache-shared-key: build-${{ matrix.target }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           install-cross-tools: ${{ matrix.cross }}
 
       - name: Download static console assets
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           mkdir -p ./rustfs/static
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            if curl.exe --fail -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" -o console.zip --retry 3 --retry-delay 5 --max-time 300; then
-              unzip -o console.zip -d ./rustfs/static
-              rm console.zip
+
+          verify_sha256() {
+            local expected="$1"
+            local file="$2"
+            local actual=""
+            local actual_line=""
+
+            if command -v sha256sum >/dev/null 2>&1; then
+              actual_line=$(sha256sum -- "$file") || return 1
+            elif command -v shasum >/dev/null 2>&1; then
+              actual_line=$(shasum -a 256 -- "$file") || return 1
             else
-              echo "Warning: Failed to download console assets, continuing without them"
-              echo "// Static assets not available" > ./rustfs/static/empty.txt
+              echo "No SHA-256 verification tool found" >&2
+              return 1
             fi
+            actual="${actual_line%%[[:space:]]*}"
+
+            if [ "$actual" = "$expected" ]; then
+              echo "SHA256 verified OK: $actual"
+              return 0
+            else
+              echo "SHA256 mismatch: expected=$expected actual=$actual" >&2
+              return 1
+            fi
+          }
+
+          download_console_assets() {
+            local curl_bin="curl"
+            local python_bin="python3"
+            local console_api="https://api.github.com/repos/rustfs/console/releases/latest"
+            local console_json="console-release.json"
+            local console_url
+            local console_sha256
+            local curl_auth_args=()
+
+            if [[ "${{ matrix.platform }}" == "windows" ]]; then
+              curl_bin="curl.exe"
+            else
+              chmod +w ./rustfs/static/LICENSE || true
+            fi
+
+            if ! command -v "$python_bin" >/dev/null 2>&1; then
+              python_bin="python"
+            fi
+            if ! command -v "$python_bin" >/dev/null 2>&1; then
+              echo "No Python interpreter found for release metadata parsing" >&2
+              return 1
+            fi
+
+            if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+              curl_auth_args=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "X-GitHub-Api-Version: 2022-11-28")
+            fi
+
+            "$curl_bin" "${curl_auth_args[@]}" --fail -L "$console_api" \
+              -o "$console_json" --retry 3 --retry-delay 5 --max-time 300 || return 1
+
+            read -r console_url console_sha256 < <("$python_bin" - "$console_json" <<'PY'
+          import json
+          import re
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              release = json.load(handle)
+
+          for asset in release.get("assets", []):
+              name = asset.get("name", "")
+              digest = asset.get("digest", "")
+              url = asset.get("browser_download_url", "")
+              if name.startswith("rustfs-console-") and name.endswith(".zip") and digest.startswith("sha256:") and url:
+                  sha256 = digest.split(":", 1)[1]
+                  if not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+                      raise SystemExit(f"console zip asset has invalid sha256 digest: {sha256}")
+                  sys.stdout.buffer.write(f"{url} {sha256}\n".encode("utf-8"))
+                  break
+          else:
+              raise SystemExit("no console zip asset with sha256 digest found")
+          PY
+            ) || return 1
+
+            if [[ -z "$console_url" || -z "$console_sha256" ]]; then
+              echo "Console release metadata is missing URL or SHA-256 digest" >&2
+              return 1
+            fi
+
+            "$curl_bin" --fail -L "$console_url" -o console.zip --retry 3 --retry-delay 5 --max-time 300 || return 1
+            verify_sha256 "$console_sha256" console.zip || return 2
+            unzip -o console.zip -d ./rustfs/static || return 2
+          }
+
+          if download_console_assets; then
+            rm -f console.zip console-release.json
           else
-            chmod +w ./rustfs/static/LICENSE || true
-            if curl --fail -L "https://dl.rustfs.com/artifacts/console/rustfs-console-latest.zip" \
-              -o console.zip --retry 3 --retry-delay 5 --max-time 300; then
-              unzip -o console.zip -d ./rustfs/static
-              rm console.zip
-            else
-              echo "Warning: Failed to download console assets, continuing without them"
-              echo "// Static assets not available" > ./rustfs/static/empty.txt
+            status=$?
+            rm -f console.zip console-release.json
+            if [[ "$status" -eq 2 ]]; then
+              echo "Console asset integrity verification failed" >&2
+              exit 1
             fi
+            echo "Warning: Failed to download verified console assets, continuing without them"
+            echo "// Static assets not available" > ./rustfs/static/empty.txt
           fi
 
       - name: Build RustFS
@@ -260,14 +363,8 @@ jobs:
           touch rustfs/build.rs
 
           if [[ "${{ matrix.cross }}" == "true" ]]; then
-            if [[ "${{ matrix.platform }}" == "windows" ]]; then
-              # Use cross for Windows ARM64
-              cargo install cross --git https://github.com/cross-rs/cross
-              cross build --release --target ${{ matrix.target }} -p rustfs --bins
-            else
-              # Use zigbuild for other cross-compilation
-              cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
-            fi
+            # All cross targets in the matrix are Linux; zigbuild handles them.
+            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
           else
             cargo build --release --target ${{ matrix.target }} -p rustfs --bins
           fi
@@ -459,85 +556,53 @@ jobs:
           echo "📊 Version: ${VERSION}"
 
       - name: Upload to GitHub artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ steps.package.outputs.package_name }}
           path: "rustfs-*.zip"
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
-      - name: Upload to Aliyun OSS
-        if: env.OSS_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
+      - name: Upload to Cloudflare R2
+        if: env.R2_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
         env:
-          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-          OSS_REGION: cn-beijing
-          OSS_ENDPOINT: https://oss-accelerate.aliyuncs.com
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_EC2_METADATA_DISABLED: true
         shell: bash
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
 
-          # Install ossutil (platform-specific)
-          OSSUTIL_VERSION="2.1.1"
-          case "${{ matrix.platform }}" in
-            linux)
-              if [[ "$(uname -m)" == "arm64" ]]; then
-                ARCH="arm64"
-              else
-                ARCH="amd64"
-              fi
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}"
+          if [[ -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" || -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "⚠️ R2 credentials or endpoint missing, skipping artifact upload"
+            exit 0
+          fi
 
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              chmod +x /usr/local/bin/ossutil
-              OSSUTIL_BIN=ossutil
-              ;;
-            macos)
-              if [[ "$(uname -m)" == "arm64" ]]; then
-                ARCH="arm64"
-              else
-                ARCH="amd64"
-              fi
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}"
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "❌ aws CLI not found on runner; cannot upload to R2"
+            exit 1
+          fi
 
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              chmod +x /usr/local/bin/ossutil
-              OSSUTIL_BIN=ossutil
-              ;;
-            windows)
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-windows-amd64.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-windows-amd64"
-
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil.exe" ./ossutil.exe
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              OSSUTIL_BIN=./ossutil.exe
-              ;;
-          esac
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
 
           # Determine upload path based on build type
           if [[ "$BUILD_TYPE" == "development" ]]; then
-            OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs/dev/"
-            echo "📤 Uploading development build to OSS dev directory"
+            R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/dev/"
+            echo "📤 Uploading development build to R2 dev directory"
           else
-            OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs/release/"
-            echo "📤 Uploading release build to OSS release directory"
+            R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/release/"
+            echo "📤 Uploading release build to R2 release directory"
           fi
 
-          # Upload all rustfs zip files to OSS using glob pattern
-          echo "📤 Uploading all rustfs-*.zip files to $OSS_PATH..."
+          # Upload all rustfs zip files to R2 using S3-compatible API
+          echo "📤 Uploading all rustfs-*.zip files to $R2_PATH..."
           for zip_file in rustfs-*.zip; do
             if [[ -f "$zip_file" ]]; then
-              echo "Uploading: $zip_file to $OSS_PATH..."
-              $OSSUTIL_BIN cp "$zip_file" "$OSS_PATH" --force
+              echo "Uploading: $zip_file to $R2_PATH..."
+              aws s3 cp "$zip_file" "$R2_PATH" --endpoint-url "$R2_ENDPOINT" --only-show-errors
               echo "✅ Uploaded: $zip_file"
             fi
           done
@@ -609,7 +674,7 @@ jobs:
       release_url: ${{ steps.create.outputs.release_url }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
 
@@ -693,10 +758,10 @@ jobs:
       actions: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: ./artifacts
           pattern: rustfs-*
@@ -732,12 +797,6 @@ jobs:
             sha256sum *.zip > SHA256SUMS
             sha512sum *.zip > SHA512SUMS
           fi
-
-          # Create signature placeholder files
-          for file in *.zip; do
-            echo "# Signature for $file" > "${file}.asc"
-            echo "# GPG signature will be added in future versions" >> "${file}.asc"
-          done
 
           cd ..
           python3 scripts/security/generate_release_supply_chain_assets.py \
@@ -776,11 +835,12 @@ jobs:
 
           echo "✅ All assets uploaded successfully"
 
-  # Update latest.json for stable releases only
+  # Update latest.json for stable releases only: prerelease tags (alpha/beta/
+  # rc) must never overwrite the stable version pointer.
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type == 'release'
     runs-on: ubuntu-latest
     steps:
       - name: Update latest.json
@@ -803,8 +863,10 @@ jobs:
           OSSUTIL_VERSION="2.1.1"
           OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
           OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-amd64"
+          OSSUTIL_SHA256="60f3a808cbbdfd4b5269b8f967c6a66f564c9dacff52d93a5d21a588976ab5a2"
 
-          curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          curl --fail -L -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          printf '%s  %s\n' "$OSSUTIL_SHA256" "$OSSUTIL_ZIP" | sha256sum -c -
           unzip "$OSSUTIL_ZIP"
           OSSUTIL_BIN="${RUNNER_TEMP}/ossutil"
           mv "${OSSUTIL_DIR}/ossutil" "$OSSUTIL_BIN"
@@ -837,7 +899,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Update release notes and publish
         env:

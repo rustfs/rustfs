@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use super::*;
+use crate::core::pools::local_decommission_queue_prefix;
 use crate::error::is_err_decommission_running;
-use crate::global::{
-    GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
-    get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
-};
+use crate::runtime::sources as runtime_sources;
+use crate::storage_api_contracts::object::EcstoreObjectIO;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -27,7 +26,7 @@ const EVENT_DECOMMISSION_RESUME_FAILED: &str = "decommission_resume_failed";
 const EVENT_STORE_FORMAT_RETRY: &str = "store_format_retry";
 const EVENT_ECSTORE_INIT_STATUS: &str = "ecstore_init_status";
 
-fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
+fn pool_first_endpoint_is_local(pool: &crate::layout::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
 }
 
@@ -54,6 +53,22 @@ fn should_retry_local_decommission_resume(err: &Error, attempt: usize) -> bool {
     matches!(err, Error::ConfigNotFound) && attempt < LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
 }
 
+fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_meta_loaded: bool) -> bool {
+    rebalance_meta_loaded && !decommission_running
+}
+
+fn pool_meta_has_active_decommission(meta: &PoolMeta) -> bool {
+    meta.pools.iter().any(|pool| {
+        pool.decommission
+            .as_ref()
+            .is_some_and(|info| info.has_decommission_state() && !info.complete && !info.failed && !info.canceled)
+    })
+}
+
+fn should_auto_start_rebalance_after_recovered_meta(pool_meta: &PoolMeta, rebalance_meta_loaded: bool) -> bool {
+    should_auto_start_rebalance_after_init(pool_meta_has_active_decommission(pool_meta), rebalance_meta_loaded)
+}
+
 async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
     tokio::select! {
         _ = rx.cancelled() => false,
@@ -63,6 +78,22 @@ async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay:
 
 fn resolve_store_init_stage_result(result: Result<()>, stage: &str) -> Result<()> {
     result.map_err(|err| Error::other(format!("store init failed during {stage}: {err}")))
+}
+
+async fn load_pool_meta_for_startup<S>(pool: Arc<S>) -> Result<PoolMeta>
+where
+    S: EcstoreObjectIO,
+{
+    let mut meta = PoolMeta::default();
+    resolve_store_init_stage_result(meta.load_for_startup(pool).await, "load_pool_meta")?;
+    Ok(meta)
+}
+
+async fn save_validated_pool_meta_for_startup<S>(meta: &PoolMeta, pools: Vec<Arc<S>>) -> Result<()>
+where
+    S: EcstoreObjectIO,
+{
+    resolve_store_init_stage_result(meta.save_for_startup(pools).await, "save_validated_pool_meta")
 }
 
 async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken, pool_indices: Vec<usize>) {
@@ -154,11 +185,11 @@ impl ECStore {
         );
         let mut host = address.ip().to_string();
         if host.is_empty() {
-            host = GLOBAL_RUSTFS_HOST.read().await.to_string()
+            host = runtime_sources::rustfs_host().await
         }
         let mut port = address.port().to_string();
         if port.is_empty() {
-            port = GLOBAL_RUSTFS_PORT.read().await.to_string()
+            port = runtime_sources::rustfs_port().to_string()
         }
         debug!(
             event = EVENT_ECSTORE_INIT_STATUS,
@@ -188,7 +219,7 @@ impl ECStore {
             // periodic monitoring until format loading succeeds. Startup RPC
             // failures can still spawn recovery probes for peers that come up
             // after this node.
-            let (disks, errs) = store_init::init_disks(
+            let (disks, errs) = init_format::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
@@ -203,7 +234,7 @@ impl ECStore {
                 let mut times = 0;
                 let mut interval = 1;
                 loop {
-                    match store_init::connect_load_init_formats(
+                    match init_format::connect_load_init_formats(
                         pool_first_is_local,
                         &disks,
                         pool_eps.set_count,
@@ -272,8 +303,8 @@ impl ECStore {
             }
 
             for disk in disks.iter() {
-                if disk.is_some() && disk.as_ref().unwrap().is_local() {
-                    local_disks.push(disk.as_ref().unwrap().clone());
+                if disk.is_some() && disk.as_ref().expect("operation should succeed").is_local() {
+                    local_disks.push(disk.as_ref().expect("operation should succeed").clone());
                 }
             }
 
@@ -284,12 +315,8 @@ impl ECStore {
         }
 
         // Replace the local disk
-        if !is_dist_erasure().await {
-            let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
-            for disk in local_disks {
-                let path = disk.endpoint().to_string();
-                global_local_disk_map.insert(path, Some(disk.clone()));
-            }
+        if !runtime_sources::setup_is_dist_erasure().await {
+            runtime_sources::record_local_disks(local_disks).await;
         }
 
         let peer_sys = S3PeerSys::new(&endpoint_pools);
@@ -305,20 +332,16 @@ impl ECStore {
             pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
-
-            local_disk_map: GLOBAL_LOCAL_DISK_MAP.clone(),
-            local_disk_id_map: GLOBAL_LOCAL_DISK_ID_MAP.clone(),
-            local_disk_set_drives: GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
-            tier_config_mgr: GLOBAL_TierConfigMgr.clone(),
-            event_notifier: GLOBAL_EventNotifier.clone(),
-            bucket_monitor: OnceLock::new(),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
+            // Adopt the process bootstrap context so startup writes (erasure
+            // type recorded before this point) and later reads share one cell.
+            ctx: crate::runtime::instance::bootstrap_ctx(),
         });
 
         // Only set it when the global deployment ID is not yet configured
-        if let Some(dep_id) = deployment_id
-            && get_global_deployment_id().is_none()
-        {
-            set_global_deployment_id(dep_id);
+        if let Some(dep_id) = deployment_id {
+            runtime_sources::ensure_deployment_id(dep_id);
         }
 
         let wait_sec = 5;
@@ -341,59 +364,61 @@ impl ECStore {
             break;
         }
 
-        set_object_layer(ec.clone()).await;
-
-        if let Some(monitor) = get_global_bucket_monitor() {
-            let _ = ec.bucket_monitor.set(monitor);
-        }
+        runtime_sources::publish_object_store(ec.clone()).await;
 
         Ok(ec)
     }
 
     #[instrument(level = "debug", skip(self, rx))]
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
-        GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
+        runtime_sources::ensure_boot_time().await;
 
-        resolve_store_init_stage_result(self.load_rebalance_meta().await, "load_rebalance_meta")?;
-        if self.rebalance_meta.read().await.is_some() {
-            resolve_store_init_stage_result(self.start_rebalance().await, "start_rebalance")?;
-        }
-
-        let mut meta = PoolMeta::default();
-        resolve_store_init_stage_result(
-            meta.load(
-                self.pools
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| Error::other("store init failed: no storage pools available"))?,
-                self.pools.clone(),
-            )
-            .await,
-            "load_pool_meta",
-        )?;
+        let meta = load_pool_meta_for_startup(
+            self.pools
+                .first()
+                .cloned()
+                .ok_or_else(|| Error::other("store init failed: no storage pools available"))?,
+        )
+        .await?;
         let update = meta.validate(self.pools.clone())?;
-        let endpoints = get_global_endpoints();
-        let should_persist_pool_meta = is_first_cluster_node_local().await;
+        let endpoints = runtime_sources::endpoint_pools_or_default();
+        let should_persist_pool_meta = runtime_sources::first_cluster_node_is_local().await;
 
-        if !update {
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                *pool_meta = meta.clone();
-            }
+        let installed_pool_meta = if !update {
+            meta.clone()
         } else {
             let new_meta = PoolMeta::new(&self.pools, &meta);
             // Only one local node should persist validated pool metadata here; otherwise
             // distributed startup can race on the same lock and replay the prior init bug.
             if should_persist_pool_meta {
-                resolve_store_init_stage_result(new_meta.save(self.pools.clone()).await, "save_validated_pool_meta")?;
+                save_validated_pool_meta_for_startup(&new_meta, self.pools.clone()).await?;
             }
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                *pool_meta = new_meta;
-            }
+            new_meta
+        };
+
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            *pool_meta = installed_pool_meta.clone();
         }
 
-        let pools = meta.return_resumable_pools();
+        resolve_store_init_stage_result(self.load_rebalance_meta().await, "load_rebalance_meta")?;
+        let rebalance_meta_loaded = self.rebalance_meta.read().await.is_some();
+        let decommission_running =
+            pool_meta_has_active_decommission(&installed_pool_meta) || self.is_decommission_running().await;
+        if should_auto_start_rebalance_after_init(decommission_running, rebalance_meta_loaded) {
+            resolve_store_init_stage_result(self.start_rebalance().await, "start_rebalance")?;
+        } else if decommission_running && rebalance_meta_loaded {
+            warn!(
+                event = EVENT_ECSTORE_INIT_STATUS,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                stage = "start_rebalance",
+                reason = "active_decommission",
+                "Deferred rebalance auto-start during store init because decommission is active"
+            );
+        }
+
+        let pools = installed_pool_meta.return_resumable_pools();
         let mut pool_indices = Vec::with_capacity(pools.len());
 
         for p in pools.iter() {
@@ -407,30 +432,27 @@ impl ECStore {
             }
         }
 
-        if !pool_indices.is_empty() {
-            let idx = pool_indices[0];
-            if should_resume_local_decommission(&endpoints, idx)? {
-                let store = self.clone();
+        let local_pool_indices = local_decommission_queue_prefix(&endpoints, &pool_indices)?;
+        if !local_pool_indices.is_empty() {
+            let store = self.clone();
 
-                tokio::spawn(async move {
-                    if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
-                        return;
-                    }
-                    resume_local_decommission_after_init(store, rx, pool_indices).await;
-                });
-            }
+            tokio::spawn(async move {
+                if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
+                    return;
+                }
+                resume_local_decommission_after_init(store, rx, local_pool_indices).await;
+            });
         }
 
-        let num_nodes = get_global_endpoints().get_nodes().len() as u64;
-        init_global_bucket_monitor(num_nodes);
+        runtime_sources::init_bucket_monitor_for_current_endpoints();
 
         init_background_expiry(self.clone()).await;
         crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_stale_multipart_upload_cleanup(self.clone());
 
         TransitionState::init(self.clone()).await;
-        crate::tier::tier::try_migrate_tiering_config(self.clone()).await;
+        crate::services::tier::tier::try_migrate_tiering_config(self.clone()).await;
 
-        if let Err(err) = GLOBAL_TierConfigMgr.write().await.init(self.clone()).await {
+        if let Err(err) = runtime_sources::init_tier_config_mgr(self.clone()).await {
             info!("TierConfigMgr init error: {}", err);
         }
 
@@ -447,16 +469,137 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, pool_first_endpoint_is_local, resolve_store_init_stage_result,
-        should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, load_pool_meta_for_startup, pool_first_endpoint_is_local,
+        resolve_store_init_stage_result, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
+        should_auto_start_rebalance_after_recovered_meta, should_resume_local_decommission,
+        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     use crate::{
+        core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
         disk::endpoint::Endpoint,
-        endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-        error::StorageError,
+        error::{Error, Result, StorageError},
+        layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+        object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+        services::rebalance::RebalanceMeta,
+        storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec},
     };
-    use std::time::Duration;
+    use http::HeaderMap;
+    use std::{
+        io::Cursor,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+    use time::OffsetDateTime;
     use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug)]
+    struct StartupPoolMetaStorage {
+        read_payload: Vec<u8>,
+        read_without_lock: AtomicBool,
+        wrote_without_lock: AtomicBool,
+        wrote_with_max_parity: AtomicBool,
+    }
+
+    impl StartupPoolMetaStorage {
+        fn new(read_payload: Vec<u8>) -> Self {
+            Self {
+                read_payload,
+                read_without_lock: AtomicBool::new(false),
+                wrote_without_lock: AtomicBool::new(false),
+                wrote_with_max_parity: AtomicBool::new(false),
+            }
+        }
+
+        fn object_info(&self, bucket: &str, object: &str, size: usize) -> ObjectInfo {
+            ObjectInfo {
+                bucket: bucket.to_string(),
+                name: object.to_string(),
+                size: size as i64,
+                actual_size: size as i64,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for StartupPoolMetaStorage {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            _range: Option<HTTPRangeSpec>,
+            _h: HeaderMap,
+            opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            assert!(opts.no_lock, "store init pool metadata load must not require namespace locks");
+            self.read_without_lock.store(true, Ordering::SeqCst);
+
+            Ok(GetObjectReader {
+                stream: Box::new(Cursor::new(self.read_payload.clone())),
+                object_info: self.object_info(bucket, object, self.read_payload.len()),
+                buffered_body: None,
+            })
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            _data: &mut PutObjReader,
+            opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            assert!(opts.no_lock, "store init pool metadata save must not require namespace locks");
+            self.wrote_without_lock.store(true, Ordering::SeqCst);
+            self.wrote_with_max_parity.store(opts.max_parity, Ordering::SeqCst);
+            Ok(self.object_info(bucket, object, 0))
+        }
+    }
+
+    fn init_test_pool_meta(decommission: Option<PoolDecommissionInfo>) -> PoolMeta {
+        PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission,
+            }],
+            dont_save: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_init_pool_meta_io_bypasses_namespace_lock_surface() {
+        let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+
+        let loaded = load_pool_meta_for_startup(storage.clone())
+            .await
+            .expect("startup pool metadata load should tolerate missing metadata without locks");
+        assert!(loaded.pools.is_empty());
+        assert!(storage.read_without_lock.load(Ordering::SeqCst));
+
+        let meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: Vec::new(),
+            dont_save: false,
+        };
+        save_validated_pool_meta_for_startup(&meta, vec![storage.clone()])
+            .await
+            .expect("startup pool metadata save should bypass locks");
+        assert!(storage.wrote_without_lock.load(Ordering::SeqCst));
+        assert!(storage.wrote_with_max_parity.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn test_should_resume_local_decommission_respects_local_flag() {
@@ -517,6 +660,43 @@ mod tests {
     #[test]
     fn test_should_retry_local_decommission_resume_rejects_non_config_errors() {
         assert!(!should_retry_local_decommission_resume(&StorageError::SlowDown, 0));
+    }
+
+    #[test]
+    fn test_should_auto_start_rebalance_after_init_allows_loaded_rebalance_without_decommission() {
+        assert!(should_auto_start_rebalance_after_init(false, true));
+    }
+
+    #[test]
+    fn test_should_auto_start_rebalance_after_init_rejects_active_decommission() {
+        assert!(!should_auto_start_rebalance_after_init(true, true));
+    }
+
+    #[test]
+    fn test_should_auto_start_rebalance_after_init_rejects_missing_rebalance_meta() {
+        assert!(!should_auto_start_rebalance_after_init(false, false));
+    }
+
+    #[test]
+    fn test_store_init_recovery_skips_rebalance_when_decommission_metadata_is_active() {
+        let pool_meta = init_test_pool_meta(Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::UNIX_EPOCH),
+            complete: false,
+            failed: false,
+            canceled: false,
+            ..Default::default()
+        }));
+        let rebalance_meta = Some(RebalanceMeta::default());
+
+        assert!(!should_auto_start_rebalance_after_recovered_meta(&pool_meta, rebalance_meta.is_some()));
+    }
+
+    #[test]
+    fn test_store_init_recovery_allows_rebalance_when_only_rebalance_metadata_exists() {
+        let pool_meta = init_test_pool_meta(None);
+        let rebalance_meta = Some(RebalanceMeta::default());
+
+        assert!(should_auto_start_rebalance_after_recovered_meta(&pool_meta, rebalance_meta.is_some()));
     }
 
     #[test]

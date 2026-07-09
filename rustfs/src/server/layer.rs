@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::runtime_sources;
 use crate::admin::console::is_console_path;
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
-    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report,
-    has_path_prefix, is_admin_path, is_table_catalog_path,
+    ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
+    MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
+    MINIO_HEALTH_READY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, build_health_response_parts,
+    collect_probe_readiness, has_path_prefix, is_admin_path, is_table_catalog_path,
 };
-use crate::storage::apply_cors_headers;
-use crate::storage::request_context::{
+use crate::storage_api::server::layer::apply_cors_headers;
+use crate::storage_api::server::layer::request_context::{
     RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
 };
 use bytes::Bytes;
@@ -883,8 +884,10 @@ fn resolve_public_health_probe(method: &Method, path: &str) -> Option<HealthProb
     }
 
     match path {
-        HEALTH_PREFIX | HEALTH_COMPAT_LIVE_PATH => Some(HealthProbe::Liveness),
-        HEALTH_READY_PATH => Some(HealthProbe::Readiness),
+        HEALTH_PREFIX | HEALTH_COMPAT_LIVE_PATH | MINIO_HEALTH_LIVE_PATH => Some(HealthProbe::Liveness),
+        HEALTH_READY_PATH | MINIO_HEALTH_READY_PATH => Some(HealthProbe::Readiness),
+        MINIO_HEALTH_CLUSTER_PATH => Some(HealthProbe::ClusterWrite),
+        MINIO_HEALTH_CLUSTER_READ_PATH => Some(HealthProbe::ClusterRead),
         _ => None,
     }
 }
@@ -903,7 +906,7 @@ fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
 }
 
 async fn health_kms_ready() -> bool {
-    let Some(service_manager) = rustfs_kms::get_global_kms_service_manager() else {
+    let Some(service_manager) = runtime_sources::current_kms_runtime_service_manager() else {
         return true;
     };
 
@@ -937,14 +940,15 @@ where
             .expect("failed to build health busy response");
     }
 
-    let readiness_report = collect_dependency_readiness_report().await;
+    let readiness_report = collect_probe_readiness(probe).await;
     let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
         Some(health_kms_ready().await)
     } else {
         None
     };
 
-    let response_parts = build_health_response_parts(method, probe, &readiness_report, "rustfs-endpoint", None, kms_ready);
+    let response_parts =
+        build_health_response_parts(method, probe, readiness_report.as_ref(), "rustfs-endpoint", None, kms_ready);
     let body = response_parts
         .payload
         .map(|payload| Bytes::from(serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec())))
@@ -1279,8 +1283,17 @@ impl ConditionalCorsLayer {
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
-    const EXCLUDED_EXACT_PATHS: &'static [&'static str] =
-        &["/health", "/health/live", "/health/ready", "/profile/cpu", "/profile/memory"];
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &[
+        "/health",
+        "/health/live",
+        "/health/ready",
+        "/minio/health/live",
+        "/minio/health/ready",
+        "/minio/health/cluster",
+        "/minio/health/cluster/read",
+        "/profile/cpu",
+        "/profile/memory",
+    ];
 
     fn is_s3_path(path: &str) -> bool {
         // Exclude Admin, Console, RPC, and configured special paths
@@ -1422,7 +1435,10 @@ where
                             .unwrap());
                     }
 
-                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                    let mut response = Response::builder()
+                        .status(StatusCode::OK)
+                        .body(ResBody::default())
+                        .expect("valid response body");
                     let cors_layer = ConditionalCorsLayer {
                         cors_origins: (*cors_origins).clone(),
                     };
@@ -1451,7 +1467,10 @@ where
                         let cors_allowed = cors_headers.contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN);
                         let status = if cors_allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
 
-                        let mut response = Response::builder().status(status).body(ResBody::default()).unwrap();
+                        let mut response = Response::builder()
+                            .status(status)
+                            .body(ResBody::default())
+                            .expect("valid response body");
                         if cors_allowed {
                             for (key, value) in cors_headers.iter() {
                                 response.headers_mut().insert(key, value.clone());
@@ -1461,7 +1480,10 @@ where
                     }
 
                     // No bucket-level CORS config: fall back to global/default CORS behavior.
-                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                    let mut response = Response::builder()
+                        .status(StatusCode::OK)
+                        .body(ResBody::default())
+                        .expect("valid response body");
                     cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
                     Ok(response)
                 });
@@ -1469,7 +1491,10 @@ where
 
             let request_headers_clone = request_headers.clone();
             return Box::pin(async move {
-                let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                let mut response = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(ResBody::default())
+                    .expect("valid response body");
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
                 };
@@ -1517,6 +1542,79 @@ where
             Ok(response)
         })
     }
+}
+
+/// Rewrites the request-target of a root-level double-slash `GET //` to `GET /`
+/// so it routes to `ListBuckets`, matching MinIO browser compatibility.
+///
+/// The AWS S3 browser client (SigV4) concatenates the endpoint with a leading
+/// slash and emits `GET //` for `ListBuckets`. The `s3s` path parser strips the
+/// single leading slash and then treats the remaining `/` as an empty bucket
+/// name, rejecting the request with `InvalidBucketName` before it is routed.
+/// MinIO's `api-router.go` registers an explicit `//` route to `ListBuckets`;
+/// this layer reproduces that behavior by collapsing the path to `/` up front.
+///
+/// The rewrite is intentionally limited to a path that is exactly `//` (optionally
+/// followed by a query string). It never touches bucket/object requests, so object
+/// keys with embedded or leading slashes are unaffected (those are normalized by
+/// `s3s` via `normalize_forward_slash_path`).
+#[derive(Clone)]
+pub struct DoubleSlashListBucketsCompatLayer;
+
+impl<S> Layer<S> for DoubleSlashListBucketsCompatLayer {
+    type Service = DoubleSlashListBucketsCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        DoubleSlashListBucketsCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct DoubleSlashListBucketsCompatService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for DoubleSlashListBucketsCompatService<S>
+where
+    S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    ResBody: Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<ReqBody>) -> Self::Future {
+        if req.method() == Method::GET
+            && let Some(rewritten) = rewrite_double_slash_root(req.uri())
+        {
+            *req.uri_mut() = rewritten;
+        }
+        self.inner.call(req)
+    }
+}
+
+/// Returns the `/`-rooted URI when `uri` has a request-target path of exactly `//`.
+///
+/// Returns `None` for every other path so the rewrite is confined to the
+/// root-level double-slash case.
+fn rewrite_double_slash_root(uri: &Uri) -> Option<Uri> {
+    if uri.path() != "//" {
+        return None;
+    }
+
+    let mut parts = uri.clone().into_parts();
+    let path_and_query = match uri.query() {
+        Some(query) => format!("/?{query}"),
+        None => "/".to_string(),
+    };
+    parts.path_and_query = Some(path_and_query.parse().ok()?);
+    Uri::from_parts(parts).ok()
 }
 
 #[cfg(test)]
@@ -1642,7 +1740,12 @@ mod tests {
             );
 
             let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
-            assert!(body.windows(br#""status":"#.len()).any(|window| window == br#""status":"#));
+            let payload: serde_json::Value =
+                serde_json::from_slice(&body).expect("public liveness health response should be valid JSON");
+            assert_eq!(payload["status"], "ok");
+            assert_eq!(payload["ready"], true);
+            assert!(payload.get("details").is_none());
+            assert!(payload.get("degradedReasons").is_none());
         })
         .await;
     }
@@ -1856,6 +1959,109 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn public_health_endpoint_layer_handles_minio_health_live_path() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(MINIO_HEALTH_LIVE_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_handles_minio_health_ready_head_before_inner_service() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::HEAD)
+                        .uri(MINIO_HEALTH_READY_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert!(response.status() == StatusCode::OK || response.status() == StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+            assert!(body.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_handles_minio_health_cluster_before_inner_service() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(MINIO_HEALTH_CLUSTER_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert!(response.status() == StatusCode::OK || response.status() == StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_handles_minio_health_cluster_read_before_inner_service() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(MINIO_HEALTH_CLUSTER_READ_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert!(response.status() == StatusCode::OK || response.status() == StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn public_health_endpoint_layer_forwards_unknown_health_path_when_endpoint_disabled() {
         async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
             let inner = CountingHybridService::default();
@@ -1867,6 +2073,31 @@ mod tests {
                     Request::builder()
                         .method(Method::GET)
                         .uri("/health/live")
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("inner response");
+
+            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_forwards_minio_health_alias_when_endpoint_disabled() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("false"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(MINIO_HEALTH_LIVE_PATH)
                         .body(Full::<Bytes>::from(Bytes::new()))
                         .expect("request"),
                 )
@@ -3188,5 +3419,83 @@ mod tests {
         assert!(output.contains("span-ctx"), "{output}");
         assert!(output.contains("500"), "{output}");
         assert!(output.contains("server_error"), "{output}");
+    }
+
+    #[test]
+    fn rewrite_double_slash_root_only_matches_exact_double_slash() {
+        // Exactly `//` is rewritten to `/` (query preserved).
+        assert_eq!(
+            rewrite_double_slash_root(&Uri::from_static("//")).map(|u| u.to_string()),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            rewrite_double_slash_root(&Uri::from_static("//?x-id=ListBuckets")).map(|u| u.to_string()),
+            Some("/?x-id=ListBuckets".to_string())
+        );
+
+        // Everything else is left untouched.
+        assert_eq!(rewrite_double_slash_root(&Uri::from_static("/")), None);
+        assert_eq!(rewrite_double_slash_root(&Uri::from_static("//bucket")), None);
+        assert_eq!(rewrite_double_slash_root(&Uri::from_static("/bucket")), None);
+        assert_eq!(rewrite_double_slash_root(&Uri::from_static("/bucket//key")), None);
+        assert_eq!(rewrite_double_slash_root(&Uri::from_static("///")), None);
+    }
+
+    /// Inner service that records the request-target path it received and
+    /// returns an empty response, so the layer's URI rewrite can be observed.
+    #[derive(Clone, Default)]
+    struct UriCaptureService {
+        path: Arc<Mutex<Option<String>>>,
+    }
+
+    impl<B> Service<Request<B>> for UriCaptureService {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<B>) -> Self::Future {
+            *self.path.lock().expect("path lock") = Some(req.uri().path().to_string());
+            ready(Ok(Response::new(Full::from(Bytes::new()))))
+        }
+    }
+
+    #[tokio::test]
+    async fn double_slash_compat_layer_rewrites_get_double_slash() {
+        let inner = UriCaptureService::default();
+        let seen = inner.path.clone();
+        let mut service = DoubleSlashListBucketsCompatLayer.layer(inner);
+
+        let observe = |seen: &Arc<Mutex<Option<String>>>| seen.lock().expect("path lock").clone();
+
+        // `GET //` becomes `GET /`.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("//")
+            .body(Full::<Bytes>::from(Bytes::new()))
+            .expect("request");
+        service.call(req).await.expect("response");
+        assert_eq!(observe(&seen).as_deref(), Some("/"));
+
+        // Non-GET `//` is not rewritten.
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("//")
+            .body(Full::<Bytes>::from(Bytes::new()))
+            .expect("request");
+        service.call(req).await.expect("response");
+        assert_eq!(observe(&seen).as_deref(), Some("//"));
+
+        // `GET //bucket` is not rewritten.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("//bucket")
+            .body(Full::<Bytes>::from(Bytes::new()))
+            .expect("request");
+        service.call(req).await.expect("response");
+        assert_eq!(observe(&seen).as_deref(), Some("//bucket"));
     }
 }

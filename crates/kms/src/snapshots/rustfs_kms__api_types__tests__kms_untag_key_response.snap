@@ -1,0 +1,9 @@
+---
+source: crates/kms/src/api_types.rs
+expression: "serde_json::to_value(UntagKeyResponse\n{\n    success: true, message: \"key tags removed\".to_string(), key_id:\n    \"key-a\".to_string(),\n}).expect(\"untag key response should serialize\")"
+---
+{
+  "key_id": "key-a",
+  "message": "key tags removed",
+  "success": true
+}

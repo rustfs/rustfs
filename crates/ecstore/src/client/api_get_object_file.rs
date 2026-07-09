@@ -11,31 +11,63 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
-use bytes::Bytes;
-use http::HeaderMap;
-use std::io::Cursor;
-#[cfg(not(windows))]
-use std::os::unix::fs::MetadataExt;
-#[cfg(not(windows))]
-use std::os::unix::fs::OpenOptionsExt;
+use std::io;
+use std::path::{Path, PathBuf};
+
 #[cfg(not(windows))]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
-use tokio::io::BufReader;
+
+use tokio::fs::{self, OpenOptions};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 use crate::client::{
-    api_error_response::err_invalid_argument,
-    api_get_options::GetObjectOptions,
-    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
+    api_error_response::err_invalid_argument, api_get_options::GetObjectOptions, transition_api::TransitionClient,
 };
+
+async fn prepare_download_target(file_path: &Path) -> io::Result<()> {
+    match fs::metadata(file_path).await {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(io::Error::other(err_invalid_argument("filename is a directory.")));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    if let Some(parent) = file_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).await?;
+
+        #[cfg(not(windows))]
+        {
+            let mut permissions = fs::metadata(parent).await?.permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(parent, permissions).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_part_path(file_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.part.rustfs", file_path.display()))
+}
+
+async fn open_download_part_file(file_part_path: &Path) -> io::Result<tokio::fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+
+    #[cfg(not(windows))]
+    options.mode(0o600);
+
+    options.open(file_part_path).await
+}
+
+async fn cleanup_part_file(file_part_path: &Path) {
+    let _ = fs::remove_file(file_part_path).await;
+}
 
 impl TransitionClient {
     pub async fn fget_object(
@@ -43,105 +75,85 @@ impl TransitionClient {
         bucket_name: &str,
         object_name: &str,
         file_path: &str,
-        opts: GetObjectOptions,
-    ) -> Result<(), std::io::Error> {
-        match std::fs::metadata(file_path) {
-            Ok(file_path_stat) => {
-                let ft = file_path_stat.file_type();
-                if ft.is_dir() {
-                    return Err(std::io::Error::other(err_invalid_argument("filename is a directory.")));
-                }
-            }
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
+        mut opts: GetObjectOptions,
+    ) -> Result<(), io::Error> {
+        let file_path = Path::new(file_path);
+        prepare_download_target(file_path).await?;
+
+        let file_part_path = build_part_path(file_path);
+        let mut file_part = open_download_part_file(&file_part_path).await?;
+        let existing_len = file_part.metadata().await?.len();
+        if existing_len > 0 {
+            opts.set_range(existing_len as i64, 0)?;
+            file_part.seek(SeekFrom::Start(existing_len)).await?;
         }
 
-        let path = std::path::Path::new(file_path);
-        if let Some(parent) = path.parent() {
-            if let Some(object_dir) = parent.file_name() {
-                match std::fs::create_dir_all(object_dir) {
-                    Ok(_) => {
-                        let dir = std::path::Path::new(object_dir);
-                        if let Ok(dir_stat) = dir.metadata() {
-                            #[cfg(not(windows))]
-                            dir_stat.permissions().set_mode(0o700);
-                        }
-                    }
-                    Err(err) => {
-                        return Err(std::io::Error::other(err));
-                    }
-                }
-            }
+        let (_object_info, _headers, mut object_reader) = self.get_object_inner(bucket_name, object_name, &opts).await?;
+        if let Err(err) = tokio::io::copy(&mut object_reader, &mut file_part).await {
+            cleanup_part_file(&file_part_path).await;
+            return Err(err);
         }
 
-        let object_stat = match self.stat_object(bucket_name, object_name, &opts).await {
-            Ok(object_stat) => object_stat,
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
-        };
-
-        let mut file_part_path = file_path.to_string();
-        file_part_path.push_str("" /*sum_sha256_hex(object_stat.etag.as_bytes())*/);
-        file_part_path.push_str(".part.rustfs");
-
-        #[cfg(not(windows))]
-        let file_part = match std::fs::OpenOptions::new().mode(0o600).open(file_part_path.clone()) {
-            Ok(file_part) => file_part,
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
-        };
-        #[cfg(windows)]
-        let file_part = match std::fs::OpenOptions::new().open(file_part_path.clone()) {
-            Ok(file_part) => file_part,
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
-        };
-
-        let mut close_and_remove = true;
-        /*defer(|| {
-            if close_and_remove {
-                _ = file_part.close();
-                let _ = std::fs::remove(file_part_path);
-            }
-        });*/
-
-        let st = match file_part.metadata() {
-            Ok(st) => st,
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
-        };
-
-        let mut opts = opts;
-        #[cfg(windows)]
-        if st.file_size() > 0 {
-            opts.set_range(st.file_size() as i64, 0);
+        if let Err(err) = file_part.flush().await {
+            cleanup_part_file(&file_part_path).await;
+            return Err(err);
         }
+        drop(file_part);
 
-        let object_reader = match self.get_object(bucket_name, object_name, &opts) {
-            Ok(object_reader) => object_reader,
-            Err(err) => {
-                return Err(std::io::Error::other(err));
-            }
-        };
-
-        /*if let Err(err) = std::fs::copy(file_part, object_reader) {
-            return Err(std::io::Error::other(err));
-        }*/
-
-        close_and_remove = false;
-        /*if let Err(err) = file_part.close() {
-            return Err(std::io::Error::other(err));
-        }*/
-
-        if let Err(err) = std::fs::rename(file_part_path, file_path) {
-            return Err(std::io::Error::other(err));
+        if let Err(err) = fs::rename(&file_part_path, file_path).await {
+            cleanup_part_file(&file_part_path).await;
+            return Err(err);
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn prepare_download_target_allows_missing_file_and_creates_parent_dirs() {
+        let dir = tempdir().expect("temp dir");
+        let target = dir.path().join("nested").join("object.bin");
+
+        prepare_download_target(&target)
+            .await
+            .expect("missing target should be accepted");
+
+        assert!(target.parent().expect("parent").exists(), "parent directory should be created");
+        assert!(
+            fs::metadata(&target).await.is_err(),
+            "preparing the target should not create the final file eagerly"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_download_target_rejects_directory_paths() {
+        let dir = tempdir().expect("temp dir");
+        let target_dir = dir.path().join("download-dir");
+        fs::create_dir_all(&target_dir).await.expect("target dir");
+
+        let err = prepare_download_target(&target_dir)
+            .await
+            .expect_err("directory targets must be rejected");
+
+        assert!(err.to_string().contains("directory"), "unexpected error for directory target: {err}");
+    }
+
+    #[tokio::test]
+    async fn open_download_part_file_creates_part_file() {
+        let dir = tempdir().expect("temp dir");
+        let target = dir.path().join("object.bin");
+        let part_path = build_part_path(&target);
+
+        let file = open_download_part_file(&part_path)
+            .await
+            .expect("part file should be created");
+        drop(file);
+
+        assert!(part_path.exists(), "part file should exist after creation");
     }
 }

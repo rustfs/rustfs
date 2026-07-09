@@ -676,3 +676,135 @@ fn policy_is_allowed(policy: Policy, args: ArgsBuilder) -> bool {
         deny_only: args.deny_only,
     }))
 }
+
+// Regression coverage for rustfs/backlog#1028: `Statement` equality must account for
+// `NotResource`. When it does not, `Policy::merge_policies`/`drop_duplicate_statements`
+// treat statements that differ only in `NotResource` as duplicates and drop one of them,
+// which can shrink Deny coverage and escalate privileges.
+
+fn get_object() -> rustfs_policy::policy::action::Action {
+    rustfs_policy::policy::action::Action::S3Action(GetObjectAction)
+}
+
+fn is_allowed_get_object(policy: &Policy, bucket: &str, object: &str) -> bool {
+    let conditions: HashMap<String, Vec<String>> = HashMap::new();
+    let claims: HashMap<String, Value> = HashMap::new();
+    let groups: Option<Vec<String>> = None;
+    pollster::block_on(policy.is_allowed(&Args {
+        account: "Q3AM3UQ867SPQQA43P2F",
+        groups: &groups,
+        action: "s3:GetObject".try_into().unwrap(),
+        bucket,
+        conditions: &conditions,
+        is_owner: false,
+        object,
+        claims: &claims,
+        deny_only: false,
+    }))
+}
+
+#[test]
+fn statements_differing_only_in_not_resource_are_not_equal() {
+    let base = Statement {
+        effect: Deny,
+        actions: ActionSet(vec![get_object()].into_iter().collect()),
+        not_resources: ResourceSet(
+            vec!["arn:aws:s3:::mybucket/public/*".try_into().unwrap()]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let other = Statement {
+        not_resources: ResourceSet(vec!["arn:aws:s3:::mybucket/logs/*".try_into().unwrap()].into_iter().collect()),
+        ..base.clone()
+    };
+    assert_ne!(base, other, "statements differing only in NotResource must not compare equal");
+}
+
+#[test]
+fn merge_keeps_deny_statements_differing_only_in_not_resource() {
+    let allow_all = Policy {
+        version: DEFAULT_VERSION.into(),
+        statements: vec![Statement {
+            effect: Allow,
+            actions: ActionSet(vec![get_object()].into_iter().collect()),
+            resources: ResourceSet(vec!["arn:aws:s3:::mybucket/*".try_into().unwrap()].into_iter().collect()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let deny_except_public = Policy {
+        version: DEFAULT_VERSION.into(),
+        statements: vec![Statement {
+            effect: Deny,
+            actions: ActionSet(vec![get_object()].into_iter().collect()),
+            not_resources: ResourceSet(
+                vec!["arn:aws:s3:::mybucket/public/*".try_into().unwrap()]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let deny_except_logs = Policy {
+        version: DEFAULT_VERSION.into(),
+        statements: vec![Statement {
+            effect: Deny,
+            actions: ActionSet(vec![get_object()].into_iter().collect()),
+            not_resources: ResourceSet(vec!["arn:aws:s3:::mybucket/logs/*".try_into().unwrap()].into_iter().collect()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let merged = Policy::merge_policies(vec![allow_all, deny_except_public, deny_except_logs]);
+    assert_eq!(
+        merged.statements.len(),
+        3,
+        "both Deny statements must survive the merge; dropping either shrinks Deny coverage"
+    );
+
+    // A request into public/* is denied only by the NotResource=[logs/*] statement. If that
+    // statement were dropped as a duplicate, the broad Allow would leak access.
+    assert!(
+        !is_allowed_get_object(&merged, "mybucket", "public/file.txt"),
+        "request into public/* must remain denied"
+    );
+}
+
+#[test]
+fn merge_keeps_allow_statements_differing_only_in_not_resource() {
+    let allow_except_public = Policy {
+        version: DEFAULT_VERSION.into(),
+        statements: vec![Statement {
+            effect: Allow,
+            actions: ActionSet(vec![get_object()].into_iter().collect()),
+            not_resources: ResourceSet(
+                vec!["arn:aws:s3:::mybucket/public/*".try_into().unwrap()]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let allow_except_logs = Policy {
+        version: DEFAULT_VERSION.into(),
+        statements: vec![Statement {
+            effect: Allow,
+            actions: ActionSet(vec![get_object()].into_iter().collect()),
+            not_resources: ResourceSet(vec!["arn:aws:s3:::mybucket/logs/*".try_into().unwrap()].into_iter().collect()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let merged = Policy::merge_policies(vec![allow_except_public, allow_except_logs]);
+    assert_eq!(
+        merged.statements.len(),
+        2,
+        "both Allow statements must survive the merge; neither may be dropped as a duplicate"
+    );
+}

@@ -13,20 +13,26 @@
 // limitations under the License.
 
 use crate::admin::handlers::target_descriptor::AdminTargetSpec;
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context};
+use crate::admin::storage_api::config::{read_admin_config_without_migrate, save_admin_server_config};
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::server_config::Config;
 use s3s::{S3Result, s3_error};
 
-pub(crate) async fn load_server_config_from_store() -> S3Result<Config> {
-    let Some(store) = resolve_object_store_handle() else {
+pub(crate) async fn load_server_config_from_store_for_context(context: Option<&AppContext>) -> S3Result<Config> {
+    let Some(store) = current_object_store_handle_for_context(context) else {
         return Ok(Config::new());
     };
 
-    crate::admin::storage_compat::ecstore::config::com::read_config_without_migrate(store)
+    read_admin_config_without_migrate(store)
         .await
         .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))
+}
+
+pub(crate) async fn load_server_config_from_store() -> S3Result<Config> {
+    let context = current_app_context();
+    load_server_config_from_store_for_context(context.as_deref()).await
 }
 
 fn has_any_audit_targets(specs: &[AdminTargetSpec], config: &Config) -> bool {
@@ -74,15 +80,19 @@ pub(crate) async fn apply_audit_runtime_config(specs: &[AdminTargetSpec], config
     Ok(())
 }
 
-pub(crate) async fn update_audit_config_and_reload<F>(specs: &[AdminTargetSpec], mut modifier: F) -> S3Result<()>
+async fn update_audit_config_and_reload_for_context<F>(
+    context: Option<&AppContext>,
+    specs: &[AdminTargetSpec],
+    mut modifier: F,
+) -> S3Result<()>
 where
     F: FnMut(&mut Config) -> bool,
 {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = current_object_store_handle_for_context(context) else {
         return Err(s3_error!(InternalError, "server storage not initialized"));
     };
 
-    let mut config = crate::admin::storage_compat::ecstore::config::com::read_config_without_migrate(store.clone())
+    let mut config = read_admin_config_without_migrate(store.clone())
         .await
         .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
 
@@ -90,11 +100,19 @@ where
         return Ok(());
     }
 
-    crate::admin::storage_compat::ecstore::config::com::save_server_config(store, &config)
+    save_admin_server_config(store, &config)
         .await
         .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
 
     apply_audit_runtime_config(specs, config).await
+}
+
+pub(crate) async fn update_audit_config_and_reload<F>(specs: &[AdminTargetSpec], modifier: F) -> S3Result<()>
+where
+    F: FnMut(&mut Config) -> bool,
+{
+    let context = current_app_context();
+    update_audit_config_and_reload_for_context(context.as_deref(), specs, modifier).await
 }
 
 pub(crate) async fn set_audit_target_config(

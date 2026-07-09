@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::arn::TargetID;
+use crate::plugin::PluginEvent;
 use crate::store::{Key, QueueStore, Store};
 use crate::{StoreError, TargetError, TargetLog};
 use async_trait::async_trait;
 use rustfs_s3_types::EventName;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use std::future::Future;
@@ -96,7 +96,7 @@ impl TargetDeliveryCounters {
 #[async_trait]
 pub trait Target<E>: Send + Sync + 'static
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     /// Returns the ID of the target
     fn id(&self) -> TargetID;
@@ -123,7 +123,15 @@ where
 
         let raw = match store.get_raw(&key) {
             Ok(raw) => raw,
-            Err(StoreError::NotFound) => return Ok(()),
+            Err(StoreError::NotFound) => {
+                // The backing file is missing or empty (a zero-byte file reads as
+                // NotFound). Left in the index it would be "replayed" forever and
+                // permanently occupy a queue slot, eventually rejecting new events
+                // with LimitExceeded. Purge the stale index entry (and any residual
+                // file) before returning.
+                delete_stored_payload(store, &key)?;
+                return Ok(());
+            }
             Err(err) => return Err(TargetError::Storage(format!("Failed to read queued payload from store: {err}"))),
         };
 
@@ -278,9 +286,21 @@ impl QueuedPayload {
             return Err(TargetError::Serialization("Queued payload metadata length exceeds input".to_string()));
         }
 
-        let meta = serde_json::from_slice(&raw[meta_start..meta_end])
+        let meta: QueuedPayloadMeta = serde_json::from_slice(&raw[meta_start..meta_end])
             .map_err(|err| TargetError::Serialization(format!("Failed to deserialize queued payload metadata: {err}")))?;
         let body = raw[meta_end..].to_vec();
+
+        // Reject torn/truncated writes: the body length recorded at encode time
+        // must match the bytes actually present. Without this, a partially
+        // written file (e.g. a crash mid-write) would decode into a silently
+        // truncated payload and be delivered as if complete.
+        if body.len() != meta.payload_len {
+            return Err(TargetError::Serialization(format!(
+                "Queued payload body length mismatch: header declares {} bytes but {} were present",
+                meta.payload_len,
+                body.len()
+            )));
+        }
 
         Ok(Self { meta, body })
     }
@@ -382,17 +402,56 @@ impl std::fmt::Display for TargetType {
     }
 }
 
+/// Stable, deterministic 64-bit FNV-1a hash used only to disambiguate queue
+/// directory names. It must stay identical across restarts and releases so a
+/// target keeps resolving to the same on-disk queue directory, hence a fixed
+/// inline implementation rather than `DefaultHasher` (whose algorithm is not
+/// contractually stable).
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Maps a target-id component to a filesystem-safe queue directory name.
+///
+/// Path-unsafe characters are replaced with `_`. Because that replacement is
+/// lossy, two distinct ids (e.g. `a/b` and `a_b`) could otherwise collapse to
+/// the same directory and interleave their persisted events. To prevent that,
+/// whenever any character had to be replaced we append a short hash of the
+/// original component, guaranteeing distinct ids map to distinct directories.
+///
+/// Ids that are already path-safe are returned unchanged, preserving the
+/// on-disk directory layout for existing deployments (no queue migration).
 pub(crate) fn sanitize_queue_dir_component(component: &str) -> String {
     let mut sanitized = String::with_capacity(component.len());
+    let mut lossy = false;
     for ch in component.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
             sanitized.push(ch);
         } else {
             sanitized.push('_');
+            lossy = true;
         }
     }
 
-    if sanitized.is_empty() { "_".to_string() } else { sanitized }
+    if sanitized.is_empty() {
+        // An entirely non-safe id would otherwise all collapse to "_"; key it by
+        // the original bytes so distinct ids stay distinct.
+        return format!("_{:016x}", fnv1a_hash(component.as_bytes()));
+    }
+
+    if lossy {
+        // Disambiguate the lossy replacement so different originals cannot alias.
+        return format!("{sanitized}-{:016x}", fnv1a_hash(component.as_bytes()));
+    }
+
+    sanitized
 }
 
 pub(crate) fn queue_store_subdir_name(target_type: &str, target_id: &str) -> String {
@@ -428,7 +487,7 @@ pub fn decode_object_name(encoded: &str) -> Result<String, TargetError> {
 
 pub(crate) fn build_queued_payload<E>(event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     build_queued_payload_with_records(event, vec![event.data.clone()])
 }
@@ -438,7 +497,7 @@ pub(crate) fn build_queued_payload_with_records<E, R>(
     records: Vec<R>,
 ) -> Result<QueuedPayload, TargetError>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
     R: Serialize,
 {
     let object_name = decode_object_name(&event.object_name)?;
@@ -686,14 +745,15 @@ mod tests {
 
     #[test]
     fn queued_payload_round_trips_meta_and_body() {
+        let body = br#"{"ok":true}"#.to_vec();
         let meta = QueuedPayloadMeta::new(
             EventName::ObjectCreatedPut,
             "bucket-a".to_string(),
             "folder/object.txt".to_string(),
             "application/json",
-            12,
+            body.len(),
         );
-        let payload = QueuedPayload::new(meta.clone(), br#"{"ok":true}"#.to_vec());
+        let payload = QueuedPayload::new(meta.clone(), body);
 
         let encoded = payload.encode().unwrap();
         let decoded = QueuedPayload::decode(&encoded).unwrap();
@@ -863,12 +923,137 @@ mod tests {
     #[test]
     fn sanitize_queue_dir_component_replaces_non_path_safe_characters() {
         let sanitized = sanitize_queue_dir_component("tenant:alpha/beta\\gamma?*");
-        assert_eq!(sanitized, "tenant_alpha_beta_gamma__");
+        // The readable, path-safe prefix is preserved, followed by a disambiguating
+        // hash suffix because the replacement was lossy.
+        assert!(
+            sanitized.starts_with("tenant_alpha_beta_gamma__-"),
+            "unexpected sanitized value: {sanitized}"
+        );
+        // Deterministic across calls (must be stable across restarts).
+        assert_eq!(sanitized, sanitize_queue_dir_component("tenant:alpha/beta\\gamma?*"));
+    }
+
+    #[test]
+    fn sanitize_queue_dir_component_preserves_path_safe_ids() {
+        // Path-safe ids are returned unchanged so existing on-disk queue
+        // directories keep resolving (no migration on upgrade).
+        assert_eq!(sanitize_queue_dir_component("plain-id_1.2"), "plain-id_1.2");
+    }
+
+    #[test]
+    fn sanitize_queue_dir_component_disambiguates_colliding_ids() {
+        // Two distinct ids that used to collapse onto the same directory must now
+        // map to different directories.
+        let a = sanitize_queue_dir_component("a/b");
+        let b = sanitize_queue_dir_component("a_b");
+        assert_ne!(a, b, "distinct ids must not share a queue directory");
     }
 
     #[test]
     fn queue_store_subdir_name_sanitizes_target_id() {
         let dir = queue_store_subdir_name("redis", "tenant:alpha");
-        assert_eq!(dir, "rustfs-redis-tenant_alpha");
+        assert!(dir.starts_with("rustfs-redis-tenant_alpha-"), "unexpected subdir: {dir}");
+    }
+
+    #[derive(Clone)]
+    struct StoreBackedTarget {
+        id: TargetID,
+        store: QueueStore<QueuedPayload>,
+    }
+
+    #[async_trait]
+    impl Target<String> for StoreBackedTarget {
+        fn id(&self) -> TargetID {
+            self.id.clone()
+        }
+
+        async fn is_active(&self) -> Result<bool, TargetError> {
+            Ok(true)
+        }
+
+        async fn save(&self, _event: Arc<EntityTarget<String>>) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), TargetError> {
+            Ok(())
+        }
+
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
+            Some(&self.store)
+        }
+
+        fn clone_dyn(&self) -> Box<dyn Target<String> + Send + Sync> {
+            Box::new(self.clone())
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn send_from_store_purges_missing_or_empty_entry() {
+        let dir = std::env::temp_dir().join(format!("rustfs-send-from-store-{}", Uuid::new_v4()));
+        let store = QueueStore::<QueuedPayload>::new_with_compression(&dir, 8, ".event", false);
+        store.open().unwrap();
+
+        // Enqueue a valid payload, then truncate its backing file to zero bytes to
+        // simulate a torn write: read_file now reports NotFound while the index
+        // still counts the entry.
+        let meta = QueuedPayloadMeta::new(
+            EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            7,
+        );
+        let encoded = QueuedPayload::new(meta, br#"{"x":1}"#.to_vec()).encode().unwrap();
+        let key = store.put_raw(&encoded).unwrap();
+        assert_eq!(store.len(), 1);
+
+        let event_file = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_file())
+            .expect("event file should exist");
+        std::fs::write(&event_file, b"").unwrap();
+
+        let target = StoreBackedTarget {
+            id: TargetID::new("primary".to_string(), "webhook".to_string()),
+            store: store.clone(),
+        };
+
+        // A NotFound/empty entry must be purged (index + file) rather than
+        // silently skipped and replayed forever.
+        target.send_from_store(key).await.unwrap();
+        assert_eq!(store.len(), 0, "stale entry must be removed from the index");
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn queued_payload_decode_rejects_body_length_mismatch() {
+        let meta = QueuedPayloadMeta::new(
+            EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            11,
+        );
+        let payload = QueuedPayload::new(meta, br#"{"ok":true}"#.to_vec());
+        let mut encoded = payload.encode().unwrap();
+
+        // Drop the final body byte, simulating a torn/truncated write. The header
+        // still declares the original payload_len, so decode must reject it rather
+        // than hand back a silently truncated body.
+        encoded.pop();
+        let err = QueuedPayload::decode(&encoded).unwrap_err();
+        assert!(err.to_string().contains("body length mismatch"), "unexpected error: {err}");
     }
 }

@@ -1,7 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustfs_ecstore::bucket::utils::{check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix};
+mod path_containment_storage_api;
+use path_containment_storage_api::{check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix};
 use rustfs_utils::path::{clean, path_join};
 use std::path::{Path, PathBuf};
 
@@ -68,8 +69,23 @@ fn materialize_object(base: String, extra: &str, flags: &[String]) -> String {
 
 fn has_dot_segments(path: &str) -> bool {
     path.split(['/', '\\']).any(|segment| {
-        let trimmed = segment.trim();
-        trimmed == "." || trimmed == ".."
+        let mut bytes = segment.as_bytes();
+
+        // Match ecstore's path-component check. `str::trim()` also trims
+        // Unicode whitespace such as vertical tab, which would reject object
+        // keys that the production validator accepts as ordinary path bytes.
+        while let Some((first, rest)) = bytes.split_first()
+            && first.is_ascii_whitespace()
+        {
+            bytes = rest;
+        }
+        while let Some((last, rest)) = bytes.split_last()
+            && last.is_ascii_whitespace()
+        {
+            bytes = rest;
+        }
+
+        bytes == b"." || bytes == b".."
     })
 }
 

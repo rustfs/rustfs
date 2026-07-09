@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use axum::http::HeaderMap;
 use rustfs_config::{
-    DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_MAX_HOPS, ENV_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_VALIDATION_MODE,
+    DEFAULT_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_EXTRA_PROXIES, ENV_TRUSTED_PROXY_IPS, ENV_TRUSTED_PROXY_MAX_HOPS,
+    ENV_TRUSTED_PROXY_PROXIES, ENV_TRUSTED_PROXY_VALIDATION_MODE,
 };
-use rustfs_trusted_proxies::{ConfigLoader, TrustedProxy, TrustedProxyConfig, ValidationMode};
+use rustfs_trusted_proxies::{ConfigLoader, ProxyValidator, TrustedProxy, TrustedProxyConfig, ValidationMode};
 use serial_test::serial;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 #[test]
 #[serial]
@@ -127,8 +129,65 @@ fn test_private_network_check() {
 
 #[test]
 fn test_default_values() {
-    assert_eq!(
-        DEFAULT_TRUSTED_PROXY_PROXIES,
-        "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8"
+    // The default trusted set is loopback-only. Private/RFC1918 ranges must not
+    // be trusted unless an operator explicitly adds them.
+    assert_eq!(DEFAULT_TRUSTED_PROXY_PROXIES, "127.0.0.1,::1");
+}
+
+#[test]
+#[serial]
+fn test_default_config_does_not_trust_private_peer() {
+    // Under the DEFAULT configuration the trusted set is loopback-only, so a
+    // peer from a private range must not be treated as a trusted proxy.
+    temp_env::with_vars_unset(
+        vec![
+            ENV_TRUSTED_PROXY_PROXIES,
+            ENV_TRUSTED_PROXY_EXTRA_PROXIES,
+            ENV_TRUSTED_PROXY_IPS,
+        ],
+        || {
+            let config = ConfigLoader::from_env_or_default().proxy;
+
+            let loopback = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 9000);
+            assert!(config.is_trusted(&loopback), "loopback must remain trusted by default");
+
+            let private_peer = SocketAddr::new(IpAddr::from([10, 1, 2, 3]), 9000);
+            assert!(
+                !config.is_trusted(&private_peer),
+                "private-range peer must not be trusted under the default config"
+            );
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn test_default_config_ignores_spoofed_forwarded_from_private_peer() {
+    // A peer from a private range (10.1.2.3) sending a spoofed X-Forwarded-For
+    // must NOT override the socket peer, because private ranges are no longer
+    // trusted under the default configuration.
+    temp_env::with_vars_unset(
+        vec![
+            ENV_TRUSTED_PROXY_PROXIES,
+            ENV_TRUSTED_PROXY_EXTRA_PROXIES,
+            ENV_TRUSTED_PROXY_IPS,
+        ],
+        || {
+            let config = ConfigLoader::from_env_or_default().proxy;
+            let validator = ProxyValidator::new(config, None);
+
+            let peer_addr = Some(SocketAddr::new(IpAddr::from([10, 1, 2, 3]), 9000));
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+
+            let info = validator.validate_request(peer_addr, &headers).unwrap();
+
+            assert!(!info.is_from_trusted_proxy, "private peer must not be a trusted proxy by default");
+            assert_eq!(
+                info.real_ip,
+                IpAddr::from([10, 1, 2, 3]),
+                "spoofed X-Forwarded-For must not override the socket peer"
+            );
+        },
     );
 }

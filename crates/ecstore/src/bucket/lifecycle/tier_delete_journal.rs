@@ -19,13 +19,18 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::bucket::lifecycle::config_boundary;
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
-use crate::config::com::{delete_config, read_config, save_config};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::storage_api_contracts::{
+    list::ListOperations as _,
+    object::{DeletedObject, ObjectIO, ObjectOperations, ObjectToDelete},
+    range::HTTPRangeSpec,
+};
 use crate::store::ECStore;
-use crate::store_api::{ObjectIO, ObjectOperations};
-use rustfs_storage_api::ListOperations as _;
+use rustfs_filemeta::FileInfo;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
@@ -58,7 +63,12 @@ impl PersistedTierDeleteJournalEntry {
         if self.version != TIER_DELETE_JOURNAL_VERSION {
             return Err(Error::other(format!("unsupported tier delete journal version {}", self.version)));
         }
-        if self.obj_name.is_empty() || self.version_id.is_empty() || self.tier_name.is_empty() {
+        // Empty `version_id` is a legal sentinel for objects transitioned to an
+        // unversioned remote tier (see CLAUDE.md: a tier version of `None`/`""`
+        // means the tier bucket is unversioned, so the remote delete is issued
+        // without a versionId). Only reject entries missing the object or tier
+        // name, which are always populated for a TRANSITION_COMPLETE object.
+        if self.obj_name.is_empty() || self.tier_name.is_empty() {
             return Err(Error::other("tier delete journal entry is incomplete"));
         }
         Ok(Jentry {
@@ -104,19 +114,34 @@ fn encode_tier_delete_journal_entry(je: &Jentry) -> Result<Vec<u8>> {
 
 pub async fn persist_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
 where
-    S: ObjectIO,
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = http::HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        >,
 {
     let data = encode_tier_delete_journal_entry(je).map_err(std::io::Error::other)?;
-    save_config(api, &tier_delete_journal_object_name(je), data)
+    config_boundary::save_config(api, &tier_delete_journal_object_name(je), data)
         .await
         .map_err(std::io::Error::other)
 }
 
 pub async fn remove_tier_delete_journal_entry<S>(api: Arc<S>, je: &Jentry) -> std::io::Result<()>
 where
-    S: ObjectOperations,
+    S: ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
-    match delete_config(api, &tier_delete_journal_object_name(je)).await {
+    match config_boundary::delete_config(api, &tier_delete_journal_object_name(je)).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
         Err(err) => Err(std::io::Error::other(err)),
     }
@@ -160,7 +185,7 @@ pub async fn recover_tier_delete_journal_entries(
 
     for object in list.objects {
         stats.scanned += 1;
-        let data = match read_config(api.clone(), &object.name).await {
+        let data = match config_boundary::read_config(api.clone(), &object.name).await {
             Ok(data) => data,
             Err(Error::ConfigNotFound) => continue,
             Err(err) => {
@@ -299,5 +324,40 @@ mod tests {
         let err = decode_tier_delete_journal_entry(payload).expect_err("incomplete journal entry should be rejected");
 
         assert!(err.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn tier_delete_journal_recovers_unversioned_tier_entry() {
+        // A remote tier that is unversioned records an empty `version_id`. Such a
+        // WAL entry must decode successfully so recovery can drive a versionless
+        // remote delete, otherwise the remote object is orphaned and the journal
+        // file leaks forever.
+        let payload = br#"{"version":1,"obj_name":"remote/object","version_id":"","tier_name":"WARM"}"#;
+
+        let decoded = decode_tier_delete_journal_entry(payload).expect("unversioned tier entry should decode");
+
+        assert_eq!(decoded.obj_name, "remote/object");
+        assert!(decoded.version_id.is_empty());
+        assert_eq!(decoded.tier_name, "WARM");
+    }
+
+    #[test]
+    fn tier_delete_journal_rejects_missing_tier_name() {
+        let payload = br#"{"version":1,"obj_name":"remote/object","version_id":"v1","tier_name":""}"#;
+
+        let err = decode_tier_delete_journal_entry(payload).expect_err("entry missing tier name should be rejected");
+
+        assert!(err.to_string().contains("incomplete"));
+    }
+
+    #[test]
+    fn tier_delete_journal_rejects_truncated_payload() {
+        // A partially written journal file fails at JSON deserialization, so
+        // relaxing the empty-version_id check does not admit truncated records.
+        let payload = br#"{"version":1,"obj_name":"remote/object","version_id":""#;
+
+        let err = decode_tier_delete_journal_entry(payload).expect_err("truncated journal payload should be rejected");
+
+        assert!(err.to_string().contains("decode tier delete journal failed"));
     }
 }

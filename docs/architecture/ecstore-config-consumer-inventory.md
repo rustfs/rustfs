@@ -42,7 +42,7 @@ or calls the right node.
 ```mermaid
 flowchart TB
     EC["crates/ecstore/src/config"]
-    Store["crates/ecstore/src/store.rs"]
+    Store["crates/ecstore/src/store/mod.rs"]
     AppCtx["rustfs/src/app/context.rs"]
     Server["rustfs/src/server/{event,audit}.rs"]
     Admin["rustfs/src/admin"]
@@ -93,7 +93,7 @@ behind narrower contracts.
 | `crates/ecstore/src/config/mod.rs` | Defines `KV`, `KVS`, `Config`, defaults, global snapshot, initialization, and tests. |
 | `crates/ecstore/src/config/com.rs` | Encodes, decodes, reads, writes, creates, and normalizes server config objects through ECStore-local persistence helpers. |
 | `crates/ecstore/src/config/{notify,audit,oidc,scanner,storageclass}.rs` | Register default `KVS` values and subsystem-specific parsing helpers. |
-| `crates/ecstore/src/store.rs` | Exposes store-level server-config accessors that delegate to the global config snapshot. |
+| `crates/ecstore/src/store/mod.rs` | Exposes store-level server-config accessors that delegate to the global config snapshot. |
 
 ### App Context And Server Startup Consumers
 

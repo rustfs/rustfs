@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_compat::ecstore::{
-    bucket::{metadata::table_catalog_path_hash, metadata_sys},
-    store::ECStore,
-};
+use crate::admin::runtime_sources::default_admin_usecase;
+use crate::admin::runtime_sources::{current_object_store_handle, current_token_signing_key};
+use crate::admin::storage_api::bucket::{metadata::table_catalog_path_hash, metadata_sys};
+use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
 };
-use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
@@ -29,7 +28,7 @@ use hyper::Method;
 use matchit::Params;
 use metrics::{counter, histogram};
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
+use rustfs_iam::sys::SESSION_POLICY_NAME;
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
     policy::{
@@ -53,6 +52,7 @@ const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const WAREHOUSE_PROPERTY: &str = "warehouse";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
+const CATALOG_BACKING_CONFIG_KEY: &str = "rustfs.catalog-backing";
 const CREDENTIAL_VENDING_CONFIG_KEY: &str = "rustfs.credential-vending";
 const CREDENTIAL_VENDING_REASON_CONFIG_KEY: &str = "rustfs.credential-vending-reason";
 const CREDENTIAL_SCOPE_CONFIG_KEY: &str = "rustfs.credential-scope";
@@ -62,6 +62,7 @@ const CREDENTIAL_EXPIRATION_CONFIG_KEY: &str = "rustfs.credential-expiration-uni
 const CREDENTIAL_VENDING_UNSUPPORTED: &str = "unsupported";
 const CREDENTIAL_VENDING_SUPPORTED: &str = "supported";
 const CREDENTIAL_VENDING_UNSUPPORTED_REASON: &str = "temporary-credentials-not-implemented";
+const CREDENTIAL_VENDING_DISABLED_REASON: &str = "credential-vending-disabled";
 const CREDENTIAL_SCOPE_WAREHOUSE_PREFIX: &str = "warehouse-prefix";
 const CREDENTIAL_SCOPE_TABLE_PREFIX: &str = "table-prefix";
 const CREDENTIAL_MODE_CLIENT_PROVIDED: &str = "client-provided-s3-credentials-required";
@@ -73,6 +74,7 @@ const TABLE_CATALOG_NAMESPACE_RESOURCE_ROOT: &str = "namespaces";
 const TABLE_CATALOG_TABLE_RESOURCE_ROOT: &str = "tables";
 const TABLE_CATALOG_VIEW_RESOURCE_ROOT: &str = "views";
 const TABLE_CATALOG_ADMIN_OPERATION_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
+const DEFAULT_TABLE_MAINTENANCE_SCHEDULER_ID: &str = "rustfs-maintenance-scheduler";
 const DEFAULT_TABLE_MAINTENANCE_WORKER_ID: &str = "rustfs-maintenance-worker";
 const EXTERNAL_CATALOG_BRIDGE_STATUS_UNCONFIGURED: &str = "bridge-unconfigured";
 const EXTERNAL_CATALOG_BRIDGE_STATUS_CONFIGURED: &str = "bridge-configured";
@@ -105,6 +107,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "PUT /buckets/{warehouse}",
     "GET /buckets/{warehouse}",
+    "GET /{warehouse}/catalog/migration",
     "GET /{warehouse}/namespaces",
     "POST /{warehouse}/namespaces",
     "GET /{warehouse}/namespaces/{namespace}",
@@ -133,8 +136,11 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
@@ -148,6 +154,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
 static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {};
+static GET_TABLE_CATALOG_MIGRATION_HANDLER: GetTableCatalogMigrationHandler = GetTableCatalogMigrationHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
 static CREATE_NAMESPACE_HANDLER: RestCreateNamespaceHandler = RestCreateNamespaceHandler {};
 static GET_NAMESPACE_HANDLER: RestGetNamespaceHandler = RestGetNamespaceHandler {};
@@ -176,8 +183,11 @@ static TABLE_METADATA_MAINTENANCE_HANDLER: RestTableMetadataMaintenanceHandler =
 static GET_TABLE_MAINTENANCE_CONFIG_HANDLER: GetTableMaintenanceConfigHandler = GetTableMaintenanceConfigHandler {};
 static PUT_TABLE_MAINTENANCE_CONFIG_HANDLER: PutTableMaintenanceConfigHandler = PutTableMaintenanceConfigHandler {};
 static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTableMaintenanceJobHandler {};
+static GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER: GetTableMaintenanceSchedulerHandler = GetTableMaintenanceSchedulerHandler {};
+static RUN_TABLE_MAINTENANCE_SCHEDULER_HANDLER: RunTableMaintenanceSchedulerHandler = RunTableMaintenanceSchedulerHandler {};
 static RUN_TABLE_MAINTENANCE_WORKER_HANDLER: RunTableMaintenanceWorkerHandler = RunTableMaintenanceWorkerHandler {};
 static HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER: HeartbeatTableMaintenanceJobHandler = HeartbeatTableMaintenanceJobHandler {};
+static TABLE_MAINTENANCE_QUARANTINE_HANDLER: TableMaintenanceQuarantineHandler = TableMaintenanceQuarantineHandler {};
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
 static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
 static EXTERNAL_CATALOG_BRIDGE_HANDLER: ExternalCatalogBridgeHandler = ExternalCatalogBridgeHandler {};
@@ -192,6 +202,17 @@ struct CatalogConfigResponse {
     defaults: BTreeMap<&'static str, &'static str>,
     overrides: BTreeMap<&'static str, &'static str>,
     endpoints: Vec<&'static str>,
+    admin_discovery: CatalogAdminDiscovery,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogAdminDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: &'static str,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: &'static str,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +358,19 @@ struct TableMetadataMaintenanceRequest {
     compaction: Option<crate::table_catalog::TableCompactionPlanningConfig>,
     #[serde(default, rename = "commit-compaction")]
     commit_compaction: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableMaintenanceSchedulerRunRequest {
+    #[serde(default, rename = "scheduler-id")]
+    scheduler_id: Option<String>,
+}
+
+impl TableMaintenanceSchedulerRunRequest {
+    fn scheduler_id(&self) -> &str {
+        self.scheduler_id.as_deref().unwrap_or(DEFAULT_TABLE_MAINTENANCE_SCHEDULER_ID)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -698,12 +732,13 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             serde_json::Value::String(request.scope_prefix.clone()),
         );
 
-        let secret = get_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
+        let secret = current_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
         let mut credential = get_new_credentials_with_metadata(&claims, &secret)
             .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
         bind_table_credential_parent(&mut credential, principal);
 
-        let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+        let iam_store =
+            crate::admin::runtime_sources::current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam not init"))?;
         iam_store
             .set_temp_user(&credential.access_key, &credential, None)
             .await
@@ -734,6 +769,7 @@ struct RestLoadTableResponse {
 
 #[derive(Debug, Serialize)]
 struct RestLoadCredentialsResponse {
+    config: BTreeMap<String, String>,
     #[serde(rename = "storage-credentials")]
     storage_credentials: Vec<RestStorageCredential>,
 }
@@ -780,6 +816,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/buckets/{{warehouse}}").as_str(),
         AdminOperation(&GET_TABLE_BUCKET_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/catalog/migration").as_str(),
+        AdminOperation(&GET_TABLE_CATALOG_MIGRATION_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -922,6 +963,16 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         AdminOperation(&GET_TABLE_MAINTENANCE_JOB_HANDLER),
     )?;
     r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/scheduler").as_str(),
+        AdminOperation(&GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/scheduler/run").as_str(),
+        AdminOperation(&RUN_TABLE_MAINTENANCE_SCHEDULER_HANDLER),
+    )?;
+    r.insert(
         Method::POST,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/worker/run").as_str(),
         AdminOperation(&RUN_TABLE_MAINTENANCE_WORKER_HANDLER),
@@ -930,6 +981,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::POST,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}/heartbeat").as_str(),
         AdminOperation(&HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}/quarantine").as_str(),
+        AdminOperation(&TABLE_MAINTENANCE_QUARANTINE_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -975,16 +1031,28 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     Ok(())
 }
 
-fn catalog_config_response() -> CatalogConfigResponse {
-    CatalogConfigResponse {
+fn catalog_config_response() -> S3Result<CatalogConfigResponse> {
+    let usecase = default_admin_usecase();
+    let backing_mode = crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)?;
+    let mut overrides = BTreeMap::new();
+    if backing_mode != crate::table_catalog::TableCatalogBackingMode::ObjectBacked {
+        overrides.insert(CATALOG_BACKING_CONFIG_KEY, backing_mode.as_str());
+    }
+    Ok(CatalogConfigResponse {
         defaults: BTreeMap::from([
             (WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID),
             (CATALOG_ENDPOINT_PREFIX_CONFIG_KEY, TABLE_CATALOG_PREFIX),
             (CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY, TABLE_CATALOG_COMPAT_PREFIX),
+            (CATALOG_BACKING_CONFIG_KEY, crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
         ]),
-        overrides: BTreeMap::new(),
+        overrides,
         endpoints: TABLE_CATALOG_ENDPOINTS.to_vec(),
-    }
+        admin_discovery: CatalogAdminDiscovery {
+            runtime_capabilities: usecase.runtime_capabilities_route(),
+            cluster_snapshot: usecase.cluster_snapshot_route(),
+            extensions_catalog: usecase.extensions_catalog_route(),
+        },
+    })
 }
 
 fn build_json_response<T: Serialize>(status: StatusCode, body: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -1239,13 +1307,36 @@ fn job_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
 }
 
 fn table_catalog_backend() -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
-    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store))
+}
+
+type EcStoreObjectTableCatalogStore =
+    crate::table_catalog::ObjectTableCatalogStore<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>>;
+
+fn table_catalog_store_from_backend(
+    backend: crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>,
+) -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
+    crate::table_catalog::ConfiguredTableCatalogStore::from_env(backend).map_err(catalog_store_error)
 }
 
 fn table_catalog_store() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
     let backend = table_catalog_backend()?;
-    Ok(crate::table_catalog::ObjectTableCatalogStore::new(backend))
+    table_catalog_store_from_backend(backend)
+}
+
+fn table_catalog_object_store() -> S3Result<EcStoreObjectTableCatalogStore> {
+    match crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)? {
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked => {
+            let backend = table_catalog_backend()?;
+            Ok(crate::table_catalog::ObjectTableCatalogStore::new(backend))
+        }
+        crate::table_catalog::TableCatalogBackingMode::DurableStrong => Err(s3_error!(
+            InvalidRequest,
+            "operation is not supported with {} table catalog backing",
+            crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG
+        )),
+    }
 }
 
 async fn table_bucket_enabled_from_metadata(bucket: &str) -> S3Result<bool> {
@@ -1253,6 +1344,13 @@ async fn table_bucket_enabled_from_metadata(bucket: &str) -> S3Result<bool> {
         .await
         .map_err(|err| s3_error!(InvalidRequest, "failed to load table bucket metadata for {bucket}: {}", err))?;
     Ok(metadata.table_bucket_enabled())
+}
+
+async fn ensure_table_bucket_enabled(bucket: &str) -> S3Result<()> {
+    if table_bucket_enabled_from_metadata(bucket).await? {
+        return Ok(());
+    }
+    Err(s3_error!(InvalidRequest, "bucket {bucket} is not table-enabled"))
 }
 
 fn table_bucket_entry_from_metadata_marker(bucket: &str) -> crate::table_catalog::TableBucketEntry {
@@ -1328,8 +1426,8 @@ async fn enable_table_bucket_response<S>(store: &S, bucket: &str) -> S3Result<Ta
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    ensure_table_bucket_entry(store, bucket, true).await?;
     enable_table_bucket_marker(bucket).await?;
+    ensure_table_bucket_entry(store, bucket, true).await?;
     table_bucket_response(store, bucket, true).await
 }
 
@@ -1571,6 +1669,21 @@ fn load_view_response_from_entry(entry: crate::table_catalog::ViewEntry, metadat
     }
 }
 
+fn load_credentials_response_config(vending: &str, mode: &str, reason: Option<&str>) -> BTreeMap<String, String> {
+    let mut config = BTreeMap::new();
+    config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), vending.to_string());
+    config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), mode.to_string());
+    if let Some(reason) = reason {
+        config.insert(CREDENTIAL_VENDING_REASON_CONFIG_KEY.to_string(), reason.to_string());
+    }
+    config
+}
+
+fn add_table_credential_scope_config(config: &mut BTreeMap<String, String>, scope_prefix: &str) {
+    config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope_prefix.to_string());
+}
+
 async fn load_credentials_response_from_entry(
     entry: &crate::table_catalog::TableEntry,
     issuer: &dyn TableCredentialIssuer,
@@ -1578,6 +1691,11 @@ async fn load_credentials_response_from_entry(
 ) -> S3Result<RestLoadCredentialsResponse> {
     if !issuer.enabled() {
         return Ok(RestLoadCredentialsResponse {
+            config: load_credentials_response_config(
+                CREDENTIAL_VENDING_UNSUPPORTED,
+                CREDENTIAL_MODE_CLIENT_PROVIDED,
+                Some(CREDENTIAL_VENDING_DISABLED_REASON),
+            ),
             storage_credentials: Vec::new(),
         });
     }
@@ -1588,11 +1706,28 @@ async fn load_credentials_response_from_entry(
         scope_prefix: scope.scope_prefix.clone(),
         object_prefix: scope.object_prefix.clone(),
     };
+    let scope_prefix = scope.scope_prefix.clone();
     let storage_credentials = match issuer.issue_table_credentials(request).await? {
         Some(issued) => vec![storage_credential_from_issued(scope, issued)],
-        None => Vec::new(),
+        None => {
+            let mut config = load_credentials_response_config(
+                CREDENTIAL_VENDING_UNSUPPORTED,
+                CREDENTIAL_MODE_CLIENT_PROVIDED,
+                Some(CREDENTIAL_VENDING_UNSUPPORTED_REASON),
+            );
+            add_table_credential_scope_config(&mut config, &scope_prefix);
+            return Ok(RestLoadCredentialsResponse {
+                config,
+                storage_credentials: Vec::new(),
+            });
+        }
     };
-    Ok(RestLoadCredentialsResponse { storage_credentials })
+    let mut config = load_credentials_response_config(CREDENTIAL_VENDING_SUPPORTED, CREDENTIAL_MODE_CATALOG_VENDED, None);
+    add_table_credential_scope_config(&mut config, &scope_prefix);
+    Ok(RestLoadCredentialsResponse {
+        config,
+        storage_credentials,
+    })
 }
 
 fn commit_table_response_from_result(
@@ -1645,10 +1780,11 @@ fn table_commit_request_from_rest_request(
 }
 
 fn validate_table_location_in_bucket(bucket: &str, location: &str) -> S3Result<()> {
-    if !location.starts_with(&format!("s3://{bucket}/")) {
-        return Err(s3_error!(InvalidRequest, "table location must be inside the table bucket"));
-    }
-    Ok(())
+    crate::table_catalog::validate_table_warehouse_location(bucket, location).map_err(catalog_store_error)
+}
+
+fn validate_view_location_in_bucket(bucket: &str, location: &str) -> S3Result<()> {
+    crate::table_catalog::validate_view_warehouse_location(bucket, location).map_err(catalog_store_error)
 }
 
 fn metadata_table_uuid(metadata: &serde_json::Value) -> S3Result<&str> {
@@ -1683,7 +1819,7 @@ fn validate_metadata_table_location_in_bucket(bucket: &str, metadata: &serde_jso
 
 fn validate_metadata_view_location_in_bucket(bucket: &str, metadata: &serde_json::Value) -> S3Result<()> {
     let location = metadata_table_location(metadata)?;
-    validate_table_location_in_bucket(bucket, location)
+    validate_view_location_in_bucket(bucket, location)
 }
 
 fn validate_metadata_matches_current_metadata(
@@ -1863,7 +1999,7 @@ fn view_entry_from_create_view_request(
     let view_id = Uuid::new_v4().to_string();
     let view_uuid = Uuid::new_v4().to_string();
     let warehouse_location = request.location.unwrap_or_else(|| format!("s3://{bucket}/views/{view_id}"));
-    validate_table_location_in_bucket(bucket, &warehouse_location)?;
+    validate_view_location_in_bucket(bucket, &warehouse_location)?;
     let metadata_location =
         crate::table_catalog::default_view_metadata_file_path(namespace, &view, &next_metadata_file_name(1, &view_id));
 
@@ -4437,8 +4573,8 @@ where
     })
 }
 
-async fn catalog_import_response<B>(
-    store: &crate::table_catalog::ObjectTableCatalogStore<B>,
+async fn catalog_import_response<S, B>(
+    store: &S,
     metadata_backend: &B,
     bucket: &str,
     namespace: &crate::table_catalog::Namespace,
@@ -4447,6 +4583,7 @@ async fn catalog_import_response<B>(
     table_bucket_enabled: bool,
 ) -> S3Result<RestLoadTableResponse>
 where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
     let started = Instant::now();
@@ -4537,7 +4674,7 @@ pub struct GetCatalogConfigHandler {}
 impl Operation for GetCatalogConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_table_catalog_request(&req, AdminAction::GetTableCatalogAction).await?;
-        build_json_response(StatusCode::OK, &catalog_config_response())
+        build_json_response(StatusCode::OK, &catalog_config_response()?)
     }
 }
 
@@ -4570,6 +4707,27 @@ impl Operation for GetTableBucketHandler {
     }
 }
 
+pub struct GetTableCatalogMigrationHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetTableCatalogMigrationHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCatalogAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let store = table_catalog_object_store()?;
+        let started = Instant::now();
+        let result = store
+            .plan_durable_strong_backing_migration(&warehouse)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("migration", &warehouse, "", "", started, &result);
+        let response = result?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RestListNamespacesHandler {}
 
 #[async_trait::async_trait]
@@ -4578,6 +4736,7 @@ impl Operation for RestListNamespacesHandler {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let response = list_namespaces_response(&store, &warehouse).await?;
         build_json_response(StatusCode::OK, &response)
@@ -4609,6 +4768,7 @@ impl Operation for RestGetNamespaceHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let response = get_namespace_response(&store, &warehouse, &namespace).await?;
         build_json_response(StatusCode::OK, &response)
@@ -4624,6 +4784,7 @@ impl Operation for RestDropNamespaceHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableNamespaceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         drop_namespace_in_store(&store, &warehouse, &namespace.public_name()).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
@@ -4639,6 +4800,7 @@ impl Operation for RestNamespaceExistsHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableNamespaceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         Ok(empty_response(namespace_exists_status(&store, &warehouse, &namespace).await?))
     }
@@ -4653,6 +4815,7 @@ impl Operation for RestListTablesHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let response = list_tables_response(&store, &warehouse, &namespace).await?;
         build_json_response(StatusCode::OK, &response)
@@ -4670,7 +4833,7 @@ impl Operation for RestCreateTableHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CreateTableAction).await?;
         let request = read_json_body::<CreateTableRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
         let response =
             create_table_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
@@ -4689,7 +4852,7 @@ impl Operation for RestRegisterTableHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
         let request = read_json_body::<RegisterTableRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
         let response =
             register_table_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
@@ -4706,6 +4869,7 @@ impl Operation for RestListViewsHandler {
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let response = list_views_response(&store, &warehouse, &namespace).await?;
         build_json_response(StatusCode::OK, &response)
@@ -4723,7 +4887,7 @@ impl Operation for RestCreateViewHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CreateTableAction).await?;
         let request = read_json_body::<CreateViewRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
         let response =
             create_view_response(&store, &metadata_backend, &warehouse, &namespace, request, table_bucket_enabled).await?;
@@ -4741,8 +4905,9 @@ impl Operation for RestLoadTableHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response = load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -4758,6 +4923,7 @@ impl Operation for RestTableExistsHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         Ok(empty_response(table_exists_status(&store, &warehouse, &namespace, &table).await?))
     }
@@ -4773,6 +4939,7 @@ impl Operation for RestLoadCredentialsHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCredentialsAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let principal = table_catalog_request_principal(&req).await?;
         let store = table_catalog_store()?;
         let issuer = IamTableCredentialIssuer::from_env();
@@ -4791,9 +4958,10 @@ impl Operation for RestCommitTableHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<RestCommitTableRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response = commit_table_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -4809,6 +4977,7 @@ impl Operation for RestDropTableHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         drop_table_in_store(&store, &warehouse, &namespace, &table).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
@@ -4825,8 +4994,9 @@ impl Operation for RestLoadViewHandler {
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response = load_view_response(&store, &metadata_backend, &warehouse, &namespace, &view).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -4842,6 +5012,7 @@ impl Operation for RestViewExistsHandler {
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         Ok(empty_response(view_exists_status(&store, &warehouse, &namespace, &view).await?))
     }
@@ -4857,9 +5028,10 @@ impl Operation for RestReplaceViewHandler {
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<RestCommitViewRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response = replace_view_response(&store, &metadata_backend, &warehouse, &namespace, &view, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -4875,6 +5047,7 @@ impl Operation for RestDropViewHandler {
         let view = view_name_from_params(&params)?;
         let resource = TableCatalogResource::view(&warehouse, &namespace, &view);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::DeleteTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         drop_view_in_store(&store, &warehouse, &namespace, &view).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
@@ -4891,8 +5064,9 @@ impl Operation for ListTableRefsHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response = table_refs_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -4909,9 +5083,10 @@ impl Operation for PutTableRefHandler {
         let ref_name = ref_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<PutTableRefRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response =
             put_table_ref_response(&store, &metadata_backend, &warehouse, &namespace, &table, &ref_name, request).await?;
         build_json_response(StatusCode::OK, &response)
@@ -4929,9 +5104,10 @@ impl Operation for DeleteTableRefHandler {
         let ref_name = ref_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body_or_default::<DeleteTableRefRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response =
             delete_table_ref_response(&store, &metadata_backend, &warehouse, &namespace, &table, &ref_name, request).await?;
         build_json_response(StatusCode::OK, &response)
@@ -4948,6 +5124,7 @@ impl Operation for GetTableMetadataLocationHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataLocationAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let response = get_table_metadata_location_response(&store, &warehouse, &namespace, &table).await?;
         build_json_response(StatusCode::OK, &response)
@@ -4964,9 +5141,10 @@ impl Operation for UpdateTableMetadataLocationHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<UpdateTableMetadataLocationRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response =
             update_table_metadata_location_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
@@ -4983,9 +5161,10 @@ impl Operation for RestTableMetadataMaintenanceHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<TableMetadataMaintenanceRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_object_store()?;
         let response =
             table_metadata_maintenance_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
@@ -5002,6 +5181,7 @@ impl Operation for GetTableMaintenanceConfigHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let response = store
             .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
@@ -5021,6 +5201,7 @@ impl Operation for PutTableMaintenanceConfigHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableLifecycleAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<crate::table_catalog::TableMaintenanceConfig>(req.input).await?;
         let store = table_catalog_store()?;
         let response = store
@@ -5042,6 +5223,7 @@ impl Operation for GetTableMaintenanceJobHandler {
         let job = job_id_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let Some(response) = store
             .get_table_metadata_maintenance_report(&warehouse, &namespace.public_name(), &table, &job)
@@ -5054,7 +5236,53 @@ impl Operation for GetTableMaintenanceJobHandler {
     }
 }
 
+pub struct GetTableMaintenanceSchedulerHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetTableMaintenanceSchedulerHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .get_table_maintenance_scheduler_report(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RunTableMaintenanceWorkerHandler {}
+
+#[async_trait::async_trait]
+impl Operation for RunTableMaintenanceSchedulerHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let request = read_json_body_or_default::<TableMaintenanceSchedulerRunRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .run_table_maintenance_scheduler_once(
+                &warehouse,
+                &namespace.public_name(),
+                &table,
+                request.scheduler_id().to_string(),
+            )
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
+pub struct RunTableMaintenanceSchedulerHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RunTableMaintenanceWorkerHandler {
@@ -5064,6 +5292,7 @@ impl Operation for RunTableMaintenanceWorkerHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<TableMaintenanceWorkerRunRequest>(req.input).await?;
         let store = table_catalog_store()?;
         let response = store
@@ -5090,6 +5319,7 @@ impl Operation for HeartbeatTableMaintenanceJobHandler {
         let job = job_id_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<TableMaintenanceHeartbeatRequest>(req.input).await?;
         let store = table_catalog_store()?;
         let response = store
@@ -5107,6 +5337,28 @@ impl Operation for HeartbeatTableMaintenanceJobHandler {
     }
 }
 
+pub struct TableMaintenanceQuarantineHandler {}
+
+#[async_trait::async_trait]
+impl Operation for TableMaintenanceQuarantineHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let job = job_id_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let request = read_json_body::<crate::table_catalog::TableMaintenanceQuarantineOperationRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .apply_table_maintenance_quarantine_operation(&warehouse, &namespace.public_name(), &table, &job, request)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct ExportTableCatalogHandler {}
 
 #[async_trait::async_trait]
@@ -5117,6 +5369,7 @@ impl Operation for ExportTableCatalogHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let started = Instant::now();
         let result = store
@@ -5141,7 +5394,7 @@ impl Operation for ImportTableCatalogHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
         let request = read_json_body::<CatalogImportRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
         let response =
             catalog_import_response(&store, &metadata_backend, &warehouse, &namespace, &table, request, table_bucket_enabled)
@@ -5160,7 +5413,8 @@ impl Operation for ExternalCatalogBridgeHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
-        let store = table_catalog_store()?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let store = table_catalog_object_store()?;
         let response = external_catalog_bridge_response(&store, &warehouse, &namespace, &table).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -5176,8 +5430,9 @@ impl Operation for PutExternalCatalogBridgeHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<ExternalCatalogBridgeRequest>(req.input).await?;
-        let store = table_catalog_store()?;
+        let store = table_catalog_object_store()?;
         let response = put_external_catalog_bridge_response(&store, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -5193,9 +5448,18 @@ impl Operation for SyncExternalCatalogBridgeHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableMetadataLocationAction).await?;
-        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(req.input).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_object_store()?;
+        if store
+            .load_table(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error)?
+            .is_none()
+        {
+            authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
+        }
+        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(req.input).await?;
         let table_bucket_enabled = table_bucket_enabled_from_metadata(&warehouse).await?;
         let response = sync_external_catalog_bridge_response(
             &store,
@@ -5221,6 +5485,7 @@ impl Operation for GetTableCatalogDiagnosticsHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let config = store
             .get_table_maintenance_config(&warehouse, &namespace.public_name(), &table)
@@ -5254,6 +5519,7 @@ impl Operation for RecoverTableCatalogHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let store = table_catalog_store()?;
         let started = Instant::now();
         let result = store
@@ -5276,9 +5542,10 @@ impl Operation for RollbackTableCatalogHandler {
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CommitTableAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
         let request = read_json_body::<RollbackTableRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend()?;
-        let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+        let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let response = rollback_table_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
         build_json_response(StatusCode::OK, &response)
     }
@@ -5291,8 +5558,10 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    #[serial_test::serial]
     fn catalog_config_response_lists_standard_rest_endpoints() {
-        let response = catalog_config_response();
+        let response = temp_env::with_var_unset(crate::table_catalog::ENV_TABLE_CATALOG_BACKING, catalog_config_response)
+            .expect("catalog config should build");
 
         assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY), Some(&DEFAULT_WAREHOUSE_ID));
         assert_eq!(response.defaults.get(CATALOG_ENDPOINT_PREFIX_CONFIG_KEY), Some(&TABLE_CATALOG_PREFIX));
@@ -5300,8 +5569,16 @@ mod tests {
             response.defaults.get(CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY),
             Some(&TABLE_CATALOG_COMPAT_PREFIX)
         );
+        assert_eq!(
+            response.defaults.get(CATALOG_BACKING_CONFIG_KEY),
+            Some(&crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT)
+        );
         assert!(response.overrides.is_empty());
+        assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
         assert!(response.endpoints.contains(&"GET /v1/{prefix}/namespaces"));
+        assert!(response.endpoints.contains(&"GET /{warehouse}/catalog/migration"));
         assert!(response.endpoints.contains(&"HEAD /v1/{prefix}/namespaces/{namespace}"));
         assert!(
             response
@@ -5401,6 +5678,22 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn catalog_config_response_reports_durable_strong_backing_override() {
+        let response = temp_env::with_var(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG),
+            catalog_config_response,
+        )
+        .expect("catalog config should build");
+
+        assert_eq!(
+            response.overrides.get(CATALOG_BACKING_CONFIG_KEY),
+            Some(&crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG)
+        );
+    }
+
+    #[test]
     fn table_catalog_admin_operation_result_labels_are_stable() {
         let success: Result<(), ()> = Ok(());
         let failure: Result<(), ()> = Err(());
@@ -5425,6 +5718,7 @@ mod tests {
         for (handler, action) in [
             ("EnableTableBucketHandler", "AdminAction::SetTableBucketAction"),
             ("GetTableBucketHandler", "AdminAction::GetTableBucketAction"),
+            ("GetTableCatalogMigrationHandler", "AdminAction::GetTableCatalogAction"),
             ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
             ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
             ("RestGetNamespaceHandler", "AdminAction::GetTableNamespaceAction"),
@@ -5450,6 +5744,9 @@ mod tests {
             ("GetTableMaintenanceConfigHandler", "AdminAction::GetTableLifecycleAction"),
             ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
+            ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
+            ("RunTableMaintenanceSchedulerHandler", "AdminAction::RunTableMaintenanceAction"),
+            ("TableMaintenanceQuarantineHandler", "AdminAction::RunTableMaintenanceAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
@@ -5474,6 +5771,22 @@ mod tests {
             );
         }
 
+        let sync_bridge_block = operation_block(src, "SyncExternalCatalogBridgeHandler");
+        assert!(
+            sync_bridge_block.contains("AdminAction::RegisterTableAction"),
+            "external catalog sync should require register authorization before creating a missing table"
+        );
+        assert!(
+            sync_bridge_block.contains(".load_table(&warehouse, &namespace.public_name(), &table)"),
+            "external catalog sync should branch authorization on current table existence"
+        );
+
+        let migration_block = operation_block(src, "GetTableCatalogMigrationHandler");
+        assert!(
+            migration_block.contains("TableCatalogResource::warehouse(&warehouse)"),
+            "catalog migration dry-run should authorize against the warehouse resource"
+        );
+
         for (handler, action) in [
             ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
             ("RestTableExistsHandler", "AdminAction::GetTableAction"),
@@ -5487,6 +5800,9 @@ mod tests {
             ("GetTableMaintenanceConfigHandler", "AdminAction::GetTableLifecycleAction"),
             ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
+            ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
+            ("RunTableMaintenanceSchedulerHandler", "AdminAction::RunTableMaintenanceAction"),
+            ("TableMaintenanceQuarantineHandler", "AdminAction::RunTableMaintenanceAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
@@ -5506,6 +5822,80 @@ mod tests {
                 "{handler} should authorize against the table-aware catalog resource"
             );
         }
+    }
+
+    #[test]
+    fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_state() {
+        let src = include_str!("table_catalog.rs");
+
+        for handler in [
+            "GetTableCatalogMigrationHandler",
+            "RestListNamespacesHandler",
+            "RestCreateNamespaceHandler",
+            "RestGetNamespaceHandler",
+            "RestNamespaceExistsHandler",
+            "RestDropNamespaceHandler",
+            "RestListTablesHandler",
+            "RestCreateTableHandler",
+            "RestRegisterTableHandler",
+            "RestListViewsHandler",
+            "RestCreateViewHandler",
+            "RestLoadTableHandler",
+            "RestTableExistsHandler",
+            "RestLoadCredentialsHandler",
+            "RestCommitTableHandler",
+            "RestDropTableHandler",
+            "RestLoadViewHandler",
+            "RestViewExistsHandler",
+            "RestReplaceViewHandler",
+            "RestDropViewHandler",
+            "ListTableRefsHandler",
+            "PutTableRefHandler",
+            "DeleteTableRefHandler",
+            "GetTableMetadataLocationHandler",
+            "UpdateTableMetadataLocationHandler",
+            "RestTableMetadataMaintenanceHandler",
+            "GetTableMaintenanceConfigHandler",
+            "PutTableMaintenanceConfigHandler",
+            "GetTableMaintenanceJobHandler",
+            "GetTableMaintenanceSchedulerHandler",
+            "RunTableMaintenanceSchedulerHandler",
+            "RunTableMaintenanceWorkerHandler",
+            "HeartbeatTableMaintenanceJobHandler",
+            "TableMaintenanceQuarantineHandler",
+            "ExportTableCatalogHandler",
+            "ImportTableCatalogHandler",
+            "ExternalCatalogBridgeHandler",
+            "PutExternalCatalogBridgeHandler",
+            "SyncExternalCatalogBridgeHandler",
+            "GetTableCatalogDiagnosticsHandler",
+            "RecoverTableCatalogHandler",
+            "RollbackTableCatalogHandler",
+        ] {
+            let block = operation_block(src, handler);
+            assert!(
+                block.contains("ensure_table_bucket_enabled(&warehouse).await?;")
+                    || block.contains("table_bucket_enabled_from_metadata(&warehouse).await?;"),
+                "{handler} should require the table bucket metadata marker before catalog state access"
+            );
+        }
+    }
+
+    #[test]
+    fn enable_table_bucket_response_writes_metadata_marker_before_catalog_entry() {
+        let src = include_str!("table_catalog.rs");
+        let block = function_block(src, "async fn enable_table_bucket_response");
+        let marker_write = block
+            .find("enable_table_bucket_marker(bucket).await?;")
+            .expect("enable should write the metadata marker");
+        let catalog_entry_write = block
+            .find("ensure_table_bucket_entry(store, bucket, true).await?;")
+            .expect("enable should write the catalog entry");
+
+        assert!(
+            marker_write < catalog_entry_write,
+            "enable should write the metadata marker before the catalog entry"
+        );
     }
 
     #[test]
@@ -5538,12 +5928,22 @@ mod tests {
         &block[..end]
     }
 
+    fn function_block<'a>(src: &'a str, signature: &str) -> &'a str {
+        let block = src.split_once(signature).expect("function should exist").1;
+        let end = block
+            .find("\nfn ")
+            .or_else(|| block.find("\nasync fn "))
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
     #[test]
     fn rest_catalog_mvp_routes_use_implemented_handlers() {
         fn assert_operation<T: Operation>() {}
 
         let _: &EnableTableBucketHandler = &ENABLE_TABLE_BUCKET_HANDLER;
         let _: &GetTableBucketHandler = &GET_TABLE_BUCKET_HANDLER;
+        let _: &GetTableCatalogMigrationHandler = &GET_TABLE_CATALOG_MIGRATION_HANDLER;
         let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
         let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
         let _: &RestGetNamespaceHandler = &GET_NAMESPACE_HANDLER;
@@ -5569,6 +5969,9 @@ mod tests {
         let _: &GetTableMaintenanceConfigHandler = &GET_TABLE_MAINTENANCE_CONFIG_HANDLER;
         let _: &PutTableMaintenanceConfigHandler = &PUT_TABLE_MAINTENANCE_CONFIG_HANDLER;
         let _: &GetTableMaintenanceJobHandler = &GET_TABLE_MAINTENANCE_JOB_HANDLER;
+        let _: &GetTableMaintenanceSchedulerHandler = &GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER;
+        let _: &RunTableMaintenanceSchedulerHandler = &RUN_TABLE_MAINTENANCE_SCHEDULER_HANDLER;
+        let _: &TableMaintenanceQuarantineHandler = &TABLE_MAINTENANCE_QUARANTINE_HANDLER;
         let _: &ExportTableCatalogHandler = &EXPORT_TABLE_CATALOG_HANDLER;
         let _: &ImportTableCatalogHandler = &IMPORT_TABLE_CATALOG_HANDLER;
         let _: &ExternalCatalogBridgeHandler = &EXTERNAL_CATALOG_BRIDGE_HANDLER;
@@ -5580,6 +5983,7 @@ mod tests {
 
         assert_operation::<EnableTableBucketHandler>();
         assert_operation::<GetTableBucketHandler>();
+        assert_operation::<GetTableCatalogMigrationHandler>();
         assert_operation::<RestListNamespacesHandler>();
         assert_operation::<RestCreateNamespaceHandler>();
         assert_operation::<RestGetNamespaceHandler>();
@@ -5605,8 +6009,11 @@ mod tests {
         assert_operation::<GetTableMaintenanceConfigHandler>();
         assert_operation::<PutTableMaintenanceConfigHandler>();
         assert_operation::<GetTableMaintenanceJobHandler>();
+        assert_operation::<GetTableMaintenanceSchedulerHandler>();
+        assert_operation::<RunTableMaintenanceSchedulerHandler>();
         assert_operation::<RunTableMaintenanceWorkerHandler>();
         assert_operation::<HeartbeatTableMaintenanceJobHandler>();
+        assert_operation::<TableMaintenanceQuarantineHandler>();
         assert_operation::<ExportTableCatalogHandler>();
         assert_operation::<ImportTableCatalogHandler>();
         assert_operation::<ExternalCatalogBridgeHandler>();
@@ -5676,6 +6083,33 @@ mod tests {
         assert_eq!(compaction.small_file_threshold_bytes, 67_108_864);
         assert_eq!(compaction.min_input_files, 5);
         assert_eq!(compaction.max_rewrite_bytes_per_job, 10_737_418_240);
+    }
+
+    #[test]
+    fn table_maintenance_scheduler_run_request_uses_stable_default_scheduler_id() {
+        let request: TableMaintenanceSchedulerRunRequest =
+            serde_json::from_value(serde_json::json!({})).expect("scheduler run request should parse");
+
+        assert_eq!(request.scheduler_id(), "rustfs-maintenance-scheduler");
+    }
+
+    #[tokio::test]
+    async fn table_maintenance_scheduler_run_request_empty_body_uses_default_scheduler_id() {
+        let request: TableMaintenanceSchedulerRunRequest = read_json_body_or_default(Body::empty())
+            .await
+            .expect("bodyless scheduler run should use the default scheduler id");
+
+        assert_eq!(request.scheduler_id(), "rustfs-maintenance-scheduler");
+    }
+
+    #[test]
+    fn table_maintenance_scheduler_run_request_accepts_scheduler_id() {
+        let request: TableMaintenanceSchedulerRunRequest = serde_json::from_value(serde_json::json!({
+            "scheduler-id": "scheduler-a"
+        }))
+        .expect("scheduler run request should parse scheduler id");
+
+        assert_eq!(request.scheduler_id(), "scheduler-a");
     }
 
     #[test]
@@ -8211,6 +8645,47 @@ mod tests {
         assert_eq!(request.properties.get("comment").map(String::as_str), Some("recent event ids"));
     }
 
+    #[test]
+    fn create_view_request_accepts_deep_warehouse_location() {
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let deep_prefix = (0..80).map(|index| format!("level-{index}")).collect::<Vec<_>>().join("/");
+        let location = format!("s3://warehouse/{deep_prefix}");
+        assert!(crate::table_catalog::validate_table_warehouse_location("warehouse", &location).is_err());
+        let request: CreateViewRequest = serde_json::from_value(serde_json::json!({
+            "name": "recent_events",
+            "location": location,
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": []
+            },
+            "view-version": {
+                "version-id": 1,
+                "schema-id": 0,
+                "summary": {
+                    "engine-name": "spark"
+                },
+                "default-catalog": "warehouse",
+                "default-namespace": ["analytics"],
+                "representations": [
+                    {
+                        "type": "sql",
+                        "sql": "SELECT 1",
+                        "dialect": "spark"
+                    }
+                ]
+            }
+        }))
+        .expect("deep create view request should parse");
+
+        let (entry, metadata) = view_entry_from_create_view_request("warehouse", &namespace, request)
+            .expect("view location should not inherit table warehouse index depth limits");
+
+        assert_eq!(entry.warehouse_location, format!("s3://warehouse/{deep_prefix}"));
+        validate_metadata_view_location_in_bucket("warehouse", &metadata)
+            .expect("view metadata location should not inherit table warehouse index depth limits");
+    }
+
     #[tokio::test]
     async fn view_catalog_responses_persist_replace_and_drop_view_metadata() {
         let store = TestTableCatalogStore::default();
@@ -8525,6 +9000,18 @@ mod tests {
             .expect("disabled issuer should build an empty response");
 
         assert!(response.storage_credentials.is_empty());
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_UNSUPPORTED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_MODE_CONFIG_KEY),
+            Some(&CREDENTIAL_MODE_CLIENT_PROVIDED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_REASON_CONFIG_KEY),
+            Some(&"credential-vending-disabled".to_string())
+        );
     }
 
     #[tokio::test]
@@ -8538,6 +9025,54 @@ mod tests {
             .expect("disabled issuer should not validate credential scopes");
 
         assert!(response.storage_credentials.is_empty());
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_UNSUPPORTED.to_string())
+        );
+        assert!(!response.config.contains_key(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY));
+    }
+
+    struct UnavailableTableCredentialIssuer;
+
+    #[async_trait::async_trait]
+    impl TableCredentialIssuer for UnavailableTableCredentialIssuer {
+        async fn issue_table_credentials(
+            &self,
+            request: TableCredentialIssueRequest<'_>,
+        ) -> S3Result<Option<IssuedTableCredentials>> {
+            assert_eq!(request.scope_prefix, "s3://warehouse/tables/table-id/");
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_table_credential_issuer_reports_fallback_scope() {
+        let issuer = UnavailableTableCredentialIssuer;
+        let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, None)
+            .await
+            .expect("unavailable issuer should build a fallback response");
+
+        assert!(response.storage_credentials.is_empty());
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_UNSUPPORTED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_MODE_CONFIG_KEY),
+            Some(&CREDENTIAL_MODE_CLIENT_PROVIDED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_REASON_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_UNSUPPORTED_REASON.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_SCOPE_CONFIG_KEY),
+            Some(&CREDENTIAL_SCOPE_TABLE_PREFIX.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY),
+            Some(&"s3://warehouse/tables/table-id/".to_string())
+        );
     }
 
     struct TestTableCredentialIssuer;
@@ -8573,6 +9108,17 @@ mod tests {
             .await
             .expect("issuer should build a scoped credential response");
 
+        assert_eq!(
+            response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+            Some(&CREDENTIAL_VENDING_SUPPORTED.to_string())
+        );
+        assert_eq!(
+            response.config.get(CREDENTIAL_MODE_CONFIG_KEY),
+            Some(&CREDENTIAL_MODE_CATALOG_VENDED.to_string())
+        );
+        assert!(!response.config.contains_key(S3_ACCESS_KEY_ID_CONFIG_KEY));
+        assert!(!response.config.contains_key(S3_SECRET_ACCESS_KEY_CONFIG_KEY));
+        assert!(!response.config.contains_key(S3_SESSION_TOKEN_CONFIG_KEY));
         assert_eq!(response.storage_credentials.len(), 1);
         let credential = &response.storage_credentials[0];
         assert_eq!(credential.prefix, "s3://warehouse/tables/table-id/");
@@ -8592,6 +9138,28 @@ mod tests {
             Some(&"1800000000".to_string())
         );
         assert!(!credential.config.contains_key("rustfs.credential-vending-reason"));
+    }
+
+    #[tokio::test]
+    async fn credential_response_serializes_sensitive_config_only_inside_storage_credentials() {
+        let issuer = TestTableCredentialIssuer;
+        let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, None)
+            .await
+            .expect("issuer should build a scoped credential response");
+
+        let value = serde_json::to_value(&response).expect("credential response should serialize");
+
+        assert_eq!(
+            value["config"][CREDENTIAL_VENDING_CONFIG_KEY],
+            serde_json::Value::String(CREDENTIAL_VENDING_SUPPORTED.to_string())
+        );
+        assert!(value["config"].get(S3_ACCESS_KEY_ID_CONFIG_KEY).is_none());
+        assert!(value["config"].get(S3_SECRET_ACCESS_KEY_CONFIG_KEY).is_none());
+        assert!(value["config"].get(S3_SESSION_TOKEN_CONFIG_KEY).is_none());
+        assert_eq!(
+            value["storage-credentials"][0]["config"][S3_ACCESS_KEY_ID_CONFIG_KEY],
+            serde_json::Value::String("temporary-access-key".to_string())
+        );
     }
 
     #[test]
@@ -9529,11 +10097,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enable_table_bucket_response_fails_before_marker_when_catalog_entry_fails() {
+    async fn ensure_table_bucket_entry_propagates_catalog_entry_failure() {
         let store = TestTableCatalogStore::default();
         *store.fail_put_table_bucket.lock().await = true;
 
-        assert!(enable_table_bucket_response(&store, "warehouse").await.is_err());
+        assert!(ensure_table_bucket_entry(&store, "warehouse", true).await.is_err());
         assert!(
             store
                 .get_table_bucket("warehouse")

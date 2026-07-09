@@ -15,7 +15,6 @@
 use crate::error::{Error, Result};
 use manager::IamCache;
 use oidc::OidcSys;
-use rustfs_ecstore::store::ECStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
 use sys::IamSys;
@@ -33,15 +32,139 @@ pub mod keyring;
 pub mod manager;
 pub mod oidc;
 pub mod oidc_state;
+mod root_credentials;
+mod runtime_sources;
+mod server_config;
+mod storage_api;
 pub mod store;
 pub mod sys;
 pub mod utils;
+pub(crate) use storage_api::crate_boundary::{
+    IAM_CONFIG_ROOT_PREFIX, IamEcstoreError, IamStorageError, IamStore, classify_iam_system_path_failure_reason,
+    delete_iam_config, is_iam_first_cluster_node_local, read_iam_config_no_lock, read_iam_config_with_metadata, save_iam_config,
+    save_iam_config_with_opts,
+};
+
+pub fn is_root_access_key(access_key: &str) -> bool {
+    root_credentials::is_root_access_key(access_key)
+}
+
+/// Decrypts an at-rest IAM config blob using the same key sources as the IAM load
+/// path (RustFS master keys and MinIO-compatible legacy keys derived from the root
+/// credentials). Used by the MinIO -> RustFS migration path. See
+/// [`store::object::try_decrypt_iam_blob`].
+pub use store::object::try_decrypt_iam_blob;
+
+pub(crate) struct IamNotificationPeerErr {
+    pub(crate) err: Option<IamEcstoreError>,
+}
+
+impl From<storage_api::crate_boundary::IamEcstoreNotificationPeerErr> for IamNotificationPeerErr {
+    fn from(value: storage_api::crate_boundary::IamEcstoreNotificationPeerErr) -> Self {
+        Self { err: value.err }
+    }
+}
+
+pub(crate) async fn notify_iam_delete_policy(policy_name: &str) -> Vec<IamNotificationPeerErr> {
+    match runtime_sources::notification_sys() {
+        Some(notification_sys) => notification_sys
+            .delete_policy(policy_name)
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+pub(crate) async fn notify_iam_load_policy(policy_name: &str) -> Vec<IamNotificationPeerErr> {
+    match runtime_sources::notification_sys() {
+        Some(notification_sys) => notification_sys
+            .load_policy(policy_name)
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+pub(crate) async fn notify_iam_delete_user(access_key: &str) -> Vec<IamNotificationPeerErr> {
+    match runtime_sources::notification_sys() {
+        Some(notification_sys) => notification_sys
+            .delete_user(access_key)
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<IamNotificationPeerErr> {
+    match runtime_sources::notification_sys() {
+        Some(notification_sys) => notification_sys
+            .load_user(access_key, temp)
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+pub(crate) async fn notify_iam_load_service_account(access_key: &str) -> Vec<IamNotificationPeerErr> {
+    match runtime_sources::notification_sys() {
+        Some(notification_sys) => notification_sys
+            .load_service_account(access_key)
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+pub(crate) async fn notify_iam_delete_service_account(access_key: &str) -> Vec<IamNotificationPeerErr> {
+    match runtime_sources::notification_sys() {
+        Some(notification_sys) => notification_sys
+            .delete_service_account(access_key)
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+pub(crate) async fn notify_iam_load_group(group: &str) -> Vec<IamNotificationPeerErr> {
+    match runtime_sources::notification_sys() {
+        Some(notification_sys) => notification_sys.load_group(group).await.into_iter().map(Into::into).collect(),
+        None => Vec::new(),
+    }
+}
+
+pub(crate) async fn notify_iam_load_policy_mapping(
+    user_or_group: &str,
+    user_type: u64,
+    is_group: bool,
+) -> Vec<IamNotificationPeerErr> {
+    match runtime_sources::notification_sys() {
+        Some(notification_sys) => notification_sys
+            .load_policy_mapping(user_or_group, user_type, is_group)
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        None => Vec::new(),
+    }
+}
 
 static IAM_SYS: OnceLock<Arc<IamSys<ObjectStore>>> = OnceLock::new();
 static OIDC_SYS: OnceLock<Arc<OidcSys>> = OnceLock::new();
 
 #[instrument(skip(ecstore))]
-pub async fn init_iam_sys(ecstore: Arc<ECStore>) -> Result<()> {
+pub async fn init_iam_sys(ecstore: Arc<IamStore>) -> Result<()> {
     if IAM_SYS.get().is_some() {
         info!(
             event = EVENT_IAM_STATE,

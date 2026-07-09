@@ -26,6 +26,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -464,7 +465,15 @@ impl Authenticator for FtpsAuthenticator {
             AuthenticationError::BadUser
         })?;
 
-        if !identity.credentials.secret_key.eq(&s3_creds.secret_key) {
+        // Constant-time secret comparison to prevent timing side-channel
+        // attacks. Same primitive used by the SFTP handler and rustfs/src/auth.rs.
+        let secret_matches: bool = identity
+            .credentials
+            .secret_key
+            .as_bytes()
+            .ct_eq(s3_creds.secret_key.as_bytes())
+            .into();
+        if !secret_matches {
             warn!(
                 event = EVENT_FTPS_AUTH_STATE,
                 component = LOG_COMPONENT_PROTOCOLS,

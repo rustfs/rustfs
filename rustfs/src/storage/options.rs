@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::storage_compat::ecstore::bucket::versioning_sys::BucketVersioningSys;
-use crate::storage::storage_compat::ecstore::error::Result;
-use crate::storage::storage_compat::ecstore::error::StorageError;
+use super::{BucketVersioningSys, ReplicationStatusType, Result, StorageError};
+use crate::storage::storage_api::options_consumer::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
-    AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
-    AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
+    insert_header_map,
+    metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
 };
 use rustfs_utils::http::{
-    SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_DELETEMARKER,
-    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
-    is_encryption_metadata_key, is_internal_key,
+    AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+    AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
 };
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
@@ -32,7 +32,6 @@ use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
 use rustfs_policy::service_type::ServiceType;
-use rustfs_storage_api::{HTTPPreconditions, HTTPRangeSpec};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;
@@ -46,10 +45,48 @@ use crate::auth::AuthType;
 use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
-use crate::storage::StorageObjectOptions as ObjectOptions;
+use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
+use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
+use s3s::dto::VersioningConfiguration;
 
-#[cfg(test)]
-use rustfs_utils::http::insert_header;
+/// Fetch the bucket's versioning configuration once so callers can derive
+/// enabled/suspended state without repeated metadata-sys lookups per request.
+async fn bucket_versioning_config(bucket: &str) -> VersioningConfiguration {
+    match BucketVersioningSys::get(bucket).await {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!(
+                bucket = %bucket,
+                error = ?err,
+                "failed to load bucket versioning configuration; using default configuration"
+            );
+            VersioningConfiguration::default()
+        }
+    }
+}
+
+/// Whether GET should skip per-shard bitrot verification. Read once: the env
+/// flag is consulted on every GET and `std::env::var` takes a process-global
+/// lock. In tests the env is read directly so `temp_env` overrides apply.
+fn get_skip_verify_bitrot() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
+            rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
+                rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
+            )
+        })
+    }
+}
 
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
@@ -59,8 +96,9 @@ pub async fn del_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
-    let version_suspended = BucketVersioningSys::suspended(bucket).await;
+    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioned = versioning_cfg.prefix_enabled(object);
+    let version_suspended = versioning_cfg.suspended();
 
     let vid = if vid.is_none() {
         get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
@@ -124,8 +162,9 @@ pub async fn get_opts(
     part_num: Option<usize>,
     headers: &HeaderMap<HeaderValue>,
 ) -> Result<ObjectOptions> {
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
-    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioned = versioning_cfg.prefix_enabled(object);
+    let version_suspended = versioning_cfg.prefix_suspended(object);
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
@@ -163,10 +202,7 @@ pub async fn get_opts(
 
     // Optionally skip per-shard bitrot hash verification on reads to save CPU.
     // Background scanner still performs full integrity checks asynchronously.
-    opts.skip_verify_bitrot = rustfs_utils::get_env_bool(
-        rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
-        rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
-    );
+    opts.skip_verify_bitrot = get_skip_verify_bitrot();
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
@@ -217,8 +253,9 @@ pub async fn put_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
-    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioned = versioning_cfg.prefix_enabled(object);
+    let version_suspended = versioning_cfg.prefix_suspended(object);
 
     let vid = if vid.is_none() {
         get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
@@ -280,6 +317,7 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
         replication_request,
         ..Default::default()
     };
+    apply_replica_status_from_headers(headers, &mut opts);
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
     Ok(opts)
@@ -302,6 +340,7 @@ pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderVal
 
 pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
     let mut opts = get_default_opts(headers, metadata, false)?;
+    apply_replica_status_from_headers(headers, &mut opts);
     if get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         opts.replication_request = true;
         if let Some(v) = get_header(headers, SUFFIX_SOURCE_MTIME) {
@@ -316,6 +355,16 @@ pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap
         }
     }
     Ok(opts)
+}
+
+fn apply_replica_status_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) {
+    if headers
+        .get(AMZ_BUCKET_REPLICATION_STATUS)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|status| status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()))
+    {
+        opts.set_replica_status(ReplicationStatusType::Replica);
+    }
 }
 
 /// Creates default options for getting an object from a bucket.
@@ -485,6 +534,49 @@ pub fn extract_metadata_from_mime_with_object_name(
     }
 }
 
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn should_skip_object_metadata_key(key: &str, value: &str, excluded_headers: &[&str]) -> bool {
+    const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
+    const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
+    const X_AMZ_PREFIX: &str = "x-amz-";
+
+    // Skip internal/reserved metadata (x-rustfs-internal-* or x-minio-internal-*)
+    if starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX) || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX) {
+        return true;
+    }
+
+    // Skip internal encryption metadata (x-rustfs-encryption-* or x-minio-encryption-*)
+    if starts_with_ignore_ascii_case(key, RUSTFS_ENCRYPTION_PREFIX) || starts_with_ignore_ascii_case(key, MINIO_ENCRYPTION_PREFIX)
+    {
+        return true;
+    }
+
+    // Skip empty object lock values
+    if value.is_empty()
+        && (key.eq_ignore_ascii_case(X_AMZ_OBJECT_LOCK_MODE.as_str())
+            || key.eq_ignore_ascii_case(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()))
+    {
+        return true;
+    }
+
+    if key.eq_ignore_ascii_case(AMZ_META_UNENCRYPTED_CONTENT_MD5) || key.eq_ignore_ascii_case(AMZ_META_UNENCRYPTED_CONTENT_LENGTH)
+    {
+        return true;
+    }
+
+    if excluded_headers.iter().any(|excluded| key.eq_ignore_ascii_case(excluded)) {
+        return true;
+    }
+
+    // User metadata is stored without the x-amz-meta- prefix by extract_metadata_from_mime.
+    starts_with_ignore_ascii_case(key, X_AMZ_PREFIX)
+}
+
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
     // HTTP headers that should NOT be returned in the Metadata field.
     // These headers are returned as separate response headers, not user metadata.
@@ -505,48 +597,19 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
         "x-amz-server-side-encryption-aws-kms-key-id",
     ];
 
-    let mut filtered_metadata = HashMap::new();
+    let mut filtered_metadata = None;
     for (k, v) in metadata {
-        let lower_key = k.to_ascii_lowercase();
-        // Skip internal/reserved metadata (x-rustfs-internal-* or x-minio-internal-*)
-        if is_internal_key(&lower_key) {
-            continue;
-        }
-
-        // Skip internal encryption metadata (x-rustfs-encryption-* or x-minio-encryption-*)
-        if is_encryption_metadata_key(&lower_key) {
-            continue;
-        }
-
-        // Skip empty object lock values
-        if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
-            continue;
-        }
-
-        // Skip UNENCRYPTED metadata placeholders
-        if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
-            continue;
-        }
-
-        // Skip excluded HTTP headers (they are returned as separate headers, not metadata)
-        if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
-            continue;
-        }
-
-        // Skip any x-amz-* headers that are not user metadata
-        // User metadata was stored WITHOUT the x-amz-meta- prefix by extract_metadata_from_mime
-        if lower_key.starts_with("x-amz-") {
+        if should_skip_object_metadata_key(k, v, EXCLUDED_HEADERS) {
             continue;
         }
 
         // Include user-defined metadata (keys like "meta1", "custom-key", etc.)
-        filtered_metadata.insert(k.clone(), v.clone());
+        filtered_metadata
+            .get_or_insert_with(HashMap::new)
+            .insert(k.clone(), v.clone());
     }
-    if filtered_metadata.is_empty() {
-        None
-    } else {
-        Some(filtered_metadata)
-    }
+
+    filtered_metadata
 }
 
 /// Detects content type from object name based on file extension.
@@ -784,12 +847,25 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use proptest::prelude::*;
     use temp_env;
 
-    use super::*;
+    use super::super::StorageError;
+    use super::{
+        ENV_REJECT_ARCHIVE_CONTENT_ENCODING, ReplicationStatusType, SUPPORTED_HEADERS, copy_dst_opts, copy_src_opts, del_opts,
+        detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
+        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
+        get_default_opts, get_opts, parse_copy_source_range, put_opts, put_opts_from_headers, validate_archive_content_encoding,
+    };
     use http::{HeaderMap, HeaderValue};
+    use rustfs_utils::http::{
+        AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST,
+        insert_header,
+    };
+    use s3s::S3ErrorCode;
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -1117,6 +1193,32 @@ mod tests {
         let opts_invalid = result_invalid.unwrap();
         assert!(opts_invalid.replication_request);
         assert!(opts_invalid.mod_time.is_none());
+    }
+
+    #[test]
+    fn test_put_opts_from_headers_with_replica_status() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AMZ_BUCKET_REPLICATION_STATUS,
+            HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
+        );
+
+        let opts = put_opts_from_headers(&headers, HashMap::new()).expect("replica status header should parse");
+
+        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn test_complete_multipart_opts_with_replica_status() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AMZ_BUCKET_REPLICATION_STATUS,
+            HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
+        );
+
+        let opts = get_complete_multipart_upload_opts(&headers).expect("replica status header should parse");
+
+        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Replica);
     }
 
     #[test]
@@ -1454,6 +1556,21 @@ mod tests {
 
         let filtered = filter_object_metadata(&metadata);
         assert!(filtered.is_none(), "content-type must not be exposed as user metadata");
+    }
+
+    #[test]
+    fn test_filter_object_metadata_excludes_case_insensitive_system_headers() {
+        let mut metadata = HashMap::new();
+        metadata.insert("Content-Type".to_string(), "application/octet-stream".to_string());
+        metadata.insert("X-Amz-Storage-Class".to_string(), "STANDARD".to_string());
+        metadata.insert("X-RustFS-Internal-Healing".to_string(), "true".to_string());
+        metadata.insert("X-Minio-Encryption-Iv".to_string(), "secret".to_string());
+        metadata.insert("custom-key".to_string(), "custom-value".to_string());
+
+        let filtered = filter_object_metadata(&metadata).expect("user metadata should remain");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
     }
 
     #[test]

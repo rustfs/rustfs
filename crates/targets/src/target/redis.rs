@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -37,8 +38,6 @@ use redis::{
 use rustfs_config::{REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY};
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::io::BufReader;
 use std::path::Path;
@@ -300,7 +299,7 @@ fn validate_redis_tls_config(url: &Url, tls: &RedisTlsConfig) -> Result<(), Targ
 
 pub struct RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: RedisArgs,
@@ -326,7 +325,7 @@ where
 
 impl<E> RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     #[instrument(skip(args), fields(target_id_as_string = %id))]
     pub fn new(id: String, args: RedisArgs) -> Result<Self, TargetError> {
@@ -475,8 +474,26 @@ where
                 .publish::<_, _, i64>(self.args.channel.as_str(), body.as_slice())
                 .await
             {
-                Ok(_) => {
-                    debug!(target_id = %self.id, channel = %self.args.channel, attempt, "Event published to Redis channel");
+                Ok(receiver_count) => {
+                    // PUBLISH returns the number of subscribers that received the
+                    // message. Redis pub/sub is best-effort: with zero subscribers
+                    // the event is delivered to no one, yet the durable copy is
+                    // deleted. Warn so operators relying on reliable delivery are
+                    // not silently losing events (backlog#982).
+                    if receiver_count == 0 {
+                        warn!(
+                            target_id = %self.id,
+                            channel = %self.args.channel,
+                            "Redis PUBLISH reached 0 subscribers; the event was not received by any consumer (pub/sub is best-effort)"
+                        );
+                    }
+                    debug!(
+                        target_id = %self.id,
+                        channel = %self.args.channel,
+                        attempt,
+                        receiver_count,
+                        "Event published to Redis channel"
+                    );
                     self.delivery_counters.record_success();
                     return Ok(());
                 }
@@ -518,7 +535,7 @@ where
 #[async_trait]
 impl<E> Target<E> for RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -529,14 +546,17 @@ where
             return Ok(false);
         }
 
-        let client = self.publisher_client.lock().clone();
-        match tokio::time::timeout(Duration::from_secs(5), ping_redis_server(&client, &self.args)).await {
+        // Reuse the cached ConnectionManager for the health probe (via
+        // ensure_publisher_ready) instead of building a brand-new manager — and
+        // thus a fresh TCP+TLS handshake — on every health check (backlog#982).
+        // ensure_publisher_ready already invalidates the cached manager on a
+        // connectivity error so the next attempt rebuilds it.
+        match tokio::time::timeout(Duration::from_secs(5), self.ensure_publisher_ready()).await {
             Ok(Ok(())) => {
                 self.connected.store(true, Ordering::SeqCst);
                 Ok(true)
             }
             Ok(Err(err)) => {
-                invalidate_cache_on_connectivity_error(&err, || self.invalidate_cached_publisher()).await;
                 mark_target_disconnected_on_connectivity_error(&self.connected, &err);
                 Err(err)
             }
@@ -651,6 +671,13 @@ pub(crate) fn build_redis_client(args: &RedisArgs) -> Result<Client, TargetError
     let mut url = args.url.clone();
     if args.tls.allow_insecure {
         url.set_fragment(Some("insecure"));
+        // Mirror the webhook `skip_tls_verify` warning: this disables Redis
+        // server certificate verification and must only be used for testing
+        // (backlog#982).
+        warn!(
+            target = %redact_redis_url(&args.url),
+            "Redis tls_allow_insecure is enabled: server certificate verification is DISABLED (insecure). Use for testing only."
+        );
     }
 
     let mut connection_info: ConnectionInfo = url.into_connection_info().map_err(map_redis_error)?;
@@ -796,7 +823,7 @@ fn compute_retry_delay(attempt: usize, min_delay: Duration, max_delay: Duration)
 #[async_trait]
 impl<E> ReloadableTargetTls for RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Client;
 
@@ -1005,7 +1032,11 @@ mod tests {
 
     #[tokio::test]
     async fn is_active_succeeds_when_ping_returns_pong() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(run_fake_redis_server(listener, false));
 
@@ -1021,7 +1052,11 @@ mod tests {
 
     #[tokio::test]
     async fn is_active_returns_error_when_ping_fails() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {
@@ -1165,7 +1200,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_body_keeps_connected_true_when_retryable_error_eventually_recovers() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(run_fake_redis_server(listener, true));
 
@@ -1197,7 +1236,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_body_sets_connected_false_after_retry_exhaustion() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {
@@ -1238,7 +1281,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_raw_from_store_failure_does_not_count_as_success() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {

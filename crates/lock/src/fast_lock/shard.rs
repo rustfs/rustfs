@@ -169,6 +169,15 @@ impl LockShard {
 
         let mut retry_count = 0u32;
         const MAX_RETRIES: u32 = 10;
+        // Upper bound for a single notification wait. The notification pool is
+        // shared process-wide (a fixed set of `Notify` slots hashed by lock), so a
+        // wakeup meant for this lock can be consumed by a waiter of a different
+        // lock that hashes to the same slot, and this lock's waiter would then
+        // sleep until the full deadline. Capping each wait turns that lost-wakeup
+        // into bounded re-polling: on cap elapse we loop and re-`try_acquire`,
+        // only returning `Timeout` once the real deadline passes. The notification
+        // still delivers prompt wakeups in the common (no-collision) case.
+        const NOTIFY_WAIT_CAP: Duration = Duration::from_millis(50);
 
         loop {
             // Get or create object state
@@ -217,23 +226,25 @@ impl LockShard {
                 }
             }
 
-            // If we've exhausted quick retries or have little time left, use notification wait
+            // If we've exhausted quick retries or have little time left, use a
+            // notification wait, but bounded by NOTIFY_WAIT_CAP so a lost/stolen
+            // wakeup cannot strand this waiter until the deadline.
+            let wait = remaining.min(NOTIFY_WAIT_CAP);
             let wait_result = match request.mode {
                 LockMode::Shared => {
                     let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Shared);
-                    timeout(remaining, state.optimized_notify.wait_for_read()).await
+                    timeout(wait, state.optimized_notify.wait_for_read()).await
                 }
                 LockMode::Exclusive => {
                     let _waiter_guard = WaiterCounterGuard::new(state.clone(), LockMode::Exclusive);
-                    timeout(remaining, state.optimized_notify.wait_for_write()).await
+                    timeout(wait, state.optimized_notify.wait_for_write()).await
                 }
             };
 
-            if wait_result.is_err() {
-                self.metrics.record_timeout();
-                return Err(LockResult::Timeout);
-            }
-
+            // A capped-wait elapse is not a real timeout: loop back and re-try the
+            // acquisition. The deadline check at the top of the loop is the single
+            // source of truth for returning `Timeout`.
+            let _ = wait_result;
             retry_count += 1;
         }
     }
@@ -416,9 +427,10 @@ impl LockShard {
         let adaptive_timeout_secs =
             (base_timeout.as_secs_f64() * total_multiplier).min(crate::fast_lock::MAX_ACQUIRE_TIMEOUT.as_secs_f64());
 
-        // Ensure minimum reasonable timeout even for low priority
+        // Keep the caller-provided and global acquire timeouts as hard deadlines.
         let min_timeout_secs = base_timeout.as_secs_f64() * 0.8;
-        Duration::from_secs_f64(adaptive_timeout_secs.max(min_timeout_secs))
+        let adaptive_timeout = Duration::from_secs_f64(adaptive_timeout_secs.max(min_timeout_secs));
+        adaptive_timeout.min(base_timeout.min(crate::fast_lock::MAX_ACQUIRE_TIMEOUT))
     }
 
     /// Batch acquire locks with ordering to prevent deadlocks
@@ -505,6 +517,87 @@ impl LockShard {
             });
         }
         None
+    }
+
+    /// Enumerate every currently held lock in this shard.
+    ///
+    /// Exclusive locks yield a single entry; shared locks yield one entry per
+    /// distinct owner so administrative "top locks" views can attribute every
+    /// holder. Entries for objects that are tracked but not currently locked
+    /// (e.g. pooled-but-idle state) are skipped.
+    pub fn list_locks(&self) -> Vec<crate::fast_lock::types::ObjectLockInfo> {
+        let objects = self.objects.read();
+        let mut infos = Vec::new();
+        for (key, state) in objects.iter() {
+            let Some(mode) = state.current_mode() else {
+                continue;
+            };
+            let priority = *state.priority.read();
+            match mode {
+                LockMode::Exclusive => {
+                    if let Some(info) = state.current_owner.read().clone() {
+                        let expires_at = info
+                            .acquired_at
+                            .checked_add(info.lock_timeout)
+                            .unwrap_or_else(|| info.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+                        infos.push(crate::fast_lock::types::ObjectLockInfo {
+                            key: key.clone(),
+                            mode,
+                            owner: info.owner,
+                            acquired_at: info.acquired_at,
+                            expires_at,
+                            priority,
+                        });
+                    }
+                }
+                LockMode::Shared => {
+                    for entry in state.shared_owners.read().iter() {
+                        let expires_at = entry
+                            .acquired_at
+                            .checked_add(entry.lock_timeout)
+                            .unwrap_or_else(|| entry.acquired_at + crate::fast_lock::DEFAULT_LOCK_TIMEOUT);
+                        infos.push(crate::fast_lock::types::ObjectLockInfo {
+                            key: key.clone(),
+                            mode,
+                            owner: entry.owner.clone(),
+                            acquired_at: entry.acquired_at,
+                            expires_at,
+                            priority,
+                        });
+                    }
+                }
+            }
+        }
+        infos
+    }
+
+    /// Force-release every holder of a lock on `key`, regardless of owner.
+    ///
+    /// Returns the number of owners that were released. Used by the admin
+    /// force-unlock path to clear a stuck resource.
+    pub fn force_release_all(&self, key: &ObjectKey) -> usize {
+        let owners_modes: Vec<(Arc<str>, LockMode)> = {
+            let objects = self.objects.read();
+            let Some(state) = objects.get(key) else {
+                return 0;
+            };
+            let mut pairs = Vec::new();
+            if let Some(info) = state.current_owner.read().clone() {
+                pairs.push((info.owner, LockMode::Exclusive));
+            }
+            for entry in state.shared_owners.read().iter() {
+                pairs.push((entry.owner.clone(), LockMode::Shared));
+            }
+            pairs
+        };
+
+        let mut released = 0;
+        for (owner, mode) in owners_modes {
+            if self.release_lock(key, &owner, mode) {
+                released += 1;
+            }
+        }
+        released
     }
 
     /// Get current load factor of the shard
@@ -629,9 +722,13 @@ impl LockShard {
         let mut objects = self.objects.write();
         let mut processed = 0;
 
-        // Process in batches to avoid long-held locks
-        let mut to_recycle = Vec::new();
-        objects.retain(|_key, state| {
+        // Collect the keys to evict during the walk, then remove them afterward.
+        // `retain` only exposes a shared `&Arc`, and cloning it keeps
+        // `strong_count >= 2`, so `Arc::try_unwrap` on that clone can never
+        // succeed. Removing the key after the walk hands back the owned `Arc`,
+        // which can be unwrapped and recycled into the pool.
+        let mut to_remove = Vec::new();
+        objects.retain(|key, state| {
             if processed >= max_batch_size {
                 return true; // Stop processing after batch limit
             }
@@ -642,24 +739,25 @@ impl LockShard {
                 let idle_time = now_millis.saturating_sub(last_access_millis);
 
                 if idle_time > cleanup_threshold_millis {
-                    // Try to recycle the state back to pool if possible
-                    if let Ok(state_box) = Arc::try_unwrap(state.clone()) {
-                        to_recycle.push(state_box);
-                    }
+                    to_remove.push(key.clone());
                     cleaned += 1;
-                    false // Remove
-                } else {
-                    true // Keep
                 }
-            } else {
-                true // Keep active locks
             }
+            // Removal is deferred to the loop below so the owned `Arc` can be
+            // recovered for recycling.
+            true
         });
 
-        // Return recycled objects to pool
-        for state_box in to_recycle {
-            let boxed_state = Box::new(state_box);
-            self.object_pool.release(boxed_state);
+        // Evict the collected keys and recycle their states into the pool.
+        // Removing the key yields the owned `Arc`; `try_unwrap` succeeds only
+        // when this shard held the last reference, in which case the inner
+        // state is reboxed and returned to the pool.
+        for key in to_remove {
+            if let Some(state) = objects.remove(&key)
+                && let Ok(state) = Arc::try_unwrap(state)
+            {
+                self.object_pool.release(Box::new(state));
+            }
         }
 
         self.metrics.record_cleanup(cleaned);
@@ -753,6 +851,50 @@ mod tests {
 
         // Release first lock
         assert!(shard.release_lock(&key, &owner1, LockMode::Exclusive));
+    }
+
+    #[test]
+    fn test_adaptive_timeout_does_not_exceed_request_acquire_timeout() {
+        let shard = LockShard::new(0);
+        let key = ObjectKey::new("bucket", "object");
+        let owner: Arc<str> = Arc::from("owner");
+        let acquire_timeout = Duration::from_millis(500);
+
+        for priority in [LockPriority::Normal, LockPriority::High, LockPriority::Critical] {
+            let request = ObjectLockRequest {
+                key: key.clone(),
+                mode: LockMode::Exclusive,
+                owner: owner.clone(),
+                acquire_timeout,
+                lock_timeout: Duration::from_secs(30),
+                priority,
+            };
+
+            assert_eq!(
+                shard.calculate_adaptive_timeout(&request),
+                acquire_timeout,
+                "adaptive timeout must not extend the requested acquire timeout for {priority:?} priority"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_timeout_does_not_exceed_global_max_acquire_timeout() {
+        let shard = LockShard::new(0);
+        let request = ObjectLockRequest {
+            key: ObjectKey::new("bucket", "object"),
+            mode: LockMode::Exclusive,
+            owner: Arc::from("owner"),
+            acquire_timeout: crate::fast_lock::MAX_ACQUIRE_TIMEOUT + Duration::from_secs(60),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Critical,
+        };
+
+        assert_eq!(
+            shard.calculate_adaptive_timeout(&request),
+            crate::fast_lock::MAX_ACQUIRE_TIMEOUT,
+            "adaptive timeout must not extend the global max acquire timeout"
+        );
     }
 
     #[tokio::test]
@@ -865,6 +1007,19 @@ mod tests {
         waiter_handle.abort();
         let _ = waiter_handle.await;
 
+        // The OptimizedNotify writer waiter counter must not leak after the
+        // waiting future is dropped by the abort.
+        if let Some(state) = shard.objects.read().get(&key).cloned() {
+            assert_eq!(
+                state
+                    .optimized_notify
+                    .writer_waiters
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "optimized_notify writer waiter count must return to 0 after abort"
+            );
+        }
+
         assert!(shard.release_lock(&key, &owner1, LockMode::Exclusive));
 
         let followup_reader = ObjectLockRequest {
@@ -930,6 +1085,19 @@ mod tests {
         waiter_handle.abort();
         let _ = waiter_handle.await;
 
+        // The OptimizedNotify reader waiter counter must not leak after the
+        // waiting future is dropped by the abort.
+        if let Some(state) = shard.objects.read().get(&key).cloned() {
+            assert_eq!(
+                state
+                    .optimized_notify
+                    .reader_waiters
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "optimized_notify reader waiter count must return to 0 after abort"
+            );
+        }
+
         assert!(shard.release_lock(&key, &writer_owner, LockMode::Exclusive));
 
         let followup_writer = ObjectLockRequest {
@@ -946,5 +1114,60 @@ mod tests {
             "exclusive lock should succeed after reader waiter task is aborted"
         );
         assert!(shard.release_lock(&key, &followup_owner, LockMode::Exclusive));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_batch_recycles_into_pool() {
+        let shard = LockShard::new(0);
+        let owner: Arc<str> = Arc::from("owner");
+        const N: usize = 8;
+
+        // Populate the shard with idle (acquired then released) lock states.
+        for i in 0..N {
+            let key = ObjectKey::new("bucket", format!("obj-{i}"));
+            let request = ObjectLockRequest {
+                key: key.clone(),
+                mode: LockMode::Exclusive,
+                owner: owner.clone(),
+                acquire_timeout: Duration::from_secs(1),
+                lock_timeout: Duration::from_secs(30),
+                priority: LockPriority::Normal,
+            };
+            assert!(shard.acquire_lock(&request).await.is_ok());
+            assert!(shard.release_lock(&key, &owner, LockMode::Exclusive));
+        }
+
+        // The pool started empty, so every acquisition allocated a fresh state:
+        // N misses and no releases yet.
+        let (_hits, misses, releases_before, _pool_size) = shard.pool_stats();
+        assert_eq!(misses, N as u64);
+        assert_eq!(releases_before, 0);
+
+        // Make sure the idle states are old enough to be evicted, then force a
+        // batch cleanup with a zero idle threshold.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let cleaned = shard.cleanup_expired_batch(N, 0);
+        assert_eq!(cleaned, N, "all idle states should be cleaned");
+        assert_eq!(shard.lock_count(), 0, "cleaned entries must be removed from the shard");
+
+        // The evicted states must actually be recycled back into the pool.
+        let (_hits, _misses, releases_after, pool_size) = shard.pool_stats();
+        assert_eq!(releases_after, N as u64, "cleanup must recycle evicted states into the pool");
+        assert_eq!(pool_size, N, "recycled states must be available in the pool");
+
+        // A subsequent acquire should reuse a pooled state, raising the hit rate.
+        let key = ObjectKey::new("bucket", "reuse");
+        let request = ObjectLockRequest {
+            key,
+            mode: LockMode::Exclusive,
+            owner: owner.clone(),
+            acquire_timeout: Duration::from_secs(1),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Normal,
+        };
+        assert!(shard.acquire_lock(&request).await.is_ok());
+        let (hits, _misses, _releases, _pool_size) = shard.pool_stats();
+        assert!(hits >= 1, "subsequent acquire should hit the recycled pool");
+        assert!(shard.pool_hit_rate() > 0.0, "pool hit rate should rise after recycling");
     }
 }

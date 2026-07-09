@@ -319,6 +319,36 @@ pub enum ScannerReplicationRepairKind {
     SiteActiveResync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerReplicationRepairRole {
+    RepairAdmission,
+    BoundarySignal,
+}
+
+impl ScannerReplicationRepairRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RepairAdmission => "repair_admission",
+            Self::BoundarySignal => "boundary_signal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerReplicationExecutionOwner {
+    BucketReplicationQueue,
+    SiteReplicationRuntime,
+}
+
+impl ScannerReplicationExecutionOwner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BucketReplicationQueue => "bucket_replication_queue",
+            Self::SiteReplicationRuntime => "site_replication_runtime",
+        }
+    }
+}
+
 impl ScannerReplicationRepairKind {
     const ALL: [Self; 6] = [
         Self::BucketObject,
@@ -335,6 +365,24 @@ impl ScannerReplicationRepairKind {
                 ScannerWorkSource::BucketReplication
             }
             Self::SitePassiveRequeue | Self::SiteActiveResync => ScannerWorkSource::SiteReplication,
+        }
+    }
+
+    pub fn scanner_role(self) -> ScannerReplicationRepairRole {
+        match self {
+            Self::BucketObject | Self::BucketDeleteMarker | Self::BucketVersionPurge | Self::BucketExistingObject => {
+                ScannerReplicationRepairRole::RepairAdmission
+            }
+            Self::SitePassiveRequeue | Self::SiteActiveResync => ScannerReplicationRepairRole::BoundarySignal,
+        }
+    }
+
+    pub fn execution_owner(self) -> ScannerReplicationExecutionOwner {
+        match self {
+            Self::BucketObject | Self::BucketDeleteMarker | Self::BucketVersionPurge | Self::BucketExistingObject => {
+                ScannerReplicationExecutionOwner::BucketReplicationQueue
+            }
+            Self::SitePassiveRequeue | Self::SiteActiveResync => ScannerReplicationExecutionOwner::SiteReplicationRuntime,
         }
     }
 
@@ -515,6 +563,8 @@ impl ScannerSourceWorkValues {
         ScannerReplicationRepairSnapshot {
             source: kind.source().as_str().to_string(),
             kind: kind.as_str().to_string(),
+            scanner_role: kind.scanner_role().as_str().to_string(),
+            execution_owner: kind.execution_owner().as_str().to_string(),
             checked: self.checked,
             queued: self.queued,
             executed: self.executed,
@@ -689,12 +739,22 @@ pub struct Metrics {
     scanner_set_scans_queued: AtomicU64,
     scanner_set_scans_active: AtomicU64,
     scanner_disk_bucket_scan_states: Mutex<HashMap<String, ScannerDiskBucketScanState>>,
+    scanner_leader_lock_state: RwLock<String>,
+    scanner_leader_lock_held: AtomicBool,
+    scanner_leader_lock_last_error: RwLock<String>,
+    scanner_leader_lock_last_update_unix_secs: AtomicU64,
     last_scan_cycle_result: AtomicU8,
     last_scan_cycle_partial_reason: AtomicU8,
     last_scan_cycle_partial_source: AtomicU8,
+    last_scan_cycle_end_unix_secs: AtomicU64,
     last_scan_cycle_duration_millis: AtomicU64,
     last_scan_cycle_objects_scanned: AtomicU64,
     last_scan_cycle_directories_scanned: AtomicU64,
+    /// Lifetime count of object versions walked by the data scanner, counted
+    /// for every version regardless of whether any lifecycle rule applies.
+    /// This is the honest source for `rustfs_scanner_versions_scanned_total`;
+    /// ILM-checked versions are tracked separately on the `Lifecycle` source.
+    lifetime_versions_scanned: AtomicU64,
     last_scan_cycle_bucket_drive_scans: AtomicU64,
     last_scan_cycle_bucket_drive_failures: AtomicU64,
     last_scan_cycle_yield_events: AtomicU64,
@@ -753,6 +813,13 @@ pub struct Metrics {
     scanner_checkpoint_cleared: AtomicU64,
     scanner_checkpoint_ignored: AtomicU64,
     scanner_checkpoint_stale: AtomicU64,
+    scanner_dirty_usage_pending_buckets: AtomicU64,
+    scanner_dirty_usage_last_mark_unix_secs: AtomicU64,
+    scanner_dirty_usage_last_clear_unix_secs: AtomicU64,
+    scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64,
+    scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64,
+    scanner_usage_last_save_unix_secs: AtomicU64,
+    scanner_usage_last_save_result: AtomicU8,
     scanner_source_work: Vec<ScannerSourceWorkCounters>,
     current_scan_cycle_source_work_start: Vec<ScannerSourceWorkCounters>,
     last_scan_cycle_source_work: Vec<ScannerSourceWorkCounters>,
@@ -795,6 +862,38 @@ impl ScanCyclePartialReason {
             1 => Self::Runtime,
             2 => Self::Objects,
             3 => Self::Directories,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScannerUsageSaveResult {
+    #[default]
+    Unknown = 0,
+    Success = 1,
+    Failed = 2,
+    SkippedStale = 3,
+    EncodeFailed = 4,
+}
+
+impl ScannerUsageSaveResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => SCAN_CYCLE_RESULT_UNKNOWN_LABEL,
+            Self::Success => SCAN_CYCLE_RESULT_SUCCESS_LABEL,
+            Self::Failed => "failed",
+            Self::SkippedStale => "skipped_stale",
+            Self::EncodeFailed => "encode_failed",
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Success,
+            2 => Self::Failed,
+            3 => Self::SkippedStale,
+            4 => Self::EncodeFailed,
             _ => Self::Unknown,
         }
     }
@@ -857,6 +956,10 @@ pub struct ScannerSourceWorkSnapshot {
 pub struct ScannerReplicationRepairSnapshot {
     pub source: String,
     pub kind: String,
+    #[serde(default)]
+    pub scanner_role: String,
+    #[serde(default)]
+    pub execution_owner: String,
     pub checked: u64,
     pub queued: u64,
     pub executed: u64,
@@ -977,6 +1080,18 @@ pub struct ScannerLifecycleTransitionSnapshot {
     pub failed: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerUsageFreshnessSnapshot {
+    pub dirty_pending_buckets: u64,
+    pub last_dirty_mark_unix_secs: u64,
+    pub last_dirty_clear_unix_secs: u64,
+    pub last_cycle_dirty_buckets: u64,
+    pub last_cycle_cleared_dirty_buckets: u64,
+    pub last_usage_save_unix_secs: u64,
+    pub last_usage_save_result: String,
+    pub last_usage_save_result_code: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerLastMinute {
     pub actions: HashMap<String, ScannerTimedAction>,
@@ -996,9 +1111,22 @@ pub struct ScannerMetricsReport {
     pub oldest_active_path_age_seconds: u64,
     pub life_time_ops: HashMap<String, u64>,
     pub life_time_ilm: HashMap<String, u64>,
+    /// Lifetime object versions scanned, independent of ILM configuration.
+    #[serde(default)]
+    pub versions_scanned: u64,
     pub last_minute: ScannerLastMinute,
     pub active_paths: Vec<String>,
     pub current_scan_mode: String,
+    #[serde(default)]
+    pub leader_lock_state: String,
+    #[serde(default)]
+    pub leader_lock_held_by_this_process: bool,
+    #[serde(default)]
+    pub leader_lock_last_error: String,
+    #[serde(default)]
+    pub leader_lock_last_update_unix_secs: u64,
+    #[serde(default)]
+    pub last_cycle_end_unix_secs: u64,
     #[serde(default)]
     pub current_set_scan_concurrency_limit: u64,
     #[serde(default)]
@@ -1096,6 +1224,8 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
     #[serde(default)]
+    pub usage_freshness: ScannerUsageFreshnessSnapshot,
+    #[serde(default)]
     pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(default)]
     pub throttle_idle_mode_enabled: bool,
@@ -1190,6 +1320,13 @@ fn scanner_ratio(numerator: f64, denominator: f64) -> f64 {
     } else {
         (numerator / denominator).clamp(0.0, 1.0)
     }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn scanner_last_cycle_budget_limited(result_code: u64, partial_reason: &str) -> bool {
@@ -1564,12 +1701,18 @@ impl Metrics {
             scanner_set_scans_queued: AtomicU64::new(0),
             scanner_set_scans_active: AtomicU64::new(0),
             scanner_disk_bucket_scan_states: Mutex::new(HashMap::new()),
+            scanner_leader_lock_state: RwLock::new("unknown".to_string()),
+            scanner_leader_lock_held: AtomicBool::new(false),
+            scanner_leader_lock_last_error: RwLock::new(String::new()),
+            scanner_leader_lock_last_update_unix_secs: AtomicU64::new(0),
             last_scan_cycle_result: AtomicU8::new(SCAN_CYCLE_RESULT_UNKNOWN),
             last_scan_cycle_partial_reason: AtomicU8::new(ScanCyclePartialReason::Unknown as u8),
             last_scan_cycle_partial_source: AtomicU8::new(0),
+            last_scan_cycle_end_unix_secs: AtomicU64::new(0),
             last_scan_cycle_duration_millis: AtomicU64::new(0),
             last_scan_cycle_objects_scanned: AtomicU64::new(0),
             last_scan_cycle_directories_scanned: AtomicU64::new(0),
+            lifetime_versions_scanned: AtomicU64::new(0),
             last_scan_cycle_bucket_drive_scans: AtomicU64::new(0),
             last_scan_cycle_bucket_drive_failures: AtomicU64::new(0),
             last_scan_cycle_yield_events: AtomicU64::new(0),
@@ -1628,6 +1771,13 @@ impl Metrics {
             scanner_checkpoint_cleared: AtomicU64::new(0),
             scanner_checkpoint_ignored: AtomicU64::new(0),
             scanner_checkpoint_stale: AtomicU64::new(0),
+            scanner_dirty_usage_pending_buckets: AtomicU64::new(0),
+            scanner_dirty_usage_last_mark_unix_secs: AtomicU64::new(0),
+            scanner_dirty_usage_last_clear_unix_secs: AtomicU64::new(0),
+            scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64::new(0),
+            scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64::new(0),
+            scanner_usage_last_save_unix_secs: AtomicU64::new(0),
+            scanner_usage_last_save_result: AtomicU8::new(ScannerUsageSaveResult::Unknown as u8),
             scanner_source_work: ScannerWorkSource::all()
                 .iter()
                 .map(|_| ScannerSourceWorkCounters::default())
@@ -1772,7 +1922,7 @@ impl Metrics {
         let duration_millis = duration_millis_saturated(duration);
         let _ = self
             .scanner_yield_duration_millis
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(duration_millis))
             });
     }
@@ -1786,7 +1936,7 @@ impl Metrics {
         let duration_millis = duration_millis_saturated(duration);
         let _ = self
             .scanner_throttle_sleep_duration_millis
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(duration_millis))
             });
     }
@@ -1909,6 +2059,46 @@ impl Metrics {
         self.update_scanner_checkpoint_event(SCANNER_CHECKPOINT_EVENT_STALE);
     }
 
+    pub fn record_scanner_dirty_usage_pending(&self, pending_buckets: u64) {
+        self.scanner_dirty_usage_pending_buckets
+            .store(pending_buckets, Ordering::Relaxed);
+        if pending_buckets > 0 {
+            self.scanner_dirty_usage_last_mark_unix_secs
+                .store(unix_now_secs(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_scanner_dirty_usage_clear(&self, pending_buckets: u64) {
+        self.scanner_dirty_usage_pending_buckets
+            .store(pending_buckets, Ordering::Relaxed);
+        self.scanner_dirty_usage_last_clear_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_dirty_usage_cycle_snapshot(&self, dirty_buckets: u64) {
+        self.scanner_dirty_usage_last_cycle_dirty_buckets
+            .store(dirty_buckets, Ordering::Relaxed);
+        self.scanner_dirty_usage_last_cycle_cleared_buckets
+            .store(0, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_dirty_usage_cycle_clear(&self, cleared_buckets: u64, pending_buckets: u64) {
+        self.scanner_dirty_usage_last_cycle_cleared_buckets
+            .store(cleared_buckets, Ordering::Relaxed);
+        self.scanner_dirty_usage_pending_buckets
+            .store(pending_buckets, Ordering::Relaxed);
+        if cleared_buckets > 0 {
+            self.scanner_dirty_usage_last_clear_unix_secs
+                .store(unix_now_secs(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_scanner_usage_save_result(&self, result: ScannerUsageSaveResult) {
+        self.scanner_usage_last_save_result.store(result as u8, Ordering::Relaxed);
+        self.scanner_usage_last_save_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+    }
+
     pub fn record_scanner_source_work(&self, source: ScannerWorkSource, work: ScannerSourceWorkUpdate) {
         if let Some(counters) = self.scanner_source_work.get(source.index()) {
             counters.add(work);
@@ -1929,6 +2119,17 @@ impl Metrics {
 
     pub fn record_scanner_source_checked(&self, source: ScannerWorkSource, count: u64) {
         self.record_scanner_source_work(source, ScannerSourceWorkUpdate::checked(count));
+    }
+
+    /// Record `count` object versions walked by the data scanner.
+    ///
+    /// Every version the scanner visits is counted here, independent of
+    /// lifecycle configuration, so `rustfs_scanner_versions_scanned_total`
+    /// reflects real scan coverage even on clusters with no ILM rules. ILM
+    /// evaluation coverage is recorded separately via the `Lifecycle` source's
+    /// `checked` counter and surfaces as `rustfs_ilm_versions_scanned_total`.
+    pub fn record_scanner_versions_scanned(&self, count: u64) {
+        self.lifetime_versions_scanned.fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_scanner_source_queued(&self, source: ScannerWorkSource, count: u64) {
@@ -2058,10 +2259,10 @@ impl Metrics {
         active: Option<usize>,
     ) {
         let key = format!("{pool}/{set}");
-        let mut states = match self.scanner_disk_bucket_scan_states.lock() {
-            Ok(states) => states,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut states = self
+            .scanner_disk_bucket_scan_states
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = states.entry(key).or_default();
         if let Some(concurrency_limit) = concurrency_limit {
             state.concurrency_limit = concurrency_limit as u64;
@@ -2119,6 +2320,19 @@ impl Metrics {
         HealScanMode::from_u8(self.current_scan_mode.load(Ordering::Relaxed)).unwrap_or(HealScanMode::Unknown)
     }
 
+    pub async fn record_scanner_leader_liveness(&self, state: impl Into<String>, held: bool, error: impl Into<String>) {
+        *self.scanner_leader_lock_state.write().await = state.into();
+        *self.scanner_leader_lock_last_error.write().await = error.into();
+        self.scanner_leader_lock_held.store(held, Ordering::Relaxed);
+        self.scanner_leader_lock_last_update_unix_secs
+            .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_cycle_end_time(&self) {
+        self.last_scan_cycle_end_unix_secs
+            .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
+    }
+
     pub fn record_scan_cycle_complete(&self, success: bool, duration: Duration) {
         let result = if success {
             SCAN_CYCLE_RESULT_SUCCESS
@@ -2126,6 +2340,7 @@ impl Metrics {
             self.failed_scan_cycles.fetch_add(1, Ordering::Relaxed);
             SCAN_CYCLE_RESULT_ERROR
         };
+        self.record_scanner_cycle_end_time();
         self.last_scan_cycle_result.store(result, Ordering::Relaxed);
         self.last_scan_cycle_partial_reason
             .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
@@ -2144,6 +2359,7 @@ impl Metrics {
         reason: ScanCyclePartialReason,
         source: Option<ScannerWorkSource>,
     ) {
+        self.record_scanner_cycle_end_time();
         self.partial_scan_cycles.fetch_add(1, Ordering::Relaxed);
         match reason {
             ScanCyclePartialReason::Unknown => &self.partial_scan_cycles_unknown,
@@ -2499,6 +2715,12 @@ impl Metrics {
             .map(|(disk, state)| format!("{disk}/{}", state.path))
             .collect();
         m.current_scan_mode = self.current_scan_mode().as_str().to_string();
+        m.versions_scanned = self.lifetime_versions_scanned.load(Ordering::Relaxed);
+        m.leader_lock_state = self.scanner_leader_lock_state.read().await.clone();
+        m.leader_lock_held_by_this_process = self.scanner_leader_lock_held.load(Ordering::Relaxed);
+        m.leader_lock_last_error = self.scanner_leader_lock_last_error.read().await.clone();
+        m.leader_lock_last_update_unix_secs = self.scanner_leader_lock_last_update_unix_secs.load(Ordering::Relaxed);
+        m.last_cycle_end_unix_secs = self.last_scan_cycle_end_unix_secs.load(Ordering::Relaxed);
         m.current_set_scan_concurrency_limit = self.scanner_set_scan_concurrency_limit.load(Ordering::Relaxed);
         m.current_set_scans_queued = self.scanner_set_scans_queued.load(Ordering::Relaxed);
         m.current_set_scans_active = self.scanner_set_scans_active.load(Ordering::Relaxed);
@@ -2606,6 +2828,17 @@ impl Metrics {
             scanner_missed: self.scanner_transition_missed_total.load(Ordering::Relaxed),
             completed: self.scanner_transition_completed.load(Ordering::Relaxed),
             failed: self.scanner_transition_failed.load(Ordering::Relaxed),
+        };
+        let usage_save_result = ScannerUsageSaveResult::from_code(self.scanner_usage_last_save_result.load(Ordering::Relaxed));
+        m.usage_freshness = ScannerUsageFreshnessSnapshot {
+            dirty_pending_buckets: self.scanner_dirty_usage_pending_buckets.load(Ordering::Relaxed),
+            last_dirty_mark_unix_secs: self.scanner_dirty_usage_last_mark_unix_secs.load(Ordering::Relaxed),
+            last_dirty_clear_unix_secs: self.scanner_dirty_usage_last_clear_unix_secs.load(Ordering::Relaxed),
+            last_cycle_dirty_buckets: self.scanner_dirty_usage_last_cycle_dirty_buckets.load(Ordering::Relaxed),
+            last_cycle_cleared_dirty_buckets: self.scanner_dirty_usage_last_cycle_cleared_buckets.load(Ordering::Relaxed),
+            last_usage_save_unix_secs: self.scanner_usage_last_save_unix_secs.load(Ordering::Relaxed),
+            last_usage_save_result: usage_save_result.as_str().to_string(),
+            last_usage_save_result_code: usage_save_result as u8 as u64,
         };
         m.throttle_idle_mode_enabled = self.scanner_throttle_idle_mode_enabled.load(Ordering::Relaxed);
         m.throttle_sleep_factor = self.scanner_throttle_sleep_factor_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
@@ -2840,6 +3073,50 @@ mod tests {
         assert_eq!(report.current_disk_scan_concurrency_limit, 0);
         assert_eq!(report.current_disk_bucket_scans_queued, 0);
         assert_eq!(report.current_disk_bucket_scans_active, 0);
+    }
+
+    #[tokio::test]
+    async fn report_counts_scanned_versions_independent_of_lifecycle() {
+        let metrics = Metrics::new();
+
+        // No ILM configuration touched: scanned versions must still accrue so
+        // rustfs_scanner_versions_scanned_total reflects real coverage.
+        metrics.record_scanner_versions_scanned(3);
+        metrics.record_scanner_versions_scanned(5);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.versions_scanned, 8);
+        // ILM-checked versions live on the Lifecycle source and stay zero when
+        // no lifecycle evaluation ran.
+        let lifecycle_checked = report
+            .source_work
+            .iter()
+            .find(|s| s.source == "lifecycle")
+            .map(|s| s.checked)
+            .unwrap_or_default();
+        assert_eq!(lifecycle_checked, 0);
+    }
+
+    #[tokio::test]
+    async fn report_tracks_lifecycle_checked_versions_separately() {
+        let metrics = Metrics::new();
+
+        // Simulate the scanner walking versions and, on a lifecycle-configured
+        // bucket, handing a subset to the ILM evaluator.
+        metrics.record_scanner_versions_scanned(10);
+        metrics.record_scanner_source_checked(ScannerWorkSource::Lifecycle, 4);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.versions_scanned, 10, "total scanned versions independent of ILM");
+        let lifecycle_checked = report
+            .source_work
+            .iter()
+            .find(|s| s.source == "lifecycle")
+            .map(|s| s.checked)
+            .unwrap_or_default();
+        assert_eq!(lifecycle_checked, 4, "ILM-checked versions tracked on the Lifecycle source");
     }
 
     #[tokio::test]
@@ -3289,6 +3566,14 @@ mod tests {
             ScannerReplicationRepairKind::BucketExistingObject,
             ScannerSourceWorkUpdate::queued(4),
         );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::SitePassiveRequeue,
+            ScannerSourceWorkUpdate::missed(5),
+        );
+        metrics.record_scanner_replication_repair_work(
+            ScannerReplicationRepairKind::SiteActiveResync,
+            ScannerSourceWorkUpdate::queued(6),
+        );
 
         let report = metrics.report().await;
         let object = report
@@ -3296,6 +3581,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
             .expect("bucket object repair work should be visible");
+        assert_eq!(object.scanner_role, "repair_admission");
+        assert_eq!(object.execution_owner, "bucket_replication_queue");
         assert_eq!(object.queued, 2);
 
         let delete_marker = report
@@ -3303,6 +3590,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
             .expect("bucket delete-marker repair work should be visible");
+        assert_eq!(delete_marker.scanner_role, "repair_admission");
+        assert_eq!(delete_marker.execution_owner, "bucket_replication_queue");
         assert_eq!(delete_marker.missed, 1);
 
         let version_purge = report
@@ -3310,6 +3599,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "version_purge")
             .expect("bucket version purge repair work should be visible");
+        assert_eq!(version_purge.scanner_role, "repair_admission");
+        assert_eq!(version_purge.execution_owner, "bucket_replication_queue");
         assert_eq!(version_purge.skipped, 3);
 
         let existing_object = report
@@ -3317,7 +3608,69 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "existing_object")
             .expect("bucket existing object repair work should be visible");
+        assert_eq!(existing_object.scanner_role, "repair_admission");
+        assert_eq!(existing_object.execution_owner, "bucket_replication_queue");
         assert_eq!(existing_object.queued, 4);
+
+        let passive_requeue = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "site_replication" && repair.kind == "passive_requeue")
+            .expect("site passive requeue boundary work should be visible");
+        assert_eq!(passive_requeue.scanner_role, "boundary_signal");
+        assert_eq!(passive_requeue.execution_owner, "site_replication_runtime");
+        assert_eq!(passive_requeue.missed, 5);
+
+        let active_resync = report
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "site_replication" && repair.kind == "active_resync")
+            .expect("site active resync boundary work should be visible");
+        assert_eq!(active_resync.scanner_role, "boundary_signal");
+        assert_eq!(active_resync.execution_owner, "site_replication_runtime");
+        assert_eq!(active_resync.queued, 6);
+    }
+
+    #[test]
+    fn scanner_replication_repair_kind_sources_are_stable() {
+        let bucket_kinds = [
+            ScannerReplicationRepairKind::BucketObject,
+            ScannerReplicationRepairKind::BucketDeleteMarker,
+            ScannerReplicationRepairKind::BucketVersionPurge,
+            ScannerReplicationRepairKind::BucketExistingObject,
+        ];
+        for kind in bucket_kinds {
+            assert_eq!(kind.source(), ScannerWorkSource::BucketReplication);
+            assert_eq!(kind.scanner_role(), ScannerReplicationRepairRole::RepairAdmission);
+            assert_eq!(kind.execution_owner(), ScannerReplicationExecutionOwner::BucketReplicationQueue);
+        }
+
+        assert_eq!(
+            ScannerReplicationRepairKind::SitePassiveRequeue.source(),
+            ScannerWorkSource::SiteReplication
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SiteActiveResync.source(),
+            ScannerWorkSource::SiteReplication
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SitePassiveRequeue.scanner_role(),
+            ScannerReplicationRepairRole::BoundarySignal
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SiteActiveResync.scanner_role(),
+            ScannerReplicationRepairRole::BoundarySignal
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SitePassiveRequeue.execution_owner(),
+            ScannerReplicationExecutionOwner::SiteReplicationRuntime
+        );
+        assert_eq!(
+            ScannerReplicationRepairKind::SiteActiveResync.execution_owner(),
+            ScannerReplicationExecutionOwner::SiteReplicationRuntime
+        );
+        assert_eq!(ScannerReplicationRepairKind::SitePassiveRequeue.as_str(), "passive_requeue");
+        assert_eq!(ScannerReplicationRepairKind::SiteActiveResync.as_str(), "active_resync");
     }
 
     #[tokio::test]
@@ -3421,6 +3774,21 @@ mod tests {
         let report = metrics.report().await;
 
         assert_eq!(report.current_scan_mode, HealScanMode::Deep.as_str());
+    }
+
+    #[tokio::test]
+    async fn report_includes_scanner_leader_liveness() {
+        let metrics = Metrics::new();
+
+        metrics.record_scanner_leader_liveness("contended", false, "lock busy").await;
+        metrics.record_scanner_cycle_end_time();
+        let report = metrics.report().await;
+
+        assert_eq!(report.leader_lock_state, "contended");
+        assert!(!report.leader_lock_held_by_this_process);
+        assert_eq!(report.leader_lock_last_error, "lock busy");
+        assert!(report.leader_lock_last_update_unix_secs > 0);
+        assert!(report.last_cycle_end_unix_secs > 0);
     }
 
     #[tokio::test]
@@ -3536,6 +3904,39 @@ mod tests {
 
         assert_eq!(report.life_time_ops.get("scan_bucket_drive_start"), Some(&1));
         assert_eq!(report.life_time_ops.get("scan_bucket_drive_failure"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn report_includes_usage_freshness_status() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_dirty_usage_pending(2);
+        metrics.record_scanner_dirty_usage_cycle_snapshot(1);
+        metrics.record_scanner_dirty_usage_cycle_clear(1, 1);
+        metrics.record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.usage_freshness.dirty_pending_buckets, 1);
+        assert!(report.usage_freshness.last_dirty_mark_unix_secs > 0);
+        assert!(report.usage_freshness.last_dirty_clear_unix_secs > 0);
+        assert_eq!(report.usage_freshness.last_cycle_dirty_buckets, 1);
+        assert_eq!(report.usage_freshness.last_cycle_cleared_dirty_buckets, 1);
+        assert!(report.usage_freshness.last_usage_save_unix_secs > 0);
+        assert_eq!(report.usage_freshness.last_usage_save_result, "success");
+        assert_eq!(report.usage_freshness.last_usage_save_result_code, 1);
+    }
+
+    #[tokio::test]
+    async fn dirty_usage_cycle_snapshot_resets_stale_cleared_count() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_dirty_usage_cycle_snapshot(2);
+        metrics.record_scanner_dirty_usage_cycle_clear(2, 0);
+        metrics.record_scanner_dirty_usage_cycle_snapshot(1);
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.usage_freshness.last_cycle_dirty_buckets, 1);
+        assert_eq!(report.usage_freshness.last_cycle_cleared_dirty_buckets, 0);
     }
 
     #[tokio::test]

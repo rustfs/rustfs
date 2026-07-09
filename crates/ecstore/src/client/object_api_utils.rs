@@ -25,10 +25,10 @@ use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::io::BufReader;
 
 use crate::error::ErrorResponse;
-use crate::store_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+use crate::storage_api_contracts::range::HTTPRangeSpec;
 use rustfs_filemeta::ObjectPartInfo;
 use rustfs_rio::HashReader;
-use rustfs_storage_api::HTTPRangeSpec;
 use s3s::S3ErrorCode;
 
 //#[derive(Clone)]
@@ -121,8 +121,8 @@ pub fn new_getobjectreader<'a>(
     let is_compressed = false; //oi.is_compressed_ok();
 
     let rs_;
-    if rs.is_none() && opts.part_number.is_some() && opts.part_number.unwrap() > 0 {
-        rs_ = part_number_to_rangespec(oi.clone(), opts.part_number.unwrap());
+    if rs.is_none() && opts.part_number.is_some() && opts.part_number.expect("operation should succeed") > 0 {
+        rs_ = part_number_to_rangespec(oi.clone(), opts.part_number.expect("operation should succeed"));
     } else {
         rs_ = rs.clone();
     }
@@ -149,6 +149,7 @@ pub fn new_getobjectreader<'a>(
             let r = GetObjectReader {
                 object_info: oi.clone(),
                 stream: Box::new(input_reader),
+                buffered_body: None,
             };
             r
             //})

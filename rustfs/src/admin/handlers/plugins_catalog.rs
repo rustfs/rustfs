@@ -15,10 +15,11 @@
 use crate::admin::{
     auth::validate_admin_request,
     plugin_contract::{
-        PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain, PluginContractEntrypointKind,
-        PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
+        PluginCatalogAdminDiscovery, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
+        PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
     },
     router::{AdminOperation, Operation, S3Router},
+    runtime_sources::default_admin_usecase,
 };
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -29,10 +30,7 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::{
     builtin::builtin_audit_target_admin_descriptors, builtin::builtin_notify_target_admin_descriptors,
 };
-use rustfs_targets::{
-    BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest, builtin_target_plugin_installation,
-    catalog::example_external_webhook_plugin,
-};
+use rustfs_targets::{BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest, builtin_target_plugin_installation};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -57,6 +55,7 @@ fn target_domain_name_from_subsystem(subsystem: &str) -> PluginContractDomain {
 }
 
 fn build_catalog_response() -> PluginCatalogResponse {
+    let usecase = default_admin_usecase();
     let mut plugins: HashMap<&'static str, PluginCatalogEntry> = HashMap::new();
 
     for descriptor in builtin_notify_target_admin_descriptors()
@@ -67,39 +66,19 @@ fn build_catalog_response() -> PluginCatalogResponse {
     }
 
     let mut plugins = plugins.into_values().collect::<Vec<_>>();
-    plugins.push(example_external_webhook_plugin_entry());
     plugins.sort_by(|a, b| a.target_type.cmp(&b.target_type));
     for plugin in &mut plugins {
         plugin.supported_domains.sort();
         plugin.domain_configs.sort_by_key(|a| a.domain);
     }
 
-    PluginCatalogResponse { plugins }
-}
-
-fn example_external_webhook_plugin_entry() -> PluginCatalogEntry {
-    let example = example_external_webhook_plugin();
-    let manifest = example.manifest;
-
-    PluginCatalogEntry {
-        plugin_id: manifest.plugin_id.to_string(),
-        target_type: manifest.target_type.to_string(),
-        display_name: manifest.display_name.to_string(),
-        provider: manifest.provider.to_string(),
-        version: manifest.version.to_string(),
-        packaging: PluginContractPackaging::from(manifest.packaging),
-        entrypoint_kind: PluginContractEntrypointKind::from(manifest.entrypoint_kind),
-        api_compatibility_version: manifest.api_compatibility_version.to_string(),
-        runtime_contract: PluginRuntimeContract::from(manifest.runtime_contract),
-        distribution: manifest.distribution.map(PluginDistributionContract::from),
-        supported_domains: manifest.supported_domains.iter().copied().map(Into::into).collect(),
-        secret_fields: manifest.secret_fields.iter().map(|field| (*field).to_string()).collect(),
-        domain_configs: vec![PluginCatalogDomainEntry {
-            domain: PluginContractDomain::Notify,
-            subsystem: "notify_webhook".to_string(),
-            valid_fields: example.valid_fields,
-        }],
-        installation: Some(example.installation.into()),
+    PluginCatalogResponse {
+        plugins,
+        admin_discovery: PluginCatalogAdminDiscovery {
+            runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+            cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+            extensions_catalog: usecase.extensions_catalog_route().to_string(),
+        },
     }
 }
 
@@ -200,6 +179,10 @@ mod tests {
     fn plugin_catalog_contains_representative_builtin_targets() {
         let response = build_catalog_response();
 
+        assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
+
         let webhook = response
             .plugins
             .iter()
@@ -236,6 +219,26 @@ mod tests {
         assert_eq!(kafka.target_type, "kafka");
         assert!(kafka.domain_configs.iter().any(|domain| domain.subsystem == "audit_kafka"));
         assert!(kafka.domain_configs.iter().any(|domain| domain.subsystem == "notify_kafka"));
+    }
+
+    #[test]
+    fn plugin_catalog_never_exposes_example_or_external_fixtures() {
+        let response = build_catalog_response();
+
+        assert!(
+            response
+                .plugins
+                .iter()
+                .all(|plugin| plugin.packaging == PluginContractPackaging::Builtin),
+            "production plugin catalog must only expose builtin plugins until a real marketplace source exists"
+        );
+        assert!(
+            !response
+                .plugins
+                .iter()
+                .any(|plugin| plugin.plugin_id.starts_with("external:")),
+            "example external plugin fixtures must not leak into the production catalog"
+        );
     }
 
     #[test]

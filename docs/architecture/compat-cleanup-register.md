@@ -12,13 +12,6 @@ for later deletion.
 
 ## Open Items
 
-- `RUSTFS_COMPAT_TODO(S-012)`
-  - Task: `S-012`
-  - File: `rustfs/src/admin/handlers/kms_keys.rs`
-  - Why: legacy KMS create-key and key-status admin grants must keep working during the dedicated KMS policy migration.
-  - Removal condition: remove after KMS admin clients and built-in policies use `kms:Configure`, `kms:DescribeKey`, and `kms:ListKeys`.
-  - Status: planned cleanup.
-
 ## Review Checklist
 
 Before completing a PR that adds wrappers, re-exports, fallbacks, legacy action

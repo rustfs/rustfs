@@ -25,6 +25,7 @@ on:
       - '.github/workflows/**'
       - 'scripts/security/check_workflow_pins.sh'
   pull_request:
+    types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
     paths:
       - '**/Cargo.toml'
@@ -34,48 +35,41 @@ on:
       - '.github/workflows/**'
       - 'scripts/security/check_workflow_pins.sh'
   schedule:
-    - cron: '0 0 * * 0' # Weekly on Sunday at midnight UTC
+    - cron: '0 3 * * 0' # Weekly on Sunday 03:00 UTC (staggered after the midnight ci/build crons)
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Event-scoped groups: merges to main must not cancel the weekly scheduled
+# run (same rationale as ci.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  security-audit:
-    name: Security Audit
+  cancel-closed-pr-runs:
+    name: Cancel Closed PR Runs
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Explain cancellation run
+        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-
-      - name: Run security audit
-        run: |
-          cargo audit -D warnings --json | tee audit-results.json
-
-      - name: Upload audit results
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: security-audit-results-${{ github.run_number }}
-          path: audit-results.json
-          retention-days: 30
-
+  # RustSec advisory scanning is covered by the `advisories` check of
+  # cargo-deny below; a separate cargo-audit job would duplicate the same
+  # database lookup with a second ignore list to maintain.
   cargo-deny:
     name: Cargo Deny
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -83,7 +77,7 @@ jobs:
           cache-shared-key: rustfs-cargo-deny
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
         with:
           tool: cargo-deny
 
@@ -92,28 +86,29 @@ jobs:
 
   workflow-pin-report:
     name: Workflow Pin Report
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Report unpinned GitHub Actions
-        run: ./scripts/security/check_workflow_pins.sh
+        run: ./scripts/security/check_workflow_pins.sh --enforce
 
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
     permissions:
       contents: read
       pull-requests: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Dependency Review
-        uses: actions/dependency-review-action@v5
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5
         with:
           fail-on-severity: moderate
           allow-ghsas: GHSA-2f9f-gq7v-9h6m

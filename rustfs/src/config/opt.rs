@@ -98,13 +98,7 @@ impl Opt {
         let cli = Cli::parse_from(args);
         match cli.command {
             Some(Commands::Server(opts)) => Self::from_server_opts(*opts),
-            Some(Commands::Info(_)) => {
-                // This should not happen in parse_from, as it's handled by parse_command
-                panic!("Info command should be handled by parse_command");
-            }
-            Some(Commands::Tls(_)) => {
-                panic!("TLS command should be handled by parse_command");
-            }
+            Some(Commands::Info(_)) | Some(Commands::Tls(_)) => Self::from_server_opts(default_server_opts()),
             None => {
                 // Default to server with empty volumes (will be filled from env)
                 Self::from_server_opts(default_server_opts())

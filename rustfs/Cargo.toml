@@ -40,6 +40,10 @@ name = "manual-test-dial9"
 path = "tests/manual/test_dial9.rs"
 test = false
 bench = false
+
+[[bench]]
+name = "s3_operations"
+harness = false
 required-features = ["manual-test-runners"]
 
 [features]
@@ -52,15 +56,23 @@ sftp = ["rustfs-protocols/sftp"]
 license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
-full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp"]
+full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope"]
 manual-test-runners = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope"]
+hotpath = [
+    "dep:hotpath",
+    "hotpath/hotpath",
+    "rustfs-ecstore/hotpath",
+    "rustfs-filemeta/hotpath",
+    "rustfs-rio/hotpath",
+]
 
 [lints]
 workspace = true
 
 [dependencies]
+hotpath = { workspace = true, optional = true }
 # RustFS Internal Crates
 rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }
@@ -97,9 +109,11 @@ rustfs-zip = { workspace = true }
 rustfs-io-core = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 rustfs-object-capacity = { workspace = true }
+rustfs-object-data-cache = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
+starshard = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
@@ -126,6 +140,7 @@ tower-http = { workspace = true, features = ["trace", "compression-full", "cors"
 # Serialization and Data Formats
 apache-avro = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 flatbuffers.workspace = true
 rmp-serde.workspace = true
 rustfs-signer.workspace = true
@@ -158,6 +173,7 @@ md5.workspace = true
 mime_guess = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
+parking_lot = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s.workspace = true
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
@@ -171,6 +187,7 @@ zip = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
 aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
@@ -178,31 +195,22 @@ opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 # Data structures
 hashbrown = { workspace = true }
+mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
-# io-uring is Linux-only. Scope the feature to Linux targets.
-tokio = { workspace = true, features = ["io-uring"] }
 
-[target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
-mimalloc = { workspace = true }
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
-
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-pprof = { workspace = true }
-
-# jemalloc-based allocator and memory profiling are only enabled on validated linux-gnu-x86_64 targets.
-[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
-tikv-jemallocator = { workspace = true }
-tikv-jemalloc-ctl = { workspace = true }
-jemalloc_pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+quick-xml = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
+insta = { workspace = true }
 proptest = "1"
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = { workspace = true, features = ["async_closure"] }
@@ -210,6 +218,7 @@ tracing-subscriber = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 rsa = { workspace = true }
 rcgen = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
 
 [build-dependencies]
 http.workspace = true

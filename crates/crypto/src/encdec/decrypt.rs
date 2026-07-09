@@ -53,6 +53,6 @@ fn decrypt<T: aes_gcm::aead::Aead>(stream: T, nonce: &[u8], data: &[u8]) -> Resu
 }
 
 #[cfg(not(any(test, feature = "crypto")))]
-pub fn decrypt_data(_password: &[u8], data: &[u8]) -> Result<Vec<u8>, crate::Error> {
-    Ok(data.to_vec())
+pub fn decrypt_data(_password: &[u8], _data: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    Err(crate::Error::ErrCryptoDisabled)
 }

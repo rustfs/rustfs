@@ -12,28 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::profile::authorize_profile_request;
+use super::profile::{authorize_profile_request, profile_not_implemented_response};
+use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::server::ADMIN_PREFIX;
-use http::{HeaderMap, HeaderValue, Uri};
+use crate::admin::storage_api::access::spawn_traced;
+use crate::auth::{check_key_valid, get_session_token};
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
+use rustfs_madmin::service_commands::ServiceTraceOpts;
+use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response, S3Result};
-use std::collections::HashMap;
+use s3s::stream::{ByteStream, DynByteStream};
+use s3s::{Body, S3Request, S3Response, S3Result, StdError, s3_error};
+use serde::Serialize;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
 
-#[allow(dead_code)]
-fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-
-    if let Some(query) = uri.query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
-    }
-
-    params
+#[derive(Serialize)]
+struct ProfileStatus {
+    enabled: &'static str,
+    status: &'static str,
+    platform: &'static str,
+    message: &'static str,
 }
 
 pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -49,119 +57,55 @@ pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
         AdminOperation(&ProfileStatusHandler {}),
     )?;
 
+    // MinIO-compatible profiling / trace family (#606).
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/profiling/start").as_str(),
+        AdminOperation(&ProfilingStartHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/profiling/download").as_str(),
+        AdminOperation(&ProfilingDownloadHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/profile").as_str(),
+        AdminOperation(&ProfileControlHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/trace").as_str(),
+        AdminOperation(&TraceHandler {}),
+    )?;
+
     Ok(())
 }
 
-pub struct ProfileHandler {}
-
-#[allow(dead_code)]
-fn map_cpu_profile_collect_error_message(err: &str) -> (StatusCode, String) {
-    if err.contains("start running cpu profiler error") {
-        return (
-            StatusCode::CONFLICT,
-            "CPU profiler is already running. Disable RUSTFS_OBS_PROFILING_EXPORT_ENABLED or retry later.".to_string(),
-        );
-    }
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to collect CPU profile: {err}"))
+/// Authorize a request against a single admin action (profiling or trace).
+async fn authorize_action(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
+    let Some(input_cred) = req.credentials.as_ref() else {
+        return Err(s3_error!(AccessDenied, "Signature is required"));
+    };
+    let (cred, owner) =
+        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
 }
+
+pub struct ProfileHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ProfileHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_profile_request(&req).await?;
 
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
-        {
-            let requested_url = req.uri.to_string();
-            let target_os = std::env::consts::OS;
-            let target_arch = std::env::consts::ARCH;
-            let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
-            let msg = format!(
-                "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}, requested_url={requested_url}"
-            );
-            return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(msg))));
-        }
-
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        {
-            use rustfs_config::{DEFAULT_CPU_FREQ, ENV_CPU_FREQ};
-            use rustfs_utils::get_env_usize;
-
-            let queries = extract_query_params(&req.uri);
-            let seconds = queries.get("seconds").and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
-            let format = queries.get("format").cloned().unwrap_or_else(|| "protobuf".to_string());
-
-            if seconds > 300 {
-                return Ok(S3Response::new((
-                    StatusCode::BAD_REQUEST,
-                    Body::from("Profile duration cannot exceed 300 seconds".to_string()),
-                )));
-            }
-
-            match format.as_str() {
-                "protobuf" | "pb" => match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(seconds)).await {
-                    Ok(path) => match tokio::fs::read(&path).await {
-                        Ok(bytes) => {
-                            let mut headers = HeaderMap::new();
-                            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-                            Ok(S3Response::with_headers((StatusCode::OK, Body::from(bytes)), headers))
-                        }
-                        Err(e) => {
-                            error!("Failed to read profile file {}: {}", path.display(), e);
-                            Ok(S3Response::new((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to read profile file: {e}")),
-                            )))
-                        }
-                    },
-                    Err(e) => {
-                        let (status, message) = map_cpu_profile_collect_error_message(&e);
-                        error!("CPU protobuf profile collection failed: {}", e);
-                        Ok(S3Response::new((status, Body::from(message))))
-                    }
-                },
-                "flamegraph" | "svg" => {
-                    let freq = get_env_usize(ENV_CPU_FREQ, DEFAULT_CPU_FREQ) as i32;
-                    let guard = match pprof::ProfilerGuard::new(freq) {
-                        Ok(g) => g,
-                        Err(e) => {
-                            return Ok(S3Response::new((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to create profiler: {e}")),
-                            )));
-                        }
-                    };
-
-                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-
-                    let report = match guard.report().build() {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return Ok(S3Response::new((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to build profile report: {e}")),
-                            )));
-                        }
-                    };
-
-                    let mut flamegraph_buf = Vec::new();
-                    if let Err(e) = report.flamegraph(&mut flamegraph_buf) {
-                        return Ok(S3Response::new((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Body::from(format!("Failed to generate flamegraph: {e}")),
-                        )));
-                    }
-
-                    let mut headers = HeaderMap::new();
-                    headers.insert(CONTENT_TYPE, HeaderValue::from_static("image/svg+xml"));
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(flamegraph_buf)), headers))
-                }
-                _ => Ok(S3Response::new((
-                    StatusCode::BAD_REQUEST,
-                    Body::from("Unsupported format. Use 'protobuf' or 'flamegraph'".to_string()),
-                ))),
-            }
-        }
+        let requested_url = req.uri.to_string();
+        crate::profiling::log_cpu_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(format!(
+            "{}; requested_url={requested_url}",
+            crate::profiling::local_cpu_pprof_unsupported_message()
+        )))
     }
 }
 
@@ -172,37 +116,11 @@ impl Operation for ProfileStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_profile_request(&req).await?;
 
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
-        let message = format!("CPU profiling is not supported on {} platform", std::env::consts::OS);
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
-        let status = HashMap::from([
-            ("enabled", "false"),
-            ("status", "not_supported"),
-            ("platform", std::env::consts::OS),
-            ("message", message.as_str()),
-        ]);
-
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        let status = {
-            use rustfs_config::{DEFAULT_ENABLE_PROFILING, ENV_ENABLE_PROFILING};
-            use rustfs_utils::get_env_bool;
-
-            let enabled = get_env_bool(ENV_ENABLE_PROFILING, DEFAULT_ENABLE_PROFILING);
-            if enabled {
-                HashMap::from([
-                    ("enabled", "true"),
-                    ("status", "running"),
-                    ("supported_formats", "protobuf, flamegraph"),
-                    ("max_duration_seconds", "300"),
-                    ("endpoint", "/rustfs/admin/debug/pprof/profile"),
-                ])
-            } else {
-                HashMap::from([
-                    ("enabled", "false"),
-                    ("status", "disabled"),
-                    ("message", "Set RUSTFS_ENABLE_PROFILING=true to enable profiling"),
-                ])
-            }
+        let status = ProfileStatus {
+            enabled: "false",
+            status: "not_supported",
+            platform: std::env::consts::OS,
+            message: crate::profiling::LOCAL_CPU_PPROF_UNSUPPORTED_SUMMARY,
         };
 
         match serde_json::to_string(&status) {
@@ -222,13 +140,144 @@ impl Operation for ProfileStatusHandler {
     }
 }
 
+/// `POST /v3/profiling/start` — begin a profiling session.
+///
+/// RustFS builds with the mimalloc allocator and ships no in-process pprof/CPU
+/// sampler (see `crate::profiling`): profiling is exported out-of-process via
+/// Pyroscope. We therefore honor the MinIO request shape but return
+/// `501 Not Implemented` with a clear reason rather than pretending to have
+/// started a capture that will never produce data.
+pub struct ProfilingStartHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ProfilingStartHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_action(&req, AdminAction::ProfilingAdminAction).await?;
+        crate::profiling::log_cpu_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(format!(
+            "profiling start is not supported: {}",
+            crate::profiling::local_cpu_pprof_unsupported_message()
+        )))
+    }
+}
+
+/// `GET /v3/profiling/download` — download the captured profile archive.
+///
+/// No capture is ever produced (see `ProfilingStartHandler`), so there is
+/// nothing to download.
+pub struct ProfilingDownloadHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ProfilingDownloadHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_action(&req, AdminAction::ProfilingAdminAction).await?;
+        Ok(profile_not_implemented_response(format!(
+            "profiling download is not supported: {}",
+            crate::profiling::local_cpu_pprof_unsupported_message()
+        )))
+    }
+}
+
+/// `POST /v3/profile` — start/stop profiling in one call (legacy MinIO shape).
+pub struct ProfileControlHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ProfileControlHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_action(&req, AdminAction::ProfilingAdminAction).await?;
+        crate::profiling::log_cpu_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(format!(
+            "in-process profiling is not supported: {}",
+            crate::profiling::local_cpu_pprof_unsupported_message()
+        )))
+    }
+}
+
+struct TraceStream {
+    inner: ReceiverStream<Result<Bytes, StdError>>,
+}
+
+impl Stream for TraceStream {
+    type Item = Result<Bytes, StdError>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::into_inner(self).inner.poll_next_unpin(cx)
+    }
+}
+
+impl ByteStream for TraceStream {}
+
+/// `GET /v3/trace` — stream real-time server trace events.
+///
+/// RustFS emits diagnostics through the `tracing` pipeline but does not expose
+/// an in-process subscriber that can fan trace events out to an admin client
+/// (there is no request-trace broadcast channel). Rather than return an opaque
+/// `501` — which would make `mc admin trace` fail to connect — this honors the
+/// streaming NDJSON contract: it validates the requested trace filters, opens
+/// the stream, emits a single capability record explaining that live tracing is
+/// not wired, then holds the connection open with keep-alives. No fabricated
+/// trace records are ever sent.
+pub struct TraceHandler {}
+
+#[async_trait::async_trait]
+impl Operation for TraceHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        authorize_action(&req, AdminAction::TraceAdminAction).await?;
+
+        // Validate the trace options so malformed filters are rejected up front,
+        // matching MinIO's behavior.
+        let mut opts = ServiceTraceOpts::default();
+        opts.parse_params(&req.uri)
+            .map_err(|_| s3_error!(InvalidRequest, "invalid trace parameters"))?;
+
+        let node_name = sysinfo::System::host_name().unwrap_or_else(|| "rustfs".to_string());
+        let (tx, rx) = mpsc::channel::<Result<Bytes, StdError>>(8);
+
+        spawn_traced(async move {
+            let notice = serde_json::json!({
+                "nodename": node_name,
+                "funcname": "admin.Trace",
+                "msg": "RustFS does not expose an in-process trace-event subscriber; live tracing is not yet available",
+                "err": "trace_streaming_unsupported",
+            });
+            if let Ok(mut encoded) = serde_json::to_vec(&notice) {
+                encoded.push(b'\n');
+                if tx.send(Ok(Bytes::from(encoded))).await.is_err() {
+                    return;
+                }
+            }
+
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    _ = ticker.tick() => {
+                        if tx.send(Ok(Bytes::from_static(b" \n"))).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let stream: DynByteStream = Box::pin(TraceStream {
+            inner: ReceiverStream::new(rx),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-ndjson"));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(stream)), headers))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProfileHandler, ProfileStatusHandler, extract_query_params};
+    use super::{
+        ProfileControlHandler, ProfileHandler, ProfileStatusHandler, ProfilingDownloadHandler, ProfilingStartHandler,
+        TraceHandler,
+    };
     use crate::admin::router::Operation;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
-    use hyper::StatusCode;
     use matchit::Params;
     use s3s::{Body, S3ErrorCode, S3Request};
 
@@ -244,17 +293,6 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
-    }
-
-    #[test]
-    fn test_extract_query_params_decodes_percent_encoded_values() {
-        let uri: Uri = "/rustfs/admin/debug/pprof/profile?format=flamegraph&note=a%2Bb+value"
-            .parse()
-            .expect("uri should parse");
-        let params = extract_query_params(&uri);
-
-        assert_eq!(params.get("format"), Some(&"flamegraph".to_string()));
-        assert_eq!(params.get("note"), Some(&"a+b value".to_string()));
     }
 
     #[tokio::test]
@@ -285,11 +323,39 @@ mod tests {
         assert_eq!(err.message(), Some("Signature is required"));
     }
 
-    #[test]
-    fn cpu_profile_collect_error_maps_profiler_conflict_to_409() {
-        let (status, message) =
-            super::map_cpu_profile_collect_error_message("create profiler failed: start running cpu profiler error");
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert!(message.contains("CPU profiler is already running"));
+    #[tokio::test]
+    async fn profiling_start_rejects_missing_credentials() {
+        let err = ProfilingStartHandler {}
+            .call(build_profile_request("/rustfs/admin/v3/profiling/start"), Params::new())
+            .await
+            .expect_err("profiling start must reject anonymous requests");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn profiling_download_rejects_missing_credentials() {
+        let err = ProfilingDownloadHandler {}
+            .call(build_profile_request("/rustfs/admin/v3/profiling/download"), Params::new())
+            .await
+            .expect_err("profiling download must reject anonymous requests");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn profile_control_rejects_missing_credentials() {
+        let err = ProfileControlHandler {}
+            .call(build_profile_request("/rustfs/admin/v3/profile"), Params::new())
+            .await
+            .expect_err("profile control must reject anonymous requests");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[tokio::test]
+    async fn trace_handler_rejects_missing_credentials() {
+        let err = TraceHandler {}
+            .call(build_profile_request("/rustfs/admin/v3/trace?s3=true"), Params::new())
+            .await
+            .expect_err("trace must reject anonymous requests");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 }

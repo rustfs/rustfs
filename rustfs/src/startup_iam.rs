@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{AppContext, get_global_app_context, init_global_app_context};
+use crate::runtime_sources::AppContext;
 use crate::server::{ServiceStateManager, publish_ready_when_runtime_ready};
+use crate::storage_api::startup::iam::ECStore;
 use rustfs_common::{GlobalReadiness, SystemStage};
-use rustfs_ecstore::store::ECStore;
 use rustfs_iam::init_iam_sys;
 use rustfs_kms::KmsServiceManager;
 use std::future::Future;
@@ -39,12 +39,12 @@ const IAM_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 const IAM_RETRY_ESCALATION_THRESHOLD: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IamBootstrapDisposition {
+pub(crate) enum IamBootstrapDisposition {
     ReadyInline,
     Deferred,
 }
 
-pub async fn publish_ready_for_iam_bootstrap(
+pub(crate) async fn publish_ready_for_iam_bootstrap(
     disposition: IamBootstrapDisposition,
     readiness: &GlobalReadiness,
     state_manager: Option<&ServiceStateManager>,
@@ -71,28 +71,13 @@ where
     Ok(false)
 }
 
-fn init_app_context_if_needed(store: Arc<ECStore>, kms_interface: Arc<KmsServiceManager>) -> bool {
-    if get_global_app_context().is_some() {
-        return false;
-    }
-
-    let Ok(iam_interface) = rustfs_iam::get() else {
-        return false;
-    };
-
-    init_global_app_context(AppContext::with_default_interfaces(store, iam_interface, kms_interface));
-    true
-}
-
 async fn finalize_iam_recovery(
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
 ) -> Result<()> {
-    if !init_app_context_if_needed(store, kms_interface) && get_global_app_context().is_none() {
-        return Err(std::io::Error::other("IAM recovered but app context is still unavailable"));
-    }
+    AppContext::ensure_startup_after_iam(store, kms_interface)?;
 
     readiness.mark_stage(SystemStage::IamReady);
     publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
@@ -183,6 +168,7 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
             }
             Err(err) => {
                 let next_interval = compute_backoff_interval(attempts + 1, initial_interval, max_interval);
+                let hint = iam_bootstrap_failure_hint(&err.to_string());
                 if attempts >= IAM_RETRY_ESCALATION_THRESHOLD {
                     error!(
                         event = EVENT_IAM_BOOTSTRAP_RETRY_FAILED,
@@ -192,6 +178,7 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                         next_retry_secs = next_interval.as_secs(),
                         degraded_duration_secs = degraded_since.elapsed().as_secs(),
                         error = %err,
+                        hint,
                         "IAM bootstrap retry failed; service remains degraded"
                     );
                 } else {
@@ -202,6 +189,7 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                         attempts,
                         next_retry_secs = next_interval.as_secs(),
                         error = %err,
+                        hint,
                         "IAM bootstrap retry failed; service remains degraded"
                     );
                 }
@@ -247,6 +235,23 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                 }
             }
         }
+    }
+}
+
+/// Classifies an IAM bootstrap failure into an actionable operator hint, so
+/// the degraded-retry logs explain *what to do* instead of only echoing the
+/// storage error (rustfs#4304: sequential cold starts left operators
+/// guessing why the node stayed degraded).
+fn iam_bootstrap_failure_hint(err_text: &str) -> &'static str {
+    let lower = err_text.to_lowercase();
+    if lower.contains("quorum") && lower.contains("lock") {
+        "distributed lock quorum unavailable; waiting for peer nodes' lock RPC endpoints to come online"
+    } else if lower.contains("read quorum") || lower.contains("erasure") || lower.contains("quorum") {
+        "storage read quorum not met yet; waiting for enough cluster nodes/disks to come online"
+    } else if lower.contains("not ready") || lower.contains("not found") {
+        "storage metadata not initialized yet; retrying automatically"
+    } else {
+        "retrying automatically; check storage and peer connectivity if this persists"
     }
 }
 
@@ -297,7 +302,8 @@ fn should_fail_test_init_attempt() -> bool {
 /// call re-reads the environment variable by restoring the sentinel value.
 /// Intended for use in integration tests that share a process.
 #[doc(hidden)]
-pub fn reset_test_failure_counter() {
+#[allow(dead_code)]
+pub(crate) fn reset_test_failure_counter() {
     use std::sync::atomic::Ordering;
     TEST_REMAINING_FAILURES.store(u64::MAX, Ordering::SeqCst);
 }
@@ -321,7 +327,7 @@ async fn attempt_init_iam_sys(store: Arc<ECStore>) -> std::result::Result<(), st
 /// Returns `Ok(ReadyInline)` if IAM initialized immediately, `Ok(Deferred)` if
 /// recovery is happening in the background, or `Err` if IAM succeeded but
 /// app context initialization failed (unexpected, indicates a bug).
-pub async fn bootstrap_or_defer_iam_init(
+pub(crate) async fn bootstrap_or_defer_iam_init(
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
@@ -330,9 +336,7 @@ pub async fn bootstrap_or_defer_iam_init(
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(()) => {
-            if !init_app_context_if_needed(store, kms_interface) && get_global_app_context().is_none() {
-                return Err(std::io::Error::other("IAM bootstrap succeeded but app context is still unavailable"));
-            }
+            AppContext::ensure_startup_after_iam(store, kms_interface)?;
             readiness.mark_stage(SystemStage::IamReady);
             return Ok(IamBootstrapDisposition::ReadyInline);
         }
@@ -365,12 +369,67 @@ pub async fn bootstrap_or_defer_iam_init(
     Ok(IamBootstrapDisposition::Deferred)
 }
 
+pub(crate) async fn bootstrap_or_defer_iam_init_with_startup_kms(
+    store: Arc<ECStore>,
+    readiness: Arc<GlobalReadiness>,
+    state_manager: Option<Arc<ServiceStateManager>>,
+    shutdown_token: Option<tokio_util::sync::CancellationToken>,
+) -> Result<IamBootstrapDisposition> {
+    let kms_interface = AppContext::ensure_startup_kms_interface();
+    bootstrap_or_defer_iam_init(store, kms_interface, readiness, state_manager, shutdown_token).await
+}
+
+pub(crate) async fn init_embedded_iam_runtime(
+    store: Arc<ECStore>,
+    ctx: tokio_util::sync::CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+) -> Result<IamBootstrapDisposition> {
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx)).await
+}
+
+pub(crate) async fn init_iam_runtime(
+    store: Arc<ECStore>,
+    ctx: tokio_util::sync::CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+    state_manager: Arc<ServiceStateManager>,
+) -> Result<IamBootstrapDisposition> {
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, Some(state_manager), Some(ctx)).await
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::iam_bootstrap_failure_hint;
+
+    /// rustfs#4304: the degraded-retry log must tell the operator what the
+    /// node is waiting on, for each of the observed failure shapes.
+    #[test]
+    fn classifies_observed_bootstrap_failures() {
+        assert!(
+            iam_bootstrap_failure_hint(
+                "load group failed: io error: Failed to acquire read lock: Quorum not reached: required 2, achieved 0"
+            )
+            .contains("lock quorum"),
+            "lock-quorum failures must point at peer lock RPC endpoints"
+        );
+        assert!(
+            iam_bootstrap_failure_hint("load group failed: erasure read quorum").contains("storage read quorum"),
+            "storage-quorum failures must point at missing nodes/disks"
+        );
+        assert!(
+            iam_bootstrap_failure_hint("Storage metadata not ready: probe object not found").contains("not initialized"),
+            "missing-metadata failures must say the store is still initializing"
+        );
+        assert!(
+            iam_bootstrap_failure_hint("some opaque failure").contains("retrying automatically"),
+            "unknown failures must still promise the automatic retry"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, IamBootstrapDisposition,
-        compute_backoff_interval, publish_ready_for_iam_bootstrap_with, run_iam_recovery_loop,
-    };
+    use super::*;
+    use super::{IAM_RETRY_ESCALATION_THRESHOLD, IAM_RETRY_INITIAL_INTERVAL, IAM_RETRY_MAX_INTERVAL, compute_backoff_interval};
     use rustfs_common::{GlobalReadiness, SystemStage};
     use std::io::Error;
     use std::sync::{

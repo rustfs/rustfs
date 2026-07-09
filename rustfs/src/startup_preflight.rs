@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{config::Config, license::init_license, startup_runtime::init_startup_runtime_foundation};
-use rustfs_obs::{init_obs, set_global_guard};
+use crate::{config::Config, license::init_license, startup_runtime::init_startup_runtime_foundation, startup_runtime_sources};
 use rustfs_utils::{ExternalEnvCompatReport, apply_external_env_compat};
 use std::{
     fmt,
@@ -29,7 +28,7 @@ const EVENT_OBSERVABILITY_GUARD_SET: &str = "observability_guard_set";
 const EVENT_OBSERVABILITY_GUARD_SET_FAILED: &str = "observability_guard_set_failed";
 
 #[derive(Debug)]
-pub enum StartupServerPreflightError {
+pub(crate) enum StartupServerPreflightError {
     ObservabilityInit(Error),
     Other(Error),
 }
@@ -54,12 +53,12 @@ impl std::error::Error for StartupServerPreflightError {
     }
 }
 
-pub fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
+pub(crate) fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
     let env_compat_report = apply_external_env_compat();
     Ok(env_compat_report)
 }
 
-pub async fn init_startup_server_preflight(
+pub(crate) async fn init_startup_server_preflight(
     config: &Config,
     env_compat_report: &ExternalEnvCompatReport,
 ) -> std::result::Result<(), StartupServerPreflightError> {
@@ -73,11 +72,11 @@ pub async fn init_startup_server_preflight(
 }
 
 async fn init_startup_observability(obs_endpoint: String) -> std::result::Result<(), StartupServerPreflightError> {
-    let guard = init_obs(Some(obs_endpoint))
+    let guard = startup_runtime_sources::init_observability_guard(obs_endpoint)
         .await
         .map_err(|err| StartupServerPreflightError::ObservabilityInit(Error::other(err)))?;
 
-    match set_global_guard(guard).map_err(Error::other) {
+    match startup_runtime_sources::set_observability_guard(guard).map_err(Error::other) {
         Ok(_) => {
             debug!(
                 target: "rustfs::main",

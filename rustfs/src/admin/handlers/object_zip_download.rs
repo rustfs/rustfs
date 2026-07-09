@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
-use crate::admin::storage_compat::ecstore::global::get_global_region;
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::runtime_sources::{current_action_credentials, current_object_store_handle, current_region};
+use crate::admin::storage_api::access::{ReqInfo, authorize_request};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::contract::list::ListOperations as _;
+use crate::admin::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
+use crate::admin::storage_api::object::StorageObjectOptions as ObjectOptions;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use crate::storage::access::{ReqInfo, authorize_request};
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -31,9 +34,8 @@ use hyper::{Method, Uri};
 use matchit::Params;
 use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
+use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_storage_api::{BucketOperations, ListOperations as _, ObjectIO as _, ObjectOperations as _, bucket::BucketOptions};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
 use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
 use s3s::{Body, S3Request, S3Response, S3Result, dto::StreamingBlob, header::CONTENT_TYPE, s3_error};
@@ -48,8 +50,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 use uuid::Uuid;
-
-use crate::storage::StorageObjectOptions as ObjectOptions;
 
 const OBJECT_ZIP_DOWNLOAD_TOKEN_TTL: Duration = Duration::minutes(5);
 const ZIP_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -206,7 +206,7 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
             bucket: snapshot.bucket,
             object: snapshot.object,
             version_id: snapshot.version_id,
-            region: get_global_region(),
+            region: current_region(),
             request_context: None,
         }
     }
@@ -282,9 +282,11 @@ impl From<ClientInfoSnapshot> for ClientInfo {
     }
 }
 
-fn download_token_encryption_key() -> S3Result<[u8; 32]> {
-    let credentials =
-        get_global_action_cred().ok_or_else(|| s3_error!(InternalError, "global action credentials are not initialized"))?;
+fn current_download_token_credentials() -> S3Result<Credentials> {
+    current_action_credentials().ok_or_else(|| s3_error!(InternalError, "global action credentials are not initialized"))
+}
+
+fn download_token_encryption_key(credentials: &Credentials) -> S3Result<[u8; 32]> {
     if credentials.secret_key.is_empty() {
         return Err(s3_error!(InternalError, "global action credentials are not initialized"));
     }
@@ -294,10 +296,10 @@ fn download_token_encryption_key() -> S3Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn encode_download_token(payload: &ObjectZipDownloadTokenPayload) -> S3Result<String> {
+fn encode_download_token(payload: &ObjectZipDownloadTokenPayload, credentials: &Credentials) -> S3Result<String> {
     let payload_json =
         serde_json::to_vec(payload).map_err(|e| s3_error!(InternalError, "failed to serialize download token: {}", e))?;
-    let key = download_token_encryption_key()?;
+    let key = download_token_encryption_key(credentials)?;
     let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(key));
     let mut nonce_bytes = [0_u8; 12];
     rand::rng().fill(&mut nonce_bytes);
@@ -312,7 +314,7 @@ fn encode_download_token(payload: &ObjectZipDownloadTokenPayload) -> S3Result<St
     ))
 }
 
-fn decode_download_token(token: &str) -> S3Result<ObjectZipDownloadTokenPayload> {
+fn decode_download_token(token: &str, credentials: &Credentials) -> S3Result<ObjectZipDownloadTokenPayload> {
     let Some((nonce_part, ciphertext_part)) = token.split_once('.') else {
         return Err(s3_error!(AccessDenied, "invalid or expired download token"));
     };
@@ -328,7 +330,7 @@ fn decode_download_token(token: &str) -> S3Result<ObjectZipDownloadTokenPayload>
         .as_slice()
         .try_into()
         .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
-    let key = download_token_encryption_key()?;
+    let key = download_token_encryption_key(credentials)?;
     let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(key));
     let payload = cipher
         .decrypt(&Nonce::from(nonce), ciphertext.as_slice())
@@ -343,6 +345,7 @@ fn create_download_token(
     auth_context: ObjectZipDownloadAuthContext,
     request: CreateObjectZipDownloadRequest,
     now: OffsetDateTime,
+    credentials: &Credentials,
 ) -> S3Result<CreatedObjectZipDownloadToken> {
     let id = Uuid::new_v4().to_string();
     let expires_at = now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL;
@@ -354,13 +357,18 @@ fn create_download_token(
         request,
         expires_at_unix: expires_at.unix_timestamp(),
     };
-    let token = encode_download_token(&payload)?;
+    let token = encode_download_token(&payload, credentials)?;
 
     Ok(CreatedObjectZipDownloadToken { id, token, expires_at })
 }
 
-fn validate_download_token(id: &str, token: &str, now: OffsetDateTime) -> S3Result<ObjectZipDownloadToken> {
-    let payload = decode_download_token(token)?;
+fn validate_download_token(
+    id: &str,
+    token: &str,
+    now: OffsetDateTime,
+    credentials: &Credentials,
+) -> S3Result<ObjectZipDownloadToken> {
+    let payload = decode_download_token(token, credentials)?;
     if payload.id != id {
         return Err(s3_error!(AccessDenied, "invalid or expired download token"));
     }
@@ -401,7 +409,7 @@ async fn authenticate_object_zip_download_request(req: &mut S3Request<Body>) -> 
     req.extensions.insert(ReqInfo {
         cred: Some(cred),
         is_owner: owner,
-        region: get_global_region(),
+        region: current_region(),
         request_context: req.extensions.get().cloned(),
         ..Default::default()
     });
@@ -556,7 +564,8 @@ impl Operation for CreateObjectZipDownloadHandler {
         let principal = authenticated_zip_download_principal(&req)?;
         let req_info = authenticated_zip_download_req_info(&req)?;
         let auth_context = authenticated_zip_download_auth_context(&req);
-        let created = create_download_token(principal, req_info, auth_context, request, OffsetDateTime::now_utc())?;
+        let credentials = current_download_token_credentials()?;
+        let created = create_download_token(principal, req_info, auth_context, request, OffsetDateTime::now_utc(), &credentials)?;
 
         build_json_response(
             StatusCode::OK,
@@ -580,7 +589,8 @@ impl Operation for DownloadObjectZipHandler {
             return Err(s3_error!(AccessDenied, "invalid or expired download token"));
         }
 
-        let record = validate_download_token(id, &token, OffsetDateTime::now_utc())?;
+        let credentials = current_download_token_credentials()?;
+        let record = validate_download_token(id, &token, OffsetDateTime::now_utc(), &credentials)?;
         let _token_id = &record.id;
         let _principal = &record.principal;
         let prepared = prepare_zip_download_archive(&record).await?;
@@ -639,7 +649,7 @@ fn validate_zip_entry_name(entry_name: &str) -> S3Result<()> {
 }
 
 async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[ZipDownloadItem]) -> S3Result<()> {
-    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     for item in items {
         store
             .get_object_info(&request.bucket, &item.key, &ObjectOptions::default())
@@ -649,12 +659,12 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: crate::admin::storage_compat::ecstore::error::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_api::error::Error) -> s3s::S3Error {
     ApiError::from(err).into()
 }
 
 async fn validate_zip_download_request(record: &ObjectZipDownloadToken) -> S3Result<()> {
-    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     store
         .get_bucket_info(&record.request.bucket, &BucketOptions::default())
         .await
@@ -698,7 +708,7 @@ async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items
                 extensions
             },
             credentials: None,
-            region: get_global_region(),
+            region: current_region(),
             service: None,
             trailing_headers: None,
         };
@@ -779,7 +789,7 @@ async fn prepare_zip_download_archive(record: &ObjectZipDownloadToken) -> S3Resu
 
 async fn generate_zip_archive(record: &ObjectZipDownloadToken, file: &mut File) -> io::Result<()> {
     let mut zip = ZipFileWriter::with_tokio(file).force_zip64();
-    let store = resolve_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
 
     let explicit_items = collect_explicit_zip_items(&record.request)
         .map_err(|err| io::Error::other(format!("failed to prepare explicit ZIP items: {err}")))?;
@@ -866,7 +876,7 @@ async fn write_zip_item<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let store = resolve_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
     let mut reader = store
         .get_object_reader(bucket, &item.key, None, HeaderMap::new(), &ObjectOptions::default())
         .await
@@ -900,7 +910,6 @@ struct ZipDownloadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_credentials::init_global_action_credentials;
     use s3s::S3ErrorCode;
 
     fn valid_request() -> CreateObjectZipDownloadRequest {
@@ -1009,7 +1018,8 @@ mod tests {
 
     #[test]
     fn validate_download_token_rejects_unknown_token() {
-        let err = validate_download_token("missing", "missing", OffsetDateTime::UNIX_EPOCH)
+        let credentials = test_signing_credentials();
+        let err = validate_download_token("missing", "missing", OffsetDateTime::UNIX_EPOCH, &credentials)
             .expect_err("unknown token should be rejected");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
@@ -1019,8 +1029,10 @@ mod tests {
     fn validate_download_token_rejects_mismatched_token_value() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
 
-        let err = validate_download_token("different-id", &created.token, now).expect_err("wrong token id should be rejected");
+        let err = validate_download_token("different-id", &created.token, now, &credentials)
+            .expect_err("wrong token id should be rejected");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
@@ -1029,8 +1041,9 @@ mod tests {
     fn validate_download_token_rejects_expired_token() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
 
-        let err = validate_download_token(&created.id, &created.token, now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL)
+        let err = validate_download_token(&created.id, &created.token, now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL, &credentials)
             .expect_err("expired token should be rejected");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
@@ -1040,8 +1053,10 @@ mod tests {
     fn validate_download_token_accepts_unexpired_matching_token() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
 
-        let record = validate_download_token(&created.id, &created.token, now).expect("matching token should be accepted");
+        let record =
+            validate_download_token(&created.id, &created.token, now, &credentials).expect("matching token should be accepted");
 
         assert_eq!(record.id, created.id);
         assert_eq!(record.principal, "alice");
@@ -1078,8 +1093,10 @@ mod tests {
         let first = ciphertext.first_mut().expect("ciphertext should not be empty");
         *first ^= 0x01;
         let tampered = format!("{}.{}", nonce, base64_encode_url_safe_no_pad(&ciphertext));
+        let credentials = test_signing_credentials();
 
-        let err = validate_download_token(&created.id, &tampered, now).expect_err("tampered token should be rejected");
+        let err =
+            validate_download_token(&created.id, &tampered, now, &credentials).expect_err("tampered token should be rejected");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
@@ -1093,7 +1110,7 @@ mod tests {
             "object ZIP download token should carry an authenticated payload"
         );
         assert!(
-            src.contains("get_global_action_cred"),
+            src.contains("current_action_credentials"),
             "object ZIP download token should be verifiable by any node sharing global credentials"
         );
         assert!(
@@ -1372,17 +1389,23 @@ mod tests {
     }
 
     fn create_test_download_token(now: OffsetDateTime) -> CreatedObjectZipDownloadToken {
-        ensure_test_signing_credentials();
-        create_download_token("alice".to_string(), test_req_info(), test_auth_context(), valid_request(), now)
-            .expect("token should be created")
+        let credentials = test_signing_credentials();
+        create_download_token(
+            "alice".to_string(),
+            test_req_info(),
+            test_auth_context(),
+            valid_request(),
+            now,
+            &credentials,
+        )
+        .expect("token should be created")
     }
 
-    fn ensure_test_signing_credentials() {
-        if get_global_action_cred().is_none() {
-            let _ = init_global_action_credentials(
-                Some("TESTROOTACCESSKEY".to_string()),
-                Some("TESTROOTSECRET1234567890".to_string()),
-            );
+    fn test_signing_credentials() -> Credentials {
+        Credentials {
+            access_key: "TESTROOTACCESSKEY".to_string(),
+            secret_key: "TESTROOTSECRET1234567890".to_string(),
+            ..Default::default()
         }
     }
 
@@ -1401,7 +1424,7 @@ mod tests {
             bucket: Some("photos".to_string()),
             object: None,
             version_id: None,
-            region: get_global_region(),
+            region: current_region(),
             request_context: None,
         }
     }

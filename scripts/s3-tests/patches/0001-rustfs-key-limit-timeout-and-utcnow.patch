@@ -1,0 +1,75 @@
+diff --git a/s3tests/functional/test_s3.py b/s3tests/functional/test_s3.py
+index 2ee91b3..bf2f2b1 100644
+--- a/s3tests/functional/test_s3.py
++++ b/s3tests/functional/test_s3.py
+@@ -138,6 +138,9 @@ def _create_objects(bucket=None, bucket_name=None, keys=[], put_object_args={}):
+ 
+     return bucket_name
+ 
++def _utcnow_naive():
++    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
++
+ def _get_keys(response):
+     """
+     return lists of strings that are the keys from a client.list_objects() response
+@@ -1760,15 +1763,8 @@ def test_multi_objectv2_delete():
+ 
+ def test_multi_object_delete_key_limit():
+     key_names = [f"key-{i}" for i in range(1001)]
+-    bucket_name = _create_objects(keys=key_names)
+     client = get_client()
+-
+-    paginator = client.get_paginator('list_objects')
+-    pages = paginator.paginate(Bucket=bucket_name)
+-    numKeys = 0
+-    for page in pages:
+-        numKeys += len(page['Contents'])
+-    assert numKeys == 1001
++    bucket_name = get_new_bucket(client)
+ 
+     objs_dict = _make_objs_dict(key_names=key_names)
+     e = assert_raises(ClientError,client.delete_objects,Bucket=bucket_name,Delete=objs_dict)
+@@ -1777,15 +1773,8 @@ def test_multi_object_delete_key_limit():
+ 
+ def test_multi_objectv2_delete_key_limit():
+     key_names = [f"key-{i}" for i in range(1001)]
+-    bucket_name = _create_objects(keys=key_names)
+     client = get_client()
+-
+-    paginator = client.get_paginator('list_objects_v2')
+-    pages = paginator.paginate(Bucket=bucket_name)
+-    numKeys = 0
+-    for page in pages:
+-        numKeys += len(page['Contents'])
+-    assert numKeys == 1001
++    bucket_name = get_new_bucket(client)
+ 
+     objs_dict = _make_objs_dict(key_names=key_names)
+     e = assert_raises(ClientError,client.delete_objects,Bucket=bucket_name,Delete=objs_dict)
+@@ -9163,7 +9152,7 @@ def test_lifecycle_expiration_header_put():
+     bucket_name = get_new_bucket()
+     client = get_client()
+ 
+-    now = datetime.datetime.utcnow()
++    now = _utcnow_naive()
+     response = setup_lifecycle_expiration(
+         client, bucket_name, 'rule1', 1, 'days1/')
+     assert check_lifecycle_expiration_header(response, now, 'rule1', 1)
+@@ -9175,7 +9164,7 @@ def test_lifecycle_expiration_header_head():
+     bucket_name = get_new_bucket()
+     client = get_client()
+ 
+-    now = datetime.datetime.utcnow()
++    now = _utcnow_naive()
+     response = setup_lifecycle_expiration(
+         client, bucket_name, 'rule1', 1, 'days1/')
+ 
+@@ -9246,7 +9235,7 @@ def test_lifecycle_expiration_header_tags_head():
+ @pytest.mark.lifecycle_expiration
+ @pytest.mark.fails_on_dbstore
+ def test_lifecycle_expiration_header_and_tags_head():
+-    now = datetime.datetime.utcnow()
++    now = _utcnow_naive()
+     bucket_name = get_new_bucket()
+     client = get_client()
+     lifecycle={

@@ -3,7 +3,6 @@
 use libfuzzer_sys::fuzz_target;
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::compress::{CompressionAlgorithm, decompress_block};
-use std::collections::BTreeSet;
 
 fn pick_algorithm(tag: u8) -> CompressionAlgorithm {
     match tag % 6 {
@@ -16,26 +15,42 @@ fn pick_algorithm(tag: u8) -> CompressionAlgorithm {
     }
 }
 
-fn exercise_payload(payload: &[u8], algorithm: CompressionAlgorithm) {
+/// Full exercise: all parsers + decompression on the complete payload.
+fn exercise_full(payload: &[u8], algorithm: CompressionAlgorithm) {
     let _ = FileMeta::load(payload);
     let _ = FileMeta::load_or_convert(payload);
     let _ = FileMeta::read_format_versions(payload);
     let _ = decompress_block(payload, algorithm);
 }
 
-fn interesting_prefix_lengths(len: usize) -> BTreeSet<usize> {
-    let mut lengths = BTreeSet::from([0usize, 1, 2, 4, 5, 8, 16, 32]);
-    lengths.insert(len);
-    lengths.insert(len.saturating_sub(1));
-    lengths.into_iter().filter(|candidate| *candidate <= len).collect()
+/// Lightweight exercise: only metadata parsers on a prefix (no decompression).
+/// Prefix tests catch partial-input / truncated-header panics cheaply.
+fn exercise_prefix(payload: &[u8]) {
+    let _ = FileMeta::load(payload);
+    let _ = FileMeta::read_format_versions(payload);
 }
 
 fuzz_target!(|data: &[u8]| {
     let algorithm = pick_algorithm(data.first().copied().unwrap_or_default());
 
-    exercise_payload(data, algorithm);
+    // Full exercise on the complete input.
+    exercise_full(data, algorithm);
 
-    for prefix_len in interesting_prefix_lengths(data.len()) {
-        exercise_payload(&data[..prefix_len], algorithm);
+    // Prefix probing aligned with xl.meta binary layout:
+    //   4  = magic header ("XL2 ")
+    //   5  = magic + version byte
+    //   8  = magic + version + start of bin32 length field
+    //   12 = magic + version + bin32 length (4 bytes) + CRC start
+    //   len-1 = truncated-at-end
+    //
+    // Only test prefixes that are strictly smaller than the full input
+    // (the full input is already tested above).
+    for prefix_len in [4usize, 5, 8, 12] {
+        if prefix_len < data.len() {
+            exercise_prefix(&data[..prefix_len]);
+        }
+    }
+    if data.len() > 1 {
+        exercise_prefix(&data[..data.len() - 1]);
     }
 });

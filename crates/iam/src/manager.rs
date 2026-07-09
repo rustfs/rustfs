@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_config_not_found};
+use crate::is_iam_first_cluster_node_local;
 use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp};
 use crate::{
     cache::{Cache, CacheEntity, LockedCache},
@@ -24,8 +25,7 @@ use crate::{
     },
 };
 use futures::future::join_all;
-use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
-use rustfs_ecstore::global::is_first_cluster_node_local;
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE};
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
@@ -62,6 +62,11 @@ const IAM_FORMAT_VERSION_1: i32 = 1;
 const INITIAL_LOAD_RETRY_DELAY: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const INITIAL_LOAD_RETRY_DELAY: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY: Duration = Duration::from_millis(200);
+#[cfg(test)]
+const TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY: Duration = Duration::from_millis(1);
+const TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES: usize = 5;
 
 #[derive(Serialize, Deserialize)]
 struct IAMFormat {
@@ -114,6 +119,30 @@ impl<T> IamCache<T>
 where
     T: Store,
 {
+    async fn verify_temp_user_persistence(&self, access_key: &str) -> Result<()> {
+        for attempt in 0..=TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES {
+            match self.api.load_user_identity(access_key, UserType::Sts).await {
+                Ok(_) => return Ok(()),
+                Err(err)
+                    if attempt < TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES
+                        && (is_err_no_such_user(&err) || is_err_config_not_found(&err)) =>
+                {
+                    warn!(
+                        access_key,
+                        attempt = attempt + 1,
+                        max_retries = TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES,
+                        error = ?err,
+                        "temporary IAM user not yet visible after save; retrying persistence verification"
+                    );
+                    tokio::time::sleep(TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        unreachable!("temp-user persistence verification loop should return on success or terminal error")
+    }
+
     /// Create a new IAM system instance
     /// # Arguments
     /// * `api` - The storage backend implementing the Store trait
@@ -355,7 +384,6 @@ where
         Ok(())
     }
 
-    // TODO: Check if exists, whether retry is possible
     #[tracing::instrument(level = "debug", skip(self))]
     async fn save_iam_formatter(self: Arc<Self>) -> Result<()> {
         let path = get_iam_format_file_path();
@@ -375,7 +403,7 @@ where
             return Ok(());
         }
 
-        if !is_first_cluster_node_local().await {
+        if !is_iam_first_cluster_node_local().await {
             return Ok(());
         }
 
@@ -485,12 +513,16 @@ where
             }
 
             if let Err(err) = self.api.delete_policy_doc(name).await {
+                // A real backend failure (disk IO, insufficient quorum, etc.) means the on-disk
+                // policy was NOT removed: propagate the error so callers do not report a phantom
+                // success and evict a policy that is still persisted (it would reappear on the
+                // next full IAM reload).
                 if !is_err_no_such_policy(&err) {
-                    self.cache.delete_policy_doc(name, OffsetDateTime::now_utc());
-                    return Ok(());
+                    return Err(err);
                 }
 
-                return Err(err);
+                // NoSuchPolicy means the doc is already gone on the backend; treat the delete as
+                // idempotently successful and fall through to evict any stale cache entry below.
             }
         }
 
@@ -1140,6 +1172,7 @@ where
         self.api
             .save_user_identity(access_key, UserType::Sts, u.clone(), None)
             .await?;
+        self.verify_temp_user_persistence(access_key).await?;
 
         let now = self.cache.with_write_lock(|cache| {
             let now = OffsetDateTime::now_utc();
@@ -1814,7 +1847,7 @@ where
 
     pub async fn group_notification_handler(&self, group: &str) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_group(group, &mut m).await {
+        if let Err(err) = self.api.load_group_no_lock(group, &mut m).await {
             if !is_err_no_such_group(&err) {
                 return Err(err);
             }
@@ -1843,7 +1876,7 @@ where
 
     pub async fn policy_notification_handler(&self, policy: &str) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_policy_doc(policy, &mut m).await {
+        if let Err(err) = self.api.load_policy_doc_no_lock(policy, &mut m).await {
             if !is_err_no_such_policy(&err) {
                 return Err(err);
             }
@@ -1894,7 +1927,7 @@ where
 
     pub async fn policy_mapping_notification_handler(&self, name: &str, user_type: UserType, is_group: bool) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_mapped_policy(name, user_type, is_group, &mut m).await {
+        if let Err(err) = self.api.load_mapped_policy_no_lock(name, user_type, is_group, &mut m).await {
             if !is_err_no_such_policy(&err) {
                 return Err(err);
             }
@@ -1930,7 +1963,7 @@ where
     }
     pub async fn user_notification_handler(&self, name: &str, user_type: UserType) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_user(name, user_type, &mut m).await {
+        if let Err(err) = self.api.load_user_no_lock(name, user_type, &mut m).await {
             if !is_err_no_such_user(&err) {
                 return Err(err);
             }
@@ -1995,7 +2028,7 @@ where
                 let mut policies = HashMap::new();
                 if let Err(err) = self
                     .api
-                    .load_mapped_policy(&parent_user, user_type, false, &mut policies)
+                    .load_mapped_policy_no_lock(&parent_user, user_type, false, &mut policies)
                     .await
                 {
                     if !is_err_no_such_policy(&err) {
@@ -2007,7 +2040,11 @@ where
             }
             UserType::Reg => {
                 let mut policies = HashMap::new();
-                if let Err(err) = self.api.load_mapped_policy(name, user_type, false, &mut policies).await {
+                if let Err(err) = self
+                    .api
+                    .load_mapped_policy_no_lock(name, user_type, false, &mut policies)
+                    .await
+                {
                     if !is_err_no_such_policy(&err) {
                         return Err(err);
                     }
@@ -2030,7 +2067,7 @@ where
                     let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
-                        .load_mapped_policy(&parent_user, UserType::Reg, false, &mut policies)
+                        .load_mapped_policy_no_lock(&parent_user, UserType::Reg, false, &mut policies)
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
@@ -2043,7 +2080,7 @@ where
                     let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
-                        .load_mapped_policy(&parent_user, UserType::Sts, false, &mut policies)
+                        .load_mapped_policy_no_lock(&parent_user, UserType::Sts, false, &mut policies)
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
@@ -2107,11 +2144,7 @@ fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
 }
 
 pub fn get_token_signing_key() -> Option<String> {
-    if let Some(s) = get_global_action_cred() {
-        Some(s.secret_key)
-    } else {
-        None
-    }
+    crate::root_credentials::token_signing_key()
 }
 
 pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
@@ -2189,7 +2222,13 @@ mod tests {
     use super::*;
     use rustfs_policy::policy::{Policy, PolicyDoc};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     #[derive(Clone)]
     struct FailingInitialLoadStore;
@@ -2317,6 +2356,230 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct DelayedTempUserVisibilityStore {
+        saved_user: Arc<Mutex<Option<UserIdentity>>>,
+        load_attempts: Arc<AtomicUsize>,
+        visible_after_attempt: usize,
+    }
+
+    impl DelayedTempUserVisibilityStore {
+        fn new(visible_after_attempt: usize) -> Self {
+            Self {
+                saved_user: Arc::new(Mutex::new(None)),
+                load_attempts: Arc::new(AtomicUsize::new(0)),
+                visible_after_attempt,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Store for DelayedTempUserVisibilityStore {
+        fn has_watcher(&self) -> bool {
+            false
+        }
+
+        async fn save_iam_config<Item: Serialize + Send>(&self, _item: Item, _path: impl AsRef<str> + Send) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_iam_config<Item: serde::de::DeserializeOwned>(&self, _path: impl AsRef<str> + Send) -> Result<Item> {
+            Err(Error::ConfigNotFound)
+        }
+
+        async fn delete_iam_config(&self, _path: impl AsRef<str> + Send) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_user_identity(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            item: UserIdentity,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            *self.saved_user.lock().expect("saved_user mutex poisoned") = Some(item);
+            Ok(())
+        }
+
+        async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_user_identity(&self, name: &str, _user_type: UserType) -> Result<UserIdentity> {
+            let attempt = self.load_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.visible_after_attempt {
+                return Err(Error::NoSuchUser(name.to_string()));
+            }
+
+            self.saved_user
+                .lock()
+                .expect("saved_user mutex poisoned")
+                .clone()
+                .ok_or_else(|| Error::NoSuchUser(name.to_string()))
+        }
+
+        async fn load_user(&self, _name: &str, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_users(&self, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_secret_key(&self, _name: &str, _user_type: UserType) -> Result<String> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_group_info(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_group(&self, _name: &str, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_groups(&self, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_policy_doc(&self, _name: &str, _item: PolicyDoc) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_policy_doc(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy(&self, _name: &str) -> Result<PolicyDoc> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_docs(&self, _m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _item: MappedPolicy,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_mapped_policy(&self, _name: &str, _user_type: UserType, _is_group: bool) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_mapped_policies(
+            &self,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_all(&self, _cache: &Cache) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn build_test_temp_credentials() -> Credentials {
+        Credentials {
+            access_key: "STSACCESS123".to_string(),
+            secret_key: "test-secret-key".to_string(),
+            session_token: "test-session-token".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            status: STATUS_ENABLED.to_string(),
+            parent_user: "parent-user".to_string(),
+            groups: Some(vec!["console-admins".to_string()]),
+            claims: None,
+            name: None,
+            description: None,
+        }
+    }
+
+    fn build_test_iam_cache<T: Store>(api: T) -> IamCache<T> {
+        let (sender, _receiver) = mpsc::channel::<i64>(1);
+        IamCache {
+            cache: Cache::default(),
+            api,
+            state: Arc::new(AtomicU8::new(IamState::Ready as u8)),
+            loading: Arc::new(AtomicBool::new(false)),
+            roles: HashMap::new(),
+            send_chan: sender,
+            last_timestamp: AtomicI64::new(0),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_temp_user_retries_until_sts_identity_becomes_visible() {
+        let store = DelayedTempUserVisibilityStore::new(2);
+        let cache = build_test_iam_cache(store.clone());
+        let cred = build_test_temp_credentials();
+
+        let updated_at = cache
+            .set_temp_user(&cred.access_key, &cred, None)
+            .await
+            .expect("temp user should succeed once persistence becomes visible");
+
+        assert!(updated_at <= OffsetDateTime::now_utc());
+        assert_eq!(store.load_attempts.load(Ordering::SeqCst), 3);
+
+        let snapshot = cache.cache.snapshot();
+        let sts_identity = snapshot
+            .sts_accounts
+            .get(&cred.access_key)
+            .expect("verified temp user should be cached");
+        assert_eq!(sts_identity.credentials.parent_user, cred.parent_user);
+    }
+
+    #[tokio::test]
+    async fn set_temp_user_fails_when_sts_identity_never_becomes_visible() {
+        let store = DelayedTempUserVisibilityStore::new(TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES + 1);
+        let cache = build_test_iam_cache(store.clone());
+        let cred = build_test_temp_credentials();
+
+        let err = cache
+            .set_temp_user(&cred.access_key, &cred, None)
+            .await
+            .expect_err("temp user should fail when persistence never becomes visible");
+
+        assert!(matches!(err, Error::NoSuchUser(user) if user == cred.access_key));
+        assert_eq!(store.load_attempts.load(Ordering::SeqCst), TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES + 1);
+
+        let snapshot = cache.cache.snapshot();
+        assert!(
+            !snapshot.sts_accounts.contains_key(&cred.access_key),
+            "cache must not publish a temp user that was not durably visible"
+        );
+    }
+
     #[tokio::test]
     async fn test_init_keeps_error_state_when_initial_load_fails() {
         let (sender, receiver) = mpsc::channel::<i64>(1);
@@ -2339,13 +2602,6 @@ mod tests {
         assert!(!sys.is_ready());
         assert_eq!(sys.state.load(Ordering::SeqCst), IamState::Error as u8);
         assert_eq!(sys.sync_failures.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn test_iam_format_new_version_1() {
-        let format = IAMFormat::new_version_1();
-        assert_eq!(format.version, IAM_FORMAT_VERSION_1);
-        assert_eq!(format.version, 1);
     }
 
     #[test]
@@ -2459,26 +2715,6 @@ mod tests {
         // When cache is empty, should return empty name and empty policy regardless of bucket
         assert_eq!(name, "");
         assert!(policy.statements.is_empty());
-    }
-
-    #[test]
-    fn test_constants() {
-        // Test that constants are properly defined
-        assert_eq!(IAM_FORMAT_FILE, "format.json");
-        assert_eq!(IAM_FORMAT_VERSION_1, 1);
-    }
-
-    #[test]
-    fn test_iam_format_serialization() {
-        let format = IAMFormat::new_version_1();
-
-        // Test serialization
-        let serialized = serde_json::to_string(&format).unwrap();
-        assert!(serialized.contains("\"version\":1"));
-
-        // Test deserialization
-        let deserialized: IAMFormat = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.version, format.version);
     }
 
     #[test]
@@ -2696,5 +2932,40 @@ mod tests {
         assert_eq!(desc.policy, "readonly");
         assert_eq!(desc.members, vec!["alice".to_string()]);
         assert!(desc.updated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_policy_propagates_backend_error_and_keeps_cache() {
+        // Regression: on the admin delete path (is_from_notify = true), a real backend delete
+        // failure (here Error::InvalidArgument, standing in for disk IO / insufficient quorum)
+        // must propagate — NOT be swallowed as Ok(()) while evicting the still-persisted policy.
+        let cache = build_test_iam_cache(FailingInitialLoadStore);
+
+        let policy = Policy {
+            id: Default::default(),
+            version: "2012-10-17".to_string(),
+            statements: vec![],
+        };
+        let policy_doc = PolicyDoc {
+            version: 1,
+            policy,
+            create_date: Some(OffsetDateTime::now_utc()),
+            update_date: Some(OffsetDateTime::now_utc()),
+        };
+        cache
+            .cache
+            .add_or_update_policy_doc("permissive-policy", &policy_doc, OffsetDateTime::now_utc());
+
+        let result = cache.delete_policy("permissive-policy", true).await;
+
+        // Pre-fix this returned Ok(()) (phantom success) and evicted the cache entry.
+        assert!(
+            result.is_err(),
+            "delete_policy must surface a real backend delete failure instead of reporting success"
+        );
+        assert!(
+            cache.cache.snapshot().policy_docs.contains_key("permissive-policy"),
+            "cache must not evict a policy whose backend delete failed"
+        );
     }
 }

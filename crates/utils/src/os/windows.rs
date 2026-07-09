@@ -170,7 +170,7 @@ pub fn get_physical_device_ids(disk: &str) -> std::io::Result<Vec<String>> {
 /// This is the Windows equivalent of Linux's `st_dev` major:minor pair and is
 /// useful for diagnostic purposes when validating physical disk independence.
 // SAFETY: `path_wide` is a valid null-terminated UTF-16 string and all output
-// pointers target initialized stack variables with documented MAX_PATH sizing.
+// SAFETY: pointers target initialized stack variables with documented MAX_PATH sizing.
 #[allow(unsafe_code)]
 pub fn get_volume_serial_number(path: &str) -> std::io::Result<u32> {
     let path_wide = to_wide_path(Path::new(path));

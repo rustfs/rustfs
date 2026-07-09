@@ -1,0 +1,10 @@
+---
+source: crates/kms/src/api_types.rs
+expression: "serde_json::to_value(DeleteKeyResponse\n{\n    success: true, message: \"key scheduled for deletion\".to_string(), key_id:\n    \"key-a\".to_string(), deletion_date:\n    Some(\"2026-07-01T00:00:00Z\".to_string()),\n}).expect(\"delete key response should serialize\")"
+---
+{
+  "deletion_date": "2026-07-01T00:00:00Z",
+  "key_id": "key-a",
+  "message": "key scheduled for deletion",
+  "success": true
+}

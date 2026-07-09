@@ -15,6 +15,7 @@
 use super::iam_error::iam_error_to_s3_error;
 use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
 use crate::{
+    admin::runtime_sources::current_action_credentials,
     admin::{
         auth::validate_admin_request,
         handlers::site_replication::site_replication_iam_change_hook,
@@ -27,7 +28,7 @@ use crate::{
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
-use rustfs_credentials::{Credentials, get_global_action_cred};
+use rustfs_credentials::Credentials;
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
     sys::{NewServiceAccountOpts, UpdateServiceAccountOpts},
@@ -220,13 +221,13 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "secret key is required"));
         }
 
-        if let Some(sys_cred) = get_global_action_cred()
+        if let Some(sys_cred) = current_action_credentials()
             && constant_time_eq(&sys_cred.access_key, ak)
         {
             return Err(s3_error!(InvalidArgument, "cannot create a user with the system access key"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -305,8 +306,8 @@ impl Operation for AddUser {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -355,18 +356,48 @@ impl Operation for SetUserStatus {
         let status = AccountStatus::try_from(query.status.as_deref().unwrap_or_default())
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e))?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        iam_store
-            .set_user_status(ak, status)
+        let updated_at = iam_store
+            .set_user_status(ak, status.clone())
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to set user status: {e}")))?;
 
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "iam-user".to_string(),
+            iam_user: Some(SRIAMUser {
+                access_key: ak.to_string(),
+                is_delete_req: false,
+                user_req: Some(AddOrUpdateUserReq {
+                    secret_key: String::new(),
+                    policy: None,
+                    status: status.clone(),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_USER,
+                event = EVENT_ADMIN_USER_STATE,
+                access_key = %ak,
+                action = "set_user_status",
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "admin user state"
+            );
+        }
+
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -407,7 +438,7 @@ impl Operation for ListUsers {
             }
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -430,7 +461,7 @@ impl Operation for ListUsers {
         let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -473,14 +504,14 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let sys_cred = get_global_action_cred()
+        let sys_cred = current_action_credentials()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "failed to load global credentials"))?;
 
         if ak == sys_cred.access_key || ak == cred.access_key || cred.parent_user == ak {
             return Err(s3_error!(InvalidArgument, "cannot remove the current user"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -531,8 +562,8 @@ impl Operation for RemoveUser {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -557,7 +588,7 @@ impl Operation for GetUserInfo {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -605,7 +636,7 @@ impl Operation for GetUserInfo {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -653,7 +684,7 @@ impl Operation for ExportIam {
         )
         .await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -839,9 +870,12 @@ impl Operation for ExportIam {
             .finish()
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/zip".parse().unwrap());
-        header.insert(CONTENT_DISPOSITION, "attachment; filename=iam-assets.zip".parse().unwrap());
-        header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/zip".parse().expect("valid header value"));
+        header.insert(
+            CONTENT_DISPOSITION,
+            "attachment; filename=iam-assets.zip".parse().expect("valid header value"),
+        );
+        header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(zip_bytes.into_inner())), header))
     }
 }
@@ -887,7 +921,7 @@ impl Operation for ImportIam {
         let mut zip_reader =
             ZipArchive::new(Cursor::new(body)).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -932,7 +966,7 @@ impl Operation for ImportIam {
             }
         }
 
-        let Some(sys_cred) = get_global_action_cred() else {
+        let Some(sys_cred) = current_action_credentials() else {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
 
@@ -1290,7 +1324,7 @@ impl Operation for ImportIam {
         let body = serde_json::to_vec(&ret).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }

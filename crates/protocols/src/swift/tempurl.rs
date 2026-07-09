@@ -142,7 +142,7 @@ impl TempURL {
         let expected_sig = self.generate_signature(method, params.temp_url_expires, path)?;
 
         // 3. Constant-time comparison to prevent timing attacks
-        if !constant_time_compare(&params.temp_url_sig, &expected_sig) {
+        if !constant_time_compare(params.temp_url_sig.as_bytes(), expected_sig.as_bytes()) {
             return Err(SwiftError::Unauthorized("Invalid TempURL signature".to_string()));
         }
 
@@ -155,28 +155,28 @@ impl TempURL {
     }
 }
 
-/// Constant-time string comparison to prevent timing attacks
+/// Constant-time byte comparison to prevent timing attacks
 ///
 /// # Security
-/// Compares strings byte-by-byte, always checking all bytes.
-/// Prevents attackers from determining correct prefix by measuring response time.
+/// Compares byte-by-byte, always checking all bytes.
+/// Prevents attackers from determining a correct prefix by measuring response time.
+///
+/// Shared across the Swift module (TempURL and FormPost) so signature checks use
+/// the same primitive.
 ///
 /// # Implementation
 /// Uses bitwise XOR accumulation, so timing is independent of match position.
-fn constant_time_compare(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     // If lengths differ, not equal (but still do constant-time comparison of min length)
     if a.len() != b.len() {
         return false;
     }
 
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-
     // XOR all bytes and accumulate
     // If any byte differs, result will be non-zero
     let mut result = 0u8;
-    for i in 0..a_bytes.len() {
-        result |= a_bytes[i] ^ b_bytes[i];
+    for i in 0..a.len() {
+        result |= a[i] ^ b[i];
     }
 
     result == 0
@@ -379,27 +379,27 @@ mod tests {
 
     #[test]
     fn test_constant_time_compare() {
-        // Equal strings
-        assert!(constant_time_compare("hello", "hello"));
+        // Equal byte slices
+        assert!(constant_time_compare(b"hello", b"hello"));
 
-        // Different strings (same length)
-        assert!(!constant_time_compare("hello", "world"));
+        // Different content (same length)
+        assert!(!constant_time_compare(b"hello", b"world"));
 
         // Different lengths
-        assert!(!constant_time_compare("hello", "hello!"));
-        assert!(!constant_time_compare("hello!", "hello"));
+        assert!(!constant_time_compare(b"hello", b"hello!"));
+        assert!(!constant_time_compare(b"hello!", b"hello"));
 
-        // Empty strings
-        assert!(constant_time_compare("", ""));
+        // Empty slices
+        assert!(constant_time_compare(b"", b""));
 
         // Hex strings (like signatures)
         assert!(constant_time_compare(
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709",
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+            b"da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            b"da39a3ee5e6b4b0d3255bfef95601890afd80709"
         ));
         assert!(!constant_time_compare(
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709",
-            "da39a3ee5e6b4b0d3255bfef95601890afd80708"
+            b"da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            b"da39a3ee5e6b4b0d3255bfef95601890afd80708"
         )); // last char differs
     }
 

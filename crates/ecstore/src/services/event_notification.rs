@@ -1,0 +1,127 @@
+#![allow(unused_imports)]
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#![allow(unused_variables)]
+
+use crate::bucket::metadata::BucketMetadata;
+// use crate::event::name::EventName;
+use crate::event::targetlist::TargetList;
+use crate::object_api::ObjectInfo;
+use crate::store::ECStore;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
+use tokio::sync::RwLock;
+use tracing::warn;
+
+pub struct EventNotifier {
+    target_list: TargetList,
+    //bucket_rules_map: HashMap<String , HashMap<EventName, Rules>>,
+}
+
+impl EventNotifier {
+    pub fn new() -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(Self {
+            target_list: TargetList::new(),
+            //bucket_rules_map: HashMap::new(),
+        }))
+    }
+
+    fn get_arn_list(&self) -> Vec<String> {
+        warn!(
+            event_count = self.target_list.total_events.load(Ordering::Relaxed),
+            "event notifier arn list requested but not implemented in this build"
+        );
+        Vec::new()
+    }
+
+    fn set(&self, bucket: &str, meta: BucketMetadata) {
+        warn!(bucket = bucket, "event notifier set() called but currently no-op in this build");
+    }
+
+    fn init_bucket_targets(&self, _api: ECStore) -> Result<(), std::io::Error> {
+        warn!("init_bucket_targets called but currently no-op in this build");
+        Ok(())
+    }
+
+    fn send(&self, args: EventArgs) {
+        warn!(
+            event_name = args.event_name,
+            bucket = args.bucket_name,
+            "event send() called but notifier is not fully implemented in this build"
+        );
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct EventArgs {
+    pub event_name: String,
+    pub bucket_name: String,
+    pub object: ObjectInfo,
+    pub req_params: HashMap<String, String>,
+    pub resp_elements: HashMap<String, String>,
+    pub host: String,
+    pub user_agent: String,
+}
+
+impl EventArgs {}
+
+type EventDispatchHook = Arc<dyn Fn(EventArgs) + Send + Sync + 'static>;
+
+static EVENT_DISPATCH_HOOK: OnceLock<EventDispatchHook> = OnceLock::new();
+
+pub fn register_event_dispatch_hook<F>(hook: F) -> bool
+where
+    F: Fn(EventArgs) + Send + Sync + 'static,
+{
+    EVENT_DISPATCH_HOOK.set(Arc::new(hook)).is_ok()
+}
+
+pub fn send_event(args: EventArgs) {
+    if let Some(hook) = EVENT_DISPATCH_HOOK.get() {
+        hook(args);
+        return;
+    }
+
+    warn!(
+        event_name = args.event_name,
+        bucket = args.bucket_name,
+        "event send() dropped because no event dispatch hook is registered"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DISPATCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn send_event_dispatches_to_registered_hook() {
+        let _ = register_event_dispatch_hook(|_args| {
+            DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        });
+        let before = DISPATCH_COUNT.load(Ordering::Relaxed);
+
+        send_event(EventArgs {
+            event_name: "s3:ObjectCreated:Put".to_string(),
+            bucket_name: "demo".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(DISPATCH_COUNT.load(Ordering::Relaxed), before + 1);
+    }
+}

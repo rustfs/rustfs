@@ -14,8 +14,8 @@
 
 use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint, Error,
-    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result, UpdateMetadataOpts, VolumeInfo,
-    WalkDirOptions,
+    FileInfoVersions, MmapCopyStageMetrics, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     health_state::{
         RuntimeDriveHealthState, classify_drive_recovery, get_drive_returning_probe_interval,
         get_drive_returning_success_threshold, get_drive_suspect_failure_threshold, record_drive_offline_duration,
@@ -23,7 +23,7 @@ use crate::disk::{
     },
     local::{LocalDisk, ScanGuard},
 };
-use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
+use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
@@ -193,6 +193,14 @@ pub fn get_drive_walkdir_stall_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,
         rustfs_config::DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,
+        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS),
+    )
+}
+
+pub fn get_object_disk_read_timeout() -> Duration {
+    get_drive_timeout_duration(
+        rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT,
+        rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT,
         Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS),
     )
 }
@@ -962,13 +970,7 @@ impl LocalDiskWrapper {
         drop(disk_id);
 
         if self.disk.is_local() {
-            let mut disk_id_map = GLOBAL_LOCAL_DISK_ID_MAP.write().await;
-            if let Some(previous_id) = previous {
-                disk_id_map.remove(&previous_id);
-            }
-            if let Some(current_id) = id {
-                disk_id_map.insert(current_id, self.disk.endpoint().to_string());
-            }
+            runtime_sources::replace_local_disk_id(previous, id, self.disk.endpoint().to_string()).await;
         }
         Ok(())
     }
@@ -1210,8 +1212,8 @@ impl DiskAPI for LocalDiskWrapper {
             .await
     }
 
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
-        self.track_disk_health(|| async { self.disk.delete_volume(volume).await }, Duration::ZERO)
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
+        self.track_disk_health(|| async { self.disk.delete_volume(volume, force_delete).await }, Duration::ZERO)
             .await
     }
 
@@ -1219,7 +1221,7 @@ impl DiskAPI for LocalDiskWrapper {
         let timeout_duration = if opts.skip_total_timeout {
             Duration::ZERO
         } else {
-            get_drive_walkdir_timeout()
+            opts.timeout_duration().unwrap_or_else(get_drive_walkdir_timeout)
         };
 
         self.track_disk_health_with_op_and_timeout_action(
@@ -1359,9 +1361,28 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
         self.track_disk_health(
-            || async { self.disk.read_file_zero_copy(volume, path, offset, length).await },
+            || async { self.disk.read_file_mmap_copy(volume, path, offset, length).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<bytes::Bytes> {
+        self.track_disk_health(
+            || async {
+                self.disk
+                    .read_file_mmap_copy_with_metrics(volume, path, offset, length, metrics)
+                    .await
+            },
             get_max_timeout_duration(),
         )
         .await
@@ -1520,6 +1541,93 @@ mod tests {
         temp_env::with_var(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, Some("7"), || {
             temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
                 assert_eq!(get_drive_metadata_timeout(), Duration::from_secs(7));
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_timeout_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, || {
+                    assert_eq!(
+                        get_drive_walkdir_timeout(),
+                        Duration::from_secs(rustfs_config::DEFAULT_DRIVE_WALKDIR_TIMEOUT_SECS)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_stall_timeout_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, || {
+                    assert_eq!(
+                        get_drive_walkdir_stall_timeout(),
+                        Duration::from_secs(rustfs_config::DEFAULT_DRIVE_WALKDIR_STALL_TIMEOUT_SECS)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_timeout_prefers_canonical_over_legacy() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("11"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                assert_eq!(get_drive_walkdir_timeout(), Duration::from_secs(11));
+            });
+        });
+    }
+
+    #[test]
+    fn drive_walkdir_stall_timeout_prefers_canonical_over_legacy() {
+        temp_env::with_var(rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS, Some("13"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                assert_eq!(get_drive_walkdir_stall_timeout(), Duration::from_secs(13));
+            });
+        });
+    }
+
+    #[test]
+    fn object_disk_read_timeout_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, || {
+                    assert_eq!(
+                        get_object_disk_read_timeout(),
+                        Duration::from_secs(rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn object_disk_read_timeout_uses_high_latency_profile_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var(
+                    rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE,
+                    Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY),
+                    || {
+                        assert_eq!(
+                            get_object_disk_read_timeout(),
+                            Duration::from_secs(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS)
+                        );
+                    },
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn object_disk_read_timeout_prefers_canonical_over_legacy() {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("7"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                assert_eq!(get_object_disk_read_timeout(), Duration::from_secs(7));
             });
         });
     }
@@ -1727,6 +1835,50 @@ mod tests {
                 .await;
 
             assert_eq!(result.expect_err("walk_dir should time out"), DiskError::Timeout);
+            assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            assert!(!wrapper.health.is_faulty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn walk_dir_uses_per_request_timeout_before_env_default() {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_WALKDIR_TIMEOUT_SECS, Some("60"))], async {
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            let bucket = "test-bucket";
+            let object = "test-object";
+
+            wrapper.make_volume(bucket).await.expect("bucket should be created");
+
+            let mut file_info = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+            file_info.volume = bucket.to_string();
+            file_info.name = object.to_string();
+            file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+            file_info.erasure.index = 1;
+
+            wrapper
+                .write_metadata("", bucket, object, file_info)
+                .await
+                .expect("object metadata should be written");
+
+            let mut writer = PendingWriter;
+            let result = wrapper
+                .walk_dir(
+                    WalkDirOptions {
+                        bucket: bucket.to_string(),
+                        recursive: true,
+                        timeout_ms: Some(10),
+                        ..Default::default()
+                    },
+                    &mut writer,
+                )
+                .await;
+
+            assert_eq!(result.expect_err("walk_dir should use per-request timeout"), DiskError::Timeout);
             assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
             assert!(!wrapper.health.is_faulty());
         })

@@ -18,6 +18,7 @@
 //! Large files (>5GB) are split into segments, and a manifest defines
 //! how segments are assembled on download.
 
+use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, object};
 use axum::http::{HeaderMap, Response, StatusCode};
 use rustfs_credentials::Credentials;
@@ -161,6 +162,12 @@ fn calculate_segments_for_range(
     let mut current_offset = 0u64;
 
     for (idx, segment) in manifest.segments.iter().enumerate() {
+        // Empty segments contribute no bytes; skip them so the `size_bytes - 1`
+        // arithmetic below cannot underflow.
+        if segment.size_bytes == 0 {
+            continue;
+        }
+
         let segment_start = current_offset;
         let segment_end = current_offset + segment.size_bytes - 1;
 
@@ -193,6 +200,13 @@ fn calculate_segments_for_range(
 fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), SwiftError> {
     if !range_str.starts_with("bytes=") {
         return Err(SwiftError::BadRequest("Invalid Range header format".to_string()));
+    }
+
+    // A range can never be satisfied against an empty aggregate. Guard here so the
+    // `total_size - 1` arithmetic below cannot underflow (which would wrap to a bogus
+    // Content-Range in release builds and panic in debug builds).
+    if total_size == 0 {
+        return Err(SwiftError::BadRequest("Cannot satisfy Range request on empty object".to_string()));
     }
 
     let range_part = &range_str[6..];
@@ -402,6 +416,8 @@ async fn create_slo_stream(
             .segments
             .iter()
             .enumerate()
+            // Skip empty segments so `s.size_bytes - 1` cannot underflow; they carry no bytes.
+            .filter(|(_, s)| s.size_bytes > 0)
             .map(|(i, s)| (i, 0, s.size_bytes - 1, s.clone()))
             .collect()
     };
@@ -420,7 +436,7 @@ async fn create_slo_stream(
 
                 // Fetch segment with range
                 let range_spec = if byte_start > 0 || byte_end < segment.size_bytes - 1 {
-                    Some(rustfs_storage_api::HTTPRangeSpec {
+                    Some(HTTPRangeSpec {
                         is_suffix_length: false,
                         start: byte_start as i64,
                         end: byte_end as i64,
@@ -706,6 +722,54 @@ mod tests {
         assert_eq!(segments[0].0, 2); // Third segment
         assert_eq!(segments[0].1, 100); // Start at byte 100 of seg3
         assert_eq!(segments[0].2, 400); // End at byte 400 of seg3
+    }
+
+    #[test]
+    fn test_calculate_segments_for_range_zero_byte_segment() {
+        let manifest = SLOManifest {
+            segments: vec![
+                SLOSegment {
+                    path: "/c/s1".to_string(),
+                    size_bytes: 1000,
+                    etag: "e1".to_string(),
+                    range: None,
+                },
+                SLOSegment {
+                    path: "/c/s2".to_string(),
+                    size_bytes: 0, // empty segment
+                    etag: "e2".to_string(),
+                    range: None,
+                },
+                SLOSegment {
+                    path: "/c/s3".to_string(),
+                    size_bytes: 500,
+                    etag: "e3".to_string(),
+                    range: None,
+                },
+            ],
+            created_at: None,
+        };
+
+        // Must not panic / underflow on the zero-byte segment.
+        let segments = calculate_segments_for_range(&manifest, 500, 1200).unwrap();
+
+        // The empty segment carries no bytes and is skipped.
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].0, 0);
+        assert_eq!(segments[0].1, 500);
+        assert_eq!(segments[0].2, 999);
+        assert_eq!(segments[1].0, 2);
+        assert_eq!(segments[1].1, 0);
+        assert_eq!(segments[1].2, 200);
+    }
+
+    #[test]
+    fn test_parse_range_header_empty_aggregate() {
+        // An all-empty manifest has total_size == 0; a range request against it must
+        // return a clean error rather than underflowing `total_size - 1`.
+        assert!(parse_range_header("bytes=0-99", 0).is_err());
+        assert!(parse_range_header("bytes=-1", 0).is_err());
+        assert!(parse_range_header("bytes=0-", 0).is_err());
     }
 
     #[test]

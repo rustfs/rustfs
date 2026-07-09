@@ -43,7 +43,7 @@ checked_files=(
   "crates/targets/src/target/webhook.rs"
   "crates/ecstore/src/store/peer.rs"
   "crates/ecstore/src/store/init.rs"
-  "crates/ecstore/src/tier/tier.rs"
+  "crates/ecstore/src/services/tier/tier.rs"
   "crates/heal/src/heal/manager.rs"
   "crates/heal/src/heal/storage.rs"
   "crates/heal/src/heal/task.rs"
@@ -54,8 +54,6 @@ checked_files=(
   "crates/scanner/src/scanner_io.rs"
   "crates/scanner/src/scanner_folder.rs"
   "crates/concurrency/src/workers.rs"
-  "crates/concurrency/src/manager.rs"
-  "crates/concurrency/src/lock.rs"
   "crates/concurrency/src/deadlock.rs"
   "crates/trusted-proxies/src/global.rs"
   "crates/trusted-proxies/src/config/loader.rs"
@@ -83,7 +81,6 @@ checked_files=(
   "crates/protocols/src/swift/expiration_worker.rs"
   "crates/protocols/src/swift/versioning.rs"
   "crates/protocols/src/swift/bulk.rs"
-  "crates/protocols/src/swift/encryption.rs"
   "crates/protocols/src/swift/handler.rs"
   "crates/protocols/src/swift/staticweb.rs"
   "crates/protocols/src/swift/acl.rs"
@@ -108,6 +105,19 @@ checked_files=(
   "crates/obs/src/telemetry/recorder.rs"
   "crates/obs/src/metrics/collectors/system_gpu.rs"
 )
+
+missing_files=()
+for file in "${checked_files[@]}"; do
+  if [[ ! -f "$file" ]]; then
+    missing_files+=("$file")
+  fi
+done
+
+if ((${#missing_files[@]} > 0)); then
+  echo "❌ logging guardrail checked file is missing:" >&2
+  printf '  %s\n' "${missing_files[@]}" >&2
+  exit 1
+fi
 
 forbidden_patterns=(
   'access_key={}'
@@ -168,8 +178,8 @@ forbidden_patterns=(
   'error!("Failed to list KMS keys: {}"'
   'error!("Failed to describe KMS key {}: {}"'
   'warn!(access_key = %ak, error = ?err, "site replication create user hook failed")'
-  'info!("OIDC authorize redirect for provider' 
-  'warn!("OIDC callback received error from IdP:' 
+  'info!("OIDC authorize redirect for provider'
+  'warn!("OIDC callback received error from IdP:'
   'error!("OIDC code exchange failed: {}"'
   'warn!("OIDC logout fallback triggered: {}"'
   'warn!("get body failed, e: {:?}")'

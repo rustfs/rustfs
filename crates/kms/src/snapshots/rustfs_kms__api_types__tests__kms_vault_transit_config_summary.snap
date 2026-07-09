@@ -1,0 +1,27 @@
+---
+source: crates/kms/src/api_types.rs
+expression: "serde_json::to_value(&summary).expect(\"KMS config summary should serialize\")"
+---
+{
+  "backend_summary": {
+    "address": "http://127.0.0.1:8200",
+    "auth_method_type": "token",
+    "backend_type": "vault-transit",
+    "has_stored_credentials": true,
+    "mount_path": "transit",
+    "namespace": "tenant-a",
+    "skip_tls_verify": false
+  },
+  "backend_type": "VaultTransit",
+  "cache_summary": {
+    "enable_metrics": true,
+    "max_keys": 1000,
+    "ttl_seconds": 3600
+  },
+  "cache_ttl_seconds": 3600,
+  "default_key_id": "rustfs-master-key",
+  "enable_cache": true,
+  "max_cached_keys": 1000,
+  "retry_attempts": 3,
+  "timeout_seconds": 30
+}

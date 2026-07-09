@@ -58,14 +58,16 @@
 // Allow dead_code for public API that may be used by external modules or future features
 #![allow(dead_code)]
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 
 use metrics::counter;
+use rustfs_concurrency::DeadlockMonitorPolicy;
 use rustfs_io_core::DeadlockDetectorConfig as CoreDeadlockConfig;
 
 /// Request identifier type.
@@ -124,10 +126,15 @@ impl RequestHangDetectionPolicy {
 
     /// Convert the request-level policy into the shared io-core deadlock config.
     pub fn to_core_config(&self) -> CoreDeadlockConfig {
-        CoreDeadlockConfig {
+        self.to_concurrency_policy().to_core_config()
+    }
+
+    /// Convert the request-level policy into the shared concurrency facade policy.
+    pub fn to_concurrency_policy(&self) -> DeadlockMonitorPolicy {
+        DeadlockMonitorPolicy {
             enabled: self.enabled,
-            detection_interval: self.check_interval,
-            max_hold_time: self.hang_threshold,
+            check_interval: self.check_interval,
+            hang_threshold: self.hang_threshold,
         }
     }
 }
@@ -258,6 +265,8 @@ pub struct ResourceUsage {
 pub struct DeadlockDetector {
     /// Configuration.
     config: RequestHangDetectionPolicy,
+    /// Shared concurrency facade policy.
+    policy: DeadlockMonitorPolicy,
     /// Active request trackers.
     requests: Arc<RwLock<HashMap<RequestId, RequestResourceTracker>>>,
     /// Detection task handle.
@@ -274,9 +283,11 @@ impl DeadlockDetector {
     /// Create a new deadlock detector.
     pub fn new(config: RequestHangDetectionPolicy) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
+        let policy = config.to_concurrency_policy();
 
         Self {
             config,
+            policy,
             requests: Arc::new(RwLock::new(HashMap::new())),
             detector_task: Arc::new(Mutex::new(None)),
             shutdown_tx,
@@ -287,12 +298,12 @@ impl DeadlockDetector {
 
     /// Check if detection is enabled.
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled
+        self.policy.enabled
     }
 
     /// Start the detection task.
     pub fn start(&self) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             debug!("Deadlock detection is disabled");
             return;
         }
@@ -303,22 +314,22 @@ impl DeadlockDetector {
         }
 
         let requests = self.requests.clone();
-        let config = self.config.clone();
+        let policy = self.policy;
         let deadlocks_detected = self.deadlocks_detected.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let running = self.running.clone();
 
         let handle = tokio::spawn(async move {
             debug!(
-                check_interval_secs = config.check_interval.as_secs(),
-                hang_threshold_secs = config.hang_threshold.as_secs(),
+                check_interval_secs = policy.check_interval.as_secs(),
+                hang_threshold_secs = policy.hang_threshold.as_secs(),
                 "Deadlock detector started"
             );
 
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(config.check_interval) => {
-                        Self::detect_cycle(&requests, &config, &deadlocks_detected);
+                    _ = tokio::time::sleep(policy.check_interval) => {
+                        Self::detect_cycle(&requests, &policy, &deadlocks_detected);
                     }
                     _ = shutdown_rx.recv() => {
                         debug!("Deadlock detector shutting down");
@@ -330,13 +341,13 @@ impl DeadlockDetector {
             running.store(false, Ordering::Relaxed);
         });
 
-        *self.detector_task.lock().unwrap() = Some(handle);
+        *self.detector_task.lock() = Some(handle);
     }
 
     /// Stop the detection task.
     pub fn stop(&self) {
         let _ = self.shutdown_tx.send(());
-        if let Some(handle) = self.detector_task.lock().unwrap().take() {
+        if let Some(handle) = self.detector_task.lock().take() {
             // Don't await the handle as we're in a non-async context
             handle.abort();
         }
@@ -345,87 +356,87 @@ impl DeadlockDetector {
 
     /// Register a new request for tracking.
     pub fn register_request(&self, request_id: impl Into<String>, description: impl Into<String>) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
         let request_id = request_id.into();
         let tracker = RequestResourceTracker::new(request_id.clone(), description);
 
-        self.requests.write().unwrap().insert(request_id.clone(), tracker);
+        self.requests.write().insert(request_id.clone(), tracker);
 
         debug!(request_id = %request_id, "Request registered for deadlock tracking");
     }
 
     /// Unregister a request (it completed or was cancelled).
     pub fn unregister_request(&self, request_id: &str) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
-        self.requests.write().unwrap().remove(request_id);
+        self.requests.write().remove(request_id);
 
         debug!(request_id = %request_id, "Request unregistered from deadlock tracking");
     }
 
     /// Record a lock acquisition.
     pub fn record_lock_acquire(&self, request_id: &str, lock: LockInfo) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.held_locks.push(lock);
         }
     }
 
     /// Record a lock release.
     pub fn record_lock_release(&self, request_id: &str, lock_id: &LockId) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.held_locks.retain(|l| &l.id != lock_id);
         }
     }
 
     /// Record that a request is waiting for a lock.
     pub fn record_lock_wait(&self, request_id: &str, lock: LockInfo) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.waiting_lock = Some(lock);
         }
     }
 
     /// Clear the waiting lock (acquired or gave up).
     pub fn clear_lock_wait(&self, request_id: &str) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.waiting_lock = None;
         }
     }
 
     /// Record resource usage.
     pub fn record_resource(&self, request_id: &str, resource_type: ResourceType, amount: usize) {
-        if !self.config.enabled {
+        if !self.policy.enabled {
             return;
         }
 
-        if let Some(tracker) = self.requests.write().unwrap().get_mut(request_id) {
+        if let Some(tracker) = self.requests.write().get_mut(request_id) {
             tracker.resources.insert(resource_type, amount);
         }
     }
 
     /// Get current number of tracked requests.
     pub fn tracked_count(&self) -> usize {
-        self.requests.read().unwrap().len()
+        self.requests.read().len()
     }
 
     /// Get total deadlocks detected.
@@ -436,15 +447,17 @@ impl DeadlockDetector {
     /// Detect deadlock cycles in the lock wait graph.
     fn detect_cycle(
         requests: &Arc<RwLock<HashMap<RequestId, RequestResourceTracker>>>,
-        config: &RequestHangDetectionPolicy,
+        policy: &DeadlockMonitorPolicy,
         deadlocks_detected: &Arc<AtomicU64>,
     ) {
-        let requests_guard = requests.read().unwrap();
+        let hung_request_snapshot: Vec<_> = requests
+            .read()
+            .values()
+            .filter(|r| r.is_hung(policy.hang_threshold))
+            .cloned()
+            .collect();
 
-        // Find hung requests
-        let hung_requests: Vec<_> = requests_guard.values().filter(|r| r.is_hung(config.hang_threshold)).collect();
-
-        if hung_requests.is_empty() {
+        if hung_request_snapshot.is_empty() {
             return;
         }
 
@@ -452,10 +465,10 @@ impl DeadlockDetector {
         // Edge: request A -> request B means A is waiting for a lock that B holds
         let mut wait_graph: Vec<WaitGraphEdge> = Vec::new();
 
-        for waiting in &hung_requests {
+        for waiting in &hung_request_snapshot {
             if let Some(waiting_for) = &waiting.waiting_lock {
                 // Find who holds this lock
-                for holding in &hung_requests {
+                for holding in &hung_request_snapshot {
                     if holding.request_id == waiting.request_id {
                         continue;
                     }
@@ -480,13 +493,13 @@ impl DeadlockDetector {
             error!(
                 cycle = ?cycle,
                 wait_graph = ?wait_graph,
-                hung_requests_count = hung_requests.len(),
+                hung_requests_count = hung_request_snapshot.len(),
                 "Deadlock detected: circular lock wait chain found"
             );
 
             // Log each request in the cycle
             for request_id in &cycle {
-                if let Some(tracker) = requests_guard.get(request_id) {
+                if let Some(tracker) = hung_request_snapshot.iter().find(|tracker| &tracker.request_id == request_id) {
                     warn!(
                         request_id = %request_id,
                         description = %tracker.description,
@@ -500,7 +513,7 @@ impl DeadlockDetector {
         } else {
             // No cycle, but log hung requests for diagnosis
             debug!(
-                hung_requests_count = hung_requests.len(),
+                hung_requests_count = hung_request_snapshot.len(),
                 wait_graph_edges = wait_graph.len(),
                 "Hung requests detected but no deadlock cycle"
             );
@@ -549,9 +562,9 @@ impl DeadlockDetector {
 
         if let Some(neighbors) = graph.get(&node) {
             for neighbor in neighbors {
-                if path_set.contains(neighbor) {
-                    // Found cycle - trim path to just the cycle
-                    let cycle_start = path.iter().position(|n| *n == *neighbor).unwrap();
+                if path_set.contains(neighbor)
+                    && let Some(cycle_start) = path.iter().position(|n| *n == *neighbor)
+                {
                     path.drain(0..cycle_start);
                     return true;
                 }
@@ -601,8 +614,10 @@ pub fn is_deadlock_detection_enabled() -> bool {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{DeadlockDetector, LockInfo, LockType, RequestHangDetectionPolicy, RequestResourceTracker, WaitGraphEdge};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_deadlock_detector_config_default() {
@@ -610,6 +625,43 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.check_interval, Duration::from_secs(5));
         assert_eq!(config.hang_threshold, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_request_hang_policy_projects_to_concurrency_and_core_config() {
+        let config = RequestHangDetectionPolicy {
+            enabled: true,
+            check_interval: Duration::from_secs(7),
+            hang_threshold: Duration::from_secs(11),
+            capture_backtrace: true,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let core = config.to_core_config();
+
+        assert!(concurrency.enabled);
+        assert_eq!(concurrency.check_interval, config.check_interval);
+        assert_eq!(concurrency.hang_threshold, config.hang_threshold);
+        assert!(core.enabled);
+        assert_eq!(core.detection_interval, config.check_interval);
+        assert_eq!(core.max_hold_time, config.hang_threshold);
+        assert!(config.capture_backtrace);
+    }
+
+    #[test]
+    fn test_deadlock_detector_consumes_concurrency_policy() {
+        let config = RequestHangDetectionPolicy {
+            enabled: true,
+            check_interval: Duration::from_secs(7),
+            hang_threshold: Duration::from_secs(11),
+            capture_backtrace: true,
+        };
+        let concurrency = config.to_concurrency_policy();
+        let detector = DeadlockDetector::new(config);
+
+        assert!(detector.is_enabled());
+        assert_eq!(detector.policy.check_interval, concurrency.check_interval);
+        assert_eq!(detector.policy.hang_threshold, concurrency.hang_threshold);
+        assert!(detector.config.capture_backtrace);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -72,6 +73,81 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         )
         self.assertEqual(profiles["minio-aistor"]["rest_signing_name"], "s3tables")
         self.assertEqual(profiles["cloudflare-r2-data-catalog"]["credential_mode"], "catalog-vended")
+        self.assertEqual(profiles["oss-tables"]["rest_signing_name"], "osstables")
+
+    def test_vendor_profiles_publish_migration_boundaries(self) -> None:
+        profiles = pyiceberg_smoke.vendor_profiles()
+
+        aws = profiles["aws-s3tables"]
+        self.assertEqual(aws["compatibility_stage"], "reference-only")
+        self.assertEqual(aws["warehouse_shape"], "arn:aws:s3tables:{region}:{account_id}:bucket/{table_bucket}")
+        self.assertEqual(aws["namespace_model"], "single-level")
+        self.assertEqual(aws["pagination_model"], "vendor-specific")
+        self.assertIn("full AWS S3 Tables API parity", aws["not_claimed"])
+
+        cloudflare = profiles["cloudflare-r2-data-catalog"]
+        self.assertEqual(cloudflare["catalog_uri_shape"], "{catalog_uri}")
+        self.assertEqual(cloudflare["credential_mode"], "catalog-vended")
+        self.assertIn("live RustFS interoperability", cloudflare["not_claimed"])
+
+        oss = profiles["oss-tables"]
+        self.assertEqual(oss["warehouse_shape"], "acs:osstables:{region}:{account_id}:bucket/{table_bucket}")
+        self.assertIn("provider-error-code parity", oss["not_claimed"])
+
+    def test_aws_reference_profile_formats_s3tables_warehouse_arn(self) -> None:
+        args = self.parse_with_args([
+            "--profile",
+            "aws-s3tables",
+            "--endpoint",
+            "https://s3tables.us-east-1.amazonaws.com",
+            "--region",
+            "us-east-1",
+            "--account-id",
+            "123456789012",
+            "--table-bucket",
+            "analytics",
+        ])
+
+        properties = pyiceberg_smoke.catalog_properties(args)
+
+        self.assertEqual(properties["uri"], "https://s3tables.us-east-1.amazonaws.com/iceberg")
+        self.assertEqual(properties["warehouse"], "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics")
+        self.assertEqual(properties["rest.signing-name"], "s3tables")
+
+    def test_oss_tables_reference_profile_formats_warehouse_arn(self) -> None:
+        args = self.parse_with_args([
+            "--profile",
+            "oss-tables",
+            "--endpoint",
+            "https://cn-hangzhou.oss-tables.aliyuncs.com",
+            "--region",
+            "cn-hangzhou",
+            "--account-id",
+            "123456789012",
+            "--table-bucket",
+            "analytics",
+        ])
+
+        properties = pyiceberg_smoke.catalog_properties(args)
+
+        self.assertEqual(properties["uri"], "https://cn-hangzhou.oss-tables.aliyuncs.com/iceberg")
+        self.assertEqual(properties["warehouse"], "acs:osstables:cn-hangzhou:123456789012:bucket/analytics")
+        self.assertEqual(properties["rest.signing-name"], "osstables")
+
+    def test_cloudflare_reference_profile_uses_catalog_uri_and_warehouse_name(self) -> None:
+        args = self.parse_with_args([
+            "--profile",
+            "cloudflare-r2-data-catalog",
+            "--catalog-uri",
+            "https://catalog.example.com/iceberg",
+            "--warehouse-name",
+            "analytics",
+        ])
+
+        properties = pyiceberg_smoke.catalog_properties(args)
+
+        self.assertEqual(properties["uri"], "https://catalog.example.com/iceberg")
+        self.assertEqual(properties["warehouse"], "analytics")
 
     def test_vended_profile_requires_catalog_credentials_and_keeps_canonical_path(self) -> None:
         args = self.parse_with_args([
@@ -243,6 +319,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         config_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/config")
         maintenance_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/metadata")
         job_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1")
+        quarantine_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1/quarantine")
+        scheduler_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler")
+        scheduler_run_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler/run")
         worker_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/worker/run")
 
         def fake_signed_request(
@@ -257,11 +336,20 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             if (method, path) == ("GET", config_path):
                 return {"version": 1}
             if (method, path) == ("POST", maintenance_path):
-                return {"job": {"job-id": "job-1"}}
+                return {"job": {"job-id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("GET", job_path):
-                return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}}
+                return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}, "audit-events": [{"action": "PLANNED"}]}
+            if (method, path) == ("POST", quarantine_path):
+                return {"action": "INSPECT", "report": {"job": {"job-id": "job-1"}}}
+            if (method, path) == ("GET", scheduler_path):
+                return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1", "audit-events": [{"action": "PLANNED"}]}]}
+            if (method, path) == ("POST", scheduler_run_path):
+                return {
+                    "report": {"job": {"job-id": "job-2", "status": "QUEUED", "scheduler-id": "pyiceberg-smoke-scheduler"}},
+                    "scheduler": {"status": "QUEUED"},
+                }
             if (method, path) == ("POST", worker_path):
-                return {"job": {"status": "UNKNOWN"}}
+                return {"job": {"status": "UNKNOWN"}, "audit-events": [{"action": "WORKER_CONTROL"}]}
             raise AssertionError(f"unexpected REST request: {method} {path}")
 
         with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=fake_signed_request):
@@ -279,6 +367,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         view_path = pyiceberg_smoke.view_endpoint_path(args)
         config_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/config")
         maintenance_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/metadata")
+        quarantine_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1/quarantine")
+        scheduler_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler")
+        scheduler_run_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler/run")
         worker_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/worker/run")
         diagnostics_path = pyiceberg_smoke.table_endpoint_path(args, "/catalog/diagnostics")
 
@@ -315,11 +406,20 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             if (method, path) == ("GET", config_path):
                 return {"version": 1}
             if (method, path) == ("POST", maintenance_path):
-                return {"job": {"job-id": "job-1"}}
+                return {"job": {"job-id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("GET", pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1")):
-                return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}}
+                return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}, "audit-events": [{"action": "PLANNED"}]}
+            if (method, path) == ("POST", quarantine_path):
+                return {"action": "INSPECT", "report": {"job": {"job-id": "job-1"}}}
+            if (method, path) == ("GET", scheduler_path):
+                return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1", "audit-events": [{"action": "PLANNED"}]}]}
+            if (method, path) == ("POST", scheduler_run_path):
+                return {
+                    "report": {"job": {"job-id": "job-2", "status": "QUEUED", "scheduler-id": "pyiceberg-smoke-scheduler"}},
+                    "scheduler": {"status": "QUEUED"},
+                }
             if (method, path) == ("POST", worker_path):
-                return {"job": {"status": "PAUSED"}}
+                return {"job": {"status": "PAUSED"}, "audit-events": [{"action": "WORKER_CONTROL"}]}
             if (method, path) == ("GET", diagnostics_path):
                 return {"status": "ok"}
             raise AssertionError(f"unexpected REST request: {method} {path}")
@@ -347,6 +447,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         )
         self.assertIn(("GET", metadata_location_path, None), calls)
         self.assertIn(("GET", diagnostics_path, None), calls)
+        self.assertIn(("GET", scheduler_path, None), calls)
+        self.assertIn(("POST", scheduler_run_path, {"scheduler-id": "pyiceberg-smoke-scheduler"}), calls)
+        self.assertIn(("POST", quarantine_path, {"action": "INSPECT"}), calls)
         self.assertIn(("POST", worker_path, {}), calls)
 
     def test_table_ref_probe_force_deletes_smoke_ref_after_validation_failure(self) -> None:
@@ -753,11 +856,97 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             self.assertIn("status", entry)
             self.assertIn("roadmap_area", entry)
 
+    def test_production_readiness_inventory_tracks_catalog_backing(self) -> None:
+        inventory = pyiceberg_smoke.production_readiness_inventory()
+        capabilities = {entry["capability"] for entry in inventory}
+
+        self.assertIn("strong-catalog-backing", capabilities)
+        self.assertIn("single-active-writer-ha", capabilities)
+        self.assertIn("scale-validation-matrix", capabilities)
+        strong_backing = next(entry for entry in inventory if entry["capability"] == "strong-catalog-backing")
+        self.assertEqual(strong_backing["status"], "migration-contract-supported")
+        for entry in inventory:
+            self.assertIn("status", entry)
+            self.assertIn("validation", entry)
+
+    def test_print_engine_compatibility_outputs_machine_readable_matrix(self) -> None:
+        args = self.parse_with_args(["--print-engine-compatibility"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("engine_compatibility", document)
+        clients = {entry["client"] for entry in document["engine_compatibility"]}
+        self.assertIn("PyIceberg", clients)
+        self.assertIn("Spark Iceberg REST catalog", clients)
+
+    def test_print_production_failure_coverage_outputs_machine_readable_matrix(self) -> None:
+        args = self.parse_with_args(["--print-production-failure-coverage"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("production_failure_coverage", document)
+        cases = {entry["case"] for entry in document["production_failure_coverage"]}
+        self.assertIn("commit-cas-conflict", cases)
+        self.assertIn("post-cas-finalization-gap", cases)
+
+    def test_print_vendor_profiles_outputs_migration_boundaries(self) -> None:
+        args = self.parse_with_args(["--print-vendor-profiles"])
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        self.assertIn("vendor_profiles", document)
+        aws = document["vendor_profiles"]["aws-s3tables"]
+        self.assertEqual(aws["rest_signing_name"], "s3tables")
+        self.assertEqual(aws["compatibility_stage"], "reference-only")
+        self.assertIn("full AWS S3 Tables API parity", aws["not_claimed"])
+
+        selected = document["selected_vendor_profile"]
+        self.assertEqual(selected["name"], "rustfs")
+        self.assertEqual(selected["catalog_uri"], "http://127.0.0.1:9000/iceberg")
+        self.assertEqual(selected["warehouse"], "rustfs-s3table-smoke")
+
+    def test_print_vendor_profiles_renders_selected_aws_profile(self) -> None:
+        args = self.parse_with_args(
+            [
+                "--profile",
+                "aws-s3tables",
+                "--region",
+                "us-east-1",
+                "--account-id",
+                "123456789012",
+                "--table-bucket",
+                "analytics",
+                "--print-vendor-profiles",
+            ]
+        )
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            self.assertTrue(pyiceberg_smoke.printed_metadata(args))
+
+        document = json.loads(stdout.getvalue())
+        selected = document["selected_vendor_profile"]
+        self.assertEqual(selected["name"], "aws-s3tables")
+        self.assertEqual(selected["catalog_uri"], "https://s3tables.us-east-1.amazonaws.com/iceberg")
+        self.assertEqual(selected["warehouse"], "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics")
+        self.assertEqual(selected["rest_signing_name"], "s3tables")
+
     def test_published_table_catalog_docs_do_not_use_internal_roadmap_labels(self) -> None:
         readme = (SCRIPT_DIR / "README.md").read_text(encoding="utf-8")
 
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(readme))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.unsupported_inventory())))
+        self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.production_readiness_inventory())))
+        self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.failure_coverage.production_failure_matrix())))
 
 
 if __name__ == "__main__":

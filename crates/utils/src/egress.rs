@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +59,36 @@ pub fn validate_outbound_url(url: &Url) -> Result<(), OutboundUrlError> {
 }
 
 fn validate_outbound_ip(ip: IpAddr) -> Result<(), &'static str> {
+    // Reject pure-IPv6 special forms first, before any IPv4 normalization. ::1 (loopback) and ::
+    // (unspecified) are technically IPv4-compatible forms too, so normalizing first would map
+    // them to a harmless-looking 0.0.0.1 / 0.0.0.0 and let them through.
+    if let IpAddr::V6(v6) = ip {
+        if v6.is_loopback() {
+            return Err("loopback address");
+        }
+        if v6.is_unspecified() {
+            return Err("unspecified address");
+        }
+        if v6.is_unicast_link_local() {
+            return Err("link-local address");
+        }
+        if v6.is_unique_local() {
+            return Err("private address");
+        }
+    }
+
+    // Normalize IPv4-mapped (::ffff:a.b.c.d) AND IPv4-compatible (::a.b.c.d) IPv6 addresses to
+    // their embedded IPv4 so the IPv4 rules below apply. The std is_* checks on the IPv6 variant
+    // never inspect the embedded IPv4, so without this an attacker bypasses the guard with e.g.
+    // ::ffff:127.0.0.1, ::127.0.0.1 (loopback) or ::169.254.169.254 (cloud metadata service).
+    let ip = match ip {
+        IpAddr::V6(v6) => match embedded_ipv4(v6) {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        other => other,
+    };
+
     if ip.is_unspecified() {
         return Err("unspecified address");
     }
@@ -79,20 +109,32 @@ fn validate_outbound_ip(ip: IpAddr) -> Result<(), &'static str> {
                 return Err("private address");
             }
         }
-        IpAddr::V6(ipv6) => {
-            if ipv6.is_loopback() {
-                return Err("loopback address");
-            }
-            if ipv6.is_unicast_link_local() {
-                return Err("link-local address");
-            }
-            if ipv6.is_unique_local() {
-                return Err("private address");
-            }
-        }
+        // Genuine IPv6 (no embedded IPv4) was already classified above.
+        IpAddr::V6(_) => {}
     }
 
     Ok(())
+}
+
+/// Extract the embedded IPv4 from an IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible
+/// (`::a.b.c.d`) IPv6 address. The pure-IPv6 specials `::` and `::1` are rejected by the caller
+/// before this runs, so returning `None` here means a genuine IPv6 host.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    // IPv4-compatible: the top 96 bits are zero and the low 32 bits carry the IPv4.
+    let segs = v6.segments();
+    if segs[0..6] == [0, 0, 0, 0, 0, 0] {
+        let hi = segs[6].to_be_bytes();
+        let lo = segs[7].to_be_bytes();
+        let v4 = Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]);
+        // `::` and `::1` are already handled by the caller; anything else is a real embedded v4.
+        if !v4.is_unspecified() && v4 != Ipv4Addr::new(0, 0, 0, 1) {
+            return Some(v4);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -166,6 +208,100 @@ mod tests {
             err,
             OutboundUrlError::ForbiddenHost {
                 reason: "link-local address",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv4_mapped_loopback() {
+        let url = Url::parse("http://[::ffff:127.0.0.1]/webhook").expect("mapped loopback URL should parse");
+        let err = validate_outbound_url(&url).expect_err("IPv4-mapped loopback should be rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "loopback address",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv4_mapped_private() {
+        let url = Url::parse("http://[::ffff:10.0.0.5]/webhook").expect("mapped private URL should parse");
+        let err = validate_outbound_url(&url).expect_err("IPv4-mapped private should be rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "private address",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv4_mapped_metadata_endpoint() {
+        let url = Url::parse("http://[::ffff:169.254.169.254]/latest/meta-data").expect("mapped metadata URL should parse");
+        let err = validate_outbound_url(&url).expect_err("IPv4-mapped metadata endpoint should be rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "metadata endpoint",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_still_allows_public_ipv6() {
+        // Pure public IPv6 (Google DNS) must remain allowed after normalization.
+        let url = Url::parse("https://[2001:4860:4860::8888]/webhook").expect("public IPv6 URL should parse");
+        assert!(validate_outbound_url(&url).is_ok());
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv4_compatible_loopback() {
+        // IPv4-compatible form ::a.b.c.d (deprecated but still routable) must also be caught.
+        let url = Url::parse("http://[::127.0.0.1]/webhook").expect("compatible loopback URL should parse");
+        let err = validate_outbound_url(&url).expect_err("IPv4-compatible loopback should be rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "loopback address",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv4_compatible_metadata_endpoint() {
+        let url = Url::parse("http://[::169.254.169.254]/latest/meta-data").expect("compatible metadata URL should parse");
+        let err = validate_outbound_url(&url).expect_err("IPv4-compatible metadata endpoint should be rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "metadata endpoint",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv6_loopback_and_unspecified() {
+        // ::1 / :: must stay rejected even though they look like IPv4-compatible forms.
+        let err = validate_outbound_url(&Url::parse("http://[::1]/x").unwrap()).expect_err("::1 rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "loopback address",
+                ..
+            }
+        ));
+        let err = validate_outbound_url(&Url::parse("http://[::]/x").unwrap()).expect_err(":: rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "unspecified address",
                 ..
             }
         ));

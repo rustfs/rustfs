@@ -21,8 +21,9 @@ use rustfs_lock::{LockClient, LockRequest};
 use rustfs_protos::{
     models::PingBodyBuilder,
     proto_gen::node_service::{
-        BatchGenerallyLockRequest, BatchGenerallyLockResponse, GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult,
-        PingRequest, PingResponse, node_service_server::NodeService,
+        BatchGenerallyLockRequest, BatchGenerallyLockResponse, BatchReadVersionRequest, BatchReadVersionResponse,
+        GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, PingRequest, PingResponse,
+        node_service_server::NodeService,
     },
 };
 use std::pin::Pin;
@@ -94,6 +95,13 @@ impl NodeService for MinimalLockNodeService {
             version: 1,
             body: Bytes::copy_from_slice(finished_data),
         }))
+    }
+
+    async fn batch_read_version(
+        &self,
+        _request: Request<BatchReadVersionRequest>,
+    ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
     }
 
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
@@ -661,6 +669,27 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::LoadRebalanceMetaRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::LoadRebalanceMetaResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn start_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::StartDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::StartDecommissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn cancel_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::CancelDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::CancelDecommissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn clear_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ClearDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::ClearDecommissionResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 

@@ -85,6 +85,12 @@ cat <<'JSON'
     "delay": { "value": 30, "source": "config" }
   },
   "metrics": {
+    "life_time_ops": {
+      "scan_cycle": 9,
+      "scan_bucket_drive": 11,
+      "scan_object": 13,
+      "save_usage": 5
+    },
     "pacing_pressure": {
       "primary_pressure": "active_scans"
     },
@@ -95,6 +101,18 @@ cat <<'JSON'
     "last_cycle_partial_source": "",
     "lifecycle_transition": {
       "scanner_missed": 0
+    },
+    "current_cycle_usage_saves": 2,
+    "last_cycle_usage_saves": 3,
+    "usage_freshness": {
+      "dirty_pending_buckets": 1,
+      "last_dirty_mark_unix_secs": 1800000001,
+      "last_dirty_clear_unix_secs": 1800000002,
+      "last_cycle_dirty_buckets": 1,
+      "last_cycle_cleared_dirty_buckets": 1,
+      "last_usage_save_unix_secs": 1800000003,
+      "last_usage_save_result": "success",
+      "last_usage_save_result_code": 1
     },
     "source_work": [
       { "source": "usage", "missed": 0 },
@@ -150,7 +168,7 @@ fi
 if [[ "$1" == "-r" ]]; then
   while [[ $# -gt 0 ]]; do
     if [[ "$1" == "--arg" && "${2:-}" == "ts" ]]; then
-      printf '"%s","active_scans",5,2,"success","","",0,0,8,2,4,2,2\n' "$3"
+      printf '"%s","active_scans",5,2,"success","","",0,0,2,3,1,1,1,"success",1800000003,9,11,13,5,8,2,4,2,2\n' "$3"
       exit 0
     fi
     shift
@@ -205,8 +223,10 @@ if [[ "$(wc -l <"$OUT_DIR/scanner-summary.csv" | tr -d ' ')" != "3" ]]; then
   echo "Expected scanner summary header plus 2 rows" >&2
   exit 1
 fi
+grep -q 'current_cycle_usage_saves,last_cycle_usage_saves,usage_dirty_pending_buckets' "$OUT_DIR/scanner-summary.csv"
+grep -q 'life_time_scan_cycle,life_time_scan_bucket_drive,life_time_scan_object,life_time_save_usage' "$OUT_DIR/scanner-summary.csv"
 grep -q 'heal_queue_length,heal_active_tasks,heal_scanner_queued,heal_admin_queued,heal_auto_heal_queued' "$OUT_DIR/scanner-summary.csv"
-grep -q '"active_scans",5,2,"success","","",0,0,8,2,4,2,2' "$OUT_DIR/scanner-summary.csv"
+grep -q '"active_scans",5,2,"success","","",0,0,2,3,1,1,1,"success",1800000003,9,11,13,5,8,2,4,2,2' "$OUT_DIR/scanner-summary.csv"
 
 grep -q '^deployment=single-disk$' "$OUT_DIR/run-metadata.env"
 grep -q '^workload_label=small-object-idle$' "$OUT_DIR/run-metadata.env"
@@ -214,6 +234,7 @@ grep -q '^metrics_endpoints=http://node-a:9000,http://node-b:9000$' "$OUT_DIR/ru
 grep -q '## Scanner Validation Report' "$OUT_DIR/scanner-validation-report.md"
 grep -q 'Distributed admin metrics snapshots: 4' "$OUT_DIR/scanner-validation-report.md"
 grep -q 'Background heal status snapshots: 4' "$OUT_DIR/scanner-validation-report.md"
+grep -q 'Usage freshness summary:' "$OUT_DIR/scanner-validation-report.md"
 grep -q 'admin config get rustfs-local scanner' "$mc_log"
 grep -q 'admin config get rustfs-local heal' "$mc_log"
 grep -q -- '--request GET' "$awscurl_log"

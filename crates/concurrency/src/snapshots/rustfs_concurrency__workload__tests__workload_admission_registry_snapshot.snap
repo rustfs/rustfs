@@ -1,0 +1,24 @@
+---
+source: crates/concurrency/src/workload.rs
+expression: "serde_json::to_value(&registry).expect(\"workload admission registry should serialize\")"
+---
+{
+  "entries": [
+    {
+      "active": null,
+      "class": "scanner",
+      "limit": null,
+      "queued": null,
+      "reason": null,
+      "state": "unknown"
+    },
+    {
+      "active": 3,
+      "class": "foreground_read",
+      "limit": 8,
+      "queued": 1,
+      "reason": null,
+      "state": "open"
+    }
+  ]
+}

@@ -34,6 +34,56 @@ If you want the Kafka-backed HA Tempo path, use `docker-compose-example-for-rust
 - **High Performance**: Optimized configurations for batching, compression, and memory management.
 - **Standardized Protocols**: Built entirely on OpenTelemetry standards.
 
+## GET Performance Optimization Dashboards
+
+Three pre-built Grafana dashboards are included for monitoring RustFS GET performance optimization rollout:
+
+### Available Dashboards
+
+| Dashboard | File | Description |
+|-----------|------|-------------|
+| **GET Rollout Health** | `grafana-get-rollout-health.json` | Monitors optimization rollout: latency by reader path, early-stop hit rate, codec streaming usage, pipeline failures |
+| **GET Data Integrity** | `grafana-get-data-integrity.json` | Monitors data safety: bitrot verify failures, decode errors, short reads, shard read outcomes |
+| **GET Resource Impact** | `grafana-get-resource-impact.json` | Monitors resource usage: concurrent requests, IO queue utilization, disk permit wait, RSS trend |
+
+### Prometheus Alert Rules
+
+The file `prometheus-rules/rustfs-get-optimization-alerts.yaml` contains pre-configured alerting rules:
+
+| Alert | Severity | Condition |
+|-------|----------|-----------|
+| `GetP99Regression` | Critical | GET p99 latency > 2x baseline for 10m |
+| `PipelineFailureSpike` | Critical | Pipeline failure rate > 5x baseline for 5m |
+| `BitrotMismatchSpike` | Critical | Bitrot mismatch rate > 3x baseline for 5m |
+| `EarlyStopInsufficientQuorum` | Warning | Early-stop insufficient quorum rate > 0.1/s for 5m |
+| `CodecStreamingFallbackSpike` | Warning | Codec streaming fallback > 10x baseline for 10m |
+| `IoQueueSaturation` | Warning | IO queue utilization > 90% for 5m |
+
+### Enabling Alert Rules
+
+Add the alert rules file to your Prometheus configuration:
+
+```yaml
+# prometheus.yml
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+# Or mount the file in docker-compose.yml:
+# volumes:
+#   - ./prometheus-rules:/etc/prometheus/rules
+```
+
+### Dashboard Usage
+
+The dashboards are automatically provisioned when Grafana starts. They use the `${DS_PROMETHEUS}` datasource variable, so you need a Prometheus datasource configured in Grafana.
+
+Key panels to monitor during optimization rollout:
+
+1. **GET Latency by Reader Path** - Compare `codec_streaming` vs `legacy_duplex` latency
+2. **Early-Stop Hit Rate** - Verify early-stop is triggering effectively
+3. **Pipeline Failure Rate** - Detect any new failure modes introduced by optimizations
+4. **Bitrot Verify Failures** - Ensure data integrity is maintained
+
 ## Quick Start
 
 ### Prerequisites

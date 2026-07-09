@@ -62,6 +62,9 @@ mod tests {
         let binary_path = rustfs_binary_path();
         let mut command = Command::new(&binary_path);
         command.env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
+        // Keep the embedded console off its fixed default port :9001, which may
+        // already be taken by unrelated local services (e.g. Docker Desktop).
+        command.env("RUSTFS_CONSOLE_ENABLE", "false");
         for (key, value) in extra_env {
             command.env(key, value);
         }

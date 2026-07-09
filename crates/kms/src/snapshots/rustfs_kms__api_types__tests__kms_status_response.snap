@@ -1,0 +1,10 @@
+---
+source: crates/kms/src/api_types.rs
+expression: "serde_json::to_value(KmsStatusResponse\n{\n    status: KmsServiceStatus::Running, backend_type:\n    Some(KmsBackend::VaultTransit), healthy: Some(true), config_summary: None,\n}).expect(\"status response should serialize\")"
+---
+{
+  "backend_type": "VaultTransit",
+  "config_summary": null,
+  "healthy": true,
+  "status": "Running"
+}

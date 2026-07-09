@@ -34,6 +34,7 @@ humantime.workspace = true
 hyper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
 time.workspace = true
 
 [lib]

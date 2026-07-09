@@ -1,0 +1,7 @@
+self-hosted-runner:
+  # Custom labels of this repository's self-hosted runners. Keep in sync with
+  # the labels actually used in `runs-on:` across .github/workflows/.
+  labels:
+    - sm-standard-2
+    - sm-standard-4
+    - dind-sm-standard-2

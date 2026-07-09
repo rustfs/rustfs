@@ -1,0 +1,25 @@
+# nextest configuration for RustFS.
+#
+# Serialize two known load-sensitive / global-state-sharing ecstore test groups
+# so the full parallel nextest suite stops producing spurious failures
+# (backlog #937). These tests pass in isolation but flake under the loaded
+# parallel run for two distinct reasons:
+#
+#   * store::bucket::tests::bucket_delete_* share process/global state (disk
+#     registry, lock client) and race make_bucket into InsufficientWriteQuorum
+#     when run concurrently with other ecstore tests.
+#   * bucket_lifecycle_ops::tests::concurrent_resend_same_part_commits_one_generation
+#     asserts a lock-acquire correctness property whose serialized cross-disk
+#     commits exceed the (already max'd, 60s) acquire deadline only when the
+#     suite saturates disk I/O.
+#
+# serial_test's #[serial] attribute does NOT serialize these across runs:
+# nextest executes each test in its own process, where the in-process
+# serial_test mutex has no effect. A nextest test-group with max-threads = 1 is
+# the mechanism that actually serializes across nextest's process boundary.
+[test-groups]
+ecstore-serial-flaky = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/))'
+test-group = 'ecstore-serial-flaky'

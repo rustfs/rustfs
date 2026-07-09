@@ -284,6 +284,24 @@ impl SizeHistogram {
     }
 
     pub fn to_map(&self) -> HashMap<String, u64> {
+        // Numeric interval bounds, kept in lockstep with `add` above. The
+        // rollup for the v1-compat `BETWEEN_1024B_AND_1_MB` bucket is derived
+        // from these bounds rather than the display names to avoid undercounting
+        // the sub-ranges in [1 KiB, 512 KiB).
+        const ONE_MIB: u64 = 1024 * 1024;
+        let intervals = [
+            (0, 1024),                          // LESS_THAN_1024_B
+            (1024, 64 * 1024 - 1),              // BETWEEN_1024_B_AND_64_KB
+            (64 * 1024, 256 * 1024 - 1),        // BETWEEN_64_KB_AND_256_KB
+            (256 * 1024, 512 * 1024 - 1),       // BETWEEN_256_KB_AND_512_KB
+            (512 * 1024, ONE_MIB - 1),          // BETWEEN_512_KB_AND_1_MB
+            (1024, ONE_MIB - 1),                // BETWEEN_1024B_AND_1_MB (v1-compat rollup)
+            (ONE_MIB, 10 * ONE_MIB - 1),        // BETWEEN_1_MB_AND_10_MB
+            (10 * ONE_MIB, 64 * ONE_MIB - 1),   // BETWEEN_10_MB_AND_64_MB
+            (64 * ONE_MIB, 128 * ONE_MIB - 1),  // BETWEEN_64_MB_AND_128_MB
+            (128 * ONE_MIB, 512 * ONE_MIB - 1), // BETWEEN_128_MB_AND_512_MB
+            (512 * ONE_MIB, u64::MAX),          // GREATER_THAN_512_MB
+        ];
         let names = [
             "LESS_THAN_1024_B",
             "BETWEEN_1024_B_AND_64_KB",
@@ -298,14 +316,21 @@ impl SizeHistogram {
             "GREATER_THAN_512_MB",
         ];
 
+        // Sum every sub-bucket whose interval lies entirely within [1024, 1 MiB),
+        // excluding the compat bucket itself, to form the v1-compat rollup.
+        let compat_rollup: u64 = self
+            .0
+            .iter()
+            .zip(intervals.iter())
+            .zip(names.iter())
+            .filter(|((_, (start, end)), name)| name != &&"BETWEEN_1024B_AND_1_MB" && *start >= 1024 && *end < ONE_MIB)
+            .map(|((count, _), _)| *count)
+            .sum();
+
         let mut res = HashMap::new();
-        let mut spl_count = 0;
         for (count, name) in self.0.iter().zip(names.iter()) {
             if name == &"BETWEEN_1024B_AND_1_MB" {
-                res.insert(name.to_string(), spl_count);
-            } else if name.starts_with("BETWEEN_") && name.contains("_KB_") && name.contains("_MB") {
-                spl_count += count;
-                res.insert(name.to_string(), *count);
+                res.insert(name.to_string(), compat_rollup);
             } else {
                 res.insert(name.to_string(), *count);
             }
@@ -475,20 +500,20 @@ impl DataUsageEntry {
 
         if let Some(o_rep) = &other.replication_stats {
             let s_rep = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
-            s_rep.targets.clear();
             s_rep.replica_size += o_rep.replica_size;
             s_rep.replica_count += o_rep.replica_count;
             for (arn, stat) in o_rep.targets.iter() {
                 let st = s_rep.targets.entry(arn.clone()).or_default();
-                *st = ReplicationStats {
-                    pending_size: stat.pending_size + st.pending_size,
-                    failed_size: stat.failed_size + st.failed_size,
-                    replicated_size: stat.replicated_size + st.replicated_size,
-                    pending_count: stat.pending_count + st.pending_count,
-                    failed_count: stat.failed_count + st.failed_count,
-                    replicated_count: stat.replicated_count + st.replicated_count,
-                    ..Default::default()
-                };
+                st.pending_size += stat.pending_size;
+                st.replicated_size += stat.replicated_size;
+                st.failed_size += stat.failed_size;
+                st.failed_count += stat.failed_count;
+                st.pending_count += stat.pending_count;
+                st.missed_threshold_size += stat.missed_threshold_size;
+                st.after_threshold_size += stat.after_threshold_size;
+                st.missed_threshold_count += stat.missed_threshold_count;
+                st.after_threshold_count += stat.after_threshold_count;
+                st.replicated_count += stat.replicated_count;
             }
         }
 
@@ -828,7 +853,7 @@ impl DataUsageCache {
             versions_total_count: flat.versions as u64,
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
-            buckets_count: e.children.len() as u64,
+            buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             ..Default::default()
         }
@@ -1257,6 +1282,17 @@ impl SizeSummary {
     }
 }
 
+/// Aggregated compression metrics: original size, compressed size, and operation count.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CompressionTotalInfo {
+    // Total bytes before compression since compression is used.
+    pub original_bytes_total: u64,
+    // Total bytes after compression since compression is used.
+    pub compressed_bytes_total: u64,
+    // Total number of compression operations since compression is used.
+    pub compression_operations_total: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,6 +1341,24 @@ mod tests {
 
         assert_eq!(summary1.total_size, 300);
         assert_eq!(summary1.versions, 15);
+    }
+
+    #[test]
+    fn test_size_histogram_compat_rollup_sums_all_sub_buckets() {
+        let mut hist = SizeHistogram::default();
+        // One object in each of the four sub-ranges within [1024, 1 MiB).
+        hist.add(32 * 1024); // [1024, 64 KiB)
+        hist.add(128 * 1024); // [64 KiB, 256 KiB)
+        hist.add(384 * 1024); // [256 KiB, 512 KiB)
+        hist.add(768 * 1024); // [512 KiB, 1 MiB)
+
+        let map = hist.to_map();
+
+        assert_eq!(map["BETWEEN_1024B_AND_1_MB"], 4);
+        assert_eq!(map["BETWEEN_1024_B_AND_64_KB"], 1);
+        assert_eq!(map["BETWEEN_64_KB_AND_256_KB"], 1);
+        assert_eq!(map["BETWEEN_256_KB_AND_512_KB"], 1);
+        assert_eq!(map["BETWEEN_512_KB_AND_1_MB"], 1);
     }
 
     #[test]
@@ -1360,6 +1414,108 @@ mod tests {
         let child_entry = base.find("bucket/child").expect("child should remain after merge");
         assert_eq!(child_entry.size, 30);
         assert_eq!(child_entry.objects, 3);
+    }
+
+    #[test]
+    fn test_dui_bucket_count_uses_bucket_list_after_compaction() {
+        let root_hash = hash_path("root");
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "root".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace_hashed(
+            &root_hash,
+            &None,
+            &DataUsageEntry {
+                compacted: true,
+                objects: 3,
+                ..Default::default()
+            },
+        );
+
+        let buckets = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+        let info = cache.dui("root", &buckets);
+
+        assert_eq!(info.buckets_count, 2);
+        assert!(info.buckets_usage.is_empty());
+        assert_eq!(info.objects_total_count, 3);
+    }
+
+    #[test]
+    fn test_data_usage_entry_merge_preserves_replication_targets() {
+        let mut base = DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: 10,
+                replica_count: 1,
+                targets: HashMap::from([
+                    (
+                        "arn:self-only".to_string(),
+                        ReplicationStats {
+                            pending_size: 7,
+                            pending_count: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "arn:shared".to_string(),
+                        ReplicationStats {
+                            failed_size: 3,
+                            failed_count: 1,
+                            missed_threshold_size: 2,
+                            missed_threshold_count: 1,
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        };
+        let other = DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: 20,
+                replica_count: 2,
+                targets: HashMap::from([
+                    (
+                        "arn:shared".to_string(),
+                        ReplicationStats {
+                            failed_size: 5,
+                            failed_count: 2,
+                            after_threshold_size: 4,
+                            after_threshold_count: 2,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "arn:other-only".to_string(),
+                        ReplicationStats {
+                            replicated_size: 11,
+                            replicated_count: 3,
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        };
+
+        base.merge(&other);
+
+        let stats = base.replication_stats.expect("replication stats should remain present");
+        assert_eq!(stats.replica_size, 30);
+        assert_eq!(stats.replica_count, 3);
+        assert_eq!(stats.targets["arn:self-only"].pending_size, 7);
+        assert_eq!(stats.targets["arn:self-only"].pending_count, 1);
+        assert_eq!(stats.targets["arn:shared"].failed_size, 8);
+        assert_eq!(stats.targets["arn:shared"].failed_count, 3);
+        assert_eq!(stats.targets["arn:shared"].missed_threshold_size, 2);
+        assert_eq!(stats.targets["arn:shared"].missed_threshold_count, 1);
+        assert_eq!(stats.targets["arn:shared"].after_threshold_size, 4);
+        assert_eq!(stats.targets["arn:shared"].after_threshold_count, 2);
+        assert_eq!(stats.targets["arn:other-only"].replicated_size, 11);
+        assert_eq!(stats.targets["arn:other-only"].replicated_count, 3);
     }
 
     // --- Tests for `add` and `reduce_children_of` (bug fixes) ---

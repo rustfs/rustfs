@@ -1,0 +1,9 @@
+---
+source: crates/kms/src/api_types.rs
+expression: "serde_json::to_value(DescribeKeyResponse\n{\n    success: false, message: \"key not found\".to_string(), key_metadata: None,\n}).expect(\"describe key response should serialize\")"
+---
+{
+  "key_metadata": null,
+  "message": "key not found",
+  "success": false
+}

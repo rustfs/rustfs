@@ -6,6 +6,7 @@ TEST_THREADS ?= 1
 script-tests: ## Run shell script tests
 	@echo "Running script tests..."
 	./scripts/test_build_rustfs_options.sh
+	./scripts/test_entrypoint_credentials.sh
 
 .PHONY: test
 test: core-deps test-deps script-tests ## Run all tests

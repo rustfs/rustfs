@@ -40,9 +40,9 @@ thiserror = { workspace = true }
 
 # Cryptography
 aes-gcm = { workspace = true }
+argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand = { workspace = true }
-sha2 = { workspace = true }
 base64 = { workspace = true }
 zeroize = { workspace = true, features = ["derive"] }
 
@@ -64,12 +64,9 @@ reqwest = { workspace = true }
 vaultrs = { workspace = true }
 
 [dev-dependencies]
+insta = { workspace = true }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
 
 [features]
 default = []
-
-# io-uring is Linux-only. Scope the feature to Linux targets.
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio = { workspace = true, features = ["io-uring"] }

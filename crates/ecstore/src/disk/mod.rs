@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: disk abstractions still carry staged health and direct-I/O migration paths.
+#![allow(dead_code)]
+
 pub mod disk_store;
 pub mod endpoint;
 pub mod error;
@@ -30,14 +33,17 @@ pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
+/// Per-disk marker present while an erasure-set heal is rebuilding this disk.
+/// `LocalDisk::disk_info` reports `healing = true` while the file exists.
+pub const HEALING_MARKER_PATH: &str = "healing.bin";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
+use crate::cluster::rpc::RemoteDisk;
+use crate::cluster::rpc::build_internode_data_transport_from_env;
 use crate::disk::disk_store::LocalDiskWrapper;
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
-use crate::rpc::RemoteDisk;
-use crate::rpc::build_internode_data_transport_from_env;
 use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
@@ -55,6 +61,21 @@ pub type DiskStore = Arc<Disk>;
 
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct MmapCopyStageMetrics {
+    pub(crate) path: &'static str,
+    pub(crate) access_check_stage: &'static str,
+    pub(crate) path_resolve_stage: &'static str,
+    pub(crate) metadata_lookup_stage: &'static str,
+    pub(crate) metadata_validate_stage: &'static str,
+    pub(crate) blocking_wait_stage: &'static str,
+    pub(crate) blocking_task_stage: &'static str,
+    pub(crate) file_open_stage: &'static str,
+    pub(crate) mmap_map_stage: &'static str,
+    pub(crate) mmap_copy_stage: &'static str,
+    pub(crate) direct_read_copy_stage: &'static str,
+}
 
 #[derive(Debug)]
 pub enum Disk {
@@ -166,10 +187,10 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         match self {
-            Disk::Local(local_disk) => local_disk.delete_volume(volume).await,
-            Disk::Remote(remote_disk) => remote_disk.delete_volume(volume).await,
+            Disk::Local(local_disk) => local_disk.delete_volume(volume, force_delete).await,
+            Disk::Remote(remote_disk) => remote_disk.delete_volume(volume, force_delete).await,
         }
     }
 
@@ -291,10 +312,28 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         match self {
-            Disk::Local(local_disk) => local_disk.read_file_zero_copy(volume, path, offset, length).await,
-            Disk::Remote(remote_disk) => remote_disk.read_file_zero_copy(volume, path, offset, length).await,
+            Disk::Local(local_disk) => local_disk.read_file_mmap_copy(volume, path, offset, length).await,
+            Disk::Remote(remote_disk) => remote_disk.read_file_mmap_copy(volume, path, offset, length).await,
+        }
+    }
+
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .read_file_mmap_copy_with_metrics(volume, path, offset, length, metrics)
+                    .await
+            }
+            Disk::Remote(remote_disk) => remote_disk.read_file_mmap_copy(volume, path, offset, length).await,
         }
     }
 
@@ -515,7 +554,12 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
-    async fn delete_volume(&self, volume: &str) -> Result<()>;
+    /// Delete a volume (bucket directory). When `force_delete` is false a
+    /// non-empty volume is refused with `VolumeNotEmpty` (non-recursive); when
+    /// true it is removed recursively. Callers on the heal/dangling path must
+    /// pass false so a misclassified bucket that still holds data cannot be
+    /// wiped (backlog#799 B1).
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()>;
 
     // Concurrent read/write pipeline w <- MetaCacheEntry
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()>;
@@ -541,6 +585,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
+    async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
+        batch_read_version_one_by_one(self, req).await
+    }
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn rename_data(
@@ -558,11 +605,28 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
 
-    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
-    /// Returns Bytes that can be shared without copying.
-    /// On Unix, this uses mmap for true zero-copy access.
-    /// On other platforms, falls back to efficient read operations.
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+    /// File read using mmap-then-copy on Unix or an efficient read on non-Unix.
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        _metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        self.read_file_mmap_copy(volume, path, offset, length).await
+    }
+
+    /// Historical name for `read_file_mmap_copy`.
+    #[deprecated(
+        since = "1.0.0-beta.8",
+        note = "use read_file_mmap_copy; this path copies mmap data into owned Bytes"
+    )]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        self.read_file_mmap_copy(volume, path, offset, length).await
+    }
 
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
@@ -582,6 +646,41 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     fn start_scan(&self) -> ScanGuard;
+}
+
+pub async fn batch_read_version_one_by_one<D>(disk: &D, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>>
+where
+    D: DiskAPI + ?Sized,
+{
+    validate_batch_read_version_item_count(req.items.len())?;
+
+    let mut responses = Vec::with_capacity(req.items.len());
+    for (index, item) in req.items.iter().enumerate() {
+        let response = match disk
+            .read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts)
+            .await
+        {
+            Ok(file_info) => BatchReadVersionResp {
+                index,
+                path: item.path.clone(),
+                version_id: item.version_id.clone(),
+                success: true,
+                file_info,
+                error: String::new(),
+            },
+            Err(err) => BatchReadVersionResp {
+                index,
+                path: item.path.clone(),
+                version_id: item.version_id.clone(),
+                success: false,
+                file_info: FileInfo::default(),
+                error: err.to_string(),
+            },
+        };
+        responses.push(response);
+    }
+
+    Ok(responses)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -690,6 +789,10 @@ pub struct WalkDirOptions {
     // Do a full recursive scan.
     pub recursive: bool,
 
+    // Include entries hidden by delete markers.
+    #[serde(default)]
+    pub incl_deleted: bool,
+
     // ReportNotFound will return errFileNotFound if all disks reports the BaseDir cannot be found.
     pub report_notfound: bool,
 
@@ -710,6 +813,24 @@ pub struct WalkDirOptions {
     // Skip the wrapper-level total timeout for long streaming walks.
     #[serde(default)]
     pub skip_total_timeout: bool,
+
+    // Override the wrapper-level total timeout for long background walks.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+
+    // Override the remote stream stall timeout for long background walks.
+    #[serde(default)]
+    pub stall_timeout_ms: Option<u64>,
+}
+
+impl WalkDirOptions {
+    pub fn timeout_duration(&self) -> Option<std::time::Duration> {
+        self.timeout_ms.map(std::time::Duration::from_millis)
+    }
+
+    pub fn stall_timeout_duration(&self) -> Option<std::time::Duration> {
+        self.stall_timeout_ms.map(std::time::Duration::from_millis)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -718,10 +839,43 @@ pub struct DiskOption {
     pub health_check: bool,
 }
 
+/// Per-disk observation of the destination key's *current* (latest) version
+/// in the dst `xl.meta` that `rename_data` reads before it commits the
+/// incoming version (rustfs/backlog#1009). Mirrors the pre-PUT
+/// `get_object_info` outcome — which the app layer previously obtained with an
+/// extra full-disk fanout — bit for bit: `Absent` iff that lookup would report
+/// object-not-found (missing xl.meta, or only hidden free versions), and
+/// `Present(size)` iff it would return `Ok` with `ObjectInfo.size == size`.
+/// Note a delete-marker latest is `Present(0)`, not `Absent`: the lookup
+/// returns markers as `Ok(size 0)` and delete-marker accounting never
+/// decrements objects_count, so `Present(0)` is what keeps usage numbers
+/// identical.
+///
+/// The parity target is the set-level (`SetDisks`) lookup. Two app-visible
+/// lookup variants deviated from it and from each other — the multi-pool
+/// `ECStore` path converts a delete-marker latest to not-found, and
+/// directory-key lookups pin the nil version — and both deviations
+/// over-incremented objects_count relative to delete-marker accounting, so
+/// the backfill standardizes on the self-consistent set-level answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OldCurrentSize {
+    /// The pre-PUT lookup would have reported object-not-found for this key.
+    Absent,
+    /// The pre-PUT lookup would have returned `Ok` with this `ObjectInfo.size`
+    /// (0 for a delete-marker latest).
+    Present(i64),
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RenameDataResp {
     pub old_data_dir: Option<Uuid>,
     pub sign: Option<Vec<u8>>,
+    /// `None` means unknown — the disk could not determine the previous
+    /// current version (pre-#1009 peer on the wire, or an existing dst
+    /// `xl.meta` that failed to parse). Consumers must treat unknown as
+    /// "cannot vote", never as `Absent`.
+    #[serde(default)]
+    pub old_current_size: Option<OldCurrentSize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -752,6 +906,41 @@ pub struct ReadMultipleResp {
     pub error: String,
     pub data: Vec<u8>,
     pub mod_time: Option<OffsetDateTime>,
+}
+
+pub const BATCH_READ_VERSION_MAX_ITEMS: usize = 128;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchReadVersionItem {
+    pub org_volume: String,
+    pub volume: String,
+    pub path: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchReadVersionReq {
+    pub items: Vec<BatchReadVersionItem>,
+    pub opts: ReadOptions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchReadVersionResp {
+    pub index: usize,
+    pub path: String,
+    pub version_id: String,
+    pub success: bool,
+    pub file_info: FileInfo,
+    pub error: String,
+}
+
+pub fn validate_batch_read_version_item_count(item_count: usize) -> Result<()> {
+    if item_count > BATCH_READ_VERSION_MAX_ITEMS {
+        return Err(DiskError::other(format!(
+            "batch read version item count {item_count} exceeds limit {BATCH_READ_VERSION_MAX_ITEMS}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -901,23 +1090,29 @@ mod tests {
             bucket: "test-bucket".to_string(),
             base_dir: "/path/to/dir".to_string(),
             recursive: true,
+            incl_deleted: false,
             report_notfound: false,
             filter_prefix: Some("prefix_".to_string()),
             forward_to: Some("object/path".to_string()),
             limit: 100,
             disk_id: "disk-123".to_string(),
             skip_total_timeout: false,
+            timeout_ms: Some(10_000),
+            stall_timeout_ms: Some(20_000),
         };
 
         assert_eq!(opts.bucket, "test-bucket");
         assert_eq!(opts.base_dir, "/path/to/dir");
         assert!(opts.recursive);
+        assert!(!opts.incl_deleted);
         assert!(!opts.report_notfound);
         assert_eq!(opts.filter_prefix, Some("prefix_".to_string()));
         assert_eq!(opts.forward_to, Some("object/path".to_string()));
         assert_eq!(opts.limit, 100);
         assert_eq!(opts.disk_id, "disk-123");
         assert!(!opts.skip_total_timeout);
+        assert_eq!(opts.timeout_duration(), Some(std::time::Duration::from_secs(10)));
+        assert_eq!(opts.stall_timeout_duration(), Some(std::time::Duration::from_secs(20)));
     }
 
     /// Test DeleteOptions structure
@@ -1067,10 +1262,56 @@ mod tests {
         let resp = RenameDataResp {
             old_data_dir: Some(uuid),
             sign: Some(signature.clone()),
+            old_current_size: Some(OldCurrentSize::Present(42)),
         };
 
         assert_eq!(resp.old_data_dir, Some(uuid));
         assert_eq!(resp.sign, Some(signature));
+        assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(42)));
+    }
+
+    /// rustfs/backlog#1009: `old_current_size` must survive a named-msgpack
+    /// round trip (the internode RPC encoding) for every variant.
+    #[test]
+    fn test_rename_data_resp_old_current_size_msgpack_roundtrip() {
+        for old_current_size in [None, Some(OldCurrentSize::Absent), Some(OldCurrentSize::Present(1337))] {
+            let resp = RenameDataResp {
+                old_data_dir: Some(Uuid::new_v4()),
+                sign: Some(vec![0x01, 0x02, 0x03]),
+                old_current_size,
+            };
+
+            let encoded = rmp_serde::encode::to_vec_named(&resp).expect("named msgpack should encode");
+            let decoded: RenameDataResp = rmp_serde::decode::from_slice(&encoded).expect("named msgpack should decode");
+
+            assert_eq!(decoded.old_data_dir, resp.old_data_dir);
+            assert_eq!(decoded.sign, resp.sign);
+            assert_eq!(decoded.old_current_size, resp.old_current_size);
+        }
+    }
+
+    /// rustfs/backlog#1009: a payload from a peer that predates
+    /// `old_current_size` must decode with the field defaulting to `None`
+    /// (unknown), keeping mixed-version clusters wire-compatible.
+    #[test]
+    fn test_rename_data_resp_decodes_payload_without_old_current_size() {
+        #[derive(Serialize)]
+        struct LegacyRenameDataResp {
+            old_data_dir: Option<Uuid>,
+            sign: Option<Vec<u8>>,
+        }
+
+        let legacy = LegacyRenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: Some(vec![0x0a, 0x0b]),
+        };
+
+        let encoded = rmp_serde::encode::to_vec_named(&legacy).expect("legacy named msgpack should encode");
+        let decoded: RenameDataResp = rmp_serde::decode::from_slice(&encoded).expect("legacy payload should decode");
+
+        assert_eq!(decoded.old_data_dir, legacy.old_data_dir);
+        assert_eq!(decoded.sign, legacy.sign);
+        assert_eq!(decoded.old_current_size, None);
     }
 
     /// Test constants
@@ -1170,7 +1411,7 @@ mod tests {
                 cleanup: false,
                 health_check: false,
             },
-            Arc::new(crate::rpc::TcpHttpInternodeDataTransport),
+            Arc::new(crate::cluster::rpc::TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();

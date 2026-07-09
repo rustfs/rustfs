@@ -18,12 +18,19 @@
 pub mod admin_usecase;
 pub mod bucket_usecase;
 pub mod context;
+pub(crate) mod metadata_route;
 pub mod multipart_usecase;
+pub(crate) mod object_data_cache;
 pub mod object_usecase;
+pub(crate) mod runtime_sources;
 mod select_object;
-pub(crate) mod storage_compat;
+pub(crate) mod storage_api;
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;
 #[cfg(test)]
+mod delete_objects_stat_gating_test;
+#[cfg(test)]
 mod lifecycle_transition_api_test;
+#[cfg(test)]
+mod put_prelookup_gating_test;

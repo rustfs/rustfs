@@ -243,6 +243,36 @@ pub struct FileInfo {
     pub uses_legacy_checksum: bool,
 }
 
+/// Validates that an erasure `distribution` is a permutation of `1..=n`.
+///
+/// A well-formed distribution has exactly `n` entries and each 1-based slot
+/// index in `1..=n` appears exactly once. Corrupt or adversarial `xl.meta`
+/// can carry values of `0` or greater than `n`, which are later used as
+/// `distribution[k] - 1` indices into fixed-size vectors and would trigger a
+/// `usize` underflow / out-of-bounds panic. Rejecting such distributions here
+/// lets the metadata surface as a clean quorum/corruption error instead.
+pub(crate) fn is_valid_distribution(distribution: &[usize], n: usize) -> bool {
+    if n == 0 || distribution.len() != n {
+        return false;
+    }
+
+    let mut seen = vec![false; n];
+    for &block_idx in distribution {
+        // Valid 1-based slots are `1..=n`; anything else (including `0`) is invalid.
+        if block_idx < 1 || block_idx > n {
+            return false;
+        }
+        let slot = block_idx - 1;
+        if seen[slot] {
+            // Duplicate slot: not a permutation.
+            return false;
+        }
+        seen[slot] = true;
+    }
+
+    true
+}
+
 impl FileInfo {
     pub fn new(object: &str, data_blocks: usize, parity_blocks: usize) -> Self {
         let indices = {
@@ -286,7 +316,7 @@ impl FileInfo {
             && (data_blocks > 0)
             && (self.erasure.index > 0
                 && self.erasure.index <= data_blocks + parity_blocks
-                && self.erasure.distribution.len() == (data_blocks + parity_blocks))
+                && is_valid_distribution(&self.erasure.distribution, data_blocks + parity_blocks))
     }
 
     pub fn get_etag(&self) -> Option<String> {
@@ -503,9 +533,7 @@ impl FileInfo {
 
     /// Check if replication related fields are equal
     pub fn replication_info_equals(&self, other: &FileInfo) -> bool {
-        self.mark_deleted == other.mark_deleted
-        // TODO: Add replication_state comparison when implemented
-        // && self.replication_state == other.replication_state
+        self.mark_deleted == other.mark_deleted && self.replication_state_internal == other.replication_state_internal
     }
 
     pub fn version_purge_status(&self) -> VersionPurgeStatusType {
@@ -686,6 +714,108 @@ mod tests {
     use super::*;
     use proptest::collection::{hash_map, vec};
     use proptest::prelude::*;
+
+    // backlog#959 / ECA-18: the interleaved per-block bitrot subsystem in
+    // rustfs-ecstore (BitrotWriter / bitrot_verify / bitrot_shard_file_size) is
+    // only self-consistent for the streaming Highway variants. That safety rests
+    // on production always resolving a streaming checksum algorithm, so pin the
+    // default here: a part with no explicit ChecksumInfo must resolve to
+    // HighwayHash256S. If this default ever changes, the ecstore bitrot layout
+    // assumptions must be revisited in lockstep.
+    #[test]
+    fn get_checksum_info_defaults_to_highwayhash256s() {
+        let ei = ErasureInfo::default();
+        assert!(ei.checksums.is_empty(), "default ErasureInfo carries no checksums");
+        let info = ei.get_checksum_info(1);
+        assert_eq!(
+            info.algorithm,
+            HashAlgorithm::HighwayHash256S,
+            "missing ChecksumInfo must default to the streaming HighwayHash256S algorithm"
+        );
+
+        // A present entry is returned as-is; the default only applies on miss.
+        let ei = ErasureInfo {
+            checksums: vec![ChecksumInfo {
+                part_number: 2,
+                algorithm: HashAlgorithm::SHA256,
+                hash: Bytes::new(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(ei.get_checksum_info(2).algorithm, HashAlgorithm::SHA256);
+        // A part_number with no entry still falls back to the streaming default.
+        assert_eq!(ei.get_checksum_info(99).algorithm, HashAlgorithm::HighwayHash256S);
+    }
+
+    // backlog#949: distribution range/permutation validation.
+    #[test]
+    fn is_valid_distribution_accepts_permutation() {
+        assert!(is_valid_distribution(&[1, 2, 3, 4], 4));
+        assert!(is_valid_distribution(&[4, 2, 1, 3], 4));
+        assert!(is_valid_distribution(&[1], 1));
+    }
+
+    #[test]
+    fn is_valid_distribution_rejects_zero_value() {
+        // A `0` would underflow `block_idx - 1` in the shuffle helpers.
+        assert!(!is_valid_distribution(&[0, 2, 3, 4], 4));
+    }
+
+    #[test]
+    fn is_valid_distribution_rejects_out_of_range_value() {
+        // A value greater than N would index out of bounds in the shuffle helpers.
+        assert!(!is_valid_distribution(&[1, 2, 3, 5], 4));
+        assert!(!is_valid_distribution(&[usize::MAX, 2, 3, 4], 4));
+    }
+
+    #[test]
+    fn is_valid_distribution_rejects_duplicates() {
+        // In-range but not a permutation.
+        assert!(!is_valid_distribution(&[1, 1, 3, 4], 4));
+    }
+
+    #[test]
+    fn is_valid_distribution_rejects_wrong_length_and_empty() {
+        assert!(!is_valid_distribution(&[1, 2, 3], 4));
+        assert!(!is_valid_distribution(&[1, 2, 3, 4, 4], 4));
+        assert!(!is_valid_distribution(&[], 0));
+        assert!(!is_valid_distribution(&[], 4));
+    }
+
+    fn distribution_test_fileinfo() -> FileInfo {
+        // data=2, parity=2 => N=4, distribution is a valid permutation of 1..=4.
+        let mut fi = FileInfo::new("bucket/object", 2, 2);
+        fi.erasure.index = 1;
+        fi
+    }
+
+    #[test]
+    fn is_valid_accepts_well_formed_distribution() {
+        assert!(distribution_test_fileinfo().is_valid());
+    }
+
+    #[test]
+    fn is_valid_rejects_corrupt_distribution_values() {
+        // Zero value.
+        let mut fi = distribution_test_fileinfo();
+        fi.erasure.distribution = vec![0, 2, 3, 4];
+        assert!(!fi.is_valid());
+
+        // Out-of-range value.
+        let mut fi = distribution_test_fileinfo();
+        fi.erasure.distribution = vec![1, 2, 3, 9];
+        assert!(!fi.is_valid());
+
+        // Duplicate value (not a permutation).
+        let mut fi = distribution_test_fileinfo();
+        fi.erasure.distribution = vec![1, 1, 3, 4];
+        assert!(!fi.is_valid());
+
+        // Wrong length.
+        let mut fi = distribution_test_fileinfo();
+        fi.erasure.distribution = vec![1, 2, 3];
+        assert!(!fi.is_valid());
+    }
 
     fn small_string_strategy() -> impl Strategy<Value = String> {
         proptest::string::string_regex("[A-Za-z0-9._/-]{0,16}").expect("small string regex should compile")
@@ -888,5 +1018,38 @@ mod tests {
             let result = std::panic::catch_unwind(|| FileInfo::unmarshal(&input));
             prop_assert!(result.is_ok(), "FileInfo::unmarshal panicked for arbitrary input");
         }
+    }
+
+    #[test]
+    fn replication_info_equals_compares_mark_deleted_and_replication_state() {
+        let base = FileInfo::default();
+
+        // Identical (both default) infos are equal.
+        assert!(base.replication_info_equals(&FileInfo::default()));
+
+        // Differing mark_deleted breaks equality.
+        let marked = FileInfo {
+            mark_deleted: true,
+            ..Default::default()
+        };
+        assert!(!base.replication_info_equals(&marked));
+
+        // Differing replication_state_internal breaks equality (regression guard:
+        // this field used to be ignored by replication_info_equals).
+        let with_state = FileInfo {
+            replication_state_internal: Some(ReplicationState {
+                replicate_decision_str: "arn:aws:s3:::dest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!base.replication_info_equals(&with_state));
+
+        // Equal replication states remain equal.
+        let with_state_clone = FileInfo {
+            replication_state_internal: with_state.replication_state_internal.clone(),
+            ..Default::default()
+        };
+        assert!(with_state.replication_info_equals(&with_state_clone));
     }
 }

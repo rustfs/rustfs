@@ -14,9 +14,10 @@
 
 use crate::{
     config::{CommandResult, Config, Opt},
+    startup_lifecycle::{StartupRuntimeLifecycle, run_startup_runtime_lifecycle},
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
-    startup_services::{StartupRuntimeLifecycle, init_startup_runtime_services, run_startup_runtime_lifecycle},
+    startup_services::init_startup_runtime_services,
     startup_storage::{StartupStorageRuntime, init_startup_storage_foundation, init_startup_storage_runtime},
 };
 use std::io::{Error, Result};
@@ -36,6 +37,7 @@ pub fn run_process() {
             // Tracing may not be initialized when startup fails this early.
             emit_fatal_stderr("Server runtime failed", e);
         }
+        let _ = crate::startup_runtime_sources::shutdown_observability_guard();
         std::process::exit(1);
     }
 }
@@ -58,6 +60,7 @@ async fn async_main() -> Result<()> {
         Ok(result) => result,
         Err(e) => {
             emit_fatal_stderr("Command parse failed", e);
+            let _ = crate::startup_runtime_sources::shutdown_observability_guard();
             std::process::exit(1);
         }
     };

@@ -19,8 +19,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::{
     collections::HashMap,
+    fs::File,
+    io::Write,
     marker::PhantomData,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -33,6 +35,31 @@ use uuid::Uuid;
 const LOG_COMPONENT_TARGETS: &str = "targets";
 const LOG_SUBSYSTEM_STORE: &str = "store";
 const EVENT_TARGET_STORE_STATE: &str = "target_store_state";
+
+/// Suffix used for the temporary file of an in-progress atomic write. A crash
+/// between `File::create` and `rename` leaves one of these behind; `open()`
+/// removes them so they are never mistaken for committed queue entries.
+const TMP_SUFFIX: &str = ".tmp";
+
+/// Upper bound applied to the initial `HashMap`/`Vec` capacities derived from
+/// untrusted inputs (`entry_limit`, batch `item_count`). Growth is still lazy,
+/// so a huge configured limit or a malicious/corrupt filename can no longer
+/// trigger a giant up-front allocation or a capacity-overflow panic.
+const MAX_PREALLOC_CAPACITY: usize = 4096;
+
+/// Returns true if `file_name` looks like a committed queue entry for `file_ext`.
+///
+/// A committed entry is `<...><file_ext>` optionally followed by [`COMPRESS_EXT`]
+/// (e.g. `<uuid>.event` or `3:<uuid>.event.snappy`). Any other file in the queue
+/// directory (foreign files, leftover temp files) is ignored so it can never be
+/// indexed and replayed as if it were a real event.
+fn is_queue_file_name(file_name: &str, file_ext: &str) -> bool {
+    if file_ext.is_empty() {
+        return false;
+    }
+    let base = file_name.strip_suffix(COMPRESS_EXT).unwrap_or(file_name);
+    base.ends_with(file_ext)
+}
 
 fn resolve_queue_store_compression_from_env_value(value: Option<&str>) -> bool {
     value
@@ -267,7 +294,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             entry_limit,
             file_ext: file_ext.to_string(),
             compress,
-            entries: Arc::new(RwLock::new(HashMap::with_capacity(entry_limit as usize))),
+            entries: Arc::new(RwLock::new(HashMap::with_capacity((entry_limit as usize).min(MAX_PREALLOC_CAPACITY)))),
             pending_entries: Arc::new(AtomicU64::new(0)),
             fs_guard: Arc::new(RwLock::new(())),
             _phantom: PhantomData,
@@ -281,10 +308,48 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
 
     fn build_key(&self, item_count: usize) -> Key {
         Key {
-            name: Uuid::new_v4().to_string(),
+            // UUIDv7 is time-ordered: sorting entries by name reproduces FIFO
+            // enqueue order deterministically and, crucially, identically after
+            // a restart — the ordering is intrinsic to the persisted filename
+            // rather than derived from coarse, clock-dependent file mtimes.
+            name: Uuid::now_v7().to_string(),
             extension: self.file_ext.clone(),
             item_count,
             compress: self.compress,
+        }
+    }
+
+    /// Best-effort `fsync` of the queue directory so a freshly `rename`d entry
+    /// (and its containing directory entry) survives a power loss. Failure is
+    /// logged at debug and not propagated: the data file itself is already
+    /// durably `fsync`ed, and not every filesystem/platform supports directory
+    /// fsync.
+    fn fsync_dir(dir: &Path) {
+        match File::open(dir) {
+            Ok(dir_file) => {
+                if let Err(err) = dir_file.sync_all() {
+                    debug!(
+                        event = EVENT_TARGET_STORE_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_STORE,
+                        action = "fsync_dir",
+                        dir = %dir.display(),
+                        error = %err,
+                        "target store state"
+                    );
+                }
+            }
+            Err(err) => {
+                debug!(
+                    event = EVENT_TARGET_STORE_STATE,
+                    component = LOG_COMPONENT_TARGETS,
+                    subsystem = LOG_SUBSYSTEM_STORE,
+                    action = "fsync_dir_open",
+                    dir = %dir.display(),
+                    error = %err,
+                    "target store state"
+                );
+            }
         }
     }
 
@@ -351,7 +416,15 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
         }
     }
 
-    /// Writes data to a file for the given key.
+    /// Durably and atomically writes data to the file for the given key.
+    ///
+    /// The write is crash-safe: bytes are written to a per-key temporary file,
+    /// `fsync`ed (`sync_all`), and only then `rename`d onto the final path. A
+    /// same-directory `rename` is atomic, so a reader (including `open()` after a
+    /// restart) observes either the complete previous file or the complete new
+    /// one — never a half-written payload. On a crash mid-write the temp file is
+    /// left behind and cleaned up by `open()`, so an acknowledged event is never
+    /// lost and no ghost/truncated entry is ever indexed.
     fn write_file(&self, key: &Key, data: &[u8]) -> Result<i64, StoreError> {
         let path = self.file_path(key);
         // Create directory if it doesn't exist
@@ -359,15 +432,46 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
         }
 
-        if key.compress {
+        let payload: std::borrow::Cow<'_, [u8]> = if key.compress {
             let mut encoder = Encoder::new();
             let compressed = encoder
                 .compress_vec(data)
                 .map_err(|e| StoreError::Compression(e.to_string()))?;
-            std::fs::write(&path, &compressed).map_err(StoreError::Io)?;
+            std::borrow::Cow::Owned(compressed)
         } else {
-            std::fs::write(&path, data).map_err(StoreError::Io)?;
+            std::borrow::Cow::Borrowed(data)
+        };
+
+        let tmp_path = {
+            let mut file_name = key.to_key_string();
+            file_name.push_str(TMP_SUFFIX);
+            self.directory.join(file_name)
+        };
+
+        // Write + fsync the full payload into the temp file, then atomically
+        // rename it into place. Any error path removes the temp file so a failed
+        // write cannot leave residue that would otherwise be cleaned only on the
+        // next open().
+        let write_result = (|| -> Result<(), StoreError> {
+            let mut file = File::create(&tmp_path).map_err(StoreError::Io)?;
+            file.write_all(&payload).map_err(StoreError::Io)?;
+            file.sync_all().map_err(StoreError::Io)?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
         }
+
+        if let Err(err) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(StoreError::Io(err));
+        }
+
+        // Best-effort: persist the new directory entry created by rename.
+        Self::fsync_dir(&self.directory);
+
         let modified = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
         debug!(
             event = EVENT_TARGET_STORE_STATE,
@@ -434,13 +538,36 @@ where
         for entry in dir_entries {
             let entry = entry.map_err(StoreError::Io)?;
             let metadata = entry.metadata().map_err(StoreError::Io)?;
-            if metadata.is_file() {
-                let modified = metadata.modified().map_err(StoreError::Io)?;
-                let unix_nano = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
-
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                entries_map.insert(file_name, unix_nano);
+            if !metadata.is_file() {
+                continue;
             }
+
+            let file_name = entry.file_name().to_string_lossy().to_string();
+
+            // Remove leftover temp files from an interrupted atomic write; they
+            // are never valid committed entries.
+            if file_name.ends_with(TMP_SUFFIX) {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+
+            // Ignore foreign files that do not match our queue file extension so
+            // externally-dropped files cannot pollute the queue.
+            if !is_queue_file_name(&file_name, &self.file_ext) {
+                continue;
+            }
+
+            // Drop zero-byte files (truncated/empty writes from older code paths
+            // or crashes) instead of indexing a ghost entry that read_file would
+            // report as NotFound forever.
+            if metadata.len() == 0 {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
+
+            let modified = metadata.modified().map_err(StoreError::Io)?;
+            let unix_nano = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
+            entries_map.insert(file_name, unix_nano);
         }
 
         debug!(
@@ -525,7 +652,10 @@ where
         if data.is_empty() {
             return Err(StoreError::Deserialization("Cannot deserialize empty data".to_string()));
         }
-        let mut items = Vec::with_capacity(key.item_count);
+        // `item_count` is parsed from the (untrusted) filename; clamp the
+        // up-front allocation so a corrupt/malicious name cannot drive a huge
+        // reservation. The loop below still reads exactly `item_count` items.
+        let mut items = Vec::with_capacity(key.item_count.min(MAX_PREALLOC_CAPACITY));
 
         // let mut deserializer = serde_json::Deserializer::from_slice(&data);
         // while let Ok(item) = serde::Deserialize::deserialize(&mut deserializer) {
@@ -545,28 +675,27 @@ where
                     return Err(StoreError::Deserialization(format!("Failed to deserialize item in batch: {e}")));
                 }
                 None => {
-                    // Reached end of stream sooner than item_count
-                    if items.len() < key.item_count && !items.is_empty() {
-                        // Partial read
-                        warn!(
-                            event = EVENT_TARGET_STORE_STATE,
-                            component = LOG_COMPONENT_TARGETS,
-                            subsystem = LOG_SUBSYSTEM_STORE,
-                            action = "read_batch",
-                            key = %key,
-                            expected_items = key.item_count,
-                            actual_items = items.len(),
-                            reason = "partial_batch_read",
-                            "target store state"
-                        );
-                        // Depending on strictness, this could be an error.
-                    } else if items.is_empty() {
-                        // No items at all, but file existed
-                        return Err(StoreError::Deserialization(format!(
-                            "No items deserialized for key {key} though file existed."
-                        )));
-                    }
-                    break;
+                    // Reached end of stream before deserializing `item_count` items: the
+                    // batch file was truncated or corrupted. This MUST be surfaced as an
+                    // error rather than silently returning the partial set. If we returned
+                    // `Ok(partial)`, the caller would treat the batch as fully delivered,
+                    // delete the store entry, and permanently lose the missing events.
+                    warn!(
+                        event = EVENT_TARGET_STORE_STATE,
+                        component = LOG_COMPONENT_TARGETS,
+                        subsystem = LOG_SUBSYSTEM_STORE,
+                        action = "read_batch",
+                        key = %key,
+                        expected_items = key.item_count,
+                        actual_items = items.len(),
+                        reason = "truncated_batch_read",
+                        "target store state"
+                    );
+                    return Err(StoreError::Deserialization(format!(
+                        "Truncated batch for key {key}: expected {} items but only deserialized {}",
+                        key.item_count,
+                        items.len()
+                    )));
                 }
             }
         }
@@ -670,11 +799,18 @@ where
             }
         };
 
-        let mut entries_vec: Vec<_> = entries.iter().collect();
-        // Sort by modtime (value in HashMap) to process oldest first
-        entries_vec.sort_by(|a, b| a.1.cmp(b.1)); // Oldest first
+        // Order by the entry name (UUIDv7), which is time-ordered by
+        // construction. This yields a stable FIFO order that is identical in a
+        // single run and after a restart, because it derives purely from the
+        // persisted filename rather than from coarse, clock-dependent file
+        // mtimes. The full filename is used as a deterministic tie-breaker.
+        let mut entries_vec: Vec<(String, String)> = entries
+            .keys()
+            .map(|file_name| (parse_key(file_name).name, file_name.clone()))
+            .collect();
+        entries_vec.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-        entries_vec.into_iter().map(|(k, _)| parse_key(k)).collect()
+        entries_vec.into_iter().map(|(_, file_name)| parse_key(&file_name)).collect()
     }
 
     fn len(&self) -> usize {
@@ -801,6 +937,41 @@ mod tests {
     }
 
     #[test]
+    fn get_multiple_errors_on_truncated_batch_instead_of_partial_success() {
+        let dir = temp_store_dir("truncated-batch");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", false);
+        store.open().unwrap();
+
+        let items = vec!["aa".to_string(), "bb".to_string(), "cc".to_string()];
+        let key = store.put_multiple(items).unwrap();
+        assert_eq!(key.item_count, 3);
+
+        // Truncate the batch file at a clean boundary after the first two serialized
+        // items (`"aa""bb"`), so the read of the third item hits end-of-stream — the
+        // exact "partial read" condition that previously returned Ok silently.
+        let prefix_len =
+            serde_json::to_vec(&"aa".to_string()).unwrap().len() + serde_json::to_vec(&"bb".to_string()).unwrap().len();
+        let path = store.file_path(&key);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(prefix_len as u64).unwrap();
+        drop(file);
+
+        // A truncated batch must be reported as an error, not silently returned as a
+        // partial-but-successful result that would drop the missing "cc" event.
+        let err = store.get_multiple(&key).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Deserialization(_)),
+            "expected Deserialization error, got {err:?}"
+        );
+
+        // Because get_multiple failed, the batch entry is still on disk for the caller
+        // to retry — the missing events are not silently discarded.
+        assert!(store.file_path(&key).exists());
+
+        let _ = store.delete();
+    }
+
+    #[test]
     fn concurrent_put_raw_respects_entry_limit() {
         let dir = temp_store_dir("concurrent-limit");
         let store = Arc::new(QueueStore::<String>::new_with_compression(&dir, 1, ".test", true));
@@ -832,6 +1003,128 @@ mod tests {
         assert_eq!(successes, 1);
         assert_eq!(limit_errors, 3);
         assert_eq!(store.len(), 1);
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn open_cleans_leftover_tmp_and_zero_byte_files() {
+        let dir = temp_store_dir("open-cleanup");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", false);
+        store.open().unwrap();
+
+        // A committed entry that must survive open().
+        let key = store.put(Arc::new("payload".to_string())).unwrap();
+        let good_name = key.to_key_string();
+
+        // Simulate an interrupted atomic write: a temp file that was fsynced but
+        // never renamed into place. It must be removed and never indexed.
+        let tmp_path = dir.join(format!("{good_name}{TMP_SUFFIX}"));
+        std::fs::write(&tmp_path, b"half-written").unwrap();
+
+        // Simulate a zero-byte ghost file with a valid queue extension.
+        let zero_name = format!("{}.test", Uuid::now_v7());
+        let zero_path = dir.join(&zero_name);
+        std::fs::write(&zero_path, b"").unwrap();
+
+        store.open().unwrap();
+
+        // The queue is clean: only the committed entry remains indexed, and both
+        // the temp and zero-byte residues are gone from disk.
+        assert_eq!(store.len(), 1);
+        let listed: Vec<String> = store.list().iter().map(|k| k.to_key_string()).collect();
+        assert_eq!(listed, vec![good_name]);
+        assert!(!tmp_path.exists(), "leftover temp file should be removed");
+        assert!(!zero_path.exists(), "zero-byte file should be removed");
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn open_ignores_foreign_extension_files() {
+        let dir = temp_store_dir("open-foreign");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", false);
+        store.open().unwrap();
+        let key = store.put(Arc::new("payload".to_string())).unwrap();
+
+        // A non-empty file with an unrelated extension must not be indexed and
+        // must be left untouched (we only clean up our own residue).
+        let foreign_path = dir.join("intruder.txt");
+        std::fs::write(&foreign_path, b"not ours").unwrap();
+
+        store.open().unwrap();
+
+        assert_eq!(store.len(), 1);
+        let listed: Vec<String> = store.list().iter().map(|k| k.to_key_string()).collect();
+        assert_eq!(listed, vec![key.to_key_string()]);
+        assert!(foreign_path.exists(), "foreign file should be left in place, just not indexed");
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn list_order_is_stable_across_reopen() {
+        let dir = temp_store_dir("list-order");
+        let store = QueueStore::<String>::new_with_compression(&dir, 32, ".test", false);
+        store.open().unwrap();
+
+        for idx in 0..8 {
+            store.put(Arc::new(format!("event-{idx}"))).unwrap();
+        }
+
+        let order_before: Vec<String> = store.list().iter().map(|k| k.to_key_string()).collect();
+        assert_eq!(order_before.len(), 8);
+
+        // Re-open from disk (simulating a restart) and assert the FIFO order is
+        // reproduced exactly — it is derived from the persisted UUIDv7 names, not
+        // from coarse file mtimes.
+        let reopened = QueueStore::<String>::new_with_compression(&dir, 32, ".test", false);
+        reopened.open().unwrap();
+        let order_after: Vec<String> = reopened.list().iter().map(|k| k.to_key_string()).collect();
+
+        assert_eq!(order_before, order_after);
+
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn new_with_huge_limit_does_not_panic() {
+        // Previously `HashMap::with_capacity(entry_limit as usize)` would attempt
+        // a giant allocation / capacity overflow for an absurd configured limit.
+        let dir = temp_store_dir("huge-limit");
+        let store = QueueStore::<String>::new_with_compression(&dir, u64::MAX, ".test", false);
+        store.open().unwrap();
+        assert!(store.is_empty());
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn get_multiple_does_not_overallocate_on_huge_item_count() {
+        let dir = temp_store_dir("huge-item-count");
+        let store = QueueStore::<String>::new_with_compression(&dir, 8, ".test", false);
+        store.open().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Craft a batch file whose name claims a colossal item_count (far beyond
+        // MAX_PREALLOC_CAPACITY) but whose body holds only two items — the shape a
+        // corrupt/malicious filename would take. The read must fail cleanly with a
+        // Deserialization error and must not attempt a giant pre-allocation
+        // (Vec::with_capacity is clamped to MAX_PREALLOC_CAPACITY).
+        let claimed_count = 1_000_000usize;
+        let file_name = format!("{claimed_count}:{}.test", Uuid::now_v7());
+        let mut body = Vec::new();
+        body.extend_from_slice(&serde_json::to_vec(&"aa".to_string()).unwrap());
+        body.extend_from_slice(&serde_json::to_vec(&"bb".to_string()).unwrap());
+        std::fs::write(dir.join(&file_name), &body).unwrap();
+
+        let key = parse_key(&file_name);
+        assert_eq!(key.item_count, claimed_count);
+
+        let err = store.get_multiple(&key).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Deserialization(_)),
+            "expected Deserialization error, got {err:?}"
+        );
 
         let _ = store.delete();
     }

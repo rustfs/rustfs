@@ -39,10 +39,31 @@ S3_REGION="${S3_REGION:-us-east-1}"
 S3_HOST="${S3_HOST:-127.0.0.1}"
 S3_PORT="${S3_PORT:-9000}"
 
+# Keep the compatibility harness focused on foreground S3 API behavior.
+# The background scanner can race short-lived test buckets and add avoidable
+# metacache/listing pressure on small CI runners.
+export RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED:-false}"
+export RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS:-3600}"
+export RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE:-3600}"
+
 # Test parameters
 TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
 XDIST="${XDIST:-0}"
+# Test scope:
+#   "implemented" (default) - run only the implemented_tests.txt whitelist (PR gate)
+#   "all"                   - run the entire upstream suite (scheduled full sweep)
+TEST_SCOPE="${TEST_SCOPE:-implemented}"
+if [[ "${TEST_SCOPE}" != "implemented" && "${TEST_SCOPE}" != "all" ]]; then
+    echo "[ERROR] Invalid TEST_SCOPE: ${TEST_SCOPE} (must be \"implemented\" or \"all\")" >&2
+    exit 1
+fi
+
+# Upstream ceph/s3-tests suite, pinned for reproducible runs.
+# Bump S3TESTS_REV deliberately: upstream changes can rename tests or change
+# assertions, so a bump usually requires reclassifying the test list files.
+S3TESTS_REPO="${S3TESTS_REPO:-https://github.com/ceph/s3-tests.git}"
+S3TESTS_REV="${S3TESTS_REV:-5522d1c351f75bc00ae0f64f742f3f095f5939d9}"
 
 # Compatibility default for the s3-tests harness:
 # this script provisions multiple local export directories on the same physical disk.
@@ -73,6 +94,55 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $*"
+}
+
+summarize_junit_failures() {
+    local junit_path="$1"
+
+    if [ ! -f "${junit_path}" ]; then
+        log_warn "JUnit report not found: ${junit_path}"
+        return 0
+    fi
+
+    python3 - "${junit_path}" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+junit_path = sys.argv[1]
+try:
+    root = ET.parse(junit_path).getroot()
+except Exception as exc:
+    print(f"[WARN] Failed to parse JUnit report {junit_path}: {exc}")
+    raise SystemExit(0)
+
+failures = []
+for case in root.iter("testcase"):
+    failure = case.find("failure")
+    error = case.find("error")
+    node = failure if failure is not None else error
+    if node is None:
+        continue
+
+    classname = case.attrib.get("classname", "")
+    name = case.attrib.get("name", "")
+    duration = case.attrib.get("time", "0")
+    message = node.attrib.get("message") or (node.text or "").strip().splitlines()[0:1]
+    if isinstance(message, list):
+        message = message[0] if message else ""
+    failures.append((classname, name, duration, message))
+
+if not failures:
+    print("[INFO] No failed testcases found in JUnit report")
+    raise SystemExit(0)
+
+print("[ERROR] s3-tests failed testcase summary:")
+for classname, name, duration, message in failures[:20]:
+    nodeid = f"{classname}::{name}" if classname else name
+    print(f"[ERROR] - {nodeid} ({duration}s): {message}")
+
+if len(failures) > 20:
+    print(f"[ERROR] - ... {len(failures) - 20} additional failed testcases omitted")
+PY
 }
 
 # =============================================================================
@@ -146,7 +216,12 @@ fi
 #   2. Easy maintenance - edit txt files to add/remove tests
 #   3. Separation of concerns - test classification vs test execution
 # =============================================================================
-if [[ -z "${TESTEXPR:-}" ]]; then
+TESTEXPR="${TESTEXPR:-}"
+if [[ -n "${TESTEXPR}" ]]; then
+    log_info "Using custom TESTEXPR selection: ${TESTEXPR}"
+elif [[ "${TEST_SCOPE}" == "all" ]]; then
+    log_info "TEST_SCOPE=all: running the entire upstream test suite (no whitelist)"
+else
     if [[ -f "${IMPLEMENTED_TESTS_FILE}" ]]; then
         log_info "Loading test list from: ${IMPLEMENTED_TESTS_FILE}"
         load_testnodes_from_file "${IMPLEMENTED_TESTS_FILE}"
@@ -240,8 +315,12 @@ Environment Variables:
   S3_ALT_ACCESS_KEY      - Alt user access key (default: rustfsalt)
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   RUSTFS_SSE_S3_MASTER_KEY - Optional base64 32-byte key for local managed SSE fallback
-  MAXFAIL                - Stop after N failures (default: 1)
+  RUSTFS_SCANNER_ENABLED - Enable background scanner for harness service (default: false)
+  MAXFAIL                - Stop after N failures, 0 = never stop (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
+  TEST_SCOPE             - "implemented" (whitelist, default) or "all" (entire upstream suite)
+  S3TESTS_REPO           - s3-tests repository URL (default: https://github.com/ceph/s3-tests.git)
+  S3TESTS_REV            - Pinned s3-tests commit; bump deliberately and reclassify test lists
   MARKEXPR               - pytest marker expression (default: no marker filtering)
   TESTEXPR               - pytest -k expression (overrides implemented_tests.txt node list)
   S3TESTS_CONF_TEMPLATE  - Path to s3tests config template (default: .github/s3tests/s3tests.conf)
@@ -457,6 +536,9 @@ elif [ "${DEPLOY_MODE}" = "docker" ]; then
         -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
         -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
         -e RUSTFS_SSE_S3_MASTER_KEY="${RUSTFS_SSE_S3_MASTER_KEY}" \
+        -e RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED}" \
+        -e RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS}" \
+        -e RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE}" \
         -e RUSTFS_VOLUMES="/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3" \
         -v "/tmp/${CONTAINER_NAME}:/data" \
         rustfs-ci || {
@@ -722,6 +804,29 @@ envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
 log_info "Provisioning s3-tests alt user..."
 
 # Helper function to install Python packages with fallback for externally-managed environments
+ensure_python_pip() {
+    if python3 -m pip --version >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_info "Installing pip for Python package setup..."
+    if python3 -m ensurepip --upgrade >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y python3-pip || {
+            log_warn "Failed to install python3-pip via apt-get"
+        }
+    elif command -v brew >/dev/null 2>&1; then
+        brew install python || {
+            log_warn "Failed to install Python via brew"
+        }
+    fi
+
+    python3 -m pip --version >/dev/null 2>&1
+}
+
 install_python_package() {
     local package=$1
     local error_output
@@ -736,6 +841,11 @@ install_python_package() {
         fi
         log_warn "Failed to install ${package} with uv, falling back to python3 -m pip"
     fi
+
+    ensure_python_pip || {
+        log_error "python3 -m pip is unavailable"
+        return 1
+    }
 
     # Try --user first (works on most Linux systems)
     error_output=$(python3 -m pip install --user --upgrade pip "${package}" 2>&1)
@@ -819,13 +929,34 @@ awscurl \
 
 log_info "Alt user provisioned successfully"
 
-# Step 8: Prepare s3-tests
-log_info "Preparing s3-tests..."
-if [ ! -d "${PROJECT_ROOT}/s3-tests" ]; then
-    git clone --depth 1 https://github.com/ceph/s3-tests.git "${PROJECT_ROOT}/s3-tests" || {
-        log_error "Failed to clone s3-tests"
+# Step 8: Prepare s3-tests, pinned to S3TESTS_REV for reproducible runs
+log_info "Preparing s3-tests at ${S3TESTS_REV}..."
+if [ ! -d "${PROJECT_ROOT}/s3-tests/.git" ]; then
+    git init -q "${PROJECT_ROOT}/s3-tests"
+    git -C "${PROJECT_ROOT}/s3-tests" remote add origin "${S3TESTS_REPO}"
+fi
+if ! git -C "${PROJECT_ROOT}/s3-tests" cat-file -e "${S3TESTS_REV}^{commit}" 2>/dev/null; then
+    git -C "${PROJECT_ROOT}/s3-tests" fetch --depth 1 origin "${S3TESTS_REV}" || {
+        log_error "Failed to fetch s3-tests revision ${S3TESTS_REV} from ${S3TESTS_REPO}"
         exit 1
     }
+fi
+# -f discards local edits left by previous runs (e.g. pytest-xdist appended to requirements.txt)
+git -C "${PROJECT_ROOT}/s3-tests" checkout -qf --detach "${S3TESTS_REV}" || {
+    log_error "Failed to checkout s3-tests revision ${S3TESTS_REV}"
+    exit 1
+}
+
+S3TESTS_PATCH_DIR="${SCRIPT_DIR}/patches"
+if [ -d "${S3TESTS_PATCH_DIR}" ]; then
+    for patch_file in "${S3TESTS_PATCH_DIR}"/*.patch; do
+        [ -e "${patch_file}" ] || continue
+        log_info "Applying s3-tests patch: ${patch_file##*/}"
+        git -C "${PROJECT_ROOT}/s3-tests" apply "${patch_file}" || {
+            log_error "Failed to apply s3-tests patch: ${patch_file}"
+            exit 1
+        }
+    done
 fi
 
 cd "${PROJECT_ROOT}/s3-tests"
@@ -862,11 +993,15 @@ fi
 PYTEST_SELECTION_ARGS=()
 if [[ "${USE_FILE_TEST_NODES}" == "true" ]]; then
     PYTEST_SELECTION_ARGS=("${TEST_NODE_ARGS[@]}")
-else
+elif [[ -n "${TESTEXPR}" ]]; then
     PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}" -k "${TESTEXPR}")
+else
+    # TEST_SCOPE=all: the whole upstream suite
+    PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}")
 fi
 
 # Run tests from s3tests/functional
+set +e
 S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     tox -- \
     -vv -ra --showlocals --tb=long \
@@ -878,6 +1013,7 @@ S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     2>&1 | tee "${ARTIFACTS_DIR}/pytest.log"
 
 TEST_EXIT_CODE=${PIPESTATUS[0]}
+set -e
 
 # Step 10: Collect RustFS logs
 log_info "Collecting RustFS logs..."
@@ -892,6 +1028,20 @@ elif [ "${DEPLOY_MODE}" = "build" ] || [ "${DEPLOY_MODE}" = "binary" ]; then
 elif [ "${DEPLOY_MODE}" = "existing" ]; then
     log_info "Skipping log collection for existing service"
     echo "{\"host\": \"${S3_HOST}\", \"port\": ${S3_PORT}, \"mode\": \"existing\"}" > "${ARTIFACTS_DIR}/rustfs-${TEST_MODE}/inspect.json" || true
+fi
+
+# Step 11: Classification report (informational, never fails the run)
+REPORT_SCRIPT="${SCRIPT_DIR}/report_compat.py"
+if [ -f "${REPORT_SCRIPT}" ] && [ -f "${ARTIFACTS_DIR}/junit.xml" ]; then
+    python3 "${REPORT_SCRIPT}" \
+        --junit "${ARTIFACTS_DIR}/junit.xml" \
+        --lists-dir "${SCRIPT_DIR}" \
+        --output "${ARTIFACTS_DIR}/compat-report.md" \
+        || log_warn "Compatibility report generation failed"
+fi
+
+if [ ${TEST_EXIT_CODE} -ne 0 ]; then
+    summarize_junit_failures "${ARTIFACTS_DIR}/junit.xml"
 fi
 
 # Summary

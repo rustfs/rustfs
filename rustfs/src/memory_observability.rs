@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use rustfs_io_metrics::{
-    record_cgroup_memory_split, record_cpu_usage, record_memory_usage, record_process_memory_split,
-    snapshot_process_resource_and_system,
+    AllocatorMemoryObservation, ProcessSampler, record_allocator_memory_observation, record_cgroup_memory_split,
+    record_cpu_usage, record_memory_usage, record_process_memory_split,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
+#[cfg(not(target_os = "windows"))]
+use std::ffi::CStr;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use sysinfo::System;
 use tokio_util::sync::CancellationToken;
@@ -127,6 +130,12 @@ struct CgroupMemorySnapshot {
     inactive_file_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AllocatorMemorySnapshot {
+    backend: &'static str,
+    observation: AllocatorMemoryObservation,
+}
+
 fn memory_system() -> &'static Mutex<System> {
     MEMORY_SYSTEM.get_or_init(|| Mutex::new(System::new()))
 }
@@ -204,6 +213,94 @@ fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
 }
 
+fn numeric_json_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok())),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
+    match value {
+        Value::Object(fields) => fields
+            .get(field)
+            .and_then(numeric_json_value)
+            .or_else(|| fields.values().find_map(|value| numeric_json_field(value, field))),
+        Value::Array(values) => values.iter().find_map(|value| numeric_json_field(value, field)),
+        _ => None,
+    }
+}
+
+fn mimalloc_stat_field(value: &Value, metric: &str, field: &str) -> Option<u64> {
+    match value {
+        Value::Object(fields) => {
+            if let Some(metric_value) = fields.get(metric)
+                && let Some(value) = numeric_json_value(metric_value).or_else(|| numeric_json_field(metric_value, field))
+            {
+                return Some(value);
+            }
+
+            fields.values().find_map(|value| mimalloc_stat_field(value, metric, field))
+        }
+        Value::Array(values) => values.iter().find_map(|value| mimalloc_stat_field(value, metric, field)),
+        _ => None,
+    }
+}
+
+fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
+    mimalloc_stat_field(value, metric, "current")
+}
+
+fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
+    let value = serde_json::from_str::<Value>(stats_json).ok()?;
+    let observation = AllocatorMemoryObservation {
+        reserved_bytes: mimalloc_stat_current(&value, "reserved"),
+        committed_bytes: mimalloc_stat_current(&value, "committed"),
+        page_committed_bytes: mimalloc_stat_current(&value, "page_committed"),
+        malloc_requested_bytes: mimalloc_stat_current(&value, "malloc_requested"),
+        malloc_requested_peak_bytes: mimalloc_stat_field(&value, "malloc_requested", "peak"),
+        malloc_requested_total_bytes: mimalloc_stat_field(&value, "malloc_requested", "total"),
+        heap_count: mimalloc_stat_current(&value, "heaps").or_else(|| mimalloc_stat_current(&value, "heap_count")),
+    };
+
+    if observation == AllocatorMemoryObservation::default() {
+        None
+    } else {
+        Some(observation)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(unsafe_code)]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    // SAFETY: `mi_stats_get_json` returns a null-terminated JSON buffer owned by
+    // mimalloc when called with a null input buffer. The mimalloc API requires
+    // freeing that buffer with `mi_free`, which is done before returning.
+    let stats = unsafe {
+        let stats_ptr = libmimalloc_sys::mi_stats_get_json(0, std::ptr::null_mut());
+        if stats_ptr.is_null() {
+            return None;
+        }
+
+        let stats = CStr::from_ptr(stats_ptr).to_str().ok().map(str::to_owned);
+        libmimalloc_sys::mi_free(stats_ptr.cast());
+        stats?
+    };
+    let observation = parse_mimalloc_stats_json(&stats)?;
+    Some(AllocatorMemorySnapshot {
+        backend: crate::allocator_reclaim::allocator_backend(),
+        observation,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    None
+}
+
 fn configured_memory_observability_interval_secs() -> u64 {
     rustfs_utils::get_env_u64(ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS, DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS).max(1)
 }
@@ -271,16 +368,18 @@ pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> Memo
     )
 }
 
-async fn record_memory_snapshot() {
-    match tokio::task::spawn_blocking(|| {
-        let (resource, process) = snapshot_process_resource_and_system();
+async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
+    match tokio::task::spawn_blocking(move || {
+        let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (resource, process) = sampler.snapshot_resource_and_system();
         let total_memory = refresh_total_memory();
         let cgroup = read_cgroup_memory_snapshot();
-        (resource, process, total_memory, cgroup)
+        let allocator = read_allocator_memory_snapshot();
+        (resource, process, total_memory, cgroup, allocator)
     })
     .await
     {
-        Ok((resource, process, total_memory, cgroup)) => {
+        Ok((resource, process, total_memory, cgroup, allocator)) => {
             record_memory_usage(process.resident_memory_bytes, total_memory);
             record_cpu_usage(resource.cpu_percent);
             record_process_memory_split(process.resident_memory_bytes, process.virtual_memory_bytes);
@@ -295,6 +394,10 @@ async fn record_memory_snapshot() {
                     cgroup.inactive_file_bytes,
                 );
             }
+
+            if let Some(allocator) = allocator {
+                record_allocator_memory_observation(allocator.backend, allocator.observation);
+            }
         }
         Err(err) => {
             debug!(error = ?err, "memory observability sampler task failed");
@@ -305,6 +408,7 @@ async fn record_memory_snapshot() {
 pub fn init_memory_observability(ctx: CancellationToken) {
     let interval_secs = configured_memory_observability_interval_secs();
     let interval = Duration::from_secs(interval_secs.max(1));
+    let process_sampler = Arc::new(Mutex::new(ProcessSampler::new()));
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -317,7 +421,7 @@ pub fn init_memory_observability(ctx: CancellationToken) {
                     break;
                 }
                 _ = ticker.tick() => {
-                    record_memory_snapshot().await;
+                    record_memory_snapshot(Arc::clone(&process_sampler)).await;
                 }
             }
         }
@@ -330,7 +434,7 @@ mod tests {
         CgroupMemorySnapshot, MEMORY_OBSERVABILITY_SERVICE_NAME, MemoryObservabilityCancellationSource,
         MemoryObservabilityController, MemoryObservabilityDesiredState, MemoryObservabilityServiceState,
         MemoryObservabilityShutdownHandle, MemoryObservabilityWorkerMutation, build_memory_observability_controller_snapshot,
-        build_memory_observability_status_snapshot, parse_kv_stats, read_optional_u64,
+        build_memory_observability_status_snapshot, parse_kv_stats, parse_mimalloc_stats_json, read_optional_u64,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -364,6 +468,39 @@ mod tests {
         assert_eq!(snapshot.file_bytes, None);
         assert_eq!(snapshot.active_file_bytes, None);
         assert_eq!(snapshot.inactive_file_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_extracts_allocator_attribution() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "process": {
+                    "reserved": { "current": 1048576 },
+                    "committed": { "current": "524288" },
+                    "page_committed": { "current": 262144 },
+                    "malloc_requested": {
+                        "current": 131072,
+                        "peak": 196608,
+                        "total": 10485760
+                    },
+                    "heaps": { "current": 8 }
+                }
+            }"#,
+        )
+        .expect("mimalloc stats should parse");
+
+        assert_eq!(parsed.reserved_bytes, Some(1_048_576));
+        assert_eq!(parsed.committed_bytes, Some(524_288));
+        assert_eq!(parsed.page_committed_bytes, Some(262_144));
+        assert_eq!(parsed.malloc_requested_bytes, Some(131_072));
+        assert_eq!(parsed.malloc_requested_peak_bytes, Some(196_608));
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(10_485_760));
+        assert_eq!(parsed.heap_count, Some(8));
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_rejects_unrecognized_payload() {
+        assert_eq!(parse_mimalloc_stats_json(r#"{ "allocator": "unknown" }"#), None);
     }
 
     #[test]

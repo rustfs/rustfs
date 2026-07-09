@@ -18,13 +18,16 @@ use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::request_guard::GetObjectGuard;
-use rustfs_concurrency::GetObjectQueueSnapshot;
+use super::request_guard::{GetObjectGuard, PutObjectGuard};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use rustfs_concurrency::{
+    AdmissionState, GetObjectQueueSnapshot, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot,
+    WorkloadAdmissionSnapshotProvider, WorkloadClass,
+};
 use rustfs_config::{KI_B, MI_B};
 use rustfs_io_core::BytesPool;
 use rustfs_io_core::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
 use rustfs_io_metrics::bandwidth::{BandwidthMonitor, BandwidthSnapshot};
-use rustfs_io_metrics::global_metrics::get_global_metrics;
 use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -115,7 +118,7 @@ impl ConcurrencyManager {
 
         // Use global performance metrics instance for consistent metrics tracking
         // This allows AutoTuner and other components to access the same metrics data
-        let performance_metrics = get_global_metrics();
+        let performance_metrics = runtime_sources::current_performance_metrics();
 
         // Initialize metrics collector for I/O latency tracking
         // Keep 1000 samples for P95/P99 calculation
@@ -142,6 +145,10 @@ impl ConcurrencyManager {
         GetObjectGuard::new()
     }
 
+    pub fn track_put_request() -> PutObjectGuard {
+        PutObjectGuard::new()
+    }
+
     /// Get the bytes pool for buffer allocation
     ///
     /// Returns a reference to the BytesPool which can be used to acquire
@@ -160,6 +167,14 @@ impl ConcurrencyManager {
     /// concurrent reads, which can cause performance degradation.
     pub async fn acquire_disk_read_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
         self.disk_read_semaphore.acquire().await
+    }
+
+    /// Acquire an owned permit to perform a disk read operation.
+    ///
+    /// Use this when the permit must outlive the borrow of the manager, such as
+    /// response body streams that continue after the S3 handler returns.
+    pub async fn acquire_owned_disk_read_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.disk_read_semaphore.clone().acquire_owned().await
     }
 
     // ============================================
@@ -228,7 +243,7 @@ impl ConcurrencyManager {
     ///
     /// Arc-wrapped PerformanceMetrics instance
     pub fn performance_metrics(&self) -> Arc<PerformanceMetrics> {
-        get_global_metrics()
+        runtime_sources::current_performance_metrics()
     }
 
     /// Calculate an adaptive I/O strategy based on disk permit wait time.
@@ -521,10 +536,7 @@ impl ConcurrencyManager {
     ///
     /// Returns information about permit usage and waiting requests.
     pub fn io_queue_status(&self) -> IoQueueStatus {
-        let snapshot = GetObjectQueueSnapshot::from_available_permits(
-            self.scheduler_config.max_concurrent_reads,
-            self.disk_read_semaphore.available_permits(),
-        );
+        let snapshot = self.get_object_queue_snapshot();
 
         IoQueueStatus {
             total_permits: snapshot.total_permits,
@@ -537,6 +549,76 @@ impl ConcurrencyManager {
             low_priority_processed: 0,
             starvation_events: 0,
         }
+    }
+
+    /// Get a read-only snapshot of local GetObject disk-read admission.
+    pub fn get_object_queue_snapshot(&self) -> GetObjectQueueSnapshot {
+        GetObjectQueueSnapshot::from_available_permits(
+            self.scheduler_config.max_concurrent_reads,
+            self.disk_read_semaphore.available_permits(),
+        )
+    }
+
+    /// Get a read-only workload admission snapshot for foreground reads.
+    pub fn get_object_admission_snapshot(&self) -> WorkloadAdmissionSnapshot {
+        let snapshot = self.get_object_queue_snapshot();
+        let state = if snapshot.total_permits == 0 {
+            AdmissionState::Disabled
+        } else if snapshot.permits_available() == 0 {
+            AdmissionState::Saturated
+        } else {
+            AdmissionState::Open
+        };
+
+        let admission = WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundRead, state).with_counts(
+            Some(snapshot.permits_in_use),
+            None,
+            Some(snapshot.total_permits),
+        );
+
+        match state {
+            AdmissionState::Disabled => admission.with_reason("disk read permits disabled"),
+            AdmissionState::Saturated => admission.with_reason("all disk read permits are in use"),
+            _ => admission,
+        }
+    }
+
+    /// Get a read-only workload admission snapshot for foreground writes.
+    pub fn put_object_admission_snapshot(&self) -> WorkloadAdmissionSnapshot {
+        let active = PutObjectGuard::concurrent_count();
+        let limit = self.scheduler_config.max_concurrent_reads;
+        let state = if limit == 0 {
+            AdmissionState::Disabled
+        } else if active >= limit {
+            AdmissionState::Saturated
+        } else {
+            AdmissionState::Open
+        };
+
+        let admission =
+            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(Some(active), None, Some(limit));
+
+        match state {
+            AdmissionState::Disabled => admission.with_reason("foreground write pressure tracking disabled"),
+            AdmissionState::Saturated => admission.with_reason("foreground write concurrency reached local pressure limit"),
+            _ => admission,
+        }
+    }
+
+    /// Get a read-only workload admission registry snapshot for local storage concurrency.
+    pub fn workload_admission_registry_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot {
+        let entries = WorkloadClass::REQUIRED
+            .iter()
+            .copied()
+            .map(|class| match class {
+                WorkloadClass::ForegroundRead => self.get_object_admission_snapshot(),
+                WorkloadClass::ForegroundWrite => self.put_object_admission_snapshot(),
+                class => WorkloadAdmissionSnapshot::new(class, AdmissionState::Unknown)
+                    .with_reason("not exposed by storage concurrency manager"),
+            })
+            .collect();
+
+        WorkloadAdmissionRegistrySnapshot::new(entries)
     }
 
     /// Acquire a disk read permit with priority awareness.
@@ -573,6 +655,12 @@ impl ConcurrencyManager {
     }
 }
 
+impl WorkloadAdmissionSnapshotProvider for ConcurrencyManager {
+    fn workload_admission_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot {
+        self.workload_admission_registry_snapshot()
+    }
+}
+
 impl Default for ConcurrencyManager {
     fn default() -> Self {
         Self::new()
@@ -584,9 +672,16 @@ impl Default for ConcurrencyManager {
 // ============================================
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod integration_tests {
-    use super::*;
+    use super::super::io_schedule::{IoLoadLevel, IoPriority};
+    use super::super::request_guard::GetObjectGuard;
+    use super::ConcurrencyManager;
+    use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
+    use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+    use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
     use serial_test::serial;
+    use std::time::Duration;
 
     #[tokio::test]
     #[serial]
@@ -615,6 +710,95 @@ mod integration_tests {
         assert_eq!(status.high_priority_waiting, 0);
         assert_eq!(status.normal_priority_waiting, 0);
         assert_eq!(status.low_priority_waiting, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_workload_admission_snapshot_tracks_disk_read_permits() {
+        let manager = ConcurrencyManager::new();
+        let initial = manager.get_object_admission_snapshot();
+
+        assert_eq!(initial.class, WorkloadClass::ForegroundRead);
+        assert_eq!(initial.state, AdmissionState::Open);
+        assert_eq!(initial.active, Some(0));
+        assert_eq!(initial.queued, None);
+        assert_eq!(initial.limit, Some(manager.scheduler_config().max_concurrent_reads));
+
+        let permit = manager.acquire_disk_read_permit().await;
+        assert!(permit.is_ok());
+        let _permit = permit.ok();
+        let snapshot = manager.get_object_admission_snapshot();
+
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_owned_disk_read_permit_tracks_queue_snapshot() {
+        let manager = ConcurrencyManager::new();
+
+        let permit = manager
+            .acquire_owned_disk_read_permit()
+            .await
+            .expect("owned disk read permit should be acquired");
+        let snapshot = manager.get_object_admission_snapshot();
+
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+
+        drop(permit);
+        assert_eq!(manager.get_object_admission_snapshot().active, Some(0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_workload_admission_snapshot_tracks_put_requests() {
+        crate::storage::concurrency::reset_active_put_requests();
+        let manager = ConcurrencyManager::new();
+        let initial = manager.put_object_admission_snapshot();
+
+        assert_eq!(initial.class, WorkloadClass::ForegroundWrite);
+        assert_eq!(initial.state, AdmissionState::Open);
+        assert_eq!(initial.active, Some(0));
+        assert_eq!(initial.queued, None);
+        assert_eq!(initial.limit, Some(manager.scheduler_config().max_concurrent_reads));
+
+        let guard = PutObjectGuard::new();
+        let snapshot = manager.put_object_admission_snapshot();
+
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+        drop(guard);
+        crate::storage::concurrency::reset_active_put_requests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_workload_admission_registry_covers_required_classes() {
+        let manager = ConcurrencyManager::new();
+        let registry = manager.workload_admission_registry_snapshot();
+        let provider: &dyn WorkloadAdmissionSnapshotProvider = &manager;
+        let trait_registry = provider.workload_admission_snapshot();
+
+        assert_eq!(registry.entries(), trait_registry.entries());
+        assert_eq!(registry.entries().len(), WorkloadClass::REQUIRED.len());
+        for class in WorkloadClass::REQUIRED {
+            assert!(registry.get(class).is_some(), "missing workload class {class}");
+        }
+
+        assert_eq!(
+            registry.get(WorkloadClass::ForegroundRead).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Open)
+        );
+        assert_eq!(
+            registry.get(WorkloadClass::ForegroundWrite).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Open)
+        );
+        assert_eq!(
+            registry.get(WorkloadClass::Scanner).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Unknown)
+        );
     }
 
     #[tokio::test]
@@ -804,13 +988,12 @@ mod integration_tests {
             StorageMedia::Hdd => config.hdd_buffer_cap,
             StorageMedia::Unknown => config.ssd_buffer_cap,
         };
-        let expected_max = media_cap.min(MI_B);
 
-        // Large base buffer should be constrained by storage cap first, then global clamp.
-        assert_eq!(
-            strategy.buffer_size, expected_max,
-            "Buffer should be capped by media profile and global clamp"
-        );
+        // Large base buffer should be constrained by the storage media cap.
+        // The final safety clamp is [32KiB, media_cap.max(MI_B)], so it never
+        // lowers the result below the media cap (e.g. NVMe's 2MiB cap stays
+        // effective even though the global floor clamp is 1MiB).
+        assert_eq!(strategy.buffer_size, media_cap, "Buffer should be capped by the storage media profile");
     }
 
     #[tokio::test]

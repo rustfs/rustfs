@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::IamStorageError;
 use rustfs_policy::policy::Error as PolicyError;
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -179,20 +180,20 @@ impl Error {
     }
 }
 
-impl From<rustfs_ecstore::error::StorageError> for Error {
-    fn from(e: rustfs_ecstore::error::StorageError) -> Self {
+impl From<IamStorageError> for Error {
+    fn from(e: IamStorageError) -> Self {
         match e {
-            rustfs_ecstore::error::StorageError::ConfigNotFound => Error::ConfigNotFound,
+            IamStorageError::ConfigNotFound => Error::ConfigNotFound,
             _ => Error::other(e),
         }
     }
 }
 
-impl From<Error> for rustfs_ecstore::error::StorageError {
+impl From<Error> for IamStorageError {
     fn from(e: Error) -> Self {
         match e {
-            Error::ConfigNotFound => rustfs_ecstore::error::StorageError::ConfigNotFound,
-            _ => rustfs_ecstore::error::StorageError::other(e),
+            Error::ConfigNotFound => IamStorageError::ConfigNotFound,
+            _ => IamStorageError::other(e),
         }
     }
 }
@@ -285,21 +286,6 @@ pub fn is_err_no_such_service_account(err: &Error) -> bool {
     matches!(err, Error::NoSuchServiceAccount(_))
 }
 
-// pub fn clone_err(e: &Error) -> Error {
-//     if let Some(e) = e.downcast_ref::<DiskError>() {
-//         clone_disk_err(e)
-//     } else if let Some(e) = e.downcast_ref::<std::io::Error>() {
-//         if let Some(code) = e.raw_os_error() {
-//             Error::new(std::io::Error::from_raw_os_error(code))
-//         } else {
-//             Error::new(std::io::Error::new(e.kind(), e.to_string()))
-//         }
-//     } else {
-//         //TODO: Optimize other types
-//         Error::msg(e.to_string())
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,13 +316,13 @@ mod tests {
     #[test]
     fn test_iam_error_from_storage_error() {
         // Test conversion from StorageError
-        let storage_error = rustfs_ecstore::error::StorageError::ConfigNotFound;
+        let storage_error = IamStorageError::ConfigNotFound;
         let iam_error: Error = storage_error.into();
         assert_eq!(iam_error, Error::ConfigNotFound);
 
         // Test reverse conversion
-        let back_to_storage: rustfs_ecstore::error::StorageError = iam_error.into();
-        assert_eq!(back_to_storage, rustfs_ecstore::error::StorageError::ConfigNotFound);
+        let back_to_storage: IamStorageError = iam_error.into();
+        assert_eq!(back_to_storage, IamStorageError::ConfigNotFound);
     }
 
     #[test]

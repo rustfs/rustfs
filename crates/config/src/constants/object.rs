@@ -67,6 +67,21 @@ pub const DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD: usize = 4;
 /// Default is set to 64 concurrent reads.
 pub const DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS: usize = 64;
 
+/// Environment variable for the disk read permit wait timeout (seconds).
+/// - Purpose: Bound how long a GET waits for a disk read permit before proceeding without one.
+/// - Unit: seconds (u64). `0` waits indefinitely.
+/// - Example: `export RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT=5`
+pub const ENV_OBJECT_DISK_PERMIT_WAIT_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT";
+
+/// Maximum time a GET request waits for a disk read permit (seconds).
+///
+/// Permits are held for the whole response body transfer, so slow clients can
+/// occupy all of them while the disks sit idle. Instead of stalling until the
+/// request-level timeout fires, a GET that waits longer than this proceeds
+/// without a permit (degraded pass-through) and the bypass is counted in
+/// metrics/logs. Set to 0 to wait indefinitely (previous behavior).
+pub const DEFAULT_OBJECT_DISK_PERMIT_WAIT_TIMEOUT: u64 = 5;
+
 /// Skip bitrot hash verification on GetObject reads.
 ///
 /// When enabled, GetObject reads skip the per-shard hash
@@ -191,9 +206,9 @@ pub const DEFAULT_OBJECT_IO_BUFFER_SIZE: usize = 128 * 1024;
 
 /// Environment variable to enable/disable lock optimization.
 ///
-/// When enabled, read locks are released immediately after metadata
-/// is read, rather than being held for the entire data transfer.
-/// This significantly reduces lock contention under high concurrency.
+/// When enabled, read locks may be released before the reader is returned.
+/// Disable this only when streaming readers must keep the object namespace
+/// locked until EOF or drop.
 ///
 /// Default: true (enabled, can be overridden by `RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE`).
 pub const ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE: &str = "RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE";
@@ -280,6 +295,19 @@ pub const ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT: &str = "RUSTFS_OBJECT_LOCK_ACQUIRE_TI
 
 /// Default lock acquisition timeout: 5 seconds.
 pub const DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT: u64 = 5;
+
+/// Environment variable for remote namespace lock RPC transport timeout in milliseconds.
+///
+/// This timeout bounds the internode RPC call itself. It is intentionally
+/// separate from `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` and the distributed lock
+/// per-attempt acquire budget so short lock-contention windows do not become
+/// aggressive network deadlines.
+///
+/// Default: 3000 milliseconds (can be overridden by `RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS`).
+pub const ENV_OBJECT_LOCK_RPC_TIMEOUT_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS";
+
+/// Default remote lock RPC transport timeout: 3000 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS: u64 = 3000;
 
 /// Environment variable to enable object namespace lock diagnostics.
 ///

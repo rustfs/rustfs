@@ -31,8 +31,29 @@ static METRICS: OnceLock<Option<ProxyMetrics>> = OnceLock::new();
 /// Global instance of the trusted proxy layer.
 static PROXY_LAYER: OnceLock<LegacyTrustedProxyLayer> = OnceLock::new();
 
+/// Disabled fallback layer used when legacy trusted proxies are not enabled.
+static DISABLED_PROXY_LAYER: OnceLock<LegacyTrustedProxyLayer> = OnceLock::new();
+
 /// Global flag indicating if the trusted proxy middleware is enabled.
 static ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn load_config() -> &'static Arc<AppConfig> {
+    CONFIG.get_or_init(|| Arc::new(ConfigLoader::from_env_or_default()))
+}
+
+fn load_metrics(config: &AppConfig, enabled: bool) -> &'static Option<ProxyMetrics> {
+    METRICS.get_or_init(|| {
+        if config.monitoring.metrics_enabled {
+            Some(default_proxy_metrics(enabled))
+        } else {
+            None
+        }
+    })
+}
+
+fn disabled_layer() -> &'static LegacyTrustedProxyLayer {
+    DISABLED_PROXY_LAYER.get_or_init(LegacyTrustedProxyLayer::disabled)
+}
 
 /// Initializes the global trusted proxy system.
 ///
@@ -54,24 +75,11 @@ pub fn init() {
         return;
     }
 
-    let config = CONFIG.get_or_init(|| Arc::new(ConfigLoader::from_env_or_default())).clone();
+    let config = load_config().clone();
+    let metrics = load_metrics(&config, enabled).clone();
 
-    METRICS.get_or_init(|| {
-        if config.monitoring.metrics_enabled {
-            Some(default_proxy_metrics(enabled))
-        } else {
-            None
-        }
-    });
-
-    PROXY_LAYER.get_or_init(|| {
-        LegacyTrustedProxyLayer::with_cache_config(
-            config.proxy.clone(),
-            config.cache.clone(),
-            METRICS.get().and_then(|m| m.clone()),
-            enabled,
-        )
-    });
+    PROXY_LAYER
+        .get_or_init(|| LegacyTrustedProxyLayer::with_cache_config(config.proxy.clone(), config.cache.clone(), metrics, enabled));
 
     tracing::info!(
         event = "trusted_proxies.lifecycle",
@@ -90,25 +98,27 @@ pub fn init() {
 /// Returns a reference to the global trusted proxy layer.
 ///
 /// This layer can be used to wrap Axum services or other Tower-compatible services.
-///
-/// # Panics
-///
-/// Panics if `init()` has not been called.
 pub fn layer() -> &'static LegacyTrustedProxyLayer {
-    PROXY_LAYER
-        .get()
-        .expect("Trusted proxy system not initialized. Call init() first.")
+    if let Some(layer) = PROXY_LAYER.get() {
+        return layer;
+    }
+
+    init();
+
+    if let Some(layer) = PROXY_LAYER.get() {
+        return layer;
+    }
+
+    disabled_layer()
 }
 
 /// Returns a reference to the global configuration.
-///
-/// # Panics
-///
-/// Panics if `init()` has not been called.
 pub fn config() -> &'static AppConfig {
-    CONFIG
-        .get()
-        .expect("Trusted proxy system not initialized. Call init() first.")
+    if CONFIG.get().is_none() {
+        init();
+    }
+
+    load_config().as_ref()
 }
 
 /// Returns a reference to the global metrics collector, if enabled.
@@ -119,4 +129,24 @@ pub fn metrics() -> Option<&'static ProxyMetrics> {
 /// Returns true if the trusted proxy system is enabled.
 pub fn is_enabled() -> bool {
     *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_TRUSTED_PROXY_ENABLED, DEFAULT_TRUSTED_PROXY_ENABLED))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_layer_is_available_without_explicit_init() {
+        let layer = layer();
+        assert_eq!(layer.is_enabled(), is_enabled());
+    }
+
+    #[test]
+    fn legacy_config_is_available_without_explicit_init() {
+        let expected = ConfigLoader::from_env_or_default();
+        let config = config();
+
+        assert_eq!(config.server_addr, expected.server_addr);
+        assert_eq!(config.monitoring.metrics_enabled, expected.monitoring.metrics_enabled);
+    }
 }

@@ -14,28 +14,32 @@
 
 use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
+use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
+    RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE,
+    STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
-    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
+    fs::{
+        O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, access_std, lstat, lstat_std, remove, remove_all_std,
+        remove_std, rename,
+    },
     os,
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
-use crate::erasure_coding::bitrot_verify;
-use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
+use crate::erasure::coding::bitrot_verify;
+use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
-use parking_lot::RwLock as ParkingLotRwLock;
+use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
-    get_file_info, read_xl_meta_no_data,
+    get_file_info, read_xl_meta_no_data_sync,
 };
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::os::get_info;
@@ -47,6 +51,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::{Error as IoError, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -56,9 +62,9 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
 use tokio::sync::{Notify, RwLock};
-use tokio::time::{Instant, interval_at, timeout};
+use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -77,11 +83,1129 @@ const EVENT_DISK_LOCAL_BACKGROUND_CLEANUP: &str = "disk_local_background_cleanup
 const EVENT_DISK_LOCAL_SCAN_FAILED: &str = "disk_local_scan_failed";
 const EVENT_DISK_LOCAL_RENAME_REJECTED: &str = "disk_local_rename_rejected";
 const EVENT_DISK_LOCAL_READ_VERSION_FALLBACK: &str = "disk_local_read_version_fallback";
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
 const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
+const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
+const METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_direct_read_page_faults_total";
+
+#[inline(always)]
+fn record_mmap_copy_stage(metrics: MmapCopyStageMetrics, stage: &'static str, started_at: Option<std::time::Instant>) {
+    if let Some(started_at) = started_at {
+        rustfs_io_metrics::record_get_object_stage_duration(metrics.path, stage, started_at.elapsed().as_secs_f64());
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MmapPageFaultCounts {
+    minor: libc::c_long,
+    major: libc::c_long,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MmapPageFaultDelta {
+    minor: u64,
+    major: u64,
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+fn mmap_rusage_who() -> libc::c_int {
+    libc::RUSAGE_THREAD
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn mmap_rusage_who() -> libc::c_int {
+    libc::RUSAGE_SELF
+}
+
+#[cfg(unix)]
+// SAFETY: this allowance is limited to reading kernel-provided rusage data via
+// libc; each unsafe operation below documents pointer validity and initialization.
+#[allow(unsafe_code)]
+fn read_mmap_page_fault_counts(enabled: bool) -> Option<MmapPageFaultCounts> {
+    if !enabled {
+        return None;
+    }
+
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` writes to the provided `rusage` pointer when it
+    // returns 0. The pointer is valid for writes and initialized only on success.
+    let rc = unsafe { libc::getrusage(mmap_rusage_who(), usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+
+    // SAFETY: `getrusage` returned success, so `usage` has been initialized.
+    let usage = unsafe { usage.assume_init() };
+    Some(MmapPageFaultCounts {
+        minor: usage.ru_minflt,
+        major: usage.ru_majflt,
+    })
+}
+
+#[cfg(unix)]
+fn non_negative_fault_delta(before: libc::c_long, after: libc::c_long) -> u64 {
+    if after <= before {
+        return 0;
+    }
+
+    u64::try_from(after - before).unwrap_or(u64::MAX)
+}
+
+#[cfg(unix)]
+fn mmap_page_fault_delta(before: Option<MmapPageFaultCounts>, after: Option<MmapPageFaultCounts>) -> MmapPageFaultDelta {
+    match (before, after) {
+        (Some(before), Some(after)) => MmapPageFaultDelta {
+            minor: non_negative_fault_delta(before.minor, after.minor),
+            major: non_negative_fault_delta(before.major, after.major),
+        },
+        _ => MmapPageFaultDelta::default(),
+    }
+}
+
+#[cfg(unix)]
+fn record_mmap_page_fault_delta(path: &'static str, stage: &'static str, delta: MmapPageFaultDelta) {
+    if delta.minor > 0 {
+        counter!(
+            METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL,
+            "path" => path,
+            "stage" => stage,
+            "kind" => "minor",
+        )
+        .increment(delta.minor);
+    }
+
+    if delta.major > 0 {
+        counter!(
+            METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL,
+            "path" => path,
+            "stage" => stage,
+            "kind" => "major",
+        )
+        .increment(delta.major);
+    }
+}
+
+#[cfg(unix)]
+fn record_direct_read_page_fault_delta(path: &'static str, stage: &'static str, delta: MmapPageFaultDelta) {
+    if delta.minor > 0 {
+        counter!(
+            METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL,
+            "path" => path,
+            "stage" => stage,
+            "kind" => "minor",
+        )
+        .increment(delta.minor);
+    }
+
+    if delta.major > 0 {
+        counter!(
+            METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL,
+            "path" => path,
+            "stage" => stage,
+            "kind" => "major",
+        )
+        .increment(delta.major);
+    }
+}
+
+/// Enable O_DIRECT for large sequential reads.
+/// When enabled, shard reads bypass the page cache using O_DIRECT flag.
+/// Requires aligned buffers (typically 512 bytes or 4096 bytes).
+/// Default: false (uses page cache via mmap/pread).
+const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE";
+const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: bool = false;
+
+/// Minimum shard size threshold for O_DIRECT reads.
+/// Only shards larger than this threshold will use O_DIRECT.
+/// Default: 4MB.
+const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD";
+const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: usize = 4 * 1024 * 1024;
+
+/// Enable O_DIRECT for erasure shard / multipart part data writes (Linux only).
+/// When enabled, `create_file` streams shard bytes straight to the device with
+/// O_DIRECT, so the commit-point `sync_dir_files` fdatasync no longer flushes
+/// ~2 MiB of dirty pages inside the `rename_data` critical section (it degrades
+/// to a cheap metadata/device FLUSH). Aligned whole blocks are written direct;
+/// the trailing sub-alignment remainder falls back to a buffered write after
+/// clearing O_DIRECT (MinIO's recipe). Durability is unchanged: the file is
+/// still fdatasynced at the commit point by the unchanged `sync_dir_files`.
+/// EINVAL/EOPNOTSUPP (tmpfs, overlayfs, 9p, ...) latch the path off and fall
+/// back to buffered writes for the whole disk. Non-Linux always falls back.
+/// Default: false (buffered writes via the page cache, as before).
+const ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE";
+const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE: bool = false;
+const ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: &str = "RUSTFS_OBJECT_MMAP_POPULATE_ENABLE";
+const DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: bool = false;
+const ENV_RUSTFS_OBJECT_MMAP_READ_METHOD: &str = "RUSTFS_OBJECT_MMAP_READ_METHOD";
+const RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY: &str = "mmap_copy";
+const RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY: &str = "direct_read_copy";
+
+/// Legacy binary switch for commit-point durability (fsync writes and renames).
+/// Kept for compatibility: `true` maps to the `strict` durability mode (the
+/// default), `false` keeps its historical semantics of disabling every fsync
+/// on this disk, system-critical metadata included. Superseded by
+/// `RUSTFS_DURABILITY_MODE`, which takes precedence when both are set.
+/// Default: true.
+const ENV_RUSTFS_DRIVE_SYNC_ENABLE: &str = "RUSTFS_DRIVE_SYNC_ENABLE";
+const DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE: bool = true;
+
+/// Durability tier for object data-path writes: `strict` (default) | `relaxed` | `none`.
+/// See docs/operations/durability-modes.md for the power-loss guarantee matrix.
+const ENV_RUSTFS_DURABILITY_MODE: &str = "RUSTFS_DURABILITY_MODE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalReadCopyMethod {
+    MmapCopy,
+    DirectReadCopy,
+}
+
+/// Check if O_DIRECT reads are enabled.
+fn is_direct_io_read_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE)
+}
+
+/// Check if O_DIRECT shard/part data writes are enabled.
+fn is_direct_io_write_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE)
+}
+
+const EVENT_DISK_LOCAL_DURABILITY_MODE: &str = "disk_local_durability_mode";
+
+/// Process-wide durability tier for commit-point fsync work on the local disk.
+///
+/// `Strict` is the default and preserves the historical (fully synced) write
+/// path bit for bit. The other tiers are opt-in and only relax the object
+/// data path; writes committing into system-critical namespaces stay pinned
+/// to `Strict` (see [`effective_durability`]), except under `LegacyOff`,
+/// which keeps the exact historical semantics of
+/// `RUSTFS_DRIVE_SYNC_ENABLE=false` (no fsync anywhere, system metadata
+/// included) so existing deployments keep their behavior unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DurabilityMode {
+    /// Every commit point is fsynced: shard/part contents, xl.meta contents,
+    /// rollback backups, and the directory entries of commit renames.
+    Strict,
+    /// Object payload bytes (erasure shard files, multipart part files) are
+    /// still fdatasynced before the commit rename, but metadata commits
+    /// (xl.meta contents, rollback backups, directory entries) are left to
+    /// the page cache. Aligned with MinIO's default durability posture.
+    Relaxed,
+    /// No fsync on the object data path at all. System-critical namespaces
+    /// are still pinned to `Strict`.
+    None,
+    /// Historical semantics of `RUSTFS_DRIVE_SYNC_ENABLE=false`: no fsync
+    /// anywhere, without the system-critical pinning. Only reachable through
+    /// the legacy switch; not exposed by `RUSTFS_DURABILITY_MODE`.
+    LegacyOff,
+}
+
+impl DurabilityMode {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "strict" => Some(Self::Strict),
+            "relaxed" => Some(Self::Relaxed),
+            "none" => Some(Self::None),
+            _ => Option::None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Relaxed => "relaxed",
+            Self::None => "none",
+            Self::LegacyOff => "legacy-off",
+        }
+    }
+
+    /// Whether object payload bytes (erasure shard files, multipart part
+    /// files) must be fdatasynced at commit points.
+    fn syncs_data_shards(self) -> bool {
+        matches!(self, Self::Strict | Self::Relaxed)
+    }
+
+    /// Whether metadata commits must be fsynced: xl.meta contents, rollback
+    /// backups, and the directory entries created by commit renames.
+    fn syncs_commit_metadata(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+/// Pure resolution of the durability mode from configuration values.
+///
+/// `RUSTFS_DURABILITY_MODE` wins when set to a valid value; otherwise the
+/// legacy `RUSTFS_DRIVE_SYNC_ENABLE` switch keeps its historical mapping
+/// (`true` -> strict, `false` -> the old full-off semantics). The default is
+/// strict.
+fn resolve_durability_mode(mode_env: Option<String>, legacy_drive_sync_enabled: bool) -> DurabilityMode {
+    if let Some(raw) = mode_env {
+        if let Some(mode) = DurabilityMode::parse(&raw) {
+            return mode;
+        }
+        warn!(
+            event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            value = %raw,
+            "Invalid RUSTFS_DURABILITY_MODE value; expected strict|relaxed|none, falling back to the legacy drive-sync switch"
+        );
+    }
+    if legacy_drive_sync_enabled {
+        DurabilityMode::Strict
+    } else {
+        DurabilityMode::LegacyOff
+    }
+}
+
+/// The configured durability mode, resolved from the environment once per
+/// process and cached (the previous binary switch re-read the environment on
+/// every call, i.e. a dozen times per PUT, and could even flip mid-operation).
+pub(crate) fn durability_mode() -> DurabilityMode {
+    #[cfg(test)]
+    if let Some(mode) = durability_mode_override::get() {
+        return mode;
+    }
+    static MODE: OnceLock<DurabilityMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = resolve_durability_mode(
+            rustfs_utils::get_env_opt_str(ENV_RUSTFS_DURABILITY_MODE),
+            rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
+        );
+        info!(
+            event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            mode = mode.as_str(),
+            "Storage durability mode resolved"
+        );
+        mode
+    })
+}
+
+/// Test-only override for [`durability_mode`].
+///
+/// The production value is resolved from the environment once per process, so
+/// tests exercising non-default tiers need a process-level override hook.
+/// Setting an override serializes callers on a mutex so a relaxed-tier test
+/// can never leak its mode into a parallel strict-tier test.
+#[cfg(test)]
+pub(crate) mod durability_mode_override {
+    use super::DurabilityMode;
+    use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
+
+    static OVERRIDE: RwLock<Option<DurabilityMode>> = RwLock::new(None);
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn get() -> Option<DurabilityMode> {
+        *OVERRIDE.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holds the override (and the serialization lock) until dropped.
+    pub(crate) struct OverrideGuard {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    pub(crate) fn set(mode: DurabilityMode) -> OverrideGuard {
+        let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        *OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = Some(mode);
+        OverrideGuard { _serial: serial }
+    }
+}
+
+/// Per-bucket durability overrides (HP-5 phase 2, rustfs/backlog#938).
+///
+/// The disk layer never loads bucket metadata itself: the bucket metadata
+/// subsystem publishes the parsed override here whenever a bucket's cached
+/// metadata is set, refreshed, or removed, so this registry follows exactly
+/// the existing bucket-metadata cache invalidation semantics (immediate on
+/// the node applying a config change, peer reload notification plus the
+/// periodic refresh loop elsewhere). Lookups sit on the commit hot path, so
+/// the empty-registry case (no bucket overrides configured anywhere — the
+/// default) is a single relaxed atomic load and the phase 1 behavior is
+/// preserved bit for bit.
+pub(crate) mod bucket_durability {
+    use super::{
+        DurabilityMode, EVENT_DISK_LOCAL_DURABILITY_MODE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_DISK_LOCAL, is_scratch_volume,
+        is_system_critical_volume,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{OnceLock, PoisonError, RwLock};
+    use tracing::{info, warn};
+
+    static OVERRIDES: OnceLock<RwLock<HashMap<String, DurabilityMode>>> = OnceLock::new();
+    /// Fast-path gate: false means "no override registered anywhere", which
+    /// keeps default deployments off the map lookup entirely.
+    static NON_EMPTY: AtomicBool = AtomicBool::new(false);
+
+    fn overrides() -> &'static RwLock<HashMap<String, DurabilityMode>> {
+        OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    /// Publish (or clear, with `None`) the durability override for `bucket`.
+    ///
+    /// System namespaces can never carry an override: they are pinned to
+    /// `strict` by [`super::effective_durability`], and any attempt to
+    /// register one is rejected here as defense in depth.
+    pub(crate) fn set(bucket: &str, mode: Option<DurabilityMode>) {
+        if bucket.is_empty() {
+            return;
+        }
+        if is_system_critical_volume(bucket) || is_scratch_volume(bucket) {
+            if mode.is_some() {
+                warn!(
+                    event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    bucket = %bucket,
+                    "Rejected per-bucket durability override for a system namespace; it stays pinned to strict"
+                );
+            }
+            return;
+        }
+        // The legacy full-off switch is process-wide only and deliberately
+        // unreachable per bucket (`DurabilityMode::parse` never returns it).
+        let mode = mode.filter(|m| *m != DurabilityMode::LegacyOff);
+
+        let mut map = overrides().write().unwrap_or_else(PoisonError::into_inner);
+        let changed = match mode {
+            Some(mode) => map.insert(bucket.to_string(), mode) != Some(mode),
+            None => map.remove(bucket).is_some(),
+        };
+        NON_EMPTY.store(!map.is_empty(), Ordering::Release);
+        drop(map);
+
+        if changed {
+            info!(
+                event = EVENT_DISK_LOCAL_DURABILITY_MODE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                bucket = %bucket,
+                mode = mode.map_or("inherit", |m| m.as_str()),
+                "Per-bucket durability override updated"
+            );
+        }
+    }
+
+    /// The override registered for `volume`, if any. `volume` is the commit
+    /// destination, so user buckets resolve by name while scratch and system
+    /// namespaces never match (they are refused by [`set`]).
+    pub(crate) fn lookup(volume: &str) -> Option<DurabilityMode> {
+        if !NON_EMPTY.load(Ordering::Acquire) {
+            return None;
+        }
+        overrides()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(volume)
+            .copied()
+    }
+}
+
+/// Whether `volume` stages in-flight user object data (`.rustfs.sys/tmp`,
+/// `.rustfs.sys/multipart`, and their subtrees). These namespaces follow the
+/// configured durability mode: their contents commit into user buckets and
+/// are exactly the writes the relaxed tiers exist for.
+fn is_scratch_volume(volume: &str) -> bool {
+    for scratch in [super::RUSTFS_META_TMP_BUCKET, super::RUSTFS_META_MULTIPART_BUCKET] {
+        if volume == scratch || volume.strip_prefix(scratch).is_some_and(|rest| rest.starts_with('/')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether writes committing into `volume` carry system-critical state:
+/// format.json, IAM and cluster config, bucket metadata, and everything else
+/// under `.rustfs.sys` (or `.minio.sys` during migration) outside the scratch
+/// namespaces. Losing these can take out the whole deployment and they are
+/// far off the object hot path, so they never follow a relaxed tier.
+fn is_system_critical_volume(volume: &str) -> bool {
+    if is_scratch_volume(volume) {
+        return false;
+    }
+    for meta in [super::RUSTFS_META_BUCKET, super::MIGRATING_META_BUCKET] {
+        if volume == meta || volume.strip_prefix(meta).is_some_and(|rest| rest.starts_with('/')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Effective durability for writes that commit into `volume`.
+///
+/// Resolution order: system-critical volumes are pinned to `Strict`
+/// regardless of any configuration; otherwise a per-bucket override
+/// (published by the bucket metadata subsystem, see [`bucket_durability`])
+/// wins over the process-wide mode; otherwise the process-wide mode applies.
+/// The legacy full-off switch keeps its historical semantics: it is never
+/// pinned and per-bucket overrides do not apply under it.
+pub(crate) fn effective_durability(volume: &str) -> DurabilityMode {
+    let global = durability_mode();
+    if global == DurabilityMode::LegacyOff {
+        return global;
+    }
+    if is_system_critical_volume(volume) {
+        return DurabilityMode::Strict;
+    }
+    bucket_durability::lookup(volume).unwrap_or(global)
+}
+
+/// Get the O_DIRECT read threshold size.
+fn get_direct_io_read_threshold() -> usize {
+    rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD)
+}
+
+fn should_populate_mmap_read(length: usize) -> bool {
+    length > 0 && rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE)
+}
+
+fn local_read_copy_method() -> LocalReadCopyMethod {
+    let method = rustfs_utils::get_env_str(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY);
+    match method.as_str() {
+        RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY => LocalReadCopyMethod::DirectReadCopy,
+        _ => LocalReadCopyMethod::MmapCopy,
+    }
+}
+
+/// Runtime state for the true O_DIRECT read path (Linux only).
+///
+/// `supported` starts true and latches false on the first EINVAL/EOPNOTSUPP
+/// from an O_DIRECT open/read (tmpfs, overlayfs, and 9p commonly reject the
+/// flag); the path then permanently falls back to the buffered read methods
+/// for this disk. `align` caches the DIO alignment probed from the backing
+/// filesystem. O_DIRECT errors must never surface to callers: EINVAL maps to
+/// `FileNotFound` in `to_file_error`, which would masquerade as a missing
+/// shard and trigger spurious EC rebuilds.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct DirectIoReadState {
+    supported: AtomicBool,
+    align: OnceLock<usize>,
+    fallback_logged: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl DirectIoReadState {
+    fn new() -> Self {
+        Self {
+            supported: AtomicBool::new(true),
+            align: OnceLock::new(),
+            fallback_logged: AtomicBool::new(false),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const DEFAULT_DIRECT_IO_ALIGN: usize = 4096;
+
+/// Probe the DIO alignment requirement for the file's filesystem via
+/// statx STATX_DIOALIGN (kernel >= 6.1). Falls back to 4096, a safe upper
+/// bound for 512e/4Kn devices, when the kernel or filesystem does not
+/// report it.
+#[cfg(target_os = "linux")]
+fn probe_direct_io_align(file: &std::fs::File) -> usize {
+    use rustix::fs::{AtFlags, StatxFlags};
+
+    match rustix::fs::statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::DIOALIGN) {
+        Ok(stx) => {
+            if StatxFlags::from_bits_retain(stx.stx_mask).contains(StatxFlags::DIOALIGN) {
+                let align = stx.stx_dio_mem_align.max(stx.stx_dio_offset_align) as usize;
+                if align.is_power_of_two() && align >= 512 {
+                    return align;
+                }
+            }
+            DEFAULT_DIRECT_IO_ALIGN
+        }
+        Err(_) => DEFAULT_DIRECT_IO_ALIGN,
+    }
+}
+
+/// Heap buffer with explicit alignment for O_DIRECT reads.
+#[cfg(target_os = "linux")]
+struct AlignedBuf {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    layout: std::alloc::Layout,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+impl AlignedBuf {
+    fn new(len: usize, align: usize) -> std::io::Result<Self> {
+        debug_assert!(len > 0, "AlignedBuf must not be zero-sized");
+        let layout = std::alloc::Layout::from_size_align(len, align)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: `layout` has non-zero size (callers guarantee len > 0) and a
+        // valid power-of-two alignment enforced by Layout::from_size_align.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = std::ptr::NonNull::new(ptr).ok_or(std::io::ErrorKind::OutOfMemory)?;
+        Ok(Self { ptr, len, layout })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is a live allocation of exactly `len` bytes owned by
+        // self, initialized to zero at allocation and only written via
+        // `as_mut_slice`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as in `as_slice`, plus `&mut self` guarantees exclusivity.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`layout` come from the successful alloc_zeroed in new().
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_direct_io_unsupported(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EINVAL) | Some(libc::EOPNOTSUPP))
+}
+
+/// True O_DIRECT positioned read: open with O_DIRECT, read the aligned
+/// superset range into an aligned bounce buffer, then slice out the exact
+/// logical range. Alignment padding never leaks to callers — BitrotReader
+/// reads exact shard_size and would flag padded output as corruption.
+///
+/// Short reads are legal for O_DIRECT; the loop stops at EOF (res == 0).
+/// A read that ends before covering the logical range is an error (the
+/// caller has already validated `offset + length <= file size`, so this
+/// only happens on concurrent truncation) and makes the caller fall back
+/// to the buffered path.
+#[cfg(target_os = "linux")]
+fn pread_direct_aligned(file_path: &Path, offset: u64, length: usize, state: &DirectIoReadState) -> std::io::Result<Bytes> {
+    use std::os::unix::fs::{FileExt, OpenOptionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
+        .open(file_path)?;
+
+    let align = *state.align.get_or_init(|| probe_direct_io_align(&file));
+    let align_u64 = align as u64;
+
+    let aligned_offset = offset - (offset % align_u64);
+    let logical_start =
+        usize::try_from(offset - aligned_offset).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let logical_end = logical_start.checked_add(length).ok_or(std::io::ErrorKind::InvalidInput)?;
+    let aligned_len = logical_end.checked_add(align - 1).ok_or(std::io::ErrorKind::InvalidInput)? / align * align;
+
+    let mut buf = AlignedBuf::new(aligned_len, align)?;
+
+    let mut filled = 0usize;
+    while filled < aligned_len {
+        // `filled` stays a multiple of `align` except possibly at EOF, so
+        // both the buffer address and the file offset remain aligned.
+        let n = file.read_at(&mut buf.as_mut_slice()[filled..], aligned_offset + filled as u64)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    if filled < logical_end {
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short O_DIRECT read"));
+    }
+
+    Ok(Bytes::copy_from_slice(&buf.as_slice()[logical_start..logical_end]))
+}
+
+// `AlignedBuf` uniquely owns a single heap allocation reached only through
+// `&self`/`&mut self`; there is no interior mutability and no aliasing, so it
+// is sound to move it across threads (into a `spawn_blocking` flush closure)
+// and to share `&AlignedBuf` between threads.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+// SAFETY: exclusive heap ownership, no aliasing (see the note above).
+unsafe impl Send for AlignedBuf {}
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+// SAFETY: `&AlignedBuf` only exposes read-only access to an immutable buffer.
+unsafe impl Sync for AlignedBuf {}
+
+/// Runtime state for the true O_DIRECT write path (Linux only), mirroring
+/// [`DirectIoReadState`].
+///
+/// `supported` starts true and latches false on the first EINVAL/EOPNOTSUPP
+/// from an O_DIRECT open (tmpfs, overlayfs, and 9p commonly reject the flag);
+/// `create_file` then permanently opens shard files buffered for this disk.
+/// `align` caches the DIO alignment probed from the backing filesystem. As on
+/// the read path, an O_DIRECT open error must never surface to callers: EINVAL
+/// maps to `FileNotFound` in `to_file_error`, which would masquerade as a
+/// missing shard and trigger spurious EC rebuilds.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct DirectIoWriteState {
+    supported: AtomicBool,
+    align: OnceLock<usize>,
+    fallback_logged: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl DirectIoWriteState {
+    fn new() -> Self {
+        Self {
+            supported: AtomicBool::new(true),
+            align: OnceLock::new(),
+            fallback_logged: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Target staging size for O_DIRECT writes, rounded up to the DIO alignment.
+/// Bounds the per-writer aligned bounce buffer and batches many shard blocks
+/// into one positioned write to keep the syscall count low.
+const DIRECT_WRITE_STAGING_BYTES: usize = 1024 * 1024;
+
+/// Aligned bounce-buffer capacity for a given DIO alignment: the target staging
+/// size rounded up to a whole multiple of `align` so the buffer address, every
+/// flushed batch length, and every write offset stay alignment-correct.
+/// Platform-independent (no O_DIRECT), so it is unit-tested on any host.
+fn direct_write_staging_capacity(align: usize) -> usize {
+    debug_assert!(align.is_power_of_two() && align >= 512);
+    DIRECT_WRITE_STAGING_BYTES.div_ceil(align) * align
+}
+
+/// Split `filled` staged bytes into the alignment-sized prefix written with
+/// O_DIRECT and the sub-alignment tail written buffered. Platform-independent,
+/// so the tail-boundary math is unit-tested on any host.
+fn direct_write_tail_split(filled: usize, align: usize) -> (usize, usize) {
+    let aligned = filled - (filled % align);
+    (aligned, filled - aligned)
+}
+
+/// Positioned write-all helper: retries short writes at increasing offsets.
+///
+/// Under O_DIRECT the buffer address, `offset`, and length must all be aligned;
+/// callers guarantee that. After O_DIRECT has been cleared (tail path) there is
+/// no alignment requirement.
+#[cfg(target_os = "linux")]
+fn pwrite_all(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    while !buf.is_empty() {
+        let n = file.write_at(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "O_DIRECT positioned write wrote 0 bytes",
+            ));
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// Never let an O_DIRECT write error reach `to_file_error` as `InvalidInput`:
+/// that maps to `FileNotFound` and would masquerade as a missing shard,
+/// triggering a spurious EC rebuild (backlog#897 / issue correction #2). Any
+/// EINVAL/EOPNOTSUPP surfacing from a flush is remapped to a generic error so
+/// the write-quorum machinery treats it as the real write failure it is.
+#[cfg(target_os = "linux")]
+fn sanitize_direct_write_error(err: std::io::Error) -> std::io::Error {
+    if is_direct_io_unsupported(&err) {
+        std::io::Error::other(format!("O_DIRECT shard write failed: {err}"))
+    } else {
+        err
+    }
+}
+
+/// Owned O_DIRECT write state moved in and out of the `spawn_blocking` flush
+/// closures so the reactor is never blocked on synchronous device I/O.
+#[cfg(target_os = "linux")]
+struct DirectWriteInner {
+    file: std::fs::File,
+    /// Aligned bounce buffer; its capacity (`buf.len`) is a whole multiple of
+    /// `align`.
+    buf: AlignedBuf,
+    /// Bytes currently staged in `buf` and not yet written to the device.
+    filled: usize,
+    /// Next file offset for an O_DIRECT positioned write; always a multiple of
+    /// `align` because every batch flushed before the tail is a whole multiple.
+    write_offset: u64,
+    align: usize,
+    direct_cleared: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl DirectWriteInner {
+    /// Flush a full staging batch (`filled == buf capacity`, a multiple of
+    /// `align`) straight to the device with O_DIRECT.
+    fn flush_batch(&mut self) -> std::io::Result<()> {
+        if self.filled == 0 {
+            return Ok(());
+        }
+        debug_assert_eq!(self.filled % self.align, 0, "batch flush must be alignment-sized");
+        pwrite_all(&self.file, &self.buf.as_slice()[..self.filled], self.write_offset).map_err(sanitize_direct_write_error)?;
+        self.write_offset += self.filled as u64;
+        self.filled = 0;
+        Ok(())
+    }
+
+    /// Final flush at shutdown: write the aligned prefix with O_DIRECT, then the
+    /// sub-alignment tail buffered after clearing O_DIRECT (MinIO's recipe; the
+    /// tail is not separately fsynced — the commit-point `sync_dir_files`
+    /// fdatasync covers the whole file, issue correction #5).
+    fn finish(&mut self) -> std::io::Result<()> {
+        let (aligned, remainder) = direct_write_tail_split(self.filled, self.align);
+        if aligned > 0 {
+            pwrite_all(&self.file, &self.buf.as_slice()[..aligned], self.write_offset).map_err(sanitize_direct_write_error)?;
+            self.write_offset += aligned as u64;
+        }
+
+        if remainder > 0 {
+            self.clear_direct()?;
+            // Snapshot the slice bounds first to avoid borrowing `self.buf`
+            // while `self.file` is borrowed immutably below.
+            let start = aligned;
+            let end = self.filled;
+            pwrite_all(&self.file, &self.buf.as_slice()[start..end], self.write_offset)?;
+            self.write_offset += remainder as u64;
+        }
+        self.filled = 0;
+        Ok(())
+    }
+
+    /// Drop the O_DIRECT flag from the open file so the unaligned tail can be
+    /// written through the page cache without an alignment fault.
+    fn clear_direct(&mut self) -> std::io::Result<()> {
+        if self.direct_cleared {
+            return Ok(());
+        }
+        let flags = rustix::fs::fcntl_getfl(&self.file).map_err(std::io::Error::from)?;
+        rustix::fs::fcntl_setfl(&self.file, flags - rustix::fs::OFlags::DIRECT).map_err(std::io::Error::from)?;
+        self.direct_cleared = true;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+type DirectFlushHandle = tokio::task::JoinHandle<(DirectWriteInner, std::io::Result<()>)>;
+
+#[cfg(target_os = "linux")]
+enum DirectWriteState {
+    Idle(Option<DirectWriteInner>),
+    Busy(DirectFlushHandle),
+}
+
+/// Streaming O_DIRECT writer returned by `create_file` on Linux when the path
+/// is enabled and supported.
+///
+/// Incoming bytes are memcpy'd into an aligned bounce buffer (cheap, on the
+/// reactor); each full aligned batch and the shutdown tail are flushed on the
+/// blocking pool so the reactor never stalls on synchronous device I/O — the
+/// same offloading posture as the buffered `tokio::fs::File` writer it
+/// replaces. Durability is unchanged: no fsync happens here; the commit-point
+/// `sync_dir_files` fdatasync persists the file.
+#[cfg(target_os = "linux")]
+struct DirectWriter {
+    state: DirectWriteState,
+    shutdown_started: bool,
+    shutdown_done: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl DirectWriter {
+    fn new(inner: DirectWriteInner) -> Self {
+        Self {
+            state: DirectWriteState::Idle(Some(inner)),
+            shutdown_started: false,
+            shutdown_done: false,
+        }
+    }
+
+    /// Build a writer over an already-open plain file with a caller-chosen
+    /// alignment and staging capacity. Exercises the streaming/tail state
+    /// machine deterministically on CI filesystems that reject O_DIRECT
+    /// (tmpfs/overlayfs), where the production `open_direct_writer` would latch
+    /// off; `write_at`/`fcntl` behave identically on a buffered file.
+    #[cfg(test)]
+    fn from_std_file_for_test(file: std::fs::File, align: usize, capacity: usize) -> Self {
+        assert_eq!(capacity % align, 0, "test capacity must be an alignment multiple");
+        let buf = AlignedBuf::new(capacity, align).expect("aligned buffer allocation");
+        Self::new(DirectWriteInner {
+            file,
+            buf,
+            filled: 0,
+            write_offset: 0,
+            align,
+            direct_cleared: false,
+        })
+    }
+
+    /// Drive an in-flight flush to completion, returning the recovered inner
+    /// state. Returns `Pending`/errors verbatim; on success the state is left
+    /// `Idle`.
+    fn poll_drive_busy(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        if let DirectWriteState::Busy(handle) = &mut self.state {
+            let (inner, res) = match std::task::ready!(std::pin::Pin::new(handle).poll(cx)) {
+                Ok(pair) => pair,
+                Err(join_err) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::other(format!("O_DIRECT flush task failed: {join_err}"))));
+                }
+            };
+            self.state = DirectWriteState::Idle(Some(inner));
+            if self.shutdown_started {
+                self.shutdown_done = true;
+            }
+            res?;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncWrite for DirectWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        loop {
+            match &mut this.state {
+                DirectWriteState::Busy(_) => {
+                    std::task::ready!(this.poll_drive_busy(cx))?;
+                }
+                DirectWriteState::Idle(inner_opt) => {
+                    if buf.is_empty() {
+                        return std::task::Poll::Ready(Ok(0));
+                    }
+                    let inner = inner_opt.as_mut().expect("idle direct writer must hold inner state");
+                    let capacity = inner.buf.len;
+                    let space = capacity - inner.filled;
+                    let n = space.min(buf.len());
+                    let start = inner.filled;
+                    inner.buf.as_mut_slice()[start..start + n].copy_from_slice(&buf[..n]);
+                    inner.filled += n;
+
+                    if inner.filled == capacity {
+                        let mut inner = inner_opt.take().expect("idle direct writer must hold inner state");
+                        let handle = tokio::task::spawn_blocking(move || {
+                            let res = inner.flush_batch();
+                            (inner, res)
+                        });
+                        this.state = DirectWriteState::Busy(handle);
+                    }
+                    return std::task::Poll::Ready(Ok(n));
+                }
+            }
+        }
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        // Only drive an in-flight batch to completion. Sub-alignment staged
+        // bytes cannot be flushed mid-stream (they would misalign the next
+        // O_DIRECT offset); they are written by `poll_shutdown`.
+        self.get_mut().poll_drive_busy(cx)
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            match &mut this.state {
+                DirectWriteState::Busy(_) => {
+                    std::task::ready!(this.poll_drive_busy(cx))?;
+                }
+                DirectWriteState::Idle(inner_opt) => {
+                    if this.shutdown_done {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    let mut inner = inner_opt.take().expect("idle direct writer must hold inner state");
+                    this.shutdown_started = true;
+                    let handle = tokio::task::spawn_blocking(move || {
+                        let res = inner.finish();
+                        (inner, res)
+                    });
+                    this.state = DirectWriteState::Busy(handle);
+                }
+            }
+        }
+    }
+}
+
+/// Open a shard file for an O_DIRECT streaming write, probing DIO alignment on
+/// the freshly created file. Returns `Ok(None)` (with the state latched off and
+/// a one-time warning) when the filesystem rejects O_DIRECT, so the caller can
+/// fall back to the buffered writer without ever surfacing EINVAL.
+#[cfg(target_os = "linux")]
+fn open_direct_writer(file_path: &Path, state: &DirectIoWriteState) -> Result<Option<DirectWriter>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let open_result = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(file_path);
+
+    let file = match open_result {
+        Ok(file) => file,
+        Err(err) => {
+            if is_direct_io_unsupported(&err) {
+                state.supported.store(false, Ordering::Relaxed);
+                if !state.fallback_logged.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        event = EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %file_path.display(),
+                        error = ?err,
+                        "O_DIRECT write unavailable; falling back to buffered writes"
+                    );
+                }
+                return Ok(None);
+            }
+            // A genuine open failure (permissions, disk full, ...): map it as a
+            // normal file error so callers see the real cause.
+            return Err(to_file_error(err).into());
+        }
+    };
+
+    let align = *state.align.get_or_init(|| probe_direct_io_align(&file));
+    let capacity = direct_write_staging_capacity(align);
+    let buf = match AlignedBuf::new(capacity, align) {
+        Ok(buf) => buf,
+        Err(err) => return Err(to_file_error(err).into()),
+    };
+
+    Ok(Some(DirectWriter::new(DirectWriteInner {
+        file,
+        buf,
+        filled: 0,
+        write_offset: 0,
+        align,
+        direct_cleared: false,
+    })))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn mmap_page_size() -> Result<u64> {
+    static PAGE_SIZE: OnceLock<Option<u64>> = OnceLock::new();
+
+    PAGE_SIZE
+        .get_or_init(|| {
+            // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and only
+            // queries process-global OS configuration.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if page_size <= 0 {
+                return None;
+            }
+            u64::try_from(page_size).ok()
+        })
+        .ok_or_else(|| DiskError::other("failed to determine system page size"))
+}
+
+#[cfg(test)]
+static RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_rename_data_fail_before_old_metadata_backup(dst_path: &str) {
+    *RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
+        .lock()
+        .expect("test failpoint lock should not be poisoned") = Some(dst_path.to_string());
+}
+
+#[cfg(test)]
+fn should_fail_before_old_metadata_backup(dst_path: &str) -> bool {
+    let mut target = RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
+        .lock()
+        .expect("test failpoint lock should not be poisoned");
+    if target.as_deref() == Some(dst_path) {
+        target.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+fn should_fail_before_old_metadata_backup(_dst_path: &str) -> bool {
+    false
+}
+
+/// Commit-sequence points where the rename_data crash-consistency harness
+/// (rustfs/backlog#935, test plan in rustfs/backlog#896) can simulate an
+/// abrupt power loss.
+///
+/// Unlike [`should_fail_before_old_metadata_backup`], which exercises the
+/// graceful in-process rollback (delete the staged data dir, return an
+/// error), a crash point models a hard power loss: the commit sequence stops
+/// dead at the armed step with **no** cleanup, leaving the on-disk state
+/// exactly as the preceding steps left it. The harness then reopens the disk
+/// and asserts the raw state is coherent — the object reads back as either the
+/// old version or the new version, never a mixed or corrupt one — without any
+/// rollback code having run.
+///
+/// The variants are constructed at the real commit-path call sites in every
+/// build, but the arming static and [`should_crash_rename_data_at`] are
+/// `#[cfg(test)]`; in production the guard is a const-`false` no-op, so the
+/// injection points compile away to nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenameDataCrashPoint {
+    /// After the data dir has been renamed into its destination but before the
+    /// old-metadata rollback backup is written. xl.meta has not been committed
+    /// yet, so a crash here must leave the object readable as the old version.
+    AfterDataRename,
+    /// After the rollback backup is persisted, immediately before the xl.meta
+    /// commit rename that makes the new version visible. Still pre-commit, so a
+    /// crash here must also leave the object readable as the old version.
+    AfterBackupBeforeMetaCommit,
+}
+
+#[cfg(test)]
+static RENAME_DATA_CRASH_POINT: std::sync::Mutex<Option<(RenameDataCrashPoint, String)>> = std::sync::Mutex::new(None);
+
+/// Arm a one-shot crash injection: the next `rename_data` committing into
+/// `dst_path` stops at `point`. Consumed on the first match so it never leaks
+/// into an unrelated commit.
+#[cfg(test)]
+fn arm_rename_data_crash(point: RenameDataCrashPoint, dst_path: &str) {
+    *RENAME_DATA_CRASH_POINT
+        .lock()
+        .expect("test crash point lock should not be poisoned") = Some((point, dst_path.to_string()));
+}
+
+#[cfg(test)]
+fn should_crash_rename_data_at(point: RenameDataCrashPoint, dst_path: &str) -> bool {
+    let mut armed = RENAME_DATA_CRASH_POINT
+        .lock()
+        .expect("test crash point lock should not be poisoned");
+    if armed.as_ref().is_some_and(|(p, path)| *p == point && path == dst_path) {
+        armed.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn should_crash_rename_data_at(_point: RenameDataCrashPoint, _dst_path: &str) -> bool {
+    false
+}
 
 fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
     warn!(
@@ -130,6 +1254,28 @@ pub enum InternalBuf<'a> {
     Owned(Bytes),
 }
 
+/// Durability mode for `write_all_internal`.
+///
+/// `FileOnly` is reserved for tmp files the caller immediately renames away.
+/// The safe-rename recipe (file content fdatasync -> rename -> fsync of the
+/// destination parent directory) never needs the tmp directory entry to be
+/// durable: the rename removes it, and a crash before the rename means the
+/// operation was never acknowledged, so there is nothing to recover. Files
+/// that stay where they are written (format.json via `write_all_public`, the
+/// old-metadata rollback backup in `rename_data`, ...) must use `FileAndDir`
+/// so both the contents and the new directory entry survive power loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncMode {
+    /// No fsync; durability is not required (or drive sync is disabled).
+    None,
+    /// fdatasync the file contents, then fsync its parent directory.
+    FileAndDir,
+    /// fdatasync only the file contents. Only valid when the caller renames
+    /// the file away right after the write and fsyncs the rename
+    /// destination's parent directory before acknowledging.
+    FileOnly,
+}
+
 struct FileCacheReclaimWriter {
     inner: File,
     reclaim_len: usize,
@@ -143,6 +1289,63 @@ struct FileCacheReclaimReader {
     reclaim_len: usize,
     reclaim_on_drop: bool,
     reclaimed: bool,
+}
+
+struct StallTimeoutReader<R> {
+    inner: R,
+    timeout: Duration,
+    timer: Option<std::pin::Pin<Box<Sleep>>>,
+}
+
+impl<R> StallTimeoutReader<R> {
+    fn new(inner: R, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            timer: None,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for StallTimeoutReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(result) => {
+                self.timer = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => {
+                if self.timeout.is_zero() {
+                    return std::task::Poll::Pending;
+                }
+
+                if self.timer.is_none() {
+                    self.timer = Some(Box::pin(tokio::time::sleep(self.timeout)));
+                }
+
+                if let Some(timer) = self.timer.as_mut()
+                    && std::future::Future::poll(timer.as_mut(), cx).is_ready()
+                {
+                    self.timer = None;
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "local disk read stall timeout",
+                    )));
+                }
+
+                if buf.filled().len() > filled_before {
+                    self.timer = None;
+                }
+
+                std::task::Poll::Pending
+            }
+        }
+    }
 }
 
 fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
@@ -169,6 +1372,26 @@ fn bitrot_size_mismatch_retry_delay() -> Duration {
 
 fn is_bitrot_size_mismatch_error(err: &std::io::Error) -> bool {
     err.to_string().contains("bitrot shard file size mismatch")
+}
+
+fn is_bitrot_verification_error(err: &std::io::Error) -> bool {
+    is_bitrot_size_mismatch_error(err) || err.to_string().contains("bitrot hash mismatch")
+}
+
+fn metacache_write_error(err: rustfs_filemeta::Error) -> DiskError {
+    let err = DiskError::from(err);
+    if err.contains_io_error_kind(ErrorKind::BrokenPipe) {
+        DiskError::metacache_output_stream_closed()
+    } else {
+        err
+    }
+}
+
+async fn write_metacache_obj<W>(out: &mut MetacacheWriter<W>, obj: &MetaCacheEntry) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    out.write_obj(obj).await.map_err(metacache_write_error)
 }
 
 impl FileCacheReclaimReader {
@@ -247,11 +1470,11 @@ impl Drop for FileCacheReclaimReader {
     }
 }
 
-impl tokio::io::AsyncRead for FileCacheReclaimReader {
+impl AsyncRead for FileCacheReclaimReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
@@ -377,6 +1600,659 @@ fn should_reclaim_file_cache_after_read(length: usize) -> bool {
     length >= threshold
 }
 
+/// Write-open semantics for [`LocalIoBackend::open_write`].
+///
+/// `Truncate` mirrors `DiskAPI::create_file` (O_CREATE|O_WRONLY|O_TRUNC, no
+/// volume access check, cache-reclaim writer); `Append` mirrors
+/// `DiskAPI::append_file` (O_CREATE|O_APPEND|O_WRONLY, volume access check).
+/// The access-check asymmetry is preserved historical behavior.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WriteMode {
+    Truncate { size_hint: i64 },
+    Append,
+}
+
+/// Local-disk file I/O backend behind [`LocalDisk`].
+///
+/// Models the real per-file operations of the `DiskAPI` hot path so an
+/// alternative backend (e.g. a runtime-probed io_uring implementation) can be
+/// swapped in without touching callers. The default [`StdBackend`] preserves
+/// the pre-trait behavior byte-for-byte. Commit-point durability
+/// (fdatasync -> rename -> fsync-dir in `rename_data`) is deliberately NOT
+/// part of this trait.
+#[async_trait::async_trait]
+pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
+    /// Positioned whole-range read returning owned bytes
+    /// (mirrors `read_file_mmap_copy_with_metrics`).
+    async fn pread_bytes(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes>;
+
+    /// Open a bounded streaming reader over `offset..offset+length`
+    /// (mirrors `read_file_stream`).
+    async fn open_read_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
+
+    /// Open a whole-file streaming reader (mirrors `read_file`).
+    async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader>;
+
+    /// Open a writer (mirrors `create_file`/`append_file` per [`WriteMode`]).
+    async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter>;
+}
+
+/// Default [`LocalIoBackend`]: tokio blocking-pool file I/O plus the
+/// mmap-copy / direct-read-copy positioned read, moved verbatim from the
+/// former `DiskAPI` method bodies on `LocalDisk`.
+#[derive(Debug)]
+pub(crate) struct StdBackend {
+    root: PathBuf,
+    #[cfg(target_os = "linux")]
+    direct_io: Arc<DirectIoReadState>,
+    #[cfg(target_os = "linux")]
+    direct_io_write: Arc<DirectIoWriteState>,
+}
+
+impl StdBackend {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            #[cfg(target_os = "linux")]
+            direct_io: Arc::new(DirectIoReadState::new()),
+            #[cfg(target_os = "linux")]
+            direct_io_write: Arc::new(DirectIoWriteState::new()),
+        }
+    }
+
+    async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
+        let mut skip_parent = skip_parent.as_ref();
+        if skip_parent.as_os_str().is_empty() {
+            skip_parent = self.root.as_path();
+        }
+
+        if let Some(parent) = path.as_ref().parent()
+            && parent != skip_parent
+        {
+            os::make_dir_all(parent, skip_parent).await?;
+        }
+
+        let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;
+
+        Ok(f)
+    }
+
+    async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
+        let f = super::fs::open_file(path.as_ref(), O_RDONLY).await.map_err(to_file_error)?;
+        Ok(f)
+    }
+}
+
+#[async_trait::async_trait]
+impl LocalIoBackend for StdBackend {
+    /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
+    // SAFETY: Unix unsafe calls in this function only query page size and mmap
+    // a read-only file region after bounds and alignment are validated.
+    #[allow(unsafe_code)]
+    async fn pread_bytes(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        let metrics = metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
+        let metrics_enabled = metrics.is_some();
+
+        let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
+        let Some(end_offset) = offset.checked_add(length) else {
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+            }
+            return Err(DiskError::FileCorrupt);
+        };
+
+        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
+        // Non-Unix: fall back to efficient read
+        #[cfg(unix)]
+        {
+            use memmap2::MmapOptions;
+            use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+            struct MmapCopyReadResult {
+                bytes: Bytes,
+                access_check_duration: StdDuration,
+                path_resolve_duration: StdDuration,
+                metadata_lookup_duration: StdDuration,
+                metadata_validate_duration: StdDuration,
+                file_open_duration: StdDuration,
+                mmap_map_duration: StdDuration,
+                mmap_copy_duration: StdDuration,
+                direct_read_copy_duration: StdDuration,
+                mmap_map_fault_delta: MmapPageFaultDelta,
+                mmap_copy_fault_delta: MmapPageFaultDelta,
+                direct_read_copy_fault_delta: MmapPageFaultDelta,
+                blocking_task_duration: StdDuration,
+                used_direct_io: bool,
+            }
+
+            enum MmapCopyReadError {
+                Disk(DiskError),
+                OutOfBounds { actual_size: u64 },
+            }
+
+            impl From<DiskError> for MmapCopyReadError {
+                fn from(err: DiskError) -> Self {
+                    Self::Disk(err)
+                }
+            }
+
+            let start = StdInstant::now();
+            let root = self.root.clone();
+            let volume_owned = volume.to_owned();
+            let path_owned = path.to_owned();
+
+            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
+            let should_populate_mmap_read = should_populate_mmap_read(length);
+            let read_copy_method = local_read_copy_method();
+            #[cfg(target_os = "linux")]
+            let direct_io_eligible = is_direct_io_read_enabled() && length > 0 && length >= get_direct_io_read_threshold();
+            #[cfg(target_os = "linux")]
+            let direct_io_state = self.direct_io.clone();
+            let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
+            let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
+            let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
+            let read_result = tokio::task::spawn_blocking(move || {
+                let blocking_task_start = metrics_enabled.then(StdInstant::now);
+
+                let access_check_start = metrics_enabled.then(StdInstant::now);
+                let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
+                if !skip_access_checks(&volume_owned) {
+                    access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+                }
+                let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let path_resolve_start = metrics_enabled.then(StdInstant::now);
+                let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
+                check_path_length(file_path.to_string_lossy().as_ref())?;
+                let path_resolve_duration = path_resolve_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let file_open_start = metrics_enabled.then(StdInstant::now);
+                let mut file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
+                let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
+                let meta = file.metadata().map_err(DiskError::from)?;
+                let metadata_lookup_duration = metadata_lookup_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let metadata_validate_start = metrics_enabled.then(StdInstant::now);
+                if meta.len() < end_offset_u64 {
+                    return Err(MmapCopyReadError::OutOfBounds { actual_size: meta.len() });
+                }
+                let metadata_validate_duration =
+                    metadata_validate_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                #[cfg(target_os = "macos")]
+                if should_reclaim_after_read {
+                    let _ = set_std_fd_nocache(&file);
+                }
+
+                let mut mmap_map_duration = StdDuration::ZERO;
+                let mut mmap_copy_duration = StdDuration::ZERO;
+                let mut direct_read_copy_duration = StdDuration::ZERO;
+                let mut mmap_map_fault_delta = MmapPageFaultDelta::default();
+                let mut mmap_copy_fault_delta = MmapPageFaultDelta::default();
+                let mut direct_read_copy_fault_delta = MmapPageFaultDelta::default();
+                let mut _reclaim_offset = offset_u64;
+                let mut _reclaim_len = length;
+
+                #[cfg(target_os = "linux")]
+                let mut direct_io_bytes: Option<Bytes> = None;
+                #[cfg(not(target_os = "linux"))]
+                let direct_io_bytes: Option<Bytes> = None;
+                #[cfg(target_os = "linux")]
+                if direct_io_eligible && direct_io_state.supported.load(Ordering::Relaxed) {
+                    let direct_start = metrics_enabled.then(StdInstant::now);
+                    let direct_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                    match pread_direct_aligned(&file_path, offset_u64, length, &direct_io_state) {
+                        Ok(bytes) => {
+                            let direct_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                            direct_read_copy_duration = direct_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                            direct_read_copy_fault_delta = mmap_page_fault_delta(direct_faults_before, direct_faults_after);
+                            direct_io_bytes = Some(bytes);
+                        }
+                        Err(err) => {
+                            // Never surface O_DIRECT errors: EINVAL maps to
+                            // FileNotFound in to_file_error and would trigger a
+                            // spurious EC rebuild. Latch off on unsupported
+                            // filesystems; otherwise retry buffered this once.
+                            if is_direct_io_unsupported(&err) {
+                                direct_io_state.supported.store(false, Ordering::Relaxed);
+                            }
+                            if !direct_io_state.fallback_logged.swap(true, Ordering::Relaxed) {
+                                warn!(
+                                    event = EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                    path = %file_path.display(),
+                                    error = ?err,
+                                    "O_DIRECT read unavailable; falling back to buffered reads"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let used_direct_io = direct_io_bytes.is_some();
+                let bytes = if let Some(bytes) = direct_io_bytes {
+                    bytes
+                } else {
+                    match read_copy_method {
+                        LocalReadCopyMethod::MmapCopy => {
+                            // mmap offsets on Unix must be page-size aligned. Align the
+                            // mapping down to the nearest page boundary, then slice out the
+                            // originally requested logical range.
+                            let page_size = mmap_page_size()?;
+                            let aligned_offset = offset_u64 - (offset_u64 % page_size);
+                            let logical_offset = usize::try_from(offset_u64 - aligned_offset)
+                                .map_err(|_| DiskError::other("mmap offset overflow"))?;
+                            let map_len = logical_offset
+                                .checked_add(length)
+                                .ok_or_else(|| DiskError::other("mmap length overflow"))?;
+                            _reclaim_offset = aligned_offset;
+                            _reclaim_len = map_len;
+
+                            // SAFETY: The file is opened as read-only, and we're mapping a region
+                            // that we've already verified exists and is within file bounds. The
+                            // file offset passed to mmap is page-size aligned as required on Unix.
+                            let mmap_map_start = metrics_enabled.then(StdInstant::now);
+                            let mmap_map_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                            let mut mmap_options = MmapOptions::new();
+                            mmap_options.offset(aligned_offset).len(map_len);
+                            if should_populate_mmap_read {
+                                mmap_options.populate();
+                            }
+                            let mmap = unsafe { mmap_options.map(&file) }.map_err(DiskError::other)?;
+                            let mmap_map_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                            mmap_map_duration = mmap_map_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                            mmap_map_fault_delta = mmap_page_fault_delta(mmap_map_faults_before, mmap_map_faults_after);
+
+                            // Copy only the requested logical range into a Bytes buffer. This
+                            // avoids undefined behavior from treating OS-managed mmap memory as
+                            // allocator-managed Vec storage, at the cost of an extra copy.
+                            let end = logical_offset
+                                .checked_add(length)
+                                .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                            let mmap_copy_start = metrics_enabled.then(StdInstant::now);
+                            let mmap_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                            let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
+                            let mmap_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                            mmap_copy_duration = mmap_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                            mmap_copy_fault_delta = mmap_page_fault_delta(mmap_copy_faults_before, mmap_copy_faults_after);
+                            bytes
+                        }
+                        LocalReadCopyMethod::DirectReadCopy => {
+                            use std::io::{Read as _, Seek as _};
+
+                            let direct_read_copy_start = metrics_enabled.then(StdInstant::now);
+                            let direct_read_copy_faults_before = read_mmap_page_fault_counts(metrics_enabled);
+                            file.seek(SeekFrom::Start(offset_u64)).map_err(DiskError::from)?;
+                            let mut buffer = vec![0; length];
+                            file.read_exact(&mut buffer).map_err(DiskError::from)?;
+                            let direct_read_copy_faults_after = read_mmap_page_fault_counts(metrics_enabled);
+                            direct_read_copy_duration =
+                                direct_read_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                            direct_read_copy_fault_delta =
+                                mmap_page_fault_delta(direct_read_copy_faults_before, direct_read_copy_faults_after);
+                            Bytes::from(buffer)
+                        }
+                    }
+                };
+
+                #[cfg(target_os = "linux")]
+                if should_reclaim_after_read && _reclaim_len > 0 {
+                    use core::num::NonZeroU64;
+                    use rustix::fs::{Advice, fadvise};
+
+                    let reclaim_len = NonZeroU64::new(
+                        u64::try_from(_reclaim_len).map_err(|_| DiskError::other("read reclaim length overflow"))?,
+                    )
+                    .ok_or_else(|| DiskError::other("read reclaim length overflow"))?;
+                    fadvise(&file, _reclaim_offset, Some(reclaim_len), Advice::DontNeed)
+                        .map_err(std::io::Error::from)
+                        .map_err(DiskError::from)?;
+                }
+
+                let blocking_task_duration = blocking_task_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                Ok::<MmapCopyReadResult, MmapCopyReadError>(MmapCopyReadResult {
+                    bytes,
+                    access_check_duration,
+                    path_resolve_duration,
+                    metadata_lookup_duration,
+                    metadata_validate_duration,
+                    file_open_duration,
+                    mmap_map_duration,
+                    mmap_copy_duration,
+                    direct_read_copy_duration,
+                    mmap_map_fault_delta,
+                    mmap_copy_fault_delta,
+                    direct_read_copy_fault_delta,
+                    blocking_task_duration,
+                    used_direct_io,
+                })
+            })
+            .await
+            .map_err(DiskError::from)
+            .map_err(MmapCopyReadError::Disk)
+            .and_then(|result| result);
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.blocking_wait_stage, blocking_wait_start);
+            }
+            let read_result = match read_result {
+                Ok(read_result) => read_result,
+                Err(MmapCopyReadError::Disk(err)) => return Err(err),
+                Err(MmapCopyReadError::OutOfBounds { actual_size }) => {
+                    error!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        volume,
+                        path,
+                        offset,
+                        length,
+                        actual_size,
+                        reason = "read_file_mmap_copy_out_of_bounds",
+                        "Disk local read fallback failed"
+                    );
+                    return Err(DiskError::FileCorrupt);
+                }
+            };
+            if metrics_enabled && let Some(metrics) = metrics {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.blocking_task_stage,
+                    read_result.blocking_task_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.access_check_stage,
+                    read_result.access_check_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.path_resolve_stage,
+                    read_result.path_resolve_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.metadata_lookup_stage,
+                    read_result.metadata_lookup_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.metadata_validate_stage,
+                    read_result.metadata_validate_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.file_open_stage,
+                    read_result.file_open_duration.as_secs_f64(),
+                );
+                if read_result.used_direct_io {
+                    rustfs_io_metrics::record_get_object_stage_duration(
+                        metrics.path,
+                        metrics.direct_read_copy_stage,
+                        read_result.direct_read_copy_duration.as_secs_f64(),
+                    );
+                    record_direct_read_page_fault_delta(
+                        metrics.path,
+                        metrics.direct_read_copy_stage,
+                        read_result.direct_read_copy_fault_delta,
+                    );
+                } else {
+                    match read_copy_method {
+                        LocalReadCopyMethod::MmapCopy => {
+                            rustfs_io_metrics::record_get_object_stage_duration(
+                                metrics.path,
+                                metrics.mmap_map_stage,
+                                read_result.mmap_map_duration.as_secs_f64(),
+                            );
+                            rustfs_io_metrics::record_get_object_stage_duration(
+                                metrics.path,
+                                metrics.mmap_copy_stage,
+                                read_result.mmap_copy_duration.as_secs_f64(),
+                            );
+                            record_mmap_page_fault_delta(metrics.path, metrics.mmap_map_stage, read_result.mmap_map_fault_delta);
+                            record_mmap_page_fault_delta(
+                                metrics.path,
+                                metrics.mmap_copy_stage,
+                                read_result.mmap_copy_fault_delta,
+                            );
+                        }
+                        LocalReadCopyMethod::DirectReadCopy => {
+                            rustfs_io_metrics::record_get_object_stage_duration(
+                                metrics.path,
+                                metrics.direct_read_copy_stage,
+                                read_result.direct_read_copy_duration.as_secs_f64(),
+                            );
+                            record_direct_read_page_fault_delta(
+                                metrics.path,
+                                metrics.direct_read_copy_stage,
+                                read_result.direct_read_copy_fault_delta,
+                            );
+                        }
+                    }
+                }
+            }
+            let bytes = read_result.bytes;
+
+            // Log successful mmap read metrics
+            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            // Record mmap read metrics
+            rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
+
+            debug!(
+                size = length,
+                duration_ms = duration_ms,
+                mmap_populate = should_populate_mmap_read,
+                read_copy_method = ?read_copy_method,
+                "mmap_read_success"
+            );
+
+            return Ok(bytes);
+        }
+
+        // Non-Unix fallback: efficient read into Bytes
+        #[cfg(not(unix))]
+        {
+            // Record zero-copy fallback
+            rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
+
+            debug!(reason = "non_unix_platform", "zero_copy_fallback");
+
+            let access_check_start = metrics_enabled.then(std::time::Instant::now);
+            let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+            if !skip_access_checks(volume) {
+                access(&volume_dir)
+                    .await
+                    .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+            }
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.access_check_stage, access_check_start);
+            }
+
+            let path_resolve_start = metrics_enabled.then(std::time::Instant::now);
+            let file_path = local_disk_object_path(&self.root, volume, path)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.path_resolve_stage, path_resolve_start);
+            }
+
+            let file_path_clone = file_path.clone();
+            let metadata_lookup_start = metrics_enabled.then(std::time::Instant::now);
+            let meta_result = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
+                .await
+                .map_err(DiskError::from)
+                .and_then(|result| result);
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_lookup_stage, metadata_lookup_start);
+            }
+            let meta = meta_result?;
+
+            let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
+            if meta.len() < end_offset as u64 {
+                if let Some(metrics) = metrics {
+                    record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+                }
+                error!(
+                    event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    volume,
+                    path,
+                    offset,
+                    length,
+                    actual_size = meta.len(),
+                    reason = "read_file_mmap_copy_out_of_bounds",
+                    "Disk local read fallback failed"
+                );
+                return Err(DiskError::FileCorrupt);
+            }
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+            }
+
+            let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+
+            if offset > 0 {
+                f.seek(SeekFrom::Start(offset as u64)).await?;
+            }
+
+            let mut buffer = vec![0; length];
+            f.read_exact(&mut buffer).await?;
+
+            Ok(Bytes::from(buffer))
+        }
+    }
+
+    async fn open_read_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
+        let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+        if !skip_access_checks(volume) {
+            access(&volume_dir)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+
+        let file_path = local_disk_object_path(&self.root, volume, path)?;
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+
+        let mut f = self.open_file_read_only(file_path).await?;
+
+        let meta = f.metadata().await?;
+        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+        if meta.len() < end_offset as u64 {
+            error!(
+                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                path,
+                offset,
+                length,
+                actual_size = meta.len(),
+                reason = "read_file_stream_out_of_bounds",
+                "Disk local read fallback failed"
+            );
+            return Err(DiskError::FileCorrupt);
+        }
+
+        if offset > 0 {
+            f.seek(SeekFrom::Start(offset as u64)).await?;
+        }
+
+        let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
+        let reader = FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop);
+        Ok(Box::new(StallTimeoutReader::new(reader, get_object_disk_read_timeout())))
+    }
+
+    async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader> {
+        let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+        if !skip_access_checks(volume) {
+            access(&volume_dir)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+
+        let file_path = local_disk_object_path(&self.root, volume, path)?;
+        check_path_length(file_path.to_string_lossy().as_ref())?;
+
+        let f = self.open_file_read_only(file_path).await?;
+
+        Ok(Box::new(f))
+    }
+
+    async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
+        match mode {
+            WriteMode::Truncate { size_hint } => {
+                let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+                let file_path = local_disk_object_path(&self.root, volume, path)?;
+                check_path_length(file_path.to_string_lossy().as_ref())?;
+
+                if let Some(parent) = file_path.parent() {
+                    os::make_dir_all(parent, &volume_dir).await?;
+                }
+
+                // O_DIRECT streaming write (Linux, opt-in): shard bytes stream
+                // straight to the device so the commit-point fdatasync no longer
+                // flushes the whole shard's dirty pages inside the rename_data
+                // critical section. Latches off and falls back to the buffered
+                // writer on filesystems that reject O_DIRECT; never surfaces the
+                // EINVAL (which would masquerade as a missing shard).
+                #[cfg(target_os = "linux")]
+                if is_direct_io_write_enabled() && self.direct_io_write.supported.load(Ordering::Relaxed) {
+                    let write_state = self.direct_io_write.clone();
+                    let direct_path = file_path.clone();
+                    let direct = tokio::task::spawn_blocking(move || open_direct_writer(&direct_path, &write_state))
+                        .await
+                        .map_err(|err| DiskError::other(format!("O_DIRECT open task failed: {err}")))??;
+                    if let Some(writer) = direct {
+                        return Ok(Box::new(writer));
+                    }
+                }
+
+                // O_TRUNC: if a file already exists at this path, stale trailing bytes past
+                // the new content would otherwise survive and mismatch the metadata size.
+                let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY | O_TRUNC)
+                    .await
+                    .map_err(to_file_error)?;
+                let reclaim_on_shutdown = should_reclaim_file_cache_after_write(size_hint);
+
+                Ok(Box::new(FileCacheReclaimWriter::new(f, size_hint.max(0) as usize, reclaim_on_shutdown)))
+            }
+            WriteMode::Append => {
+                let volume_dir = local_disk_bucket_path(&self.root, volume)?;
+                if !skip_access_checks(volume) {
+                    access(&volume_dir)
+                        .await
+                        .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+                }
+
+                let file_path = local_disk_object_path(&self.root, volume, path)?;
+                check_path_length(file_path.to_string_lossy().as_ref())?;
+
+                let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
+
+                Ok(Box::new(f))
+            }
+        }
+    }
+}
+
 pub struct LocalDisk {
     pub root: PathBuf,
     pub format_path: PathBuf,
@@ -389,6 +2265,7 @@ pub struct LocalDisk {
     pub major: u64,
     pub minor: u64,
     pub nrrequests: u64,
+    scan_locks: Arc<ParkingLotMutex<HashSet<(String, String)>>>,
     // Performance optimization fields
     path_cache: Arc<ParkingLotRwLock<HashMap<String, PathBuf>>>,
     current_dir: Arc<OnceLock<PathBuf>>,
@@ -399,6 +2276,7 @@ pub struct LocalDisk {
     startup_cleanup_ready: Arc<AtomicU32>,
     startup_cleanup_notify: Arc<Notify>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
+    io_backend: Arc<dyn LocalIoBackend>,
 }
 
 impl Drop for LocalDisk {
@@ -575,6 +2453,14 @@ impl LocalDisk {
                                 Vec::new()
                             }
                         };
+                        // An erasure-set heal drops a marker on the disks it is
+                        // rebuilding (see rustfs-heal); surface it so scanner
+                        // coordination, lock selection and admin/metrics see
+                        // the rebuild. Refreshed with this cache (~1s).
+                        let healing =
+                            tokio::fs::try_exists(root.join(super::RUSTFS_META_BUCKET).join(super::HEALING_MARKER_PATH))
+                                .await
+                                .unwrap_or(false);
                         let disk_info = DiskInfo {
                             total: info.total,
                             free: info.free,
@@ -587,13 +2473,13 @@ impl LocalDisk {
                             root_disk: is_root_disk,
                             physical_device_ids,
                             id: disk_id,
+                            healing,
                             ..Default::default()
                         };
                         // if root {
                         //     return Err(Error::new(DiskError::DriveIsRoot));
                         // }
 
-                        // disk_info.healing =
                         Ok(disk_info)
                     }
                     Err(err) => Err(err.into()),
@@ -617,6 +2503,7 @@ impl LocalDisk {
             minor: Default::default(),
             major: Default::default(),
             nrrequests: Default::default(),
+            scan_locks: Arc::new(ParkingLotMutex::new(HashSet::new())),
             // // format_legacy,
             // format_file_info: Mutex::new(format_meta),
             // format_data: Mutex::new(format_data),
@@ -626,6 +2513,7 @@ impl LocalDisk {
             startup_cleanup_ready,
             startup_cleanup_notify,
             exit_signal: None,
+            io_backend: Arc::new(StdBackend::new(root.clone())),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
             log_startup_disk_error("get_disk_info", &root, err);
@@ -867,7 +2755,8 @@ impl LocalDisk {
             return false;
         }
 
-        if cfg!(target_os = "windows") {
+        #[cfg(target_os = "windows")]
+        {
             // Windows volume names must not include reserved characters.
             // This regular expression matches disallowed characters.
             if volname.contains('|')
@@ -881,8 +2770,6 @@ impl LocalDisk {
             {
                 return false;
             }
-        } else {
-            // Non-Windows systems may require additional validation rules.
         }
 
         true
@@ -890,7 +2777,7 @@ impl LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn check_format_json(&self) -> Result<Metadata> {
-        let md = std::fs::metadata(&self.format_path).map_err(to_unformatted_disk_error)?;
+        let md = fs::metadata(&self.format_path).await.map_err(to_unformatted_disk_error)?;
         Ok(md)
     }
     async fn make_meta_volumes(&self) -> Result<()> {
@@ -961,41 +2848,35 @@ impl LocalDisk {
 
     // Get the absolute path of an object
     pub fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
-        // For high-frequency paths, use faster string concatenation
-        let cache_key = if key.is_empty() {
-            bucket.to_string()
-        } else {
-            path_join_buf(&[bucket, key])
-        };
-
-        #[cfg(windows)]
-        let path = self.root.join(cache_key.replace('/', "\\"));
-        #[cfg(not(windows))]
-        let path = self.root.join(cache_key);
-
-        self.check_valid_path(&path)?;
-        Ok(path)
+        local_disk_object_path(&self.root, bucket, key)
     }
 
     // Get the absolute path of a bucket
     pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
-        #[cfg(windows)]
-        let bucket_path = self.root.join(bucket.replace('/', "\\"));
-        #[cfg(not(windows))]
-        let bucket_path = self.root.join(bucket);
-
-        self.check_valid_path(&bucket_path)?;
-        Ok(bucket_path)
+        local_disk_bucket_path(&self.root, bucket)
     }
 
     // Check if a path is valid
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = normalize_path_components(path);
-        if path.starts_with(&self.root) {
-            Ok(())
-        } else {
-            Err(DiskError::InvalidPath)
+        check_local_disk_valid_path(&self.root, path)
+    }
+
+    fn reject_symlink_components(&self, path: &Path) -> Result<()> {
+        reject_local_disk_symlink_components(&self.root, path)
+    }
+
+    fn try_acquire_scan_lock(&self, opts: &WalkDirOptions) -> Result<LocalScanLockGuard> {
+        let key = local_disk_scan_lock_key(&opts.bucket, &opts.base_dir, opts.filter_prefix.as_deref());
+        let mut scan_locks = self.scan_locks.lock();
+
+        if !scan_locks.insert(key.clone()) {
+            return Err(DiskError::DiskOngoingReq);
         }
+
+        Ok(LocalScanLockGuard {
+            scan_locks: Arc::clone(&self.scan_locks),
+            key,
+        })
     }
 
     // Batch path generation with single lock acquisition
@@ -1102,14 +2983,30 @@ impl LocalDisk {
 
         if let Some(err) = err {
             if err == Error::DiskFull {
+                // Out of space to stage the trash rename: fall back to an in-place
+                // remove and propagate any failure from that remove.
                 if recursive {
                     remove_all_std(delete_path).map_err(to_volume_error)?;
                 } else {
                     remove_std(delete_path).map_err(to_file_error)?;
                 }
+
+                return Ok(());
             }
 
-            return Ok(());
+            // A missing source is benign (the object is already gone). Both the
+            // recursive path (rename_all_ignore_missing_source) and the
+            // non-recursive NotFound arm above already fold that case into `None`,
+            // but keep the guard explicit so a genuine rename failure is never
+            // reported as success. Every other error is a real failure: propagate
+            // it (already mapped by to_file_error, e.g. I/O -> FaultyDisk,
+            // permission -> FileAccessDenied) so callers can surface a faulty disk
+            // and trigger heal, matching MinIO's deleteFile.
+            if err == Error::FileNotFound {
+                return Ok(());
+            }
+
+            return Err(err);
         }
 
         Ok(())
@@ -1238,32 +3135,50 @@ impl LocalDisk {
         Ok((buf, mtime))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn read_metadata_with_dmtime(&self, file_path: impl AsRef<Path>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
         check_path_length(file_path.as_ref().to_string_lossy().as_ref())?;
 
-        let mut f = super::fs::open_file(file_path.as_ref(), O_RDONLY)
-            .await
-            .map_err(to_file_error)?;
+        // HP-12 item 1 (sub-change A): fold the open + fstat + bounded xl.meta
+        // read into a single spawn_blocking dispatch instead of three separate
+        // async fs hops. The closure mirrors the previous async body one-to-one,
+        // including every error mapping, so the returned Result stays
+        // byte-for-byte equivalent (see read_xl_meta_no_data_sync equivalence
+        // tests in rustfs-filemeta):
+        //  - open failure     -> to_file_error (was fs::open_file(..).map_err(to_file_error))
+        //  - is_dir           -> Error::FileNotFound (NOT to_file_error(EISDIR))
+        //  - metadata failure -> to_file_error
+        //  - parse failure    -> propagated verbatim from read_xl_meta_no_data_sync (`?`)
+        let path = file_path.as_ref().to_path_buf();
+        let (data, modtime) = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
+            // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
+            let mut f = std::fs::File::open(&path).map_err(to_file_error)?;
 
-        let meta = f.metadata().await.map_err(to_file_error)?;
+            let meta = f.metadata().map_err(to_file_error)?;
 
-        if meta.is_dir() {
-            // fix use io::Error
-            return Err(Error::FileNotFound);
-        }
+            if meta.is_dir() {
+                // fix use io::Error
+                return Err(Error::FileNotFound);
+            }
 
-        let size = meta.len() as usize;
+            let size = meta.len() as usize;
 
-        let data = read_xl_meta_no_data(&mut f, size).await?;
+            let data = read_xl_meta_no_data_sync(&mut f, size)?;
 
-        let modtime = match meta.modified() {
-            Ok(md) => Some(OffsetDateTime::from(md)),
-            Err(_) => None,
-        };
+            let modtime = match meta.modified() {
+                Ok(md) => Some(OffsetDateTime::from(md)),
+                Err(_) => None,
+            };
+
+            Ok((data, modtime))
+        })
+        .await
+        .map_err(DiskError::from)??;
 
         Ok((data, modtime))
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn read_all_data(&self, volume: &str, volume_dir: impl AsRef<Path>, file_path: impl AsRef<Path>) -> Result<Vec<u8>> {
         // TODO: timeout support
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
@@ -1277,9 +3192,60 @@ impl LocalDisk {
         volume_dir: impl AsRef<Path>,
         file_path: impl AsRef<Path>,
     ) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-        let mut f = match super::fs::open_file(file_path.as_ref(), O_RDONLY).await {
-            Ok(f) => f,
-            Err(e) => {
+        // HP-12 item 1 (sub-change A): fold open + fstat + is_dir + try_reserve +
+        // read_to_end into a single spawn_blocking dispatch. The closure mirrors
+        // the previous async body one-to-one so the returned Result stays
+        // byte-for-byte equivalent. Post-open errors are mapped to their final
+        // DiskError inside the closure (metadata/read -> to_file_error; is_dir ->
+        // FileNotFound; try_reserve -> Error::other) exactly as before. The raw
+        // open error is carried out unmapped so the async side can preserve the
+        // original NotFound -> access(volume_dir) -> VolumeNotFound fallback.
+        //
+        // Only the open() call can yield ErrorKind::NotFound here: once open
+        // succeeds the fd is valid, so fstat/read never return ENOENT. Hence
+        // gating the volume fallback on the open error alone is equivalent to
+        // the original code, where the fallback lived solely in the open match arm.
+        enum ReadAllError {
+            /// Raw, unmapped open() error; the async side decides the fallback.
+            Open(std::io::Error),
+            /// Already-mapped post-open error.
+            Disk(DiskError),
+        }
+
+        let path = file_path.as_ref().to_path_buf();
+        let res =
+            tokio::task::spawn_blocking(move || -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
+                // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
+                let mut f = std::fs::File::open(&path).map_err(ReadAllError::Open)?;
+
+                let meta = f.metadata().map_err(|e| ReadAllError::Disk(to_file_error(e).into()))?;
+
+                if meta.is_dir() {
+                    return Err(ReadAllError::Disk(DiskError::FileNotFound));
+                }
+
+                let size = meta.len() as usize;
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(size)
+                    .map_err(|e| ReadAllError::Disk(Error::other(e)))?;
+
+                std::io::Read::read_to_end(&mut f, &mut bytes).map_err(|e| ReadAllError::Disk(to_file_error(e).into()))?;
+
+                let modtime = match meta.modified() {
+                    Ok(md) => Some(OffsetDateTime::from(md)),
+                    Err(_) => None,
+                };
+
+                Ok((bytes, modtime))
+            })
+            .await
+            .map_err(DiskError::from)?;
+
+        let (bytes, modtime) = match res {
+            Ok(v) => v,
+            Err(ReadAllError::Disk(e)) => return Err(e),
+            Err(ReadAllError::Open(e)) => {
                 if e.kind() == ErrorKind::NotFound
                     && !skip_access_checks(volume)
                     && let Err(er) = access(volume_dir.as_ref()).await
@@ -1298,23 +3264,6 @@ impl LocalDisk {
 
                 return Err(to_file_error(e).into());
             }
-        };
-
-        let meta = f.metadata().await.map_err(to_file_error)?;
-
-        if meta.is_dir() {
-            return Err(DiskError::FileNotFound);
-        }
-
-        let size = meta.len() as usize;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(size).map_err(Error::other)?;
-
-        f.read_to_end(&mut bytes).await.map_err(to_file_error)?;
-
-        let modtime = match meta.modified() {
-            Ok(md) => Some(OffsetDateTime::from(md)),
-            Err(_) => None,
         };
 
         Ok((bytes, modtime))
@@ -1366,12 +3315,11 @@ impl LocalDisk {
             return Ok(());
         }
 
-        // Update xl.meta
+        // Update xl.meta atomically: a concurrent reader or crash mid-write must
+        // never observe a truncated xl.meta for versions that were not deleted.
         let buf = fm.marshal_msg()?;
 
-        let volume_dir = self.get_bucket_path(volume)?;
-
-        self.write_all_private(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), buf.into(), true, &volume_dir)
+        self.write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
             .await?;
 
         Ok(())
@@ -1385,10 +3333,29 @@ impl LocalDisk {
         let tmp_volume_dir = self.get_bucket_path(super::RUSTFS_META_TMP_BUCKET)?;
         let tmp_file_path = self.get_object_path(super::RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
-        self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), sync, &tmp_volume_dir)
+        let durability = effective_durability(volume);
+
+        // The tmp file is renamed to its final location right below, so only
+        // its contents must be durable here (SyncMode::FileOnly): the rename
+        // drops the tmp directory entry, and the destination parent directory
+        // is fsynced after the rename. Both are metadata commits, so relaxed
+        // tiers skip them.
+        let tmp_sync = if sync && durability.syncs_commit_metadata() {
+            SyncMode::FileOnly
+        } else {
+            SyncMode::None
+        };
+        self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), tmp_sync, &tmp_volume_dir)
             .await?;
 
         rename_all(tmp_file_path, &file_path, volume_dir).await?;
+
+        if sync
+            && durability.syncs_commit_metadata()
+            && let Some(parent) = file_path.parent()
+        {
+            os::fsync_dir(parent).await.map_err(to_file_error)?;
+        }
 
         Ok(())
     }
@@ -1402,14 +3369,23 @@ impl LocalDisk {
 
         let volume_dir = self.get_bucket_path(volume)?;
 
-        self.write_all_private(volume, path, data, true, &volume_dir).await?;
+        // Files written here (format.json, ...) stay where they land — no
+        // rename follows — so the new directory entry must be fsynced too.
+        // System-critical volumes are pinned to strict by effective_durability;
+        // only the legacy full-off switch (historical semantics) skips this.
+        let sync = if effective_durability(volume).syncs_commit_metadata() {
+            SyncMode::FileAndDir
+        } else {
+            SyncMode::None
+        };
+        self.write_all_private(volume, path, data, sync, &volume_dir).await?;
 
         Ok(())
     }
 
     // write_all_private with check_path_length
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: bool, skip_parent: &Path) -> Result<()> {
+    async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
@@ -1418,8 +3394,16 @@ impl LocalDisk {
 
         Ok(())
     }
-    // write_all_internal do write file
-    async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
+    // write_all_internal do write file.
+    // Executes the given SyncMode verbatim: durability policy (tier gating,
+    // system-critical pinning) is resolved by callers via effective_durability.
+    async fn write_all_internal(
+        &self,
+        file_path: &Path,
+        data: InternalBuf<'_>,
+        sync: SyncMode,
+        skip_parent: &Path,
+    ) -> Result<()> {
         let skip_parent = if skip_parent.as_os_str().is_empty() {
             self.root.as_path()
         } else {
@@ -1430,6 +3414,17 @@ impl LocalDisk {
             InternalBuf::Ref(buf) => {
                 let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
                 f.write_all(buf).await.map_err(to_file_error)?;
+                if sync != SyncMode::None {
+                    f.sync_data().await.map_err(to_file_error)?;
+                    // Persist the directory entry too, so a freshly created file
+                    // survives power loss along with its contents. Skipped for
+                    // FileOnly: the caller renames the file away immediately.
+                    if sync == SyncMode::FileAndDir
+                        && let Some(parent) = file_path.parent()
+                    {
+                        os::fsync_dir(parent).await.map_err(to_file_error)?;
+                    }
+                }
             }
             InternalBuf::Owned(buf) => {
                 let path = file_path.to_path_buf();
@@ -1444,10 +3439,21 @@ impl LocalDisk {
                         .create(true)
                         .write(true)
                         .truncate(true)
-                        .open(path)
+                        .open(&path)
                         .map_err(to_file_error)?;
 
                     std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
+                    if sync != SyncMode::None {
+                        f.sync_data().map_err(to_file_error)?;
+                        // See the Ref branch above: FileOnly callers rename the
+                        // file away, so the tmp directory entry never needs to
+                        // become durable.
+                        if sync == SyncMode::FileAndDir
+                            && let Some(parent) = path.parent()
+                        {
+                            os::fsync_dir_std(parent).map_err(to_file_error)?;
+                        }
+                    }
 
                     Ok::<(), std::io::Error>(())
                 })
@@ -1455,9 +3461,6 @@ impl LocalDisk {
                 .map_err(DiskError::from)??;
             }
         }
-
-        // Keep existing durability contract: this path intentionally ignores `sync`.
-        let _ = sync;
 
         Ok(())
     }
@@ -1489,14 +3492,7 @@ impl LocalDisk {
         DiskMetrics::default()
     }
 
-    async fn bitrot_verify(
-        &self,
-        part_path: &PathBuf,
-        part_size: usize,
-        algo: HashAlgorithm,
-        sum: &[u8],
-        shard_size: usize,
-    ) -> Result<()> {
+    async fn bitrot_verify(&self, part_path: &PathBuf, part_size: usize, algo: HashAlgorithm, shard_size: usize) -> Result<()> {
         let retry_count = bitrot_size_mismatch_retry_count();
         let retry_delay = bitrot_size_mismatch_retry_delay();
 
@@ -1505,16 +3501,7 @@ impl LocalDisk {
             let meta = file.metadata().await.map_err(to_file_error)?;
             let file_size = meta.len() as usize;
 
-            match bitrot_verify(
-                Box::new(file),
-                file_size,
-                part_size,
-                algo.clone(),
-                Bytes::copy_from_slice(sum),
-                shard_size,
-            )
-            .await
-            {
+            match bitrot_verify(Box::new(file), file_size, part_size, algo.clone(), shard_size).await {
                 Ok(()) => return Ok(()),
                 Err(err) if attempt < retry_count && is_bitrot_size_mismatch_error(&err) => {
                     info!(
@@ -1532,11 +3519,12 @@ impl LocalDisk {
                     );
                     tokio::time::sleep(retry_delay).await;
                 }
+                Err(err) if is_bitrot_verification_error(&err) => return Err(DiskError::FileCorrupt),
                 Err(err) => return Err(to_file_error(err).into()),
             }
         }
 
-        Err(DiskError::other("bitrot size mismatch retry loop exhausted"))
+        Err(DiskError::FileCorrupt)
     }
 
     #[async_recursion::async_recursion]
@@ -1666,11 +3654,14 @@ impl LocalDisk {
                     *objs_returned += 1;
                 }
 
-                out.write_obj(&MetaCacheEntry {
-                    name: name.clone(),
-                    metadata: metadata.to_vec(),
-                    ..Default::default()
-                })
+                write_metacache_obj(
+                    out,
+                    &MetaCacheEntry {
+                        name: name.clone(),
+                        metadata: metadata.to_vec(),
+                        ..Default::default()
+                    },
+                )
                 .await?;
 
                 continue;
@@ -1725,11 +3716,14 @@ impl LocalDisk {
             while let Some((last_name, _, _)) = dir_stack.last()
                 && *last_name < name
             {
-                let (pop, skip_object, dir_to_skip) = dir_stack.pop().unwrap();
-                out.write_obj(&MetaCacheEntry {
-                    name: pop.clone(),
-                    ..Default::default()
-                })
+                let (pop, skip_object, dir_to_skip) = dir_stack.pop().expect("operation should succeed");
+                write_metacache_obj(
+                    out,
+                    &MetaCacheEntry {
+                        name: pop.clone(),
+                        ..Default::default()
+                    },
+                )
                 .await?;
 
                 let scan_path = pop.clone();
@@ -1737,15 +3731,18 @@ impl LocalDisk {
                     && let Err(er) =
                         Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
                 {
-                    error!(
-                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                        path = %scan_path,
-                        operation = "scan_dir",
-                        error = ?er,
-                        "Disk local scan failed"
-                    );
+                    if !er.is_metacache_output_stream_closed() {
+                        error!(
+                            event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = %scan_path,
+                            operation = "scan_dir",
+                            error = ?er,
+                            "Disk local scan failed"
+                        );
+                    }
+                    return Err(er);
                 }
             }
 
@@ -1759,7 +3756,7 @@ impl LocalDisk {
             if let Some(_dir) = dir_objes.get(entry) {
                 is_dir_obj = true;
                 meta.name
-                    .truncate(meta.name.len() - meta.name.chars().last().unwrap().len_utf8());
+                    .truncate(meta.name.len() - meta.name.chars().last().expect("operation should succeed").len_utf8());
                 meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
             }
 
@@ -1774,9 +3771,9 @@ impl LocalDisk {
 
                     meta.metadata = res.to_vec();
 
-                    out.write_obj(&meta).await?;
+                    write_metacache_obj(out, &meta).await?;
 
-                    let file_meta = if opts.limit > 0 || opts.recursive {
+                    let file_meta = if opts.limit > 0 || opts.recursive || !is_dir_obj {
                         FileMeta::load(&res).ok()
                     } else {
                         None
@@ -1786,15 +3783,16 @@ impl LocalDisk {
                         *objs_returned += 1;
                     }
 
-                    if opts.recursive {
-                        let mut dir_to_skip = HashSet::new();
-                        if let Some(file_meta) = file_meta.as_ref()
-                            && let Ok(data_dirs) = file_meta.get_data_dirs()
-                        {
-                            for data_dir in data_dirs.iter().flatten() {
-                                dir_to_skip.insert(data_dir.to_string());
-                            }
+                    let mut dir_to_skip = HashSet::new();
+                    if let Some(file_meta) = file_meta.as_ref()
+                        && let Ok(data_dirs) = file_meta.get_data_dirs()
+                    {
+                        for data_dir in data_dirs.iter().flatten() {
+                            dir_to_skip.insert(data_dir.to_string());
                         }
+                    }
+
+                    if opts.recursive {
                         let mut dir_name = meta.name.clone();
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
@@ -1805,6 +3803,20 @@ impl LocalDisk {
                             true,
                             if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
                         );
+                    } else if !is_dir_obj
+                        && self
+                            .object_dir_has_listable_child(&opts.bucket, &meta.name, &dir_to_skip, opts.incl_deleted)
+                            .await?
+                    {
+                        // A plain object `a` shares its backing directory with any
+                        // children `a/...`, and non-recursive walks never descend into
+                        // it — so the prefix `a/` must be produced here or delimiter
+                        // listings lose the CommonPrefix (backlog#1042). Dir-marker
+                        // objects are excluded: their logical children live in a
+                        // separate real directory entry handled above.
+                        let mut dir_name = meta.name.clone();
+                        dir_name.push_str(SLASH_SEPARATOR);
+                        schedule_dir(&mut dir_stack, dir_name, true, None);
                     }
                 }
                 Err(err) => {
@@ -1813,11 +3825,29 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            schedule_dir(&mut dir_stack, meta.name, false, None);
+                            if opts.recursive
+                                || opts.incl_deleted
+                                || self
+                                    .directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted)
+                                    .await?
+                            {
+                                schedule_dir(&mut dir_stack, meta.name, false, None);
+                            }
                         }
+
+                        continue;
                     }
 
-                    continue;
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %fname,
+                        operation = "read_metadata",
+                        error = ?err,
+                        "Disk local scan failed"
+                    );
+                    return Err(err);
                 }
             };
         }
@@ -1827,10 +3857,13 @@ impl LocalDisk {
                 return Ok(());
             }
 
-            out.write_obj(&MetaCacheEntry {
-                name: dir.clone(),
-                ..Default::default()
-            })
+            write_metacache_obj(
+                out,
+                &MetaCacheEntry {
+                    name: dir.clone(),
+                    ..Default::default()
+                },
+            )
             .await?;
 
             let scan_path = dir.clone();
@@ -1838,19 +3871,160 @@ impl LocalDisk {
                 && let Err(er) =
                     Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
-                warn!(
-                    event = EVENT_DISK_LOCAL_SCAN_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    path = %scan_path,
-                    operation = "scan_dir",
-                    error = ?er,
-                    "Disk local recursive scan failed"
-                );
+                if !er.is_metacache_output_stream_closed() {
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %scan_path,
+                        operation = "scan_dir",
+                        error = ?er,
+                        "Disk local recursive scan failed"
+                    );
+                }
+                return Err(er);
             }
         }
 
         Ok(())
+    }
+
+    /// Whether the backing directory of plain object `object_name` also holds
+    /// listable children (`object_name/...`), beyond the object's own storage
+    /// internals: its `xl.meta` and the version data dirs in `data_dirs`.
+    ///
+    /// With `incl_deleted`, a child subtree counts as soon as it holds any
+    /// object metadata (versioned listings surface delete markers too);
+    /// otherwise the child must have a visible listing entry.
+    async fn object_dir_has_listable_child(
+        &self,
+        bucket: &str,
+        object_name: &str,
+        data_dirs: &HashSet<String>,
+        incl_deleted: bool,
+    ) -> Result<bool> {
+        // The backing dir usually holds only the xl.meta plus the version data
+        // dirs, so a read bounded just past that count decides the common case
+        // without materializing large child sets: an under-filled batch proves
+        // the listing is complete. Only an inconclusive full batch (candidates
+        // present but none listable yet) falls back to the unbounded read.
+        let bounded = i32::try_from(data_dirs.len() + 2).unwrap_or(-1);
+        let mut probed = HashSet::new();
+
+        for count in [bounded, -1] {
+            let entries = match self.list_dir("", bucket, object_name, count).await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    if err == DiskError::VolumeNotFound || err == Error::FileNotFound {
+                        return Ok(false);
+                    }
+
+                    return Err(err);
+                }
+            };
+
+            let complete = count < 0 || entries.len() < count as usize;
+
+            for entry in entries {
+                let Some(child) = entry.strip_suffix(SLASH_SEPARATOR) else {
+                    // Plain files (the object's own xl.meta) can never hold children.
+                    continue;
+                };
+
+                if child.is_empty() || data_dirs.contains(child) || !probed.insert(child.to_owned()) {
+                    continue;
+                }
+
+                let child_path = path_join_buf(&[object_name, child]);
+                if self.directory_has_listing_entry(bucket, &child_path, incl_deleted).await? {
+                    return Ok(true);
+                }
+            }
+
+            if complete {
+                break;
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Whether anything under `dir_name` would appear in a listing. With
+    /// `incl_deleted`, any `xl.meta` counts (versioned listings surface
+    /// delete-marker-only objects too); otherwise the metadata must hold a
+    /// visible version.
+    async fn directory_has_listing_entry(&self, bucket: &str, dir_name: &str, incl_deleted: bool) -> Result<bool> {
+        let mut stack = vec![dir_name.trim_matches('/').to_owned()];
+
+        while let Some(current) = stack.pop() {
+            if current.is_empty() {
+                continue;
+            }
+
+            let entries = match self.list_dir("", bucket, &current, -1).await {
+                Ok(entries) => entries,
+                Err(err) => {
+                    if err == DiskError::VolumeNotFound || err == Error::FileNotFound {
+                        continue;
+                    }
+
+                    return Err(err);
+                }
+            };
+
+            let mut data_dirs_to_skip = HashSet::new();
+            let mut child_dirs = Vec::new();
+
+            for entry in entries {
+                if entry == STORAGE_FORMAT_FILE {
+                    if incl_deleted {
+                        return Ok(true);
+                    }
+
+                    let metadata_path = path_join_buf(&[current.as_str(), STORAGE_FORMAT_FILE]);
+                    match self.read_metadata(bucket, metadata_path.as_str()).await {
+                        Ok(metadata) => {
+                            let file_meta = match FileMeta::load(&metadata) {
+                                Ok(file_meta) => file_meta,
+                                Err(_) => return Ok(true),
+                            };
+
+                            if file_meta_counts_toward_limit(&file_meta) {
+                                return Ok(true);
+                            }
+
+                            if let Ok(data_dirs) = file_meta.get_data_dirs() {
+                                for data_dir in data_dirs.iter().flatten() {
+                                    data_dirs_to_skip.insert(data_dir.to_string());
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if err != Error::FileNotFound && err != Error::IsNotRegular {
+                                return Err(err);
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+
+                if entry.ends_with(SLASH_SEPARATOR) {
+                    let child = entry.trim_end_matches(SLASH_SEPARATOR);
+                    if !child.is_empty() {
+                        child_dirs.push(child.to_owned());
+                    }
+                }
+            }
+
+            for child in child_dirs {
+                if !data_dirs_to_skip.contains(&child) {
+                    stack.push(path_join_buf(&[current.as_str(), child.as_str()]));
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 
@@ -1859,6 +4033,90 @@ pub struct ScanGuard(pub Arc<AtomicU32>);
 impl Drop for ScanGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+struct LocalScanLockGuard {
+    scan_locks: Arc<ParkingLotMutex<HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for LocalScanLockGuard {
+    fn drop(&mut self) {
+        self.scan_locks.lock().remove(&self.key);
+    }
+}
+
+fn local_disk_scan_lock_key(bucket: &str, base_dir: &str, filter_prefix: Option<&str>) -> (String, String) {
+    let mut prefix = base_dir.trim_matches('/').to_owned();
+    if let Some(filter_prefix) = filter_prefix
+        .map(|prefix| prefix.trim_matches('/'))
+        .filter(|prefix| !prefix.is_empty())
+    {
+        if prefix.is_empty() {
+            prefix.push_str(filter_prefix);
+        } else {
+            prefix.push_str(SLASH_SEPARATOR);
+            prefix.push_str(filter_prefix);
+        }
+    }
+
+    (bucket.to_owned(), prefix)
+}
+
+fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
+    if meta.versions.len() > 10 {
+        return None;
+    }
+
+    let mut signature = Vec::with_capacity(meta.versions.len() * 16);
+    for version in meta.versions.iter() {
+        signature.extend_from_slice(version.header.version_id.unwrap_or_default().as_bytes());
+    }
+    Some(signature)
+}
+
+/// rustfs/backlog#1009: observe the destination key's *current* (latest)
+/// version in the dst `xl.meta` that `rename_data` already loaded, before
+/// `add_version` commits the incoming one. Replicates the pre-PUT
+/// `get_object_info` outcome bit for bit, as the per-disk `read_version`
+/// pipeline (`get_file_info`) would report it:
+///
+/// - `dst_meta_existed == false` (no dst xl.meta on this disk): the lookup
+///   errors FileNotFound → app-level `None` → `Absent`.
+/// - Existing meta whose versions are all hidden free versions: the lookup
+///   errors FileNotFound the same way → `Absent`.
+/// - Existing meta with zero versions: `get_file_info` synthesizes a deleted
+///   `FileInfo` with size 0 and the lookup returns `Ok` → `Present(0)`.
+/// - A resolvable latest version — live object, delete marker, or a
+///   purge-pending version flagged `deleted` — returns `Ok` with
+///   `ObjectInfo.size == fi.size` (0 for markers) → `Present(fi.size)`.
+///   Delete markers deliberately do NOT map to `Absent`: today's lookup
+///   returns `Ok(size 0)` for them, and delete-marker creation never
+///   decrements `objects_count`, so `Some(0)` is what keeps versioned
+///   accounting bit-identical.
+/// - A latest version that fails to decode — including the part-array length
+///   guard that `all_parts=true` enables, the same flag the per-disk lookup
+///   uses — yields `None` (unknown): the old lookup surfaced a per-disk error
+///   there, so this disk must not vote in the set-level quorum reduction.
+///
+/// One deliberate divergence: `read_data` stays `false` (the lookup used
+/// `true`), so a corrupt inline-data map that would have errored the old
+/// lookup votes the version's own `size` here instead of abstaining. The
+/// size field decodes independently of the inline data, so the vote carries
+/// the same value healthy disks report, and skipping the lookup's inline
+/// bytes clone keeps the observation allocation-light.
+fn observe_old_current_size(dst_meta_existed: bool, xlmeta: &FileMeta) -> Option<OldCurrentSize> {
+    if !dst_meta_existed {
+        return Some(OldCurrentSize::Absent);
+    }
+    if xlmeta.versions.is_empty() {
+        return Some(OldCurrentSize::Present(0));
+    }
+    match xlmeta.into_fileinfo("", "", "", false, false, true) {
+        Ok(fi) => Some(OldCurrentSize::Present(fi.size)),
+        Err(rustfs_filemeta::Error::FileNotFound) => Some(OldCurrentSize::Absent),
+        Err(_) => None,
     }
 }
 
@@ -1940,6 +4198,62 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
     }
 
     false
+}
+
+fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
+    let cache_key = if key.is_empty() {
+        bucket.to_string()
+    } else {
+        path_join_buf(&[bucket, key])
+    };
+
+    #[cfg(windows)]
+    let path = root.join(cache_key.replace('/', "\\"));
+    #[cfg(not(windows))]
+    let path = root.join(cache_key);
+
+    check_local_disk_valid_path(root, &path)?;
+    Ok(path)
+}
+
+fn local_disk_bucket_path(root: &Path, bucket: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    let bucket_path = root.join(bucket.replace('/', "\\"));
+    #[cfg(not(windows))]
+    let bucket_path = root.join(bucket);
+
+    check_local_disk_valid_path(root, &bucket_path)?;
+    Ok(bucket_path)
+}
+
+fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()> {
+    let path = normalize_path_components(path);
+    if !path.starts_with(root) {
+        return Err(DiskError::InvalidPath);
+    }
+
+    reject_local_disk_symlink_components(root, &path)
+}
+
+fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| DiskError::InvalidPath)?;
+    let mut current = root.to_path_buf();
+
+    for component in relative.components() {
+        current.push(component.as_os_str());
+
+        match lstat_std(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(DiskError::InvalidPath);
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => break,
+            Err(err) => return Err(to_file_error(err).into()),
+        }
+    }
+
+    Ok(())
 }
 
 // Lightweight path normalization without filesystem calls
@@ -2108,6 +4422,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
+        crate::hp_guard!("LocalDisk::read_all");
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let format_info = self.format_info.read().await;
             if !format_info.data.is_empty() {
@@ -2124,11 +4439,13 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip_all)]
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
+        crate::hp_guard!("LocalDisk::write_all");
         self.write_all_public(volume, path, data).await
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
+        crate::hp_guard!("LocalDisk::delete");
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume)
             && let Err(e) = access(&volume_dir).await
@@ -2182,7 +4499,6 @@ impl DiskAPI for LocalDisk {
                     &part_path,
                     erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
-                    &checksum_info.hash,
                     erasure.shard_size(),
                 )
                 .await
@@ -2429,7 +4745,15 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::FileAccessDenied);
             }
 
-            remove_std(&dst_file_path).map_err(to_file_error)?;
+            // Clear any stale destination before the directory rename. An absent
+            // destination is the normal case when renaming a directory to a new
+            // location, so tolerate NotFound instead of aborting the whole rename
+            // (MinIO's RenameFile ignores osIsNotExist here).
+            if let Err(e) = remove_std(&dst_file_path)
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(to_file_error(e).into());
+            }
         } else {
             let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
             if meta.is_dir() {
@@ -2445,7 +4769,25 @@ impl DiskAPI for LocalDisk {
             }
         }
 
+        // UploadPart is acknowledged once this rename lands, so the part data and
+        // its directory entry must be durable before we return. Relaxed keeps the
+        // part payload fdatasync but leaves the directory entry to the page cache.
+        let durability = effective_durability(dst_volume);
+        if durability.syncs_data_shards() && !src_is_dir {
+            let src = src_file_path.clone();
+            tokio::task::spawn_blocking(move || std::fs::File::open(&src)?.sync_data())
+                .await
+                .map_err(DiskError::from)?
+                .map_err(to_file_error)?;
+        }
+
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
+
+        if durability.syncs_commit_metadata()
+            && let Some(parent) = dst_file_path.parent()
+        {
+            os::fsync_dir(parent).await.map_err(to_file_error)?;
+        }
 
         let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
         if src_is_dir != dst_meta.is_dir() {
@@ -2471,6 +4813,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        crate::hp_guard!("LocalDisk::rename_file");
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
@@ -2515,7 +4858,15 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::FileAccessDenied);
             }
 
-            remove(&dst_file_path).await.map_err(to_file_error)?;
+            // Clear any stale destination before the directory rename. An absent
+            // destination is the normal case when renaming a directory to a new
+            // location, so tolerate NotFound instead of aborting the whole rename
+            // (MinIO's RenameFile ignores osIsNotExist here).
+            if let Err(e) = remove(&dst_file_path).await
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(to_file_error(e).into());
+            }
         }
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
@@ -2529,6 +4880,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
+        crate::hp_guard!("LocalDisk::create_file");
         if !origvolume.is_empty() {
             let origvolume_dir = self.get_bucket_path(origvolume)?;
             if !skip_access_checks(origvolume) {
@@ -2538,239 +4890,50 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let volume_dir = self.get_bucket_path(volume)?;
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        //  TODO: writeAllDirect io.copy
-        // info!("file_path: {:?}", file_path);
-        if let Some(parent) = file_path.parent() {
-            os::make_dir_all(parent, &volume_dir).await?;
-        }
-        let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY)
+        self.io_backend
+            .open_write(volume, path, WriteMode::Truncate { size_hint: _file_size })
             .await
-            .map_err(to_file_error)?;
-        let reclaim_on_shutdown = should_reclaim_file_cache_after_write(_file_size);
-
-        Ok(Box::new(FileCacheReclaimWriter::new(f, _file_size.max(0) as usize, reclaim_on_shutdown)))
-
-        // Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume) {
-            access(&volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
-
-        Ok(Box::new(f))
+        self.io_backend.open_write(volume, path, WriteMode::Append).await
     }
 
-    // TODO: io verifier
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        // warn!("disk read_file: volume: {}, path: {}", volume, path);
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume) {
-            access(&volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        let f = self.open_file_read_only(file_path).await?;
-
-        Ok(Box::new(f))
+        crate::hp_guard!("LocalDisk::read_file");
+        self.io_backend.open_full_read(volume, path).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume) {
-            access(&volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        let mut f = self.open_file_read_only(file_path).await?;
-
-        let meta = f.metadata().await?;
-        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
-        if meta.len() < end_offset as u64 {
-            error!(
-                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                volume,
-                path,
-                offset,
-                length,
-                actual_size = meta.len(),
-                reason = "read_file_stream_out_of_bounds",
-                "Disk local read fallback failed"
-            );
-            return Err(DiskError::FileCorrupt);
-        }
-
-        if offset > 0 {
-            f.seek(SeekFrom::Start(offset as u64)).await?;
-        }
-
-        let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
-        Ok(Box::new(FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop)))
+        crate::hp_guard!("LocalDisk::read_file_stream");
+        self.io_backend.open_read_stream(volume, path, offset, length).await
     }
 
-    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
-    /// Returns Bytes that can be shared without copying.
+    /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
     // SAFETY: Unix unsafe calls in this function only query page size and mmap
     // a read-only file region after bounds and alignment are validated.
     #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume) {
-            access(&volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        // Verify file exists and get metadata
-        let file_path_clone = file_path.clone();
-        let meta = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        self.read_file_mmap_copy_with_metrics(volume, path, offset, length, None)
             .await
-            .map_err(DiskError::from)??;
+    }
 
-        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
-        if meta.len() < end_offset as u64 {
-            error!(
-                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                volume,
-                path,
-                offset,
-                length,
-                actual_size = meta.len(),
-                reason = "read_file_zero_copy_out_of_bounds",
-                "Disk local read fallback failed"
-            );
-            return Err(DiskError::FileCorrupt);
-        }
-
-        // Unix: use mmap to read the data (copies into Bytes for safe ownership)
-        // Non-Unix: fall back to efficient read
-        #[cfg(unix)]
-        {
-            use memmap2::MmapOptions;
-            use std::time::Instant;
-
-            let start = Instant::now();
-            let file_path_clone = file_path.clone();
-
-            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
-            let bytes = tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
-
-                #[cfg(target_os = "macos")]
-                if should_reclaim_after_read {
-                    let _ = set_std_fd_nocache(&file);
-                }
-
-                // mmap offsets on Unix must be page-size aligned. Align the
-                // mapping down to the nearest page boundary, then slice out the
-                // originally requested logical range.
-                // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and
-                // only queries process-global OS configuration.
-                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-                if page_size <= 0 {
-                    return Err(DiskError::other("failed to determine system page size"));
-                }
-                let page_size = page_size as u64;
-                let offset_u64 = offset as u64;
-                let aligned_offset = offset_u64 - (offset_u64 % page_size);
-                let logical_offset = (offset_u64 - aligned_offset) as usize;
-                let map_len = logical_offset
-                    .checked_add(length)
-                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
-
-                // SAFETY: The file is opened as read-only, and we're mapping a region
-                // that we've already verified exists and is within file bounds. The
-                // file offset passed to mmap is page-size aligned as required on Unix.
-                let mmap =
-                    unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
-
-                // Copy only the requested logical range into a Bytes buffer. This
-                // avoids undefined behavior from treating OS-managed mmap memory as
-                // allocator-managed Vec storage, at the cost of an extra copy.
-                let end = logical_offset
-                    .checked_add(length)
-                    .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
-                let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
-
-                #[cfg(target_os = "linux")]
-                if should_reclaim_after_read {
-                    use core::num::NonZeroU64;
-                    use rustix::fs::{Advice, fadvise};
-
-                    let reclaim_len =
-                        NonZeroU64::new(map_len as u64).ok_or_else(|| DiskError::other("mmap reclaim length overflow"))?;
-                    fadvise(&file, aligned_offset, Some(reclaim_len), Advice::DontNeed)
-                        .map_err(std::io::Error::from)
-                        .map_err(DiskError::from)?;
-                }
-
-                Ok::<Bytes, DiskError>(bytes)
-            })
-            .await
-            .map_err(DiskError::from)??;
-
-            // Log successful mmap read metrics
-            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-            // Record mmap read metrics
-            rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
-
-            debug!(size = length, duration_ms = duration_ms, "mmap_read_success");
-
-            return Ok(bytes);
-        }
-
-        // Non-Unix fallback: efficient read into Bytes
-        #[cfg(not(unix))]
-        {
-            // Record zero-copy fallback
-            rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
-
-            debug!(reason = "non_unix_platform", "zero_copy_fallback");
-
-            let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
-
-            if offset > 0 {
-                f.seek(SeekFrom::Start(offset as u64)).await?;
-            }
-
-            let mut buffer = vec![0; length];
-            f.read_exact(&mut buffer).await?;
-
-            Ok(Bytes::from(buffer))
-        }
+    /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        self.io_backend.pread_bytes(volume, path, offset, length, metrics).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -2817,6 +4980,8 @@ impl DiskAPI for LocalDisk {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
+        let _scan_lock = self.try_acquire_scan_lock(&opts)?;
+
         let mut wr = wr;
 
         let mut out = MetacacheWriter::new(&mut wr);
@@ -2842,7 +5007,7 @@ impl DiskAPI for LocalDisk {
                     metadata: data.to_vec(),
                     ..Default::default()
                 };
-                out.write_obj(&meta).await?;
+                write_metacache_obj(&mut out, &meta).await?;
                 objs_returned += 1;
             } else {
                 let fpath =
@@ -2896,6 +5061,7 @@ impl DiskAPI for LocalDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
+        crate::hp_guard!("LocalDisk::rename_data");
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         if !skip_access_checks(src_volume)
             && let Err(e) = super::fs::access_std(&src_volume_dir)
@@ -2964,6 +5130,14 @@ impl DiskAPI for LocalDisk {
 
         let no_inline = fi.data.is_none() && fi.size > 0;
 
+        // Resolved once for the whole commit so a concurrent configuration
+        // change can never leave a single rename_data half-synced. The tier is
+        // keyed on the destination volume: user data staged in scratch
+        // namespaces follows the configured tier, while commits into
+        // system-critical namespaces (IAM, config, bucket metadata) stay
+        // pinned to strict.
+        let durability = effective_durability(dst_volume);
+
         if no_inline {
             // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
             let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
@@ -2978,12 +5152,26 @@ impl DiskAPI for LocalDisk {
             };
 
             let mut xlmeta = FileMeta::new();
-            if let Some(dst_buf) = has_dst_buf.as_ref()
-                && FileMeta::is_xl2_v1_format(dst_buf)
-                && let Ok(nmeta) = FileMeta::load(dst_buf)
-            {
-                xlmeta = nmeta
+            // An existing dst xl.meta that fails to parse leaves `xlmeta` empty
+            // and gets overwritten by the commit below (pre-existing behavior);
+            // track that so the old-size observation reports unknown instead of
+            // a false `Absent` (rustfs/backlog#1009).
+            let mut dst_meta_unparsable = false;
+            if let Some(dst_buf) = has_dst_buf.as_ref() {
+                if FileMeta::is_xl2_v1_format(dst_buf)
+                    && let Ok(nmeta) = FileMeta::load(dst_buf)
+                {
+                    xlmeta = nmeta
+                } else {
+                    dst_meta_unparsable = true;
+                }
             }
+
+            let old_current_size = if dst_meta_unparsable {
+                None
+            } else {
+                observe_old_current_size(has_dst_buf.is_some(), &xlmeta)
+            };
 
             let mut skip_parent = dst_volume_dir.clone();
             if has_dst_buf.as_ref().is_some()
@@ -2998,17 +5186,55 @@ impl DiskAPI for LocalDisk {
                 let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
             }
             xlmeta.add_version(fi)?;
+            let version_signature = rename_data_versions_signature(&xlmeta);
             let new_dst_buf = xlmeta.marshal_msg()?;
 
             let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
-            self.write_all_private(
-                src_volume,
-                &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE),
-                new_dst_buf.into(),
-                true,
-                src_file_parent,
-            )
-            .await?;
+            // This tmp xl.meta is renamed onto dst_file_path at the commit
+            // point below, so only its contents must be durable before the
+            // rename (SyncMode::FileOnly); the dst parent directory is fsynced
+            // after the commit rename, and a crash before the rename means the
+            // PUT was never acknowledged. A metadata commit: relaxed tiers
+            // leave it to the page cache.
+            let tmp_meta_sync = if durability.syncs_commit_metadata() {
+                SyncMode::FileOnly
+            } else {
+                SyncMode::None
+            };
+            // The tmp xl.meta write and the shard-file fdatasync are independent
+            // (disjoint paths) and both only need to be durable before the commit
+            // renames below, so run them concurrently to drop a blocking
+            // round-trip from the PUT commit critical path (rustfs/backlog#922
+            // step 2). The "contents durable -> rename -> dst dir fsync" ordering
+            // is unchanged — both futures complete before any rename — which the
+            // rename_data crash-consistency harness (backlog#935) exercises.
+            //
+            // Shard durability: once rename_data succeeds the write is
+            // acknowledged, so data must not live only in the page cache.
+            // Multipart parts were already synced during rename_part, so their
+            // fdatasync here is a cheap no-op. A missing source dir is left for the
+            // rename below to report through the existing rollback path. Payload
+            // durability is kept by both strict and relaxed.
+            // Bound to a local so the borrow lives across the join! below.
+            let tmp_meta_rel_path = format!("{}/{}", &src_path, STORAGE_FORMAT_FILE);
+            let tmp_meta_write =
+                self.write_all_private(src_volume, &tmp_meta_rel_path, new_dst_buf.into(), tmp_meta_sync, src_file_parent);
+            let shard_sync = async {
+                if durability.syncs_data_shards()
+                    && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
+                    && let Err(err) = os::sync_dir_files(src_data_path).await
+                    && err.kind() != ErrorKind::NotFound
+                {
+                    return Err::<(), DiskError>(to_file_error(err).into());
+                }
+                Ok(())
+            };
+            let (tmp_meta_res, shard_sync_res) = tokio::join!(tmp_meta_write, shard_sync);
+            // Surface a tmp-meta failure first (its prior serial position), then a
+            // shard-sync failure; either aborts before any rename, exactly as the
+            // sequential version did.
+            tmp_meta_res?;
+            shard_sync_res?;
 
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
                 && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await
@@ -3025,6 +5251,72 @@ impl DiskAPI for LocalDisk {
                     "Disk local rename flow failed"
                 );
                 return Err(err);
+            }
+
+            // Crash-consistency injection: hard power loss after the data dir
+            // is in place but before xl.meta commits. No cleanup — the harness
+            // reopens the disk and asserts the object still reads as the old
+            // version (the staged data dir is a harmless orphan for GC).
+            if should_crash_rename_data_at(RenameDataCrashPoint::AfterDataRename, dst_path) {
+                return Err(DiskError::Unexpected);
+            }
+
+            if should_fail_before_old_metadata_backup(dst_path) {
+                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
+                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                }
+                info!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "test_fail_before_old_metadata_backup",
+                    "Disk local rename flow failed before metadata commit"
+                );
+                return Err(DiskError::Unexpected);
+            }
+
+            // The rollback backup stays where it is written (no rename) and is
+            // the sole restore source for a later undo_write, so under strict
+            // it keeps SyncMode::FileAndDir: contents and directory entry both
+            // durable. It is part of the metadata commit machinery, so relaxed
+            // tiers leave it to the page cache like the xl.meta it mirrors.
+            let backup_sync = if durability.syncs_commit_metadata() {
+                SyncMode::FileAndDir
+            } else {
+                SyncMode::None
+            };
+            if let Some(old_data_dir) = has_old_data_dir
+                && let Some(dst_buf) = has_dst_buf.as_ref()
+                && let Err(err) = self
+                    .write_all_private(
+                        dst_volume,
+                        &format!("{}/{}/{}", &dst_path, &old_data_dir, STORAGE_FORMAT_FILE_BACKUP),
+                        dst_buf.clone().into(),
+                        backup_sync,
+                        &skip_parent,
+                    )
+                    .await
+            {
+                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
+                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                }
+                info!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "write_old_metadata_backup_failed",
+                    error = ?err,
+                    "Disk local rename flow failed"
+                );
+                return Err(err);
+            }
+
+            // Crash-consistency injection: hard power loss after the rollback
+            // backup is durable but before the xl.meta commit rename. No
+            // cleanup — the harness asserts the object still reads as the old
+            // version, since the destination xl.meta is untouched here.
+            if should_crash_rename_data_at(RenameDataCrashPoint::AfterBackupBeforeMetaCommit, dst_path) {
+                return Err(DiskError::Unexpected);
             }
 
             if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
@@ -3044,27 +5336,38 @@ impl DiskAPI for LocalDisk {
                 return Err(err);
             }
 
-            if let Some(old_data_dir) = has_old_data_dir
-                && let Some(dst_buf) = has_dst_buf
-                && let Err(err) = self
-                    .write_all_private(
-                        dst_volume,
-                        &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE),
-                        dst_buf.into(),
-                        true,
-                        &skip_parent,
-                    )
-                    .await
+            // Persist the directory entries for both the data dir and xl.meta renames;
+            // without this the commit itself can vanish on power loss. Relaxed tiers
+            // accept that window (documented in docs/operations/durability-modes.md).
+            if durability.syncs_commit_metadata()
+                && let Some(parent) = dst_file_path.parent()
+                && let Err(err) = os::fsync_dir(parent).await
             {
-                info!(
-                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    reason = "write_old_metadata_failed",
-                    error = ?err,
-                    "Disk local rename flow failed"
-                );
-                return Err(err);
+                return Err(to_file_error(err).into());
+            }
+
+            // First PUT of an object creates its directory (and any missing prefix
+            // dirs) via reliable_mkdir_all, which never fsyncs the parent chain. The
+            // commit fsync above persists the object dir's *contents*, not its own
+            // entry in the bucket/prefix dir, so on power loss after ack the whole
+            // object dir could vanish (rustfs/backlog#922 step 4). For a new object
+            // (no prior xl.meta) fsync the ancestor chain from the object dir's
+            // parent up to and including the bucket so those new directory entries
+            // are durable. Overwrites already have a durable object dir. The
+            // starts_with guard bounds the walk to the bucket subtree. Relaxed/none
+            // accept the wider window, like the commit fsync above.
+            if has_dst_buf.is_none() && durability.syncs_commit_metadata() {
+                let mut ancestor = dst_file_path.parent().and_then(|object_dir| object_dir.parent());
+                while let Some(dir) = ancestor {
+                    if !dir.starts_with(&dst_volume_dir) {
+                        break;
+                    }
+                    os::fsync_dir(dir).await.map_err(to_file_error)?;
+                    if dir == dst_volume_dir.as_path() {
+                        break;
+                    }
+                    ancestor = dir.parent();
+                }
             }
 
             if let Some(src_file_path_parent) = src_file_path.parent() {
@@ -3079,19 +5382,22 @@ impl DiskAPI for LocalDisk {
 
             Ok(RenameDataResp {
                 old_data_dir: has_old_data_dir,
-                sign: None,
+                sign: version_signature,
+                old_current_size,
             })
         } else {
             // Inline: merge read + parse + write + rename into single spawn_blocking
             let src = src_file_path.clone();
             let dst = dst_file_path.clone();
+            // Captured by the closure to fsync the new object's ancestor dir chain.
+            let bucket_dir = dst_volume_dir.clone();
             let cleanup_path = if src_volume == super::RUSTFS_META_MULTIPART_BUCKET {
                 src_file_path.parent().map(|p| p.to_path_buf())
             } else {
                 None
             };
 
-            let (old_data_dir, _dst_buf) = tokio::task::spawn_blocking(move || {
+            let (old_data_dir, version_signature, old_current_size) = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -3100,12 +5406,25 @@ impl DiskAPI for LocalDisk {
                 };
 
                 let mut xlmeta = FileMeta::new();
-                if let Some(ref buf) = has_dst_buf
-                    && FileMeta::is_xl2_v1_format(buf)
-                    && let Ok(nmeta) = FileMeta::load(buf)
-                {
-                    xlmeta = nmeta
+                // Same as the non-inline branch: an unparsable existing dst
+                // xl.meta must surface as unknown, not `Absent`
+                // (rustfs/backlog#1009).
+                let mut dst_meta_unparsable = false;
+                if let Some(ref buf) = has_dst_buf {
+                    if FileMeta::is_xl2_v1_format(buf)
+                        && let Ok(nmeta) = FileMeta::load(buf)
+                    {
+                        xlmeta = nmeta
+                    } else {
+                        dst_meta_unparsable = true;
+                    }
                 }
+
+                let old_current_size = if dst_meta_unparsable {
+                    None
+                } else {
+                    observe_old_current_size(has_dst_buf.is_some(), &xlmeta)
+                };
 
                 let version_id = fi.version_id.unwrap_or_default();
                 let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
@@ -3113,18 +5432,57 @@ impl DiskAPI for LocalDisk {
                     let _ = xlmeta.data.remove_two(version_id, *d);
                 }
                 xlmeta.add_version(fi)?;
+                let version_signature = rename_data_versions_signature(&xlmeta);
                 let new_buf = xlmeta.marshal_msg()?;
 
-                // Write new xl.meta + rename
+                // Write new xl.meta + rename. Inline objects carry their data
+                // inside xl.meta, so this whole sequence is a metadata commit:
+                // relaxed tiers do no per-object fsync here at all (aligned
+                // with MinIO's default), trading a documented power-loss
+                // window for latency.
                 if let Some(parent) = src.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
+                let sync = durability.syncs_commit_metadata();
                 let mut f = std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
                     .truncate(true)
                     .open(&src)?;
                 std::io::Write::write_all(&mut f, &new_buf)?;
+                if sync {
+                    f.sync_data()?;
+                }
+                if let Some(old_dir) = old_data_dir.as_ref()
+                    && let Some(ref buf) = has_dst_buf
+                    && let Some(dst_parent) = dst.parent()
+                {
+                    let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+                    let old_parent = old_path.parent().map(|p| p.to_path_buf());
+                    if let Some(ref old_parent) = old_parent {
+                        std::fs::create_dir_all(old_parent)?;
+                    }
+                    // This rollback backup is the sole restore source for a later
+                    // undo_write when the set-level write quorum fails. Persist it as
+                    // durably as the new xl.meta written above (and as the non-inline
+                    // branch does): a bare std::fs::write leaves both the bytes and the
+                    // new directory entry in the page cache, so a crash before a
+                    // rollback could restore a lost or truncated backup.
+                    let mut backup = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&old_path)
+                        .map_err(to_file_error)?;
+                    std::io::Write::write_all(&mut backup, buf).map_err(to_file_error)?;
+                    if sync {
+                        backup.sync_data().map_err(to_file_error)?;
+                        if let Some(ref old_parent) = old_parent {
+                            os::fsync_dir_std(old_parent).map_err(to_file_error)?;
+                        }
+                    }
+                }
+
                 match std::fs::rename(&src, &dst) {
                     Ok(()) => Ok(()),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
@@ -3138,18 +5496,37 @@ impl DiskAPI for LocalDisk {
                     Err(err) => Err(to_file_error(err)),
                 }?;
 
-                if let Some(old_dir) = old_data_dir.as_ref()
-                    && let Some(ref buf) = has_dst_buf
-                    && let Some(dst_parent) = dst.parent()
-                {
-                    let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
-                    if let Some(old_parent) = old_path.parent() {
-                        std::fs::create_dir_all(old_parent)?;
-                    }
-                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
+                // Persist the commit rename's directory entry across power loss.
+                if sync && let Some(dst_parent) = dst.parent() {
+                    os::fsync_dir_std(dst_parent)?;
                 }
 
-                Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
+                // Same power-loss gap as the non-inline path (rustfs/backlog#922
+                // step 4): a first PUT creates the object dir (and any missing
+                // prefix dirs) whose entry in the bucket/prefix dir reliable_mkdir_all
+                // never fsynced. The fsync above persists the object dir's contents,
+                // not its own entry, so for a new inline object fsync the ancestor
+                // chain up to and including the bucket. Overwrites already have a
+                // durable object dir; the starts_with guard bounds the walk.
+                if sync && has_dst_buf.is_none() {
+                    let mut ancestor = dst.parent().and_then(|object_dir| object_dir.parent());
+                    while let Some(ancestor_dir) = ancestor {
+                        if !ancestor_dir.starts_with(&bucket_dir) {
+                            break;
+                        }
+                        os::fsync_dir_std(ancestor_dir)?;
+                        if ancestor_dir == bucket_dir.as_path() {
+                            break;
+                        }
+                        ancestor = ancestor_dir.parent();
+                    }
+                }
+
+                Ok::<(Option<uuid::Uuid>, Option<Vec<u8>>, Option<OldCurrentSize>), std::io::Error>((
+                    old_data_dir,
+                    version_signature,
+                    old_current_size,
+                ))
             })
             .await
             .map_err(DiskError::from)??;
@@ -3163,7 +5540,8 @@ impl DiskAPI for LocalDisk {
 
             Ok(RenameDataResp {
                 old_data_dir,
-                sign: None,
+                sign: version_signature,
+                old_current_size,
             })
         }
     }
@@ -3312,6 +5690,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        crate::hp_guard!("LocalDisk::write_metadata");
         let p = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
         let mut meta = FileMeta::new();
@@ -3328,7 +5707,9 @@ impl DiskAPI for LocalDisk {
 
         let fm_data = meta.marshal_msg()?;
 
-        self.write_all(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), fm_data.into())
+        // Atomic temp+rename: this path also rewrites live xl.meta (delete markers,
+        // decommission), where an in-place truncate would expose torn metadata.
+        self.write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &fm_data, true)
             .await?;
 
         Ok(())
@@ -3343,6 +5724,7 @@ impl DiskAPI for LocalDisk {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
+        crate::hp_guard!("LocalDisk::read_version");
         if !org_volume.is_empty() {
             let org_volume_path = self.get_bucket_path(org_volume)?;
             if !skip_access_checks(org_volume) {
@@ -3438,6 +5820,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
+        crate::hp_guard!("LocalDisk::read_xl");
         let file_path = self.get_object_path(volume, path)?;
         let file_dir = self.get_bucket_path(volume)?;
 
@@ -3513,14 +5896,6 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        if !meta.versions.is_empty() {
-            let buf = meta.marshal_msg()?;
-            return self
-                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
-                .await;
-        }
-
-        // opts.undo_write && opts.old_data_dir.is_some_and(f)
         if let Some(old_data_dir) = opts.old_data_dir
             && opts.undo_write
         {
@@ -3528,11 +5903,15 @@ impl DiskAPI for LocalDisk {
                 file_path.as_path(),
                 Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
             ]);
-            let dst_path = path_join(&[
-                file_path.as_path(),
-                Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()),
-            ]);
+            let dst_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
             return rename_all(&src_path, &dst_path, file_path).await;
+        }
+
+        if !meta.versions.is_empty() {
+            let buf = meta.marshal_msg()?;
+            return self
+                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
+                .await;
         }
 
         self.delete_file(&volume_dir, &xl_path, true, false).await
@@ -3622,12 +6001,23 @@ impl DiskAPI for LocalDisk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
-        // TODO: avoid recursive deletion; return errVolumeNotEmpty when files remain
+        // Non-force is non-recursive: `remove_dir` (rmdir) fails atomically with
+        // `DirectoryNotEmpty` -> VolumeNotEmpty if the bucket still holds any
+        // object data, so a misclassified "dangling" bucket on the heal path
+        // (or a non-force S3 DeleteBucket on a populated bucket) can never be
+        // recursively wiped. Only an explicit `force_delete` (e.g. S3 force
+        // bucket delete) removes recursively. Mirrors MinIO's
+        // xlStorage.DeleteVol (Remove vs RemoveAll). (backlog#799 B1)
+        let res = if force_delete {
+            fs::remove_dir_all(&p).await
+        } else {
+            fs::remove_dir(&p).await
+        };
 
-        if let Err(err) = fs::remove_dir_all(&p).await {
+        if let Err(err) = res {
             let e: DiskError = to_volume_error(err).into();
             if e != DiskError::VolumeNotFound {
                 return Err(e);
@@ -3642,7 +6032,7 @@ impl DiskAPI for LocalDisk {
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
         info.nr_requests = self.nrrequests;
         info.rotational = self.rotational;
-        info.mount_path = self.path().to_str().unwrap().to_string();
+        info.mount_path = self.path().to_str().expect("operation should succeed").to_string();
         info.endpoint = self.endpoint.to_string();
         info.scanning = self.scanning.load(Ordering::Acquire) == 1;
 
@@ -3660,6 +6050,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(skip(self))]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        crate::hp_guard!("LocalDisk::read_metadata");
         let file_path = self.get_object_path(volume, path)?;
         let volume_dir = self.get_bucket_path(volume)?;
         let (data, _) = self.read_all_data_with_dmtime(volume, volume_dir, file_path).await?;
@@ -3700,8 +6091,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
     let disk_info = get_info(&drive_path).inspect_err(|err| {
         log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
     })?;
-    let root_drive = if !*GLOBAL_IsErasureSD.read().await {
-        let root_disk_threshold = *GLOBAL_RootDiskThreshold.read().await;
+    let root_drive = if let Some(root_disk_threshold) = runtime_sources::root_disk_threshold_for_erasure_disk().await {
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
         } else {
@@ -3717,6 +6107,2142 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 #[cfg(test)]
 mod test {
     use super::*;
+    use rustfs_filemeta::ErasureInfo;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    fn test_file_info(name: &str, version_id: Uuid, data_dir: Option<Uuid>, data: Option<Bytes>) -> FileInfo {
+        let size = data
+            .as_ref()
+            .map(|data| i64::try_from(data.len()).expect("test data length should fit i64"))
+            .unwrap_or(1);
+        FileInfo {
+            name: name.to_string(),
+            version_id: Some(version_id),
+            data_dir,
+            data,
+            size,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        }
+    }
+
+    fn test_meta(fi: FileInfo) -> Vec<u8> {
+        let mut meta = FileMeta::default();
+        meta.add_version(fi).expect("test metadata should accept file info");
+        meta.marshal_msg().expect("test metadata should encode")
+    }
+
+    async fn ensure_test_volume(disk: &LocalDisk, volume: &str) {
+        match disk.make_volume(volume).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("test volume should be available: {err:?}"),
+        }
+    }
+
+    /// Regression coverage for the disk-layer delete/rename fixes:
+    /// - move_to_trash must propagate real rename failures instead of silently
+    ///   reporting success (rustfs/backlog#948, ECA-07).
+    /// - the directory (trailing-slash) branch of rename_file/rename_part must
+    ///   tolerate a missing destination instead of aborting on NotFound
+    ///   (rustfs/backlog#960, ECA-19).
+    mod delete_and_rename_regressions {
+        use super::*;
+        use tempfile::tempdir;
+
+        async fn new_disk() -> (LocalDisk, tempfile::TempDir) {
+            let dir = tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            (disk, dir)
+        }
+
+        // #948: a genuinely missing source is benign and must still return Ok.
+        #[tokio::test]
+        async fn move_to_trash_missing_source_is_ok() {
+            let (disk, dir) = new_disk().await;
+            let missing = dir.path().join("bucket").join("does-not-exist");
+
+            disk.move_to_trash(&missing, true, false)
+                .await
+                .expect("missing source must be treated as benign");
+            disk.move_to_trash(&missing, false, false)
+                .await
+                .expect("missing source must be treated as benign (non-recursive)");
+        }
+
+        // #948: a real rename failure (here ENOTDIR, because a path component is a
+        // regular file) must propagate instead of being swallowed as Ok(()). Before
+        // the fix every non-DiskFull error fell through to `return Ok(())`.
+        #[tokio::test]
+        async fn move_to_trash_propagates_real_rename_error() {
+            let (disk, dir) = new_disk().await;
+            let bucket_dir = dir.path().join("bucket");
+            fs::create_dir_all(&bucket_dir).await.expect("bucket dir should be created");
+            let regular_file = bucket_dir.join("afile");
+            fs::write(&regular_file, b"x").await.expect("regular file should be written");
+
+            // Traversing through the regular file yields ENOTDIR at rename time.
+            let bad_path = regular_file.join("child");
+
+            let err = disk
+                .move_to_trash(&bad_path, true, false)
+                .await
+                .expect_err("a real rename failure must propagate, not be reported as success");
+            assert_eq!(err, DiskError::FileAccessDenied, "ENOTDIR must map to FileAccessDenied via to_file_error");
+        }
+
+        // #948: the happy path is unchanged — an existing object is moved out of its
+        // original location and the call succeeds.
+        #[tokio::test]
+        async fn move_to_trash_moves_existing_object() {
+            let (disk, dir) = new_disk().await;
+            let object_dir = dir.path().join("bucket").join("obj-dir");
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            fs::write(object_dir.join("part.1"), b"data")
+                .await
+                .expect("part should be written");
+
+            disk.move_to_trash(&object_dir, true, false)
+                .await
+                .expect("existing object should move to trash");
+            assert!(!object_dir.exists(), "object must be gone from its original location");
+        }
+
+        // #960: renaming a directory to a brand-new (non-existent) location must
+        // succeed. Before the fix the unconditional pre-rename remove returned
+        // FileNotFound and aborted the whole rename.
+        #[tokio::test]
+        async fn rename_file_directory_to_missing_destination_succeeds() {
+            let (disk, dir) = new_disk().await;
+            ensure_test_volume(&disk, "vol").await;
+
+            let src_dir = dir.path().join("vol").join("a").join("dir");
+            fs::create_dir_all(&src_dir).await.expect("src dir should be created");
+            fs::write(src_dir.join("file"), b"payload")
+                .await
+                .expect("src file should be written");
+
+            assert!(has_suffix("a/dir/", SLASH_SEPARATOR), "src path must carry directory semantics");
+            disk.rename_file("vol", "a/dir/", "vol", "b/newdir/")
+                .await
+                .expect("directory rename to a missing destination must succeed");
+
+            let moved = dir.path().join("vol").join("b").join("newdir").join("file");
+            assert_eq!(fs::read(&moved).await.expect("moved file should be readable"), b"payload");
+            assert!(!src_dir.exists(), "source directory must be gone after rename");
+        }
+
+        // #960: the same NotFound-tolerance fix applied to rename_part.
+        #[tokio::test]
+        async fn rename_part_directory_to_missing_destination_succeeds() {
+            let (disk, dir) = new_disk().await;
+            ensure_test_volume(&disk, "vol").await;
+
+            let src_dir = dir.path().join("vol").join("a").join("dir");
+            fs::create_dir_all(&src_dir).await.expect("src dir should be created");
+            fs::write(src_dir.join("file"), b"payload")
+                .await
+                .expect("src file should be written");
+
+            disk.rename_part("vol", "a/dir/", "vol", "b/newdir/", Bytes::from_static(b"meta-bytes"))
+                .await
+                .expect("directory rename_part to a missing destination must succeed");
+
+            let moved = dir.path().join("vol").join("b").join("newdir").join("file");
+            assert_eq!(fs::read(&moved).await.expect("moved file should be readable"), b"payload");
+            let meta = dir.path().join("vol").join("b").join("newdir").join(".meta");
+            assert_eq!(fs::read(&meta).await.expect("meta file should be readable"), b"meta-bytes");
+            assert!(!src_dir.exists(), "source directory must be gone after rename");
+        }
+    }
+
+    /// Crash-consistency harness for the rename_data commit sequence
+    /// (rustfs/backlog#935 HP-14, test plan rustfs/backlog#896; hard rule from
+    /// rustfs/backlog#878: "partial commit 后对象只能是旧版本或新版本,不能混合").
+    ///
+    /// For every pre-commit crash point × durability tier, it seeds a committed
+    /// object, stages a replacement, injects a hard power loss (no in-process
+    /// rollback runs), reopens the disk to model a restart, and asserts the
+    /// object still reads back as exactly the old version — or, when there was
+    /// no old version, does not exist. The un-injected run asserts the commit
+    /// makes the new version visible. Relaxed is exercised alongside Strict so
+    /// the durability relaxations landing in HP-1/HP-4/HP-5 are held to the same
+    /// old-or-new invariant, only with a wider (documented) power-loss window.
+    mod crash_consistency {
+        use super::*;
+        use tempfile::tempdir;
+
+        const VERSION_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        const OLD_DATA_DIR: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        const NEW_DATA_DIR: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+        async fn run_scenario(mode: DurabilityMode, crash: Option<RenameDataCrashPoint>, with_old_version: bool) {
+            // Serializes with every other durability-sensitive test and pins the
+            // resolved tier for the whole scenario (held until dropped).
+            let _mode = durability_mode_override::set(mode);
+
+            let dir = tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+            let bucket = "bucket";
+            let object = "crash-object";
+            let tmp_object = "tmp-crash-object";
+            let version_id = Uuid::parse_str(VERSION_ID).expect("version id should parse");
+            let old_data_dir = Uuid::parse_str(OLD_DATA_DIR).expect("old data dir should parse");
+            let new_data_dir = Uuid::parse_str(NEW_DATA_DIR).expect("new data dir should parse");
+
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+            let object_dir = dir.path().join(bucket).join(object);
+            let meta_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+            let old_meta = if with_old_version {
+                let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+                let old_meta = test_meta(old_fi);
+                fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+                    .await
+                    .expect("old data dir should be created");
+                fs::write(&meta_path, &old_meta)
+                    .await
+                    .expect("old metadata should be written");
+                Some(old_meta)
+            } else {
+                None
+            };
+
+            // Stage the replacement version's shard data under the tmp bucket.
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join(tmp_object)
+                .join(new_data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("new tmp data dir should be created");
+            fs::write(tmp_data_dir.join("part.1"), b"new-data")
+                .await
+                .expect("new tmp data should be written");
+
+            if let Some(point) = crash {
+                arm_rename_data_crash(point, object);
+            }
+            let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+            let result = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+                .await;
+
+            // Reopen the disk to model a process restart after the crash.
+            drop(disk);
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should reopen");
+            let read = disk
+                .read_version("", bucket, object, &version_id.to_string(), &ReadOptions::default())
+                .await;
+
+            match crash {
+                Some(point) => {
+                    assert!(result.is_err(), "{mode:?}/{point:?}: an armed crash must surface as an error");
+                    match &old_meta {
+                        Some(old) => {
+                            // The commit rename never ran: xl.meta is byte-for-byte
+                            // the old version and its data dir is intact.
+                            let after = fs::read(&meta_path).await.expect("old metadata must survive the crash");
+                            assert_eq!(&after, old, "{mode:?}/{point:?}: xl.meta must remain the old version");
+                            assert!(
+                                object_dir.join(old_data_dir.to_string()).exists(),
+                                "{mode:?}/{point:?}: old data dir must remain on disk"
+                            );
+                            let fi = read.expect("old version must be readable after the crash");
+                            assert_eq!(
+                                fi.data_dir,
+                                Some(old_data_dir),
+                                "{mode:?}/{point:?}: read must resolve to the old data dir, never the half-committed new one"
+                            );
+                        }
+                        None => {
+                            // No prior version: a pre-commit crash must leave no
+                            // object behind at all.
+                            assert!(
+                                !meta_path.exists(),
+                                "{mode:?}/{point:?}: no old version means no xl.meta after a pre-commit crash"
+                            );
+                            let err = read.expect_err("absent object must not be readable");
+                            assert!(
+                                matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound),
+                                "{mode:?}/{point:?}: unexpected error for absent object: {err:?}"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    result.expect("un-injected rename_data must commit");
+                    let fi = read.expect("new version must be readable after commit");
+                    assert_eq!(
+                        fi.data_dir,
+                        Some(new_data_dir),
+                        "{mode:?}: read must resolve to the newly committed data dir"
+                    );
+                    assert!(
+                        object_dir.join(new_data_dir.to_string()).exists(),
+                        "{mode:?}: new data dir must be in place after commit"
+                    );
+                }
+            }
+        }
+
+        const CRASH_POINTS: [RenameDataCrashPoint; 2] = [
+            RenameDataCrashPoint::AfterDataRename,
+            RenameDataCrashPoint::AfterBackupBeforeMetaCommit,
+        ];
+
+        #[tokio::test]
+        async fn overwrite_pre_commit_crash_keeps_old_version_strict() {
+            for point in CRASH_POINTS {
+                run_scenario(DurabilityMode::Strict, Some(point), true).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn overwrite_pre_commit_crash_keeps_old_version_relaxed() {
+            for point in CRASH_POINTS {
+                run_scenario(DurabilityMode::Relaxed, Some(point), true).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn fresh_pre_commit_crash_leaves_no_object_strict() {
+            for point in CRASH_POINTS {
+                run_scenario(DurabilityMode::Strict, Some(point), false).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn fresh_pre_commit_crash_leaves_no_object_relaxed() {
+            for point in CRASH_POINTS {
+                run_scenario(DurabilityMode::Relaxed, Some(point), false).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn commit_without_crash_makes_new_version_visible() {
+            run_scenario(DurabilityMode::Strict, None, true).await;
+            run_scenario(DurabilityMode::Relaxed, None, true).await;
+            run_scenario(DurabilityMode::Strict, None, false).await;
+        }
+    }
+
+    /// Backdate a path's mtime so zero-expiry cleanup tests classify it as
+    /// stale deterministically, instead of sleeping and hoping the filesystem
+    /// timestamp granularity (or a backward wall-clock step) cooperates.
+    fn backdate_mtime(path: &std::path::Path, age: Duration) {
+        use std::fs::{File, FileTimes};
+        let mtime = std::time::SystemTime::now() - age;
+        File::open(path)
+            .expect("path should open to backdate its mtime")
+            .set_times(FileTimes::new().set_modified(mtime))
+            .expect("mtime should rewind into the past");
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_barrier_and_tmp_trash_cleanup_cover_noop_and_delete_paths() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        disk.startup_cleanup_ready.store(0, Ordering::Release);
+        let ready = Arc::clone(&disk.startup_cleanup_ready);
+        let notify = Arc::clone(&disk.startup_cleanup_notify);
+        tokio::spawn(async move {
+            ready.store(1, Ordering::Release);
+            notify.notify_waiters();
+        });
+        disk.wait_for_startup_cleanup().await;
+        assert_eq!(disk.startup_cleanup_ready.load(Ordering::Acquire), 1);
+
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().join("missing-root"), Duration::ZERO)
+            .await
+            .expect("missing tmp path should be a cleanup no-op");
+        LocalDisk::cleanup_deleted_objects(dir.path().join("missing-root"))
+            .await
+            .expect("missing trash path should be a cleanup no-op");
+
+        let tmp_root = dir.path().join(RUSTFS_META_TMP_BUCKET);
+        let stale_dir = tmp_root.join("stale-upload");
+        let live_file = tmp_root.join("part-file");
+        let trash_root = dir.path().join(RUSTFS_META_TMP_DELETED_BUCKET);
+        fs::create_dir_all(&stale_dir).await.expect("stale dir should be created");
+        fs::write(&live_file, b"not-a-dir").await.expect("tmp file should be created");
+        fs::create_dir_all(&trash_root).await.expect("trash dir should be created");
+        backdate_mtime(&stale_dir, Duration::from_secs(10));
+
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
+            .await
+            .expect("stale tmp directory should move to trash");
+        assert!(!stale_dir.exists(), "stale tmp directory should be moved away");
+        assert!(live_file.exists(), "plain tmp files should be ignored by stale dir cleanup");
+
+        fs::write(trash_root.join("trash-file"), b"delete me")
+            .await
+            .expect("trash file should be created");
+        fs::create_dir_all(trash_root.join("trash-dir"))
+            .await
+            .expect("trash dir should be created");
+        LocalDisk::cleanup_deleted_objects(dir.path().to_path_buf())
+            .await
+            .expect("trash cleanup should remove files and directories");
+        assert!(
+            fs::read_dir(&trash_root)
+                .await
+                .expect("trash root should exist")
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn path_cache_covers_absolute_relative_batch_hit_miss_and_eviction() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let absolute = disk
+            .resolve_abs_path(dir.path().join("absolute-object"))
+            .expect("absolute path should resolve");
+        assert!(absolute.ends_with("absolute-object"));
+
+        {
+            let mut cache = disk.path_cache.write();
+            for index in 0..4096 {
+                cache.insert(format!("cached-{index}"), dir.path().join(format!("cached-{index}")));
+            }
+        }
+        let relative = disk.resolve_abs_path("bucket/object").expect("relative path should resolve");
+        assert!(relative.ends_with("bucket/object"));
+        assert!(
+            disk.path_cache.read().len() < 4097,
+            "cache eviction should run before inserting a new path"
+        );
+
+        let requests = vec![
+            ("bucket".to_string(), "a".to_string()),
+            ("bucket".to_string(), "b".to_string()),
+        ];
+        let first = disk
+            .get_object_paths_batch(&requests)
+            .expect("batch path resolution should handle cache misses");
+        assert_eq!(first.len(), 2);
+        assert!(first[0].ends_with("bucket/a"));
+        assert!(first[1].ends_with("bucket/b"));
+
+        let second = disk
+            .get_object_paths_batch(&requests)
+            .expect("batch path resolution should reuse cache hits");
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn open_file_read_only_returns_existing_payload_without_parent_creation() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let path = dir.path().join("bucket/object/part.1");
+        fs::create_dir_all(path.parent().expect("test file should have a parent"))
+            .await
+            .expect("parent directory should be created");
+        fs::write(&path, b"read-only-payload")
+            .await
+            .expect("test file should be written");
+
+        let mut file = disk.open_file_read_only(&path).await.expect("read-only file should open");
+        let mut payload = Vec::new();
+        file.read_to_end(&mut payload).await.expect("read-only file should read");
+
+        assert_eq!(payload, b"read-only-payload");
+    }
+
+    #[tokio::test]
+    async fn write_metadata_replaces_corrupt_existing_xl_meta_without_losing_new_version() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "metadata-rewrite-bucket";
+        let object = "nested/object";
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"not-valid-xl-meta")
+            .await
+            .expect("corrupt metadata should be installed");
+
+        let version_id = Uuid::new_v4();
+        let mut fi = test_file_info(object, version_id, Some(Uuid::new_v4()), Some(Bytes::from_static(b"restored")));
+        fi.fresh = false;
+        disk.write_metadata(bucket, bucket, object, fi)
+            .await
+            .expect("new metadata write should replace corrupt old metadata");
+
+        let raw = disk
+            .read_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .await
+            .expect("rewritten metadata should be readable");
+        let restored = FileMeta::load(&raw)
+            .expect("rewritten metadata should decode")
+            .into_fileinfo(bucket, object, "", true, false, true)
+            .expect("rewritten metadata should expose the new version");
+
+        assert_eq!(restored.version_id, Some(version_id));
+        assert_eq!(restored.name, object);
+    }
+
+    fn test_check_parts_file_info(data_dir: Uuid) -> FileInfo {
+        FileInfo {
+            name: "dir/object".to_string(),
+            data_dir: Some(data_dir),
+            parts: (1..=4)
+                .map(|number| ObjectPartInfo {
+                    number,
+                    size: 5,
+                    actual_size: 5,
+                    ..Default::default()
+                })
+                .collect(),
+            erasure: ErasureInfo {
+                data_blocks: 2,
+                parity_blocks: 2,
+                block_size: 4,
+                distribution: vec![1, 2, 3, 4],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_parts_classifies_part_and_volume_failures() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let data_dir = Uuid::parse_str("01010101-0101-0101-0101-010101010101").expect("data dir should parse");
+        let fi = test_check_parts_file_info(data_dir);
+
+        ensure_test_volume(&disk, bucket).await;
+        let part_dir = dir.path().join(bucket).join(object).join(data_dir.to_string());
+        fs::create_dir_all(&part_dir).await.expect("part dir should be created");
+        fs::write(part_dir.join("part.1"), vec![1; 4])
+            .await
+            .expect("valid part should be written");
+        fs::write(part_dir.join("part.2"), vec![2; 3])
+            .await
+            .expect("short part should be written");
+        fs::create_dir_all(part_dir.join("part.3"))
+            .await
+            .expect("directory part marker should be created");
+
+        let resp = disk
+            .check_parts(bucket, object, &fi)
+            .await
+            .expect("check_parts should return per-part status");
+        assert_eq!(
+            resp.results,
+            vec![
+                CHECK_PART_SUCCESS,
+                CHECK_PART_FILE_CORRUPT,
+                CHECK_PART_FILE_NOT_FOUND,
+                CHECK_PART_FILE_NOT_FOUND,
+            ],
+            "valid, short, directory, and missing parts must be classified distinctly"
+        );
+
+        let missing_volume_resp = disk
+            .check_parts("missing-bucket", object, &fi)
+            .await
+            .expect("missing volume should be reported per part");
+        assert_eq!(
+            missing_volume_resp.results,
+            vec![CHECK_PART_VOLUME_NOT_FOUND; fi.parts.len()],
+            "missing volume must not be reported as recoverable missing shards"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_parts_reports_bad_metadata_and_missing_data_part() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        let valid_part = ObjectPartInfo {
+            etag: "etag-1".to_string(),
+            number: 1,
+            size: 5,
+            actual_size: 5,
+            ..Default::default()
+        };
+        disk.write_all(bucket, "upload/part.1", Bytes::from_static(b"data-1"))
+            .await
+            .expect("part data should be written");
+        disk.write_all(
+            bucket,
+            "upload/part.1.meta",
+            Bytes::from(valid_part.marshal_msg().expect("part metadata should encode")),
+        )
+        .await
+        .expect("part metadata should be written");
+        disk.write_all(bucket, "upload/part.2", Bytes::from_static(b"data-2"))
+            .await
+            .expect("second part data should be written");
+        disk.write_all(bucket, "upload/part.2.meta", Bytes::from_static(b"not-msgpack"))
+            .await
+            .expect("bad part metadata should be written");
+        disk.write_all(bucket, "upload/part.3.meta", Bytes::from_static(b"orphan-meta"))
+            .await
+            .expect("orphan metadata should be written");
+
+        let parts = disk
+            .read_parts(
+                bucket,
+                &[
+                    "upload/part.1.meta".to_string(),
+                    "upload/part.2.meta".to_string(),
+                    "upload/part.3.meta".to_string(),
+                ],
+            )
+            .await
+            .expect("read_parts should return per-part status");
+
+        assert_eq!(parts[0], valid_part);
+        assert_eq!(parts[1].number, 2);
+        assert!(
+            parts[1].error.is_some(),
+            "bad metadata must be surfaced as a per-part error instead of a decoded part"
+        );
+        assert_eq!(parts[2].number, 3);
+        assert!(parts[2].error.is_some(), "missing data part must be surfaced as a per-part error");
+    }
+
+    #[tokio::test]
+    async fn test_rename_part_rejects_type_mismatch_without_touching_source() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let tmp_volume = "tmp";
+        let bucket = "bucket";
+        ensure_test_volume(&disk, tmp_volume).await;
+        ensure_test_volume(&disk, bucket).await;
+
+        let payload = Bytes::from_static(b"part payload");
+        disk.write_all(tmp_volume, "upload/part.1", payload.clone())
+            .await
+            .expect("source part should be written");
+
+        let result = disk
+            .rename_part(tmp_volume, "upload/part.1", bucket, "object/part.1/", Bytes::from_static(b"metadata"))
+            .await;
+        assert!(
+            matches!(result, Err(DiskError::FileAccessDenied)),
+            "file-to-directory rename_part mismatch must be rejected, got {result:?}"
+        );
+        assert_eq!(
+            disk.read_all(tmp_volume, "upload/part.1")
+                .await
+                .expect("source part must remain after rejected rename"),
+            payload
+        );
+        assert!(
+            matches!(disk.read_all(bucket, "object/part.1.meta").await, Err(DiskError::FileNotFound)),
+            "rejected rename_part must not write destination metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_part_commits_data_and_metadata_then_removes_source() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let tmp_volume = "tmp";
+        let bucket = "bucket";
+        ensure_test_volume(&disk, tmp_volume).await;
+        ensure_test_volume(&disk, bucket).await;
+
+        let payload = Bytes::from_static(b"part payload");
+        let meta = Bytes::from_static(b"part metadata");
+        disk.write_all(tmp_volume, "upload/part.1", payload.clone())
+            .await
+            .expect("source part should be written");
+
+        disk.rename_part(tmp_volume, "upload/part.1", bucket, "object/part.1", meta.clone())
+            .await
+            .expect("rename_part should commit part");
+
+        assert_eq!(
+            disk.read_all(bucket, "object/part.1")
+                .await
+                .expect("destination part should be readable"),
+            payload
+        );
+        assert_eq!(
+            disk.read_all(bucket, "object/part.1.meta")
+                .await
+                .expect("destination metadata should be readable"),
+            meta
+        );
+        assert!(
+            matches!(disk.read_all(tmp_volume, "upload/part.1").await, Err(DiskError::FileNotFound)),
+            "source part must be removed after a successful commit"
+        );
+    }
+
+    struct BlockingScanWriter {
+        entered_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl AsyncWrite for BlockingScanWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            if let Some(tx) = self.entered_tx.take() {
+                let _ = tx.send(());
+            }
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_scan_writer_keeps_flush_and_shutdown_pending() {
+        let mut flush_writer = BlockingScanWriter { entered_tx: None };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), flush_writer.flush())
+                .await
+                .is_err(),
+            "blocking scan writer flush should stay pending"
+        );
+
+        let mut shutdown_writer = BlockingScanWriter { entered_tx: None };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), shutdown_writer.shutdown())
+                .await
+                .is_err(),
+            "blocking scan writer shutdown should stay pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_disk_scan_rejects_concurrent_same_prefix_and_releases_on_cancel() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let bucket = "test-bucket";
+        let object_dir = dir.path().join(bucket).join("prefix/object");
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("object metadata should be written");
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "prefix/".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let first_disk = Arc::clone(&disk);
+        let first_opts = opts.clone();
+        let mut blocking_writer = BlockingScanWriter {
+            entered_tx: Some(entered_tx),
+        };
+        let first_scan = tokio::spawn(async move { first_disk.walk_dir(first_opts, &mut blocking_writer).await });
+
+        entered_rx.await.expect("first scan should enter write path");
+
+        let mut second_writer = tokio::io::sink();
+        let second_scan = disk.walk_dir(opts.clone(), &mut second_writer).await;
+        assert!(
+            matches!(second_scan, Err(DiskError::DiskOngoingReq)),
+            "concurrent scan of same bucket and prefix must be rejected, got {second_scan:?}"
+        );
+
+        first_scan.abort();
+        assert!(
+            first_scan
+                .await
+                .expect_err("first scan task should be cancelled")
+                .is_cancelled(),
+            "aborting the blocked scan should cancel the task"
+        );
+
+        let mut after_cancel_writer = tokio::io::sink();
+        let after_cancel = disk.walk_dir(opts, &mut after_cancel_writer).await;
+        assert!(
+            after_cancel.is_ok(),
+            "cancelled scan must release the bucket/prefix lock, got {after_cancel:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_writes_old_metadata_backup_before_non_inline_undo() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-write";
+        let version_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let dst_object_dir = dir.path().join(bucket).join("dir/object");
+        fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let resp = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit");
+
+        assert_eq!(resp.old_data_dir, Some(old_data_dir));
+        assert_eq!(resp.sign, Some(version_id.as_bytes().to_vec()));
+        assert!(
+            dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .exists()
+        );
+        assert!(
+            !dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_meta_skips_tmp_parent_dir_fsync_but_fsyncs_dst_parent() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "sync-meta-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let meta_path = format!("dir/object/{STORAGE_FORMAT_FILE}");
+        disk.write_all_meta(bucket, &meta_path, b"payload", true)
+            .await
+            .expect("write_all_meta should succeed");
+
+        let dst_file_path = disk.get_object_path(bucket, &meta_path).expect("dst path should resolve");
+        assert_eq!(
+            tokio::fs::read(&dst_file_path).await.expect("xl.meta should exist"),
+            b"payload",
+            "renamed xl.meta must carry the written contents"
+        );
+
+        let tmp_parent = disk
+            .get_bucket_path(RUSTFS_META_TMP_BUCKET)
+            .expect("tmp bucket path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&tmp_parent),
+            "tmp parent dir must not be fsynced for a write-then-rename tmp file"
+        );
+
+        let dst_parent = dst_file_path.parent().expect("dst file should have a parent").to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&dst_parent),
+            "destination parent dir must be fsynced after the commit rename"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_public_still_fsyncs_parent_dir() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "sync-public-bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        disk.write_all(bucket, "config/settings.json", Bytes::from_static(b"payload"))
+            .await
+            .expect("write_all should succeed");
+
+        let file_path = disk
+            .get_object_path(bucket, "config/settings.json")
+            .expect("file path should resolve");
+        let parent = file_path.parent().expect("file should have a parent").to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&parent),
+            "direct (non-renamed) writes must keep fsyncing their parent dir"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_non_inline_skips_tmp_parent_dir_fsync() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "sync-rename-bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-sync-write";
+        let version_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("55555555-5555-5555-5555-555555555555").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("66666666-6666-6666-6666-666666666666").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let dst_object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit");
+
+        // The tmp xl.meta write point uses SyncMode::FileOnly: its parent dir
+        // ({tmp}/{tmp_object}) must not be fsynced.
+        let tmp_meta_parent = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{STORAGE_FORMAT_FILE}"))
+            .expect("tmp meta path should resolve")
+            .parent()
+            .expect("tmp meta should have a parent")
+            .to_path_buf();
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&tmp_meta_parent),
+            "tmp xl.meta parent dir must not be fsynced for the write-then-rename tmp file"
+        );
+
+        // The commit sequence itself is untouched: the destination parent dir
+        // is fsynced after the commit rename, ...
+        let dst_meta_parent = disk
+            .get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("dst meta path should resolve")
+            .parent()
+            .expect("dst meta should have a parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&dst_meta_parent),
+            "destination parent dir must be fsynced after the commit rename"
+        );
+
+        // ... and the rollback backup (which stays in place, no rename) still
+        // fsyncs its parent dir (SyncMode::FileAndDir).
+        let backup_parent = disk
+            .get_object_path(bucket, &format!("{object}/{old_data_dir}/{STORAGE_FORMAT_FILE_BACKUP}"))
+            .expect("backup path should resolve")
+            .parent()
+            .expect("backup should have a parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&backup_parent),
+            "old-metadata rollback backup must keep fsyncing its parent dir"
+        );
+    }
+
+    // Seed a first PUT of `object` (no prior version) through the non-inline
+    // rename_data path and return (disk, tempdir). The object dir and any prefix
+    // dirs are created during the commit.
+    async fn commit_new_object(mode: DurabilityMode, bucket: &str, object: &str) -> (LocalDisk, tempfile::TempDir) {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let tmp_object = "tmp-new-object";
+        let version_id = Uuid::parse_str("77777777-7777-7777-7777-777777777777").expect("version id should parse");
+        let new_data_dir = Uuid::parse_str("88888888-8888-8888-8888-888888888888").expect("new data dir should parse");
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let _mode = durability_mode_override::set(mode);
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit the new object");
+        (disk, dir)
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_new_object_fsyncs_new_ancestor_dirs() {
+        // A first PUT under a new prefix must fsync every newly created ancestor
+        // directory (prefix dir and bucket dir) so the object dir's own entry
+        // survives power loss after ack (rustfs/backlog#922 step 4).
+        let bucket = "new-object-bucket";
+        let (disk, _dir) = commit_new_object(DurabilityMode::Strict, bucket, "prefix/new-object").await;
+
+        let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        let prefix_dir = disk.get_object_path(bucket, "prefix").expect("prefix path should resolve");
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&prefix_dir),
+            "the newly created prefix dir must be fsynced"
+        );
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&bucket_dir),
+            "the bucket dir must be fsynced so the new prefix entry survives power loss"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_relaxed_new_object_skips_ancestor_fsync() {
+        // Relaxed persists shard payload but leaves metadata/directory commits to
+        // the page cache, so a new object must not fsync the ancestor chain.
+        let bucket = "new-object-bucket-relaxed";
+        let (disk, _dir) = commit_new_object(DurabilityMode::Relaxed, bucket, "prefix/new-object").await;
+
+        let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&bucket_dir),
+            "relaxed durability must not fsync the bucket dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_new_inline_object_fsyncs_new_ancestor_dirs() {
+        // The inline commit path (fi.data present) has the same mkdir gap as the
+        // non-inline path: a first PUT under a new prefix must fsync the newly
+        // created prefix and bucket dirs.
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "new-inline-bucket";
+        let object = "prefix/new-inline-object";
+        let tmp_object = "tmp-new-inline";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let version_id = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("version id should parse");
+        // fi.data present -> no_inline is false -> the inline commit branch runs.
+        let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-payload")));
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("inline rename_data should commit the new object");
+
+        let bucket_dir = disk.get_bucket_path(bucket).expect("bucket path should resolve");
+        let prefix_dir = disk.get_object_path(bucket, "prefix").expect("prefix path should resolve");
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&prefix_dir),
+            "the newly created prefix dir must be fsynced on an inline first PUT"
+        );
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&bucket_dir),
+            "the bucket dir must be fsynced on an inline first PUT"
+        );
+    }
+
+    #[test]
+    fn test_resolve_durability_mode_mapping() {
+        // Default: nothing set -> strict (current main behavior).
+        assert_eq!(resolve_durability_mode(None, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE), DurabilityMode::Strict);
+        // Legacy switch compatibility mapping.
+        assert_eq!(resolve_durability_mode(None, true), DurabilityMode::Strict);
+        assert_eq!(resolve_durability_mode(None, false), DurabilityMode::LegacyOff);
+        // Explicit mode wins over the legacy switch.
+        assert_eq!(resolve_durability_mode(Some("strict".into()), false), DurabilityMode::Strict);
+        assert_eq!(resolve_durability_mode(Some("relaxed".into()), true), DurabilityMode::Relaxed);
+        assert_eq!(resolve_durability_mode(Some("none".into()), true), DurabilityMode::None);
+        // Case- and whitespace-tolerant.
+        assert_eq!(resolve_durability_mode(Some(" RELAXED ".into()), true), DurabilityMode::Relaxed);
+        // Invalid values fall back to the legacy switch, then the default.
+        assert_eq!(resolve_durability_mode(Some("bogus".into()), true), DurabilityMode::Strict);
+        assert_eq!(resolve_durability_mode(Some("bogus".into()), false), DurabilityMode::LegacyOff);
+        assert_eq!(resolve_durability_mode(Some(String::new()), true), DurabilityMode::Strict);
+    }
+
+    #[test]
+    fn test_durability_mode_sync_gates() {
+        // Strict = current main behavior: every commit point synced.
+        assert!(DurabilityMode::Strict.syncs_data_shards());
+        assert!(DurabilityMode::Strict.syncs_commit_metadata());
+        // Relaxed keeps payload durability, drops metadata-commit fsyncs.
+        assert!(DurabilityMode::Relaxed.syncs_data_shards());
+        assert!(!DurabilityMode::Relaxed.syncs_commit_metadata());
+        // None and the legacy full-off switch sync nothing on the data path.
+        assert!(!DurabilityMode::None.syncs_data_shards());
+        assert!(!DurabilityMode::None.syncs_commit_metadata());
+        assert!(!DurabilityMode::LegacyOff.syncs_data_shards());
+        assert!(!DurabilityMode::LegacyOff.syncs_commit_metadata());
+    }
+
+    #[test]
+    fn test_system_critical_volume_classification() {
+        // System namespaces are pinned.
+        assert!(is_system_critical_volume(RUSTFS_META_BUCKET));
+        assert!(is_system_critical_volume(&format!("{RUSTFS_META_BUCKET}/buckets")));
+        assert!(is_system_critical_volume(&format!("{RUSTFS_META_BUCKET}/config")));
+        assert!(is_system_critical_volume(super::super::MIGRATING_META_BUCKET));
+        // Scratch namespaces stage user object data and follow the tier.
+        assert!(!is_system_critical_volume(RUSTFS_META_TMP_BUCKET));
+        assert!(!is_system_critical_volume(RUSTFS_META_TMP_DELETED_BUCKET));
+        assert!(!is_system_critical_volume(super::super::RUSTFS_META_MULTIPART_BUCKET));
+        // User buckets follow the tier; similarly-prefixed names are not meta.
+        assert!(!is_system_critical_volume("my-bucket"));
+        assert!(!is_system_critical_volume(".rustfs.sys-lookalike"));
+    }
+
+    #[test]
+    fn test_effective_durability_pins_system_volumes() {
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+            assert_eq!(effective_durability("user-bucket"), DurabilityMode::Relaxed);
+            assert_eq!(effective_durability(super::super::RUSTFS_META_MULTIPART_BUCKET), DurabilityMode::Relaxed);
+            assert_eq!(effective_durability(RUSTFS_META_TMP_BUCKET), DurabilityMode::Relaxed);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+        }
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::None);
+            assert_eq!(effective_durability("user-bucket"), DurabilityMode::None);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+        }
+        {
+            // The legacy full-off switch keeps its historical semantics:
+            // nothing is pinned, not even system-critical namespaces.
+            let _mode = durability_mode_override::set(DurabilityMode::LegacyOff);
+            assert_eq!(effective_durability("user-bucket"), DurabilityMode::LegacyOff);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::LegacyOff);
+        }
+    }
+
+    /// Removes the bucket's durability override when dropped so a test can
+    /// never leak its override into another test's lookup.
+    struct BucketOverrideGuard(&'static str);
+
+    impl BucketOverrideGuard {
+        fn set(bucket: &'static str, mode: DurabilityMode) -> Self {
+            bucket_durability::set(bucket, Some(mode));
+            Self(bucket)
+        }
+    }
+
+    impl Drop for BucketOverrideGuard {
+        fn drop(&mut self) {
+            bucket_durability::set(self.0, None);
+        }
+    }
+
+    #[test]
+    fn test_effective_durability_bucket_override() {
+        // Global strict + per-bucket relaxed: only the named bucket drops.
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Strict);
+            let _guard = BucketOverrideGuard::set("hp5b-override-relaxed", DurabilityMode::Relaxed);
+            assert_eq!(effective_durability("hp5b-override-relaxed"), DurabilityMode::Relaxed);
+            assert_eq!(effective_durability("hp5b-other-bucket"), DurabilityMode::Strict);
+            assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+        }
+        // Override cleared: the bucket follows the global mode again (a new
+        // PUT after a config change resolves the new tier).
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Strict);
+            assert_eq!(effective_durability("hp5b-override-relaxed"), DurabilityMode::Strict);
+        }
+        // Global relaxed + per-bucket strict: overrides can raise durability.
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+            let _guard = BucketOverrideGuard::set("hp5b-override-strict", DurabilityMode::Strict);
+            assert_eq!(effective_durability("hp5b-override-strict"), DurabilityMode::Strict);
+            assert_eq!(effective_durability("hp5b-other-bucket"), DurabilityMode::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_bucket_durability_refuses_system_namespaces() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+
+        // System-critical and scratch namespaces can never carry an override.
+        bucket_durability::set(RUSTFS_META_BUCKET, Some(DurabilityMode::Relaxed));
+        bucket_durability::set(&format!("{RUSTFS_META_BUCKET}/buckets"), Some(DurabilityMode::None));
+        bucket_durability::set(RUSTFS_META_TMP_BUCKET, Some(DurabilityMode::Relaxed));
+        bucket_durability::set(super::super::RUSTFS_META_MULTIPART_BUCKET, Some(DurabilityMode::Relaxed));
+        bucket_durability::set("", Some(DurabilityMode::Relaxed));
+
+        assert_eq!(bucket_durability::lookup(RUSTFS_META_BUCKET), Option::None);
+        assert_eq!(bucket_durability::lookup(RUSTFS_META_TMP_BUCKET), Option::None);
+        assert_eq!(effective_durability(RUSTFS_META_BUCKET), DurabilityMode::Strict);
+
+        // The legacy full-off tier is process-wide only: registering it per
+        // bucket is dropped, not stored.
+        bucket_durability::set("hp5b-legacy-refused", Some(DurabilityMode::LegacyOff));
+        assert_eq!(bucket_durability::lookup("hp5b-legacy-refused"), Option::None);
+    }
+
+    #[test]
+    fn test_effective_durability_legacy_off_ignores_bucket_overrides() {
+        let _mode = durability_mode_override::set(DurabilityMode::LegacyOff);
+        let _guard = BucketOverrideGuard::set("hp5b-legacy-bucket", DurabilityMode::Strict);
+        // The legacy switch keeps its historical semantics bit for bit.
+        assert_eq!(effective_durability("hp5b-legacy-bucket"), DurabilityMode::LegacyOff);
+    }
+
+    /// HP-5b behavior regression: with the global mode at strict (the
+    /// default), a bucket override to relaxed must skip the metadata-commit
+    /// dir fsync for that bucket only, and clearing the override must restore
+    /// the strict behavior for the next write.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_meta_bucket_override_relaxed_then_cleared() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let overridden = "hp5b-relaxed-write-bucket";
+        let untouched = "hp5b-strict-write-bucket";
+        ensure_test_volume(&disk, overridden).await;
+        ensure_test_volume(&disk, untouched).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let meta_path = format!("dir/object/{STORAGE_FORMAT_FILE}");
+
+        {
+            let _guard = BucketOverrideGuard::set("hp5b-relaxed-write-bucket", DurabilityMode::Relaxed);
+
+            disk.write_all_meta(overridden, &meta_path, b"payload", true)
+                .await
+                .expect("write_all_meta should succeed");
+            let overridden_parent = disk
+                .get_object_path(overridden, &meta_path)
+                .expect("dst path should resolve")
+                .parent()
+                .expect("dst file should have a parent")
+                .to_path_buf();
+            assert!(
+                !os::fsync_dir_recorder::was_fsynced(&overridden_parent),
+                "bucket override to relaxed must skip the metadata-commit dir fsync"
+            );
+
+            // A bucket without an override keeps the strict default.
+            disk.write_all_meta(untouched, &meta_path, b"payload", true)
+                .await
+                .expect("write_all_meta should succeed");
+            let untouched_parent = disk
+                .get_object_path(untouched, &meta_path)
+                .expect("dst path should resolve")
+                .parent()
+                .expect("dst file should have a parent")
+                .to_path_buf();
+            assert!(
+                os::fsync_dir_recorder::was_fsynced(&untouched_parent),
+                "buckets without an override must keep the strict commit fsyncs"
+            );
+        }
+
+        // Override cleared (guard dropped): the next write is strict again.
+        let second_meta_path = format!("dir/object-after-clear/{STORAGE_FORMAT_FILE}");
+        disk.write_all_meta(overridden, &second_meta_path, b"payload", true)
+            .await
+            .expect("write_all_meta should succeed");
+        let after_clear_parent = disk
+            .get_object_path(overridden, &second_meta_path)
+            .expect("dst path should resolve")
+            .parent()
+            .expect("dst file should have a parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&after_clear_parent),
+            "clearing the override must restore strict fsyncs for new writes"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_meta_relaxed_skips_dst_parent_dir_fsync() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "relaxed-meta-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let meta_path = format!("dir/object/{STORAGE_FORMAT_FILE}");
+        disk.write_all_meta(bucket, &meta_path, b"payload", true)
+            .await
+            .expect("write_all_meta should succeed");
+
+        let dst_file_path = disk.get_object_path(bucket, &meta_path).expect("dst path should resolve");
+        assert_eq!(
+            tokio::fs::read(&dst_file_path).await.expect("xl.meta should exist"),
+            b"payload",
+            "relaxed mode must not change what gets written, only what gets fsynced"
+        );
+
+        let dst_parent = dst_file_path.parent().expect("dst file should have a parent").to_path_buf();
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&dst_parent),
+            "relaxed mode must skip the metadata-commit dir fsync on user volumes"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_write_all_public_relaxed_pins_system_volume() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let user_bucket = "relaxed-public-bucket";
+        ensure_test_volume(&disk, user_bucket).await;
+
+        // User volume: the direct write follows the relaxed tier.
+        disk.write_all(user_bucket, "config/settings.json", Bytes::from_static(b"payload"))
+            .await
+            .expect("write_all should succeed");
+        let user_parent = disk
+            .get_object_path(user_bucket, "config/settings.json")
+            .expect("file path should resolve")
+            .parent()
+            .expect("file should have a parent")
+            .to_path_buf();
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&user_parent),
+            "relaxed mode must skip the dir fsync for direct writes into user volumes"
+        );
+
+        // System-critical volume: pinned to strict regardless of the tier.
+        disk.write_all(RUSTFS_META_BUCKET, "buckets/test/bucket-metadata", Bytes::from_static(b"payload"))
+            .await
+            .expect("write_all should succeed");
+        let meta_parent = disk
+            .get_object_path(RUSTFS_META_BUCKET, "buckets/test/bucket-metadata")
+            .expect("meta path should resolve")
+            .parent()
+            .expect("meta file should have a parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&meta_parent),
+            "system-critical writes must stay fully synced under relaxed mode"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_relaxed_keeps_shard_sync_skips_commit_fsyncs() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Relaxed);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "relaxed-rename-bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-relaxed-write";
+        let version_id = Uuid::parse_str("77777777-7777-7777-7777-777777777777").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("88888888-8888-8888-8888-888888888888").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let dst_object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let resp = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit");
+        assert_eq!(resp.old_data_dir, Some(old_data_dir), "relaxed mode must not change commit semantics");
+
+        // Compare against root-resolved paths: the recorder stores the paths
+        // the disk actually fsyncs, which go through the canonicalized root.
+        let resolved_tmp_data_dir = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{new_data_dir}"))
+            .expect("tmp data dir path should resolve");
+        let resolved_dst_object_dir = disk.get_object_path(bucket, object).expect("dst object dir should resolve");
+
+        // Payload durability is kept: sync_dir_files fdatasyncs the shard
+        // files and fsyncs the staged data dir before the commit rename.
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&resolved_tmp_data_dir),
+            "relaxed mode must keep the shard-data sync before the commit rename"
+        );
+
+        // Metadata-commit fsyncs are skipped: neither the destination parent
+        // dir nor the rollback backup parent dir is fsynced.
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_dst_object_dir),
+            "relaxed mode must skip the commit-rename dir fsync"
+        );
+        let resolved_backup_parent = resolved_dst_object_dir.join(old_data_dir.to_string());
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_backup_parent),
+            "relaxed mode must skip the rollback-backup dir fsync"
+        );
+        assert!(
+            dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .exists(),
+            "the rollback backup itself must still be written"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_legacy_off_skips_all_fsyncs() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::LegacyOff);
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "legacy-off-bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-legacy-write";
+        let version_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("version id should parse");
+        let new_data_dir = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit");
+
+        // Historical RUSTFS_DRIVE_SYNC_ENABLE=false semantics: no fsync at
+        // all, not even the shard-data sync relaxed keeps. Assertions use the
+        // root-resolved paths the disk actually passes to fsync.
+        let resolved_tmp_data_dir = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{new_data_dir}"))
+            .expect("tmp data dir path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_tmp_data_dir),
+            "legacy-off must not sync staged shard data"
+        );
+        let resolved_dst_object_dir = disk.get_object_path(bucket, object).expect("dst object dir should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_dst_object_dir),
+            "legacy-off must not fsync the commit-rename dir"
+        );
+
+        // And system-critical volumes are NOT pinned: the old full-off
+        // behavior is preserved bit for bit for existing deployments.
+        disk.write_all(RUSTFS_META_BUCKET, "buckets/legacy/bucket-metadata", Bytes::from_static(b"payload"))
+            .await
+            .expect("write_all should succeed");
+        let meta_parent = disk
+            .get_object_path(RUSTFS_META_BUCKET, "buckets/legacy/bucket-metadata")
+            .expect("meta path should resolve")
+            .parent()
+            .expect("meta file should have a parent")
+            .to_path_buf();
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&meta_parent),
+            "legacy-off keeps the historical semantics: system metadata is not synced either"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_writes_old_metadata_backup_for_inline_overwrite() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "inline-object";
+        let tmp_object = "tmp-inline-write";
+        let version_id = Uuid::parse_str("12121212-1212-1212-1212-121212121212").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("34343434-3434-3434-3434-343434343434").expect("old data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let old_meta = test_meta(old_fi);
+        let dst_object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), &old_meta)
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_object_dir = dir.path().join(RUSTFS_META_TMP_BUCKET).join(tmp_object);
+        fs::create_dir_all(&tmp_object_dir)
+            .await
+            .expect("tmp object dir should be created");
+
+        let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-new")));
+        let resp = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("inline rename_data should commit");
+
+        assert_eq!(resp.old_data_dir, Some(old_data_dir));
+        assert_eq!(resp.sign, Some(version_id.as_bytes().to_vec()));
+        let backup_path = dst_object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        assert!(backup_path.exists());
+        // The rollback backup must contain the previous metadata bytes verbatim so
+        // that undo_write can restore the prior committed object; guards the inline
+        // backup write against truncation/corruption regressions.
+        assert_eq!(
+            fs::read(&backup_path).await.expect("backup should be readable"),
+            old_meta,
+            "inline rollback backup must contain the previous metadata bytes verbatim"
+        );
+        assert!(
+            !dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE)
+                .exists()
+        );
+        // rustfs/backlog#1009: the overwritten live current version (size 1
+        // from `test_file_info`) must be surfaced through the backfill.
+        assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(1)));
+    }
+
+    /// rustfs/backlog#1009: `observe_old_current_size` must mirror the pre-PUT
+    /// `get_object_info` semantics bit for bit — latest version's
+    /// `ObjectInfo.size` (0 for a delete-marker latest, which that lookup
+    /// returns as `Ok`, not as not-found), missing key → `Absent` — and
+    /// `rename_data` must report it for both the inline and non-inline commit
+    /// branches.
+    mod old_current_size_backfill {
+        use super::*;
+        use tempfile::tempdir;
+
+        fn live_file_info(name: &str, version_id: Uuid, size: i64, mod_time: OffsetDateTime) -> FileInfo {
+            FileInfo {
+                name: name.to_string(),
+                version_id: Some(version_id),
+                size,
+                mod_time: Some(mod_time),
+                ..Default::default()
+            }
+        }
+
+        fn delete_marker_file_info(name: &str, version_id: Uuid, mod_time: OffsetDateTime) -> FileInfo {
+            FileInfo {
+                name: name.to_string(),
+                version_id: Some(version_id),
+                deleted: true,
+                mod_time: Some(mod_time),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn observe_reports_absent_for_missing_key() {
+            assert_eq!(observe_old_current_size(false, &FileMeta::default()), Some(OldCurrentSize::Absent));
+        }
+
+        /// An existing xl.meta with zero versions reads back through
+        /// `get_file_info` as a synthetic deleted FileInfo of size 0, so the
+        /// pre-PUT lookup reported `Some(0)`, not not-found.
+        #[test]
+        fn observe_reports_present_zero_for_existing_versionless_meta() {
+            assert_eq!(observe_old_current_size(true, &FileMeta::default()), Some(OldCurrentSize::Present(0)));
+        }
+
+        #[test]
+        fn observe_reports_latest_live_version_size() {
+            let now = OffsetDateTime::now_utc();
+            let mut meta = FileMeta::new();
+            meta.add_version(live_file_info("object", Uuid::new_v4(), 10, now - time::Duration::seconds(10)))
+                .expect("older live version should be added");
+            meta.add_version(live_file_info("object", Uuid::new_v4(), 42, now))
+                .expect("newer live version should be added");
+
+            assert_eq!(observe_old_current_size(true, &meta), Some(OldCurrentSize::Present(42)));
+        }
+
+        /// The pre-PUT lookup returns `Ok(size 0)` for a delete-marker latest
+        /// (RustFS's `SetDisks::get_object_info` does not convert markers to
+        /// not-found), and delete-marker creation never decrements
+        /// objects_count — so the backfill must report `Present(0)` here, not
+        /// `Absent`, to keep versioned accounting bit-identical.
+        #[test]
+        fn observe_reports_present_zero_for_delete_marker_latest() {
+            let now = OffsetDateTime::now_utc();
+            let mut meta = FileMeta::new();
+            meta.add_version(live_file_info("object", Uuid::new_v4(), 42, now - time::Duration::seconds(10)))
+                .expect("live version should be added");
+            meta.add_version(delete_marker_file_info("object", Uuid::new_v4(), now))
+                .expect("delete marker should be added");
+
+            assert_eq!(observe_old_current_size(true, &meta), Some(OldCurrentSize::Present(0)));
+        }
+
+        /// A latest version whose part arrays are corrupt (lengths disagree)
+        /// made the old per-disk lookup error out — this disk must abstain
+        /// (`None`), never vote. Pins the `all_parts=true` flag that enables
+        /// the part-array length guard.
+        #[test]
+        fn observe_abstains_for_corrupt_part_arrays() {
+            let now = OffsetDateTime::now_utc();
+            let mut fi = live_file_info("object", Uuid::new_v4(), 42, now);
+            fi.add_object_part(1, "etag".to_string(), 42, Some(now), 42, None, None);
+            let mut version = rustfs_filemeta::FileMetaVersion::from(fi);
+            version
+                .object
+                .as_mut()
+                .expect("object version should carry a MetaObject")
+                .part_sizes
+                .clear();
+
+            let mut meta = FileMeta::new();
+            meta.add_version_filemata(version)
+                .expect("corrupt-part version should still insert");
+
+            assert_eq!(observe_old_current_size(true, &meta), None);
+        }
+
+        async fn test_disk(dir: &tempfile::TempDir) -> LocalDisk {
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            ensure_test_volume(&disk, "bucket").await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+            disk
+        }
+
+        #[tokio::test]
+        async fn inline_rename_data_reports_absent_for_fresh_key() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            let new_fi = test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"inline-new")));
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-fresh", new_fi, "bucket", "object")
+                .await
+                .expect("inline rename_data should commit");
+
+            assert_eq!(resp.old_current_size, Some(OldCurrentSize::Absent));
+        }
+
+        #[tokio::test]
+        async fn inline_rename_data_reports_present_zero_for_delete_marker_latest() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            let now = OffsetDateTime::now_utc();
+            let mut old_meta = FileMeta::new();
+            old_meta
+                .add_version(live_file_info("object", Uuid::new_v4(), 42, now - time::Duration::seconds(10)))
+                .expect("live version should be added");
+            old_meta
+                .add_version(delete_marker_file_info("object", Uuid::new_v4(), now))
+                .expect("delete marker should be added");
+            let dst_object_dir = dir.path().join("bucket").join("object");
+            fs::create_dir_all(&dst_object_dir).await.expect("dst dir should be created");
+            fs::write(
+                dst_object_dir.join(STORAGE_FORMAT_FILE),
+                old_meta.marshal_msg().expect("old metadata should encode"),
+            )
+            .await
+            .expect("old metadata should be written");
+
+            let new_fi = test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"inline-new")));
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-marker", new_fi, "bucket", "object")
+                .await
+                .expect("inline rename_data should commit");
+
+            // The pre-PUT lookup returns Ok(size 0) for a marker latest, so
+            // the backfill must match it (see observe_old_current_size docs).
+            assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(0)));
+        }
+
+        #[tokio::test]
+        async fn inline_rename_data_reports_unknown_for_unparsable_dst_meta() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            let dst_object_dir = dir.path().join("bucket").join("object");
+            fs::create_dir_all(&dst_object_dir).await.expect("dst dir should be created");
+            fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), b"not-an-xl-meta")
+                .await
+                .expect("garbage metadata should be written");
+
+            let new_fi = test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"inline-new")));
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-garbage", new_fi, "bucket", "object")
+                .await
+                .expect("inline rename_data should commit");
+
+            assert_eq!(resp.old_current_size, None);
+        }
+
+        #[tokio::test]
+        async fn non_inline_rename_data_reports_absent_then_previous_size() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            // First non-inline commit: fresh key must report Absent.
+            let first_data_dir = Uuid::new_v4();
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join("tmp-first")
+                .join(first_data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("tmp data dir should be created");
+            fs::write(tmp_data_dir.join("part.1"), b"first")
+                .await
+                .expect("part should be written");
+            let mut first_fi = test_file_info("object", Uuid::new_v4(), Some(first_data_dir), None);
+            first_fi.size = 5;
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-first", first_fi, "bucket", "object")
+                .await
+                .expect("first non-inline rename_data should commit");
+            assert_eq!(resp.old_current_size, Some(OldCurrentSize::Absent));
+
+            // Overwrite: the committed live version (size 5) must be reported.
+            let second_data_dir = Uuid::new_v4();
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join("tmp-second")
+                .join(second_data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("tmp data dir should be created");
+            fs::write(tmp_data_dir.join("part.1"), b"second-longer")
+                .await
+                .expect("part should be written");
+            let mut second_fi = test_file_info("object", Uuid::new_v4(), Some(second_data_dir), None);
+            second_fi.size = 13;
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-second", second_fi, "bucket", "object")
+                .await
+                .expect("second non-inline rename_data should commit");
+            assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(5)));
+        }
+
+        /// Twin of the inline unparsable-dst test: the `dst_meta_unparsable`
+        /// tracking is duplicated per branch, so the non-inline copy needs its
+        /// own regression coverage.
+        #[tokio::test]
+        async fn non_inline_rename_data_reports_unknown_for_unparsable_dst_meta() {
+            let dir = tempdir().expect("temp dir should be created");
+            let disk = test_disk(&dir).await;
+
+            let dst_object_dir = dir.path().join("bucket").join("object");
+            fs::create_dir_all(&dst_object_dir).await.expect("dst dir should be created");
+            fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), b"not-an-xl-meta")
+                .await
+                .expect("garbage metadata should be written");
+
+            let data_dir = Uuid::new_v4();
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join("tmp-garbage-noninline")
+                .join(data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("tmp data dir should be created");
+            fs::write(tmp_data_dir.join("part.1"), b"payload")
+                .await
+                .expect("part should be written");
+            let mut new_fi = test_file_info("object", Uuid::new_v4(), Some(data_dir), None);
+            new_fi.size = 7;
+            let resp = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-garbage-noninline", new_fi, "bucket", "object")
+                .await
+                .expect("non-inline rename_data should commit over garbage metadata");
+
+            assert_eq!(resp.old_current_size, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_undo_restores_backup_to_object_root() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("55555555-5555-5555-5555-555555555555").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("66666666-6666-6666-6666-666666666666").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join("dir/object");
+        fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old backup dir should be created");
+        fs::create_dir_all(object_dir.join(new_data_dir.to_string()))
+            .await
+            .expect("new data dir should be created");
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let old_meta = test_meta(old_fi);
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        fs::write(
+            object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP),
+            old_meta.clone(),
+        )
+        .await
+        .expect("old metadata backup should be written");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(new_fi.clone()))
+            .await
+            .expect("new metadata should be written");
+
+        disk.delete_version(
+            bucket,
+            object,
+            new_fi,
+            false,
+            DeleteOptions {
+                undo_write: true,
+                old_data_dir: Some(old_data_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("undo should restore old metadata");
+
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("restored metadata should be readable");
+        assert_eq!(restored_meta, old_meta);
+        assert!(!object_dir.join("dir/object").join(STORAGE_FORMAT_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_undo_restores_backup_when_other_versions_remain() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").expect("version id should parse");
+        let other_version_id = Uuid::parse_str("77777777-7777-7777-7777-777777777777").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("55555555-5555-5555-5555-555555555555").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("66666666-6666-6666-6666-666666666666").expect("new data dir should parse");
+        let other_data_dir = Uuid::parse_str("88888888-8888-8888-8888-888888888888").expect("other data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join("dir/object");
+        fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old backup dir should be created");
+        fs::create_dir_all(object_dir.join(new_data_dir.to_string()))
+            .await
+            .expect("new data dir should be created");
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let other_fi = test_file_info(object, other_version_id, Some(other_data_dir), None);
+        let mut old_meta = FileMeta::default();
+        old_meta
+            .add_version(old_fi)
+            .expect("old metadata should accept old file info");
+        old_meta
+            .add_version(other_fi.clone())
+            .expect("old metadata should accept other file info");
+        let old_meta = old_meta.marshal_msg().expect("old metadata should encode");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let mut new_meta = FileMeta::default();
+        new_meta
+            .add_version(new_fi.clone())
+            .expect("new metadata should accept new file info");
+        new_meta
+            .add_version(other_fi)
+            .expect("new metadata should accept other file info");
+
+        fs::write(
+            object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP),
+            old_meta.clone(),
+        )
+        .await
+        .expect("old metadata backup should be written");
+        fs::write(
+            object_dir.join(STORAGE_FORMAT_FILE),
+            new_meta.marshal_msg().expect("new metadata should encode"),
+        )
+        .await
+        .expect("new metadata should be written");
+
+        disk.delete_version(
+            bucket,
+            object,
+            new_fi,
+            false,
+            DeleteOptions {
+                undo_write: true,
+                old_data_dir: Some(old_data_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("undo should restore old metadata");
+
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("restored metadata should be readable");
+        assert_eq!(restored_meta, old_meta);
+    }
+
+    #[tokio::test]
+    async fn test_delete_versions_ignores_missing_non_deleted_version_and_deletes_existing() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let existing_version = Uuid::parse_str("10101010-1010-1010-1010-101010101010").expect("version id should parse");
+        let missing_version = Uuid::parse_str("20202020-2020-2020-2020-202020202020").expect("version id should parse");
+        let existing_data_dir = Uuid::parse_str("30303030-3030-3030-3030-303030303030").expect("data dir should parse");
+        let missing_data_dir = Uuid::parse_str("40404040-4040-4040-4040-404040404040").expect("data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(object_dir.join(existing_data_dir.to_string()))
+            .await
+            .expect("existing data dir should be created");
+
+        let existing_fi = test_file_info(object, existing_version, Some(existing_data_dir), None);
+        let missing_fi = test_file_info(object, missing_version, Some(missing_data_dir), None);
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(existing_fi.clone()))
+            .await
+            .expect("existing metadata should be written");
+
+        disk.delete_versions_internal(bucket, object, &[missing_fi, existing_fi])
+            .await
+            .expect("missing non-deleted version should not abort deletion");
+
+        assert!(
+            matches!(
+                disk.read_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}")).await,
+                Err(DiskError::FileNotFound)
+            ),
+            "metadata should be removed once the remaining real version is deleted"
+        );
+        assert!(
+            !object_dir.join(existing_data_dir.to_string()).exists(),
+            "deleted version data directory should leave the object path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_failure_before_metadata_commit_preserves_old_metadata() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "failpoint-object";
+        let tmp_object = "tmp-object";
+        let version_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").expect("version id should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let old_meta = test_meta(old_fi);
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), old_meta.clone())
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        set_rename_data_fail_before_old_metadata_backup(object);
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let result = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await;
+
+        assert!(result.is_err());
+        let current_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("old metadata should still be readable");
+        assert_eq!(current_meta, old_meta);
+        assert!(!object_dir.join("object").join(STORAGE_FORMAT_FILE).exists());
+    }
 
     #[tokio::test]
     async fn test_skip_access_checks() {
@@ -3732,8 +8258,40 @@ mod test {
         let paths: Vec<_> = vols.iter().map(|v| path_join(&[Path::new(v), Path::new("test")])).collect();
 
         for p in paths.iter() {
-            assert!(skip_access_checks(p.to_str().unwrap()));
+            assert!(skip_access_checks(p.to_str().expect("operation should succeed")));
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct PendingTestReader;
+
+    impl AsyncRead for PendingTestReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_read_timeout_reader_times_out_when_inner_stalls() {
+        let mut reader = StallTimeoutReader::new(PendingTestReader, Duration::from_secs(10));
+        let mut buf = [0; 1];
+
+        let err = reader
+            .read(&mut buf)
+            .await
+            .expect_err("stalled local reader should return a timeout error");
+
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn local_read_timeout_reader_with_zero_timeout_stays_pending() {
+        let mut reader = StallTimeoutReader::new(PendingTestReader, Duration::ZERO);
+        let mut buf = [0; 1];
+
+        let result = tokio::time::timeout(Duration::from_millis(10), reader.read(&mut buf)).await;
+
+        assert!(result.is_err(), "zero timeout must leave stalled reads pending instead of failing");
     }
 
     #[tokio::test]
@@ -3742,8 +8300,9 @@ mod test {
         use crate::disk::format::FormatV3;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
-        let mut endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let dir = tempdir().expect("operation should succeed");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         endpoint.set_pool_index(0);
         endpoint.set_set_index(0);
         endpoint.set_disk_index(0);
@@ -3786,15 +8345,17 @@ mod test {
     async fn cleanup_tmp_on_startup_moves_existing_tmp_and_recreates_trash() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
         let leftover = tmp.join("leftover").join("data");
-        fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
-        fs::write(&leftover, b"temporary").await.unwrap();
+        fs::create_dir_all(leftover.parent().expect("operation should succeed"))
+            .await
+            .expect("operation should succeed");
+        fs::write(&leftover, b"temporary").await.expect("operation should succeed");
 
         LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         assert!(!tmp.join("leftover").exists());
         assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
@@ -3804,50 +8365,56 @@ mod test {
     async fn cleanup_stale_tmp_objects_moves_expired_tmp_dirs_to_trash() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
         let stale = tmp.join("stale").join("data");
         let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
-        fs::create_dir_all(stale.parent().unwrap()).await.unwrap();
-        fs::create_dir_all(&trash).await.unwrap();
-        fs::write(&stale, b"temporary").await.unwrap();
+        fs::create_dir_all(stale.parent().expect("operation should succeed"))
+            .await
+            .expect("operation should succeed");
+        fs::create_dir_all(&trash).await.expect("operation should succeed");
+        fs::write(&stale, b"temporary").await.expect("operation should succeed");
 
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        // Backdate after the write above: creating stale/data refreshes the
+        // scanned tmp/stale directory's mtime.
+        backdate_mtime(&tmp.join("stale"), Duration::from_secs(10));
         LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         assert!(!tmp.join("stale").exists());
         assert!(trash.exists());
 
-        let mut entries = fs::read_dir(&trash).await.unwrap();
-        assert!(entries.next_entry().await.unwrap().is_some());
+        let mut entries = fs::read_dir(&trash).await.expect("operation should succeed");
+        assert!(entries.next_entry().await.expect("operation should succeed").is_some());
     }
 
     #[tokio::test]
     async fn cleanup_stale_tmp_objects_keeps_fresh_dirs_and_regular_files() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
         let fresh_dir = tmp.join("fresh").join("data");
         let regular_file = tmp.join("note.txt");
         let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
 
-        fs::create_dir_all(fresh_dir.parent().unwrap()).await.unwrap();
-        fs::create_dir_all(&trash).await.unwrap();
-        fs::write(&fresh_dir, b"temporary").await.unwrap();
-        fs::write(&regular_file, b"keep").await.unwrap();
+        fs::create_dir_all(fresh_dir.parent().expect("operation should succeed"))
+            .await
+            .expect("operation should succeed");
+        fs::create_dir_all(&trash).await.expect("operation should succeed");
+        fs::write(&fresh_dir, b"temporary").await.expect("operation should succeed");
+        fs::write(&regular_file, b"keep").await.expect("operation should succeed");
 
         LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::from_secs(60))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         assert!(tmp.join("fresh").exists());
         assert!(regular_file.exists());
 
-        let mut entries = fs::read_dir(&trash).await.unwrap();
-        assert!(entries.next_entry().await.unwrap().is_none());
+        let mut entries = fs::read_dir(&trash).await.expect("operation should succeed");
+        assert!(entries.next_entry().await.expect("operation should succeed").is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -3878,7 +8445,7 @@ mod test {
         ready.store(1, Ordering::Release);
         notify.notify_waiters();
 
-        assert!(wait.await.unwrap());
+        assert!(wait.await.expect("operation should succeed"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3895,7 +8462,50 @@ mod test {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
 
-        assert!(!wait.await.unwrap());
+        assert!(!wait.await.expect("operation should succeed"));
+    }
+
+    #[test]
+    fn metacache_write_obj_classifies_closed_output_stream() {
+        struct BrokenPipeWriter;
+
+        impl AsyncWrite for BrokenPipeWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed")))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut writer = BrokenPipeWriter;
+        let mut out = MetacacheWriter::new(&mut writer);
+
+        let err = futures::executor::block_on(write_metacache_obj(
+            &mut out,
+            &MetaCacheEntry {
+                name: "object".to_string(),
+                ..Default::default()
+            },
+        ))
+        .expect_err("closed metacache output stream should fail");
+
+        assert!(err.is_metacache_output_stream_closed());
     }
 
     #[tokio::test]
@@ -3903,21 +8513,36 @@ mod test {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
-        fs::create_dir_all(bucket_dir.join("foo/bar/xyzzy")).await.unwrap();
-        fs::create_dir_all(bucket_dir.join("quux/thud")).await.unwrap();
-        fs::create_dir_all(bucket_dir.join("asdf")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("foo/bar/xyzzy"))
+            .await
+            .expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("quux/thud"))
+            .await
+            .expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("asdf"))
+            .await
+            .expect("operation should succeed");
 
-        fs::write(bucket_dir.join("foo/bar/xl.meta"), b"meta").await.unwrap();
-        fs::write(bucket_dir.join("foo/bar/xyzzy/xl.meta"), b"meta").await.unwrap();
-        fs::write(bucket_dir.join("quux/thud/xl.meta"), b"meta").await.unwrap();
-        fs::write(bucket_dir.join("asdf/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("foo/bar/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
+        fs::write(bucket_dir.join("foo/bar/xyzzy/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
+        fs::write(bucket_dir.join("quux/thud/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
+        fs::write(bucket_dir.join("asdf/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
         let mut out = MetacacheWriter::new(&mut writer);
@@ -3931,11 +8556,11 @@ mod test {
 
         disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
-            .unwrap();
-        out.close().await.unwrap();
+            .expect("operation should succeed");
+        out.close().await.expect("operation should succeed");
 
         let mut reader = MetacacheReader::new(reader);
-        let entries = reader.read_all().await.unwrap();
+        let entries = reader.read_all().await.expect("operation should succeed");
         let names: Vec<String> = entries
             .into_iter()
             .filter(|entry| !entry.metadata.is_empty())
@@ -3949,30 +8574,84 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_scan_dir_reports_base_dir_object_metadata() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("operation should succeed");
+        let bucket = "test-bucket";
+        let base_dir = "base-object";
+        let bucket_dir = dir.path().join(bucket);
+        fs::create_dir_all(bucket_dir.join(base_dir))
+            .await
+            .expect("base object dir should be created");
+        fs::write(bucket_dir.join(base_dir).join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("base object metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: base_dir.to_string(),
+            recursive: false,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .expect("operation should succeed");
+        out.close().await.expect("operation should succeed");
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.expect("operation should succeed");
+        let names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+
+        assert_eq!(names, vec![format!("{base_dir}/")]);
+        assert_eq!(objs_returned, 1);
+    }
+
+    #[tokio::test]
     async fn test_scan_dir_deduplicates_explicit_dir_marker_recursion() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
-        fs::create_dir_all(bucket_dir.join("marker/file.txt")).await.unwrap();
-        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("marker/file.txt"))
+            .await
+            .expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt"))
+            .await
+            .expect("operation should succeed");
         fs::create_dir_all(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}")))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
-        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
         fs::write(bucket_dir.join("marker/subdir/file.txt/xl.meta"), b"meta")
             .await
-            .unwrap();
+            .expect("operation should succeed");
         fs::write(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}/xl.meta")), b"meta")
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
         let mut out = MetacacheWriter::new(&mut writer);
@@ -3986,11 +8665,11 @@ mod test {
 
         disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
-            .unwrap();
-        out.close().await.unwrap();
+            .expect("operation should succeed");
+        out.close().await.expect("operation should succeed");
 
         let mut reader = MetacacheReader::new(reader);
-        let entries = reader.read_all().await.unwrap();
+        let entries = reader.read_all().await.expect("operation should succeed");
         let names: Vec<String> = entries
             .into_iter()
             .filter(|entry| !entry.metadata.is_empty())
@@ -4007,7 +8686,7 @@ mod test {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
@@ -4025,12 +8704,15 @@ mod test {
             "unrelated/engineering/repo-0000",
         ] {
             let object_dir = bucket_dir.join(name);
-            fs::create_dir_all(&object_dir).await.unwrap();
-            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta").await.unwrap();
+            fs::create_dir_all(&object_dir).await.expect("operation should succeed");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                .await
+                .expect("operation should succeed");
         }
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
             let (reader, mut writer) = tokio::io::duplex(4096);
@@ -4046,13 +8728,13 @@ mod test {
 
             disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
                 .await
-                .unwrap();
-            out.close().await.unwrap();
+                .expect("operation should succeed");
+            out.close().await.expect("operation should succeed");
             drop(out);
             drop(writer);
 
             let mut reader = MetacacheReader::new(reader);
-            let entries = reader.read_all().await.unwrap();
+            let entries = reader.read_all().await.expect("operation should succeed");
             let names: Vec<String> = entries
                 .into_iter()
                 .filter(|entry| !entry.metadata.is_empty())
@@ -4150,7 +8832,7 @@ mod test {
             fm.marshal_msg().expect("object metadata should encode")
         }
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
@@ -4160,14 +8842,16 @@ mod test {
             ("shard/aaa-trash-0002", "33333333-3333-3333-3333-333333333333"),
         ] {
             let object_dir = bucket_dir.join(name);
-            fs::create_dir_all(&object_dir).await.unwrap();
+            fs::create_dir_all(&object_dir).await.expect("operation should succeed");
             fs::write(object_dir.join(STORAGE_FORMAT_FILE), delete_marker_metadata(version_id))
                 .await
-                .unwrap();
+                .expect("operation should succeed");
         }
 
         let hidden_versioned_dir = bucket_dir.join("shard/aaa-trash-0003");
-        fs::create_dir_all(&hidden_versioned_dir).await.unwrap();
+        fs::create_dir_all(&hidden_versioned_dir)
+            .await
+            .expect("operation should succeed");
         fs::write(
             hidden_versioned_dir.join(STORAGE_FORMAT_FILE),
             delete_marker_with_old_object_metadata(
@@ -4176,19 +8860,20 @@ mod test {
             ),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
         let visible_dir = bucket_dir.join("shard/bbb-visible-0000");
-        fs::create_dir_all(&visible_dir).await.unwrap();
+        fs::create_dir_all(&visible_dir).await.expect("operation should succeed");
         fs::write(
             visible_dir.join(STORAGE_FORMAT_FILE),
             object_metadata("66666666-6666-6666-6666-666666666666"),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
         let mut out = MetacacheWriter::new(&mut writer);
@@ -4203,8 +8888,8 @@ mod test {
 
         disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
-            .unwrap();
-        out.close().await.unwrap();
+            .expect("operation should succeed");
+        out.close().await.expect("operation should succeed");
         drop(out);
         drop(writer);
 
@@ -4212,12 +8897,641 @@ mod test {
         let has_visible_object = reader
             .read_all()
             .await
-            .unwrap()
+            .expect("operation should succeed")
             .into_iter()
             .any(|entry| !entry.metadata.is_empty() && entry.name == "shard/bbb-visible-0000");
 
         assert!(has_visible_object);
         assert_eq!(objs_returned, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_skips_dirs_with_only_hidden_delete_markers() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn hidden_versioned_object_metadata(name: &str, delete_version_id: &str, object_version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version({
+                let mut fi = FileInfo::new(name, 1, 1);
+                fi.version_id = Some(Uuid::parse_str(object_version_id).expect("test version id should parse"));
+                fi.mod_time = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
+                fi
+            })
+            .expect("object metadata should be valid");
+            fm.add_version(FileInfo {
+                name: name.to_owned(),
+                deleted: true,
+                version_id: Some(Uuid::parse_str(delete_version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("hidden metadata should encode")
+        }
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, incl_deleted: bool) -> Vec<String> {
+            let (reader, mut writer) = tokio::io::duplex(4096);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: base_dir.to_string(),
+                recursive: false,
+                incl_deleted,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        let hidden_object = bucket_dir.join("hidden/deleted.txt");
+        fs::create_dir_all(&hidden_object)
+            .await
+            .expect("hidden object dir should be created");
+        fs::write(
+            hidden_object.join(STORAGE_FORMAT_FILE),
+            hidden_versioned_object_metadata(
+                "hidden/deleted.txt",
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ),
+        )
+        .await
+        .expect("hidden object metadata should be written");
+
+        let nested_hidden_object = bucket_dir.join("hidden/nested/deleted.txt");
+        fs::create_dir_all(&nested_hidden_object)
+            .await
+            .expect("nested hidden object dir should be created");
+        fs::write(
+            nested_hidden_object.join(STORAGE_FORMAT_FILE),
+            hidden_versioned_object_metadata(
+                "hidden/nested/deleted.txt",
+                "33333333-3333-3333-3333-333333333333",
+                "44444444-4444-4444-4444-444444444444",
+            ),
+        )
+        .await
+        .expect("nested hidden object metadata should be written");
+
+        let visible_object = bucket_dir.join("visible/nested/object.txt");
+        fs::create_dir_all(&visible_object)
+            .await
+            .expect("visible object dir should be created");
+        fs::write(
+            visible_object.join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("visible/nested/object.txt", "55555555-5555-5555-5555-555555555555"),
+        )
+        .await
+        .expect("visible object metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let root_names = scan_names(&disk, bucket, "", false).await;
+        assert!(!root_names.contains(&"hidden/".to_string()));
+        assert!(root_names.contains(&"visible/".to_string()));
+
+        let hidden_names = scan_names(&disk, bucket, "hidden/", false).await;
+        assert!(!hidden_names.contains(&"hidden/nested/".to_string()));
+
+        let visible_names = scan_names(&disk, bucket, "visible/", false).await;
+        assert!(visible_names.contains(&"visible/nested/".to_string()));
+
+        let versioned_root_names = scan_names(&disk, bucket, "", true).await;
+        assert!(versioned_root_names.contains(&"hidden/".to_string()));
+
+        let versioned_hidden_names = scan_names(&disk, bucket, "hidden/", true).await;
+        assert!(versioned_hidden_names.contains(&"hidden/nested/".to_string()));
+    }
+
+    /// backlog#1042: in a non-recursive (delimiter) listing a plain object `a`
+    /// and a sibling object `a/b` under the same-named prefix must BOTH appear —
+    /// `a` as an object (Contents) and `a/` as a prefix dir (CommonPrefix). A leaf
+    /// object with no sibling must NOT gain a spurious prefix.
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_object_and_sibling_prefix_coexist() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        async fn scan_entries(disk: &LocalDisk, bucket: &str, base_dir: &str) -> Vec<(String, bool)> {
+            let (reader, mut writer) = tokio::io::duplex(4096);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: base_dir.to_string(),
+                recursive: false,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| (entry.name.clone(), entry.is_object()))
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        // Object `a` at bucket/a/xl.meta.
+        let obj_a = bucket_dir.join("a");
+        fs::create_dir_all(&obj_a).await.expect("object a dir should be created");
+        fs::write(
+            obj_a.join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        )
+        .await
+        .expect("object a metadata should be written");
+
+        // Sibling object `a/b` at bucket/a/b/xl.meta — makes `a/` a real prefix.
+        let obj_ab = bucket_dir.join("a/b");
+        fs::create_dir_all(&obj_ab).await.expect("object a/b dir should be created");
+        fs::write(
+            obj_ab.join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a/b", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        )
+        .await
+        .expect("object a/b metadata should be written");
+
+        // Leaf object `c` at bucket/c/xl.meta — must NOT produce a prefix `c/`.
+        let obj_c = bucket_dir.join("c");
+        fs::create_dir_all(&obj_c).await.expect("object c dir should be created");
+        fs::write(
+            obj_c.join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("c", "cccccccc-cccc-cccc-cccc-cccccccccccc"),
+        )
+        .await
+        .expect("object c metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let entries = scan_entries(&disk, bucket, "").await;
+
+        assert!(
+            entries.iter().any(|(name, is_object)| name == "a" && *is_object),
+            "object `a` must be emitted as an object, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|(name, is_object)| name == "a/" && !*is_object),
+            "prefix `a/` must be emitted as a dir because sibling `a/b` exists, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|(name, is_object)| name == "c" && *is_object),
+            "leaf object `c` must be emitted as an object, got {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|(name, _)| name == "c/"),
+            "leaf object `c` must not produce a spurious prefix `c/`, got {entries:?}"
+        );
+    }
+
+    // Regression for backlog#1042: on a single disk, a plain object `a` and its
+    // children `a/...` share one backing directory, so the non-recursive scan
+    // must produce both the object entry `a` and the prefix entry `a/` — while
+    // an object whose directory only holds its own xl.meta and data dirs must
+    // not grow a phantom prefix.
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_object_with_children_emits_prefix() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str, data_dir: Option<&str>) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.data_dir = data_dir.map(|dir| Uuid::parse_str(dir).expect("test data dir should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        fn hidden_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version(FileInfo {
+                name: name.to_owned(),
+                deleted: true,
+                version_id: Some(Uuid::parse_str(version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("hidden metadata should encode")
+        }
+
+        async fn scan_entries(disk: &LocalDisk, bucket: &str, incl_deleted: bool) -> Vec<(String, bool)> {
+            let (reader, mut writer) = tokio::io::duplex(65536);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: "".to_string(),
+                recursive: false,
+                incl_deleted,
+                limit: 1000,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| (entry.name, !entry.metadata.is_empty()))
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        // `alpha` object with a data dir, plus a real child `alpha/beta`.
+        let alpha_data_dir = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        fs::create_dir_all(bucket_dir.join("alpha").join(alpha_data_dir))
+            .await
+            .expect("alpha data dir should be created");
+        fs::write(bucket_dir.join("alpha").join(alpha_data_dir).join("part.1"), b"data")
+            .await
+            .expect("alpha part should be written");
+        fs::write(
+            bucket_dir.join("alpha").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("alpha", "11111111-1111-1111-1111-111111111111", Some(alpha_data_dir)),
+        )
+        .await
+        .expect("alpha metadata should be written");
+        fs::create_dir_all(bucket_dir.join("alpha/beta"))
+            .await
+            .expect("alpha child dir should be created");
+        fs::write(
+            bucket_dir.join("alpha/beta").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("alpha/beta", "22222222-2222-2222-2222-222222222222", None),
+        )
+        .await
+        .expect("alpha child metadata should be written");
+
+        // `gamma` object whose only extra child is hidden by a delete marker.
+        fs::create_dir_all(bucket_dir.join("gamma/hidden"))
+            .await
+            .expect("gamma child dir should be created");
+        fs::write(
+            bucket_dir.join("gamma").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("gamma", "33333333-3333-3333-3333-333333333333", None),
+        )
+        .await
+        .expect("gamma metadata should be written");
+        fs::write(
+            bucket_dir.join("gamma/hidden").join(STORAGE_FORMAT_FILE),
+            hidden_object_metadata("gamma/hidden", "44444444-4444-4444-4444-444444444444"),
+        )
+        .await
+        .expect("gamma child metadata should be written");
+
+        // `plain` object with only its own storage internals: no prefix expected.
+        let plain_data_dir = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        fs::create_dir_all(bucket_dir.join("plain").join(plain_data_dir))
+            .await
+            .expect("plain data dir should be created");
+        fs::write(bucket_dir.join("plain").join(plain_data_dir).join("part.1"), b"data")
+            .await
+            .expect("plain part should be written");
+        // Data dirs can hold xl.meta-bearing subdirectories (multipart layout);
+        // the probe must skip the whole data dir, not just non-metadata files.
+        fs::create_dir_all(bucket_dir.join("plain").join(plain_data_dir).join("seg"))
+            .await
+            .expect("plain data subdir should be created");
+        fs::write(
+            bucket_dir
+                .join("plain")
+                .join(plain_data_dir)
+                .join("seg")
+                .join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("plain-part", "88888888-8888-8888-8888-888888888888", None),
+        )
+        .await
+        .expect("plain data subdir metadata should be written");
+        fs::write(
+            bucket_dir.join("plain").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("plain", "55555555-5555-5555-5555-555555555555", Some(plain_data_dir)),
+        )
+        .await
+        .expect("plain metadata should be written");
+
+        // `zeta` sorts last so its prefix is flushed by the final drain, not the
+        // in-loop flush that `alpha/` exercises.
+        fs::create_dir_all(bucket_dir.join("zeta/child"))
+            .await
+            .expect("zeta child dir should be created");
+        fs::write(
+            bucket_dir.join("zeta").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("zeta", "66666666-6666-6666-6666-666666666666", None),
+        )
+        .await
+        .expect("zeta metadata should be written");
+        fs::write(
+            bucket_dir.join("zeta/child").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("zeta/child", "77777777-7777-7777-7777-777777777777", None),
+        )
+        .await
+        .expect("zeta child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let entries = scan_entries(&disk, bucket, false).await;
+        let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(names, vec!["alpha", "alpha/", "gamma", "plain", "zeta", "zeta/"]);
+        assert!(entries.iter().any(|(name, has_meta)| name == "alpha" && *has_meta));
+        assert!(entries.iter().any(|(name, has_meta)| name == "alpha/" && !*has_meta));
+        assert!(entries.iter().any(|(name, has_meta)| name == "zeta/" && !*has_meta));
+
+        // Versioned listings surface delete-marker-only children, so `gamma/`
+        // appears; data dirs still never masquerade as prefixes.
+        let versioned_entries = scan_entries(&disk, bucket, true).await;
+        let versioned_names: Vec<&str> = versioned_entries.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(versioned_names, vec!["alpha", "alpha/", "gamma", "gamma/", "plain", "zeta", "zeta/"]);
+    }
+
+    // Preserve the explicit dir-marker semantics: a marker object `folder/` and
+    // the real directory `folder/` still collapse to a single prefix entry; the
+    // marker itself must not trigger the object-dir child probe.
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_dir_marker_prefix_not_duplicated() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join(format!("folder{GLOBAL_DIR_SUFFIX}")))
+            .await
+            .expect("marker dir should be created");
+        fs::write(
+            bucket_dir
+                .join(format!("folder{GLOBAL_DIR_SUFFIX}"))
+                .join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("folder/", "11111111-1111-1111-1111-111111111111"),
+        )
+        .await
+        .expect("marker metadata should be written");
+        fs::create_dir_all(bucket_dir.join("folder/nested"))
+            .await
+            .expect("real child dir should be created");
+        fs::write(
+            bucket_dir.join("folder/nested").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("folder/nested", "22222222-2222-2222-2222-222222222222"),
+        )
+        .await
+        .expect("real child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let (reader, mut writer) = tokio::io::duplex(65536);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: false,
+            limit: 1000,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .expect("scan_dir should succeed");
+        out.close().await.expect("metacache writer should close");
+        drop(out);
+        drop(writer);
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.expect("scan output should decode");
+
+        let marker_objects = entries
+            .iter()
+            .filter(|entry| entry.name == "folder/" && !entry.metadata.is_empty())
+            .count();
+        let prefix_dirs = entries
+            .iter()
+            .filter(|entry| entry.name == "folder/" && entry.metadata.is_empty())
+            .count();
+
+        assert_eq!(marker_objects, 1, "dir marker object should be reported exactly once");
+        assert_eq!(prefix_dirs, 1, "prefix dir should be reported exactly once");
+        // No other entries may leak from the marker (e.g. a malformed `folder//`
+        // from probing the marker's encoded directory).
+        assert_eq!(entries.len(), 2, "scan must emit exactly the marker object and the prefix dir");
+    }
+
+    // The prefix synthesized for an object with children is dropped when the
+    // page limit is hit on the object itself, and must be re-derived on the
+    // forward_to resume of the next page.
+    #[tokio::test]
+    async fn test_scan_dir_limit_boundary_resumes_synthesized_prefix() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, limit: i32, forward_to: Option<String>) -> Vec<String> {
+            let (reader, mut writer) = tokio::io::duplex(65536);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: "".to_string(),
+                recursive: false,
+                limit,
+                forward_to,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("a/b"))
+            .await
+            .expect("object dirs should be created");
+        fs::write(
+            bucket_dir.join("a").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a", "11111111-1111-1111-1111-111111111111"),
+        )
+        .await
+        .expect("object metadata should be written");
+        fs::write(
+            bucket_dir.join("a/b").join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a/b", "22222222-2222-2222-2222-222222222222"),
+        )
+        .await
+        .expect("child metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        // Page 1: `a` consumes the whole limit, the pending `a/` is dropped.
+        let first_page = scan_names(&disk, bucket, 1, None).await;
+        assert_eq!(first_page, vec!["a".to_string()]);
+
+        // Page 2: resuming at `a/` re-derives the prefix from the object entry.
+        let resumed = scan_names(&disk, bucket, 1000, Some("a/".to_string())).await;
+        assert!(
+            resumed.contains(&"a/".to_string()),
+            "resumed scan must re-derive the synthesized prefix, got {resumed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_scan_dir_propagates_metadata_read_errors() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("operation should succeed");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        let object_dir = bucket_dir.join("broken");
+        let meta_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+        fs::create_dir_all(&object_dir).await.expect("operation should succeed");
+        fs::write(&meta_path, b"meta").await.expect("operation should succeed");
+
+        let original_permissions = fs::metadata(&meta_path)
+            .await
+            .expect("operation should succeed")
+            .permissions();
+        fs::set_permissions(&meta_path, Permissions::from_mode(0o000))
+            .await
+            .expect("operation should succeed");
+        if fs::File::open(&meta_path).await.is_ok() {
+            fs::set_permissions(&meta_path, original_permissions)
+                .await
+                .expect("operation should succeed");
+            return;
+        }
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        let (_reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        let result = disk
+            .scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await;
+
+        fs::set_permissions(&meta_path, original_permissions)
+            .await
+            .expect("operation should succeed");
+
+        assert!(matches!(result, Err(DiskError::FileAccessDenied)));
     }
 
     #[tokio::test]
@@ -4236,7 +9550,7 @@ mod test {
         const DIR_IN_MULTIPART_DIR: &str = "dir-in-multipart";
         const EMPTY_STR: &str = "";
 
-        let parse_uuid = |s: &str| Uuid::parse_str(s).unwrap();
+        let parse_uuid = |s: &str| Uuid::parse_str(s).expect("operation should succeed");
         let create_file_info = |version_id: &str, data_dir: &str| FileInfo {
             version_id: Some(parse_uuid(version_id)),
             data_dir: Some(parse_uuid(data_dir)),
@@ -4244,39 +9558,56 @@ mod test {
             ..Default::default()
         };
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let obj_base = dir.path().join("test-bucket").join(BASE_DIR);
         let multipart_base = obj_base.join(MULTIPART_DIR);
         let dir_in_multipart_base = multipart_base.join(DIR_IN_MULTIPART_DIR);
 
-        fs::create_dir_all(&multipart_base).await.unwrap();
+        fs::create_dir_all(&multipart_base).await.expect("operation should succeed");
         for uuid in &[UUID_MULTIPART_1, UUID_MULTIPART_2] {
-            fs::create_dir_all(multipart_base.join(uuid)).await.unwrap();
-            fs::write(multipart_base.join(uuid).join("part.1"), b"part").await.unwrap();
+            fs::create_dir_all(multipart_base.join(uuid))
+                .await
+                .expect("operation should succeed");
+            fs::write(multipart_base.join(uuid).join("part.1"), b"part")
+                .await
+                .expect("operation should succeed");
         }
-        fs::create_dir_all(obj_base.join(UUID_OBJ)).await.unwrap();
-        fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part").await.unwrap();
+        fs::create_dir_all(obj_base.join(UUID_OBJ))
+            .await
+            .expect("operation should succeed");
+        fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part")
+            .await
+            .expect("operation should succeed");
 
-        fs::create_dir_all(&dir_in_multipart_base).await.unwrap();
+        fs::create_dir_all(&dir_in_multipart_base)
+            .await
+            .expect("operation should succeed");
         fs::write(dir_in_multipart_base.join(STORAGE_FORMAT_FILE), b"meta")
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         let mut fm = FileMeta::default();
-        fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1)).unwrap();
-        fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2)).unwrap();
-        fs::write(multipart_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
-            .await
-            .unwrap();
+        fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1))
+            .expect("operation should succeed");
+        fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2))
+            .expect("operation should succeed");
+        fs::write(
+            multipart_base.join(STORAGE_FORMAT_FILE),
+            fm.marshal_msg().expect("operation should succeed"),
+        )
+        .await
+        .expect("operation should succeed");
 
         let mut fm = FileMeta::default();
-        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ)).unwrap();
-        fs::write(obj_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
+        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ))
+            .expect("operation should succeed");
+        fs::write(obj_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().expect("operation should succeed"))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
         disk.walk_dir(
@@ -4290,11 +9621,14 @@ mod test {
             &mut writer,
         )
         .await
-        .unwrap();
-        MetacacheWriter::new(&mut writer).close().await.unwrap();
+        .expect("operation should succeed");
+        MetacacheWriter::new(&mut writer)
+            .close()
+            .await
+            .expect("operation should succeed");
 
         let mut reader = MetacacheReader::new(reader);
-        let entries = reader.read_all().await.unwrap();
+        let entries = reader.read_all().await.expect("operation should succeed");
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
 
         assert_eq!(
@@ -4372,27 +9706,23 @@ mod test {
     #[tokio::test]
     async fn test_make_volume() {
         let p = "./testv0";
-        fs::create_dir_all(&p).await.unwrap();
+        fs::create_dir_all(&p).await.expect("operation should succeed");
 
-        let ep = match Endpoint::try_from(p) {
-            Ok(e) => e,
-            Err(e) => {
-                println!("{e}");
-                return;
-            }
-        };
+        let ep = Endpoint::try_from(p).expect("endpoint should parse");
 
-        let disk = LocalDisk::new(&ep, false).await.unwrap();
+        let disk = LocalDisk::new(&ep, false).await.expect("operation should succeed");
 
-        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
+        let tmpp = disk
+            .resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET))
+            .expect("operation should succeed");
 
         println!("ppp :{:?}", &tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
-        disk.make_volumes(volumes.clone()).await.unwrap();
+        disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
-        disk.make_volumes(volumes.clone()).await.unwrap();
+        disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
         let _ = fs::remove_dir_all(&p).await;
     }
@@ -4400,27 +9730,23 @@ mod test {
     #[tokio::test]
     async fn test_delete_volume() {
         let p = "./testv1";
-        fs::create_dir_all(&p).await.unwrap();
+        fs::create_dir_all(&p).await.expect("operation should succeed");
 
-        let ep = match Endpoint::try_from(p) {
-            Ok(e) => e,
-            Err(e) => {
-                println!("{e}");
-                return;
-            }
-        };
+        let ep = Endpoint::try_from(p).expect("endpoint should parse");
 
-        let disk = LocalDisk::new(&ep, false).await.unwrap();
+        let disk = LocalDisk::new(&ep, false).await.expect("operation should succeed");
 
-        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
+        let tmpp = disk
+            .resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET))
+            .expect("operation should succeed");
 
         println!("ppp :{:?}", &tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
-        disk.make_volumes(volumes.clone()).await.unwrap();
+        disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
-        disk.delete_volume("a").await.unwrap();
+        disk.delete_volume("a", true).await.expect("operation should succeed");
 
         let _ = fs::remove_dir_all(&p).await;
     }
@@ -4428,10 +9754,10 @@ mod test {
     #[tokio::test]
     async fn test_local_disk_basic_operations() {
         let test_dir = "./test_local_disk_basic";
-        fs::create_dir_all(&test_dir).await.unwrap();
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(test_dir).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         // Test basic properties
         assert!(disk.is_local());
@@ -4440,15 +9766,17 @@ mod test {
         assert!(!disk.to_string().is_empty());
 
         // Test path resolution
-        let abs_path = disk.resolve_abs_path("test/path").unwrap();
+        let abs_path = disk.resolve_abs_path("test/path").expect("operation should succeed");
         assert!(abs_path.is_absolute());
 
         // Test bucket path
-        let bucket_path = disk.get_bucket_path("test-bucket").unwrap();
+        let bucket_path = disk.get_bucket_path("test-bucket").expect("operation should succeed");
         assert!(bucket_path.to_string_lossy().contains("test-bucket"));
 
         // Test object path
-        let object_path = disk.get_object_path("test-bucket", "test-object").unwrap();
+        let object_path = disk
+            .get_object_path("test-bucket", "test-object")
+            .expect("operation should succeed");
         assert!(object_path.to_string_lossy().contains("test-bucket"));
         assert!(object_path.to_string_lossy().contains("test-object"));
 
@@ -4456,24 +9784,63 @@ mod test {
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_get_bucket_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let outside_dir = tempdir().expect("operation should succeed");
+        let link_path = root_dir.path().join("escape-bucket");
+        symlink(outside_dir.path(), &link_path).expect("operation should succeed");
+
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        assert!(matches!(disk.get_bucket_path("escape-bucket"), Err(DiskError::InvalidPath)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_get_object_path_rejects_symlink_component_escape() {
+        use std::os::unix::fs::symlink;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let outside_dir = tempdir().expect("operation should succeed");
+        let bucket_dir = root_dir.path().join("bucket");
+        fs::create_dir_all(&bucket_dir).await.expect("operation should succeed");
+        let link_path = bucket_dir.join("escape");
+        symlink(outside_dir.path(), &link_path).expect("operation should succeed");
+
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        assert!(matches!(disk.get_object_path("bucket", "escape/object.txt"), Err(DiskError::InvalidPath)));
+    }
+
     #[tokio::test]
     async fn test_local_disk_file_operations() {
         let test_dir = "./test_local_disk_file_ops";
-        fs::create_dir_all(&test_dir).await.unwrap();
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(test_dir).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         // Create test volume
-        disk.make_volume("test-volume").await.unwrap();
+        disk.make_volume("test-volume").await.expect("operation should succeed");
 
         // Test write and read operations
         let test_data: Vec<u8> = vec![1, 2, 3, 4, 5];
         disk.write_all("test-volume", "test-file.txt", test_data.clone().into())
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
-        let read_data = disk.read_all("test-volume", "test-file.txt").await.unwrap();
+        let read_data = disk
+            .read_all("test-volume", "test-file.txt")
+            .await
+            .expect("operation should succeed");
         assert_eq!(read_data, test_data);
 
         // Test file deletion
@@ -4483,38 +9850,81 @@ mod test {
             undo_write: false,
             old_data_dir: None,
         };
-        disk.delete("test-volume", "test-file.txt", delete_opts).await.unwrap();
+        disk.delete("test-volume", "test-file.txt", delete_opts)
+            .await
+            .expect("operation should succeed");
 
         // Clean up
-        disk.delete_volume("test-volume").await.unwrap();
+        disk.delete_volume("test-volume", true)
+            .await
+            .expect("operation should succeed");
+        let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn delete_volume_non_force_refuses_non_empty_bucket() {
+        // backlog#799 B1: a non-force delete_volume must refuse a bucket that
+        // still holds object data (VolumeNotEmpty) and leave it intact, so a
+        // misclassified "dangling" bucket cannot be recursively wiped. Only an
+        // explicit force delete removes it recursively.
+        let test_dir = "./test_b1_delete_volume_guard";
+        let _ = fs::remove_dir_all(&test_dir).await;
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        disk.make_volume("b1-bucket").await.expect("operation should succeed");
+        let data: Vec<u8> = vec![1, 2, 3];
+        disk.write_all("b1-bucket", "obj.dat", data.clone().into())
+            .await
+            .expect("operation should succeed");
+
+        // Non-force must refuse and preserve the data.
+        let err = disk
+            .delete_volume("b1-bucket", false)
+            .await
+            .expect_err("non-empty bucket must be refused");
+        assert!(matches!(err, DiskError::VolumeNotEmpty), "expected VolumeNotEmpty, got {err:?}");
+        assert!(
+            disk.stat_volume("b1-bucket").await.is_ok(),
+            "bucket must still exist after a refused non-force delete"
+        );
+        assert_eq!(disk.read_all("b1-bucket", "obj.dat").await.expect("data preserved"), data);
+
+        // Force removes it recursively.
+        disk.delete_volume("b1-bucket", true)
+            .await
+            .expect("force delete removes non-empty");
+        assert!(disk.stat_volume("b1-bucket").await.is_err(), "bucket must be gone after force delete");
+
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
     #[tokio::test]
     async fn test_local_disk_volume_operations() {
         let test_dir = "./test_local_disk_volumes";
-        fs::create_dir_all(&test_dir).await.unwrap();
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(test_dir).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         // Test creating multiple volumes
         let volumes = vec!["vol1", "vol2", "vol3"];
-        disk.make_volumes(volumes.clone()).await.unwrap();
+        disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
         // Test listing volumes
-        let volume_list = disk.list_volumes().await.unwrap();
+        let volume_list = disk.list_volumes().await.expect("operation should succeed");
         assert!(!volume_list.is_empty());
 
         // Test volume stats
         for vol in &volumes {
-            let vol_info = disk.stat_volume(vol).await.unwrap();
+            let vol_info = disk.stat_volume(vol).await.expect("operation should succeed");
             assert_eq!(vol_info.name, *vol);
         }
 
         // Test deleting volumes
         for vol in &volumes {
-            disk.delete_volume(vol).await.unwrap();
+            disk.delete_volume(vol, true).await.expect("operation should succeed");
         }
 
         // Clean up the test directory
@@ -4524,10 +9934,10 @@ mod test {
     #[tokio::test]
     async fn test_local_disk_disk_info() {
         let test_dir = "./test_local_disk_info";
-        fs::create_dir_all(&test_dir).await.unwrap();
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(test_dir).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let disk_info_opts = DiskInfoOptions {
             disk_id: "test-disk".to_string(),
@@ -4535,7 +9945,7 @@ mod test {
             noop: false,
         };
 
-        let disk_info = disk.disk_info(&disk_info_opts).await.unwrap();
+        let disk_info = disk.disk_info(&disk_info_opts).await.expect("operation should succeed");
 
         // Basic checks on disk info
         // Note: On macOS, Windows, and some other systems, fs_type may be empty
@@ -4558,31 +9968,52 @@ mod test {
     async fn test_read_file_stream_rejects_offset_length_overflow() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let dir = tempdir().expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
-        disk.make_volume("test-volume").await.unwrap();
+        disk.make_volume("test-volume").await.expect("operation should succeed");
         disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         let result = disk.read_file_stream("test-volume", "test-file.txt", usize::MAX, 1).await;
         assert!(matches!(result, Err(DiskError::FileCorrupt)));
     }
 
     #[tokio::test]
-    async fn test_read_file_zero_copy_rejects_offset_length_overflow() {
+    async fn test_read_file_mmap_copy_rejects_offset_length_overflow() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let dir = tempdir().expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
-        disk.make_volume("test-volume").await.unwrap();
+        disk.make_volume("test-volume").await.expect("operation should succeed");
         disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
             .await
-            .unwrap();
+            .expect("operation should succeed");
+
+        let result = disk.read_file_mmap_copy("test-volume", "test-file.txt", usize::MAX, 1).await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_read_file_zero_copy_legacy_alias_rejects_offset_length_overflow() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        disk.make_volume("test-volume").await.expect("operation should succeed");
+        disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
+            .await
+            .expect("operation should succeed");
 
         let result = disk.read_file_zero_copy("test-volume", "test-file.txt", usize::MAX, 1).await;
         assert!(matches!(result, Err(DiskError::FileCorrupt)));
@@ -4630,20 +10061,32 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_local_disk_scan_lock_key_combines_base_and_filter_prefixes() {
+        assert_eq!(
+            local_disk_scan_lock_key("bucket", "", Some("/prefix/")),
+            ("bucket".to_string(), "prefix".to_string())
+        );
+        assert_eq!(
+            local_disk_scan_lock_key("bucket", "/base/", Some("/prefix/")),
+            ("bucket".to_string(), "base/prefix".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn test_read_file_exists() {
         let test_file = "./test_read_exists.txt";
 
         // Test non-existent file
-        let (data, metadata) = read_file_exists(test_file).await.unwrap();
+        let (data, metadata) = read_file_exists(test_file).await.expect("operation should succeed");
         assert!(data.is_empty());
         assert!(metadata.is_none());
 
         // Create test file
-        fs::write(test_file, b"test content").await.unwrap();
+        fs::write(test_file, b"test content").await.expect("operation should succeed");
 
         // Test existing file
-        let (data, metadata) = read_file_exists(test_file).await.unwrap();
+        let (data, metadata) = read_file_exists(test_file).await.expect("operation should succeed");
         assert_eq!(data.as_ref(), b"test content");
         assert!(metadata.is_some());
 
@@ -4657,10 +10100,10 @@ mod test {
         let test_content = b"test content for read_all";
 
         // Create test file
-        fs::write(test_file, test_content).await.unwrap();
+        fs::write(test_file, test_content).await.expect("operation should succeed");
 
         // Test reading file
-        let (data, metadata) = read_file_all(test_file).await.unwrap();
+        let (data, metadata) = read_file_all(test_file).await.expect("operation should succeed");
         assert_eq!(data.as_ref(), test_content);
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), test_content.len() as u64);
@@ -4674,10 +10117,10 @@ mod test {
         let test_file = "./test_metadata.txt";
 
         // Create test file
-        fs::write(test_file, b"test").await.unwrap();
+        fs::write(test_file, b"test").await.expect("operation should succeed");
 
         // Test reading metadata
-        let metadata = read_file_metadata(test_file).await.unwrap();
+        let metadata = read_file_metadata(test_file).await.expect("operation should succeed");
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), 4); // "test" is 4 bytes
 
@@ -4783,7 +10226,16 @@ mod test {
     #[test]
     fn should_reclaim_file_cache_after_read_respects_env_and_threshold() {
         temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, || {
-            assert!(!should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+            temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, || {
+                assert!(should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+                assert!(!should_reclaim_file_cache_after_read(1024));
+            });
+        });
+
+        temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("false"), || {
+            temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+                assert!(!should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+            });
         });
 
         temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true"), || {
@@ -4795,8 +10247,923 @@ mod test {
     }
 
     #[test]
+    fn should_populate_mmap_read_respects_env() {
+        temp_env::with_var_unset(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, || {
+            assert!(!should_populate_mmap_read(512 * 1024));
+        });
+
+        temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, Some("true"), || {
+            assert!(should_populate_mmap_read(512 * 1024));
+            assert!(!should_populate_mmap_read(0));
+        });
+
+        temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, Some("false"), || {
+            assert!(!should_populate_mmap_read(512 * 1024));
+        });
+    }
+
+    #[test]
+    fn local_read_copy_method_respects_env() {
+        temp_env::with_var_unset(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, || {
+            assert_eq!(local_read_copy_method(), LocalReadCopyMethod::MmapCopy);
+        });
+
+        temp_env::with_var(
+            ENV_RUSTFS_OBJECT_MMAP_READ_METHOD,
+            Some(RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY),
+            || {
+                assert_eq!(local_read_copy_method(), LocalReadCopyMethod::DirectReadCopy);
+            },
+        );
+
+        temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some("unknown"), || {
+            assert_eq!(local_read_copy_method(), LocalReadCopyMethod::MmapCopy);
+        });
+    }
+
+    #[test]
+    fn direct_io_drive_sync_and_bitrot_retry_envs_respect_overrides() {
+        temp_env::with_var_unset(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, || {
+            assert!(!is_direct_io_read_enabled());
+        });
+        temp_env::with_var(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true"), || {
+            assert!(is_direct_io_read_enabled());
+        });
+
+        temp_env::with_var_unset(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, || {
+            assert_eq!(get_direct_io_read_threshold(), DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD);
+        });
+        temp_env::with_var(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("12345"), || {
+            assert_eq!(get_direct_io_read_threshold(), 12_345);
+        });
+
+        temp_env::with_var_unset(ENV_RUSTFS_DRIVE_SYNC_ENABLE, || {
+            assert_eq!(
+                resolve_durability_mode(
+                    None,
+                    rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
+                ),
+                DurabilityMode::Strict
+            );
+        });
+        temp_env::with_var(ENV_RUSTFS_DRIVE_SYNC_ENABLE, Some("false"), || {
+            assert_eq!(
+                resolve_durability_mode(
+                    None,
+                    rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE),
+                ),
+                DurabilityMode::LegacyOff
+            );
+        });
+
+        temp_env::with_var_unset(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, || {
+            assert_eq!(bitrot_size_mismatch_retry_count(), DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT as usize);
+        });
+        temp_env::with_var(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, Some("7"), || {
+            assert_eq!(bitrot_size_mismatch_retry_count(), 7);
+        });
+        temp_env::with_var(ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS, Some("42"), || {
+            assert_eq!(bitrot_size_mismatch_retry_delay(), Duration::from_millis(42));
+        });
+    }
+
+    #[test]
+    // Serialized because it flips the process-global GET stage-metrics gate,
+    // which the decode.rs shard-locality tests also toggle under the same key.
+    #[serial_test::serial]
+    fn mmap_and_reclaim_metric_helpers_record_expected_counters_and_samples() {
+        let metrics = || MmapCopyStageMetrics {
+            path: "local_test",
+            access_check_stage: "access",
+            path_resolve_stage: "path",
+            metadata_lookup_stage: "metadata_lookup",
+            metadata_validate_stage: "metadata_validate",
+            blocking_wait_stage: "blocking_wait",
+            blocking_task_stage: "blocking_task",
+            file_open_stage: "file_open",
+            mmap_map_stage: "mmap_map",
+            mmap_copy_stage: "mmap_copy",
+            direct_read_copy_stage: "direct_read_copy",
+        };
+
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            record_mmap_copy_stage(metrics(), "mmap_copy", None);
+            record_mmap_copy_stage(metrics(), "mmap_copy", Some(std::time::Instant::now()));
+            record_file_cache_reclaim_success("read", 128, std::time::Instant::now());
+            record_file_cache_reclaim_error("write");
+
+            #[cfg(unix)]
+            {
+                record_mmap_page_fault_delta("local_test", "mmap_map", MmapPageFaultDelta::default());
+                record_mmap_page_fault_delta("local_test", "mmap_map", MmapPageFaultDelta { minor: 1, major: 2 });
+                record_direct_read_page_fault_delta("local_test", "direct_read_copy", MmapPageFaultDelta::default());
+                record_direct_read_page_fault_delta("local_test", "direct_read_copy", MmapPageFaultDelta { minor: 3, major: 4 });
+            }
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        assert_eq!(
+            recorder.histogram_sample_count("rustfs_io_get_object_stage_duration_seconds"),
+            1,
+            "only the Some-timer stage call must record a duration sample"
+        );
+        assert_eq!(
+            recorder.counter_value("rustfs_page_cache_reclaim_requests_total", &[("kind", "read"), ("result", "ok")]),
+            1
+        );
+        assert_eq!(recorder.counter_value("rustfs_page_cache_reclaim_bytes_total", &[("kind", "read")]), 128);
+        assert_eq!(recorder.histogram_sample_count("rustfs_page_cache_reclaim_duration_seconds"), 1);
+        assert_eq!(
+            recorder.counter_value("rustfs_page_cache_reclaim_requests_total", &[("kind", "write"), ("result", "err")]),
+            1
+        );
+
+        #[cfg(unix)]
+        {
+            for (kind, expected) in [("minor", 1), ("major", 2)] {
+                assert_eq!(
+                    recorder.counter_value(
+                        METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL,
+                        &[("path", "local_test"), ("stage", "mmap_map"), ("kind", kind)]
+                    ),
+                    expected,
+                    "zero deltas must not emit and positive {kind} deltas must accumulate exactly"
+                );
+            }
+            for (kind, expected) in [("minor", 3), ("major", 4)] {
+                assert_eq!(
+                    recorder.counter_value(
+                        METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL,
+                        &[("path", "local_test"), ("stage", "direct_read_copy"), ("kind", kind)]
+                    ),
+                    expected,
+                    "zero deltas must not emit and positive {kind} deltas must accumulate exactly"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mmap_page_fault_counts_respect_disabled_and_enabled_modes() {
+        assert_eq!(read_mmap_page_fault_counts(false), None);
+
+        let counts = read_mmap_page_fault_counts(true).expect("getrusage should return page fault counters");
+        assert!(counts.minor >= 0);
+        assert!(counts.major >= 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mmap_page_size_is_cached_positive() {
+        let first = mmap_page_size().expect("page size should be available");
+        let second = mmap_page_size().expect("cached page size should be available");
+
+        assert!(first > 0);
+        assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_mmap_copy_supports_direct_read_copy_method() {
+        use tempfile::tempdir;
+
+        temp_env::async_with_vars(
+            [(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some(RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY))],
+            async {
+                let root_dir = tempdir().expect("operation should succeed");
+                let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+                disk.make_volume("test-volume").await.expect("operation should succeed");
+                disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"0123456789abcdef"))
+                    .await
+                    .expect("operation should succeed");
+
+                let data = disk
+                    .read_file_mmap_copy("test-volume", "test-file.txt", 4, 6)
+                    .await
+                    .expect("operation should succeed");
+
+                assert_eq!(data, Bytes::from_static(b"456789"));
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn resolve_local_disk_root_reports_missing_path_as_volume_not_found() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let missing = dir.path().join("missing");
+
+        let err = resolve_local_disk_root(missing.to_str().expect("temp path should be utf8"))
+            .expect_err("missing disk root must be rejected");
+
+        assert!(matches!(err, DiskError::VolumeNotFound));
+    }
+
+    #[tokio::test]
+    async fn local_disk_debug_includes_stable_identity_fields() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let debug = format!("{disk:?}");
+
+        assert!(debug.contains("LocalDisk"));
+        assert!(debug.contains("root"));
+        assert!(debug.contains("format_path"));
+        assert!(debug.contains("endpoint"));
+    }
+
+    #[tokio::test]
+    async fn std_backend_truncate_append_stream_and_full_read_restore_bytes() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let volume = "test-volume";
+        fs::create_dir_all(dir.path().join(volume))
+            .await
+            .expect("volume should be created");
+        let backend = StdBackend::new(dir.path().to_path_buf());
+
+        let mut writer = backend
+            .open_write(volume, "nested/blob.bin", WriteMode::Truncate { size_hint: 6 })
+            .await
+            .expect("truncate writer should open");
+        writer.write_all(b"abcdef").await.expect("initial bytes should write");
+        writer.shutdown().await.expect("truncate writer should shutdown");
+
+        let window = backend
+            .pread_bytes(volume, "nested/blob.bin", 1, 3, None)
+            .await
+            .expect("pread should restore requested window");
+        assert_eq!(window, Bytes::from_static(b"bcd"));
+
+        let mut writer = backend
+            .open_write(volume, "nested/blob.bin", WriteMode::Truncate { size_hint: 2 })
+            .await
+            .expect("second truncate writer should open");
+        writer.write_all(b"xy").await.expect("truncated bytes should write");
+        writer.shutdown().await.expect("second truncate writer should shutdown");
+
+        let mut writer = backend
+            .open_write(volume, "nested/blob.bin", WriteMode::Append)
+            .await
+            .expect("append writer should open");
+        writer.write_all(b"z").await.expect("append byte should write");
+        writer.shutdown().await.expect("append writer should shutdown");
+
+        let mut stream = backend
+            .open_read_stream(volume, "nested/blob.bin", 0, 3)
+            .await
+            .expect("bounded stream should open");
+        let mut streamed = Vec::new();
+        stream.read_to_end(&mut streamed).await.expect("bounded stream should read");
+        assert_eq!(streamed, b"xyz");
+
+        let mut full = backend
+            .open_full_read(volume, "nested/blob.bin")
+            .await
+            .expect("full stream should open");
+        let mut body = Vec::new();
+        full.read_to_end(&mut body).await.expect("full stream should read");
+        assert_eq!(body, b"xyz");
+    }
+
+    #[tokio::test]
+    async fn std_backend_rejects_overflow_and_out_of_bounds_reads() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let volume = "test-volume";
+        fs::create_dir_all(dir.path().join(volume))
+            .await
+            .expect("volume should be created");
+        fs::write(dir.path().join(volume).join("blob.bin"), b"abc")
+            .await
+            .expect("test object should be written");
+        let backend = StdBackend::new(dir.path().to_path_buf());
+
+        let overflow = backend.pread_bytes(volume, "blob.bin", usize::MAX, 1, None).await;
+        assert!(matches!(overflow, Err(DiskError::FileCorrupt)));
+
+        let out_of_bounds = backend.pread_bytes(volume, "blob.bin", 2, 2, None).await;
+        assert!(matches!(out_of_bounds, Err(DiskError::FileCorrupt)));
+
+        let stream_out_of_bounds = backend.open_read_stream(volume, "blob.bin", 2, 2).await;
+        assert!(matches!(stream_out_of_bounds, Err(DiskError::FileCorrupt)));
+    }
+
+    #[tokio::test]
+    async fn file_cache_reclaim_wrappers_forward_read_write_flush_and_shutdown() {
+        use futures_util::task::noop_waker_ref;
+        use std::io::IoSlice;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let path = dir.path().join("reclaim.bin");
+        let file = File::create(&path).await.expect("writer file should be created");
+        let mut writer = FileCacheReclaimWriter::new(file, 6, true);
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let bufs = [IoSlice::new(b"ab"), IoSlice::new(b"cd")];
+        let vectored = Pin::new(&mut writer).poll_write_vectored(&mut cx, &bufs);
+        assert!(matches!(vectored, Poll::Ready(Ok(_)) | Poll::Pending));
+        let _ = AsyncWrite::is_write_vectored(&writer);
+
+        writer.write_all(b"abcdef").await.expect("writer should forward writes");
+        writer.flush().await.expect("writer should forward flush");
+        writer.shutdown().await.expect("writer should reclaim on shutdown");
+
+        let file = File::open(&path).await.expect("reader file should open");
+        let mut reader = FileCacheReclaimReader::new(file, 0, 6, true);
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("reader should forward reads");
+        assert!(body.ends_with(b"abcdef"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_nocache_helpers_accept_tokio_and_std_files() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let path = dir.path().join("nocache.bin");
+        fs::write(&path, b"nocache").await.expect("test file should be written");
+
+        let tokio_file = File::open(&path).await.expect("tokio file should open");
+        set_fd_nocache(&tokio_file).expect("tokio fd should accept F_NOCACHE");
+
+        let std_file = std::fs::File::open(&path).expect("std file should open");
+        set_std_fd_nocache(&std_file).expect("std fd should accept F_NOCACHE");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mmap_page_fault_delta_clamps_non_monotonic_counts() {
+        let before = Some(MmapPageFaultCounts { minor: 10, major: 4 });
+        let after = Some(MmapPageFaultCounts { minor: 7, major: 6 });
+
+        assert_eq!(mmap_page_fault_delta(before, after), MmapPageFaultDelta { minor: 0, major: 2 });
+        assert_eq!(mmap_page_fault_delta(before, None), MmapPageFaultDelta::default());
+    }
+
+    #[test]
     fn test_is_bitrot_size_mismatch_error_only_matches_target_message() {
         assert!(is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot shard file size mismatch")));
         assert!(!is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot hash mismatch")));
+    }
+
+    #[test]
+    fn test_is_bitrot_verification_error_matches_hash_and_size_mismatch() {
+        assert!(is_bitrot_verification_error(&std::io::Error::other("bitrot shard file size mismatch")));
+        assert!(is_bitrot_verification_error(&std::io::Error::other("bitrot hash mismatch")));
+        assert!(!is_bitrot_verification_error(&std::io::Error::other("unrelated io failure")));
+    }
+
+    #[tokio::test]
+    async fn local_disk_read_file_verifier_reports_bitrot_mismatch() {
+        use crate::erasure::coding::BitrotWriter;
+        use rustfs_filemeta::ChecksumInfo;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "verify-volume";
+        ensure_test_volume(&disk, volume).await;
+
+        let payload = Bytes::from_static(b"bitrot-payload!!");
+        let object = "object.bin";
+        let data_dir = Uuid::new_v4();
+        let part_number = 1;
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let mut file_info = FileInfo::new(object, 1, 0);
+        file_info.volume = volume.to_string();
+        file_info.name = object.to_string();
+        file_info.size = i64::try_from(payload.len()).expect("test payload length should fit i64");
+        file_info.data_dir = Some(data_dir);
+        file_info.erasure.block_size = payload.len();
+        file_info.erasure.index = 1;
+        file_info.erasure.checksums = vec![ChecksumInfo {
+            part_number,
+            algorithm: checksum_algo.clone(),
+            hash: Bytes::new(),
+        }];
+        file_info.parts = vec![ObjectPartInfo {
+            number: part_number,
+            size: payload.len(),
+            actual_size: i64::try_from(payload.len()).expect("test payload length should fit i64"),
+            ..Default::default()
+        }];
+
+        let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::new()), file_info.erasure.shard_size(), checksum_algo);
+        writer
+            .write(&payload)
+            .await
+            .expect("bitrot writer should encode test payload");
+        writer.shutdown().await.expect("bitrot writer should flush test payload");
+        let mut encoded = writer.into_inner().into_inner();
+        let last = encoded.last_mut().expect("encoded part should not be empty");
+        *last ^= 0xff;
+
+        let part_path = path_join_buf(&[object, &data_dir.to_string(), &format!("part.{part_number}")]);
+        disk.write_all(volume, &part_path, Bytes::from(encoded))
+            .await
+            .expect("corrupted encoded part should be written");
+
+        let result = disk
+            .verify_file(volume, object, &file_info)
+            .await
+            .expect("verify_file should return per-part status");
+
+        assert_eq!(result.results, vec![CHECK_PART_FILE_CORRUPT]);
+    }
+
+    // ----- HP-6: O_DIRECT shard write -----
+
+    #[test]
+    fn direct_io_write_env_gate_defaults_off() {
+        temp_env::with_var_unset(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, || {
+            assert!(!is_direct_io_write_enabled(), "O_DIRECT write must default to off");
+        });
+        temp_env::with_var(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("true"), || {
+            assert!(is_direct_io_write_enabled());
+        });
+        temp_env::with_var(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("false"), || {
+            assert!(!is_direct_io_write_enabled());
+        });
+    }
+
+    #[test]
+    fn direct_write_staging_capacity_is_smallest_alignment_multiple_covering_target() {
+        for align in [512usize, 1024, 4096, 8192, 65536] {
+            let cap = direct_write_staging_capacity(align);
+            assert_eq!(cap % align, 0, "capacity must be an alignment multiple (align={align})");
+            assert!(
+                cap >= DIRECT_WRITE_STAGING_BYTES,
+                "capacity must cover the target staging size (align={align})"
+            );
+            assert!(
+                cap - DIRECT_WRITE_STAGING_BYTES < align,
+                "capacity must be the smallest covering multiple (align={align})"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_write_tail_split_separates_aligned_prefix_from_remainder() {
+        let align = 4096usize;
+        assert_eq!(direct_write_tail_split(0, align), (0, 0));
+        assert_eq!(direct_write_tail_split(align, align), (align, 0));
+        assert_eq!(direct_write_tail_split(3 * align, align), (3 * align, 0));
+        assert_eq!(direct_write_tail_split(100, align), (0, 100));
+        let (prefix, remainder) = direct_write_tail_split(2 * align + 123, align);
+        assert_eq!((prefix, remainder), (2 * align, 123));
+        assert_eq!(prefix + remainder, 2 * align + 123, "split must reconstruct the input length");
+        assert_eq!(prefix % align, 0, "prefix must be alignment-sized");
+        assert!(remainder < align, "remainder must be sub-alignment");
+    }
+
+    /// End-to-end round trip through `create_file`'s writer with O_DIRECT writes
+    /// enabled. On a block-backed Linux filesystem this drives the true
+    /// O_DIRECT path; on macOS and on CI filesystems that reject O_DIRECT it
+    /// exercises the buffered fallback. Either way, enabling the gate must not
+    /// change the bytes read back, across sizes crossing the alignment and
+    /// multi-batch staging boundaries (zero-breakage contract).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_file_direct_write_round_trips_all_sizes() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("tempdir");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("disk");
+        disk.make_volume("test-volume").await.expect("make_volume");
+
+        let sizes = [
+            1usize,
+            511,
+            512,
+            4095,
+            4096,
+            4097,
+            8192,
+            12345,
+            DIRECT_WRITE_STAGING_BYTES - 1,
+            DIRECT_WRITE_STAGING_BYTES,
+            DIRECT_WRITE_STAGING_BYTES + 4096,
+            2 * DIRECT_WRITE_STAGING_BYTES + 777,
+        ];
+
+        for (i, size) in sizes.into_iter().enumerate() {
+            let mut state = 0x1234_5678u64.wrapping_add(i as u64);
+            let content: Vec<u8> = (0..size)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (state >> 33) as u8
+                })
+                .collect();
+            let path = format!("obj-{i}.bin");
+
+            temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, Some("true"))], async {
+                let mut writer = disk
+                    .create_file("", "test-volume", &path, size as i64)
+                    .await
+                    .expect("create_file");
+                // Odd-sized chunks exercise partial staging fills and flushes.
+                let mut off = 0;
+                while off < content.len() {
+                    let end = (off + 777).min(content.len());
+                    writer.write_all(&content[off..end]).await.expect("write_all");
+                    off = end;
+                }
+                writer.shutdown().await.expect("shutdown");
+            })
+            .await;
+
+            let got = disk.read_file_mmap_copy("test-volume", &path, 0, size).await.expect("read");
+            assert_eq!(got.as_ref(), content.as_slice(), "round-trip mismatch at size={size}");
+        }
+    }
+
+    /// Deterministic coverage of the O_DIRECT writer's aligned-batch + tail
+    /// state machine on Linux, independent of whether the CI filesystem
+    /// supports O_DIRECT: the writer is driven over a plain file with a small
+    /// alignment and staging capacity so both a full-batch flush and the tail
+    /// split are exercised for every size class.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_writer_state_machine_round_trips_over_plain_file() {
+        use std::io::Read;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let align = 512usize;
+        let capacity = 4 * align; // forces multi-batch flushes for larger sizes
+        for &size in &[0usize, 1, 511, 512, 513, 1024, 2048, 2049, 5000] {
+            let path = dir.path().join(format!("s{size}"));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .read(true)
+                .open(&path)
+                .expect("open plain file");
+            let content: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(7).wrapping_add(3)) as u8).collect();
+
+            let mut writer = DirectWriter::from_std_file_for_test(file, align, capacity);
+            let mut off = 0;
+            while off < content.len() {
+                let end = (off + 300).min(content.len());
+                writer.write_all(&content[off..end]).await.expect("write_all");
+                off = end;
+            }
+            writer.shutdown().await.expect("shutdown");
+
+            let mut got = Vec::new();
+            std::fs::File::open(&path)
+                .expect("reopen")
+                .read_to_end(&mut got)
+                .expect("read_to_end");
+            assert_eq!(got, content, "state-machine round-trip mismatch at size={size}");
+        }
+    }
+
+    /// Differential test for the LocalIoBackend refactor: every read shape
+    /// (pread via mmap_copy, pread via direct_read_copy, bounded stream, full
+    /// read) must return byte-identical data for the same (offset, length),
+    /// including ranges straddling page boundaries and the file tail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn io_backend_read_shapes_return_identical_bytes() {
+        use tempfile::tempdir;
+        use tokio::io::AsyncReadExt;
+
+        const FILE_LEN: usize = 64 * 1024;
+
+        // Deterministic pseudo-random content (LCG) so failures are reproducible.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let content: Vec<u8> = (0..FILE_LEN)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let content = Bytes::from(content);
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+        disk.make_volume("test-volume").await.expect("operation should succeed");
+        disk.write_all("test-volume", "blob.bin", content.clone())
+            .await
+            .expect("operation should succeed");
+
+        let page = mmap_page_size().expect("page size should be available") as usize;
+        let ranges = [
+            (0usize, FILE_LEN),
+            (1, 17),
+            (page - 1, 2),
+            (page, page),
+            (2 * page - 1, page + 2),
+            (FILE_LEN - 7, 7),
+            (0, 0),
+        ];
+
+        for (offset, length) in ranges {
+            let expected = content.slice(offset..offset + length);
+
+            for method in [
+                RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY,
+                RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY,
+            ] {
+                let got = temp_env::async_with_vars([(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some(method))], async {
+                    disk.read_file_mmap_copy("test-volume", "blob.bin", offset, length)
+                        .await
+                        .expect("operation should succeed")
+                })
+                .await;
+                assert_eq!(got, expected, "pread_bytes({method}) mismatch at offset={offset} length={length}");
+            }
+
+            let mut stream = disk
+                .read_file_stream("test-volume", "blob.bin", offset, length)
+                .await
+                .expect("operation should succeed");
+            let mut streamed = vec![0u8; length];
+            stream.read_exact(&mut streamed).await.expect("operation should succeed");
+            assert_eq!(
+                Bytes::from(streamed),
+                expected,
+                "open_read_stream mismatch at offset={offset} length={length}"
+            );
+        }
+
+        let mut full = disk
+            .read_file("test-volume", "blob.bin")
+            .await
+            .expect("operation should succeed");
+        let mut all = Vec::new();
+        full.read_to_end(&mut all).await.expect("operation should succeed");
+        assert_eq!(Bytes::from(all), content, "open_full_read mismatch");
+    }
+
+    /// The O_DIRECT read path must return the same bytes as the buffered
+    /// path for unaligned shard sizes and ranges, and must silently fall
+    /// back (never error) on filesystems that reject O_DIRECT (e.g. tmpfs).
+    /// Both legs are covered regardless of which filesystem backs tempdir.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn direct_io_read_matches_buffered_path_or_falls_back() {
+        use tempfile::tempdir;
+
+        // Unaligned on purpose: 3 blocks + 7 bytes.
+        const FILE_LEN: usize = 4096 * 3 + 7;
+
+        let mut state = 0x2545f4914f6cdd1du64;
+        let content: Vec<u8> = (0..FILE_LEN)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let content = Bytes::from(content);
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+        disk.make_volume("test-volume").await.expect("operation should succeed");
+        disk.write_all("test-volume", "shard.bin", content.clone())
+            .await
+            .expect("operation should succeed");
+
+        let ranges = [
+            (0usize, FILE_LEN),
+            (0, 4096),
+            (4095, 4098),
+            (4096 * 2, 4096 + 7),
+            (FILE_LEN - 7, 7),
+        ];
+
+        for (offset, length) in ranges {
+            let expected = content.slice(offset..offset + length);
+            // Threshold 1 forces every non-empty read through the O_DIRECT attempt.
+            let got = temp_env::async_with_vars(
+                [
+                    (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true")),
+                    (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("1")),
+                ],
+                async {
+                    disk.read_file_mmap_copy("test-volume", "shard.bin", offset, length)
+                        .await
+                        .expect("O_DIRECT-eligible read must succeed (direct or fallback)")
+                },
+            )
+            .await;
+            assert_eq!(got, expected, "direct-io read mismatch at offset={offset} length={length}");
+        }
+    }
+
+    /// pread_direct_aligned must never leak alignment padding: the returned
+    /// buffer is exactly the requested logical range.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pread_direct_aligned_exact_range_or_unsupported() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("operation should succeed");
+        let file_path = dir.path().join("blob.bin");
+        let content: Vec<u8> = (0..4096 * 2 + 13).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(&file_path)
+            .and_then(|mut f| f.write_all(&content))
+            .expect("operation should succeed");
+
+        let state = DirectIoReadState::new();
+        match pread_direct_aligned(&file_path, 4090, 100, &state) {
+            Ok(bytes) => {
+                assert_eq!(&bytes[..], &content[4090..4190], "padding must not leak");
+            }
+            Err(err) => {
+                assert!(
+                    is_direct_io_unsupported(&err),
+                    "only unsupported-filesystem errors are acceptable here: {err}"
+                );
+            }
+        }
+    }
+
+    /// P1.5 benchmark gate harness (backlog#893): O_DIRECT vs mmap-copy.
+    ///
+    /// Ignored by default; run explicitly in release mode on a Linux box:
+    ///
+    /// ```text
+    /// RUSTFS_BENCH_DIR=/data/rustfs/bench \
+    ///   RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE=true RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD=1 \
+    ///   cargo test --release -p rustfs-ecstore --lib direct_read_bench_gate -- --ignored --nocapture
+    /// ```
+    ///
+    /// Baseline run: same command without the two DIRECT_IO vars. Knobs:
+    /// RUSTFS_BENCH_SHARD_MIB (8), RUSTFS_BENCH_FILE_COUNT (64),
+    /// RUSTFS_BENCH_READS (256). Cold cache is enforced with
+    /// fadvise(DONTNEED) over the dataset between rounds. Every read is
+    /// verified for length; the first four shards are verified byte-for-byte
+    /// before timing starts (correctness before performance).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "benchmark harness, run explicitly in release mode"]
+    async fn direct_read_bench_gate() {
+        use std::time::Instant;
+
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        }
+
+        fn cpu_time_secs() -> f64 {
+            // SAFETY: getrusage with RUSAGE_SELF and a zeroed out-param.
+            #[allow(unsafe_code)]
+            unsafe {
+                let mut ru: libc::rusage = std::mem::zeroed();
+                if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+                    return f64::NAN;
+                }
+                let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+                tv(ru.ru_utime) + tv(ru.ru_stime)
+            }
+        }
+
+        fn drop_dataset_cache(paths: &[PathBuf]) {
+            use rustix::fs::{Advice, fadvise};
+            for p in paths {
+                if let Ok(f) = std::fs::File::open(p) {
+                    let _ = fadvise(&f, 0, None, Advice::DontNeed);
+                }
+            }
+        }
+
+        fn percentile(sorted: &[f64], p: f64) -> f64 {
+            let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+            sorted[idx]
+        }
+
+        fn gen_content(len: usize, seed: u64) -> Bytes {
+            let mut state = seed;
+            let v: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (state >> 33) as u8
+                })
+                .collect();
+            Bytes::from(v)
+        }
+
+        let bench_dir = std::env::var("RUSTFS_BENCH_DIR").expect("set RUSTFS_BENCH_DIR to a directory on the target disk");
+        let shard_mib = env_usize("RUSTFS_BENCH_SHARD_MIB", 8);
+        let file_count = env_usize("RUSTFS_BENCH_FILE_COUNT", 64);
+        let reads = env_usize("RUSTFS_BENCH_READS", 256);
+        let shard_len = shard_mib * 1024 * 1024;
+        const VOLUME: &str = "bench-volume";
+
+        std::fs::create_dir_all(&bench_dir).expect("create bench dir");
+        let endpoint = Endpoint::try_from(bench_dir.as_str()).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let _ = disk.make_volume(VOLUME).await;
+
+        // Populate, skipping shards that already exist with the right size.
+        let mut paths = Vec::with_capacity(file_count);
+        for i in 0..file_count {
+            let name = format!("shard-{i:04}.bin");
+            let abs = disk.get_object_path(VOLUME, &name).expect("path");
+            let need_write = std::fs::metadata(&abs).map(|m| m.len() as usize != shard_len).unwrap_or(true);
+            if need_write {
+                disk.write_all(VOLUME, &name, gen_content(shard_len, 0x9e3779b9 + i as u64))
+                    .await
+                    .expect("populate shard");
+            }
+            paths.push(abs);
+        }
+
+        // Correctness gate before any timing.
+        for i in 0..4.min(file_count) {
+            let name = format!("shard-{i:04}.bin");
+            let got = disk
+                .read_file_mmap_copy(VOLUME, &name, 0, shard_len)
+                .await
+                .expect("verify read");
+            assert_eq!(got, gen_content(shard_len, 0x9e3779b9 + i as u64), "shard {i} content mismatch");
+        }
+
+        let mut idx_state = 0xdeadbeefu64;
+        let mut pick = |n: usize| {
+            idx_state = idx_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((idx_state >> 33) as usize) % n
+        };
+
+        for _ in 0..8 {
+            let name = format!("shard-{:04}.bin", pick(file_count));
+            let _ = disk
+                .read_file_mmap_copy(VOLUME, &name, 0, shard_len)
+                .await
+                .expect("warmup read");
+        }
+        drop_dataset_cache(&paths);
+
+        // Concurrency models the EC GET shape: FuturesUnordered over shard
+        // reads. concurrency=1 keeps the original sequential behavior.
+        let concurrency = env_usize("RUSTFS_BENCH_CONCURRENCY", 1).max(1);
+        let disk = std::sync::Arc::new(disk);
+
+        let mut latencies_us = Vec::with_capacity(reads);
+        let cpu_before = cpu_time_secs();
+        let wall_start = Instant::now();
+        let mut done = 0usize;
+        while done < reads {
+            use futures::StreamExt;
+
+            let batch = concurrency.min(reads - done);
+            let mut tasks = futures::stream::FuturesUnordered::new();
+            for _ in 0..batch {
+                let name = format!("shard-{:04}.bin", pick(file_count));
+                let disk = disk.clone();
+                tasks.push(async move {
+                    let t = Instant::now();
+                    let bytes = disk
+                        .read_file_mmap_copy(VOLUME, &name, 0, shard_len)
+                        .await
+                        .expect("bench read");
+                    assert_eq!(bytes.len(), shard_len);
+                    t.elapsed().as_secs_f64() * 1e6
+                });
+            }
+            while let Some(lat) = tasks.next().await {
+                latencies_us.push(lat);
+            }
+            done += batch;
+            if done.is_multiple_of(file_count) {
+                drop_dataset_cache(&paths);
+            }
+        }
+        let wall = wall_start.elapsed().as_secs_f64();
+        let cpu = cpu_time_secs() - cpu_before;
+
+        latencies_us.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        let mean = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
+        let direct_enabled = std::env::var(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE).unwrap_or_default();
+
+        println!(
+            "BENCH_RESULT {{\"direct_io_enabled\":\"{direct_enabled}\",\"concurrency\":{concurrency},\"shard_mib\":{shard_mib},\"file_count\":{file_count},\
+\"reads\":{reads},\"p50_us\":{:.1},\"p95_us\":{:.1},\"p99_us\":{:.1},\"mean_us\":{:.1},\"wall_s\":{wall:.3},\
+\"cpu_s\":{cpu:.3},\"throughput_mib_s\":{:.1}}}",
+            percentile(&latencies_us, 0.50),
+            percentile(&latencies_us, 0.95),
+            percentile(&latencies_us, 0.99),
+            mean,
+            (reads * shard_mib) as f64 / wall,
+        );
     }
 }

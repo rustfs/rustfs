@@ -16,10 +16,25 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use hashbrown::HashMap;
 use rustfs_s3_ops::is_object_removed_event;
 use rustfs_s3_types::{EventName, event_schema_version};
+use rustfs_utils::http::{is_encryption_metadata_key, is_internal_key};
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
 
-use crate::storage_compat::NotifyObjectInfo;
+/// Legacy internal-metadata prefix retained for backward compatibility.
+const LEGACY_AMZ_META_INTERNAL_PREFIX: &str = "x-amz-meta-internal-";
+
+/// Returns `true` if `key` is RustFS/MinIO internal metadata that must not be exposed in
+/// notification `userMetadata`. Covers the internal xl.meta prefixes
+/// (`x-rustfs-internal-*` / `x-minio-internal-*`), the server-side-encryption prefixes
+/// (`x-rustfs-encryption-*` / `x-minio-encryption-*`), and the legacy
+/// `x-amz-meta-internal-*` prefix. Case-insensitive.
+fn is_internal_metadata_key(key: &str) -> bool {
+    is_internal_key(key)
+        || is_encryption_metadata_key(key)
+        || key.len() >= LEGACY_AMZ_META_INTERNAL_PREFIX.len()
+            && key.as_bytes()[..LEGACY_AMZ_META_INTERNAL_PREFIX.len()]
+                .eq_ignore_ascii_case(LEGACY_AMZ_META_INTERNAL_PREFIX.as_bytes())
+}
 
 /// Represents the identity of the user who triggered the event
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +79,22 @@ pub struct Object {
     pub version_id: Option<String>,
     /// A unique identifier for the event
     pub sequencer: String,
+}
+
+/// Object metadata required by notification event serialization.
+#[derive(Debug, Clone, Default)]
+pub struct NotifyObjectInfo {
+    pub bucket: String,
+    pub name: String,
+    pub size: i64,
+    pub etag: Option<String>,
+    pub content_type: Option<String>,
+    pub user_defined: HashMap<String, String>,
+    pub version_id: Option<String>,
+    pub mod_time: Option<DateTime<Utc>>,
+    pub restore_expires: Option<DateTime<Utc>>,
+    pub storage_class: Option<String>,
+    pub transitioned_tier: Option<String>,
 }
 
 /// Metadata about the event
@@ -119,6 +150,7 @@ pub struct Event {
     /// The AWS region where the event occurred
     pub aws_region: String,
     /// The time when the event occurred
+    #[serde(serialize_with = "serialize_event_time_millis")]
     pub event_time: DateTime<Utc>,
     /// The name of the event
     pub event_name: EventName,
@@ -206,7 +238,7 @@ impl Event {
     pub fn new(args: EventArgs) -> Self {
         let event_time = Utc::now().naive_local();
         let sequencer = match args.object.mod_time {
-            Some(t) => format!("{:X}", t.unix_timestamp_nanos()),
+            Some(t) => format!("{:X}", t.timestamp_nanos_opt().unwrap_or(0)),
             None => format!("{:X}", event_time.and_utc().timestamp_nanos_opt().unwrap_or(0)),
         };
 
@@ -217,10 +249,19 @@ impl Event {
         let key_name = form_urlencoded::byte_serialize(args.object.name.as_bytes()).collect::<String>();
         let principal_id = args.req_params.get("principalId").unwrap_or(&String::new()).to_string();
 
-        let version_id = match args.object.version_id {
-            Some(id) => Some(id.to_string()),
-            None => Some(args.version_id.clone()),
-        };
+        // An unversioned object must omit `versionId` entirely rather than emit it as
+        // an empty string. Prefer the object's own version id, fall back to the
+        // request-scoped one, and treat an empty value from either source as "no
+        // version" so serialization skips the field (`skip_serializing_if` on
+        // `Object::version_id`). This matches S3 and the repo's tier convention that a
+        // `None`/`""` version means "unversioned" (backlog#984).
+        let version_id = args
+            .object
+            .version_id
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| Some(args.version_id.clone()))
+            .filter(|v| !v.is_empty());
 
         let mut s3_metadata = Metadata {
             schema_version: "1.0".to_string(),
@@ -246,22 +287,29 @@ impl Event {
             s3_metadata.object.size = Some(args.object.size);
             s3_metadata.object.e_tag = args.object.etag.clone();
             s3_metadata.object.content_type = args.object.content_type.clone();
-            // Filter out internal reserved metadata
+            // Filter out internal/reserved metadata so it never leaks to downstream
+            // notification targets (webhook/MQ). RustFS stores internal metadata under both
+            // `x-rustfs-internal-*` and `x-minio-internal-*` (see rustfs_utils metadata_compat),
+            // and server-side-encryption details under `x-rustfs-encryption-*` /
+            // `x-minio-encryption-*` (header_compat). All of these must be stripped; only genuine
+            // user-defined metadata (e.g. `x-amz-meta-*`) is preserved.
             let mut user_metadata = HashMap::new();
             for (k, v) in args.object.user_defined.iter() {
-                if !k.to_lowercase().starts_with("x-amz-meta-internal-") {
-                    user_metadata.insert(k.clone(), v.clone());
+                if is_internal_metadata_key(k) {
+                    continue;
                 }
+                user_metadata.insert(k.clone(), v.clone());
             }
             s3_metadata.object.user_metadata = Some(user_metadata);
         }
 
         let glacier_event_data = if args.event_name == EventName::ObjectRestoreCompleted {
-            args.object.restore_expires.and_then(|expiry| {
-                let expiry_time = DateTime::<Utc>::from_timestamp(expiry.unix_timestamp(), expiry.nanosecond())?;
-                let storage_class = args.object.storage_class.clone().or_else(|| {
-                    (!args.object.transitioned_object.tier.is_empty()).then_some(args.object.transitioned_object.tier.clone())
-                })?;
+            args.object.restore_expires.and_then(|expiry_time| {
+                let storage_class = args
+                    .object
+                    .storage_class
+                    .clone()
+                    .or_else(|| args.object.transitioned_tier.clone())?;
                 Some(GlacierEventData {
                     restore_event_data: RestoreEventData {
                         lifecycle_restoration_expiry_time: expiry_time.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -295,6 +343,13 @@ impl Event {
             },
         }
     }
+}
+
+fn serialize_event_time_millis<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 fn initialize_response_elements(elements: &mut HashMap<String, String>, keys: &[&str]) {
@@ -367,11 +422,11 @@ pub struct EventArgsBuilder {
 
 impl EventArgsBuilder {
     /// Creates a new builder with the required fields.
-    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: NotifyObjectInfo) -> Self {
+    pub fn new(event_name: EventName, bucket_name: impl Into<String>, object: impl Into<NotifyObjectInfo>) -> Self {
         Self {
             event_name,
             bucket_name: bucket_name.into(),
-            object,
+            object: object.into(),
             ..Default::default()
         }
     }
@@ -389,8 +444,8 @@ impl EventArgsBuilder {
     }
 
     /// Sets the object information.
-    pub fn object(mut self, object: NotifyObjectInfo) -> Self {
-        self.object = object;
+    pub fn object(mut self, object: impl Into<NotifyObjectInfo>) -> Self {
+        self.object = object.into();
         self
     }
 
@@ -503,7 +558,7 @@ mod tests {
             NotifyObjectInfo {
                 bucket: "bucket".to_string(),
                 name: "key".to_string(),
-                restore_expires: Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()),
+                restore_expires: DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
                 storage_class: Some("GLACIER".to_string()),
                 ..Default::default()
             },
@@ -515,6 +570,136 @@ mod tests {
         let glacier = event.glacier_event_data.expect("glacier event data should be present");
         assert_eq!(glacier.restore_event_data.lifecycle_restoration_expiry_time, "2023-11-14T22:13:20.000Z");
         assert_eq!(glacier.restore_event_data.lifecycle_restore_storage_class, "GLACIER");
+    }
+
+    #[test]
+    fn event_user_metadata_strips_internal_and_encryption_keys() {
+        let mut user_defined = HashMap::new();
+        // RustFS internal (xl.meta) keys
+        user_defined.insert("x-rustfs-internal-inline-data".to_string(), "true".to_string());
+        user_defined.insert("x-rustfs-internal-transition-tier".to_string(), "WARM".to_string());
+        // MinIO internal keys (interop) + SSE internal metadata
+        user_defined.insert("x-minio-internal-compression".to_string(), "s2".to_string());
+        user_defined.insert("x-minio-internal-server-side-encryption-iv".to_string(), "secret-iv".to_string());
+        // Encryption prefixes (both flavors), including mixed-case
+        user_defined.insert("x-rustfs-encryption-key".to_string(), "wrapped-key".to_string());
+        user_defined.insert("X-Minio-Encryption-Iv".to_string(), "secret".to_string());
+        // Legacy internal prefix
+        user_defined.insert("x-amz-meta-internal-foo".to_string(), "bar".to_string());
+        // Genuine user metadata that MUST be preserved
+        user_defined.insert("x-amz-meta-project".to_string(), "rustfs".to_string());
+        user_defined.insert("content-type".to_string(), "text/plain".to_string());
+
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                user_defined,
+                ..Default::default()
+            },
+        )
+        .build();
+        let event = Event::new(args);
+
+        let user_metadata = event
+            .s3
+            .object
+            .user_metadata
+            .expect("user_metadata should be present for a create event");
+
+        // All internal / encryption keys stripped.
+        for internal in [
+            "x-rustfs-internal-inline-data",
+            "x-rustfs-internal-transition-tier",
+            "x-minio-internal-compression",
+            "x-minio-internal-server-side-encryption-iv",
+            "x-rustfs-encryption-key",
+            "X-Minio-Encryption-Iv",
+            "x-amz-meta-internal-foo",
+        ] {
+            assert!(
+                !user_metadata.contains_key(internal),
+                "internal key {internal:?} leaked into notification userMetadata"
+            );
+        }
+
+        // Genuine user metadata preserved unchanged.
+        assert_eq!(user_metadata.get("x-amz-meta-project").map(String::as_str), Some("rustfs"));
+        assert_eq!(user_metadata.get("content-type").map(String::as_str), Some("text/plain"));
+        assert_eq!(user_metadata.len(), 2);
+    }
+
+    #[test]
+    fn unversioned_object_omits_version_id() {
+        // Neither the object nor the request carries a version id: the field must be
+        // `None` so it is omitted from the serialized event, not `Some("")` (backlog#984).
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                version_id: None,
+                ..Default::default()
+            },
+        )
+        .version_id(String::new())
+        .build();
+        let event = Event::new(args);
+        assert_eq!(event.s3.object.version_id, None);
+
+        let json = serde_json::to_value(&event).expect("event should serialize");
+        assert!(
+            json.pointer("/s3/object/versionId").is_none(),
+            "unversioned object must not serialize a versionId field"
+        );
+    }
+
+    #[test]
+    fn empty_object_version_falls_back_then_omits() {
+        // Empty object version must not shadow a real request-scoped version.
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                version_id: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .version_id("v-42".to_string())
+        .build();
+        let event = Event::new(args);
+        assert_eq!(event.s3.object.version_id.as_deref(), Some("v-42"));
+    }
+
+    #[test]
+    fn present_object_version_is_preserved() {
+        let args = EventArgsBuilder::new(
+            EventName::ObjectCreatedPut,
+            "bucket",
+            NotifyObjectInfo {
+                bucket: "bucket".to_string(),
+                name: "key".to_string(),
+                version_id: Some("v-1".to_string()),
+                ..Default::default()
+            },
+        )
+        .build();
+        let event = Event::new(args);
+        assert_eq!(event.s3.object.version_id.as_deref(), Some("v-1"));
+    }
+
+    #[test]
+    fn event_time_serializes_with_millisecond_precision() {
+        let mut event = Event::new_test_event("bucket", "key", EventName::ObjectCreatedPut);
+        event.event_time = DateTime::<Utc>::from_timestamp(1_711_423_698, 870_816_000).expect("timestamp should be valid");
+
+        let json = serde_json::to_value(&event).expect("event should serialize");
+        assert_eq!(json.get("eventTime").and_then(|value| value.as_str()), Some("2024-03-26T03:28:18.870Z"));
     }
 }
 

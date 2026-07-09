@@ -26,6 +26,9 @@ pub enum Error {
     #[error("invalid key length")]
     ErrInvalidKeyLength,
 
+    #[error("crypto feature is disabled")]
+    ErrCryptoDisabled,
+
     #[cfg(any(test, feature = "crypto"))]
     #[error("{0}")]
     ErrInvalidLength(#[from] sha2::digest::InvalidLength),

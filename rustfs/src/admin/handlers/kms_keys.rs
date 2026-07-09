@@ -16,15 +16,15 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_kms_runtime_service_manager;
+use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_kms::{KmsError, init_global_kms_service_manager, types::*};
-use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
+use rustfs_kms::{KmsError, types::*};
+use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
@@ -117,36 +117,24 @@ fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
 }
 
 fn kms_service_manager_from_context() -> Option<std::sync::Arc<rustfs_kms::KmsServiceManager>> {
-    resolve_kms_runtime_service_manager()
+    current_kms_runtime_service_manager()
 }
 
 async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
-    let manager = kms_service_manager_from_context().unwrap_or_else(init_global_kms_service_manager);
+    let manager = current_or_init_kms_runtime_service_manager();
     manager.get_encryption_service().await
 }
 
 fn kms_create_key_actions() -> Vec<Action> {
-    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS create-key grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:Configure.
-    vec![
-        Action::KmsAction(KmsAction::ConfigureAction),
-        Action::AdminAction(AdminAction::KMSCreateKeyAdminAction),
-    ]
+    vec![Action::KmsAction(KmsAction::ConfigureAction)]
 }
 
 fn kms_describe_key_actions() -> Vec<Action> {
-    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS key-status grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:DescribeKey.
-    vec![
-        Action::KmsAction(KmsAction::DescribeKeyAction),
-        Action::AdminAction(AdminAction::KMSKeyStatusAdminAction),
-    ]
+    vec![Action::KmsAction(KmsAction::DescribeKeyAction)]
 }
 
 fn kms_list_keys_actions() -> Vec<Action> {
-    // RUSTFS_COMPAT_TODO(S-012): keep legacy KMS key-status grants during KMS policy migration. Remove after KMS admin clients and built-in policies use kms:ListKeys.
-    vec![
-        Action::KmsAction(KmsAction::ListKeysAction),
-        Action::AdminAction(AdminAction::KMSKeyStatusAdminAction),
-    ]
+    vec![Action::KmsAction(KmsAction::ListKeysAction)]
 }
 
 fn kms_generate_data_key_actions() -> Vec<Action> {
@@ -258,7 +246,7 @@ impl Operation for CreateKeyHandler {
                     .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -321,7 +309,7 @@ impl Operation for DescribeKeyHandler {
                     .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -403,17 +391,9 @@ mod tests {
 
     #[test]
     fn kms_key_auth_actions_use_dedicated_kms_actions() {
-        let create_actions = kms_create_key_actions();
-        assert_has_action(&create_actions, Action::KmsAction(KmsAction::ConfigureAction));
-        assert_has_action(&create_actions, Action::AdminAction(AdminAction::KMSCreateKeyAdminAction));
-
-        let describe_actions = kms_describe_key_actions();
-        assert_has_action(&describe_actions, Action::KmsAction(KmsAction::DescribeKeyAction));
-        assert_has_action(&describe_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
-
-        let list_actions = kms_list_keys_actions();
-        assert_has_action(&list_actions, Action::KmsAction(KmsAction::ListKeysAction));
-        assert_has_action(&list_actions, Action::AdminAction(AdminAction::KMSKeyStatusAdminAction));
+        assert_eq!(kms_create_key_actions(), vec![Action::KmsAction(KmsAction::ConfigureAction)]);
+        assert_eq!(kms_describe_key_actions(), vec![Action::KmsAction(KmsAction::DescribeKeyAction)]);
+        assert_eq!(kms_list_keys_actions(), vec![Action::KmsAction(KmsAction::ListKeysAction)]);
     }
 
     #[test]
@@ -494,7 +474,7 @@ impl Operation for ListKeysHandler {
                     .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -568,7 +548,7 @@ impl Operation for GenerateDataKeyHandler {
                     .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -637,7 +617,7 @@ impl Operation for CreateKmsKeyHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -651,7 +631,7 @@ impl Operation for CreateKmsKeyHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -690,7 +670,7 @@ impl Operation for CreateKmsKeyHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -715,7 +695,7 @@ impl Operation for CreateKmsKeyHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::INTERNAL_SERVER_ERROR, Body::from(data)), headers))
             }
@@ -780,7 +760,7 @@ impl Operation for DeleteKmsKeyHandler {
                 let data =
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
                 return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
             };
 
@@ -807,7 +787,7 @@ impl Operation for DeleteKmsKeyHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -821,7 +801,7 @@ impl Operation for DeleteKmsKeyHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -853,7 +833,7 @@ impl Operation for DeleteKmsKeyHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -884,7 +864,7 @@ impl Operation for DeleteKmsKeyHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((status, Body::from(data)), headers))
             }
@@ -947,7 +927,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 let data =
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
                 return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
             };
             CancelKmsKeyDeletionRequest { key_id: key_id.clone() }
@@ -965,7 +945,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -979,7 +959,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -1009,7 +989,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -1035,7 +1015,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::INTERNAL_SERVER_ERROR, Body::from(data)), headers))
             }
@@ -1090,7 +1070,7 @@ impl Operation for ListKmsKeysHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -1105,7 +1085,7 @@ impl Operation for ListKmsKeysHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -1139,7 +1119,7 @@ impl Operation for ListKmsKeysHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -1165,7 +1145,7 @@ impl Operation for ListKmsKeysHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::INTERNAL_SERVER_ERROR, Body::from(data)), headers))
             }
@@ -1212,7 +1192,7 @@ impl Operation for DescribeKmsKeyHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
         };
 
@@ -1225,7 +1205,7 @@ impl Operation for DescribeKmsKeyHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -1238,7 +1218,7 @@ impl Operation for DescribeKmsKeyHandler {
             let data =
                 serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
             let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
             return Ok(S3Response::with_headers((StatusCode::SERVICE_UNAVAILABLE, Body::from(data)), headers));
         };
 
@@ -1267,7 +1247,7 @@ impl Operation for DescribeKmsKeyHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }
@@ -1298,7 +1278,7 @@ impl Operation for DescribeKmsKeyHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((status, Body::from(data)), headers))
             }

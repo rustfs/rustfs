@@ -1,0 +1,9 @@
+---
+source: crates/kms/src/api_types.rs
+expression: "serde_json::to_value(ConfigureKmsResponse\n{\n    success: true, message: \"kms configured\".to_string(), status:\n    KmsServiceStatus::Configured,\n}).expect(\"configure response should serialize\")"
+---
+{
+  "message": "kms configured",
+  "status": "Configured",
+  "success": true
+}

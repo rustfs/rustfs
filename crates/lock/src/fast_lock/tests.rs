@@ -14,8 +14,9 @@
 
 #[cfg(test)]
 mod fast_lock_tests {
-    use crate::fast_lock::FastObjectLockManager;
+    use crate::LockError;
     use crate::fast_lock::types::{LockConfig, LockMode, LockPriority, LockResult, ObjectKey, ObjectLockRequest};
+    use crate::fast_lock::{DEFAULT_SHARD_COUNT, FastObjectLockManager};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::sleep;
@@ -29,6 +30,32 @@ mod fast_lock_tests {
             ..LockConfig::default()
         };
         FastObjectLockManager::with_config(config)
+    }
+
+    #[test]
+    fn try_with_config_returns_error_for_invalid_shard_count() {
+        let config = LockConfig {
+            shard_count: 3,
+            ..LockConfig::default()
+        };
+
+        let err = FastObjectLockManager::try_with_config(config)
+            .expect_err("non-power-of-two shard counts should return an explicit configuration error");
+
+        assert!(matches!(err, LockError::Configuration { .. }));
+        assert!(err.to_string().contains("shard count must be a non-zero power of 2"));
+    }
+
+    #[tokio::test]
+    async fn with_config_falls_back_to_default_for_invalid_shard_count() {
+        let config = LockConfig {
+            shard_count: 3,
+            ..LockConfig::default()
+        };
+
+        let manager = FastObjectLockManager::with_config(config);
+
+        assert_eq!(manager.shards.len(), DEFAULT_SHARD_COUNT);
     }
 
     #[tokio::test]
@@ -380,6 +407,66 @@ mod fast_lock_tests {
         // Wait for all writers - they should complete sequentially
         for handle in handles {
             handle.await.expect("Writer task should complete");
+        }
+    }
+
+    // Regression for the fast-lock lost-wakeup (backlog#853 follow-up).
+    //
+    // A waiter that enters the notification wait can miss its wakeup: the release
+    // path only calls `notify_one` when `writer_waiters > 0`, so if the holder
+    // releases in the narrow gap after the waiter's `try_acquire` fails but before
+    // it registers as a waiter, no notification (and no stored permit) is produced.
+    // The waiter then blocks until the acquire deadline even though the lock is free
+    // and stays free — surfacing as a spurious `LockResult::Timeout`.
+    //
+    // Each key here has one long holder plus one waiter that starts slightly later,
+    // so the waiter is pushed past the early backoff phase into the notification
+    // wait and there is no re-contention after the single release. With the fix
+    // (bounded notification wait + re-poll) the waiter acquires within ~50ms of the
+    // release; without it, the missed wakeup strands the waiter until timeout.
+    // Many independent keys make hitting the narrow race reliable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_lock_waiter_is_not_stranded_by_missed_wakeup() {
+        let manager = Arc::new(create_test_manager());
+        const KEYS: usize = 64;
+        // Long enough to push the waiter past the ~850ms backoff phase into the
+        // notification wait, where the missed-wakeup bug lives.
+        const HOLDER_HOLD: Duration = Duration::from_millis(950);
+
+        let mut handles = Vec::new();
+        for k in 0..KEYS {
+            let key = ObjectKey::new("bucket", format!("object-{k}"));
+
+            // Holder: grabs the lock immediately and holds it across the waiter's
+            // backoff-to-notification transition, then releases exactly once.
+            let holder_mgr = manager.clone();
+            let holder_key = key.clone();
+            handles.push(tokio::spawn(async move {
+                let mut guard = holder_mgr
+                    .acquire_write_lock(holder_key, "holder")
+                    .await
+                    .expect("holder should acquire immediately");
+                sleep(HOLDER_HOLD).await;
+                assert!(guard.release());
+            }));
+
+            // Waiter: starts a touch later so the holder wins the lock first, then
+            // must survive the whole hold and acquire promptly after the release.
+            let waiter_mgr = manager.clone();
+            let waiter_key = key.clone();
+            handles.push(tokio::spawn(async move {
+                sleep(Duration::from_millis(10)).await;
+                let request = ObjectLockRequest::new_write(waiter_key, "waiter").with_acquire_timeout(Duration::from_secs(5));
+                let mut guard = waiter_mgr
+                    .acquire_lock(request)
+                    .await
+                    .expect("waiter must acquire after the holder releases, not time out on a missed wakeup");
+                assert!(guard.release());
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("lock task should not panic");
         }
     }
 

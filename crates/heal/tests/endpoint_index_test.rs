@@ -14,14 +14,15 @@
 
 //! test endpoint index settings
 
-use rustfs_ecstore::disk::endpoint::Endpoint;
-use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
 use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+mod storage_api;
+
+use storage_api::endpoint_index::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_endpoint_index_settings() -> anyhow::Result<()> {
+async fn test_endpoint_index_settings() -> rustfs_heal::Result<()> {
     let temp_dir = TempDir::new()?;
 
     // create test disk paths
@@ -57,7 +58,7 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
         platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
     };
 
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
 
     // validate all endpoint indexes are in valid range
     for (i, ep) in endpoints.iter().enumerate() {
@@ -71,10 +72,10 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
     }
 
     // test ECStore initialization
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await?;
+    init_local_disks(endpoint_pools.clone()).await?;
 
     let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let ecstore = rustfs_ecstore::store::ECStore::new(server_addr, endpoint_pools, CancellationToken::new()).await?;
+    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new()).await?;
 
     println!("ECStore initialized successfully with {} pools", ecstore.pools.len());
 

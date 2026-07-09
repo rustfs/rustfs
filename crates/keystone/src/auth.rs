@@ -120,24 +120,14 @@ impl KeystoneAuthProvider {
     }
 
     /// Convert EC2 credential to Keystone token
-    async fn ec2_to_keystone_token(&self, ec2_cred: &EC2Credential) -> Result<KeystoneToken> {
-        // In a real implementation, you'd need to:
-        // 1. Use admin credentials to get user/project details
-        // 2. Or maintain a mapping table
-        // For simplicity, construct a minimal token
-
-        Ok(KeystoneToken {
-            token: String::new(),
-            user_id: ec2_cred.user_id.clone(),
-            username: ec2_cred.user_id.clone(), // Use user_id as username
-            project_id: ec2_cred.project_id.clone(),
-            project_name: ec2_cred.project_id.clone(),
-            domain_id: None,
-            domain_name: None,
-            roles: vec!["Member".to_string()], // Default role
-            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(24),
-            issued_at: time::OffsetDateTime::now_utc(),
-        })
+    ///
+    /// Fails closed. A correct implementation must resolve the full identity
+    /// (user, project, roles, expiry) from Keystone using admin credentials or
+    /// a trusted mapping. It must never fabricate roles or derive identity from
+    /// client-supplied input. Until that is modeled against a live server, this
+    /// path refuses to mint a token.
+    async fn ec2_to_keystone_token(&self, _ec2_cred: &EC2Credential) -> Result<KeystoneToken> {
+        Err(KeystoneError::Ec2AuthUnsupported)
     }
 
     /// Convert Keystone token to RustFS credentials
@@ -236,6 +226,7 @@ mod tests {
             None,
             "Default".to_string(),
             true,
+            Duration::from_secs(30),
         );
 
         let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
@@ -275,6 +266,7 @@ mod tests {
             None,
             "Default".to_string(),
             true,
+            Duration::from_secs(30),
         );
 
         let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
@@ -290,5 +282,35 @@ mod tests {
 
         cred.groups = Some(vec!["Admin".to_string()]);
         assert!(provider.is_admin(&cred));
+    }
+
+    #[tokio::test]
+    async fn test_ec2_authentication_fails_closed() {
+        // The EC2/SigV4 path must never fabricate an identity from client input.
+        // It must fail closed rather than produce credentials.
+        let client = KeystoneClient::new(
+            "http://localhost:5000".to_string(),
+            crate::KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".to_string(),
+            true,
+            Duration::from_secs(30),
+        );
+
+        let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true).without_cache();
+
+        // A `:`-bearing access key previously shaped user_id/project_id. It must
+        // no longer produce any credentials.
+        let result = provider
+            .authenticate_with_ec2("attacker:admin-project", "sig", "string-to-sign")
+            .await;
+
+        assert!(result.is_err(), "EC2 auth must not return fabricated credentials");
+        assert!(
+            matches!(result, Err(KeystoneError::Ec2AuthUnsupported)),
+            "EC2 auth must fail closed with Ec2AuthUnsupported"
+        );
     }
 }

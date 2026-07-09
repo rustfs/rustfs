@@ -14,16 +14,17 @@
 
 //! Bucket application use-case contracts.
 
-use crate::admin::handlers::site_replication::{
-    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
-};
-use crate::app::context::{
-    AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
-};
-use crate::app::storage_compat::ecstore::bucket::{
+use super::storage_api::bucket_usecase::ECStore;
+use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
+use super::storage_api::bucket_usecase::access::{ReqInfo, authorize_request, req_info_ref};
+#[cfg(test)]
+use super::storage_api::bucket_usecase::bucket::target::BucketTarget;
+use super::storage_api::bucket_usecase::bucket::{
+    ObjectLockConfigExt as _, VersioningConfigExt as _,
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
-        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_transition_tier,
+        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, run_stale_multipart_upload_cleanup_once,
+        validate_lifecycle_config, validate_transition_tier,
     },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
@@ -31,29 +32,44 @@ use crate::app::storage_compat::ecstore::bucket::{
         BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
     },
     metadata_sys,
-    object_lock::ObjectLockApi,
     policy_sys::PolicySys,
+    replication::{
+        ReplicationTargetValidationError, replication_target_arns, should_remove_replication_target,
+        validate_replication_config_target_arns,
+    },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
-    versioning::VersioningApi,
     versioning_sys::BucketVersioningSys,
 };
-use crate::app::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
-use crate::app::storage_compat::ecstore::error::StorageError;
-use crate::app::storage_compat::ecstore::notification_sys::get_global_notification_sys;
-use crate::app::storage_compat::ecstore::store::ECStore;
+use super::storage_api::bucket_usecase::contract::bucket::{
+    BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+};
+use super::storage_api::bucket_usecase::contract::list::{
+    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _,
+};
+use super::storage_api::bucket_usecase::data_usage::remove_bucket_usage_from_backend;
+use super::storage_api::bucket_usecase::error::StorageError;
+use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::bucket_usecase::object_utils::to_s3s_etag;
+use super::storage_api::bucket_usecase::s3_api::bucket::{
+    ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
+    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
+    rustfs_owner,
+};
+use super::storage_api::bucket_usecase::{
+    get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    request_context, validate_list_object_unordered_with_delimiter,
+};
+use crate::admin::handlers::site_replication::{
+    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
+};
+use crate::app::runtime_sources::{
+    AppContext, current_app_context, current_encryption_service, current_notification_system,
+    current_notify_interface_for_context, current_object_store_handle_for_context,
+};
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
-use crate::storage::StorageObjectInfo as ObjectInfo;
-use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
-use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::s3_api::bucket::{
-    ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
-};
-use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::*;
 use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
@@ -64,10 +80,6 @@ use rustfs_policy::policy::{
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
-    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _, MakeBucketOptions,
-};
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},
@@ -76,13 +88,37 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use rustfs_utils::string::parse_bool;
-use s3s::dto::*;
+use s3s::dto::{
+    BucketLifecycleConfiguration, BucketLocationConstraint, CommonPrefix, CreateBucketInput, CreateBucketOutput,
+    DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
+    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
+    DeleteBucketPolicyOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput,
+    DeleteBucketTaggingOutput, DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
+    ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
+    GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
+    GetBucketNotificationConfigurationInput, GetBucketNotificationConfigurationOutput, GetBucketPolicyInput,
+    GetBucketPolicyOutput, GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput,
+    GetBucketVersioningOutput, GetPublicAccessBlockInput, GetPublicAccessBlockOutput, HeadBucketInput, HeadBucketOutput,
+    LifecycleRule, ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput,
+    ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration,
+    NotificationConfigurationFilter, Object, ObjectLockConfiguration, ObjectStorageClass, ObjectVersion,
+    ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput,
+    PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput,
+    PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput, PutBucketPolicyInput,
+    PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput,
+    PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput,
+    ReplicationConfiguration, ServerSideEncryption, Tagging, Timestamp, UserMetadata, VersioningConfiguration,
+};
 use s3s::region::Region;
 use s3s::xml;
+use s3s::xml::{SerResult, SerializeContent};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt::Display,
+    io::Write,
     sync::Arc,
 };
 use tracing::{debug, error, info, instrument, warn};
@@ -93,6 +129,248 @@ use urlencoding::encode;
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+
+const XMLNS_S3: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ObjectInternalInfo {
+    pub k: i32,
+    pub m: i32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ObjectMetadataExtension {
+    pub user_metadata: Option<UserMetadata>,
+    pub user_tags: Option<String>,
+    pub internal: Option<ObjectInternalInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ListObjectVersionMetadataEntry {
+    DeleteMarker(DeleteMarkerEntry, ObjectMetadataExtension),
+    Version(ObjectVersion, ObjectMetadataExtension),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ListObjectVersionsMetadataOutput {
+    pub output: ListObjectVersionsOutput,
+    pub entries: Vec<ListObjectVersionMetadataEntry>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ObjectMetadataEntry {
+    pub object: Object,
+    pub extension: ObjectMetadataExtension,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ListObjectsV2MetadataOutput {
+    pub output: ListObjectsV2Output,
+    pub contents: Vec<ObjectMetadataEntry>,
+}
+
+impl xml::Serialize for ListObjectVersionsMetadataOutput {
+    fn serialize<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        s.content_with_ns("ListVersionsResult", XMLNS_S3, self)
+    }
+}
+
+impl SerializeContent for ListObjectVersionsMetadataOutput {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        if let Some(iter) = &self.output.common_prefixes {
+            s.flattened_list("CommonPrefixes", iter)?;
+        }
+        if let Some(ref val) = self.output.delimiter {
+            s.content("Delimiter", val)?;
+        }
+        if let Some(ref val) = self.output.encoding_type {
+            s.content("EncodingType", val)?;
+        }
+        if let Some(ref val) = self.output.is_truncated {
+            s.content("IsTruncated", val)?;
+        }
+        if let Some(ref val) = self.output.key_marker {
+            s.content("KeyMarker", val)?;
+        }
+        if let Some(ref val) = self.output.max_keys {
+            s.content("MaxKeys", val)?;
+        }
+        if let Some(ref val) = self.output.name {
+            s.content("Name", val)?;
+        }
+        if let Some(ref val) = self.output.next_key_marker {
+            s.content("NextKeyMarker", val)?;
+        }
+        if let Some(ref val) = self.output.next_version_id_marker {
+            s.content("NextVersionIdMarker", val)?;
+        }
+        if let Some(ref val) = self.output.prefix {
+            s.content("Prefix", val)?;
+        }
+        if let Some(ref val) = self.output.version_id_marker {
+            s.content("VersionIdMarker", val)?;
+        }
+        for entry in &self.entries {
+            match entry {
+                ListObjectVersionMetadataEntry::DeleteMarker(marker, extension) => {
+                    s.content(
+                        "DeleteMarker",
+                        &VersionMetadataContent {
+                            value: marker,
+                            extension,
+                        },
+                    )?;
+                }
+                ListObjectVersionMetadataEntry::Version(version, extension) => {
+                    s.content(
+                        "Version",
+                        &VersionMetadataContent {
+                            value: version,
+                            extension,
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl xml::Serialize for ListObjectsV2MetadataOutput {
+    fn serialize<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        s.content_with_ns("ListBucketResult", XMLNS_S3, self)
+    }
+}
+
+impl SerializeContent for ListObjectsV2MetadataOutput {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        if let Some(ref val) = self.output.name {
+            s.content("Name", val)?;
+        }
+        if let Some(ref val) = self.output.prefix {
+            s.content("Prefix", val)?;
+        }
+        if let Some(ref val) = self.output.max_keys {
+            s.content("MaxKeys", val)?;
+        }
+        if let Some(ref val) = self.output.key_count {
+            s.content("KeyCount", val)?;
+        }
+        if let Some(ref val) = self.output.continuation_token {
+            s.content("ContinuationToken", val)?;
+        }
+        if let Some(ref val) = self.output.is_truncated {
+            s.content("IsTruncated", val)?;
+        }
+        if let Some(ref val) = self.output.next_continuation_token {
+            s.content("NextContinuationToken", val)?;
+        }
+        for entry in &self.contents {
+            s.content("Contents", entry)?;
+        }
+        if let Some(iter) = &self.output.common_prefixes {
+            s.flattened_list("CommonPrefixes", iter)?;
+        }
+        if let Some(ref val) = self.output.delimiter {
+            s.content("Delimiter", val)?;
+        }
+        if let Some(ref val) = self.output.encoding_type {
+            s.content("EncodingType", val)?;
+        }
+        if let Some(ref val) = self.output.start_after {
+            s.content("StartAfter", val)?;
+        }
+        Ok(())
+    }
+}
+
+struct VersionMetadataContent<'a, T> {
+    value: &'a T,
+    extension: &'a ObjectMetadataExtension,
+}
+
+impl<T: SerializeContent> SerializeContent for VersionMetadataContent<'_, T> {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        self.value.serialize_content(s)?;
+        self.extension.serialize_content(s)
+    }
+}
+
+impl SerializeContent for ObjectMetadataEntry {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        self.object.serialize_content(s)?;
+        self.extension.serialize_content(s)
+    }
+}
+
+/// Whether `name` is a legal XML 1.0 element name.
+///
+/// User metadata keys are emitted as XML *element names* in the `metadata=true`
+/// listing (`<key>value</key>`). Keys derived from HTTP headers can legally
+/// contain characters that are illegal in an XML `Name` (spaces, `$`, `%`, `#`,
+/// leading digits, control bytes, ...). Emitting such a key verbatim as a tag
+/// produces a malformed document that the console's XML parser rejects wholesale,
+/// blanking the entire prefix in the Web UI while plain `ListObjectsV2` (which
+/// never serializes user metadata) keeps working. See issue #2743.
+fn is_valid_xml_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let is_name_start = |c: char| c == '_' || c == ':' || c.is_alphabetic();
+    let is_name_char = |c: char| is_name_start(c) || c == '-' || c == '.' || c.is_numeric();
+    is_name_start(first) && chars.all(is_name_char)
+}
+
+/// Drop characters that are illegal in XML 1.0 text content.
+///
+/// XML 1.0 permits tab/newline/carriage-return but forbids the other C0 control
+/// characters. The serializer escapes `< > & ' "` but does not strip these, so a
+/// metadata value carrying e.g. a `\u{1}` byte would still emit an unparsable
+/// document. Returns a borrowed slice when nothing needs stripping.
+fn sanitize_xml_text(value: &str) -> Cow<'_, str> {
+    let is_illegal = |c: char| (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r';
+    if value.contains(is_illegal) {
+        Cow::Owned(value.chars().filter(|c| !is_illegal(*c)).collect())
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+impl SerializeContent for ObjectMetadataExtension {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        if let Some(metadata) = &self.user_metadata {
+            s.element("UserMetadata", |s| {
+                for entry in metadata {
+                    if let (Some(name), Some(value)) = (&entry.name, &entry.value) {
+                        // Skip entries whose key is not a valid XML element name and strip
+                        // XML-illegal control characters from the value, so a single poison
+                        // object can never corrupt the whole listing document. See issue #2743.
+                        if is_valid_xml_name(name) {
+                            let sanitized = sanitize_xml_text(value);
+                            s.content(name, sanitized.as_ref())?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(tags) = &self.user_tags {
+            s.content("UserTags", tags)?;
+        }
+        if let Some(internal) = &self.internal {
+            s.content("Internal", internal)?;
+        }
+        Ok(())
+    }
+}
+
+impl SerializeContent for ObjectInternalInfo {
+    fn serialize_content<W: Write>(&self, s: &mut xml::Serializer<W>) -> SerResult {
+        s.content("K", &self.k)?;
+        s.content("M", &self.m)
+    }
+}
 
 fn serialize_config<T: xml::Serialize>(value: &T) -> S3Result<Vec<u8>> {
     serialize(value).map_err(to_internal_error)
@@ -207,7 +485,7 @@ fn notify_bucket_metadata_reload(
     request_context: Option<request_context::RequestContext>,
 ) {
     spawn_background_with_context(request_context, async move {
-        if let Some(notification_sys) = get_global_notification_sys()
+        if let Some(notification_sys) = current_notification_system()
             && let Err(err) = notification_sys.load_bucket_metadata(&bucket).await
         {
             warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
@@ -215,22 +493,27 @@ fn notify_bucket_metadata_reload(
     });
 }
 
-fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
-    let mut arns = HashSet::new();
-
-    if !config.role.trim().is_empty() {
-        arns.insert(config.role.clone());
-        return arns;
-    }
-
-    for rule in &config.rules {
-        let arn = rule.destination.bucket.trim();
-        if !arn.is_empty() {
-            arns.insert(arn.to_string());
+/// Notify peers to drop their cached metadata for a bucket that was just deleted,
+/// so they stop serving stale bucket configuration. Runs in the background to
+/// avoid blocking the delete response.
+fn notify_bucket_metadata_delete(bucket: String, request_context: Option<request_context::RequestContext>) {
+    spawn_background_with_context(request_context, async move {
+        if let Some(notification_sys) = current_notification_system() {
+            for peer_err in notification_sys
+                .delete_bucket_metadata(&bucket)
+                .await
+                .into_iter()
+                .filter(|e| e.err.is_some())
+            {
+                warn!(
+                    bucket = %bucket,
+                    host = %peer_err.host,
+                    error = ?peer_err.err,
+                    "failed to notify peer to delete bucket metadata"
+                );
+            }
         }
-    }
-
-    arns
+    });
 }
 
 fn validate_replication_config_targets(targets: &BucketTargets, config: &ReplicationConfiguration) -> S3Result<()> {
@@ -238,32 +521,20 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
         .targets
         .iter()
         .filter(|target| target.target_type == BucketTargetType::ReplicationService)
-        .map(|target| target.arn.as_str())
-        .collect::<HashSet<_>>();
+        .map(|target| target.arn.as_str());
 
-    for rule in &config.rules {
-        if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
-            continue;
+    match validate_replication_config_target_arns(configured_arns, config) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let message = match err {
+                ReplicationTargetValidationError::RoleWithMultipleDestinations => {
+                    "replication config with Role cannot define multiple destination targets"
+                }
+                ReplicationTargetValidationError::StaleTarget => "replication config has a stale target",
+            };
+            Err(S3Error::with_message(S3ErrorCode::InvalidRequest, message))
         }
-
-        let configured_arn = if config.role.trim().is_empty() {
-            rule.destination.bucket.trim()
-        } else {
-            config.role.trim()
-        };
-
-        if !configured_arn.is_empty() && configured_arns.contains(configured_arn) {
-            continue;
-        }
-
-        return Err(s3_error!(
-            InvalidRequest,
-            "replication config with rule ID {} has a stale target",
-            rule.id.clone().unwrap_or_default()
-        ));
     }
-
-    Ok(())
 }
 
 async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
@@ -286,39 +557,83 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
     validate_replication_config_targets(&targets, config)
 }
 
-async fn remove_replication_targets_for_config(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
+async fn replication_targets_without_config_targets(
+    bucket: &str,
+    config: &ReplicationConfiguration,
+) -> S3Result<Option<(BucketTargets, usize)>> {
     let target_arns = replication_target_arns(config);
     if target_arns.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut targets = match metadata_sys::get_bucket_targets_config(bucket).await {
         Ok(targets) => targets,
         Err(StorageError::ConfigNotFound) => {
             BucketTargetSys::get().update_all_targets(bucket, None).await;
-            return Ok(());
+            return Ok(None);
         }
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
-    let original_len = targets.targets.len();
-    targets.targets.retain(|target| {
-        target.target_type != BucketTargetType::ReplicationService || !target_arns.contains(target.arn.as_str())
-    });
-
-    if targets.targets.len() == original_len {
-        return Ok(());
+    let removed = remove_replication_targets_from_config_targets(&mut targets, &target_arns);
+    if removed == 0 {
+        return Ok(None);
     }
 
-    let removed = original_len - targets.targets.len();
+    Ok(Some((targets, removed)))
+}
+
+fn remove_replication_targets_from_config_targets(targets: &mut BucketTargets, target_arns: &HashSet<String>) -> usize {
+    let original_len = targets.targets.len();
+    targets.targets.retain(|target| {
+        !should_remove_replication_target(
+            target.arn.as_str(),
+            target.target_type == BucketTargetType::ReplicationService,
+            target_arns,
+        )
+    });
+
+    original_len - targets.targets.len()
+}
+
+async fn write_replication_targets_after_config_delete(bucket: &str, targets: &BucketTargets, removed: usize) -> S3Result<()> {
     let json_targets = serde_json::to_vec(&targets).map_err(to_internal_error)?;
     metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
         .await
         .map_err(ApiError::from)?;
-    BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
+    BucketTargetSys::get().update_all_targets(bucket, Some(targets)).await;
     info!(bucket = %bucket, removed, "removed replication remote targets referenced by deleted bucket replication config");
 
     Ok(())
+}
+
+async fn restore_replication_config_after_target_cleanup_failure(
+    bucket: &str,
+    config: &ReplicationConfiguration,
+    cleanup_err: S3Error,
+) -> S3Error {
+    match serialize(config) {
+        Ok(data) => {
+            if let Err(restore_err) = metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data).await {
+                error!(
+                    bucket = %bucket,
+                    error = ?restore_err,
+                    cleanup_error = ?cleanup_err,
+                    "failed to restore bucket replication config after target cleanup failure"
+                );
+            }
+        }
+        Err(restore_err) => {
+            error!(
+                bucket = %bucket,
+                error = ?restore_err,
+                cleanup_error = ?cleanup_err,
+                "failed to serialize bucket replication config for restore after target cleanup failure"
+            );
+        }
+    }
+
+    cleanup_err
 }
 
 fn versioning_configuration_has_object_lock_incompatible_settings(config: &VersioningConfiguration) -> bool {
@@ -373,19 +688,22 @@ fn encode_list_objects_v2_value(value: &str, encoding_type: Option<&EncodingType
     }
 }
 
-fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<UserMetadataCollection> {
+fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<UserMetadata> {
     let mut items = extract_user_defined_metadata(user_defined)
         .into_iter()
         .filter(|(key, _)| !key.is_empty())
-        .map(|(key, value)| UserMetadataEntry { key, value })
+        .map(|(key, value)| MetadataEntry {
+            name: Some(key),
+            value: Some(value),
+        })
         .collect::<Vec<_>>();
-    items.sort_by(|left, right| left.key.cmp(&right.key));
+    items.sort_by(|left, right| left.name.cmp(&right.name));
 
-    if items.is_empty() {
-        None
-    } else {
-        Some(UserMetadataCollection { items })
-    }
+    if items.is_empty() { None } else { Some(items) }
+}
+
+fn metadata_count_to_i32(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 async fn is_list_objects_metadata_action_allowed<T>(
@@ -448,13 +766,13 @@ async fn collect_list_objects_metadata_permissions<T>(
     Ok(permissions)
 }
 
-fn build_list_object_versions_m_output(
+fn build_list_object_versions_metadata_output(
     object_infos: ListObjectVersionsInfo,
     bucket: &str,
     params: &ListObjectVersionsParams,
     encoding_type: Option<&EncodingType>,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
-) -> ListObjectVersionsMOutput {
+) -> ListObjectVersionsMetadataOutput {
     let owner = rustfs_owner();
     let common_prefixes = object_infos
         .prefixes
@@ -487,42 +805,49 @@ fn build_list_object_versions_m_output(
             };
             let internal = if permission.metadata_allowed && (object.data_blocks > 0 || object.parity_blocks > 0) {
                 Some(ObjectInternalInfo {
-                    k: object.data_blocks as i32,
-                    m: object.parity_blocks as i32,
+                    k: metadata_count_to_i32(object.data_blocks),
+                    m: metadata_count_to_i32(object.parity_blocks),
                 })
             } else {
                 None
             };
 
+            let extension = ObjectMetadataExtension {
+                user_metadata,
+                user_tags,
+                internal,
+            };
+
             if object.delete_marker {
-                ListObjectVersionMEntry::DeleteMarker(DeleteMarkerM {
-                    key: Some(object_name),
-                    last_modified: object.mod_time.map(Timestamp::from),
-                    owner: Some(owner.clone()),
-                    version_id: Some(version_id),
-                    is_latest: Some(object.is_latest),
-                    user_metadata,
-                    user_tags,
-                    internal,
-                })
+                ListObjectVersionMetadataEntry::DeleteMarker(
+                    DeleteMarkerEntry {
+                        key: Some(object_name),
+                        last_modified: object.mod_time.map(Timestamp::from),
+                        owner: Some(owner.clone()),
+                        version_id: Some(version_id),
+                        is_latest: Some(object.is_latest),
+                    },
+                    extension,
+                )
             } else {
-                ListObjectVersionMEntry::Version(ObjectVersionM {
-                    key: Some(object_name),
-                    last_modified: object.mod_time.map(Timestamp::from),
-                    size: Some(object.size),
-                    version_id: Some(version_id),
-                    is_latest: Some(object.is_latest),
-                    e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                    storage_class: Some(ObjectVersionStorageClass::from(
-                        object
-                            .storage_class
-                            .unwrap_or_else(|| ObjectVersionStorageClass::STANDARD.to_string()),
-                    )),
-                    owner: Some(owner.clone()),
-                    user_metadata,
-                    user_tags,
-                    internal,
-                })
+                ListObjectVersionMetadataEntry::Version(
+                    ObjectVersion {
+                        key: Some(object_name),
+                        last_modified: object.mod_time.map(Timestamp::from),
+                        size: Some(object.size),
+                        version_id: Some(version_id),
+                        is_latest: Some(object.is_latest),
+                        e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                        storage_class: Some(ObjectVersionStorageClass::from(
+                            object
+                                .storage_class
+                                .unwrap_or_else(|| ObjectVersionStorageClass::STANDARD.to_string()),
+                        )),
+                        owner: Some(owner.clone()),
+                        ..Default::default()
+                    },
+                    extension,
+                )
             }
         })
         .collect::<Vec<_>>();
@@ -533,37 +858,40 @@ fn build_list_object_versions_m_output(
         .map(|marker| encode_list_versions_value(&marker, encoding_type));
     let next_version_id_marker = object_infos.next_version_idmarker.filter(|marker| !marker.is_empty());
 
-    ListObjectVersionsMOutput {
-        common_prefixes: Some(common_prefixes),
-        delimiter: params
-            .delimiter
-            .clone()
-            .map(|value| encode_list_versions_value(&value, encoding_type)),
-        encoding_type: encoding_type.cloned(),
-        is_truncated: Some(object_infos.is_truncated),
-        key_marker: Some(encode_list_versions_value(
-            params.key_marker.as_deref().unwrap_or_default(),
-            encoding_type,
-        )),
-        max_keys: Some(params.max_keys),
-        name: Some(bucket.to_owned()),
-        next_key_marker,
-        next_version_id_marker,
-        prefix: Some(encode_list_versions_value(&params.prefix, encoding_type)),
-        request_charged: None,
-        version_id_marker: Some(params.version_id_marker.clone().unwrap_or_default()),
+    ListObjectVersionsMetadataOutput {
+        output: ListObjectVersionsOutput {
+            common_prefixes: Some(common_prefixes),
+            delimiter: params
+                .delimiter
+                .clone()
+                .map(|value| encode_list_versions_value(&value, encoding_type)),
+            encoding_type: encoding_type.cloned(),
+            is_truncated: Some(object_infos.is_truncated),
+            key_marker: Some(encode_list_versions_value(
+                params.key_marker.as_deref().unwrap_or_default(),
+                encoding_type,
+            )),
+            max_keys: Some(params.max_keys),
+            name: Some(bucket.to_owned()),
+            next_key_marker,
+            next_version_id_marker,
+            prefix: Some(encode_list_versions_value(&params.prefix, encoding_type)),
+            request_charged: None,
+            version_id_marker: Some(params.version_id_marker.clone().unwrap_or_default()),
+            ..Default::default()
+        },
         entries,
     }
 }
 
-fn build_list_objects_v2m_output(
+fn build_list_objects_v2_metadata_output(
     object_infos: ListObjectsV2Info,
     bucket: &str,
     params: &ListObjectsV2Params,
     encoding_type: Option<&EncodingType>,
     fetch_owner: bool,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
-) -> ListObjectsV2MOutput {
+) -> ListObjectsV2MetadataOutput {
     let owner = rustfs_owner();
 
     let contents = object_infos
@@ -584,28 +912,33 @@ fn build_list_objects_v2m_output(
             };
             let internal = if permission.metadata_allowed && (object.data_blocks > 0 || object.parity_blocks > 0) {
                 Some(ObjectInternalInfo {
-                    k: object.data_blocks as i32,
-                    m: object.parity_blocks as i32,
+                    k: metadata_count_to_i32(object.data_blocks),
+                    m: metadata_count_to_i32(object.parity_blocks),
                 })
             } else {
                 None
             };
 
-            ObjectM {
-                key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
-                last_modified: object.mod_time.map(Timestamp::from),
-                size: Some(object.get_actual_size().unwrap_or_default()),
-                e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                storage_class: Some(ObjectStorageClass::from(
-                    object
-                        .storage_class
-                        .clone()
-                        .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
-                )),
-                owner: fetch_owner.then_some(owner.clone()),
-                user_metadata,
-                user_tags,
-                internal,
+            ObjectMetadataEntry {
+                object: Object {
+                    key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
+                    last_modified: object.mod_time.map(Timestamp::from),
+                    size: Some(object.get_actual_size().unwrap_or_default()),
+                    e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: Some(ObjectStorageClass::from(
+                        object
+                            .storage_class
+                            .clone()
+                            .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
+                    )),
+                    owner: fetch_owner.then_some(owner.clone()),
+                    ..Default::default()
+                },
+                extension: ObjectMetadataExtension {
+                    user_metadata,
+                    user_tags,
+                    internal,
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -618,25 +951,27 @@ fn build_list_objects_v2m_output(
         })
         .collect::<Vec<_>>();
 
-    let key_count = (contents.len() + common_prefixes.len()) as i32;
+    let key_count = metadata_count_to_i32(contents.len() + common_prefixes.len());
     let next_continuation_token = object_infos
         .next_continuation_token
         .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
 
-    ListObjectsV2MOutput {
-        name: Some(bucket.to_owned()),
-        prefix: Some(params.prefix.clone()),
-        max_keys: Some(params.max_keys),
-        key_count: Some(key_count),
-        continuation_token: params.response_continuation_token.clone(),
-        is_truncated: Some(object_infos.is_truncated),
-        next_continuation_token,
-        contents: Some(contents),
-        common_prefixes: Some(common_prefixes),
-        delimiter: params.delimiter.clone(),
-        encoding_type: encoding_type.cloned(),
-        start_after: params.response_start_after.clone(),
-        ..Default::default()
+    ListObjectsV2MetadataOutput {
+        output: ListObjectsV2Output {
+            name: Some(bucket.to_owned()),
+            prefix: Some(params.prefix.clone()),
+            max_keys: Some(params.max_keys),
+            key_count: Some(key_count),
+            continuation_token: params.response_continuation_token.clone(),
+            is_truncated: Some(object_infos.is_truncated),
+            next_continuation_token,
+            common_prefixes: Some(common_prefixes),
+            delimiter: params.delimiter.clone(),
+            encoding_type: encoding_type.cloned(),
+            start_after: params.response_start_after.clone(),
+            ..Default::default()
+        },
+        contents,
     }
 }
 
@@ -685,7 +1020,7 @@ fn assign_lifecycle_rule_ids(rules: &mut [LifecycleRule]) {
     }
 }
 
-fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> Result<(), &'static str> {
+fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> std::result::Result<(), &'static str> {
     for rule in rules {
         if rule.status != ExpirationStatus::from_static(ExpirationStatus::ENABLED)
             && rule.status != ExpirationStatus::from_static(ExpirationStatus::DISABLED)
@@ -725,6 +1060,13 @@ fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
     })
 }
 
+fn lifecycle_has_abort_multipart_rules(config: &BucketLifecycleConfiguration) -> bool {
+    config.rules.iter().any(|rule| {
+        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+            && rule.abort_incomplete_multipart_upload.is_some()
+    })
+}
+
 #[derive(Clone, Default)]
 pub struct DefaultBucketUsecase {
     context: Option<Arc<AppContext>>,
@@ -738,7 +1080,7 @@ impl DefaultBucketUsecase {
 
     pub fn from_global() -> Self {
         Self {
-            context: get_global_app_context(),
+            context: current_app_context(),
         }
     }
 
@@ -747,7 +1089,7 @@ impl DefaultBucketUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        resolve_object_store_handle_for_context(self.context.as_deref())
+        current_object_store_handle_for_context(self.context.as_deref())
     }
 
     #[instrument(
@@ -786,7 +1128,11 @@ impl DefaultBucketUsecase {
             .await;
 
         match make_result {
-            Ok(()) => {}
+            Ok(()) => {
+                // Invalidate the bucket validation cache so subsequent GETs
+                // see the newly created bucket immediately.
+                crate::storage::invalidate_bucket_validation_cache(&bucket);
+            }
             Err(StorageError::BucketExists(_)) => {
                 // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
                 // non-owner gets 409 BucketAlreadyExists.
@@ -838,11 +1184,22 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+
+        // Invalidate bucket validation cache
+        crate::storage::invalidate_bucket_validation_cache(&input.bucket);
+
         rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
+        if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
+            warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");
+        }
 
         if let Err(err) = site_replication_delete_bucket_hook(&input.bucket, force).await {
             warn!(bucket = %input.bucket, error = ?err, "site replication delete bucket hook failed");
         }
+
+        // Notify peers to drop their cached metadata for the now-deleted bucket.
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        notify_bucket_metadata_delete(input.bucket.clone(), request_context);
 
         let result = Ok(S3Response::new(DeleteBucketOutput {}));
         let _ = helper.complete(&result);
@@ -948,6 +1305,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -963,6 +1321,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context);
+
         let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket encryption delete hook failed");
@@ -976,6 +1336,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -990,6 +1351,8 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket cors", request_context);
 
         let item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1027,6 +1390,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle delete hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
     }
 
@@ -1064,6 +1428,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -1079,15 +1444,25 @@ impl DefaultBucketUsecase {
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
+        let updated_targets = if let Some(config) = replication_config.as_ref() {
+            replication_targets_without_config_targets(&bucket, config).await?
+        } else {
+            None
+        };
 
         metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
             .await
             .map_err(ApiError::from)?;
-        if let Some(config) = replication_config.as_ref()
-            && let Err(err) = remove_replication_targets_for_config(&bucket, config).await
+        if let Some((targets, removed)) = updated_targets
+            && let Err(err) = write_replication_targets_after_config_delete(&bucket, &targets, removed).await
         {
-            warn!(bucket = %bucket, error = ?err, "failed to remove replication targets referenced by deleted bucket replication config");
+            if let Some(config) = replication_config.as_ref() {
+                return Err(restore_replication_config_after_target_cleanup_failure(&bucket, config, err).await);
+            }
+            return Err(err);
         }
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context);
 
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1096,6 +1471,7 @@ impl DefaultBucketUsecase {
 
         info!(bucket = %bucket, "deleted bucket replication config");
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 
@@ -1104,17 +1480,21 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
 
         metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context);
+
         let item = sr_bucket_meta_item(bucket.clone(), "tags");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging delete hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
@@ -1427,14 +1807,21 @@ impl DefaultBucketUsecase {
 
         let replication_configuration = match metadata_sys::get_replication_config(&bucket).await {
             Ok((cfg, _created)) => cfg,
+            Err(StorageError::ConfigNotFound) => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::ReplicationConfigurationNotFoundError,
+                    "replication not found".to_string(),
+                ));
+            }
             Err(err) => {
-                error!("get_replication_config err {:?}", err);
-                if err == StorageError::ConfigNotFound {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::ReplicationConfigurationNotFoundError,
-                        "replication not found".to_string(),
-                    ));
-                }
+                warn!(
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                    event = "bucket_replication_config_load_failed",
+                    bucket = %bucket,
+                    error = ?err,
+                    "Failed to load bucket replication configuration"
+                );
                 return Err(ApiError::from(err).into());
             }
         };
@@ -1542,6 +1929,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketEncryptionInput {
             bucket,
             mut server_side_encryption_configuration,
@@ -1557,7 +1945,7 @@ impl DefaultBucketUsecase {
             && by_default.sse_algorithm.as_str() == ServerSideEncryption::AWS_KMS
             && by_default.kms_master_key_id.as_deref().is_none_or(str::is_empty)
         {
-            let service = rustfs_kms::service_manager::get_global_encryption_service()
+            let service = current_encryption_service()
                 .await
                 .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS service not initialized".to_string()))?;
             let default_key = service
@@ -1582,6 +1970,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         item.sse_config = Some(
@@ -1628,9 +2018,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        if let Err(err) =
-            crate::app::storage_compat::ecstore::bucket::lifecycle::lifecycle::Lifecycle::validate(&input_cfg, &rcfg).await
-        {
+        if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
             return Err(s3_error!(InvalidArgument, "{err}"));
         }
 
@@ -1678,6 +2066,18 @@ impl DefaultBucketUsecase {
             });
         }
 
+        if lifecycle_has_abort_multipart_rules(&input_cfg)
+            && let Some(store) = self.object_store()
+        {
+            let bucket_name = bucket.clone();
+            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+            spawn_background_with_context(request_context, async move {
+                let deleted = run_stale_multipart_upload_cleanup_once(store).await;
+                debug!(bucket = %bucket_name, deleted, "completed lifecycle abort multipart cleanup trigger");
+            });
+        }
+
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
     }
 
@@ -1686,6 +2086,7 @@ impl DefaultBucketUsecase {
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
         let request_region = req.region.clone();
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
 
         let PutBucketNotificationConfigurationInput {
             bucket,
@@ -1709,12 +2110,10 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context);
+
         let region = resolve_notification_region(self.global_region(), request_region);
-        let notify = self
-            .context
-            .as_ref()
-            .map(|context| context.notify())
-            .unwrap_or_else(default_notify_interface);
+        let notify = current_notify_interface_for_context(self.context.as_deref());
         let clear_rules = notify.clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();
@@ -1827,6 +2226,7 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketCorsInput {
             bucket,
             cors_configuration,
@@ -1847,6 +2247,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context);
+
         let mut item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         item.cors =
             Some(serialize_config(&cors_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
@@ -1861,6 +2263,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketReplicationInput {
             bucket,
             replication_configuration,
@@ -1883,6 +2286,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context);
+
         let mut item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         item.replication_config = Some(
             serialize_config(&replication_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
@@ -1891,6 +2296,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
@@ -1930,6 +2336,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -1947,12 +2354,15 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context);
+
         let mut item = sr_bucket_meta_item(bucket.clone(), "tags");
         item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket tagging hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
 
@@ -1961,6 +2371,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketVersioningInput {
             bucket,
             versioning_configuration,
@@ -1975,6 +2386,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context);
+
         let mut item = sr_bucket_meta_item(bucket.clone(), "version-config");
         item.versioning = Some(
             serialize_config(&versioning_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?,
@@ -1983,6 +2396,7 @@ impl DefaultBucketUsecase {
             warn!(bucket = %bucket, error = ?err, "site replication bucket versioning hook failed");
         }
 
+        rustfs_scanner::record_dirty_usage_bucket(&bucket);
         Ok(S3Response::new(PutBucketVersioningOutput {}))
     }
 
@@ -2040,10 +2454,10 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
-    pub async fn execute_list_objects_v2m(
+    pub(crate) async fn execute_list_objects_v2m(
         &self,
         req: S3Request<ListObjectsV2Input>,
-    ) -> S3Result<S3Response<ListObjectsV2MOutput>> {
+    ) -> S3Result<S3Response<ListObjectsV2MetadataOutput>> {
         let input = req.input.clone();
         let ListObjectsV2Input {
             bucket,
@@ -2081,7 +2495,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let output = build_list_objects_v2m_output(
+        let output = build_list_objects_v2_metadata_output(
             object_infos,
             &bucket,
             &params,
@@ -2129,10 +2543,10 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(output))
     }
 
-    pub async fn execute_list_object_versions_m(
+    pub(crate) async fn execute_list_object_versions_m(
         &self,
         req: S3Request<ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
+    ) -> S3Result<S3Response<ListObjectVersionsMetadataOutput>> {
         let input = req.input.clone();
         let ListObjectVersionsInput {
             bucket,
@@ -2161,7 +2575,8 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let output = build_list_object_versions_m_output(object_infos, &bucket, &params, encoding_type.as_ref(), &permissions);
+        let output =
+            build_list_object_versions_metadata_output(object_infos, &bucket, &params, encoding_type.as_ref(), &permissions);
 
         Ok(S3Response::new(output))
     }
@@ -2179,6 +2594,12 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri};
+    use s3s::dto::ReplicationRuleStatus;
+    use s3s::dto::{
+        BucketVersioningStatus, CORSConfiguration, Destination, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
+        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, ReplicationRule, S3KeyFilter,
+        ServerSideEncryptionConfiguration, Tag, Transition, TransitionStorageClass,
+    };
     use std::sync::Arc;
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
@@ -2210,13 +2631,25 @@ mod tests {
     }
 
     #[test]
-    fn bucket_policy_and_public_access_block_changes_notify_peer_metadata_reload() {
+    fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
         let source = include_str!("bucket_usecase.rs");
         for (method, operation) in [
             ("execute_delete_bucket_policy", "delete bucket policy"),
             ("execute_put_bucket_policy", "put bucket policy"),
             ("execute_delete_public_access_block", "delete public access block"),
             ("execute_put_public_access_block", "put public access block"),
+            ("execute_delete_bucket_lifecycle", "delete bucket lifecycle"),
+            ("execute_put_bucket_lifecycle_configuration", "put bucket lifecycle"),
+            ("execute_put_bucket_versioning", "put bucket versioning"),
+            ("execute_delete_bucket_tagging", "delete bucket tagging"),
+            ("execute_put_bucket_tagging", "put bucket tagging"),
+            ("execute_delete_bucket_replication", "delete bucket replication"),
+            ("execute_put_bucket_replication", "put bucket replication"),
+            ("execute_delete_bucket_cors", "delete bucket cors"),
+            ("execute_put_bucket_cors", "put bucket cors"),
+            ("execute_delete_bucket_encryption", "delete bucket encryption"),
+            ("execute_put_bucket_encryption", "put bucket encryption"),
+            ("execute_put_bucket_notification_configuration", "put bucket notification"),
         ] {
             let body = usecase_method_source(source, method);
             assert!(
@@ -2253,7 +2686,7 @@ mod tests {
         let role = "arn:rustfs:replication:us-east-1:source:bucket";
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
         let config = ReplicationConfiguration {
-            role: role.to_string(),
+            role: format!(" {role} "),
             rules: vec![replication_rule_for_target(destination)],
         };
 
@@ -2280,7 +2713,7 @@ mod tests {
         BucketTargets {
             targets: arns
                 .iter()
-                .map(|arn| crate::app::storage_compat::ecstore::bucket::target::BucketTarget {
+                .map(|arn| BucketTarget {
                     arn: (*arn).to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()
@@ -2320,11 +2753,42 @@ mod tests {
         let arn = "arn:rustfs:replication:us-east-1:role-target:bucket";
         let targets = replication_targets_with_arn(&[arn]);
         let config = ReplicationConfiguration {
-            role: arn.to_string(),
+            role: format!(" {arn} "),
             rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:ignored:bucket")],
         };
 
         validate_replication_config_targets(&targets, &config).expect("matching role ARN should pass validation");
+    }
+
+    #[test]
+    fn validate_replication_config_targets_rejects_role_with_multiple_destinations() {
+        let role = "arn:rustfs:replication:us-east-1:role-target:bucket";
+        let targets = replication_targets_with_arn(&[role]);
+        let config = ReplicationConfiguration {
+            role: role.to_string(),
+            rules: vec![
+                replication_rule_for_target("arn:rustfs:replication:us-east-1:target-a:bucket"),
+                replication_rule_for_target("arn:rustfs:replication:us-east-1:target-b:bucket"),
+            ],
+        };
+
+        let err = validate_replication_config_targets(&targets, &config)
+            .expect_err("role plus multiple destinations should be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn validate_replication_config_targets_trims_destination_arns() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let targets = replication_targets_with_arn(&[arn]);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_for_target(
+                " arn:rustfs:replication:us-east-1:target:bucket ",
+            )],
+        };
+
+        validate_replication_config_targets(&targets, &config).expect("trimmed destination ARN should match configured target");
     }
 
     #[test]
@@ -2338,6 +2802,45 @@ mod tests {
         };
 
         validate_replication_config_targets(&targets, &config).expect("disabled rules should not require live targets");
+    }
+
+    #[test]
+    fn remove_replication_targets_from_config_targets_only_removes_referenced_replication_targets() {
+        let removed_arn = "arn:rustfs:replication:us-east-1:removed:bucket";
+        let kept_replication_arn = "arn:rustfs:replication:us-east-1:kept:bucket";
+        let kept_ilm_arn = "arn:rustfs:ilm:us-east-1:kept:bucket";
+        let mut targets = BucketTargets {
+            targets: vec![
+                BucketTarget {
+                    arn: removed_arn.to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: kept_replication_arn.to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: kept_ilm_arn.to_string(),
+                    target_type: BucketTargetType::IlmService,
+                    ..Default::default()
+                },
+            ],
+        };
+        let target_arns = HashSet::from([removed_arn.to_string(), kept_ilm_arn.to_string()]);
+
+        let removed = remove_replication_targets_from_config_targets(&mut targets, &target_arns);
+
+        assert_eq!(removed, 1);
+        let remaining_arns = targets
+            .targets
+            .iter()
+            .map(|target| target.arn.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!remaining_arns.contains(removed_arn));
+        assert!(remaining_arns.contains(kept_replication_arn));
+        assert!(remaining_arns.contains(kept_ilm_arn));
     }
 
     #[test]
@@ -2741,6 +3244,30 @@ mod tests {
         assert!(lifecycle_has_transition_rules(&config));
     }
 
+    #[test]
+    fn lifecycle_has_abort_multipart_rules_accepts_enabled_abort_rule() {
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(0),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("enabled-abort".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        assert!(lifecycle_has_abort_multipart_rules(&config));
+        assert!(!lifecycle_has_expiry_rules(&config));
+    }
+
     #[tokio::test]
     async fn execute_list_buckets_returns_internal_error_when_store_uninitialized() {
         let input = ListBucketsInput::builder().build().unwrap();
@@ -2781,7 +3308,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_object_versions_m_output_maps_metadata_and_preserves_entry_order() {
+    fn build_list_object_versions_metadata_output_maps_metadata_and_preserves_entry_order() {
         use time::macros::datetime;
         use uuid::Uuid;
 
@@ -2841,7 +3368,7 @@ mod tests {
             version_id_marker: Some("vid-1".to_string()),
             max_keys: 1000,
         };
-        let output = build_list_object_versions_m_output(
+        let output = build_list_object_versions_metadata_output(
             object_infos,
             "demo-bucket",
             &params,
@@ -2849,24 +3376,24 @@ mod tests {
             &permissions,
         );
 
-        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("pre"));
-        assert_eq!(output.key_marker.as_deref(), Some("start%20marker"));
-        assert_eq!(output.next_key_marker.as_deref(), Some("obj-z"));
-        assert_eq!(output.next_version_id_marker.as_deref(), Some("null"));
+        assert_eq!(output.output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.output.prefix.as_deref(), Some("pre"));
+        assert_eq!(output.output.key_marker.as_deref(), Some("start%20marker"));
+        assert_eq!(output.output.next_key_marker.as_deref(), Some("obj-z"));
+        assert_eq!(output.output.next_version_id_marker.as_deref(), Some("null"));
         assert_eq!(output.entries.len(), 2);
 
         match &output.entries[0] {
-            ListObjectVersionMEntry::Version(version) => {
+            ListObjectVersionMetadataEntry::Version(version, extension) => {
                 assert_eq!(version.key.as_deref(), Some("obj-a"));
                 assert_eq!(version.version_id.as_deref(), Some(Uuid::nil().to_string().as_str()));
-                assert_eq!(version.user_tags.as_deref(), Some("env=prod"));
-                assert_eq!(version.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
+                assert_eq!(extension.user_tags.as_deref(), Some("env=prod"));
+                assert_eq!(extension.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
                 assert_eq!(
-                    version.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-                    Some(vec![UserMetadataEntry {
-                        key: "project".to_string(),
-                        value: "alpha".to_string(),
+                    extension.user_metadata.clone(),
+                    Some(vec![MetadataEntry {
+                        name: Some("project".to_string()),
+                        value: Some("alpha".to_string()),
                     }])
                 );
             }
@@ -2874,15 +3401,15 @@ mod tests {
         }
 
         match &output.entries[1] {
-            ListObjectVersionMEntry::DeleteMarker(marker) => {
+            ListObjectVersionMetadataEntry::DeleteMarker(marker, extension) => {
                 assert_eq!(marker.key.as_deref(), Some("obj-b"));
                 assert_eq!(marker.version_id.as_deref(), Some("null"));
-                assert!(marker.user_tags.is_none());
+                assert!(extension.user_tags.is_none());
                 assert_eq!(
-                    marker.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-                    Some(vec![UserMetadataEntry {
-                        key: "marker".to_string(),
-                        value: "true".to_string(),
+                    extension.user_metadata.clone(),
+                    Some(vec![MetadataEntry {
+                        name: Some("marker".to_string()),
+                        value: Some("true".to_string()),
                     }])
                 );
             }
@@ -2891,7 +3418,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_object_versions_m_output_uses_params_and_hides_metadata_without_permissions() {
+    fn build_list_object_versions_metadata_output_uses_params_and_hides_metadata_without_permissions() {
         use time::macros::datetime;
 
         let object_infos = ListObjectVersionsInfo {
@@ -2920,7 +3447,7 @@ mod tests {
             max_keys: 25,
         };
 
-        let output = build_list_object_versions_m_output(
+        let output = build_list_object_versions_metadata_output(
             object_infos,
             "demo-bucket",
             &params,
@@ -2928,20 +3455,20 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("logs%20and%20more%2F"));
-        assert_eq!(output.delimiter.as_deref(), Some("%20"));
-        assert_eq!(output.key_marker.as_deref(), Some("marker%20value"));
-        assert_eq!(output.version_id_marker.as_deref(), Some(""));
-        assert_eq!(output.next_key_marker, None);
-        assert_eq!(output.next_version_id_marker, None);
+        assert_eq!(output.output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.output.prefix.as_deref(), Some("logs%20and%20more%2F"));
+        assert_eq!(output.output.delimiter.as_deref(), Some("%20"));
+        assert_eq!(output.output.key_marker.as_deref(), Some("marker%20value"));
+        assert_eq!(output.output.version_id_marker.as_deref(), Some(""));
+        assert_eq!(output.output.next_key_marker, None);
+        assert_eq!(output.output.next_version_id_marker, None);
 
         match &output.entries[0] {
-            ListObjectVersionMEntry::Version(version) => {
+            ListObjectVersionMetadataEntry::Version(version, extension) => {
                 assert_eq!(version.key.as_deref(), Some("logs%20and%20more%2Fobject%20one.txt"));
-                assert!(version.user_metadata.is_none());
-                assert!(version.user_tags.is_none());
-                assert!(version.internal.is_none());
+                assert!(extension.user_metadata.is_none());
+                assert!(extension.user_tags.is_none());
+                assert!(extension.internal.is_none());
             }
             other => panic!("expected version entry, got {other:?}"),
         }
@@ -2973,7 +3500,7 @@ mod tests {
     }
 
     #[test]
-    fn build_list_objects_v2m_output_maps_metadata_and_key_count() {
+    fn build_list_objects_v2_metadata_output_maps_metadata_and_key_count() {
         use time::macros::datetime;
 
         let object_infos = ListObjectsV2Info {
@@ -3013,7 +3540,7 @@ mod tests {
             decoded_continuation_token: None,
         };
 
-        let output = build_list_objects_v2m_output(
+        let output = build_list_objects_v2_metadata_output(
             object_infos,
             "demo-bucket",
             &params,
@@ -3022,34 +3549,165 @@ mod tests {
             &permissions,
         );
 
-        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("logs/"));
-        assert_eq!(output.continuation_token.as_deref(), Some("start token"));
-        assert_eq!(output.start_after.as_deref(), Some("logs/start after"));
-        assert_eq!(output.next_continuation_token.as_deref(), Some("bmV4dC10b2tlbg=="));
-        assert_eq!(output.key_count, Some(2));
-        assert_eq!(output.contents.as_ref().map(Vec::len), Some(1));
-        assert_eq!(output.common_prefixes.as_ref().map(Vec::len), Some(1));
+        assert_eq!(output.output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.output.prefix.as_deref(), Some("logs/"));
+        assert_eq!(output.output.continuation_token.as_deref(), Some("start token"));
+        assert_eq!(output.output.start_after.as_deref(), Some("logs/start after"));
+        assert_eq!(output.output.next_continuation_token.as_deref(), Some("bmV4dC10b2tlbg=="));
+        assert_eq!(output.output.key_count, Some(2));
+        assert_eq!(output.contents.len(), 1);
+        assert_eq!(output.output.common_prefixes.as_ref().map(Vec::len), Some(1));
 
-        let object = output.contents.as_ref().unwrap().first().unwrap();
-        assert_eq!(object.key.as_deref(), Some("logs/obj%20a.txt"));
-        assert_eq!(object.user_tags.as_deref(), Some("env=prod"));
-        assert_eq!(object.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
-        assert!(object.owner.is_some());
+        let entry = output.contents.first().unwrap();
+        assert_eq!(entry.object.key.as_deref(), Some("logs/obj%20a.txt"));
+        assert_eq!(entry.extension.user_tags.as_deref(), Some("env=prod"));
+        assert_eq!(entry.extension.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
+        assert!(entry.object.owner.is_some());
         assert_eq!(
-            object.user_metadata.as_ref().map(|metadata| metadata.items.clone()),
-            Some(vec![UserMetadataEntry {
-                key: "project".to_string(),
-                value: "alpha".to_string(),
+            entry.extension.user_metadata.clone(),
+            Some(vec![MetadataEntry {
+                name: Some("project".to_string()),
+                value: Some("alpha".to_string()),
             }])
         );
 
-        let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
+        let prefix = output.output.common_prefixes.as_ref().unwrap().first().unwrap();
         assert_eq!(prefix.prefix.as_deref(), Some("logs/archive/"));
     }
 
     #[test]
-    fn build_list_objects_v2m_output_uses_params_and_hides_owner_without_fetch_owner() {
+    fn list_objects_v2_metadata_output_serializes_minio_extension_xml() {
+        use time::macros::datetime;
+
+        let object_infos = ListObjectsV2Info {
+            is_truncated: false,
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs/obj-a.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-03 00:00 UTC)),
+                size: 11,
+                user_defined: Arc::new(HashMap::from([("project".to_string(), "alpha".to_string())])),
+                parity_blocks: 2,
+                data_blocks: 4,
+                user_tags: Arc::new("env=prod&project=alpha".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let permissions = HashMap::from([(
+            "logs/obj-a.txt".to_string(),
+            ObjectMetadataPermissions {
+                metadata_allowed: true,
+                tags_allowed: true,
+            },
+        )]);
+        let params = ListObjectsV2Params {
+            prefix: "logs/".to_string(),
+            max_keys: 1000,
+            delimiter: None,
+            response_start_after: None,
+            start_after_for_query: None,
+            response_continuation_token: None,
+            decoded_continuation_token: None,
+        };
+
+        let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
+        let xml = String::from_utf8(serialize_config(&output).expect("metadata output should serialize"))
+            .expect("metadata output should be UTF-8");
+
+        assert!(xml.contains("<ListBucketResult"));
+        assert!(xml.contains("<Contents>"));
+        assert!(xml.contains("<UserMetadata><project>alpha</project></UserMetadata>"));
+        assert!(xml.contains("<UserTags>env=prod&amp;project=alpha</UserTags>"));
+        assert!(xml.contains("<Internal><K>4</K><M>2</M></Internal>"));
+        assert!(!xml.contains("<MetadataEntry>"));
+    }
+
+    #[test]
+    fn is_valid_xml_name_rejects_non_name_keys() {
+        // Regression for #2743: keys that are illegal as XML element names.
+        for good in ["project", "_x", "a-b.c", "Content_Type", "ns:key", "键名"] {
+            assert!(is_valid_xml_name(good), "{good:?} should be a valid XML name");
+        }
+        for bad in ["", "bad key", "1abc", "a$b", "a%b", "a#b", "a*b", "a|b", "a\u{1}b", "-lead"] {
+            assert!(!is_valid_xml_name(bad), "{bad:?} should be rejected as an XML name");
+        }
+    }
+
+    #[test]
+    fn sanitize_xml_text_strips_illegal_control_chars() {
+        // Regression for #2743: XML 1.0 forbids C0 controls other than tab/newline/CR.
+        assert_eq!(sanitize_xml_text("clean value").as_ref(), "clean value");
+        assert_eq!(sanitize_xml_text("keep\ttab\nnl\rcr").as_ref(), "keep\ttab\nnl\rcr");
+        assert_eq!(sanitize_xml_text("bad\u{1}\u{7}\u{1b}chars").as_ref(), "badchars");
+    }
+
+    #[test]
+    fn list_objects_v2_metadata_output_survives_poison_metadata_key() {
+        // Regression for #2743: a single object carrying an XML-unsafe user-metadata key
+        // (space in the key) or an illegal control char in the value must not corrupt the
+        // whole listing document. The offending key is dropped; well-formed siblings remain.
+        use time::macros::datetime;
+
+        let object_infos = ListObjectsV2Info {
+            is_truncated: false,
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs/obj-a.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-03 00:00 UTC)),
+                size: 11,
+                user_defined: Arc::new(HashMap::from([
+                    ("project".to_string(), "alpha".to_string()),
+                    ("bad key".to_string(), "should-be-dropped".to_string()),
+                    ("note".to_string(), "line1\u{1}line2".to_string()),
+                ])),
+                parity_blocks: 2,
+                data_blocks: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let permissions = HashMap::from([(
+            "logs/obj-a.txt".to_string(),
+            ObjectMetadataPermissions {
+                metadata_allowed: true,
+                tags_allowed: true,
+            },
+        )]);
+        let params = ListObjectsV2Params {
+            prefix: "logs/".to_string(),
+            max_keys: 1000,
+            delimiter: None,
+            response_start_after: None,
+            start_after_for_query: None,
+            response_continuation_token: None,
+            decoded_continuation_token: None,
+        };
+
+        let output = build_list_objects_v2_metadata_output(object_infos, "demo-bucket", &params, None, false, &permissions);
+        let xml = String::from_utf8(serialize_config(&output).expect("metadata output should serialize"))
+            .expect("metadata output should be UTF-8");
+
+        // Good sibling metadata survives.
+        assert!(xml.contains("<project>alpha</project>"), "well-formed key must remain: {xml}");
+        // The XML-unsafe key is dropped entirely (never emitted as a malformed tag).
+        assert!(!xml.contains("bad key"), "poison key must not appear: {xml}");
+        // The control char is stripped from the value.
+        assert!(xml.contains("<note>line1line2</note>"), "control char must be stripped: {xml}");
+        assert!(!xml.contains('\u{1}'), "no raw control chars in output");
+        // The document is well-formed and re-parses cleanly.
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(err) => panic!("serialized listing must be well-formed XML, got {err} in {xml}"),
+            }
+        }
+    }
+
+    #[test]
+    fn build_list_objects_v2_metadata_output_uses_params_and_hides_owner_without_fetch_owner() {
         use time::macros::datetime;
 
         let object_infos = ListObjectsV2Info {
@@ -3080,7 +3738,7 @@ mod tests {
             decoded_continuation_token: Some("decoded token".to_string()),
         };
 
-        let output = build_list_objects_v2m_output(
+        let output = build_list_objects_v2_metadata_output(
             object_infos,
             "demo-bucket",
             &params,
@@ -3089,22 +3747,22 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
-        assert_eq!(output.prefix.as_deref(), Some("logs and more/"));
-        assert_eq!(output.delimiter.as_deref(), Some("/"));
-        assert_eq!(output.continuation_token.as_deref(), Some("opaque token"));
-        assert_eq!(output.start_after.as_deref(), Some("logs and more/start after"));
-        assert_eq!(output.key_count, Some(2));
-        assert_eq!(output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
+        assert_eq!(output.output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.output.prefix.as_deref(), Some("logs and more/"));
+        assert_eq!(output.output.delimiter.as_deref(), Some("/"));
+        assert_eq!(output.output.continuation_token.as_deref(), Some("opaque token"));
+        assert_eq!(output.output.start_after.as_deref(), Some("logs and more/start after"));
+        assert_eq!(output.output.key_count, Some(2));
+        assert_eq!(output.output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
 
-        let object = output.contents.as_ref().unwrap().first().unwrap();
-        assert_eq!(object.key.as_deref(), Some("logs%20and%20more/object%20one.txt"));
-        assert!(object.owner.is_none());
-        assert!(object.user_metadata.is_none());
-        assert!(object.user_tags.is_none());
-        assert!(object.internal.is_none());
+        let entry = output.contents.first().unwrap();
+        assert_eq!(entry.object.key.as_deref(), Some("logs%20and%20more/object%20one.txt"));
+        assert!(entry.object.owner.is_none());
+        assert!(entry.extension.user_metadata.is_none());
+        assert!(entry.extension.user_tags.is_none());
+        assert!(entry.extension.internal.is_none());
 
-        let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
+        let prefix = output.output.common_prefixes.as_ref().unwrap().first().unwrap();
         assert_eq!(prefix.prefix.as_deref(), Some("logs%20and%20more/archive/"));
     }
 

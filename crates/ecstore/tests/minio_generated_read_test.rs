@@ -4,21 +4,46 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use rustfs_ecstore::bitrot::create_bitrot_reader;
-use rustfs_ecstore::disk::endpoint::Endpoint;
-use rustfs_ecstore::disk::{DiskAPI as _, DiskOption, new_disk};
-use rustfs_ecstore::store_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+mod storage_api;
+
 use rustfs_filemeta::{FileInfo, FileInfoOpts, get_file_info};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use storage_api::minio_generated_read::{
+    DiskAPI as _, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
+};
 use temp_env::async_with_vars;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 
 #[derive(Debug, Deserialize)]
 struct ManifestRecord {
     bucket: String,
     object: String,
     backend_files: Vec<String>,
+}
+
+#[derive(Default)]
+struct VecAsyncWriter {
+    bytes: Vec<u8>,
+}
+
+impl AsyncWrite for VecAsyncWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.bytes.extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 fn fixture_root() -> PathBuf {
@@ -92,24 +117,79 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex_simd::encode_to_string(Sha256::digest(bytes), hex_simd::AsciiCase::Lower)
 }
 
-async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, file_info: &FileInfo) -> Vec<u8> {
-    let disk_root = case_dir.join("backend").join("disk1");
-    let disk_root_str = disk_root
-        .to_str()
-        .unwrap_or_else(|| panic!("non-utf8 disk root {}", disk_root.display()));
-    let mut endpoint = Endpoint::try_from(disk_root_str).expect("fixture disk endpoint");
-    endpoint.set_pool_index(0);
-    endpoint.set_set_index(0);
-    endpoint.set_disk_index(0);
-    let disk = new_disk(
-        &endpoint,
-        &DiskOption {
-            cleanup: false,
-            health_check: false,
+async fn load_fixture_reader_input(case_id: &str) -> (ObjectInfo, Vec<u8>, String) {
+    let case_dir = require_fixture_case(case_id);
+    let manifest: ManifestRecord = read_json(&case_dir.join("manifest.json"));
+    let expected_sha256 = read_plaintext_sha256(&case_dir);
+    let file_info = load_file_info(&case_dir, &manifest);
+    let encrypted = encrypted_fixture_bytes(&case_dir, &manifest, &file_info).await;
+    let object_info = load_object_info(&file_info, &manifest);
+
+    (object_info, encrypted, expected_sha256)
+}
+
+async fn read_fixture_plaintext(encrypted: Vec<u8>, object_info: ObjectInfo, kms_key_b64: String) -> Result<Vec<u8>, String> {
+    let object_size = object_info.size;
+
+    async_with_vars(
+        [
+            ("__RUSTFS_SSE_SIMPLE_CMK", Some(kms_key_b64)),
+            ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
+        ],
+        async move {
+            let (mut reader, offset, length) = GetObjectReader::new(
+                Box::new(Cursor::new(encrypted)),
+                None,
+                &object_info,
+                &ObjectOptions::default(),
+                &http::HeaderMap::new(),
+            )
+            .await
+            .map_err(|err| format!("construct GetObjectReader from MinIO raw fixture: {err:?}"))?;
+
+            if offset != 0 || length != object_size {
+                return Err(format!("unexpected fixture range offset={offset} length={length} size={object_size}"));
+            }
+
+            let mut plaintext = Vec::new();
+            reader
+                .read_to_end(&mut plaintext)
+                .await
+                .map_err(|err| format!("read plaintext from MinIO raw fixture: {err}"))?;
+
+            Ok(plaintext)
         },
     )
     .await
-    .expect("open fixture disk");
+}
+
+async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, file_info: &FileInfo) -> Vec<u8> {
+    let mut disks = Vec::with_capacity(file_info.erasure.distribution.len());
+    for disk_number in 1..=file_info.erasure.distribution.len() {
+        let disk_root = case_dir.join("backend").join(format!("disk{disk_number}"));
+        let disk_root_str = disk_root
+            .to_str()
+            .unwrap_or_else(|| panic!("non-utf8 disk root {}", disk_root.display()));
+        let mut endpoint = Endpoint::try_from(disk_root_str).expect("fixture disk endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_number - 1);
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("open fixture disk {disk_number}: {err}"));
+        disks.push(disk);
+    }
+    let mut disk_order = vec![None; disks.len()];
+    for (idx, disk) in disks.iter().enumerate() {
+        let block_index = file_info.erasure.distribution[idx];
+        disk_order[block_index - 1] = Some(disk);
+    }
     let data_dir = file_info
         .data_dir
         .as_ref()
@@ -119,37 +199,42 @@ async fn encrypted_fixture_bytes(case_dir: &Path, manifest: &ManifestRecord, fil
     for part in &file_info.parts {
         let checksum_info = file_info.erasure.get_checksum_info(part.number);
         let path = format!("{}/{}/part.{}", manifest.object, data_dir, part.number);
-        let mut reader = create_bitrot_reader(
-            None,
-            Some(&disk),
-            &manifest.bucket,
-            &path,
-            0,
-            part.size,
-            file_info.erasure.shard_size(),
-            checksum_info.algorithm.clone(),
-            false,
-            false,
-        )
-        .await
-        .unwrap_or_else(|err| panic!("create bitrot reader for {path}: {err:?}"))
-        .unwrap_or_else(|| panic!("missing bitrot reader for {path}"));
-        let mut block = vec![0u8; file_info.erasure.shard_size()];
-        loop {
-            let n = reader
-                .read(&mut block)
-                .await
-                .unwrap_or_else(|err| panic!("read decoded encrypted bytes from {path}: {err}"));
-            if n == 0 {
-                break;
-            }
-            encrypted.extend_from_slice(&block[..n]);
-            if n < block.len() {
-                break;
-            }
+        let shard_read_len = file_info.erasure.shard_file_size(part.size as i64);
+        let mut readers = Vec::with_capacity(disks.len());
+        for (idx, disk) in disk_order.iter().enumerate() {
+            let reader = create_bitrot_reader(
+                None,
+                *disk,
+                &manifest.bucket,
+                &path,
+                0,
+                shard_read_len as usize,
+                file_info.erasure.shard_size(),
+                checksum_info.algorithm.clone(),
+                false,
+                false,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("create bitrot reader for disk{} {path}: {err:?}", idx + 1));
+            readers.push(reader);
         }
+
+        let erasure = Erasure::new(
+            file_info.erasure.data_blocks,
+            file_info.erasure.parity_blocks,
+            file_info.erasure.block_size,
+        );
+        let mut writer = VecAsyncWriter::default();
+        let (written, err) = erasure.decode(&mut writer, readers, 0, part.size, part.size).await;
+        if let Some(err) = err {
+            panic!("decode erasure shards for {path}: {err}");
+        }
+        assert_eq!(written, part.size, "decoded part size should match xl.meta part size");
+        encrypted.extend_from_slice(&writer.bytes);
     }
-    disk.close().await.expect("close fixture disk");
+    for disk in disks {
+        disk.close().await.expect("close fixture disk");
+    }
     encrypted
 }
 
@@ -165,43 +250,44 @@ async fn reads_minio_generated_sse_kms_multipart_fixture() {
     assert_fixture_round_trip("sse-kms-multipart-8m", 8 * 1024 * 1024).await;
 }
 
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data and a local static KMS key"]
+async fn rejects_minio_generated_sse_s3_fixture_with_wrong_kms_key() {
+    let (object_info, encrypted, _) = load_fixture_reader_input("sse-s3-multipart-8m").await;
+    let wrong_key_b64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_string();
+
+    let result = read_fixture_plaintext(encrypted, object_info, wrong_key_b64).await;
+
+    assert!(result.is_err(), "wrong KMS key must fail closed");
+}
+
+#[tokio::test]
+#[ignore = "requires generated MinIO fixture data and a local static KMS key"]
+async fn rejects_minio_generated_sse_s3_fixture_with_truncated_ciphertext() {
+    let (object_info, mut encrypted, expected_sha256) = load_fixture_reader_input("sse-s3-multipart-8m").await;
+    encrypted.truncate(encrypted.len() / 2);
+
+    let result = read_fixture_plaintext(encrypted, object_info, minio_static_kms_key_b64()).await;
+
+    if let Ok(plaintext) = result {
+        assert_ne!(
+            sha256_hex(&plaintext),
+            expected_sha256,
+            "truncated ciphertext must not restore the original plaintext"
+        );
+    }
+}
+
 async fn assert_fixture_round_trip(case_id: &str, expected_size: i64) {
-    let case_dir = require_fixture_case(case_id);
-    let manifest: ManifestRecord = read_json(&case_dir.join("manifest.json"));
-    let expected_sha256 = read_plaintext_sha256(&case_dir);
-    let file_info = load_file_info(&case_dir, &manifest);
-    let encrypted = encrypted_fixture_bytes(&case_dir, &manifest, &file_info).await;
-    let object_info = load_object_info(&file_info, &manifest);
+    let (object_info, encrypted, expected_sha256) = load_fixture_reader_input(case_id).await;
+    let object_size = object_info.size;
     let kms_key_b64 = minio_static_kms_key_b64();
 
-    async_with_vars(
-        [
-            ("__RUSTFS_SSE_SIMPLE_CMK", Some(kms_key_b64)),
-            ("RUSTFS_SSE_S3_MASTER_KEY", None::<String>),
-        ],
-        async {
-            let (mut reader, offset, length) = GetObjectReader::new(
-                Box::new(Cursor::new(encrypted)),
-                None,
-                &object_info,
-                &ObjectOptions::default(),
-                &http::HeaderMap::new(),
-            )
-            .await
-            .expect("construct GetObjectReader from MinIO raw fixture");
+    let plaintext = read_fixture_plaintext(encrypted, object_info, kms_key_b64)
+        .await
+        .expect("fixture must restore with the configured KMS key");
 
-            let mut plaintext = Vec::new();
-            reader
-                .read_to_end(&mut plaintext)
-                .await
-                .expect("read plaintext from MinIO raw fixture");
-
-            assert_eq!(offset, 0);
-            assert_eq!(length, object_info.size);
-            assert_eq!(reader.object_info.size, expected_size);
-            assert_eq!(plaintext.len(), expected_size as usize);
-            assert_eq!(sha256_hex(&plaintext), expected_sha256);
-        },
-    )
-    .await;
+    assert_eq!(object_size, expected_size);
+    assert_eq!(plaintext.len(), expected_size as usize);
+    assert_eq!(sha256_hex(&plaintext), expected_sha256);
 }

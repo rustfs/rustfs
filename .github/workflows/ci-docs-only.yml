@@ -1,0 +1,60 @@
+# Copyright 2026 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Companion to ci.yml for the required "Test and Lint" status check.
+#
+# ci.yml skips docs-only pull requests via paths-ignore, but the branch
+# ruleset requires a check named "Test and Lint" — without this workflow a
+# docs-only PR would wait on that check forever. This workflow triggers on
+# exactly the paths ci.yml ignores and reports an instant success under the
+# same job name. Mixed PRs trigger both workflows and the real check still
+# gates: a required check with any failing run blocks the merge.
+# https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/defining-the-mergeability-of-pull-requests/troubleshooting-required-status-checks#handling-skipped-but-required-checks
+#
+# Keep the paths list below in sync with the pull_request paths-ignore list
+# in ci.yml.
+
+name: Continuous Integration (docs only)
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+    branches: [ main ]
+    paths:
+      - "**.md"
+      - "docs/**"
+      - "deploy/**"
+      - "scripts/dev_*.sh"
+      - "scripts/probe.sh"
+      - "LICENSE*"
+      - ".gitignore"
+      - ".dockerignore"
+      - "README*"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.svg"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/audit.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-lint:
+    name: Test and Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Satisfy required check for docs-only changes
+        run: echo "Docs-only change — code CI is skipped by paths-ignore; reporting success for the required 'Test and Lint' check."

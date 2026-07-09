@@ -14,10 +14,10 @@
 
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
-use crate::storage::storage_compat::ecstore::disk::{DiskAPI, WalkDirOptions};
-use crate::storage::storage_compat::ecstore::rpc::verify_rpc_signature;
-use crate::storage::storage_compat::ecstore::set_disk::DEFAULT_READ_BUFFER_SIZE;
-use crate::storage::storage_compat::ecstore::store::find_local_disk_by_ref;
+use crate::storage::storage_api::rpc_consumer::http_service::{
+    DEFAULT_READ_BUFFER_SIZE, StorageDiskRpcExt as _, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature,
+};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -26,7 +26,7 @@ use hyper::body::Incoming;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
-    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
 };
 use rustfs_utils::net::bytes_stream;
 use s3s::Body;
@@ -36,6 +36,7 @@ use serde_urlencoded::from_bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{self, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use tower::Service;
@@ -278,6 +279,7 @@ fn is_internode_rpc_path(path: &str) -> bool {
 
 async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
     let operation = internode_http_operation(req.uri().path());
+    let started_at = Instant::now();
     if let Err(response) = verify_internode_rpc_signature(req.uri(), req.method(), req.headers()) {
         record_internode_rpc_error(operation);
         return *response;
@@ -297,6 +299,14 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
         record_internode_rpc_error(operation);
     }
 
+    if let Some(operation) = operation {
+        runtime_sources::current_internode_metrics().record_duration_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            started_at.elapsed(),
+        );
+    }
+
     response
 }
 
@@ -310,11 +320,10 @@ fn internode_http_operation(path: &str) -> Option<&'static str> {
 }
 
 fn record_internode_rpc_error(operation: Option<&'static str>) {
+    let metrics = runtime_sources::current_internode_metrics();
     match operation {
-        Some(operation) => {
-            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
-        }
-        None => global_internode_metrics().record_error(),
+        Some(operation) => metrics.record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP),
+        None => metrics.record_error(),
     }
 }
 
@@ -399,7 +408,7 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    global_internode_metrics().record_incoming_request_for_operation_and_backend(
+    runtime_sources::current_internode_metrics().record_incoming_request_for_operation_and_backend(
         INTERNODE_OPERATION_READ_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
@@ -419,7 +428,7 @@ fn read_file_body_stream<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
-    let metrics = global_internode_metrics().clone();
+    let metrics = runtime_sources::current_internode_metrics();
     let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
         bytes
@@ -534,9 +543,9 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         }
     });
 
-    global_internode_metrics()
+    runtime_sources::current_internode_metrics()
         .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
-    let metrics = global_internode_metrics().clone();
+    let metrics = runtime_sources::current_internode_metrics();
     let stream = ReaderStream::with_capacity(rd, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_WALK_DIR,
@@ -603,15 +612,26 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    global_internode_metrics().record_incoming_request_for_operation_and_backend(
+    let metrics = runtime_sources::current_internode_metrics();
+    metrics.record_incoming_request_for_operation_and_backend(
         INTERNODE_OPERATION_PUT_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
-    global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+    metrics.record_recv_bytes_for_operation_and_backend(
         INTERNODE_OPERATION_PUT_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-        copied as usize,
+        usize::try_from(copied).unwrap_or(usize::MAX),
     );
+
+    if put_body_size_mismatch(&query, copied) {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("body size mismatch: expected {} bytes, received {copied}", query.size),
+        );
+        let message = put_file_stage_error_message("verify_size", &query, &err);
+        log_internode_put_file_stage_failure!("verify_size", query, err);
+        return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+    }
 
     if let Err(e) = file.flush().await {
         let message = put_file_stage_error_message("flush", &query, &e);
@@ -633,7 +653,7 @@ where
     let mut pending = BytesMut::with_capacity(DEFAULT_READ_BUFFER_SIZE);
 
     while let Some(bytes) = body.try_next().await.map_err(io::Error::other)? {
-        copied += bytes.len() as u64;
+        copied = copied.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         pending.extend_from_slice(&bytes);
 
         if pending.len() >= DEFAULT_READ_BUFFER_SIZE {
@@ -695,6 +715,14 @@ fn internode_rpc_subsystem(operation: Option<&'static str>) -> &'static str {
     }
 }
 
+/// A writer that is dropped mid-stream (cancelled sender task) terminates the chunked
+/// body cleanly, indistinguishable from intentional EOF. When the client declared the
+/// exact size up front (create path; append and unknown-size writes send `size <= 0`),
+/// a byte-count mismatch means the body was truncated and must not be acknowledged.
+fn put_body_size_mismatch(query: &PutFileQuery, copied: u64) -> bool {
+    !query.append && query.size > 0 && copied != u64::try_from(query.size).unwrap_or(u64::MAX)
+}
+
 fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std::fmt::Display) -> String {
     format!(
         "{stage} file err {err} [disk={}, volume={}, path={}, append={}, size={}]",
@@ -704,7 +732,18 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER, LOG_SUBSYSTEM_ROUTING, PUT_FILE_STREAM_PATH, PutFileQuery,
+        READ_FILE_STREAM_PATH, WALK_DIR_PATH, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
+        put_body_size_mismatch, put_file_stage_error_message, read_file_body_stream, verify_internode_rpc_signature,
+        write_body_chunks_to_writer,
+    };
+    use bytes::Bytes;
+    use http::{HeaderMap, Method, StatusCode, Uri};
+    use rustfs_io_metrics::internode_metrics::{
+        INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+    };
+    use tokio::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::StreamExt;
     use tokio_stream::iter;
@@ -759,6 +798,26 @@ mod tests {
         assert!(msg.contains("path=tmp/object/part.1"));
         assert!(msg.contains("append=false"));
         assert!(msg.contains("size=1024"));
+    }
+
+    #[test]
+    fn put_body_size_mismatch_rejects_truncated_create_only() {
+        let query = |append: bool, size: i64| PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append,
+            size,
+        };
+
+        // Truncated (or over-long) body on the create path is rejected.
+        assert!(put_body_size_mismatch(&query(false, 1024), 512));
+        assert!(put_body_size_mismatch(&query(false, 1024), 2048));
+        assert!(!put_body_size_mismatch(&query(false, 1024), 1024));
+        // Append streams send size=0; unknown-size creates send size<=0 — never rejected.
+        assert!(!put_body_size_mismatch(&query(true, 0), 512));
+        assert!(!put_body_size_mismatch(&query(false, 0), 512));
+        assert!(!put_body_size_mismatch(&query(false, -1), 512));
     }
 
     #[test]

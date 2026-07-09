@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -23,14 +24,12 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store, redacted_secret,
+        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store, redacted_secret,
     },
 };
 use async_trait::async_trait;
 use rustfs_config::{NATS_CREDENTIALS_FILE, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -161,6 +160,21 @@ fn validate_nats_auth(args: &NATSArgs) -> Result<(), TargetError> {
     Ok(())
 }
 
+/// Returns true when the target is configured to send credentials (token,
+/// username/password, or a credentials file) over a connection that does not
+/// require TLS, which would transmit the secrets in cleartext (backlog#983).
+///
+/// TLS is considered active when `tls_required` is set or the address uses the
+/// `tls://` scheme.
+fn nats_sends_credentials_without_tls(args: &NATSArgs) -> bool {
+    let has_auth = !args.token.is_empty() || !args.credentials_file.is_empty() || !args.username.is_empty();
+    if !has_auth {
+        return false;
+    }
+    let scheme_is_tls = args.address.trim_start().to_ascii_lowercase().starts_with("tls://");
+    !(args.tls_required || scheme_is_tls)
+}
+
 pub async fn connect_nats(args: &NATSArgs) -> Result<async_nats::Client, TargetError> {
     args.validate()?;
 
@@ -192,7 +206,7 @@ pub async fn connect_nats(args: &NATSArgs) -> Result<async_nats::Client, TargetE
 
 pub struct NATSTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: NATSArgs,
@@ -210,7 +224,7 @@ where
 
 impl<E> NATSTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(NATSTarget::<E> {
@@ -229,6 +243,13 @@ where
     #[instrument(skip(args), fields(target_id_as_string = %id))]
     pub fn new(id: String, args: NATSArgs) -> Result<Self, TargetError> {
         args.validate()?;
+        if args.enable && nats_sends_credentials_without_tls(&args) {
+            warn!(
+                target_id = %id,
+                address = %args.address,
+                "NATS target sends authentication credentials without TLS; secrets are transmitted in cleartext. Enable tls_required or use a tls:// address."
+            );
+        }
         let target_id = TargetID::new(id, ChannelTargetType::Nats.as_str().to_string());
         let queue_store = open_target_queue_store(
             &args.queue_dir,
@@ -306,19 +327,59 @@ where
 
     async fn send_body(&self, body: Vec<u8>) -> Result<(), TargetError> {
         let client = self.get_or_connect().await?;
-        client
-            .publish(self.args.subject.clone(), body.into())
-            .await
-            .map_err(|e| TargetError::Request(format!("Failed to publish NATS message: {e}")))?;
+        if let Err(e) = client.publish(self.args.subject.clone(), body.into()).await {
+            let err = classify_nats_publish_error(&e);
+            if is_connectivity_error(&err) {
+                self.invalidate_cached_client_connection().await;
+                self.connected.store(false, Ordering::SeqCst);
+            }
+            return Err(err);
+        }
+
+        // `publish` only enqueues the message on the client's outbound channel;
+        // it does not guarantee the broker received it. Flush to confirm the
+        // message reached the server before the caller treats delivery as
+        // successful and deletes the durable copy (backlog#971).
+        if let Err(e) = client.flush().await {
+            let err = classify_nats_flush_error(&e);
+            self.invalidate_cached_client_connection().await;
+            self.connected.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+
         self.delivery_counters.record_success();
         Ok(())
+    }
+}
+
+/// Classifies a NATS publish failure using the typed error kind rather than a
+/// substring match. `Send` means the outbound channel is closed (the connection
+/// is gone) and is retriable; payload/subject violations are permanent
+/// request-level errors (backlog#971, backlog#973).
+fn classify_nats_publish_error(err: &async_nats::PublishError) -> TargetError {
+    use async_nats::PublishErrorKind;
+    match err.kind() {
+        PublishErrorKind::Send => TargetError::NotConnected,
+        PublishErrorKind::MaxPayloadExceeded | PublishErrorKind::InvalidSubject => {
+            TargetError::Request(format!("Failed to publish NATS message: {err}"))
+        }
+    }
+}
+
+/// Classifies a NATS flush failure. Both flush error kinds indicate the message
+/// was not confirmed on the wire (a connectivity problem), so the event is kept
+/// for replay (backlog#971, backlog#973).
+fn classify_nats_flush_error(err: &async_nats::client::FlushError) -> TargetError {
+    use async_nats::client::FlushErrorKind;
+    match err.kind() {
+        FlushErrorKind::SendError | FlushErrorKind::FlushError => TargetError::NotConnected,
     }
 }
 
 #[async_trait]
 impl<E> Target<E> for NATSTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -415,7 +476,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for NATSTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = async_nats::Client;
 
@@ -510,5 +571,57 @@ mod tests {
             ..base_args()
         };
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn nats_credentials_without_tls_is_detected() {
+        // Token auth over a plaintext nats:// address without tls_required leaks
+        // the credential in cleartext (backlog#983).
+        let insecure = NATSArgs {
+            token: "secret-token".to_string(),
+            tls_required: false,
+            ..base_args()
+        };
+        assert!(nats_sends_credentials_without_tls(&insecure));
+
+        // tls_required protects the credentials.
+        let with_tls = NATSArgs {
+            tls_required: true,
+            ..insecure.clone()
+        };
+        assert!(!nats_sends_credentials_without_tls(&with_tls));
+
+        // A tls:// address also counts as protected.
+        let tls_scheme = NATSArgs {
+            address: "tls://127.0.0.1:4222".to_string(),
+            ..insecure
+        };
+        assert!(!nats_sends_credentials_without_tls(&tls_scheme));
+
+        // No credentials configured: nothing to leak.
+        let no_auth = base_args();
+        assert!(!nats_sends_credentials_without_tls(&no_auth));
+    }
+
+    #[test]
+    fn nats_publish_error_classification() {
+        use async_nats::PublishErrorKind;
+        // `Send` means the outbound channel is gone: retriable connectivity error.
+        let send_err = async_nats::PublishError::new(PublishErrorKind::Send);
+        assert!(matches!(classify_nats_publish_error(&send_err), TargetError::NotConnected));
+
+        // Payload/subject violations are permanent request-level errors.
+        let payload_err = async_nats::PublishError::new(PublishErrorKind::MaxPayloadExceeded);
+        assert!(matches!(classify_nats_publish_error(&payload_err), TargetError::Request(_)));
+        let subject_err = async_nats::PublishError::new(PublishErrorKind::InvalidSubject);
+        assert!(matches!(classify_nats_publish_error(&subject_err), TargetError::Request(_)));
+    }
+
+    #[test]
+    fn nats_flush_error_classification() {
+        use async_nats::client::{FlushError, FlushErrorKind};
+        for kind in [FlushErrorKind::SendError, FlushErrorKind::FlushError] {
+            assert!(matches!(classify_nats_flush_error(&FlushError::new(kind)), TargetError::NotConnected));
+        }
     }
 }

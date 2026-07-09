@@ -14,53 +14,62 @@
 
 //! Multipart application use-case contracts.
 
-use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
-use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
-use crate::app::storage_compat::ecstore::bucket::quota::checker::QuotaChecker;
-use crate::app::storage_compat::ecstore::bucket::{
+use super::storage_api::multipart_usecase::ECStore;
+use super::storage_api::multipart_usecase::access::has_bypass_governance_header;
+use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
+use super::storage_api::multipart_usecase::bucket::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
-    replication::{get_must_replicate_options, must_replicate, schedule_replication},
+    replication::{must_replicate_object, schedule_object_replication},
     versioning_sys::BucketVersioningSys,
 };
-use crate::app::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
-use crate::app::storage_compat::ecstore::compress::is_disk_compressible;
-use crate::app::storage_compat::ecstore::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use super::storage_api::multipart_usecase::compression::is_disk_compressible;
 #[cfg(test)]
-use crate::app::storage_compat::ecstore::rio::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use crate::app::storage_compat::ecstore::rio::{HashReader, WritePlan};
-use crate::app::storage_compat::ecstore::set_disk::is_valid_storage_class;
-use crate::app::storage_compat::ecstore::store::ECStore;
-use crate::capacity::record_capacity_write;
-use crate::error::ApiError;
-use crate::storage::access::has_bypass_governance_header;
-use crate::storage::helper::OperationHelper;
-use crate::storage::options::{
+use super::storage_api::multipart_usecase::contract::http::HTTPPreconditions;
+use super::storage_api::multipart_usecase::contract::multipart::{CompletePart, MultipartOperations as _, MultipartUploadResult};
+use super::storage_api::multipart_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
+use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
+use super::storage_api::multipart_usecase::data_usage::{
+    record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+};
+use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use super::storage_api::multipart_usecase::helper::OperationHelper;
+#[cfg(test)]
+use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
+use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
+use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
+use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
-use crate::storage::s3_api::multipart::{
+use super::storage_api::multipart_usecase::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
     parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
-use crate::storage::sse::{
-    build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
-    extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
+use super::storage_api::multipart_usecase::sse::{
+    DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, apply_bucket_default_lock_retention,
+    build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
+    extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error,
+    mark_encrypted_multipart_metadata, sse_decryption, sse_prepare_encryption,
 };
-use crate::storage::*;
-use crate::storage::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
+use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
+use crate::app::object_data_cache::{
+    ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
+};
+use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
+use crate::app::runtime_sources::{
+    AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
+};
+use crate::capacity::record_capacity_write;
+use crate::error::ApiError;
 use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, Uri};
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_s3_ops::S3Operation;
-#[cfg(test)]
-use rustfs_storage_api::HTTPPreconditions;
-use rustfs_storage_api::{
-    CompletePart, HTTPRangeSpec, MultipartOperations as _, MultipartUploadResult, ObjectIO as _, ObjectOperations as _,
-};
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
@@ -68,7 +77,12 @@ use rustfs_utils::http::{
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
     insert_str,
 };
-use s3s::dto::*;
+use s3s::dto::{
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, ChecksumAlgorithm, ChecksumType, CompleteMultipartUploadInput,
+    CompleteMultipartUploadOutput, CompletedPart, CopyPartResult, CopySource, CreateMultipartUploadInput,
+    CreateMultipartUploadOutput, ETag, ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput,
+    ServerSideEncryption, StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+};
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 #[cfg(test)]
@@ -277,7 +291,7 @@ impl DefaultMultipartUsecase {
 
     pub fn from_global() -> Self {
         Self {
-            context: get_global_app_context(),
+            context: current_app_context(),
         }
     }
 
@@ -286,7 +300,11 @@ impl DefaultMultipartUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        resolve_object_store_handle_for_context(self.context.as_deref())
+        current_object_store_handle_for_context(self.context.as_deref())
+    }
+
+    fn object_data_cache(&self) -> Arc<ObjectDataCacheAdapter> {
+        current_object_data_cache_for_context(self.context.as_deref())
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -314,7 +332,10 @@ impl DefaultMultipartUsecase {
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), opts)
             .await
         {
-            Ok(_) => Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() })),
+            Ok(_) => {
+                rustfs_scanner::record_dirty_usage_bucket(&bucket);
+                Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
+            }
             Err(err) => {
                 // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
                 if matches!(err, StorageError::MalformedUploadID(_)) {
@@ -436,6 +457,8 @@ impl DefaultMultipartUsecase {
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
             .map_err(ApiError::from)?;
+        let cache_adapter = self.object_data_cache();
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let server_side_encryption = multipart_info
             .user_defined
@@ -455,6 +478,7 @@ impl DefaultMultipartUsecase {
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
             .await
             .map_err(ApiError::from)?;
+        let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
         record_capacity_write(Some(capacity_scope_token)).await;
 
         // check quota after completing multipart upload
@@ -469,6 +493,7 @@ impl DefaultMultipartUsecase {
                     if !check_result.allowed {
                         // Quota exceeded, delete the completed object
                         let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
+                        let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
                         return Err(S3Error::with_message(
                             S3ErrorCode::InvalidRequest,
                             format!(
@@ -479,12 +504,13 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    crate::app::storage_compat::ecstore::data_usage::record_bucket_object_write_memory(
-                        &bucket,
-                        previous_current_size,
-                        obj_info.size.max(0) as u64,
-                    )
-                    .await;
+                    let mpu_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                    if mpu_versioned {
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
+                            .await;
+                    } else {
+                        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                    }
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
@@ -547,13 +573,13 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
         let mt2 = obj_info.user_defined.clone();
-        let replicate_options =
-            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-        let dsc = must_replicate(&bucket, &key, replicate_options).await;
+        let dsc =
+            must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
+                .await;
 
         if dsc.replicate_any() {
             warn!("need multipart replication");
-            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
+            schedule_object_replication(obj_info.clone(), store, dsc).await;
         }
 
         // Set object info for event notification
@@ -657,8 +683,8 @@ impl DefaultMultipartUsecase {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
                 let ssekms_key_id = material.kms_key_id.clone();
 
-                let mut encryption_metadata = encryption_material_to_metadata(&material);
-                if material.key_kind == crate::storage::sse::EncryptionKeyKind::Object {
+                let mut encryption_metadata = encryption_material_to_metadata(&material)?;
+                if material.key_kind == EncryptionKeyKind::Object {
                     mark_encrypted_multipart_metadata(&mut encryption_metadata);
                 }
                 metadata.extend(encryption_metadata);
@@ -672,7 +698,7 @@ impl DefaultMultipartUsecase {
             rustfs_utils::http::insert_str(
                 &mut metadata,
                 rustfs_utils::http::SUFFIX_COMPRESSION,
-                crate::app::storage_compat::ecstore::rio::compression_metadata_value(CompressionAlgorithm::default()),
+                compression_metadata_value(CompressionAlgorithm::default()),
             );
         }
 
@@ -681,9 +707,9 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let replicate_options =
-            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-        let dsc = must_replicate(&bucket, &key, replicate_options).await;
+        let dsc =
+            must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
+                .await;
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(
@@ -796,6 +822,7 @@ impl DefaultMultipartUsecase {
             .map_err(ApiError::from)?;
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
+        let ingress_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(std::time::Instant::now);
 
         // Apply adaptive buffer sizing based on part size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
@@ -890,18 +917,9 @@ impl DefaultMultipartUsecase {
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
             let ssec_write = match ssec_material.key_kind {
-                crate::storage::sse::EncryptionKeyKind::Object => {
-                    crate::app::storage_compat::ecstore::rio::WriteEncryption::multipart_object_key(
-                        ssec_material.key_bytes,
-                        part_id as u32,
-                    )
-                }
-                crate::storage::sse::EncryptionKeyKind::Direct => {
-                    crate::app::storage_compat::ecstore::rio::WriteEncryption::multipart(
-                        ssec_material.key_bytes,
-                        ssec_material.base_nonce,
-                        part_id,
-                    )
+                EncryptionKeyKind::Object => WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32),
+                EncryptionKeyKind::Direct => {
+                    WriteEncryption::multipart(ssec_material.key_bytes, ssec_material.base_nonce, part_id)
                 }
             };
             write_plan = write_plan.with_encryption(ssec_write);
@@ -917,18 +935,9 @@ impl DefaultMultipartUsecase {
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
             let managed_write = match managed_material.key_kind {
-                crate::storage::sse::EncryptionKeyKind::Object => {
-                    crate::app::storage_compat::ecstore::rio::WriteEncryption::multipart_object_key(
-                        managed_material.key_bytes,
-                        part_id as u32,
-                    )
-                }
-                crate::storage::sse::EncryptionKeyKind::Direct => {
-                    crate::app::storage_compat::ecstore::rio::WriteEncryption::multipart(
-                        managed_material.key_bytes,
-                        managed_material.base_nonce,
-                        part_id,
-                    )
+                EncryptionKeyKind::Object => WriteEncryption::multipart_object_key(managed_material.key_bytes, part_id as u32),
+                EncryptionKeyKind::Direct => {
+                    WriteEncryption::multipart(managed_material.key_bytes, managed_material.base_nonce, part_id)
                 }
             };
             write_plan = write_plan.with_encryption(managed_write);
@@ -940,6 +949,13 @@ impl DefaultMultipartUsecase {
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         let mut reader = PutObjReader::new(reader);
+
+        if let Some(stage_start) = ingress_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_ingress_prepare",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
@@ -1243,18 +1259,9 @@ impl DefaultMultipartUsecase {
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
             let ssec_write = match ssec_material.key_kind {
-                crate::storage::sse::EncryptionKeyKind::Object => {
-                    crate::app::storage_compat::ecstore::rio::WriteEncryption::multipart_object_key(
-                        ssec_material.key_bytes,
-                        part_id as u32,
-                    )
-                }
-                crate::storage::sse::EncryptionKeyKind::Direct => {
-                    crate::app::storage_compat::ecstore::rio::WriteEncryption::multipart(
-                        ssec_material.key_bytes,
-                        ssec_material.base_nonce,
-                        part_id,
-                    )
+                EncryptionKeyKind::Object => WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32),
+                EncryptionKeyKind::Direct => {
+                    WriteEncryption::multipart(ssec_material.key_bytes, ssec_material.base_nonce, part_id)
                 }
             };
             write_plan = write_plan.with_encryption(ssec_write);
@@ -1274,18 +1281,9 @@ impl DefaultMultipartUsecase {
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
             let managed_write = match managed_material.key_kind {
-                crate::storage::sse::EncryptionKeyKind::Object => {
-                    crate::app::storage_compat::ecstore::rio::WriteEncryption::multipart_object_key(
-                        managed_material.key_bytes,
-                        part_id as u32,
-                    )
-                }
-                crate::storage::sse::EncryptionKeyKind::Direct => {
-                    crate::app::storage_compat::ecstore::rio::WriteEncryption::multipart(
-                        managed_material.key_bytes,
-                        managed_material.base_nonce,
-                        part_id,
-                    )
+                EncryptionKeyKind::Object => WriteEncryption::multipart_object_key(managed_material.key_bytes, part_id as u32),
+                EncryptionKeyKind::Direct => {
+                    WriteEncryption::multipart(managed_material.key_bytes, managed_material.base_nonce, part_id)
                 }
             };
             write_plan = write_plan.with_encryption(managed_write);
@@ -1365,6 +1363,7 @@ mod tests {
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     };
+    use s3s::dto::{CompletedMultipartUpload, StorageClass};
     use std::{collections::HashMap, io::Cursor};
     use temp_env::async_with_vars;
     use tokio::io::AsyncReadExt;
@@ -1503,7 +1502,8 @@ mod tests {
                     .await
                     .expect("prepare multipart encryption")
                     .expect("managed multipart session material");
-                let mut session_metadata = encryption_material_to_metadata(&session_material);
+                let mut session_metadata =
+                    encryption_material_to_metadata(&session_material).expect("multipart session metadata should be generated");
                 mark_encrypted_multipart_metadata(&mut session_metadata);
 
                 let part_one_plaintext = vec![0x31; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 23];
@@ -1522,12 +1522,12 @@ mod tests {
                 let mut encrypted_one = Vec::new();
                 #[cfg(feature = "rio-v2")]
                 let mut part_one_reader = match part_one_material.key_kind {
-                    crate::storage::sse::EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
+                    EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
                         Cursor::new(part_one_plaintext.clone()),
                         part_one_material.key_bytes,
                         1,
                     ),
-                    crate::storage::sse::EncryptionKeyKind::Direct => EncryptReader::new_multipart(
+                    EncryptionKeyKind::Direct => EncryptReader::new_multipart(
                         Cursor::new(part_one_plaintext.clone()),
                         part_one_material.key_bytes,
                         part_one_material.base_nonce,
@@ -1559,12 +1559,12 @@ mod tests {
                 let mut encrypted_two = Vec::new();
                 #[cfg(feature = "rio-v2")]
                 let mut part_two_reader = match part_two_material.key_kind {
-                    crate::storage::sse::EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
+                    EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
                         Cursor::new(part_two_plaintext.clone()),
                         part_two_material.key_bytes,
                         2,
                     ),
-                    crate::storage::sse::EncryptionKeyKind::Direct => EncryptReader::new_multipart(
+                    EncryptionKeyKind::Direct => EncryptReader::new_multipart(
                         Cursor::new(part_two_plaintext.clone()),
                         part_two_material.key_bytes,
                         part_two_material.base_nonce,
@@ -1583,7 +1583,7 @@ mod tests {
                     .await
                     .expect("read encrypted part two");
 
-                if session_material.key_kind == crate::storage::sse::EncryptionKeyKind::Object {
+                if session_material.key_kind == EncryptionKeyKind::Object {
                     assert!(session_metadata.contains_key("X-Minio-Internal-Encrypted-Multipart"));
                     assert!(session_metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key"));
                 } else {
@@ -1623,12 +1623,12 @@ mod tests {
                 let plaintext_size = multipart_plaintext_size(&parts, -1);
                 #[cfg(feature = "rio-v2")]
                 let decrypted_stream = match decryption_material.key_kind {
-                    crate::storage::sse::EncryptionKeyKind::Object => boxed_reader(DecryptReader::new_multipart_with_object_key(
+                    EncryptionKeyKind::Object => boxed_reader(DecryptReader::new_multipart_with_object_key(
                         wrap_reader(Cursor::new(encrypted_stream)),
                         decryption_material.key_bytes,
                         multipart_part_numbers(&parts),
                     )),
-                    crate::storage::sse::EncryptionKeyKind::Direct => boxed_reader(DecryptReader::new_multipart(
+                    EncryptionKeyKind::Direct => boxed_reader(DecryptReader::new_multipart(
                         wrap_reader(Cursor::new(encrypted_stream)),
                         decryption_material.key_bytes,
                         decryption_material.base_nonce,

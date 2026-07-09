@@ -93,6 +93,28 @@ fn test_jwt_decode_invalid_token_format() {
 }
 
 #[test]
+fn test_jwt_decode_with_tampered_signature() {
+    let claims = json!({
+        "exp": OffsetDateTime::now_utc().unix_timestamp() + 1000,
+        "sub": "user123"
+    });
+
+    let secret = b"test_secret";
+    let jwt_token = encode(secret, &claims).expect("Failed to encode JWT");
+
+    // Flip one character in the signature segment
+    let (head, signature) = jwt_token.rsplit_once('.').expect("JWT should have a signature segment");
+    let last_char = signature.chars().last().expect("Signature should not be empty");
+    let flipped = if last_char == 'A' { 'B' } else { 'A' };
+    let mut tampered_signature = signature[..signature.len() - 1].to_string();
+    tampered_signature.push(flipped);
+    let tampered_token = format!("{head}.{tampered_signature}");
+
+    let result = decode(&tampered_token, secret);
+    assert!(result.is_err(), "Token with tampered signature should fail to decode");
+}
+
+#[test]
 fn test_jwt_with_expired_token() {
     let expired_claims = json!({
         "exp": OffsetDateTime::now_utc().unix_timestamp() - 1000, // Expired 1000 seconds ago

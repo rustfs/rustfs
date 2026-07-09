@@ -388,14 +388,13 @@ impl TransitionClient {
 
         let complete_multipart_upload_result: CompleteMultipartUploadResult = CompleteMultipartUploadResult::default();
 
-        let (exp_time, rule_id) = if let Some(h_x_amz_expiration) = resp.headers().get(X_AMZ_EXPIRATION) {
-            (
-                OffsetDateTime::parse(h_x_amz_expiration.to_str().unwrap(), ISO8601_DATEFORMAT).unwrap(),
-                "".to_string(),
-            )
-        } else {
-            (OffsetDateTime::now_utc(), "".to_string())
-        };
+        let exp_time = resp
+            .headers()
+            .get(X_AMZ_EXPIRATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| OffsetDateTime::parse(s, ISO8601_DATEFORMAT).ok())
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        let rule_id = "".to_string();
 
         Ok(UploadInfo {
             bucket: complete_multipart_upload_result.bucket,

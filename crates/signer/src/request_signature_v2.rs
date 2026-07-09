@@ -26,6 +26,14 @@ use super::utils::{HostAddrError, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hmac_sha1};
 use s3s::Body;
 
+// NOTE: SHA-1 HMAC is used here for AWS S3 Signature V2 compatibility.
+// SHA-1 is considered weak, but it's only used for HMAC (not signature collision).
+// Migration plan (not yet implemented):
+// Phase 1: Support both SHA-1 and SHA-256 (configurable)
+// Phase 2: Deprecation warnings in response headers
+// Phase 3: Default to SHA-256, SHA-1 becomes optional
+// See https://github.com/rustfs/backlog/issues/747 for discussion.
+
 const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
 
@@ -79,10 +87,6 @@ fn pre_sign_v2_inner(
     }
 
     let d = OffsetDateTime::now_utc();
-    let d = match time::Time::from_hms(0, 0, 0) {
-        Ok(midnight) => d.replace_time(midnight),
-        Err(err) => return sign_v2_fail(req, SignV2Error::TimeComponent { reason: err.to_string() }),
-    };
     let epoch_expires = d.unix_timestamp() + expires;
 
     let headers = req.headers_mut();
@@ -107,7 +111,7 @@ fn pre_sign_v2_inner(
         Ok(v) => v,
         Err(err) => return sign_v2_fail(req, err),
     };
-    let signature = hex(hmac_sha1(secret_access_key, string_to_sign));
+    let signature = base64_simd::STANDARD.encode_to_string(hmac_sha1(secret_access_key, string_to_sign));
 
     let query_source = req.uri().query().unwrap_or("");
     let result = serde_urlencoded::from_str::<HashMap<String, String>>(query_source);
@@ -185,16 +189,12 @@ fn sign_v2_inner(
     }
 
     let d = OffsetDateTime::now_utc();
-    let d2 = match time::Time::from_hms(0, 0, 0) {
-        Ok(midnight) => d.replace_time(midnight),
-        Err(err) => return sign_v2_fail(req, SignV2Error::TimeComponent { reason: err.to_string() }),
-    };
 
     {
         let headers = req.headers_mut();
         let need_default_date = headers.get("Date").and_then(|v| v.to_str().ok()).is_none_or(|v| v.is_empty());
         if need_default_date {
-            let date_str = match d2.format(&format_description::well_known::Rfc2822) {
+            let date_str = match d.format(&format_description::well_known::Rfc2822) {
                 Ok(v) => v,
                 Err(err) => return sign_v2_fail(req, SignV2Error::TimeFormat { reason: err.to_string() }),
             };
@@ -223,7 +223,7 @@ fn sign_v2_inner(
     let auth_header = format!(
         "{}{}",
         auth_header,
-        base64_simd::URL_SAFE_NO_PAD.encode_to_string(hmac_sha1(secret_access_key, string_to_sign))
+        base64_simd::STANDARD.encode_to_string(hmac_sha1(secret_access_key, string_to_sign))
     );
 
     let auth_value = match auth_header.parse::<HeaderValue>() {
@@ -461,11 +461,143 @@ mod tests {
 
         let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
         let expected_string_to_sign = try_string_to_sign_v2(&req, false).expect("string to sign should build");
-        let expected_signature = base64_simd::URL_SAFE_NO_PAD.encode_to_string(hmac_sha1("SECRET", expected_string_to_sign));
+        let expected_signature = base64_simd::STANDARD.encode_to_string(hmac_sha1("SECRET", expected_string_to_sign));
 
         assert_eq!(
             req.headers().get("Authorization").unwrap().to_str().unwrap(),
             format!("AWS AKIAEXAMPLE:{expected_signature}")
         );
+    }
+
+    // Known-answer test: with a fixed non-midnight Date already set, the emitted
+    // Authorization signature is the STANDARD (padded) base64 of the HMAC-SHA1 over
+    // the canonical string-to-sign "GET\n\n\nFri, 24 May 2013 12:34:56 GMT\n/object".
+    #[test]
+    fn test_sign_v2_authorization_known_answer() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+        req.headers_mut()
+            .insert("Date", "Fri, 24 May 2013 12:34:56 GMT".parse().unwrap());
+
+        let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
+
+        // The fixed Date must be preserved (not overwritten with midnight).
+        assert_eq!(req.headers().get("Date").unwrap().to_str().unwrap(), "Fri, 24 May 2013 12:34:56 GMT");
+        // Reference value: standard base64 of HMAC-SHA1("SECRET", string_to_sign).
+        assert_eq!(
+            req.headers().get("Authorization").unwrap().to_str().unwrap(),
+            "AWS AKIAEXAMPLE:1SPmXVPPoRZ1v5hKvou9xXq5GfU="
+        );
+    }
+
+    // The auto-generated Date header must reflect the real signing instant, never
+    // midnight UTC.
+    #[test]
+    fn test_sign_v2_date_uses_real_time_not_midnight() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let before = OffsetDateTime::now_utc();
+        let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
+        let after = OffsetDateTime::now_utc();
+
+        let date_str = req.headers().get("Date").unwrap().to_str().unwrap();
+        let signed = OffsetDateTime::parse(date_str, &format_description::well_known::Rfc2822).expect("Date must be RFC2822");
+
+        // RFC2822 truncates to whole seconds, so allow a one-second slack on each side.
+        assert!(
+            signed.unix_timestamp() >= before.unix_timestamp() - 1 && signed.unix_timestamp() <= after.unix_timestamp() + 1,
+            "signed Date {signed} must fall within the signing window [{before}, {after}]"
+        );
+    }
+
+    // A presigned V2 URL must set Expires to (now + expires), computed from the real
+    // signing instant rather than midnight.
+    #[test]
+    fn test_pre_sign_v2_expires_is_now_plus_expires() {
+        let expires = 60i64;
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let before = OffsetDateTime::now_utc();
+        let req = pre_sign_v2(req, "AKIAEXAMPLE", "SECRET", expires, false);
+        let after = OffsetDateTime::now_utc();
+
+        let query = req.uri().query().unwrap_or_default();
+        let values = serde_urlencoded::from_str::<HashMap<String, String>>(query).unwrap();
+        let signed_expires = values.get("Expires").unwrap().parse::<i64>().unwrap();
+
+        assert!(
+            signed_expires >= before.unix_timestamp() + expires && signed_expires <= after.unix_timestamp() + expires,
+            "Expires {signed_expires} must equal now + {expires}"
+        );
+    }
+
+    // The header-auth signature must be valid STANDARD base64 (decodes to the 20-byte
+    // HMAC-SHA1 digest, padded), never URL-safe or hex.
+    #[test]
+    fn test_sign_v2_signature_is_standard_base64() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
+        let auth = req.headers().get("Authorization").unwrap().to_str().unwrap();
+        let signature = auth.strip_prefix("AWS AKIAEXAMPLE:").expect("auth prefix");
+
+        // Standard base64 of a 20-byte SHA-1 digest is 28 chars with one '=' pad.
+        assert_eq!(signature.len(), 28);
+        assert!(signature.ends_with('='), "standard base64 must be padded: {signature}");
+        assert!(
+            !signature.contains('-') && !signature.contains('_'),
+            "signature must not be URL-safe base64: {signature}"
+        );
+        let decoded = base64_simd::STANDARD
+            .decode_to_vec(signature)
+            .expect("must decode as standard base64");
+        assert_eq!(decoded.len(), 20);
+    }
+
+    // The presigned Signature query value must likewise be STANDARD base64, not hex.
+    #[test]
+    fn test_pre_sign_v2_signature_is_standard_base64() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let req = pre_sign_v2(req, "AKIAEXAMPLE", "SECRET", 60, false);
+        let query = req.uri().query().unwrap_or_default();
+        // Signature is appended last as `&Signature=<value>`, unencoded.
+        let signature = query.rsplit_once("Signature=").expect("Signature param").1;
+
+        assert_eq!(signature.len(), 28);
+        assert!(signature.ends_with('='), "standard base64 must be padded: {signature}");
+        let decoded = base64_simd::STANDARD
+            .decode_to_vec(signature)
+            .expect("must decode as standard base64");
+        assert_eq!(decoded.len(), 20);
     }
 }

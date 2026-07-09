@@ -1,7 +1,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustfs_ecstore::bucket::utils::{check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict};
+mod bucket_validation_storage_api;
+use bucket_validation_storage_api::{
+    check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict, is_meta_bucketname,
+};
 
 fn parse_case(data: &[u8]) -> (String, String) {
     let text = String::from_utf8_lossy(data);
@@ -23,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
     let (bucket, object) = parse_case(data);
 
     let strict_bucket_ok = check_valid_bucket_name_strict(&bucket).is_ok();
+    let valid_bucket_for_object_ops = strict_bucket_ok || is_meta_bucketname(&bucket);
     let pair_ok = check_bucket_and_object_names(&bucket, &object).is_ok();
     let list_ok = check_list_objs_args(&bucket, &object, &None).is_ok();
 
@@ -46,10 +50,16 @@ fuzz_target!(|data: &[u8]| {
     }
 
     if pair_ok {
-        assert!(strict_bucket_ok, "accepted bucket/object pair must also satisfy strict bucket validation");
+        assert!(
+            valid_bucket_for_object_ops,
+            "accepted bucket/object pair must satisfy strict bucket validation or meta bucket compatibility"
+        );
     }
 
     if list_ok {
-        assert!(strict_bucket_ok, "accepted list-object args must also satisfy strict bucket validation");
+        assert!(
+            valid_bucket_for_object_ops,
+            "accepted list-object args must satisfy strict bucket validation or meta bucket compatibility"
+        );
     }
 });

@@ -604,6 +604,14 @@ fn write_small_zip_entry<R: Read>(reader: &mut R, output_path: &Path, size: u64)
     let size = usize::try_from(size).map_err(|_| io::Error::other("small zip entry size overflow"))?;
     let mut buffer = [0_u8; SMALL_ZIP_EXTRACT_FAST_PATH_LIMIT as usize];
     reader.read_exact(&mut buffer[..size])?;
+    // `read_exact` stops as soon as the declared bytes are read and never performs the
+    // terminal zero-length read that the zip crate's `Crc32Reader` uses to validate the
+    // entry checksum. Force one extra read to EOF so a corrupted small entry is rejected
+    // here, matching the large-entry `io::copy` path which already reads through EOF.
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(io::Error::other("small zip entry produced more data than its declared size").into());
+    }
     std::fs::write(output_path, &buffer[..size])?;
     Ok(())
 }
@@ -1530,6 +1538,118 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ZipError::UnsafeEntryPath(path) if path == "../escape.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_rejects_parent_traversal_entry_and_writes_nothing_outside_target() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("traversal.zip");
+        let extract_path = temp.path().join("extract");
+
+        build_zip_file_with_entries(&zip_path, &[("safe.txt", b"safe"), ("../escape.txt", b"escape")])
+            .await
+            .expect("zip fixture should be created");
+
+        let err = extract_zip_simple(&zip_path, &extract_path)
+            .await
+            .expect_err("zip entry with parent traversal should be rejected");
+
+        assert!(matches!(err, ZipError::UnsafeEntryPath(path) if path == "../escape.txt"));
+        assert!(
+            fs::metadata(temp.path().join("escape.txt")).await.is_err(),
+            "traversal entry must not be written outside the extraction target"
+        );
+        assert!(
+            fs::metadata(extract_path.join("escape.txt")).await.is_err(),
+            "traversal entry must not be written inside the extraction target either"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_rejects_small_entry_with_corrupted_crc() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("corrupt-crc.zip");
+        let extract_path = temp.path().join("extract");
+
+        // A stored entry well under the small-entry fast-path limit so extraction takes
+        // the in-memory buffer path rather than the streaming `io::copy` path.
+        let content = b"small-entry-crc-payload";
+        assert!((content.len() as u64) <= SMALL_ZIP_EXTRACT_FAST_PATH_LIMIT);
+        build_zip_file_with_entries(&zip_path, &[("small.txt", content)])
+            .await
+            .expect("zip fixture should be created");
+
+        // Corrupt the stored entry data so its bytes no longer match the recorded CRC32.
+        let mut raw = fs::read(&zip_path).await.expect("zip fixture should be readable");
+        let offset = raw
+            .windows(content.len())
+            .position(|window| window == content)
+            .expect("stored entry data should be present in the zip");
+        raw[offset] ^= 0xFF;
+        fs::write(&zip_path, &raw).await.expect("corrupted zip should be writable");
+
+        let err = extract_zip_simple(&zip_path, &extract_path)
+            .await
+            .expect_err("small entry with a corrupted CRC should be rejected");
+
+        assert!(
+            matches!(err, ZipError::Io(ref e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "expected an InvalidData checksum error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_allows_entry_count_exactly_at_limit() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("at-limit.zip");
+        let extract_path = temp.path().join("extract");
+
+        build_zip_file_with_entries(&zip_path, &[("one.txt", b"1"), ("two.txt", b"2")])
+            .await
+            .expect("zip fixture should be created");
+
+        let entries = extract_zip_with_limits(
+            &zip_path,
+            &extract_path,
+            ArchiveLimits {
+                max_entries: 2,
+                ..ArchiveLimits::default()
+            },
+        )
+        .await
+        .expect("entry count exactly at the limit should extract successfully");
+
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_extract_zip_allows_total_unpacked_size_exactly_at_limit() {
+        let temp = tempdir().expect("tempdir should be created");
+        let zip_path = temp.path().join("total-at-limit.zip");
+        let extract_path = temp.path().join("extract");
+
+        build_zip_file_with_entries(&zip_path, &[("one.txt", b"12345"), ("two.txt", b"67890")])
+            .await
+            .expect("zip fixture should be created");
+
+        let entries = extract_zip_with_limits(
+            &zip_path,
+            &extract_path,
+            ArchiveLimits {
+                max_total_unpacked_size: 10,
+                ..ArchiveLimits::default()
+            },
+        )
+        .await
+        .expect("total unpacked size exactly at the limit should extract successfully");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            fs::read(extract_path.join("two.txt"))
+                .await
+                .expect("second entry should be extracted"),
+            b"67890"
+        );
     }
 
     #[tokio::test]

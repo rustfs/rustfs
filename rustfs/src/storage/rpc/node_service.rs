@@ -16,45 +16,33 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::storage::storage_compat::ecstore::{
-    admin_server_info::get_local_server_property,
-    bucket::{metadata::load_bucket_metadata, metadata_sys},
-    disk::{
-        DeleteOptions, DiskAPI, DiskInfoOptions, DiskStore, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        UpdateMetadataOpts, error::DiskError,
-    },
-    get_global_lock_client,
-    global::GLOBAL_TierConfigMgr,
-    metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
-    resolve_object_store_handle,
-    rpc::{
-        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC,
-    },
-    store::{all_local_disk_path, find_local_disk_by_ref},
+#[cfg(test)]
+use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_SYS;
+#[cfg(test)]
+use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
+use crate::storage::storage_api::rpc_consumer::node_service::{
+    DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
+    reload_transition_tier_config,
 };
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
-use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
-use rustfs_filemeta::{FileInfo, MetacacheReader};
-use rustfs_iam::{get_global_iam_sys, store::UserType};
-use rustfs_lock::{LockClient, LockRequest};
-use rustfs_madmin::health::{
-    get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
-};
-use rustfs_madmin::net::get_net_info;
+use rustfs_filemeta::MetacacheReader;
+use rustfs_iam::store::UserType;
+use rustfs_lock::LockClient;
 use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
-use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use serde::Deserialize;
 use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 use tokio::spawn;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
@@ -132,36 +120,77 @@ fn unimplemented_rpc(method: &str) -> Status {
     Status::unimplemented(format!("{method} is not implemented"))
 }
 
-fn background_rebalance_start_error_message(
-    result: crate::storage::storage_compat::ecstore::error::Result<()>,
-) -> Option<String> {
+fn background_rebalance_start_error_message(result: StorageResult<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
 }
 
-#[path = "bucket.rs"]
+fn stop_rebalance_response(result: StorageResult<()>) -> StopRebalanceResponse {
+    match result {
+        Ok(_) => StopRebalanceResponse {
+            success: true,
+            error_info: None,
+        },
+        Err(err) => StopRebalanceResponse {
+            success: false,
+            error_info: Some(err.to_string()),
+        },
+    }
+}
+
+fn ensure_rpc_decommission_local_leader(store: &ECStore, idx: usize) -> StorageResult<()> {
+    let endpoints = store.endpoints();
+    let endpoint = endpoints
+        .as_ref()
+        .get(idx)
+        .and_then(|pool| pool.endpoints.as_ref().first())
+        .ok_or_else(|| Error::other(format!("invalid decommission pool index {idx} for {} pools", endpoints.as_ref().len())))?;
+
+    if !endpoint.is_local {
+        return Err(Error::other(format!(
+            "decommission for pool {idx} must run on the pool first endpoint {endpoint}"
+        )));
+    }
+
+    Ok(())
+}
+
 mod bucket;
-#[path = "disk.rs"]
 mod disk;
-#[path = "event.rs"]
 mod event;
-#[path = "health.rs"]
 mod health;
-#[path = "lock.rs"]
 mod lock;
-#[path = "metrics.rs"]
 mod metrics;
 
-#[derive(Debug)]
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
+    context: Option<Arc<runtime_sources::AppContext>>,
+}
+
+impl std::fmt::Debug for NodeService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeService")
+            .field("local_peer", &self.local_peer)
+            .field("context_present", &self.context.is_some())
+            .finish()
+    }
 }
 
 pub fn make_server() -> NodeService {
+    let context = runtime_sources::current_app_context();
+    make_server_for_context(context)
+}
+
+pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>) -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeService { local_peer }
+    NodeService { local_peer, context }
 }
 
 impl NodeService {
+    fn resolve_object_store(&self) -> Option<Arc<ECStore>> {
+        let context = self.context.clone().or_else(runtime_sources::current_app_context);
+        runtime_sources::current_object_store_handle_for_context(context.as_deref())
+    }
+
     async fn find_disk(&self, disk_path: &str) -> Option<DiskStore> {
         find_local_disk_by_ref(disk_path).await
     }
@@ -170,9 +199,9 @@ impl NodeService {
         all_local_disk_path().await
     }
 
-    /// Get the global lock client, returning an error if not initialized
+    /// Get the lock client, returning an error if not initialized
     fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
-        get_global_lock_client()
+        runtime_sources::current_lock_client()
             .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
     }
 }
@@ -460,6 +489,13 @@ impl Node for NodeService {
         self.handle_read_version(request).await
     }
 
+    async fn batch_read_version(
+        &self,
+        request: Request<BatchReadVersionRequest>,
+    ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        self.handle_batch_read_version(request).await
+    }
+
     async fn read_xl(&self, request: Request<ReadXlRequest>) -> Result<Response<ReadXlResponse>, Status> {
         self.handle_read_xl(request).await
     }
@@ -631,7 +667,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(DeletePolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -660,7 +696,7 @@ impl Node for NodeService {
                 error_info: Some("policy name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadPolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -699,7 +735,7 @@ impl Node for NodeService {
             }));
         };
         let is_group = request.is_group;
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadPolicyMappingResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -727,7 +763,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(DeleteUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -759,7 +795,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -789,7 +825,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -825,7 +861,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -856,7 +892,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadGroupResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -880,7 +916,7 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadSiteReplicationConfigRequest>,
     ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
-        let Some(_store) = resolve_object_store_handle() else {
+        let Some(_store) = self.resolve_object_store() else {
             return Ok(Response::new(ReloadSiteReplicationConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -969,17 +1005,23 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadPoolMetaRequest>,
     ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
         match store.reload_pool_meta().await {
-            Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
-                success: true,
-                error_info: None,
-            })),
+            Ok(_) => match store.spawn_missing_local_decommission_routines().await {
+                Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            },
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some(err.to_string()),
@@ -987,19 +1029,20 @@ impl Node for NodeService {
         }
     }
 
-    async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+    async fn stop_rebalance(&self, request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
 
-        let _ = store.stop_rebalance().await;
-        Ok(Response::new(StopRebalanceResponse {
-            success: true,
-            error_info: None,
-        }))
+        let expected_rebalance_id = request.into_inner().expected_rebalance_id;
+        let expected_rebalance_id = (!expected_rebalance_id.is_empty()).then_some(expected_rebalance_id);
+
+        Ok(Response::new(stop_rebalance_response(
+            store.stop_rebalance_for_id(expected_rebalance_id.as_deref()).await,
+        )))
     }
 
     #[tracing::instrument(skip_all, fields(start_rebalance))]
@@ -1008,7 +1051,7 @@ impl Node for NodeService {
         request: Request<LoadRebalanceMetaRequest>,
     ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
         let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             log_load_rebalance_meta_rejected!("server_not_initialized", start_rebalance);
             return Ok(Response::new(LoadRebalanceMetaResponse {
                 success: false,
@@ -1024,21 +1067,22 @@ impl Node for NodeService {
 
         if start_rebalance {
             log_background_rebalance_task_spawned!(start_rebalance);
-            let store = store.clone();
-            spawn(async move {
-                if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
-                    error!(
-                        event = EVENT_RPC_BACKGROUND_TASK_FAILED,
-                        component = LOG_COMPONENT_STORAGE,
-                        subsystem = LOG_SUBSYSTEM_REBALANCE,
-                        operation = "start_rebalance",
-                        state = "failed",
-                        start_rebalance,
-                        error = %message,
-                        "node rpc background task failed"
-                    );
-                }
-            });
+            if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
+                error!(
+                    event = EVENT_RPC_BACKGROUND_TASK_FAILED,
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    operation = "start_rebalance",
+                    state = "failed",
+                    start_rebalance,
+                    error = %message,
+                    "node rpc background task failed"
+                );
+                return Ok(Response::new(LoadRebalanceMetaResponse {
+                    success: false,
+                    error_info: Some(message),
+                }));
+            }
         }
 
         Ok(Response::new(LoadRebalanceMetaResponse {
@@ -1047,18 +1091,113 @@ impl Node for NodeService {
         }))
     }
 
+    async fn start_decommission(
+        &self,
+        request: Request<StartDecommissionRequest>,
+    ) -> Result<Response<StartDecommissionResponse>, Status> {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
+            return Ok(Response::new(StartDecommissionResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        let mut indices = Vec::with_capacity(request.get_ref().pool_indices.len());
+        for idx in request.into_inner().pool_indices {
+            indices.push(
+                usize::try_from(idx)
+                    .map_err(|_| Status::invalid_argument(format!("decommission pool index {idx} exceeds local range")))?,
+            );
+        }
+
+        match store.decommission(CancellationToken::new(), indices).await {
+            Ok(()) => Ok(Response::new(StartDecommissionResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(StartDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
+    }
+
+    async fn cancel_decommission(
+        &self,
+        request: Request<CancelDecommissionRequest>,
+    ) -> Result<Response<CancelDecommissionResponse>, Status> {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
+            return Ok(Response::new(CancelDecommissionResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        let idx = usize::try_from(request.into_inner().pool_index)
+            .map_err(|_| Status::invalid_argument("decommission pool index exceeds local range"))?;
+        if let Err(err) = ensure_rpc_decommission_local_leader(&store, idx) {
+            return Ok(Response::new(CancelDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+
+        match store.decommission_cancel(idx).await {
+            Ok(()) => Ok(Response::new(CancelDecommissionResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(CancelDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
+    }
+
+    async fn clear_decommission(
+        &self,
+        request: Request<ClearDecommissionRequest>,
+    ) -> Result<Response<ClearDecommissionResponse>, Status> {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
+            return Ok(Response::new(ClearDecommissionResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        let idx = usize::try_from(request.into_inner().pool_index)
+            .map_err(|_| Status::invalid_argument("decommission pool index exceeds local range"))?;
+        if let Err(err) = ensure_rpc_decommission_local_leader(&store, idx) {
+            return Ok(Response::new(ClearDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            }));
+        }
+
+        match store.clear_decommission(idx).await {
+            Ok(()) => Ok(Response::new(ClearDecommissionResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(ClearDecommissionResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
+    }
+
     async fn load_transition_tier_config(
         &self,
         _request: Request<LoadTransitionTierConfigRequest>,
     ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
 
-        match GLOBAL_TierConfigMgr.write().await.reload(store).await {
+        match reload_transition_tier_config(store).await {
             Ok(_) => Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: true,
                 error_info: None,
@@ -1074,26 +1213,33 @@ impl Node for NodeService {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
-    use super::*;
-    use Request;
+    use super::{
+        CollectMetricsOpts, Error, MetricType, Node as _, NodeService, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
+        background_rebalance_start_error_message, make_server, stop_rebalance_response,
+    };
+    use bytes::Bytes;
+    use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
         DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
         DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
         GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
-        GetMetacacheListingRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest,
-        GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest,
-        ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+        GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
+        GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
+        HealBucketRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
         LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
-        ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest,
-        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-        WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
+        MakeVolumesRequest, Mss, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest,
+        ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest,
+        RenamePartRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest,
+        StopRebalanceRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+        WriteMetadataRequest, WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
     };
+    use std::collections::HashMap;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status};
 
     fn create_test_node_service() -> NodeService {
         make_server()
@@ -1456,6 +1602,7 @@ mod tests {
             dst_volume: "dst-volume".to_string(),
             dst_path: "dst-path".to_string(),
             file_info: "{}".to_string(),
+            file_info_bin: Vec::new().into(),
         });
 
         let response = service.rename_data(request).await;
@@ -1477,6 +1624,7 @@ mod tests {
             dst_volume: "dst-volume".to_string(),
             dst_path: "dst-path".to_string(),
             file_info: "invalid json".to_string(),
+            file_info_bin: Vec::new().into(),
         });
 
         let response = service.rename_data(request).await;
@@ -1754,6 +1902,7 @@ mod tests {
             file_info: "{}".to_string(),
             force_del_marker: false,
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1775,6 +1924,7 @@ mod tests {
             file_info: "invalid json".to_string(),
             force_del_marker: false,
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1796,6 +1946,7 @@ mod tests {
             file_info: "{}".to_string(),
             force_del_marker: false,
             opts: "invalid json".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_version(request).await;
@@ -1815,6 +1966,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["{}".to_string()],
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
@@ -1834,6 +1986,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["invalid json".to_string()],
             opts: "{}".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
@@ -1853,6 +2006,7 @@ mod tests {
             volume: "test-volume".to_string(),
             versions: vec!["{}".to_string()],
             opts: "invalid json".to_string(),
+            ..Default::default()
         });
 
         let response = service.delete_versions(request).await;
@@ -1907,6 +2061,7 @@ mod tests {
         let request = Request::new(DeleteVolumeRequest {
             disk: "invalid-disk-path".to_string(),
             volume: "test-volume".to_string(),
+            force: false,
         });
 
         let response = service.delete_volume(request).await;
@@ -2343,7 +2498,9 @@ mod tests {
     async fn test_stop_rebalance() {
         let service = create_test_node_service();
 
-        let request = Request::new(StopRebalanceRequest {});
+        let request = Request::new(StopRebalanceRequest {
+            expected_rebalance_id: String::new(),
+        });
 
         let response = service.stop_rebalance(request).await;
         assert!(response.is_ok());
@@ -2378,12 +2535,27 @@ mod tests {
 
     #[test]
     fn test_background_rebalance_start_error_message_formats_error() {
-        let message =
-            background_rebalance_start_error_message(Err(crate::storage::storage_compat::ecstore::error::Error::other("boom")))
-                .expect("background rebalance start failure should be formatted");
+        let message = background_rebalance_start_error_message(Err(Error::other("boom")))
+            .expect("background rebalance start failure should be formatted");
 
         assert!(message.contains("start_rebalance failed"));
         assert!(message.contains("boom"));
+    }
+
+    #[test]
+    fn test_stop_rebalance_response_reports_local_stop_error() {
+        let response = stop_rebalance_response(Err(Error::other("boom")));
+
+        assert!(!response.success);
+        assert!(response.error_info.as_deref().is_some_and(|message| message.contains("boom")));
+    }
+
+    #[test]
+    fn test_stop_rebalance_response_reports_success() {
+        let response = stop_rebalance_response(Ok(()));
+
+        assert!(response.success);
+        assert!(response.error_info.is_none());
     }
 
     #[tokio::test]
@@ -2436,18 +2608,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_bucket_metadata() {
+    async fn test_delete_bucket_metadata_empty_bucket() {
         let service = create_test_node_service();
 
-        let request = Request::new(DeleteBucketMetadataRequest {
-            bucket: "test-bucket".to_string(),
-        });
+        let request = Request::new(DeleteBucketMetadataRequest { bucket: String::new() });
 
         let response = service.delete_bucket_metadata(request).await;
         assert!(response.is_ok());
 
+        // An empty bucket name is rejected before touching the metadata system.
         let delete_response = response.unwrap().into_inner();
-        assert!(delete_response.success); // Currently returns success (todo implementation)
+        assert!(!delete_response.success);
+        assert!(delete_response.error_info.unwrap().contains("bucket name is missing"));
     }
 
     #[tokio::test]
@@ -2708,10 +2880,7 @@ mod tests {
 
         let mut vars = HashMap::new();
         vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
-        vars.insert(
-            PEER_RESTSUB_SYS.to_string(),
-            crate::storage::storage_compat::ecstore::config::com::STORAGE_CLASS_SUB_SYS.to_string(),
-        );
+        vars.insert(PEER_RESTSUB_SYS.to_string(), STORAGE_CLASS_SUB_SYS.to_string());
 
         let request = Request::new(SignalServiceRequest {
             vars: Some(Mss { value: vars }),
@@ -2789,9 +2958,13 @@ mod tests {
         );
     }
 
-    async fn connect_test_node_service_client() -> NodeServiceClient<tonic::transport::Channel> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn connect_test_node_service_client() -> Option<NodeServiceClient<tonic::transport::Channel>> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         let service = create_test_node_service();
 
         tokio::spawn(async move {
@@ -2802,12 +2975,18 @@ mod tests {
                 .unwrap();
         });
 
-        NodeServiceClient::connect(format!("http://{addr}")).await.unwrap()
+        Some(
+            NodeServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("node service test client should connect"),
+        )
     }
 
     #[tokio::test]
     async fn test_write_stream_unimplemented() {
-        let mut client = connect_test_node_service_client().await;
+        let Some(mut client) = connect_test_node_service_client().await else {
+            return;
+        };
         let request = tokio_stream::iter([WriteRequest::default()]);
 
         let response = client.write_stream(request).await;
@@ -2819,7 +2998,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_at_unimplemented() {
-        let mut client = connect_test_node_service_client().await;
+        let Some(mut client) = connect_test_node_service_client().await else {
+            return;
+        };
         let request = tokio_stream::iter([ReadAtRequest::default()]);
 
         let response = client.read_at(request).await;

@@ -33,9 +33,11 @@ on:
       - ".github/workflows/build.yml"
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
-      - ".github/workflows/performance.yml"
   pull_request:
+    types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
+    # Keep this list in sync with the `paths` list in ci-docs-only.yml, which
+    # reports the required "Test and Lint" check for PRs skipped here.
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -52,7 +54,6 @@ on:
       - ".github/workflows/build.yml"
       - ".github/workflows/docker.yml"
       - ".github/workflows/audit.yml"
-      - ".github/workflows/performance.yml"
   merge_group:
     types: [ checks_requested ]
   schedule:
@@ -62,70 +63,55 @@ on:
 permissions:
   contents: read
 
+# Concurrency groups are scoped per event so different triggers never cancel
+# each other: PR pushes cancel the previous run of that PR, main pushes keep
+# latest-wins semantics among themselves, and scheduled runs always complete
+# (a shared group used to let every merge kill the weekly scheduled run).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CARGO_BUILD_JOBS: 2
 
 jobs:
 
-  skip-check:
-    name: Skip Duplicate Actions
-    permissions:
-      actions: write
-      contents: read
+  cancel-closed-pr-runs:
+    name: Cancel Closed PR Runs
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
-    outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
     steps:
-      - name: Skip duplicate actions
-        id: skip_check
-        uses: fkirc/skip-duplicate-actions@v5
-        with:
-          concurrent_skipping: "same_content_newer"
-          cancel_others: true
-          paths_ignore: '["*.md", "docs/**", "deploy/**"]'
-          do_not_skip: '["workflow_dispatch", "schedule", "merge_group", "release", "push"]'
+      - name: Explain cancellation run
+        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
 
   typos:
     name: Typos
-    needs: skip-check
-    if: needs.skip-check.outputs.should_skip != 'true'
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Typos check with custom config file
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89 # master
 
-  test-and-lint:
-    name: Test and Lint
-    needs: skip-check
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
-    timeout-minutes: 60
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # Fast, compile-free checks that fail early so contributors get feedback in
+  # ~1 minute instead of waiting for the full test job.
+  quick-checks:
+    name: Quick Checks
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          rust-version: stable
-          cache-shared-key: ci-test-${{ hashFiles('**/Cargo.lock') }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Run tests
-        run: |
-          cargo nextest run --all --exclude e2e_test
-          cargo test --all --doc
+          components: rustfmt
 
       - name: Check code formatting
         run: cargo fmt --all --check
@@ -133,70 +119,139 @@ jobs:
       - name: Check unsafe code allowances
         run: ./scripts/check_unsafe_code_allowances.sh
 
-      - name: Run clippy lints
-        run: cargo clippy --all-targets -- -D warnings
-
       - name: Check layered dependencies
         run: ./scripts/check_layer_dependencies.sh
 
       - name: Check architecture migration rules
         run: ./scripts/check_architecture_migration_rules.sh
 
-  test-and-lint-rio-v2:
-    name: Test and Lint (rio-v2)
-    needs: skip-check
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+      - name: Check tokio io-uring feature guard
+        run: ./scripts/check_no_tokio_io_uring.sh
+
+  test-and-lint:
+    name: Test and Lint
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: sm-standard-4
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-test-rio-v2-${{ hashFiles('**/Cargo.lock') }}
+          cache-shared-key: ci-test
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Clippy runs before the test pass: lint failures are the most common
+      # CI-only breakage and should surface in minutes, not after 20+ minutes
+      # of tests.
+      - name: Run clippy lints
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: |
+          cargo nextest run --all --exclude e2e_test
+          cargo test --all --doc
+
+      # Explicit gate for migration-critical suites. These tests already ran in
+      # the full nextest pass above; a single filtered nextest invocation keeps
+      # the named gate without rebuilding or re-running them one package at a time.
+      - name: Run rebalance/decommission migration proofs
+        run: |
+          cargo nextest run -p rustfs-ecstore --lib \
+            -E 'test(data_movement) or test(rebalance) or test(decommission) or test(source_cleanup) or test(delete_marker)'
+
+  test-and-lint-rio-v2:
+    name: Test and Lint (rio-v2)
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-test-rio-v2
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run rio-v2 clippy lints
+        run: cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings
 
       - name: Run rio-v2 feature tests
         run: |
           cargo nextest run -p rustfs -p rustfs-ecstore --features rio-v2
           cargo test -p rustfs --doc --features rio-v2
 
-      - name: Run rio-v2 clippy lints
-        run: cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings
-
-  build-rustfs-debug-binary:
-    name: Build RustFS Debug Binary
-    needs: skip-check
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
-    timeout-minutes: 30
+  test-and-lint-protocols:
+    name: "Test and Lint (${{ matrix.features.name }})"
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - name: swift
+            flags: "--features swift"
+          - name: sftp
+            flags: "--features sftp"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-rustfs-debug-binary-${{ hashFiles('**/Cargo.lock') }}
+          cache-shared-key: ci-test-${{ matrix.features.name }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run clippy with ${{ matrix.features.name }}
+        run: |
+          cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
+
+      - name: Run tests with ${{ matrix.features.name }}
+        run: |
+          cargo nextest run -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
+
+  build-rustfs-debug-binary:
+    name: Build RustFS Debug Binary
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: sm-standard-4
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-rustfs-debug-binary
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build debug binary
-        run: |
-          touch rustfs/build.rs
-          cargo build -p rustfs --bins --jobs 2
+        run: cargo build -p rustfs --bins
 
       - name: Upload debug binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary
           path: target/debug/rustfs
@@ -205,31 +260,28 @@ jobs:
 
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
-    needs: skip-check
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: sm-standard-4
     timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
           rust-version: stable
-          cache-shared-key: ci-rustfs-debug-binary-rio-v2-${{ hashFiles('**/Cargo.lock') }}
+          cache-shared-key: ci-rustfs-debug-binary-rio-v2
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build debug binary with rio-v2
-        run: |
-          touch rustfs/build.rs
-          cargo build -p rustfs --bins --features rio-v2 --jobs 2
+        run: cargo build -p rustfs --bins --features rio-v2
 
       - name: Upload debug binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary-rio-v2
           path: target/debug/rustfs
@@ -238,16 +290,28 @@ jobs:
 
   e2e-tests:
     name: End-to-End Tests
-    needs: [ skip-check, build-rustfs-debug-binary ]
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-2
+    needs: [ build-rustfs-debug-binary ]
+    runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
+      # Full setup with dependency caching: the migration-proof step below
+      # compiles the e2e_test crate, which pulls in most of the workspace.
+      # Without a restored cache this was a cold multi-GB build on every run.
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-e2e
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Download after the cache restore so the freshly built binary from the
+      # build job always wins over anything restored into target/debug.
       - name: Download debug binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: rustfs-debug-binary
           path: target/debug
@@ -255,11 +319,11 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
-      - name: Setup Rust toolchain for s3s-e2e installation
-        uses: dtolnay/rust-toolchain@stable
+      - name: Run delete-marker migration proof
+        run: cargo test -p e2e_test delete_marker_migration_semantics -- --nocapture --test-threads=1
 
       - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
@@ -277,7 +341,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: e2e-test-logs-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-e2e-*/rustfs.log
@@ -285,13 +349,12 @@ jobs:
 
   e2e-tests-rio-v2:
     name: End-to-End Tests (rio-v2)
-    needs: [ skip-check, build-rustfs-debug-binary-rio-v2 ]
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-2
+    needs: [ build-rustfs-debug-binary-rio-v2 ]
+    runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Clean up previous test run
         run: |
@@ -299,7 +362,7 @@ jobs:
           rm -f /tmp/rustfs.log
 
       - name: Download debug binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: rustfs-debug-binary-rio-v2
           path: target/debug
@@ -308,10 +371,10 @@ jobs:
         run: chmod +x ./target/debug/rustfs
 
       - name: Setup Rust toolchain for s3s-e2e installation
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
@@ -324,7 +387,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: e2e-test-logs-rio-v2-${{ github.run_number }}
           path: /tmp/rustfs.log
@@ -332,16 +395,15 @@ jobs:
 
   s3-implemented-tests:
     name: S3 Implemented Tests
-    needs: [ skip-check, build-rustfs-debug-binary, e2e-tests ]
-    if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    needs: [ build-rustfs-debug-binary, e2e-tests ]
+    runs-on: sm-standard-4
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Download debug binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: rustfs-debug-binary
           path: target/debug
@@ -357,7 +419,8 @@ jobs:
           DEPLOY_MODE=binary \
           RUSTFS_BINARY=./target/debug/rustfs \
           TEST_MODE=single \
-          MAXFAIL=1 \
+          MAXFAIL=0 \
+          XDIST=4 \
           S3_PORT="${S3_PORT}" \
           DATA_ROOT="${RUN_ROOT}" \
           S3TESTS_CONF=artifacts/s3tests-single/s3tests.conf \
@@ -365,7 +428,7 @@ jobs:
 
       - name: Upload s3 test artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: s3tests-implemented-${{ github.run_number }}
           path: artifacts/s3tests-single/**

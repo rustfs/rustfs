@@ -15,6 +15,7 @@
 use super::iam_error::iam_error_to_s3_error;
 use crate::admin::access_key_identity;
 use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
+use crate::admin::runtime_sources::current_action_credentials;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -26,7 +27,7 @@ use http::HeaderMap;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::{Credentials as StoredCredentials, get_global_action_cred};
+use rustfs_credentials::Credentials as StoredCredentials;
 use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
 use rustfs_iam::store::Store as IamStore;
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
@@ -105,6 +106,20 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
     };
 
     caller_parent == target_parent_user
+}
+
+/// Fail-closed ownership check used by DeleteServiceAccount for a caller that
+/// lacks the RemoveServiceAccount admin action.
+///
+/// Returns `true` only when the target service account was successfully loaded
+/// AND is owned by the caller. A `None` target — meaning `get_service_account`
+/// failed with a non-not-found error (e.g. a stored-credential decode error) so
+/// ownership could not be verified — denies, as does an owner mismatch. The
+/// previous `svc_account.is_some_and(|v| v.parent_user != user)` form returned
+/// `false` for a `None` target and thus fell through to the delete, an authz
+/// bypass (backlog#806).
+fn non_admin_may_delete_service_account(caller_user: &str, target_parent_user: Option<&str>) -> bool {
+    matches!(target_parent_user, Some(parent) if parent == caller_user)
 }
 
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
@@ -267,7 +282,7 @@ impl Operation for AddServiceAccount {
             None
         };
 
-        let Some(sys_cred) = get_global_action_cred() else {
+        let Some(sys_cred) = current_action_credentials() else {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
 
@@ -291,7 +306,7 @@ impl Operation for AddServiceAccount {
             req_is_derived_cred = true;
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -440,7 +455,7 @@ impl Operation for AddServiceAccount {
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -512,7 +527,7 @@ impl Operation for UpdateServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -615,8 +630,8 @@ impl Operation for UpdateServiceAccount {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::NO_CONTENT, Body::empty()), header))
     }
 }
@@ -641,7 +656,7 @@ impl Operation for InfoServiceAccount {
 
         let access_key = query.access_key;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -687,7 +702,7 @@ impl Operation for InfoServiceAccount {
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -718,7 +733,7 @@ impl Operation for TemporaryAccountInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -755,7 +770,7 @@ impl Operation for TemporaryAccountInfo {
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -788,7 +803,7 @@ impl Operation for InfoAccessKey {
             query.access_key
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -853,7 +868,7 @@ impl Operation for InfoAccessKey {
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -911,7 +926,7 @@ impl Operation for ListServiceAccount {
         //     cred.parent_user
         // };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -979,7 +994,7 @@ impl Operation for ListServiceAccount {
         let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -1048,7 +1063,7 @@ impl Operation for ListAccessKeysBulk {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -1120,7 +1135,7 @@ impl Operation for ListAccessKeysBulk {
                 .into_keys()
                 .collect::<Vec<_>>();
 
-            if let Some(sys_cred) = get_global_action_cred() {
+            if let Some(sys_cred) = current_action_credentials() {
                 users.push(sys_cred.access_key);
             }
             users
@@ -1208,7 +1223,7 @@ impl Operation for ListAccessKeysBulk {
         let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -1251,7 +1266,7 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -1287,12 +1302,20 @@ impl Operation for DeleteServiceAccount {
             .await
         {
             let user = if cred.parent_user.is_empty() {
-                &cred.access_key
+                cred.access_key.as_str()
             } else {
-                &cred.parent_user
+                cred.parent_user.as_str()
             };
 
-            if svc_account.is_some_and(|v| &v.parent_user != user) {
+            // Fail closed: a caller without the RemoveServiceAccount admin action
+            // may only delete a service account it OWNS. If the target could not be
+            // loaded (svc_account is None because get_service_account failed with a
+            // non-not-found error — e.g. a credential decode error), ownership cannot
+            // be verified, so deny rather than fall through to the delete. The
+            // previous `is_some_and(parent != user)` form skipped the guard on a
+            // None target, an authz bypass (backlog#806).
+            let target_parent = svc_account.as_ref().map(|v| v.parent_user.as_str());
+            if !non_admin_may_delete_service_account(user, target_parent) {
                 return Err(s3_error!(InvalidRequest, "service account not exist"));
             }
         }
@@ -1338,8 +1361,8 @@ impl Operation for DeleteServiceAccount {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers(
             (delete_service_account_success_status(req.uri.path()), Body::empty()),
             header,
@@ -1358,6 +1381,26 @@ mod tests {
     fn access_key_query_supports_external_alias() {
         let query: AccessKeyQuery = from_bytes(b"access-key=test-access-key").expect("parse query");
         assert_eq!(query.access_key, "test-access-key");
+    }
+
+    #[test]
+    fn non_admin_delete_is_fail_closed_on_unloadable_target() {
+        // Regression (backlog#806): a non-admin caller may delete ONLY a service
+        // account it owns; a None target (get_service_account failed to load /
+        // decode) must DENY, not fall through to the delete.
+        assert!(
+            non_admin_may_delete_service_account("alice", Some("alice")),
+            "owner may delete own service account"
+        );
+        assert!(!non_admin_may_delete_service_account("alice", Some("bob")), "non-owner must be denied");
+        assert!(
+            !non_admin_may_delete_service_account("alice", None),
+            "unloadable target (None) must be denied (fail-closed), not bypass the owner check"
+        );
+        assert!(
+            !non_admin_may_delete_service_account("", None),
+            "empty caller + unloadable target must still deny"
+        );
     }
 
     #[test]

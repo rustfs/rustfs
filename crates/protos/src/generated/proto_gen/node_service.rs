@@ -349,6 +349,8 @@ pub struct RenameDataRequest {
     pub dst_volume: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub dst_path: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub file_info_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RenameDataResponse {
@@ -358,6 +360,8 @@ pub struct RenameDataResponse {
     pub rename_data_resp: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub rename_data_resp_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MakeVolumesRequest {
@@ -527,6 +531,26 @@ pub struct ReadVersionResponse {
     pub file_info_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchReadVersionRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub batch_read_version_req: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub batch_read_version_req_bin: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchReadVersionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, repeated, tag = "2")]
+    pub batch_read_version_resps: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", repeated, tag = "4")]
+    pub batch_read_version_resps_bin: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadXlRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
@@ -562,6 +586,10 @@ pub struct DeleteVersionRequest {
     pub force_del_marker: bool,
     #[prost(string, tag = "6")]
     pub opts: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub file_info_bin: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "8")]
+    pub opts_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteVersionResponse {
@@ -582,6 +610,10 @@ pub struct DeleteVersionsRequest {
     pub versions: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "4")]
     pub opts: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", repeated, tag = "5")]
+    pub versions_bin: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub opts_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteVersionsResponse {
@@ -618,6 +650,8 @@ pub struct DeleteVolumeRequest {
     pub disk: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub volume: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub force: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteVolumeResponse {
@@ -1080,8 +1114,11 @@ pub struct ReloadPoolMetaResponse {
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct StopRebalanceRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StopRebalanceRequest {
+    #[prost(string, tag = "1")]
+    pub expected_rebalance_id: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopRebalanceResponse {
     #[prost(bool, tag = "1")]
@@ -1096,6 +1133,42 @@ pub struct LoadRebalanceMetaRequest {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadRebalanceMetaResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StartDecommissionRequest {
+    #[prost(uint32, repeated, tag = "1")]
+    pub pool_indices: ::prost::alloc::vec::Vec<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StartDecommissionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CancelDecommissionRequest {
+    #[prost(uint32, tag = "1")]
+    pub pool_index: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CancelDecommissionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearDecommissionRequest {
+    #[prost(uint32, tag = "1")]
+    pub pool_index: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearDecommissionResponse {
     #[prost(bool, tag = "1")]
     pub success: bool,
     #[prost(string, optional, tag = "2")]
@@ -1644,6 +1717,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "ReadVersion"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn batch_read_version(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BatchReadVersionRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchReadVersionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/BatchReadVersion");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "BatchReadVersion"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn read_xl(
@@ -2353,6 +2441,51 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "LoadRebalanceMeta"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn start_decommission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StartDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::StartDecommissionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/StartDecommission");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "StartDecommission"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn cancel_decommission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CancelDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::CancelDecommissionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/CancelDecommission");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "CancelDecommission"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn clear_decommission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ClearDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::ClearDecommissionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ClearDecommission");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ClearDecommission"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn load_transition_tier_config(
             &mut self,
             request: impl tonic::IntoRequest<super::LoadTransitionTierConfigRequest>,
@@ -2522,6 +2655,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ReadVersionRequest>,
         ) -> std::result::Result<tonic::Response<super::ReadVersionResponse>, tonic::Status>;
+        async fn batch_read_version(
+            &self,
+            request: tonic::Request<super::BatchReadVersionRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchReadVersionResponse>, tonic::Status>;
         async fn read_xl(
             &self,
             request: tonic::Request<super::ReadXlRequest>,
@@ -2712,6 +2849,18 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::LoadRebalanceMetaRequest>,
         ) -> std::result::Result<tonic::Response<super::LoadRebalanceMetaResponse>, tonic::Status>;
+        async fn start_decommission(
+            &self,
+            request: tonic::Request<super::StartDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::StartDecommissionResponse>, tonic::Status>;
+        async fn cancel_decommission(
+            &self,
+            request: tonic::Request<super::CancelDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::CancelDecommissionResponse>, tonic::Status>;
+        async fn clear_decommission(
+            &self,
+            request: tonic::Request<super::ClearDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::ClearDecommissionResponse>, tonic::Status>;
         async fn load_transition_tier_config(
             &self,
             request: tonic::Request<super::LoadTransitionTierConfigRequest>,
@@ -3597,6 +3746,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReadVersionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/BatchReadVersion" => {
+                    #[allow(non_camel_case_types)]
+                    struct BatchReadVersionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::BatchReadVersionRequest> for BatchReadVersionSvc<T> {
+                        type Response = super::BatchReadVersionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::BatchReadVersionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::batch_read_version(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BatchReadVersionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
@@ -4915,6 +5092,90 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = LoadRebalanceMetaSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/StartDecommission" => {
+                    #[allow(non_camel_case_types)]
+                    struct StartDecommissionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::StartDecommissionRequest> for StartDecommissionSvc<T> {
+                        type Response = super::StartDecommissionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::StartDecommissionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::start_decommission(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StartDecommissionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/CancelDecommission" => {
+                    #[allow(non_camel_case_types)]
+                    struct CancelDecommissionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::CancelDecommissionRequest> for CancelDecommissionSvc<T> {
+                        type Response = super::CancelDecommissionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::CancelDecommissionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::cancel_decommission(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CancelDecommissionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ClearDecommission" => {
+                    #[allow(non_camel_case_types)]
+                    struct ClearDecommissionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ClearDecommissionRequest> for ClearDecommissionSvc<T> {
+                        type Response = super::ClearDecommissionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ClearDecommissionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::clear_decommission(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ClearDecommissionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

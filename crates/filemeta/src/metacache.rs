@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::filemeta::msgp_decode::MAX_MSGP_ELEMENT_SIZE;
 use crate::{
     Error, FileInfo, FileInfoOpts, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, get_file_info,
-    merge_file_meta_versions,
+    merge_file_meta_versions, merge_file_meta_versions_with_write_quorum,
 };
 use arc_swap::ArcSwapOption;
 use rmp::Marker;
@@ -188,7 +189,9 @@ impl MetaCacheEntry {
 
         let mut fm = FileMeta::new();
         fm.unmarshal_msg(&self.metadata)?;
-        fm.into_file_info_versions(bucket, self.name.as_str(), false)
+        let mut versions = fm.get_file_info_versions(bucket, self.name.as_str(), false)?;
+        versions.free_versions.clear();
+        Ok(versions)
     }
 
     pub fn file_info_versions_with_free_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
@@ -332,7 +335,41 @@ impl MetaCacheEntries {
         &self.0
     }
 
-    pub fn resolve(&self, mut params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
+    pub fn resolve(&self, params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
+        self.resolve_inner(params, false)
+    }
+
+    pub fn resolve_with_write_quorum(&self, params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
+        self.resolve_inner(params, true)
+    }
+
+    /// Resolve the cross-disk UNION of every version present on ANY disk slot.
+    ///
+    /// This mirrors MinIO's global heal enumeration (cmd/global-heal.go
+    /// `healErasureSet` -> `listPathRaw` with `objQuorum = 1` feeding
+    /// `mergeEntries`/`mergeXLV2Versions`): at quorum 1 the merge is forced
+    /// strict and returns the union of all per-disk version streams, so a version
+    /// that survives on FEWER than read-quorum disks is still surfaced for
+    /// healing. Read-quorum resolution (`resolve` with `obj_quorum >= 2`) would
+    /// silently drop such a sub-quorum version, which is exactly the durability
+    /// gap this enumerator closes (backlog#920).
+    ///
+    /// `bucket` is only used to tag the merged entry; `strict:false` lets the
+    /// non-strict header reconciliation collapse equal-but-differently-signed
+    /// replicas of the SAME version id while still retaining genuinely distinct
+    /// version ids.
+    pub fn resolve_union(&self, bucket: &str) -> Option<MetaCacheEntry> {
+        self.resolve(MetadataResolutionParams {
+            dir_quorum: 1,
+            obj_quorum: 1,
+            requested_versions: 0,
+            bucket: bucket.to_string(),
+            strict: false,
+            candidates: Vec::new(),
+        })
+    }
+
+    fn resolve_inner(&self, mut params: MetadataResolutionParams, enforce_write_quorum: bool) -> Option<MetaCacheEntry> {
         if self.0.is_empty() {
             debug!(
                 bucket = %params.bucket,
@@ -410,7 +447,7 @@ impl MetaCacheEntries {
             return Some(selected);
         }
 
-        // If we would never be able to reach read quorum.
+        // If we would never be able to reach the required object quorum.
         if objs_valid < params.obj_quorum {
             debug!(
                 objs_valid,
@@ -421,13 +458,26 @@ impl MetaCacheEntries {
         }
 
         if objs_agree == objs_valid {
-            debug!(
-                selected = %selected.name,
-                objs_agree,
-                objs_valid,
-                "metacache resolve reused selected candidate because all valid object entries agreed"
-            );
-            return Some(selected);
+            let required_quorum = if enforce_write_quorum {
+                selected
+                    .cached
+                    .as_ref()
+                    .and_then(|cached| cached.versions.first())
+                    .map(|version| version.write_quorum(params.obj_quorum).max(params.obj_quorum))
+                    .unwrap_or(params.obj_quorum)
+            } else {
+                params.obj_quorum
+            };
+
+            if objs_agree >= required_quorum {
+                debug!(
+                    selected = %selected.name,
+                    objs_agree,
+                    objs_valid,
+                    "metacache resolve reused selected candidate because all valid object entries agreed"
+                );
+                return Some(selected);
+            }
         }
 
         let Some(cached) = selected.cached else {
@@ -435,7 +485,16 @@ impl MetaCacheEntries {
             return None;
         };
 
-        let versions = merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates);
+        let versions = if enforce_write_quorum {
+            merge_file_meta_versions_with_write_quorum(
+                params.obj_quorum,
+                params.strict,
+                params.requested_versions,
+                &params.candidates,
+            )
+        } else {
+            merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates)
+        };
         if versions.is_empty() {
             debug!(
                 selected = %selected.name,
@@ -606,25 +665,36 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
     }
 
     pub async fn read_more(&mut self, read_size: usize) -> Result<&[u8]> {
-        let ext_size = read_size + self.offset;
-
-        let extra = ext_size - self.offset;
-        if self.buf.capacity() >= ext_size {
-            // Extend the buffer if we have enough space.
-            self.buf.resize(ext_size, 0);
-        } else {
-            self.buf.extend(vec![0u8; extra]);
+        // `read_size` is usually a length decoded from the stream itself, so
+        // it is untrusted: a corrupted length prefix must yield a decode
+        // error instead of a huge allocation that aborts the process
+        // (see rustfs/rustfs#2715).
+        if read_size > MAX_MSGP_ELEMENT_SIZE {
+            let err = Error::other(format!(
+                "metacache stream corrupt: element length {read_size} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
+            ));
+            self.err = Some(err.clone());
+            return Err(err);
         }
 
         let pref = self.offset;
+        let ext_size = pref + read_size;
+
+        if self.buf.len() < ext_size {
+            let extra = ext_size - self.buf.len();
+            if let Err(e) = self.buf.try_reserve(extra) {
+                let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+                self.err = Some(err.clone());
+                return Err(err);
+            }
+            self.buf.resize(ext_size, 0);
+        }
 
         self.rd.read_exact(&mut self.buf[pref..ext_size]).await?;
 
         self.offset += read_size;
 
-        let data = &self.buf[pref..ext_size];
-
-        Ok(data)
+        Ok(&self.buf[pref..ext_size])
     }
 
     fn reset(&mut self) {
@@ -958,6 +1028,74 @@ mod tests {
         assert_eq!(objs, nobjs);
     }
 
+    fn corrupt_stream_with_metadata_len(len_marker: u8, len: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        rmp::encode::write_u8(&mut data, METACACHE_STREAM_VERSION).unwrap();
+        rmp::encode::write_bool(&mut data, true).unwrap();
+        rmp::encode::write_str(&mut data, "object").unwrap();
+        // Hand-written bin/str length prefix claiming an absurd payload size.
+        data.push(len_marker);
+        data.extend_from_slice(&len.to_be_bytes());
+        data
+    }
+
+    /// Regression test for rustfs/rustfs#2715: a corrupted metadata length
+    /// prefix must surface as a decode error instead of attempting a huge
+    /// allocation that aborts the process.
+    #[tokio::test]
+    async fn test_reader_rejects_corrupt_bin_length_prefix() {
+        // 0xc6 = bin32 marker.
+        let data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        let err = r.peek().await.expect_err("corrupt bin length prefix must fail to decode");
+        assert!(err.to_string().contains("exceeds"), "error should mention the exceeded limit, got: {err}");
+
+        // The reader must stay in the error state instead of retrying.
+        assert!(r.peek().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reader_rejects_corrupt_str_length_prefix() {
+        let mut data = Vec::new();
+        rmp::encode::write_u8(&mut data, METACACHE_STREAM_VERSION).unwrap();
+        rmp::encode::write_bool(&mut data, true).unwrap();
+        // 0xdb = str32 marker with an absurd object-name length.
+        data.push(0xdb);
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        let err = r.peek().await.expect_err("corrupt str length prefix must fail to decode");
+        assert!(err.to_string().contains("exceeds"), "error should mention the exceeded limit, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_reader_skip_rejects_corrupt_length_prefix() {
+        let data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        assert!(r.skip(1).await.is_err(), "skip over a corrupt length prefix must fail");
+    }
+
+    /// Large-but-legitimate records (well above typical sizes, below the
+    /// corruption guard) must still round-trip.
+    #[tokio::test]
+    async fn test_reader_accepts_large_legitimate_metadata() {
+        let entry = MetaCacheEntry {
+            name: "big-object".to_string(),
+            metadata: vec![0xab; 4 << 20],
+            cached: None,
+            reusable: false,
+        };
+
+        let mut f = Cursor::new(Vec::new());
+        let mut w = MetacacheWriter::new(&mut f);
+        w.write(std::slice::from_ref(&entry)).await.unwrap();
+        w.close().await.unwrap();
+
+        let mut r = MetacacheReader::new(Cursor::new(f.into_inner()));
+        let decoded = r.read_all().await.unwrap();
+        assert_eq!(decoded, vec![entry]);
+    }
+
     #[test]
     fn file_info_versions_with_free_versions_includes_persisted_tier_cleanup_records() {
         let version_id = Uuid::new_v4();
@@ -1005,6 +1143,70 @@ mod tests {
         assert_eq!(with_free.free_versions[0].transitioned_objname, "remote/object");
         assert_eq!(with_free.free_versions[0].transition_tier, "WARM");
         assert_eq!(with_free.free_versions[0].transition_version_id, Some(remote_version_id));
+    }
+
+    #[test]
+    fn file_info_versions_excludes_free_versions_from_visible_version_count() {
+        let object_version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let delete_marker_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("transitioned object version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should create a free-version record");
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(delete_marker_id),
+            deleted: true,
+            mod_time: Some(base_time + time::Duration::seconds(1)),
+            ..Default::default()
+        })
+        .expect("delete marker should be added");
+
+        let entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: fm.marshal_msg().expect("metadata should marshal"),
+            ..Default::default()
+        };
+
+        let normal = entry.file_info_versions("bucket").expect("normal versions should parse");
+        assert_eq!(normal.versions.len(), 1);
+        assert!(normal.free_versions.is_empty());
+        assert!(normal.versions[0].deleted);
+        assert_eq!(normal.versions[0].num_versions, 1);
+
+        let with_free = entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("versions with free versions should parse");
+        assert_eq!(with_free.versions.len(), 1);
+        assert_eq!(with_free.free_versions.len(), 1);
+        assert_eq!(with_free.versions[0].num_versions, 1);
+        assert_eq!(with_free.free_versions[0].num_versions, 1);
     }
 
     #[test]
@@ -1204,6 +1406,386 @@ mod tests {
         assert_eq!(decoded.versions.len(), base_versions);
         assert_eq!(decoded.versions, cached.versions);
         assert_ne!(extended_versions, cached.versions.len());
+    }
+
+    fn metacache_entry_with_mod_time(mod_time: OffsetDateTime, etag: &str) -> MetaCacheEntry {
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), etag.to_string());
+
+        let mut meta = FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 1,
+            mod_time: Some(mod_time),
+            metadata,
+            ..Default::default()
+        })
+        .expect("test file metadata should accept object version");
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn metacache_entry_with_erasure(
+        mod_time: OffsetDateTime,
+        etag: &str,
+        data_blocks: usize,
+        parity_blocks: usize,
+    ) -> MetaCacheEntry {
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), etag.to_string());
+
+        let mut fi = FileInfo::new("object", data_blocks, parity_blocks);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.size = 1;
+        fi.mod_time = Some(mod_time);
+        fi.metadata = metadata;
+
+        let mut meta = FileMeta::new();
+        meta.add_version(fi).expect("test file metadata should accept object version");
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn metacache_entry_with_erasure_versions(versions: &[(OffsetDateTime, &str, usize, usize)]) -> MetaCacheEntry {
+        let mut meta = FileMeta::new();
+        for (idx, (mod_time, etag, data_blocks, parity_blocks)) in versions.iter().enumerate() {
+            let mut metadata = HashMap::new();
+            metadata.insert("etag".to_string(), (*etag).to_string());
+
+            let mut fi = FileInfo::new("object", *data_blocks, *parity_blocks);
+            fi.volume = "bucket".to_string();
+            fi.name = "object".to_string();
+            let version_idx = u128::try_from(idx + 1).expect("test version index should fit u128");
+            fi.version_id = Some(Uuid::from_u128(version_idx));
+            fi.versioned = true;
+            fi.size = 1;
+            fi.mod_time = Some(*mod_time);
+            fi.metadata = metadata;
+
+            meta.add_version(fi).expect("test file metadata should accept object version");
+        }
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn metacache_entry_without_header_ec(mut entry: MetaCacheEntry) -> MetaCacheEntry {
+        let mut cached = entry.cached.take().expect("test entry should have cached metadata");
+        for version in cached.versions.iter_mut() {
+            version.header.ec_m = 0;
+            version.header.ec_n = 0;
+        }
+        entry.metadata = cached.marshal_msg().expect("test file metadata should marshal");
+        entry.cached = Some(cached);
+        entry
+    }
+
+    fn metacache_dir_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Build an entry holding a single object version with an explicit version id
+    /// and mod_time, so a set of these can model DISJOINT per-disk version sets.
+    fn metacache_entry_single_version(version_u128: u128, mod_time: OffsetDateTime, etag: &str) -> MetaCacheEntry {
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), etag.to_string());
+
+        let mut fi = FileInfo::new("object", 4, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.version_id = Some(Uuid::from_u128(version_u128));
+        fi.versioned = true;
+        fi.size = 1;
+        fi.mod_time = Some(mod_time);
+        fi.metadata = metadata;
+
+        let mut meta = FileMeta::new();
+        meta.add_version(fi).expect("test file metadata should accept object version");
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    /// backlog#920: `resolve_union` surfaces a version present on a SINGLE slot
+    /// among four, while `resolve` at read-quorum (obj_quorum=2) drops it. This
+    /// documents the exact sub-quorum durability gap the disk-walk closes.
+    #[test]
+    fn resolve_union_surfaces_single_disk_version() {
+        let t0 = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let t1 = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+
+        // Slot 0 carries a UNIQUE version (0xBEEF) present nowhere else; the other
+        // three slots agree on a shared version (0xCAFE). Read-quorum sees only
+        // the shared one; union must see BOTH.
+        let unique = metacache_entry_single_version(0xBEEF, t1, "unique-etag");
+        let shared_a = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+        let shared_b = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+        let shared_c = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+
+        let entries = || {
+            MetaCacheEntries(vec![
+                Some(unique.clone()),
+                Some(shared_a.clone()),
+                Some(shared_b.clone()),
+                Some(shared_c.clone()),
+            ])
+        };
+
+        let union = entries().resolve_union("bucket").expect("union must resolve an entry");
+        let union_meta = union.cached.expect("union entry keeps cached metadata");
+        let union_ids: std::collections::HashSet<Option<Uuid>> =
+            union_meta.versions.iter().map(|v| v.header.version_id).collect();
+        assert!(
+            union_ids.contains(&Some(Uuid::from_u128(0xBEEF))),
+            "union must surface the single-slot version: {union_ids:?}"
+        );
+        assert!(
+            union_ids.contains(&Some(Uuid::from_u128(0xCAFE))),
+            "union must also keep the shared version: {union_ids:?}"
+        );
+
+        // Read-quorum resolution (obj_quorum=2) drops the single-slot version.
+        let read_quorum = entries()
+            .resolve(MetadataResolutionParams {
+                obj_quorum: 2,
+                dir_quorum: 2,
+                strict: false,
+                ..Default::default()
+            })
+            .expect("read-quorum must still resolve the shared version");
+        let rq_meta = read_quorum.cached.expect("read-quorum entry keeps cached metadata");
+        let rq_ids: std::collections::HashSet<Option<Uuid>> = rq_meta.versions.iter().map(|v| v.header.version_id).collect();
+        assert!(
+            !rq_ids.contains(&Some(Uuid::from_u128(0xBEEF))),
+            "read-quorum must DROP the single-slot version (the gap): {rq_ids:?}"
+        );
+        assert!(
+            rq_ids.contains(&Some(Uuid::from_u128(0xCAFE))),
+            "read-quorum must keep the shared version: {rq_ids:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_partial_latest_and_returns_committed_previous_metadata() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old_entry = metacache_entry_with_mod_time(old_mod_time, "old-etag");
+        let new_entry = metacache_entry_with_mod_time(new_mod_time, "new-etag");
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_entry.clone()),
+            Some(new_entry),
+            Some(old_entry.clone()),
+            Some(old_entry.clone()),
+            Some(old_entry.clone()),
+            Some(old_entry.clone()),
+            Some(old_entry),
+        ])
+        .resolve(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        })
+        .expect("previous committed metadata should still satisfy write quorum");
+
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(old_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn resolve_rejects_low_parity_partial_latest_below_required_object_quorum() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 7, 1);
+        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 1);
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry),
+            Some(old_entry.clone()),
+            Some(old_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        });
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_rejects_zero_parity_partial_latest_below_required_object_quorum() {
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 0);
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        });
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_accepts_low_parity_latest_at_required_object_quorum() {
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 1);
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        })
+        .expect("latest metadata should resolve after satisfying its own write quorum");
+
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(new_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("new-etag"));
+    }
+
+    #[test]
+    fn resolve_skips_low_parity_partial_latest_and_returns_committed_previous_version() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 4, 4);
+        let new_and_old_entry =
+            metacache_entry_with_erasure_versions(&[(old_mod_time, "old-etag", 4, 4), (new_mod_time, "new-etag", 7, 1)]);
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry),
+            Some(old_entry.clone()),
+            Some(old_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        })
+        .expect("previous committed metadata should resolve after rejecting partial latest");
+
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(old_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn resolve_skips_legacy_header_low_parity_partial_latest_using_payload_quorum() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 4, 4);
+        let new_and_old_entry = metacache_entry_without_header_ec(metacache_entry_with_erasure_versions(&[
+            (old_mod_time, "old-etag", 4, 4),
+            (new_mod_time, "new-etag", 7, 1),
+        ]));
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry),
+            Some(old_entry.clone()),
+            Some(old_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        })
+        .expect("previous committed metadata should resolve after rejecting legacy-header partial latest");
+
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(old_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn resolve_rejects_partial_directory_below_dir_quorum() {
+        let partial_dir = metacache_dir_entry("prefix/");
+
+        let resolved = MetaCacheEntries(vec![Some(partial_dir.clone()), Some(partial_dir)]).resolve(MetadataResolutionParams {
+            dir_quorum: 5,
+            obj_quorum: 5,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        });
+
+        assert!(resolved.is_none());
     }
 
     fn build_hashmap_cache(update_size: usize) -> Arc<Cache<HashMap<usize, usize>>> {
@@ -1516,5 +2098,64 @@ mod tests {
             .expect_err("refresh error should be propagated when return_last_good is false");
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // backlog#900: metacache boundaries live outside the HTTP CatchPanicLayer
+    // (background / listing chains). A corrupt-part xl.meta must yield Err,
+    // not panic, so it cannot poison a worker.
+    // ------------------------------------------------------------------
+
+    fn corrupt_parts_filemeta() -> FileMeta {
+        use crate::{ChecksumAlgo, ErasureAlgo, MetaObject, VersionType};
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(MetaObject {
+                version_id: Some(Uuid::new_v4()),
+                erasure_algorithm: ErasureAlgo::ReedSolomon,
+                erasure_m: 2,
+                erasure_n: 2,
+                erasure_block_size: 1 << 20,
+                bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                part_numbers: vec![1, 2],
+                part_sizes: vec![10], // corrupt: shorter than part_numbers
+                part_actual_sizes: vec![10, 20],
+                mod_time: Some(time::OffsetDateTime::now_utc()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("add version");
+        // Round-trip once so the corrupt array survives exactly like on disk.
+        FileMeta::load(&fm.marshal_msg().expect("marshal")).expect("load")
+    }
+
+    #[test]
+    fn metacache_to_fileinfo_returns_err_not_panic_on_corrupt_parts() {
+        let entry = MetaCacheEntry {
+            name: "obj".to_string(),
+            metadata: Vec::new(),
+            cached: Some(corrupt_parts_filemeta()),
+            reusable: false,
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.to_fileinfo("bucket")));
+        let inner = caught.expect("to_fileinfo must not panic");
+        assert!(matches!(inner, Err(Error::FileCorrupt)), "expected FileCorrupt from metacache boundary");
+    }
+
+    #[test]
+    fn metacache_file_info_versions_returns_err_not_panic_on_corrupt_parts() {
+        // file_info_versions reads self.metadata (not cached), so fill marshaled bytes.
+        let bytes = corrupt_parts_filemeta().marshal_msg().expect("marshal");
+        let entry = MetaCacheEntry {
+            name: "obj".to_string(),
+            metadata: bytes,
+            cached: None,
+            reusable: false,
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.file_info_versions("bucket")));
+        let inner = caught.expect("file_info_versions must not panic");
+        assert!(matches!(inner, Err(Error::FileCorrupt)), "expected FileCorrupt");
     }
 }

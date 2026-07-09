@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    any::type_name,
     collections::BTreeSet,
     collections::HashSet,
     env,
@@ -264,7 +265,15 @@ fn parse_env_value<T>(key: &str) -> Option<T>
 where
     T: std::str::FromStr,
 {
-    resolve_env_with_aliases(key, &[]).and_then(|(_, value)| value.parse().ok())
+    let (used_key, value) = resolve_env_with_aliases(key, &[])?;
+    value
+        .parse::<T>()
+        .map_err(|_| {
+            log_once(&format!("env_invalid_value:{used_key}"), || {
+                format!("Invalid {} value for {used_key}: {value}. Treating as unset.", type_name::<T>())
+            });
+        })
+        .ok()
 }
 
 pub fn get_env_str_with_aliases(key: &str, deprecated: &[&str], default: &str) -> String {
@@ -681,8 +690,8 @@ pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_bool_with_aliases,
-        get_env_i32_with_aliases, get_env_str,
+        apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_bool_with_aliases, get_env_f64,
+        get_env_i32_with_aliases, get_env_opt_f64, get_env_opt_u64, get_env_str, get_env_u64,
     };
 
     fn source_key(suffix: &str) -> String {
@@ -803,6 +812,22 @@ mod tests {
             temp_env::with_var("RUSTFS_TEST_I32_LEGACY", Some("not-an-i32"), || {
                 assert_eq!(get_env_i32_with_aliases("RUSTFS_TEST_I32", &["RUSTFS_TEST_I32_LEGACY"], 8), 8);
             });
+        });
+    }
+
+    #[test]
+    fn invalid_u64_value_falls_back_to_default_and_optional_none() {
+        temp_env::with_var("RUSTFS_TEST_U64", Some("not-a-u64"), || {
+            assert_eq!(get_env_u64("RUSTFS_TEST_U64", 42), 42);
+            assert_eq!(get_env_opt_u64("RUSTFS_TEST_U64"), None);
+        });
+    }
+
+    #[test]
+    fn invalid_f64_value_falls_back_to_default_and_optional_none() {
+        temp_env::with_var("RUSTFS_TEST_F64", Some("not-a-f64"), || {
+            assert_eq!(get_env_f64("RUSTFS_TEST_F64", 0.25), 0.25);
+            assert_eq!(get_env_opt_f64("RUSTFS_TEST_F64"), None);
         });
     }
 

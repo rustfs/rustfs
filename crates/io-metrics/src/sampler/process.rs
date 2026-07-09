@@ -15,21 +15,43 @@
 use std::sync::{Mutex, OnceLock};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
-static PROCESS_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+static PROCESS_SAMPLER: OnceLock<Mutex<ProcessSampler>> = OnceLock::new();
 
 #[inline]
 fn current_pid() -> Pid {
     Pid::from_u32(std::process::id())
 }
 
-#[inline]
-fn process_system() -> &'static Mutex<System> {
-    PROCESS_SYSTEM.get_or_init(|| {
+#[derive(Debug)]
+pub struct ProcessSampler {
+    pid: Pid,
+    sys: System,
+}
+
+impl Default for ProcessSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessSampler {
+    #[inline]
+    pub fn new() -> Self {
         let pid = current_pid();
-        let mut system = System::new();
-        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
-        Mutex::new(system)
-    })
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
+        Self { pid, sys }
+    }
+
+    #[inline]
+    pub fn snapshot_resource_and_system(&mut self) -> (ProcessResourceSnapshot, ProcessSystemSnapshot) {
+        snapshot_process_resource_and_system_with(self)
+    }
+}
+
+#[inline]
+fn process_sampler() -> &'static Mutex<ProcessSampler> {
+    PROCESS_SAMPLER.get_or_init(|| Mutex::new(ProcessSampler::new()))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -99,13 +121,21 @@ pub fn snapshot_process_system() -> ProcessSystemSnapshot {
 /// Collect both resource and system snapshots in one sysinfo refresh.
 #[inline]
 pub fn snapshot_process_resource_and_system() -> (ProcessResourceSnapshot, ProcessSystemSnapshot) {
+    let mut sampler = process_sampler().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    snapshot_process_resource_and_system_with(&mut sampler)
+}
+
+#[inline]
+pub fn snapshot_process_resource_and_system_with(
+    sampler: &mut ProcessSampler,
+) -> (ProcessResourceSnapshot, ProcessSystemSnapshot) {
     let platform_stats = crate::snapshot_process_platform_stats();
     let lock_snapshot = crate::snapshot_process_lock_counts();
-    let pid = current_pid();
-    let mut sys = process_system().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
+    sampler
+        .sys
+        .refresh_processes_specifics(ProcessesToUpdate::Some(&[sampler.pid]), true, ProcessRefreshKind::everything());
 
-    if let Some(process) = sys.process(pid) {
+    if let Some(process) = sampler.sys.process(sampler.pid) {
         let disk_usage = process.disk_usage();
         let status = ProcessStatusSnapshot::from(process.status());
         let uptime_seconds = process.run_time();
@@ -162,5 +192,14 @@ mod tests {
         let _ = snapshot_process_resource();
         let _ = snapshot_process_system();
         let _ = snapshot_process_resource_and_system();
+    }
+
+    #[test]
+    fn independent_samplers_are_collectable() {
+        let mut sampler_a = ProcessSampler::new();
+        let mut sampler_b = ProcessSampler::new();
+
+        let _ = snapshot_process_resource_and_system_with(&mut sampler_a);
+        let _ = snapshot_process_resource_and_system_with(&mut sampler_b);
     }
 }

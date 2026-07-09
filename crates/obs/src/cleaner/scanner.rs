@@ -27,6 +27,7 @@
 use super::types::{CompressionAlgorithm, FileInfo, FileMatchMode};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use std::time::SystemTime;
 use tracing::debug;
 
@@ -73,6 +74,14 @@ pub(super) fn scan_log_directory(
     delete_empty_files: bool,
     dry_run: bool,
 ) -> Result<LogScanResult, std::io::Error> {
+    let file_pattern = file_pattern.trim();
+    if file_pattern.is_empty() {
+        return Ok(LogScanResult {
+            logs: Vec::new(),
+            compressed_archives: Vec::new(),
+        });
+    }
+
     let mut logs = Vec::new();
     let mut compressed_archives = Vec::new();
     let now = SystemTime::now();
@@ -137,15 +146,20 @@ pub(super) fn scan_log_directory(
         let matched_suffix = CompressionAlgorithm::compressed_suffixes()
             .into_iter()
             .find(|suffix| filename.ends_with(suffix));
+        let matched_tmp_suffix = compressed_tmp_suffix(filename);
         let is_compressed = matched_suffix.is_some();
+        let is_tmp_archive = matched_tmp_suffix.is_some();
 
         // Perform matching on the logical log filename.
         // Examples:
         // - regular log: `foo.log.1`   -> `foo.log.1`
         // - archive:     `foo.log.1.gz` -> `foo.log.1`
+        // - temp archive:`foo.log.1.gz.tmp` -> `foo.log.1`
         // This allows the same include/exclude pattern configuration to apply
         // to both raw and already-compressed generations.
         let name_to_match = if let Some(suffix) = matched_suffix {
+            &filename[..filename.len() - suffix.len()]
+        } else if let Some(suffix) = matched_tmp_suffix {
             &filename[..filename.len() - suffix.len()]
         } else {
             filename
@@ -167,12 +181,33 @@ pub(super) fn scan_log_directory(
             Ok(t) => t,
             Err(_) => continue, // Skip files where we can't read modification time
         };
+        let age = now.duration_since(modified).ok();
+
+        if is_tmp_archive {
+            if !is_old_enough_for_cleanup(age, min_file_age_seconds) {
+                continue;
+            }
+
+            if !dry_run {
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!(event = EVENT_LOG_CLEANER_SCAN_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, result = "tmp_archive_delete_failed", path = ?path, error = %e, "log cleaner scan state changed");
+                } else {
+                    debug!(event = EVENT_LOG_CLEANER_SCAN_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "tmp_archive_deleted", path = ?path, "log cleaner scan state changed");
+                }
+            } else {
+                tracing::info!(event = EVENT_LOG_CLEANER_SCAN_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_tmp_archive_delete", path = ?path, "log cleaner scan state changed");
+            }
+            continue;
+        }
 
         // 5. Handle zero-byte files (regular logs only).
         // Empty compressed artifacts are left alone here because they belong
         // to the archive-retention path and should not disappear outside that
         // explicit policy.
         if !is_compressed && file_size == 0 && delete_empty_files {
+            if !is_old_enough_for_cleanup(age, min_file_age_seconds) {
+                continue;
+            }
             if !dry_run {
                 if let Err(e) = fs::remove_file(&path) {
                     tracing::warn!(event = EVENT_LOG_CLEANER_SCAN_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, result = "empty_file_delete_failed", path = ?path, error = %e, "log cleaner scan state changed");
@@ -188,10 +223,7 @@ pub(super) fn scan_log_directory(
         // 6. Age gate regular logs only.
         // Compressed files deliberately bypass this check because archive
         // expiry is driven by a dedicated retention horizon in the caller.
-        if !is_compressed
-            && let Ok(age) = now.duration_since(modified)
-            && age.as_secs() < min_file_age_seconds
-        {
+        if !is_compressed && !is_old_enough_for_cleanup(age, min_file_age_seconds) {
             // Too young to be touched.
             continue;
         }
@@ -199,6 +231,7 @@ pub(super) fn scan_log_directory(
         let info = FileInfo {
             path,
             size: file_size,
+            projected_freed_bytes: file_size,
             modified,
         };
 
@@ -218,4 +251,71 @@ pub(super) fn scan_log_directory(
 /// Returns `true` if `filename` matches any of the compiled exclusion patterns.
 pub(super) fn is_excluded(filename: &str, patterns: &[glob::Pattern]) -> bool {
     patterns.iter().any(|p| p.matches(filename))
+}
+
+fn compressed_tmp_suffix(filename: &str) -> Option<&'static str> {
+    [".gz.tmp", ".zst.tmp"].into_iter().find(|suffix| filename.ends_with(suffix))
+}
+
+fn is_old_enough_for_cleanup(age: Option<Duration>, min_file_age_seconds: u64) -> bool {
+    min_file_age_seconds == 0 || age.is_some_and(|age| age.as_secs() >= min_file_age_seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use tempfile::TempDir;
+
+    fn create_empty_file(dir: &Path, name: &str) -> std::io::Result<()> {
+        File::create(dir.join(name)).map(|_| ())
+    }
+
+    #[test]
+    fn empty_pattern_matches_nothing() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path();
+        create_empty_file(dir, "random.log")?;
+
+        let result = scan_log_directory(dir, "", Some("active.log"), FileMatchMode::Suffix, &[], 0, true, false)?;
+
+        assert!(result.logs.is_empty());
+        assert!(result.compressed_archives.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_empty_file_respects_min_file_age() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path();
+        let filename = "2026-07-08.rustfs.log";
+        create_empty_file(dir, filename)?;
+
+        let result = scan_log_directory(dir, ".rustfs.log", Some("active.log"), FileMatchMode::Suffix, &[], 3600, true, false)?;
+
+        assert!(dir.join(filename).exists());
+        assert!(result.logs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_tmp_archive_is_deleted() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path();
+        let filename = "2026-07-08.rustfs.log.gz.tmp";
+        create_empty_file(dir, filename)?;
+
+        let _ = scan_log_directory(dir, ".rustfs.log", Some("active.log"), FileMatchMode::Suffix, &[], 0, true, false)?;
+
+        assert!(!dir.join(filename).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_age_gate_requires_known_old_enough_age() {
+        assert!(!is_old_enough_for_cleanup(Some(Duration::from_secs(0)), 1));
+        assert!(is_old_enough_for_cleanup(Some(Duration::from_secs(1)), 1));
+        assert!(!is_old_enough_for_cleanup(None, 1));
+        assert!(is_old_enough_for_cleanup(None, 0));
+    }
 }

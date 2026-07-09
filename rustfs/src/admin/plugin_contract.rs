@@ -163,24 +163,24 @@ pub(crate) struct PluginInstallationContract {
     pub validation_error: Option<String>,
 }
 
+impl From<rustfs_targets::TargetPluginRevision> for PluginRevisionContract {
+    fn from(value: rustfs_targets::TargetPluginRevision) -> Self {
+        Self {
+            version: value.version,
+            digest_sha256: value.digest_sha256,
+            source: value.source,
+            installed_at: value.installed_at,
+            artifact_id: value.artifact_id,
+        }
+    }
+}
+
 impl From<TargetPluginInstallation> for PluginInstallationContract {
     fn from(value: TargetPluginInstallation) -> Self {
         Self {
             install_state: PluginInstallState::from(value.install_state),
-            current_revision: value.current_revision.map(|revision| PluginRevisionContract {
-                version: revision.version,
-                digest_sha256: revision.digest_sha256,
-                source: revision.source,
-                installed_at: revision.installed_at,
-                artifact_id: revision.artifact_id,
-            }),
-            previous_revision: value.previous_revision.map(|revision| PluginRevisionContract {
-                version: revision.version,
-                digest_sha256: revision.digest_sha256,
-                source: revision.source,
-                installed_at: revision.installed_at,
-                artifact_id: revision.artifact_id,
-            }),
+            current_revision: value.current_revision.map(PluginRevisionContract::from),
+            previous_revision: value.previous_revision.map(PluginRevisionContract::from),
             validation_error: value.validation_error,
         }
     }
@@ -300,6 +300,17 @@ pub(crate) struct PluginCatalogEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PluginCatalogResponse {
     pub plugins: Vec<PluginCatalogEntry>,
+    pub admin_discovery: PluginCatalogAdminDiscovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PluginCatalogAdminDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    pub runtime_capabilities: String,
+    #[serde(rename = "clusterSnapshot")]
+    pub cluster_snapshot: String,
+    #[serde(rename = "extensionsCatalog")]
+    pub extensions_catalog: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -317,7 +328,7 @@ pub(crate) struct PluginInstanceEntry {
     pub config: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operational_state: Option<PluginOperationalStateContract>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_codes: Vec<PluginInstanceDiagnosticCode>,
 }
 
@@ -350,14 +361,14 @@ pub(crate) struct PluginInstanceDiagnosticCount {
 pub(crate) struct PluginInstanceDetail {
     #[serde(flatten)]
     pub instance: PluginInstanceEntry,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<PluginInstanceDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PluginInstancesResponse {
     pub instances: Vec<PluginInstanceEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_counts: Vec<PluginInstanceDiagnosticCount>,
     pub truncated: bool,
     pub next_marker: Option<String>,
@@ -366,13 +377,30 @@ pub(crate) struct PluginInstancesResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginArtifactContract, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
-        PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginInstanceDetail,
-        PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry,
-        PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
+        PluginArtifactContract, PluginCatalogAdminDiscovery, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse,
+        PluginContractDomain, PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract,
+        PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount,
+        PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
+
+    fn sorted_json_value(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(sorted_json_value).collect()),
+            Value::Object(map) => {
+                let mut entries = map.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sorted_json_value(value)))
+                        .collect(),
+                )
+            }
+            value => value,
+        }
+    }
 
     #[test]
     fn plugin_catalog_contract_serializes_stable_json_shape() {
@@ -400,9 +428,15 @@ mod tests {
                 }],
                 installation: None,
             }],
+            admin_discovery: PluginCatalogAdminDiscovery {
+                runtime_capabilities: "/rustfs/admin/v4/runtime/capabilities".to_string(),
+                cluster_snapshot: "/rustfs/admin/v4/cluster/snapshot".to_string(),
+                extensions_catalog: "/rustfs/admin/v4/extensions/catalog".to_string(),
+            },
         };
 
-        let value = serde_json::to_value(response).expect("catalog response should serialize");
+        let value = sorted_json_value(serde_json::to_value(response).expect("catalog response should serialize"));
+        insta::assert_json_snapshot!("plugin_catalog_contract", value);
         assert_eq!(
             value,
             json!({
@@ -427,7 +461,12 @@ mod tests {
                         "subsystem": "notify_webhook",
                         "valid_fields": ["endpoint", "auth_token"]
                     }]
-                }]
+                }],
+                "admin_discovery": {
+                    "runtimeCapabilities": "/rustfs/admin/v4/runtime/capabilities",
+                    "clusterSnapshot": "/rustfs/admin/v4/cluster/snapshot",
+                    "extensionsCatalog": "/rustfs/admin/v4/extensions/catalog"
+                }
             })
         );
     }
@@ -460,7 +499,8 @@ mod tests {
             next_marker: None,
         };
 
-        let value = serde_json::to_value(response).expect("instance response should serialize");
+        let value = sorted_json_value(serde_json::to_value(response).expect("instance response should serialize"));
+        insta::assert_json_snapshot!("plugin_instance_contract", value);
         assert_eq!(
             value,
             json!({
@@ -513,7 +553,8 @@ mod tests {
             }],
         };
 
-        let value = serde_json::to_value(detail).expect("instance detail should serialize");
+        let value = sorted_json_value(serde_json::to_value(detail).expect("instance detail should serialize"));
+        insta::assert_json_snapshot!("plugin_instance_detail_contract", value);
         assert_eq!(
             value,
             json!({
@@ -570,7 +611,8 @@ mod tests {
             installation: None,
         };
 
-        let value = serde_json::to_value(entry).expect("catalog entry should serialize");
+        let value = sorted_json_value(serde_json::to_value(entry).expect("catalog entry should serialize"));
+        insta::assert_json_snapshot!("plugin_catalog_distribution_contract", value);
         assert_eq!(value["distribution"]["artifacts"][0]["artifact_id"], "sidecar-linux-amd64");
         assert_eq!(value["distribution"]["artifacts"][0]["target_triple"], "x86_64-unknown-linux-gnu");
         assert_eq!(

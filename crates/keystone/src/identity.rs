@@ -248,6 +248,7 @@ mod tests {
             None,
             "Default".to_string(),
             true,
+            std::time::Duration::from_secs(30),
         );
         KeystoneIdentityMapper::new(Arc::new(client), true)
     }

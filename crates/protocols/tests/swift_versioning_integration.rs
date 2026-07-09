@@ -109,18 +109,9 @@ fn test_version_timestamp_precision() {
         std::thread::sleep(std::time::Duration::from_micros(10));
     }
 
-    // Check uniqueness - allow some collisions on low-precision systems
+    // Check uniqueness even when the system clock has coarse precision.
     let unique_count = versions.iter().collect::<std::collections::HashSet<_>>().len();
-    let collision_rate = (versions.len() - unique_count) as f64 / versions.len() as f64;
-
-    // Allow up to 10% collision rate on low-precision systems
-    assert!(
-        collision_rate < 0.1,
-        "High collision rate: {} collisions out of {} ({}%)",
-        versions.len() - unique_count,
-        versions.len(),
-        collision_rate * 100.0
-    );
+    assert_eq!(unique_count, versions.len(), "Version names should be unique");
 }
 
 /// Test inverted timestamp calculation
@@ -171,24 +162,10 @@ fn test_version_uniqueness_stress() {
         handle.join().unwrap();
     }
 
-    // Check uniqueness - allow some collisions on low-precision systems
+    // Check uniqueness even when multiple threads generate versions in the same clock tick.
     let versions_vec = versions.lock().unwrap();
     let unique_count = versions_vec.iter().collect::<std::collections::HashSet<_>>().len();
-    let collision_rate = (versions_vec.len() - unique_count) as f64 / versions_vec.len() as f64;
-
-    // Allow up to 15% collision rate on low-precision systems with concurrent generation
-    // This is acceptable because in production:
-    // 1. Versions are generated with more time between them
-    // 2. Swift uses additional mechanisms (UUIDs) to ensure uniqueness
-    // 3. The timestamp is primarily for ordering, not uniqueness
-    // 4. Concurrent generation from multiple threads on low-precision clocks can cause higher collision rates
-    assert!(
-        collision_rate < 0.15,
-        "High collision rate: {} unique out of {} total ({}% collisions)",
-        unique_count,
-        versions_vec.len(),
-        collision_rate * 100.0
-    );
+    assert_eq!(unique_count, versions_vec.len(), "Version names should be unique");
 }
 
 /// Test that archive and restore preserve object path structure
@@ -366,18 +343,9 @@ fn test_version_high_count_performance() {
         duration.as_millis()
     );
 
-    // Check uniqueness - allow some collisions on low-precision systems
+    // Check uniqueness.
     let unique_count = versions.iter().collect::<std::collections::HashSet<_>>().len();
-    let collision_rate = (versions.len() - unique_count) as f64 / versions.len() as f64;
-
-    // Allow up to 5% collision rate
-    assert!(
-        collision_rate < 0.05,
-        "High collision rate: {} collisions out of {} ({}%)",
-        versions.len() - unique_count,
-        versions.len(),
-        collision_rate * 100.0
-    );
+    assert_eq!(unique_count, versions.len(), "Version names should be unique");
 }
 
 /// Test version name format stability

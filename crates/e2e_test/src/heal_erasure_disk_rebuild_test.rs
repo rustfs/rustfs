@@ -16,7 +16,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, execute_awscurl, init_logging};
+    use crate::chaos::signed_admin_post;
+    use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
     use serial_test::serial;
     use std::collections::HashSet;
@@ -292,7 +293,7 @@ mod tests {
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         let heal_url = format!("{}/rustfs/admin/v3/heal/{}?forceStart=true", env.url, bucket);
-        execute_awscurl(&heal_url, "POST", Some(heal_body), &env.access_key, &env.secret_key)
+        signed_admin_post(&heal_url, Some(heal_body), &env.access_key, &env.secret_key)
             .await
             .expect("admin deep heal should be accepted");
 
@@ -332,9 +333,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn test_cluster_admin_heal_rebuilds_replaced_remote_disk() -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn test_cluster_root_heal_rebuilds_replaced_remote_disk() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
-        info!("Admin deep heal should rebuild data on a remote node after its disk is replaced and the node rejoins");
+        info!("Root recursive heal should rebuild data on a remote node after its disk is replaced and the node rejoins");
 
         let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
         cluster.set_env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true");
@@ -383,15 +384,15 @@ mod tests {
         cluster.start_node(1).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
-        let status_body = execute_awscurl(&status_url, "POST", None, &cluster.access_key, &cluster.secret_key).await?;
+        let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
         assert!(
             !status_body.contains("MissingContentLength"),
             "background heal status should not fail without an explicit Content-Length: {status_body}"
         );
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
-        let heal_url = format!("{}/rustfs/admin/v3/heal/{}?forceStart=true", cluster.nodes[0].url, bucket);
-        execute_awscurl(&heal_url, "POST", Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+        let heal_url = format!("{}/rustfs/admin/v3/heal/?forceStart=true", cluster.nodes[0].url);
+        signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
 
         let expected_objects = [(online_key, online_body.as_slice()), (outage_key, outage_body.as_slice())];
         let mut remaining_rebuild_keys: HashSet<&str> = expected_objects.iter().map(|(key, _)| *key).collect();

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealProgress {
     /// Objects scanned
     pub objects_scanned: u64,
@@ -199,6 +200,22 @@ mod tests {
     }
 
     #[test]
+    fn test_heal_progress_successful_heal_reports_zero_failed() {
+        // A successful single-object heal must record the object's size as bytes
+        // processed WITHOUT inflating the failure count: the `failed` positional
+        // arg is distinct from `bytes`. Regression guard for backlog#1033 where
+        // the success paths passed object_size for both, corrupting
+        // objects_failed / the admin-visible success rate.
+        let object_size = 4096u64;
+        let mut progress = HealProgress::new();
+        progress.update_progress(3, 3, 0, object_size);
+
+        assert_eq!(progress.objects_healed, 3);
+        assert_eq!(progress.objects_failed, 0, "a successful heal must report zero failures");
+        assert_eq!(progress.bytes_processed, object_size);
+    }
+
+    #[test]
     fn test_heal_progress_set_current_object() {
         let mut progress = HealProgress::new();
         let initial_time = progress.last_update_time;
@@ -221,6 +238,22 @@ mod tests {
         progress.set_current_object(None);
 
         assert!(progress.current_object.is_none());
+    }
+
+    #[test]
+    fn test_heal_progress_serializes_camel_case_fields() {
+        let mut progress = HealProgress::new();
+        progress.update_progress(10, 8, 2, 1024);
+        progress.set_current_object(Some("test-bucket/test-object".to_string()));
+
+        let json = serde_json::to_value(&progress).expect("progress should serialize");
+
+        assert_eq!(json["objectsScanned"], 10);
+        assert_eq!(json["objectsHealed"], 8);
+        assert_eq!(json["objectsFailed"], 2);
+        assert_eq!(json["bytesProcessed"], 1024);
+        assert_eq!(json["currentObject"], "test-bucket/test-object");
+        assert!(json["progressPercentage"].is_number());
     }
 
     #[test]

@@ -59,18 +59,18 @@ runs:
           protobuf-compiler
 
     - name: Install protoc
-      uses: rustfs/setup-protoc@v3.0.1
+      uses: rustfs/setup-protoc@a3705324d8f9bf5b6c3573fb6cf8ae421db55dd6 # v3.0.1
       with:
         version: "34.1"
         repo-token: ${{ github.token }}
 
     - name: Install flatc
-      uses: Nugine/setup-flatc@v1
+      uses: Nugine/setup-flatc@e7855e994773ce90094a3f1626d4afc9080c23ae # v1
       with:
         version: "25.12.19"
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       with:
         toolchain: ${{ inputs.rust-version }}
         targets: ${{ inputs.target }}
@@ -78,17 +78,17 @@ runs:
 
     - name: Install Zig
       if: inputs.install-cross-tools == 'true'
-      uses: mlugg/setup-zig@v2
+      uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
 
     - name: Install cargo-zigbuild
       if: inputs.install-cross-tools == 'true'
-      uses: taiki-e/install-action@cargo-zigbuild
+      uses: taiki-e/install-action@a21ae4029b089b9ddc45704028756f51ab8abe48 # cargo-zigbuild
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
+      uses: taiki-e/install-action@96c7780c1d8a2b8723e12031def873a434d39d8d # nextest
 
     - name: Setup Rust cache
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         cache-all-crates: true
         cache-on-failure: true

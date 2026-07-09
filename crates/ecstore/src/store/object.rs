@@ -13,15 +13,16 @@
 // limitations under the License.
 
 use super::*;
+use crate::disk::OldCurrentSize;
 use crate::set_disk::{
     get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
     is_lock_optimization_enabled, is_object_lock_diag_enabled,
 };
+use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_hold_duration, record_object_lock_diag_slow_acquire,
     record_object_lock_diag_slow_hold,
 };
-use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
 use std::{
     fmt,
     pin::Pin,
@@ -216,6 +217,22 @@ fn resolve_latest_object_access(
     Ok((info, idx))
 }
 
+fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool {
+    opts.versioned && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
+}
+
+/// Whether a delete-time lookup miss on a directory key should trigger an orphan
+/// empty-directory tree purge (issue #4189).
+///
+/// The lookup surfaces *version*-not-found here, not object-not-found: `del_opts`
+/// pins `version_id = Uuid::nil()` for directory keys, so a missing dir object fails
+/// the specific-version lookup. Both misses must be accepted, otherwise the real
+/// HTTP delete path (which always sets the nil version) never reaches the purge and
+/// the ghost folder survives with a fake 204 — the exact #4189 symptom.
+fn should_purge_orphan_dir_on_missing(err: &Error, object: &str) -> bool {
+    (is_err_object_not_found(err) || is_err_version_not_found(err)) && rustfs_utils::path::is_dir_object(object)
+}
+
 fn version_aware_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
     let mut lookup_opts = opts.clone();
     lookup_opts.no_lock = no_lock;
@@ -234,6 +251,12 @@ fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> Object
     lookup_opts
 }
 
+fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
+    let mut lookup_opts = opts.clone();
+    lookup_opts.skip_decommissioned = true;
+    lookup_opts
+}
+
 fn effective_object_actual_size(info: &ObjectInfo) -> Option<i64> {
     info.get_actual_size().ok()
 }
@@ -243,27 +266,44 @@ fn is_equivalent_data_movement_delete_marker(source: &ObjectInfo, target: &Objec
         && is_data_movement_delete_marker(target)
         && source.version_id == target.version_id
         && source.mod_time == target.mod_time
+        && source.user_defined == target.user_defined
+        && source.user_tags == target.user_tags
+        && source.replication_status_internal == target.replication_status_internal
+        && source.replication_status == target.replication_status
+        && source.version_purge_status_internal == target.version_purge_status_internal
+        && source.version_purge_status == target.version_purge_status
 }
 
 fn is_data_movement_delete_marker(info: &ObjectInfo) -> bool {
     info.delete_marker
 }
 
+fn expected_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo) -> ObjectInfo {
+    ObjectInfo::from_file_info(source, "", &source.name, source.version_id.is_some())
+}
+
 fn is_equivalent_data_movement_tiered_object(source: &rustfs_filemeta::FileInfo, target: &ObjectInfo) -> bool {
+    let expected = expected_data_movement_tiered_object(source);
+
     source.version_id == target.version_id
         && !target.delete_marker
         && source.size == target.size
         && source.get_etag() == target.etag
         && source.checksum == target.checksum
         && source.mod_time == target.mod_time
-        && source.transition_status == target.transitioned_object.status
-        && source.transitioned_objname == target.transitioned_object.name
-        && source.transition_tier == target.transitioned_object.tier
-        && source
-            .transition_version_id
-            .map(|version_id| version_id.to_string())
-            .unwrap_or_default()
-            == target.transitioned_object.version_id
+        && expected.user_defined == target.user_defined
+        && expected.user_tags == target.user_tags
+        && expected.expires == target.expires
+        && expected.storage_class == target.storage_class
+        && expected.replication_status_internal == target.replication_status_internal
+        && expected.replication_status == target.replication_status
+        && expected.version_purge_status_internal == target.version_purge_status_internal
+        && expected.version_purge_status == target.version_purge_status
+        && expected.transitioned_object.status == target.transitioned_object.status
+        && expected.transitioned_object.name == target.transitioned_object.name
+        && expected.transitioned_object.tier == target.transitioned_object.tier
+        && expected.transitioned_object.version_id == target.transitioned_object.version_id
+        && expected.transitioned_object.free_version == target.transitioned_object.free_version
         && effective_object_actual_size(target) == Some(source.size)
 }
 
@@ -317,6 +357,27 @@ fn resolve_data_movement_tiered_resume_result(
     Ok(is_equivalent_data_movement_tiered_object(source, &target))
 }
 
+fn return_batch_delete_lock_error(objects: &[ObjectToDelete], err: Error) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+    let del_objects = objects
+        .iter()
+        .map(|object| DeletedObject {
+            object_name: decode_dir_object(&object.object_name),
+            version_id: object.version_id,
+            ..Default::default()
+        })
+        .collect();
+    let del_errs = objects.iter().map(|_| Some(err.clone())).collect();
+
+    (del_objects, del_errs)
+}
+
+fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
+    let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
+    object_names.sort_unstable();
+    object_names.dedup();
+    object_names
+}
+
 impl ECStore {
     fn map_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
         match err {
@@ -331,17 +392,7 @@ impl ECStore {
         }
     }
 
-    async fn acquire_object_write_lock_if_needed(
-        &self,
-        op: &'static str,
-        bucket: &str,
-        object: &str,
-        opts: &mut ObjectOptions,
-    ) -> Result<Option<ObjectLockDiagGuard>> {
-        if opts.no_lock {
-            return Ok(None);
-        }
-
+    async fn acquire_object_write_lock(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
@@ -359,9 +410,8 @@ impl ECStore {
             acquire_start.elapsed(),
             diag_enabled,
         );
-        opts.no_lock = true;
 
-        Ok(Some(ObjectLockDiagGuard::new(
+        Ok(ObjectLockDiagGuard::new(
             guard,
             diag_enabled,
             op,
@@ -369,7 +419,46 @@ impl ECStore {
             diag_enabled.then(|| object.to_string()),
             owner,
             ObjectLockDiagMode::Write,
-        )))
+        ))
+    }
+
+    async fn acquire_object_write_lock_if_needed(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        opts: &mut ObjectOptions,
+    ) -> Result<Option<ObjectLockDiagGuard>> {
+        if opts.no_lock {
+            return Ok(None);
+        }
+
+        let guard = self.acquire_object_write_lock(op, bucket, object).await?;
+        opts.no_lock = true;
+
+        Ok(Some(guard))
+    }
+
+    async fn acquire_delete_objects_write_locks(
+        &self,
+        bucket: &str,
+        objects: &[ObjectToDelete],
+        opts: &mut ObjectOptions,
+    ) -> Result<Vec<ObjectLockDiagGuard>> {
+        if opts.no_lock || objects.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let object_names = sorted_unique_delete_object_names(objects);
+        // Lock order: encoded object names are acquired in ascending order, then
+        // the set-layer calls receive no_lock so they do not reacquire them.
+        let mut guards = Vec::with_capacity(object_names.len());
+        for object in object_names {
+            guards.push(self.acquire_object_write_lock("delete_objects", bucket, object).await?);
+        }
+        opts.no_lock = true;
+
+        Ok(guards)
     }
 
     async fn acquire_object_read_lock_if_needed(
@@ -401,6 +490,7 @@ impl ECStore {
             diag_enabled,
         );
         opts.no_lock = true;
+        opts.metadata_cache_safe = true;
 
         Ok(Some(ObjectLockDiagGuard::new(
             guard,
@@ -414,7 +504,7 @@ impl ECStore {
     }
 
     fn attach_read_lock_guard(mut reader: GetObjectReader, guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
-        if is_lock_optimization_enabled() {
+        if is_lock_optimization_enabled() || reader.buffered_body.is_some() {
             return reader;
         }
 
@@ -588,6 +678,7 @@ impl ECStore {
     }
 
     #[instrument(level = "debug", skip(self))]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn handle_get_object_reader(
         &self,
         bucket: &str,
@@ -621,13 +712,14 @@ impl ECStore {
     }
 
     #[instrument(level = "debug", skip(self, data))]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn handle_put_object(
         &self,
         bucket: &str,
         object: &str,
         data: &mut PutObjReader,
         opts: &ObjectOptions,
-    ) -> Result<ObjectInfo> {
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         check_put_object_args(bucket, object)?;
 
         let object = encode_dir_object(object);
@@ -635,7 +727,9 @@ impl ECStore {
         // Keep PUT atomic-read friendly: SetDisks takes the object write lock only
         // around precondition checks and the final rename/commit.
         if self.single_pool() {
-            return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
+            return self.pools[0]
+                .put_object_with_old_current_size(bucket, object.as_str(), data, opts)
+                .await;
         }
 
         let idx = if opts.data_movement && opts.version_id.is_some() {
@@ -653,7 +747,9 @@ impl ECStore {
             ));
         }
 
-        self.pools[idx].put_object(bucket, &object, data, opts).await
+        self.pools[idx]
+            .put_object_with_old_current_size(bucket, &object, data, opts)
+            .await
     }
 
     #[instrument(skip(self))]
@@ -750,6 +846,25 @@ impl ECStore {
             }
 
             if dst_opts.versioned && src_opts.version_id != dst_opts.version_id {
+                // Restoring a specific historical version onto the current key creates a NEW
+                // version. When the caller supplies a reader (S3 CopyObject), write the fetched
+                // bytes through put_object so any re-encryption/compression applied to the reader
+                // stays consistent with the new version's metadata. Sharing the source data_dir via
+                // a metadata-only version copy would corrupt SSE/compressed objects (issue #4238).
+                if let Some(reader) = src_info.put_object_reader.as_mut() {
+                    let put_opts = ObjectOptions {
+                        user_defined: (*src_info.user_defined).clone(),
+                        versioned: dst_opts.versioned,
+                        version_id: dst_opts.version_id.clone(),
+                        no_lock: dst_opts.no_lock,
+                        mod_time: dst_opts.mod_time,
+                        http_preconditions: dst_opts.http_preconditions.clone(),
+                        ..Default::default()
+                    };
+                    return self.pools[pool_idx]
+                        .put_object(dst_bucket, &dst_object, reader, &put_opts)
+                        .await;
+                }
                 src_info.version_only = true;
                 return self.pools[pool_idx]
                     .copy_object(src_bucket, &src_object, dst_bucket, &dst_object, src_info, src_opts, &dst_opts)
@@ -784,6 +899,34 @@ impl ECStore {
             src_object.to_owned(),
             "put_object_reader is none".to_owned(),
         ))
+    }
+
+    /// Best-effort purge of an orphan directory prefix — an on-disk tree of empty
+    /// directories with no `xl.meta` anywhere (issue #4189). Orphan fragments can sit
+    /// on any erasure set of any pool (they are left behind by whichever sets stored
+    /// the now-deleted children), so every set is swept. Returns true when at least
+    /// one set removed an orphan tree. Hard per-set failures are logged and skipped:
+    /// the caller falls back to surfacing the original NotFound.
+    async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> bool {
+        let prefix = decode_dir_object(object);
+        let mut purged = false;
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                match set.purge_orphan_dir_object(bucket, &prefix).await {
+                    Ok(set_purged) => purged |= set_purged,
+                    Err(err) => {
+                        warn!(
+                            bucket,
+                            prefix,
+                            pool_index = pool.pool_idx,
+                            error = ?err,
+                            "failed to purge orphan directory prefix"
+                        );
+                    }
+                }
+            }
+        }
+        purged
     }
 
     #[instrument(skip(self))]
@@ -836,7 +979,7 @@ impl ECStore {
             let target_pool_idx =
                 resolve_data_movement_resume_target_pool(selected_target_pool_idx, resume_target_pool_idx, opts.src_pool_idx);
 
-            if opts.src_pool_idx == selected_target_pool_idx {
+            if !should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
                 if let Ok((source_pool_info, _)) = existing_pool_info
                     && opts.delete_marker
                     && is_data_movement_delete_marker(&source_pool_info.object_info)
@@ -862,24 +1005,36 @@ impl ECStore {
                 ));
             }
 
-            let mut obj = self.pools[selected_target_pool_idx]
-                .delete_object(bucket, object, opts)
-                .await?;
+            let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
             obj.name = decode_dir_object(obj.name.as_str());
             return Ok(obj);
         }
 
         // Determine which pool contains it
-        let (mut pinfo, errs) = self
-            .get_pool_info_existing_with_opts(bucket, object, &gopts)
-            .await
-            .map_err(|e| {
-                if is_err_read_quorum(&e) {
-                    StorageError::ErasureWriteQuorum
-                } else {
-                    e
+        let (mut pinfo, errs) = match self.get_pool_info_existing_with_opts(bucket, object, &gopts).await {
+            Ok(res) => res,
+            Err(err) if is_err_read_quorum(&err) => return Err(StorageError::ErasureWriteQuorum),
+            Err(err) if is_err_object_not_found(&err) && should_create_delete_marker_for_missing_object(&opts) => {
+                let target_pool_idx = self.get_pool_idx_no_lock(bucket, object, 0).await?;
+                let mut obj = self.pools[target_pool_idx].delete_object(bucket, object, opts).await?;
+                obj.name = decode_dir_object(object);
+                return Ok(obj);
+            }
+            Err(err) => {
+                // A folder key (`prefix/`) with no object metadata may still exist on
+                // disk as an orphan empty-directory tree (issue #4189): listings show
+                // it as a common prefix, but no regular delete path can remove it.
+                // Purge the orphan tree so folder deletes actually take effect.
+                if should_purge_orphan_dir_on_missing(&err, object) && self.purge_orphan_dir_object(bucket, object).await {
+                    return Ok(ObjectInfo {
+                        bucket: bucket.to_owned(),
+                        name: decode_dir_object(object),
+                        ..Default::default()
+                    });
                 }
-            })?;
+                return Err(err);
+            }
+        };
 
         if pinfo.object_info.delete_marker && opts.version_id.is_none() {
             pinfo.object_info.name = decode_dir_object(object);
@@ -947,7 +1102,11 @@ impl ECStore {
             del_errs.push(None)
         }
 
-        // TODO: nslock
+        let mut opts = opts;
+        let _object_lock_guards = match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
+            Ok(guards) => guards,
+            Err(err) => return return_batch_delete_lock_error(objects.as_slice(), err),
+        };
 
         let mut futures = Vec::with_capacity(self.pools.len());
 
@@ -1133,11 +1292,12 @@ impl ECStore {
             return self.pools[0].transition_object(bucket, &object, opts).await;
         }
 
-        //opts.skip_decommissioned = true;
-        //opts.no_lock = true;
-        let (_, idx) = self.get_latest_accessible_object_info_with_idx(bucket, &object, opts).await?;
+        let opts = transition_restore_pool_opts(opts);
+        let (_, idx) = self
+            .get_latest_accessible_object_info_with_idx(bucket, &object, &opts)
+            .await?;
 
-        self.pools[idx].transition_object(bucket, &object, opts).await
+        self.pools[idx].transition_object(bucket, &object, &opts).await
     }
 
     #[instrument(skip(self))]
@@ -1152,15 +1312,14 @@ impl ECStore {
             return self.pools[0].clone().restore_transitioned_object(bucket, &object, opts).await;
         }
 
-        //opts.skip_decommissioned = true;
-        //opts.nolock = true;
+        let opts = transition_restore_pool_opts(opts);
         let (_, idx) = self
-            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), opts)
+            .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
             .await?;
 
         self.pools[idx]
             .clone()
-            .restore_transitioned_object(bucket, &object, opts)
+            .restore_transitioned_object(bucket, &object, &opts)
             .await
     }
 
@@ -1255,8 +1414,15 @@ impl ECStore {
     }
 
     pub(super) async fn handle_verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader =
-            <Self as rustfs_storage_api::ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        let get_object_reader = <Self as crate::storage_api_contracts::object::ObjectIO>::get_object_reader(
+            self,
+            bucket,
+            object,
+            None,
+            HeaderMap::new(),
+            opts,
+        )
+        .await?;
         // Stream to sink to avoid loading entire object into memory during verification
         let mut reader = get_object_reader.stream;
         tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
@@ -1267,10 +1433,18 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::lifecycle::bucket_lifecycle_ops::TransitionedObject;
     use crate::bucket::lifecycle::core::TRANSITION_COMPLETE;
+    use crate::bucket::replication::{
+        ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta, replication_statuses_map,
+        version_purge_statuses_map,
+    };
+    use crate::layout::{
+        endpoints::{Endpoints, PoolEndpoints},
+        format::FormatV3,
+    };
     use bytes::Bytes;
     use std::io::Cursor;
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
     #[test]
@@ -1311,6 +1485,33 @@ mod tests {
             ..target
         };
         assert!(!is_equivalent_data_movement_delete_marker(&source, &mismatched));
+    }
+
+    #[test]
+    fn equivalent_data_movement_delete_marker_rejects_metadata_and_replication_mismatch() {
+        let version_id = Uuid::nil();
+        let mod_time = OffsetDateTime::UNIX_EPOCH;
+        let source = ObjectInfo {
+            version_id: Some(version_id),
+            delete_marker: true,
+            mod_time: Some(mod_time),
+            user_defined: Arc::new(HashMap::from([("x-amz-meta-source".to_string(), "true".to_string())])),
+            replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
+            version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
+            ..Default::default()
+        };
+
+        let mut target = source.clone();
+        target.user_defined = Arc::new(HashMap::from([("x-amz-meta-source".to_string(), "false".to_string())]));
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+
+        let mut target = source.clone();
+        target.replication_status_internal = Some("arn:minio:replication:target=FAILED;".to_string());
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
+
+        let mut target = source.clone();
+        target.version_purge_status_internal = Some("arn:minio:replication:target=COMPLETE;".to_string());
+        assert!(!is_equivalent_data_movement_delete_marker(&source, &target));
     }
 
     #[test]
@@ -1367,6 +1568,7 @@ mod tests {
     fn data_movement_resume_target_uses_resolved_non_source_pool_when_selected_is_source() {
         let target_pool_idx = resolve_data_movement_resume_target_pool(1, Some(3), 1);
         assert_eq!(target_pool_idx, 3);
+        assert!(should_check_data_movement_resume_target(1, target_pool_idx));
     }
 
     #[test]
@@ -1386,12 +1588,12 @@ mod tests {
         assert!(matches!(result, Err(Error::SlowDown)));
     }
 
-    #[test]
-    fn equivalent_data_movement_tiered_object_accepts_matching_transition_metadata() {
+    fn tiered_equivalence_source() -> FileInfo {
         let version_id = Uuid::nil();
         let transition_version_id = Uuid::new_v4();
         let mod_time = OffsetDateTime::UNIX_EPOCH;
-        let source = FileInfo {
+
+        FileInfo {
             version_id: Some(version_id),
             size: 1024,
             mod_time: Some(mod_time),
@@ -1400,80 +1602,86 @@ mod tests {
             transitioned_objname: "remote/object".to_string(),
             transition_tier: "WARM".to_string(),
             transition_version_id: Some(transition_version_id),
-            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            mod_time: Some(mod_time),
-            checksum: Some(Bytes::from_static(b"checksum")),
-            etag: Some("etag-value".to_string()),
-            transitioned_object: TransitionedObject {
-                name: "remote/object".to_string(),
-                version_id: transition_version_id.to_string(),
-                tier: "WARM".to_string(),
-                status: TRANSITION_COMPLETE.to_string(),
+            replication_state_internal: Some(replication_state_to_filemeta(&ReplicationState {
+                replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
+                targets: replication_statuses_map("arn:minio:replication:target=COMPLETED;"),
+                version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
+                purge_targets: version_purge_statuses_map("arn:minio:replication:target=PENDING;"),
                 ..Default::default()
-            },
+            })),
+            metadata: HashMap::from([
+                ("etag".to_string(), "etag-value".to_string()),
+                ("x-amz-meta-key".to_string(), "metadata-value".to_string()),
+                (rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(), "tag=value".to_string()),
+                ("expires".to_string(), "1970-01-01T00:33:20Z".to_string()),
+            ]),
             ..Default::default()
-        };
+        }
+    }
+
+    fn tiered_equivalence_target(source: &FileInfo) -> ObjectInfo {
+        ObjectInfo::from_file_info(source, "bucket", "object", source.version_id.is_some())
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_accepts_matching_persisted_metadata() {
+        let source = tiered_equivalence_source();
+        let target = tiered_equivalence_target(&source);
 
         assert!(is_equivalent_data_movement_tiered_object(&source, &target));
     }
 
     #[test]
     fn equivalent_data_movement_tiered_object_rejects_transition_mismatch() {
-        let source = FileInfo {
-            version_id: Some(Uuid::nil()),
-            size: 1024,
-            transition_status: TRANSITION_COMPLETE.to_string(),
-            transitioned_objname: "remote/source".to_string(),
-            transition_tier: "WARM".to_string(),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            version_id: source.version_id,
-            size: 1024,
-            transitioned_object: TransitionedObject {
-                name: "remote/target".to_string(),
-                tier: "WARM".to_string(),
-                status: TRANSITION_COMPLETE.to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.transitioned_object.name = "remote/target".to_string();
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_user_metadata_mismatch() {
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.user_defined = Arc::new(HashMap::from([("x-amz-meta-key".to_string(), "target-value".to_string())]));
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_tag_mismatch() {
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.user_tags = Arc::new("tag=target".to_string());
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_replication_mismatch() {
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.replication_status_internal = Some("arn:minio:replication:target=FAILED;".to_string());
+        target.replication_status = ReplicationStatusType::Failed;
+
+        assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
+    }
+
+    #[test]
+    fn equivalent_data_movement_tiered_object_rejects_version_purge_mismatch() {
+        let source = tiered_equivalence_source();
+        let mut target = tiered_equivalence_target(&source);
+        target.version_purge_status_internal = Some("arn:minio:replication:target=COMPLETE;".to_string());
+        target.version_purge_status = VersionPurgeStatusType::Complete;
 
         assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
     }
 
     #[test]
     fn data_movement_tiered_resume_accepts_equivalent_target() {
-        let version_id = Uuid::nil();
-        let transition_version_id = Uuid::new_v4();
-        let source = FileInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            transition_status: TRANSITION_COMPLETE.to_string(),
-            transitioned_objname: "remote/object".to_string(),
-            transition_tier: "WARM".to_string(),
-            transition_version_id: Some(transition_version_id),
-            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            etag: Some("etag-value".to_string()),
-            transitioned_object: TransitionedObject {
-                name: "remote/object".to_string(),
-                version_id: transition_version_id.to_string(),
-                tier: "WARM".to_string(),
-                status: TRANSITION_COMPLETE.to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let source = tiered_equivalence_source();
+        let target = tiered_equivalence_target(&source);
 
         let should_resume = resolve_data_movement_tiered_resume_result(Ok(Some(target)), &source, 0, 1)
             .expect("equivalent tiered target should be evaluated");
@@ -1483,28 +1691,8 @@ mod tests {
 
     #[test]
     fn data_movement_tiered_resume_rejects_source_pool_target() {
-        let version_id = Uuid::nil();
-        let source = FileInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            transition_status: TRANSITION_COMPLETE.to_string(),
-            transitioned_objname: "remote/object".to_string(),
-            transition_tier: "WARM".to_string(),
-            metadata: HashMap::from([("etag".to_string(), "etag-value".to_string())]),
-            ..Default::default()
-        };
-        let target = ObjectInfo {
-            version_id: Some(version_id),
-            size: 1024,
-            etag: Some("etag-value".to_string()),
-            transitioned_object: TransitionedObject {
-                name: "remote/object".to_string(),
-                tier: "WARM".to_string(),
-                status: TRANSITION_COMPLETE.to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let source = tiered_equivalence_source();
+        let target = tiered_equivalence_target(&source);
 
         let should_resume = resolve_data_movement_tiered_resume_result(Ok(Some(target)), &source, 0, 0)
             .expect("source-pool target should be rejected before target lookup");
@@ -1624,6 +1812,76 @@ mod tests {
     }
 
     #[test]
+    fn should_create_delete_marker_for_missing_object_allows_latest_versioned_delete() {
+        let opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        assert!(should_create_delete_marker_for_missing_object(&opts));
+    }
+
+    #[test]
+    fn should_create_delete_marker_for_missing_object_rejects_specialized_deletes() {
+        let version_delete = ObjectOptions {
+            versioned: true,
+            version_id: Some("vid-1".to_string()),
+            ..Default::default()
+        };
+        let delete_marker_replication = ObjectOptions {
+            versioned: true,
+            delete_marker: true,
+            ..Default::default()
+        };
+        let data_movement = ObjectOptions {
+            versioned: true,
+            data_movement: true,
+            ..Default::default()
+        };
+
+        assert!(!should_create_delete_marker_for_missing_object(&version_delete));
+        assert!(!should_create_delete_marker_for_missing_object(&delete_marker_replication));
+        assert!(!should_create_delete_marker_for_missing_object(&data_movement));
+    }
+
+    // issue #4189 regression: `del_opts` pins `version_id = Uuid::nil()` on directory
+    // keys, so deleting a ghost folder over HTTP fails the lookup with *version*-not-found
+    // (not object-not-found). The orphan-purge guard must accept both misses, or the
+    // ghost tree survives behind a fake 204 — the exact reported symptom.
+    #[test]
+    fn should_purge_orphan_dir_on_version_not_found_for_dir_key() {
+        assert!(
+            should_purge_orphan_dir_on_missing(&StorageError::FileVersionNotFound, "ghost/"),
+            "the real HTTP delete path yields version-not-found on dir keys and must reach the purge"
+        );
+        assert!(
+            should_purge_orphan_dir_on_missing(
+                &StorageError::VersionNotFound("bucket".into(), "ghost/".into(), Uuid::nil().to_string()),
+                "ghost/"
+            ),
+            "typed VersionNotFound on a dir key must also reach the purge"
+        );
+    }
+
+    #[test]
+    fn should_purge_orphan_dir_on_object_not_found_for_dir_key() {
+        assert!(should_purge_orphan_dir_on_missing(&StorageError::FileNotFound, "ghost/"));
+        assert!(should_purge_orphan_dir_on_missing(
+            &StorageError::ObjectNotFound("bucket".into(), "ghost/".into()),
+            "ghost/"
+        ));
+    }
+
+    #[test]
+    fn should_not_purge_orphan_dir_for_regular_key_or_other_errors() {
+        // A regular (non-directory) key must never trigger a prefix purge, even on a miss.
+        assert!(!should_purge_orphan_dir_on_missing(&StorageError::FileVersionNotFound, "regular.txt"));
+        assert!(!should_purge_orphan_dir_on_missing(&StorageError::FileNotFound, "regular.txt"));
+        // Non-miss errors (e.g. quorum failures) must not be masked by a purge attempt.
+        assert!(!should_purge_orphan_dir_on_missing(&StorageError::ErasureReadQuorum, "ghost/"));
+    }
+
+    #[test]
     fn resolve_decommission_target_pool_idx_result_passthrough_ok() {
         let idx = ECStore::resolve_decommission_target_pool_idx_result(Ok(3), "bucket", "object").unwrap();
 
@@ -1715,6 +1973,204 @@ mod tests {
         assert!(lookup_opts.skip_rebalancing);
     }
 
+    #[test]
+    fn transition_restore_pool_opts_skips_decommissioned_and_preserves_locking() {
+        let lookup_opts = transition_restore_pool_opts(&ObjectOptions {
+            no_lock: false,
+            skip_decommissioned: false,
+            ..Default::default()
+        });
+
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(!lookup_opts.no_lock);
+    }
+
+    #[test]
+    fn transition_restore_pool_opts_preserves_existing_no_lock() {
+        let lookup_opts = transition_restore_pool_opts(&ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        });
+
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.no_lock);
+    }
+
+    #[test]
+    fn delete_objects_lock_names_are_sorted_and_unique() {
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "alpha".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(sorted_unique_delete_object_names(&objects), vec!["alpha", "beta"]);
+    }
+
+    async fn new_read_lock_test_store() -> ECStore {
+        let format = FormatV3::new(1, 2);
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data0").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data1").expect("second endpoint should parse"),
+        ];
+        let pool_endpoints = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "read-lock-metadata-cache-safe-test".to_string(),
+            platform: "test".to_string(),
+        };
+        let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints.clone()]);
+        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1)
+            .await
+            .expect("test sets should be created with empty disks");
+
+        ECStore {
+            id: Uuid::new_v4(),
+            disk_map: HashMap::new(),
+            pools: vec![sets],
+            peer_sys: S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
+            ctx: crate::runtime::instance::bootstrap_ctx(),
+        }
+    }
+
+    // Phase 5 Slice 2 (backlog#939): the instance context flows down the whole
+    // object graph — ECStore, its Sets, and their SetDisks must all carry the
+    // same `Arc<InstanceContext>` in a single-instance deployment.
+    #[tokio::test]
+    async fn instance_context_flows_through_object_graph() {
+        let store = new_read_lock_test_store().await;
+
+        let sets = store.pools.first().expect("test store has one pool");
+        assert!(
+            std::sync::Arc::ptr_eq(&store.ctx, sets.instance_ctx()),
+            "Sets must carry the store's instance context"
+        );
+
+        let set_disks = sets.disk_set.first().expect("pool has one set");
+        assert!(
+            std::sync::Arc::ptr_eq(sets.instance_ctx(), set_disks.instance_ctx()),
+            "SetDisks must carry the Sets' instance context"
+        );
+    }
+
+    // Phase 5 Slice 3 (backlog#939): a SetDisks sources its lock manager from
+    // its instance context (not an independent process lookup), and in a
+    // single-instance build that context aliases the process lock-manager
+    // singleton — so the lock namespace is unchanged.
+    #[tokio::test]
+    async fn set_disks_lock_manager_comes_from_instance_context() {
+        let store = new_read_lock_test_store().await;
+        let set_disks = store.pools[0].disk_set.first().expect("pool has one set");
+
+        assert!(
+            std::sync::Arc::ptr_eq(set_disks.local_lock_manager_for_test(), &set_disks.instance_ctx().lock_manager()),
+            "SetDisks lock manager must be sourced from its instance context"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(set_disks.local_lock_manager_for_test(), &rustfs_lock::get_global_lock_manager()),
+            "single-instance lock manager must alias the process singleton"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_objects_write_locks_cover_each_unique_object() {
+        let store = new_read_lock_test_store().await;
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "alpha".to_string(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "beta".to_string(),
+                ..Default::default()
+            },
+        ];
+        let mut opts = ObjectOptions::default();
+
+        let guards = store
+            .acquire_delete_objects_write_locks("bucket", &objects, &mut opts)
+            .await
+            .expect("delete object locks should be acquired");
+
+        assert_eq!(guards.len(), 2, "duplicate object names should share one namespace lock");
+        assert!(opts.no_lock, "set layer should not reacquire locks already held by ECStore");
+
+        let alpha_lock = store
+            .handle_new_ns_lock("bucket", "alpha")
+            .await
+            .expect("alpha namespace lock should be created");
+        let err = alpha_lock
+            .get_read_lock(Duration::from_millis(20))
+            .await
+            .expect_err("batch delete write guard should block alpha readers");
+        assert!(matches!(err, rustfs_lock::LockError::Timeout { .. }));
+
+        drop(guards);
+        alpha_lock
+            .get_read_lock(Duration::from_secs(1))
+            .await
+            .expect("alpha read lock should be available after dropping batch guards");
+    }
+
+    #[tokio::test]
+    async fn acquired_read_lock_marks_metadata_cache_safe_for_set_layer() {
+        let store = new_read_lock_test_store().await;
+        let mut opts = ObjectOptions::default();
+
+        let guard = store
+            .acquire_object_read_lock_if_needed("get_object", "bucket", "object", &mut opts)
+            .await
+            .expect("read lock should be acquired");
+
+        assert!(guard.is_some(), "read lock should be held by the outer store layer");
+        assert!(opts.no_lock, "set layer should not reacquire the object lock");
+        assert!(
+            opts.metadata_cache_safe,
+            "metadata cache is safe only because the outer store layer acquired the read lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn prelocked_read_request_does_not_mark_metadata_cache_safe() {
+        let store = new_read_lock_test_store().await;
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        let guard = store
+            .acquire_object_read_lock_if_needed("get_object", "bucket", "object", &mut opts)
+            .await
+            .expect("prelocked read should not acquire another lock");
+
+        assert!(guard.is_none(), "prelocked caller should keep lock ownership outside ECStore");
+        assert!(
+            !opts.metadata_cache_safe,
+            "generic no_lock callers must stay ineligible for metadata cache unless explicitly marked safe"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn reader_lock_is_held_when_optimization_is_disabled() {
@@ -1738,6 +2194,7 @@ mod tests {
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(Vec::<u8>::new())),
                 object_info: ObjectInfo::default(),
+                buffered_body: None,
             };
 
             let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
@@ -1749,6 +2206,78 @@ mod tests {
             lock.get_write_lock(key, "writer", Duration::from_secs(1))
                 .await
                 .expect("dropping the reader should release the read lock");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reader_lock_is_not_held_for_stream_when_optimization_is_enabled() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+            let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
+            let key = rustfs_lock::ObjectKey::new("bucket", "object");
+            let read_guard = lock
+                .get_read_lock(key.clone(), "reader", Duration::from_secs(1))
+                .await
+                .expect("read lock should be acquired");
+            let read_guard = ObjectLockDiagGuard::new(
+                read_guard,
+                true,
+                "test_get_object",
+                Some("bucket".to_string()),
+                Some("object".to_string()),
+                Some("reader".to_string()),
+                ObjectLockDiagMode::Read,
+            );
+            let reader = GetObjectReader {
+                stream: Box::new(Cursor::new(vec![1, 2, 3])),
+                object_info: ObjectInfo::default(),
+                buffered_body: None,
+            };
+
+            let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
+
+            lock.get_write_lock(key, "writer", Duration::from_secs(1))
+                .await
+                .expect("lock optimization should release the read lock before returning the stream");
+            drop(reader);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reader_lock_is_not_held_for_buffered_body_when_optimization_is_enabled() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+            let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
+            let key = rustfs_lock::ObjectKey::new("bucket", "object");
+            let read_guard = lock
+                .get_read_lock(key.clone(), "reader", Duration::from_secs(1))
+                .await
+                .expect("read lock should be acquired");
+            let read_guard = ObjectLockDiagGuard::new(
+                read_guard,
+                true,
+                "test_get_object",
+                Some("bucket".to_string()),
+                Some("object".to_string()),
+                Some("reader".to_string()),
+                ObjectLockDiagMode::Read,
+            );
+            let reader = GetObjectReader {
+                stream: Box::new(Cursor::new(vec![1, 2, 3])),
+                object_info: ObjectInfo::default(),
+                buffered_body: Some(Bytes::from_static(b"123")),
+            };
+
+            let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
+
+            lock.get_write_lock(key, "writer", Duration::from_secs(1))
+                .await
+                .expect("buffered reader should release the read lock immediately");
+            drop(reader);
         })
         .await;
     }
@@ -1776,6 +2305,7 @@ mod tests {
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
                 object_info: ObjectInfo::default(),
+                buffered_body: None,
             };
 
             let mut reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));

@@ -18,6 +18,7 @@
 //! Segments are discovered at download time using lexicographic ordering
 //! based on a container metadata manifest pointer.
 
+use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, container, object};
 use axum::http::{HeaderMap, Response, StatusCode};
 use rustfs_credentials::Credentials;
@@ -115,6 +116,13 @@ fn parse_range_header(range_str: &str, total_size: u64) -> Result<(u64, u64), Sw
         return Err(SwiftError::BadRequest("Invalid Range header format".to_string()));
     }
 
+    // A range can never be satisfied against an empty aggregate. Guard here so the
+    // `total_size - 1` arithmetic below cannot underflow (which would wrap to a bogus
+    // Content-Range in release builds and panic in debug builds).
+    if total_size == 0 {
+        return Err(SwiftError::BadRequest("Cannot satisfy Range request on empty object".to_string()));
+    }
+
     let range_part = &range_str[6..];
     let parts: Vec<&str> = range_part.split('-').collect();
 
@@ -167,8 +175,16 @@ fn calculate_dlo_segments_for_range(
     let mut current_offset = 0u64;
 
     for (idx, segment) in segments.iter().enumerate() {
+        let seg_size = segment.size as u64;
+
+        // Empty segments contribute no bytes; skip them so the `seg_size - 1`
+        // arithmetic below cannot underflow.
+        if seg_size == 0 {
+            continue;
+        }
+
         let segment_start = current_offset;
-        let segment_end = current_offset + segment.size as u64 - 1;
+        let segment_end = current_offset + seg_size - 1;
 
         // Check if this segment overlaps with requested range
         if segment_end >= start && segment_start <= end {
@@ -178,13 +194,13 @@ fn calculate_dlo_segments_for_range(
             let byte_end = if end < segment_end {
                 end - segment_start
             } else {
-                segment.size as u64 - 1
+                seg_size - 1
             };
 
             result.push((idx, byte_start, byte_end, segment.clone()));
         }
 
-        current_offset += segment.size as u64;
+        current_offset += seg_size;
 
         // Stop if we've passed the requested range
         if current_offset > end {
@@ -284,6 +300,8 @@ async fn create_dlo_stream(
         segments
             .iter()
             .enumerate()
+            // Skip empty segments so `s.size - 1` cannot underflow; they carry no bytes.
+            .filter(|(_, s)| s.size as u64 > 0)
             .map(|(i, s)| (i, 0, s.size as u64 - 1, s.clone()))
             .collect()
     };
@@ -300,7 +318,7 @@ async fn create_dlo_stream(
 
             async move {
                 let range_spec = if byte_start > 0 || byte_end < segment.size as u64 - 1 {
-                    Some(rustfs_storage_api::HTTPRangeSpec {
+                    Some(HTTPRangeSpec {
                         is_suffix_length: false,
                         start: byte_start as i64,
                         end: byte_end as i64,
@@ -533,6 +551,76 @@ mod tests {
         // No segments should return empty result
         let result = calculate_dlo_segments_for_range(&segments, 0, 100).unwrap();
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_calculate_dlo_segments_for_range_zero_byte_segment() {
+        let segments = vec![
+            ObjectInfo {
+                name: "seg001".to_string(),
+                size: 1000,
+                content_type: None,
+                etag: None,
+            },
+            ObjectInfo {
+                name: "seg002".to_string(),
+                size: 0, // empty segment
+                content_type: None,
+                etag: None,
+            },
+            ObjectInfo {
+                name: "seg003".to_string(),
+                size: 500,
+                content_type: None,
+                etag: None,
+            },
+        ];
+
+        // Must not panic / underflow on the zero-byte segment.
+        let result = calculate_dlo_segments_for_range(&segments, 500, 1200).unwrap();
+
+        // The empty segment carries no bytes and is skipped.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 0);
+        assert_eq!(result[0].1, 500);
+        assert_eq!(result[0].2, 999);
+        assert_eq!(result[1].0, 2);
+        assert_eq!(result[1].1, 0);
+        assert_eq!(result[1].2, 200);
+    }
+
+    #[test]
+    fn test_calculate_dlo_segments_for_range_leading_zero_byte_segment() {
+        let segments = vec![
+            ObjectInfo {
+                name: "seg001".to_string(),
+                size: 0, // empty leading segment (current_offset == 0)
+                content_type: None,
+                etag: None,
+            },
+            ObjectInfo {
+                name: "seg002".to_string(),
+                size: 1000,
+                content_type: None,
+                etag: None,
+            },
+        ];
+
+        // `current_offset + 0 - 1` would underflow without the guard.
+        let result = calculate_dlo_segments_for_range(&segments, 0, 999).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 1);
+        assert_eq!(result[0].1, 0);
+        assert_eq!(result[0].2, 999);
+    }
+
+    #[test]
+    fn test_parse_range_header_empty_aggregate() {
+        // A range request against a 0-size aggregate must return a clean error
+        // rather than underflowing `total_size - 1`.
+        assert!(parse_range_header("bytes=0-99", 0).is_err());
+        assert!(parse_range_header("bytes=-1", 0).is_err());
+        assert!(parse_range_header("bytes=0-", 0).is_err());
     }
 
     #[test]

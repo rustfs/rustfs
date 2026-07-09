@@ -160,6 +160,15 @@ Merges (in order of increasing precedence):
 {{- end }}
 
 {{/*
+Resolve the Kubernetes cluster DNS domain (defaults to cluster.local).
+Trims any leading/trailing dots so callers can safely append it after `svc.`,
+falling back to cluster.local when the value is empty or only dots.
+*/}}
+{{- define "rustfs.clusterDomain" -}}
+{{- .Values.clusterDomain | default "cluster.local" | trimAll "." | default "cluster.local" -}}
+{{- end -}}
+
+{{/*
 Return the fully qualified name of a server pool.
 Pool 0 keeps the legacy single-pool name so that existing deployments can be
 expanded in place without renaming their StatefulSet, pods or PVCs.
@@ -221,14 +230,15 @@ RUSTFS_VOLUMES on spaces, one pool per expression).
 {{- end -}}
 {{- $headless := printf "%s-headless" (include "rustfs.fullname" .) -}}
 {{- $ns := .Release.Namespace -}}
+{{- $domain := include "rustfs.clusterDomain" . -}}
 {{- $port := .Values.service.endpoint.port | int -}}
 {{- $exprs := list -}}
 {{- range $pool := include "rustfs.pools" . | fromJsonArray -}}
 {{- $n := int $pool.replicaCount -}}
 {{- if eq $n 4 -}}
-{{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.cluster.local:%d/data/rustfs{0...%d}" $protocol $pool.fullname (sub $n 1) $headless $ns $port (sub $n 1)) -}}
+{{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data/rustfs{0...%d}" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port (sub $n 1)) -}}
 {{- else if eq $n 16 -}}
-{{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.cluster.local:%d/data" $protocol $pool.fullname (sub $n 1) $headless $ns $port) -}}
+{{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port) -}}
 {{- end -}}
 {{- end -}}
 {{- join " " $exprs -}}

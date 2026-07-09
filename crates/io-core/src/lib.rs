@@ -12,34 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy core reader and writer implementations for RustFS.
+//! Buffered I/O reader and writer implementations for RustFS.
 //!
-//! This crate provides zero-copy readers and writers that minimize memory
-//! allocations and data copying during I/O operations. It depends on
-//! `rustfs-io-metrics` for metrics reporting and is designed to avoid
-//! introducing cyclic dependencies in the RustFS crate graph.
+//! This crate provides buffered readers and writers for I/O operations.
+//! Prefer `BytesBufferedReader`, `BytesMutWriter`, and `AlignedPreadReader`
+//! for new code. Historical `ZeroCopy*` and `DirectIo*` names remain exported
+//! for backward compatibility.
 //!
 //! # Features
 //!
-//! - Memory-mapped file reading (mmap) on Unix platforms
-//! - Bytes-based zero-copy wrapping
+//! - Memory-mapped file reading (mmap-then-copy) on Unix platforms
+//! - Bytes-based buffered wrapping
 //! - AsyncRead trait implementations
 //! - Tiered BytesPool for buffer management
-//! - Optional Direct I/O support (Linux only)
+//! - Aligned pread-based reader (NOT true Direct I/O / O_DIRECT)
 //!
 //! # Example
 //!
 //! ```ignore
-//! use rustfs_io_core::{ZeroCopyObjectReader, BytesPool};
+//! use rustfs_io_core::{BytesBufferedReader, BytesPool};
 //! use bytes::Bytes;
 //!
 //! // Create from existing bytes (zero-copy)
 //! let data = Bytes::from("hello world");
-//! let reader = ZeroCopyObjectReader::from_bytes(data);
+//! let reader = BytesBufferedReader::from_bytes(data);
 //!
-//! // Create from file using mmap (Unix only)
-//! #[cfg(unix)]
-//! let reader = ZeroCopyObjectReader::from_file_mmap(&file, 0, 1024).await?;
+//! // Create from file using buffered reads
+//! let reader = BytesBufferedReader::from_file_read(&file, 0, 1024).await?;
 //!
 //! // Use BytesPool
 //! let pool = BytesPool::new_tiered();
@@ -62,10 +61,17 @@ pub mod timeout_wrapper;
 pub mod writer;
 
 #[cfg(target_os = "linux")]
+pub use direct_io::{AlignedPreadError, AlignedPreadReader};
+#[cfg(target_os = "linux")]
+#[allow(deprecated)]
 pub use direct_io::{DirectIoError, DirectIoReader};
 pub use pool::{BytesPool, BytesPoolConfig, BytesPoolMetrics, PooledBuffer};
-pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
-pub use writer::{ZeroCopyObjectWriter, ZeroCopyWriteError};
+#[allow(deprecated)]
+pub use reader::ZeroCopyObjectReader;
+pub use reader::{BytesBufferedReader, ZeroCopyReadError};
+#[allow(deprecated)]
+pub use writer::ZeroCopyObjectWriter;
+pub use writer::{BytesMutWriter, ZeroCopyWriteError};
 
 // BufReader optimizer exports
 pub use bufreader_optimizer::{BufReaderConfig, BufReaderOptimizer, BufReaderStats, BufferedSource};

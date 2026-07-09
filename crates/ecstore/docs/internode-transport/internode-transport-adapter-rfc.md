@@ -132,10 +132,10 @@ They should remain on gRPC/TCP:
 
 | Area | Client/server code | Examples | Notes |
 | --- | --- | --- | --- |
-| Bucket peer ops | `crates/ecstore/src/rpc/peer_s3_client.rs`, `rustfs/src/storage/rpc/bucket.rs` | `MakeBucket`, `ListBucket`, `DeleteBucket`, `GetBucketInfo`, `HealBucket` | Small metadata/control payloads. |
-| Locking | `crates/ecstore/src/rpc/remote_locker.rs`, `rustfs/src/storage/rpc/lock.rs` | `Lock`, `UnLock`, `Refresh`, batch lock/unlock | Latency-sensitive but not bulk data; correctness and timeout semantics matter more than transport bandwidth. |
-| Peer/admin state | `crates/ecstore/src/rpc/peer_rest_client.rs`, `rustfs/src/storage/rpc/health.rs`, `metrics.rs`, `event.rs` | `LocalStorageInfo`, `ServerInfo`, `GetMetrics`, `GetLiveEvents`, reload APIs, rebalance APIs | Operational control plane. |
-| Disk metadata/control | `crates/ecstore/src/rpc/remote_disk.rs`, `rustfs/src/storage/rpc/disk.rs` | `DiskInfo`, `ReadXL`, `ReadVersion`, `ReadMetadata`, `WriteMetadata`, `RenameFile`, `RenamePart`, `Delete*`, `VerifyFile`, `CheckParts` | Usually metadata, integrity checks, or namespace mutations. |
+| Bucket peer ops | `crates/ecstore/src/rpc/peer_s3_client.rs`, `rustfs/src/storage/rpc/node_service/bucket.rs` | `MakeBucket`, `ListBucket`, `DeleteBucket`, `GetBucketInfo`, `HealBucket` | Small metadata/control payloads. |
+| Locking | `crates/ecstore/src/rpc/remote_locker.rs`, `rustfs/src/storage/rpc/node_service/lock.rs` | `Lock`, `UnLock`, `Refresh`, batch lock/unlock | Latency-sensitive but not bulk data; correctness and timeout semantics matter more than transport bandwidth. |
+| Peer/admin state | `crates/ecstore/src/rpc/peer_rest_client.rs`, `rustfs/src/storage/rpc/node_service/health.rs`, `node_service/metrics.rs`, `node_service/event.rs` | `LocalStorageInfo`, `ServerInfo`, `GetMetrics`, `GetLiveEvents`, reload APIs, rebalance APIs | Operational control plane. |
+| Disk metadata/control | `crates/ecstore/src/rpc/remote_disk.rs`, `rustfs/src/storage/rpc/node_service/disk.rs` | `DiskInfo`, `ReadXL`, `ReadVersion`, `ReadMetadata`, `WriteMetadata`, `RenameFile`, `RenamePart`, `Delete*`, `VerifyFile`, `CheckParts` | Usually metadata, integrity checks, or namespace mutations. |
 | Connection health | `RemoteDisk`, `RemotePeerS3Client`, `PeerRestClient` | TCP connectivity probes and fault/recovery state | Must remain available even if an optional data backend is unavailable. |
 
 ### Data plane candidates
@@ -171,18 +171,18 @@ Classification:
 | Remote shard read stream | `crates/ecstore/src/rpc/remote_disk.rs::RemoteDisk::read_file_stream`; `crates/ecstore/src/rpc/internode_data_transport.rs::InternodeDataTransport::open_read`; `crates/ecstore/src/bitrot.rs::create_bitrot_reader` | `rustfs/src/storage/rpc/http_service.rs::handle_read_file` | Covered by `InternodeDataTransport` | Object GET, repair reads, and erasure decode use this path for remote shard bytes. |
 | Remote shard write stream | `RemoteDisk::create_file`; `RemoteDisk::append_file`; `InternodeDataTransport::open_write`; `crates/ecstore/src/bitrot.rs::create_bitrot_writer` | `rustfs/src/storage/rpc/http_service.rs::handle_put_file` | Covered by `InternodeDataTransport` | Object PUT and multipart part upload use this path for remote shard bytes. |
 | Remote namespace walk stream | `RemoteDisk::walk_dir`; `InternodeDataTransport::open_walk_dir`; `crates/ecstore/src/cache_value/metacache_set.rs` walk producers | `rustfs/src/storage/rpc/http_service.rs::handle_walk_dir` | Covered by `InternodeDataTransport` | High-volume listing/scanner/heal metadata stream. It is not object byte data, but it is a large internode stream. |
-| Remote zero-copy read fallback | `RemoteDisk::read_file_zero_copy` | same as remote shard read stream | Covered by `InternodeDataTransport` through `read_file_stream` | The remote path buffers the stream into `Bytes`; true zero-copy is not guaranteed for remote disks. |
+| Remote mmap-copy read fallback | `RemoteDisk::read_file_mmap_copy` | same as remote shard read stream | Covered by `InternodeDataTransport` through `read_file_stream` | The remote path buffers the stream into `Bytes`; true zero-copy is not guaranteed for remote disks. |
 
 ### Still Direct TCP/HTTP/gRPC
 
 | Path | Owner references | Server references | Classification | Notes |
 | --- | --- | --- | --- | --- |
-| `ReadAll` | `RemoteDisk::read_all`; `crates/ecstore/src/store_init.rs`; heal resume metadata readers | `rustfs/src/storage/rpc/disk.rs::handle_read_all` | Still direct gRPC | Unary `bytes` response. Currently used mostly for metadata/config files; measure before moving. |
-| `WriteAll` | `RemoteDisk::write_all`; `crates/ecstore/src/store_init.rs`; heal resume metadata writers | `rustfs/src/storage/rpc/disk.rs::handle_write_all` | Still direct gRPC | Unary `bytes` request. Currently used mostly for metadata/config/checkpoint writes. |
-| `ReadMultiple` | `RemoteDisk::read_multiple`; `crates/ecstore/src/set_disk/read.rs::read_multiple_files` | `rustfs/src/storage/rpc/disk.rs::handle_read_multiple` | Still direct gRPC | Returns multiple small file payloads, usually metadata/listing support. Could become large with many entries. |
-| `ReadParts` | `RemoteDisk::read_parts`; `crates/ecstore/src/set_disk/read.rs::read_parts`; multipart list/complete paths | `rustfs/src/storage/rpc/disk.rs::handle_read_parts` | Still direct gRPC | Encoded `ObjectPartInfo` metadata, not object data. |
-| `RenamePart` | `RemoteDisk::rename_part`; `crates/ecstore/src/set_disk/write.rs::rename_part` | `rustfs/src/storage/rpc/disk.rs::handle_rename_part` | Still direct gRPC | Carries part metadata while committing multipart data already written through stream writers. |
-| `ListDir` | `RemoteDisk::list_dir`; multipart/lifecycle metadata listing callers | `rustfs/src/storage/rpc/disk.rs::handle_list_dir` | Still direct gRPC | Directory name listing, metadata/control-plane unless measured otherwise. |
+| `ReadAll` | `RemoteDisk::read_all`; `crates/ecstore/src/store_init.rs`; heal resume metadata readers | `rustfs/src/storage/rpc/node_service/disk.rs::handle_read_all` | Still direct gRPC | Unary `bytes` response. Currently used mostly for metadata/config files; measure before moving. |
+| `WriteAll` | `RemoteDisk::write_all`; `crates/ecstore/src/store_init.rs`; heal resume metadata writers | `rustfs/src/storage/rpc/node_service/disk.rs::handle_write_all` | Still direct gRPC | Unary `bytes` request. Currently used mostly for metadata/config/checkpoint writes. |
+| `ReadMultiple` | `RemoteDisk::read_multiple`; `crates/ecstore/src/set_disk/read.rs::read_multiple_files` | `rustfs/src/storage/rpc/node_service/disk.rs::handle_read_multiple` | Still direct gRPC | Returns multiple small file payloads, usually metadata/listing support. Could become large with many entries. |
+| `ReadParts` | `RemoteDisk::read_parts`; `crates/ecstore/src/set_disk/read.rs::read_parts`; multipart list/complete paths | `rustfs/src/storage/rpc/node_service/disk.rs::handle_read_parts` | Still direct gRPC | Encoded `ObjectPartInfo` metadata, not object data. |
+| `RenamePart` | `RemoteDisk::rename_part`; `crates/ecstore/src/set_disk/write.rs::rename_part` | `rustfs/src/storage/rpc/node_service/disk.rs::handle_rename_part` | Still direct gRPC | Carries part metadata while committing multipart data already written through stream writers. |
+| `ListDir` | `RemoteDisk::list_dir`; multipart/lifecycle metadata listing callers | `rustfs/src/storage/rpc/node_service/disk.rs::handle_list_dir` | Still direct gRPC | Directory name listing, metadata/control-plane unless measured otherwise. |
 | Legacy gRPC `WalkDir` | `rustfs/src/storage/rpc/node_service.rs::NodeService::walk_dir` | same file | Still direct gRPC | Server implementation remains, but current `RemoteDisk::walk_dir` uses HTTP through the transport. Keep until callers are audited or compatibility policy is set. |
 
 ### Metadata/control-plane only
@@ -190,7 +190,7 @@ Classification:
 | Area | Owner references | Classification | Notes |
 | --- | --- | --- | --- |
 | Disk metadata and namespace mutations | `RemoteDisk::{read_metadata,write_metadata,update_metadata,read_version,read_xl,rename_data,rename_file,delete*,verify_file,check_parts,disk_info}` | Metadata/control-plane only | These remain on gRPC by design. |
-| Peer/bucket/admin operations | `crates/ecstore/src/rpc/{peer_s3_client.rs,peer_rest_client.rs,remote_locker.rs}` and matching `rustfs/src/storage/rpc/*` handlers | Metadata/control-plane only | Not candidates for a data-plane backend without separate measurements. |
+| Peer/bucket/admin operations | `crates/ecstore/src/rpc/{peer_s3_client.rs,peer_rest_client.rs,remote_locker.rs}` and matching `rustfs/src/storage/rpc/node_service/*` handlers | Metadata/control-plane only | Not candidates for a data-plane backend without separate measurements. |
 | Store init and format operations | `crates/ecstore/src/store_init.rs` | Metadata/control-plane only | Uses `ReadAll`/`WriteAll` for small format/config objects. |
 | Heal orchestration | `crates/heal/src/heal/storage.rs` and `crates/ecstore/src/set_disk.rs::heal_object` | Metadata/control-plane plus covered data reads | Heal object data reads go through `get_object_reader` and then covered shard streams; resume/checkpoint metadata uses direct gRPC disk metadata calls. |
 
@@ -198,7 +198,7 @@ Classification:
 
 | Path | Owner references | Classification | Notes |
 | --- | --- | --- | --- |
-| Proto `Write` | `crates/protos/src/node.proto`; `rustfs/src/storage/rpc/disk.rs::handle_write` | Not relevant | Handler is unimplemented. |
+| Proto `Write` | `crates/protos/src/node.proto`; `rustfs/src/storage/rpc/node_service/disk.rs::handle_write` | Not relevant | Handler is unimplemented. |
 | Proto `WriteStream` | `crates/protos/src/node.proto`; `rustfs/src/storage/rpc/node_service.rs::write_stream` | Not relevant | Returns `unimplemented`. |
 | Proto `ReadAt` | `crates/protos/src/node.proto`; `rustfs/src/storage/rpc/node_service.rs::read_at` | Not relevant | Returns `unimplemented`. |
 | E2E reliant gRPC helpers | `crates/e2e_test/src/reliant/*` | Not relevant | Test harnesses, not production internode data-path callers. |
@@ -210,7 +210,7 @@ Classification:
 | Medium | `ReadAll` and `WriteAll` still carry unary `bytes` over gRPC. They appear metadata-oriented today, but there is no size threshold or routing policy. |
 | Medium | `ReadMultiple` can aggregate many metadata files into one gRPC response. |
 | Low | Legacy gRPC `WalkDir` remains implemented while `RemoteDisk::walk_dir` uses HTTP through the transport. |
-| Medium | Remote `read_file_zero_copy` is a buffered read over the transport, not a remote zero-copy contract. |
+| Medium | Remote `read_file_mmap_copy` is a buffered read over the transport, not a remote zero-copy contract. |
 | Medium | Server-side TCP HTTP route handling is outside the client-side trait. |
 
 ## Current Object Write Path
@@ -235,7 +235,7 @@ This is the primary write data-plane candidate.
 For object GETs and repair reads in distributed erasure mode, the relevant flow is:
 
 1. `SetDisks` prepares shard readers for the selected disks.
-2. `create_bitrot_reader` uses local zero-copy only when `disk.is_local()`.
+2. `create_bitrot_reader` uses local mmap-copy reads only when `disk.is_local()`.
 3. For a remote disk, it calls `disk.read_file_stream(...)`.
 4. `RemoteDisk::read_file_stream` delegates to
    `InternodeDataTransport::open_read`.
@@ -385,7 +385,7 @@ The initial TCP backend can keep the current signed HTTP URLs internally.
 `RemoteDisk` delegates only these methods to the data transport:
 
 - `read_file_stream`
-- `read_file_zero_copy` as the current wrapper over `read_file_stream`
+- `read_file_mmap_copy` as the current wrapper over `read_file_stream`
 - `append_file`
 - `create_file`
 - `walk_dir`

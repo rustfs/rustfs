@@ -53,8 +53,10 @@ pub const DEFAULT_TRUSTED_PROXY_LOG_FAILED_VALIDATIONS: bool = true;
 // ==================== Trusted Proxy Networks ====================
 /// Environment variable for the list of trusted proxy networks (comma-separated IP/CIDR).
 pub const ENV_TRUSTED_PROXY_PROXIES: &str = "RUSTFS_TRUSTED_PROXY_NETWORKS";
-/// Default trusted networks include localhost and common private ranges.
-pub const DEFAULT_TRUSTED_PROXY_PROXIES: &str = "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8";
+/// Default trusted networks are loopback-only. Private/RFC1918 ranges are not
+/// trusted by default: an operator must explicitly add the specific proxy
+/// addresses in front of this server to have forwarding headers honored.
+pub const DEFAULT_TRUSTED_PROXY_PROXIES: &str = "127.0.0.1,::1";
 
 /// Environment variable for additional trusted proxy networks (production specific).
 pub const ENV_TRUSTED_PROXY_EXTRA_PROXIES: &str = "RUSTFS_TRUSTED_PROXY_EXTRA_NETWORKS";

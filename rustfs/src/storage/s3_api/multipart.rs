@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-use crate::storage::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_storage_api::{ListMultipartsInfo, ListPartsInfo};
+use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
+    ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
+};
+use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_etag;
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
 const MAX_MULTIPART_UPLOADS_LIST: i32 = 1000;
-const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ListPartsParams {
@@ -153,6 +154,9 @@ pub(crate) fn build_list_multipart_uploads_output(
     prefix: String,
     result: ListMultipartsInfo,
 ) -> ListMultipartUploadsOutput {
+    let owner = rustfs_owner();
+    let initiator = rustfs_initiator();
+
     ListMultipartUploadsOutput {
         bucket: Some(bucket),
         prefix: Some(prefix),
@@ -169,6 +173,8 @@ pub(crate) fn build_list_multipart_uploads_output(
                     key: Some(u.object),
                     upload_id: Some(u.upload_id),
                     initiated: u.initiated.map(Timestamp::from),
+                    owner: Some(owner.clone()),
+                    initiator: Some(initiator.clone()),
                     ..Default::default()
                 })
                 .collect(),
@@ -191,8 +197,10 @@ mod tests {
         parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
     };
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use crate::storage::storage_compat::ecstore::client::object_api_utils::to_s3s_etag;
-    use rustfs_storage_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
+    use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
+        ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo,
+    };
+    use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_etag;
     use s3s::S3ErrorCode;
     use s3s::dto::Timestamp;
     use time::OffsetDateTime;
@@ -298,6 +306,8 @@ mod tests {
         assert_eq!(uploads[0].key.as_deref(), Some("obj-a"));
         assert_eq!(uploads[0].upload_id.as_deref(), Some("upload-a"));
         assert_eq!(uploads[0].initiated, Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
+        assert_eq!(uploads[0].owner, Some(rustfs_owner()));
+        assert_eq!(uploads[0].initiator, Some(rustfs_initiator()));
 
         assert_eq!(common_prefixes.len(), 2);
         assert_eq!(common_prefixes[0].prefix.as_deref(), Some("prefix-a/"));

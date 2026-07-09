@@ -14,14 +14,15 @@
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::storage_compat::{BUCKET_META_PREFIX, DiskAPI, DiskError, DiskStore, RUSTFS_META_BUCKET};
+use super::{BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, RUSTFS_META_BUCKET};
 
 const LOG_COMPONENT_HEAL: &str = "heal";
 const LOG_SUBSYSTEM_RESUME: &str = "resume";
@@ -33,6 +34,58 @@ const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
 
+/// Current on-disk schema version for `ResumeState`. Snapshots written by an
+/// older schema (which tracked latest-only object names and a positional
+/// cursor) are incompatible with the per-version resume cursor, so they are
+/// discarded on load and the scan restarts from the beginning.
+const CURRENT_RESUME_SCHEMA: u32 = 2;
+/// Current on-disk schema version for `ResumeCheckpoint`. Same rationale as
+/// `CURRENT_RESUME_SCHEMA`: pre-per-version dedup identities are not comparable
+/// to the new `compose_key` identities, so a stale checkpoint is discarded.
+const CURRENT_CHECKPOINT_SCHEMA: u32 = 2;
+
+/// Build the canonical, provably-injective dedup identity for an object
+/// version. Length-prefixing the object key makes the encoding injective: no
+/// two distinct `(object, version_id)` pairs can collide, even for adversarial
+/// keys containing `:` or embedded null bytes. This is the single source of
+/// truth for per-version dedup across the heal loop and the checkpoint sets.
+pub fn compose_key(object: &str, version_id: Option<&str>) -> String {
+    format!("{}:{}{}", object.len(), object, version_id.unwrap_or(""))
+}
+
+/// Persistence throttle for per-object bookkeeping: flush after this many
+/// buffered mutations or once the interval elapses, whichever comes first.
+/// Object heal is idempotent, so a crash re-heals at most one throttle window.
+const PERSIST_EVERY_MUTATIONS: usize = 1000;
+const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Tracks buffered mutations between persisted snapshots.
+#[derive(Debug)]
+struct PersistThrottle {
+    pending: usize,
+    last_save: Instant,
+}
+
+impl PersistThrottle {
+    fn new() -> Self {
+        Self {
+            pending: 0,
+            last_save: Instant::now(),
+        }
+    }
+
+    /// Record one mutation; returns true when the batch should be flushed.
+    fn record(&mut self) -> bool {
+        self.pending += 1;
+        self.pending >= PERSIST_EVERY_MUTATIONS || self.last_save.elapsed() >= PERSIST_INTERVAL
+    }
+
+    fn mark_saved(&mut self) {
+        self.pending = 0;
+        self.last_save = Instant::now();
+    }
+}
+
 /// Helper function to convert Path to &str, returning an error if conversion fails
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
@@ -42,6 +95,13 @@ fn path_to_str(path: &Path) -> Result<&str> {
 /// resume state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeState {
+    /// on-disk schema version; absent in legacy snapshots (defaults to 0)
+    #[serde(default)]
+    pub schema_version: u32,
+    /// authoritative opaque `(marker, version_marker)` continuation token for
+    /// the version listing. `None` means "start from the beginning".
+    #[serde(default)]
+    pub resume_cursor: Option<String>,
     /// task id
     pub task_id: String,
     /// task type
@@ -84,6 +144,8 @@ pub struct ResumeState {
 impl ResumeState {
     pub fn new(task_id: String, task_type: String, set_disk_id: String, buckets: Vec<String>) -> Self {
         Self {
+            schema_version: CURRENT_RESUME_SCHEMA,
+            resume_cursor: None,
             task_id,
             task_type,
             set_disk_id,
@@ -119,6 +181,18 @@ impl ResumeState {
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
+    /// Read the authoritative version-listing continuation cursor.
+    pub fn resume_cursor(&self) -> Option<String> {
+        self.resume_cursor.clone()
+    }
+
+    /// Persist the authoritative version-listing continuation cursor. `None`
+    /// resets the scan to the beginning of the current bucket.
+    pub fn set_resume_cursor(&mut self, cursor: Option<String>) {
+        self.resume_cursor = cursor;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
     pub fn complete_bucket(&mut self, bucket: &str) {
         if !self.completed_buckets.contains(&bucket.to_string()) {
             self.completed_buckets.push(bucket.to_string());
@@ -131,6 +205,22 @@ impl ResumeState {
 
     pub fn mark_completed(&mut self) {
         self.completed = true;
+        self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    /// Reset per-pass progress so a retry re-scans the whole set from the
+    /// start. `retry_count`/`max_retries` are intentionally preserved so
+    /// retries stay bounded.
+    pub fn reset_for_retry(&mut self) {
+        self.completed_buckets.clear();
+        self.processed_objects = 0;
+        self.successful_objects = 0;
+        self.failed_objects = 0;
+        self.skipped_objects = 0;
+        self.completed = false;
+        // A retry re-scans every bucket from the beginning, so the version
+        // cursor must be cleared too — otherwise the retry would resume mid-scan.
+        self.resume_cursor = None;
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
@@ -168,6 +258,7 @@ impl ResumeState {
 pub struct ResumeManager {
     disk: DiskStore,
     state: Arc<RwLock<ResumeState>>,
+    throttle: Mutex<PersistThrottle>,
 }
 
 impl ResumeManager {
@@ -183,6 +274,7 @@ impl ResumeManager {
         let manager = Self {
             disk,
             state: Arc::new(RwLock::new(state)),
+            throttle: Mutex::new(PersistThrottle::new()),
         };
 
         // save initial state
@@ -203,13 +295,38 @@ impl ResumeManager {
     /// load resume state from disk
     pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
         let state_data = Self::read_state_file(&disk, task_id).await?;
-        let state: ResumeState = serde_json::from_slice(&state_data).map_err(|e| Error::TaskExecutionFailed {
+        let mut state: ResumeState = serde_json::from_slice(&state_data).map_err(|e| Error::TaskExecutionFailed {
             message: format!("Failed to deserialize resume state: {e}"),
         })?;
+
+        // A snapshot written by an older schema tracked a latest-only positional
+        // cursor that is meaningless under per-version resume. Discard the stale
+        // progress so the scan restarts cleanly, then stamp the current schema.
+        if state.schema_version < CURRENT_RESUME_SCHEMA {
+            warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_RESUME_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                task_id,
+                found_schema = state.schema_version,
+                current_schema = CURRENT_RESUME_SCHEMA,
+                state = "schema_discarded",
+                "Heal resume state schema is stale; discarding cursor and progress"
+            );
+            state.resume_cursor = None;
+            state.processed_objects = 0;
+            state.successful_objects = 0;
+            state.failed_objects = 0;
+            state.skipped_objects = 0;
+            state.completed = false;
+            state.schema_version = CURRENT_RESUME_SCHEMA;
+        }
 
         Ok(Self {
             disk,
             state: Arc::new(RwLock::new(state)),
+            throttle: Mutex::new(PersistThrottle::new()),
         })
     }
 
@@ -235,13 +352,44 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.update_progress(processed, successful, failed, skipped);
         drop(state);
-        self.save_state().await
+        self.save_state_throttled().await
     }
 
-    /// set current item
+    /// Set current item. Called once per healed object, so persistence is
+    /// throttled: the in-memory state always updates, but the snapshot is only
+    /// written every `PERSIST_EVERY_MUTATIONS` calls or `PERSIST_INTERVAL`.
     pub async fn set_current_item(&self, bucket: Option<String>, object: Option<String>) -> Result<()> {
         let mut state = self.state.write().await;
         state.set_current_item(bucket, object);
+        drop(state);
+        let should_save = self.throttle.lock().map(|mut throttle| throttle.record()).unwrap_or(true);
+        if !should_save {
+            return Ok(());
+        }
+        self.save_state_throttled().await
+    }
+
+    async fn save_state_throttled(&self) -> Result<()> {
+        let result = self.save_state().await;
+        if result.is_ok()
+            && let Ok(mut throttle) = self.throttle.lock()
+        {
+            throttle.mark_saved();
+        }
+        result
+    }
+
+    /// Read the authoritative version-listing continuation cursor.
+    pub async fn resume_cursor(&self) -> Option<String> {
+        self.state.read().await.resume_cursor()
+    }
+
+    /// Persist the authoritative version-listing continuation cursor. This is
+    /// written unthrottled (once per completed page) so a crash always resumes
+    /// from a real page boundary.
+    pub async fn set_resume_cursor(&self, cursor: Option<String>) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.set_resume_cursor(cursor);
         drop(state);
         self.save_state().await
     }
@@ -251,7 +399,7 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.complete_bucket(bucket);
         drop(state);
-        self.save_state().await
+        self.save_state_throttled().await
     }
 
     /// mark task completed
@@ -259,7 +407,7 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.mark_completed();
         drop(state);
-        self.save_state().await
+        self.save_state_throttled().await
     }
 
     /// set error message
@@ -276,6 +424,22 @@ impl ResumeManager {
         state.increment_retry();
         drop(state);
         self.save_state().await
+    }
+
+    /// Arm a bounded retry: if the retry budget remains, bump the retry
+    /// counter, reset per-pass progress (so the next resume re-scans the whole
+    /// set), persist, and return `true`. Returns `false` when retries are
+    /// exhausted, leaving the state untouched.
+    pub async fn schedule_retry(&self) -> Result<bool> {
+        let mut state = self.state.write().await;
+        if !state.can_retry() {
+            return Ok(false);
+        }
+        state.increment_retry();
+        state.reset_for_retry();
+        drop(state);
+        self.save_state().await?;
+        Ok(true)
     }
 
     /// cleanup resume state
@@ -368,6 +532,9 @@ impl ResumeManager {
 /// resume checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeCheckpoint {
+    /// on-disk schema version; absent in legacy snapshots (defaults to 0)
+    #[serde(default)]
+    pub schema_version: u32,
     /// task id
     pub task_id: String,
     /// checkpoint time
@@ -376,24 +543,28 @@ pub struct ResumeCheckpoint {
     pub current_bucket_index: usize,
     /// current object index
     pub current_object_index: usize,
-    /// processed objects
-    pub processed_objects: Vec<String>,
+    /// Objects healed since the last completed page. HashSet: with the
+    /// previous Vec the per-object `contains` was O(n) and made large-bucket
+    /// heals O(N²). Only spans the in-flight page — completed pages are
+    /// covered by `current_object_index`, so `complete_page` prunes the sets.
+    pub processed_objects: HashSet<String>,
     /// failed objects
-    pub failed_objects: Vec<String>,
+    pub failed_objects: HashSet<String>,
     /// skipped objects
-    pub skipped_objects: Vec<String>,
+    pub skipped_objects: HashSet<String>,
 }
 
 impl ResumeCheckpoint {
     pub fn new(task_id: String) -> Self {
         Self {
+            schema_version: CURRENT_CHECKPOINT_SCHEMA,
             task_id,
             checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             current_bucket_index: 0,
             current_object_index: 0,
-            processed_objects: Vec::new(),
-            failed_objects: Vec::new(),
-            skipped_objects: Vec::new(),
+            processed_objects: HashSet::new(),
+            failed_objects: HashSet::new(),
+            skipped_objects: HashSet::new(),
         }
     }
 
@@ -404,21 +575,34 @@ impl ResumeCheckpoint {
     }
 
     pub fn add_processed_object(&mut self, object: String) {
-        if !self.processed_objects.contains(&object) {
-            self.processed_objects.push(object);
-        }
+        self.processed_objects.insert(object);
     }
 
     pub fn add_failed_object(&mut self, object: String) {
-        if !self.failed_objects.contains(&object) {
-            self.failed_objects.push(object);
-        }
+        self.failed_objects.insert(object);
     }
 
     pub fn add_skipped_object(&mut self, object: String) {
-        if !self.skipped_objects.contains(&object) {
-            self.skipped_objects.push(object);
-        }
+        self.skipped_objects.insert(object);
+    }
+
+    /// Advance past a fully-processed page: objects below `object_index` are
+    /// skipped by position on resume, so the per-object sets no longer need
+    /// their entries and would otherwise grow with the whole bucket.
+    pub fn complete_page(&mut self, bucket_index: usize, object_index: usize) {
+        self.update_position(bucket_index, object_index);
+        self.processed_objects.clear();
+        self.skipped_objects.clear();
+        self.failed_objects.clear();
+    }
+
+    /// Reset the scan to the start and clear the per-object sets so a retry
+    /// re-scans the whole set.
+    pub fn reset_for_retry(&mut self) {
+        self.update_position(0, 0);
+        self.processed_objects.clear();
+        self.skipped_objects.clear();
+        self.failed_objects.clear();
     }
 }
 
@@ -426,6 +610,7 @@ impl ResumeCheckpoint {
 pub struct CheckpointManager {
     disk: DiskStore,
     checkpoint: Arc<RwLock<ResumeCheckpoint>>,
+    throttle: Mutex<PersistThrottle>,
 }
 
 impl CheckpointManager {
@@ -435,6 +620,7 @@ impl CheckpointManager {
         let manager = Self {
             disk,
             checkpoint: Arc::new(RwLock::new(checkpoint)),
+            throttle: Mutex::new(PersistThrottle::new()),
         };
 
         // save initial checkpoint
@@ -455,13 +641,38 @@ impl CheckpointManager {
     /// load checkpoint from disk
     pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
         let checkpoint_data = Self::read_checkpoint_file(&disk, task_id).await?;
-        let checkpoint: ResumeCheckpoint = serde_json::from_slice(&checkpoint_data).map_err(|e| Error::TaskExecutionFailed {
-            message: format!("Failed to deserialize checkpoint: {e}"),
-        })?;
+        let mut checkpoint: ResumeCheckpoint =
+            serde_json::from_slice(&checkpoint_data).map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to deserialize checkpoint: {e}"),
+            })?;
+
+        // A checkpoint from an older schema stored latest-only dedup identities
+        // that are not comparable to the new per-version `compose_key`
+        // identities. Discard the stale sets and position, then stamp the
+        // current schema so the scan restarts cleanly.
+        if checkpoint.schema_version < CURRENT_CHECKPOINT_SCHEMA {
+            warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_CHECKPOINT_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                task_id,
+                found_schema = checkpoint.schema_version,
+                current_schema = CURRENT_CHECKPOINT_SCHEMA,
+                state = "schema_discarded",
+                "Heal checkpoint schema is stale; discarding dedup sets and position"
+            );
+            checkpoint.processed_objects.clear();
+            checkpoint.failed_objects.clear();
+            checkpoint.skipped_objects.clear();
+            checkpoint.current_object_index = 0;
+            checkpoint.schema_version = CURRENT_CHECKPOINT_SCHEMA;
+        }
 
         Ok(Self {
             disk,
             checkpoint: Arc::new(RwLock::new(checkpoint)),
+            throttle: Mutex::new(PersistThrottle::new()),
         })
     }
 
@@ -487,31 +698,67 @@ impl CheckpointManager {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.update_position(bucket_index, object_index);
         drop(checkpoint);
-        self.save_checkpoint().await
+        self.save_checkpoint_throttled().await
     }
 
-    /// add processed object
+    /// Advance past a completed page and prune the per-object sets, then persist.
+    pub async fn complete_page(&self, bucket_index: usize, object_index: usize) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.complete_page(bucket_index, object_index);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    /// Reset the checkpoint to the start of the scan for a retry, then persist.
+    pub async fn reset_for_retry(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.reset_for_retry();
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    /// Add a processed object. Called once per healed object, so persistence
+    /// is batched (`PERSIST_EVERY_MUTATIONS` / `PERSIST_INTERVAL`); positions
+    /// and page boundaries still persist unconditionally.
     pub async fn add_processed_object(&self, object: String) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.add_processed_object(object);
         drop(checkpoint);
-        self.save_checkpoint().await
+        self.save_checkpoint_if_due().await
     }
 
-    /// add failed object
+    /// add failed object (batched, see `add_processed_object`)
     pub async fn add_failed_object(&self, object: String) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.add_failed_object(object);
         drop(checkpoint);
-        self.save_checkpoint().await
+        self.save_checkpoint_if_due().await
     }
 
-    /// add skipped object
+    /// add skipped object (batched, see `add_processed_object`)
     pub async fn add_skipped_object(&self, object: String) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.add_skipped_object(object);
         drop(checkpoint);
-        self.save_checkpoint().await
+        self.save_checkpoint_if_due().await
+    }
+
+    async fn save_checkpoint_if_due(&self) -> Result<()> {
+        let should_save = self.throttle.lock().map(|mut throttle| throttle.record()).unwrap_or(true);
+        if !should_save {
+            return Ok(());
+        }
+        self.save_checkpoint_throttled().await
+    }
+
+    async fn save_checkpoint_throttled(&self) -> Result<()> {
+        let result = self.save_checkpoint().await;
+        if result.is_ok()
+            && let Ok(mut throttle) = self.throttle.lock()
+        {
+            throttle.mark_saved();
+        }
+        result
     }
 
     /// cleanup checkpoint
@@ -717,6 +964,56 @@ mod tests {
         assert_eq!(progress, 10.0);
     }
 
+    #[test]
+    fn reset_for_retry_clears_progress_but_keeps_retry_budget() {
+        // backlog#855 / #799 B6: a retry must re-scan from the start without
+        // spending the retry budget's identity.
+        let buckets = vec!["bucket1".to_string(), "bucket2".to_string()];
+        let mut state = ResumeState::new("t".to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), buckets);
+        state.update_progress(10, 8, 2, 0);
+        state.complete_bucket("bucket1");
+        state.increment_retry();
+        state.mark_completed();
+
+        state.reset_for_retry();
+
+        assert!(!state.completed, "retry must un-complete the task");
+        assert_eq!(state.completed_buckets.len(), 0, "all buckets must be re-scanned");
+        assert_eq!(state.processed_objects, 0);
+        assert_eq!(state.successful_objects, 0);
+        assert_eq!(state.failed_objects, 0);
+        assert_eq!(state.skipped_objects, 0);
+        assert_eq!(state.retry_count, 1, "retry budget must be preserved");
+    }
+
+    #[test]
+    fn can_retry_is_bounded_by_max_retries() {
+        let mut state = ResumeState::new("t".to_string(), "erasure_set".to_string(), "pool_0_set_0".to_string(), vec![]);
+        assert!(state.can_retry());
+        for _ in 0..state.max_retries {
+            assert!(state.can_retry());
+            state.increment_retry();
+        }
+        assert!(!state.can_retry(), "retries must stop after max_retries");
+    }
+
+    #[test]
+    fn checkpoint_reset_for_retry_rewinds_position_and_clears_sets() {
+        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
+        checkpoint.update_position(3, 42);
+        checkpoint.add_processed_object("bucket/a".to_string());
+        checkpoint.add_failed_object("bucket/b".to_string());
+        checkpoint.add_skipped_object("bucket/c".to_string());
+
+        checkpoint.reset_for_retry();
+
+        assert_eq!(checkpoint.current_bucket_index, 0);
+        assert_eq!(checkpoint.current_object_index, 0);
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
+    }
+
     #[tokio::test]
     async fn test_resume_state_bucket_completion() {
         let task_id = ResumeUtils::generate_task_id();
@@ -732,6 +1029,188 @@ mod tests {
         assert!(state.completed_buckets.contains(&"bucket1".to_string()));
     }
 
+    #[test]
+    fn test_checkpoint_object_sets_dedupe_and_prune() {
+        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
+        checkpoint.add_processed_object("bucket/a".to_string());
+        checkpoint.add_processed_object("bucket/a".to_string());
+        checkpoint.add_skipped_object("bucket/b".to_string());
+        checkpoint.add_failed_object("bucket/c".to_string());
+        assert_eq!(checkpoint.processed_objects.len(), 1);
+        assert!(checkpoint.processed_objects.contains("bucket/a"));
+
+        checkpoint.complete_page(2, 2000);
+        assert_eq!(checkpoint.current_bucket_index, 2);
+        assert_eq!(checkpoint.current_object_index, 2000);
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+    }
+
+    #[test]
+    fn test_checkpoint_loads_legacy_vec_format() {
+        // Checkpoints written before the HashSet migration stored the object
+        // lists as JSON arrays (possibly with duplicates); they must still load.
+        let legacy = r#"{
+            "task_id": "t1",
+            "checkpoint_time": 1700000000,
+            "current_bucket_index": 1,
+            "current_object_index": 42,
+            "processed_objects": ["a", "b", "a"],
+            "failed_objects": [],
+            "skipped_objects": ["c"]
+        }"#;
+        let checkpoint: ResumeCheckpoint = serde_json::from_str(legacy).unwrap();
+        assert_eq!(checkpoint.current_object_index, 42);
+        assert_eq!(checkpoint.processed_objects.len(), 2);
+        assert!(checkpoint.processed_objects.contains("a"));
+        assert!(checkpoint.skipped_objects.contains("c"));
+    }
+
+    #[test]
+    fn test_compose_key_injective_with_adversarial_keys() {
+        // Length-prefixing must keep the encoding injective even when keys
+        // contain the delimiter, embedded nulls, or look like a composed key.
+        assert_ne!(compose_key("a\0b", None), compose_key("a", Some("b")));
+        assert_ne!(compose_key("3:xy", None), compose_key("x", Some("y")));
+        assert_ne!(compose_key("a:b", None), compose_key("a", Some("b")));
+        assert_ne!(compose_key("", Some("x")), compose_key("x", None));
+        // Identical inputs must produce identical keys (stable identity).
+        assert_eq!(compose_key("obj", Some("v1")), compose_key("obj", Some("v1")));
+    }
+
+    #[test]
+    fn test_composite_key_dedup_distinguishes_versions() {
+        // Two versions of the same object must be distinct dedup identities, and
+        // the delete-marker/nil (None) version must not collide with a real one.
+        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
+        checkpoint.add_processed_object(compose_key("obj", Some("v1")));
+        checkpoint.add_processed_object(compose_key("obj", Some("v2")));
+        checkpoint.add_processed_object(compose_key("obj", None));
+        assert_eq!(checkpoint.processed_objects.len(), 3);
+        assert!(checkpoint.processed_objects.contains(&compose_key("obj", Some("v1"))));
+        assert!(checkpoint.processed_objects.contains(&compose_key("obj", Some("v2"))));
+        assert!(checkpoint.processed_objects.contains(&compose_key("obj", None)));
+        // A different object with the same version id is still distinct.
+        assert!(!checkpoint.processed_objects.contains(&compose_key("other", Some("v1"))));
+    }
+
+    #[tokio::test]
+    async fn test_resumestate_schema_v0_discarded_on_load() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let disk_path = temp_dir.path().join("test_disk");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
+        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
+
+        // Legacy snapshot: no schema_version, a stale positional cursor and progress.
+        let legacy = r#"{
+            "task_id": "old-task",
+            "task_type": "erasure_set",
+            "set_disk_id": "pool_0_set_0",
+            "start_time": 1700000000,
+            "last_update": 1700000000,
+            "completed": true,
+            "total_objects": 100,
+            "processed_objects": 50,
+            "successful_objects": 40,
+            "failed_objects": 10,
+            "skipped_objects": 0,
+            "current_bucket": null,
+            "current_object": null,
+            "completed_buckets": ["b1"],
+            "pending_buckets": [],
+            "error_message": null,
+            "retry_count": 1,
+            "max_retries": 3,
+            "resume_cursor": "v1:stale-token"
+        }"#;
+        let file_path = format!("{BUCKET_META_PREFIX}/old-task_{RESUME_STATE_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
+            .await
+            .unwrap();
+
+        let manager = ResumeManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
+        let state = manager.get_state().await;
+        assert_eq!(state.schema_version, CURRENT_RESUME_SCHEMA, "schema must be stamped current");
+        assert_eq!(state.resume_cursor, None, "stale cursor must be cleared");
+        assert_eq!(state.processed_objects, 0);
+        assert_eq!(state.successful_objects, 0);
+        assert_eq!(state.failed_objects, 0);
+        assert!(!state.completed);
+        temp_dir.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_schema_v0_discarded_on_load() {
+        use super::super::{DiskOption, Endpoint, new_disk};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let disk_path = temp_dir.path().join("test_disk");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        let endpoint = Endpoint::try_from(disk_path.to_string_lossy().as_ref()).unwrap();
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = disk.make_volume(RUSTFS_META_BUCKET).await;
+        let _ = disk.make_volume(&format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}")).await;
+
+        // Legacy checkpoint: no schema_version, stale position and dedup sets.
+        let legacy = r#"{
+            "task_id": "old-task",
+            "checkpoint_time": 1700000000,
+            "current_bucket_index": 2,
+            "current_object_index": 500,
+            "processed_objects": ["a", "b"],
+            "failed_objects": ["c"],
+            "skipped_objects": ["d"]
+        }"#;
+        let file_path = format!("{BUCKET_META_PREFIX}/old-task_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &file_path, legacy.as_bytes().to_vec().into())
+            .await
+            .unwrap();
+
+        let manager = CheckpointManager::load_from_disk(disk.clone(), "old-task").await.unwrap();
+        let checkpoint = manager.get_checkpoint().await;
+        assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA, "schema must be stamped current");
+        assert_eq!(checkpoint.current_object_index, 0, "stale position must be reset");
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
+        temp_dir.close().unwrap();
+    }
+
+    #[test]
+    fn test_persist_throttle_batches_until_threshold() {
+        let mut throttle = PersistThrottle::new();
+        for _ in 0..PERSIST_EVERY_MUTATIONS - 1 {
+            assert!(!throttle.record(), "must not flush below the mutation threshold");
+        }
+        assert!(throttle.record(), "must flush at the mutation threshold");
+        throttle.mark_saved();
+        assert!(!throttle.record(), "counter must reset after a save");
+    }
+
     #[tokio::test]
     async fn test_resume_utils() {
         let task_id1 = ResumeUtils::generate_task_id();
@@ -744,7 +1223,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_resumable_tasks_integration() {
-        use super::super::storage_compat::{DiskOption, Endpoint, new_disk};
+        use super::super::{DiskOption, Endpoint, new_disk};
         use tempfile::TempDir;
 
         // Create a temporary directory for testing

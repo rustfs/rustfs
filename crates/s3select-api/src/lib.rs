@@ -13,65 +13,67 @@
 // limitations under the License.
 
 use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
-use snafu::{Backtrace, Location, Snafu};
 use std::fmt::Display;
+use thiserror::Error;
 
 pub mod object_store;
 pub mod query;
 pub mod server;
-mod storage_compat;
+mod storage_api;
 
 #[cfg(test)]
 mod test;
 
 pub type QueryResult<T> = Result<T, QueryError>;
+pub(crate) use storage_api::crate_boundary::{
+    SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
+    SelectStore, resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
+    select_is_err_version_not_found,
+};
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
+#[derive(Debug, Error)]
 pub enum QueryError {
-    #[snafu(display("DataFusion error: {}", source))]
-    Datafusion {
-        source: Box<DataFusionError>,
-        location: Location,
-        backtrace: Backtrace,
-    },
+    #[error("DataFusion error: {source}")]
+    Datafusion { source: Box<DataFusionError> },
 
-    #[snafu(display("This feature is not implemented: {}", err))]
+    #[error("This feature is not implemented: {err}")]
     NotImplemented { err: String },
 
-    #[snafu(display("Multi-statement not allow, found num:{}, sql:{}", num, sql))]
+    #[error("Multi-statement not allow, found num:{num}, sql:{sql}")]
     MultiStatement { num: usize, sql: String },
 
-    #[snafu(display("Failed to build QueryDispatcher. err: {}", err))]
+    #[error("Failed to build QueryDispatcher. err: {err}")]
     BuildQueryDispatcher { err: String },
 
-    #[snafu(display("The query has been canceled"))]
+    #[error("The query has been canceled")]
     Cancel,
 
-    #[snafu(display("{}", source))]
-    Parser { source: ParserError },
+    #[error("{source}")]
+    Parser {
+        #[from]
+        source: ParserError,
+    },
 
-    #[snafu(display("Udf not exists, name:{}.", name))]
+    #[error("Udf not exists, name:{name}.")]
     FunctionNotExists { name: String },
 
-    #[snafu(display("Udf already exists, name:{}.", name))]
+    #[error("Udf already exists, name:{name}.")]
     FunctionExists { name: String },
 
-    #[snafu(display("Store Error, e:{}.", e))]
+    #[error("Store Error, e:{e}.")]
     StoreError { e: String },
 }
 
 impl From<DataFusionError> for QueryError {
-    #[track_caller]
     fn from(value: DataFusionError) -> Self {
         match value {
-            DataFusionError::External(e) if e.downcast_ref::<QueryError>().is_some() => *e.downcast::<QueryError>().unwrap(),
-
-            v => Self::Datafusion {
-                source: Box::new(v),
-                location: std::panic::Location::caller(),
-                backtrace: Backtrace::capture(),
+            DataFusionError::External(e) => match e.downcast::<QueryError>() {
+                Ok(query_error) => *query_error,
+                Err(e) => Self::Datafusion {
+                    source: Box::new(DataFusionError::External(e)),
+                },
             },
+            v => Self::Datafusion { source: Box::new(v) },
         }
     }
 }

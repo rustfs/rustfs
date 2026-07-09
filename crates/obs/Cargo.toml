@@ -28,7 +28,7 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 [features]
 default = []
 gpu = ["dep:nvml-wrapper"]
-pyroscope = ["dep:jemalloc_pprof", "dep:pyroscope"]
+pyroscope = ["dep:pyroscope"]
 
 [lints]
 workspace = true
@@ -37,6 +37,12 @@ workspace = true
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-config = { workspace = true, features = ["constants", "observability"] }
+# NOTE: This dependency on rustfs-ecstore is a known architectural limitation.
+# The obs crate imports types from ecstore for metrics collection.
+# Breaking this dependency would require defining traits in obs and
+# implementing them in ecstore, which is a significant refactoring.
+# See docs/architecture/obs-ecstore-dependency-inventory.md and
+# https://github.com/rustfs/backlog/issues/735 for discussion.
 rustfs-ecstore = { workspace = true }
 rustfs-iam = { workspace = true }
 rustfs-io-metrics = { workspace = true }
@@ -52,6 +58,7 @@ metrics = { workspace = true }
 crossbeam-channel = { workspace = true }
 crossbeam-deque = { workspace = true }
 crossbeam-utils = { workspace = true }
+futures-util = { workspace = true }
 num_cpus = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
@@ -77,7 +84,6 @@ nvml-wrapper = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 pyroscope = { workspace = true, features = ["backend-pprof-rs"], optional = true }
-jemalloc_pprof = { workspace = true, optional = true }
 
 
 [dev-dependencies]

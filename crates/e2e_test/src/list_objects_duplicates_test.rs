@@ -198,4 +198,121 @@ mod tests {
 
         env.stop_server();
     }
+
+    /// Test ensuring that a plain object and a same-named prefix coexist in
+    /// delimiter listings on a single-disk deployment.
+    ///
+    /// Bug Reference: backlog#880 / backlog#1042
+    /// On a single disk, object `a` and its children `a/...` share one backing
+    /// directory, so the non-recursive scan used to classify `a` as an object
+    /// and never produce the prefix entry `a/`. Delimiter="/" listings then
+    /// returned Contents `a` but silently dropped CommonPrefix `a/`.
+    #[tokio::test]
+    #[serial]
+    async fn test_list_objects_v2_object_and_same_named_prefix_coexist() {
+        init_logging();
+        info!("Starting test: ListObjectsV2 should return both object `a` and CommonPrefix `a/`");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(vec![], &[("RUSTFS_CONSOLE_ENABLE", "false")])
+            .await
+            .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-list-object-prefix-coexist";
+
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        for (key, body) in [
+            ("a", ByteStream::from_static(b"object body")),
+            ("a/b", ByteStream::from_static(b"child body")),
+            ("plain", ByteStream::from_static(b"no children")),
+        ] {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(body)
+                .send()
+                .await
+                .unwrap_or_else(|err| panic!("Failed to create test object {key}: {err}"));
+        }
+
+        let result = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .delimiter("/")
+            .send()
+            .await
+            .expect("Failed to list objects");
+
+        let keys: Vec<&str> = result.contents().iter().filter_map(|object| object.key()).collect();
+        let prefixes: Vec<&str> = result.common_prefixes().iter().filter_map(|prefix| prefix.prefix()).collect();
+
+        info!("Contents: {:?}, CommonPrefixes: {:?}", keys, prefixes);
+
+        assert_eq!(keys, vec!["a", "plain"], "objects `a` and `plain` must both stay in Contents");
+        assert_eq!(
+            prefixes,
+            vec!["a/"],
+            "prefix `a/` must be listed and `plain/` must not appear as a phantom prefix"
+        );
+
+        // Children are still reachable under the prefix.
+        let nested = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix("a/")
+            .delimiter("/")
+            .send()
+            .await
+            .expect("Failed to list objects under prefix");
+        let nested_keys: Vec<&str> = nested.contents().iter().filter_map(|object| object.key()).collect();
+        assert_eq!(nested_keys, vec!["a/b"]);
+
+        // Pagination must keep both entries across page boundaries: `a` sorts
+        // before `a/`, so a one-key page splits them.
+        let page1 = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .delimiter("/")
+            .max_keys(1)
+            .send()
+            .await
+            .expect("Failed to list first page");
+        let page1_keys: Vec<&str> = page1.contents().iter().filter_map(|object| object.key()).collect();
+        assert_eq!(page1_keys, vec!["a"]);
+        assert_eq!(page1.is_truncated(), Some(true), "one-key first page must be truncated");
+
+        let mut token = page1.next_continuation_token().map(ToOwned::to_owned);
+        let mut remaining_keys = Vec::new();
+        let mut remaining_prefixes = Vec::new();
+        while let Some(continuation) = token {
+            let page = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .delimiter("/")
+                .max_keys(1)
+                .continuation_token(continuation)
+                .send()
+                .await
+                .expect("Failed to list continuation page");
+            remaining_keys.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|object| object.key().map(ToOwned::to_owned)),
+            );
+            remaining_prefixes.extend(
+                page.common_prefixes()
+                    .iter()
+                    .filter_map(|prefix| prefix.prefix().map(ToOwned::to_owned)),
+            );
+            token = page.next_continuation_token().map(ToOwned::to_owned);
+        }
+
+        assert_eq!(remaining_prefixes, vec!["a/".to_string()], "prefix `a/` must survive pagination");
+        assert_eq!(remaining_keys, vec!["plain".to_string()]);
+
+        env.stop_server();
+    }
 }

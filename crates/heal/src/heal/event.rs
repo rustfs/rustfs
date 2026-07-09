@@ -17,7 +17,7 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
-use super::storage_compat::Endpoint;
+use super::Endpoint;
 
 /// Corruption type
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -94,6 +94,9 @@ pub(crate) struct AdminTargetSpec {
     pub subsystem: &'static str,
     pub service: &'static str,
     pub valid_keys: &'static [&'static str],
+    /// Config keys whose values are secrets, sourced from the plugin manifest
+    /// so redaction never depends on hand-maintained per-service tables.
+    pub secret_fields: &'static [&'static str],
     validator: AdminRequestValidatorFn,
 }
 
@@ -103,6 +106,7 @@ pub(crate) fn admin_target_spec_from_builtin(descriptor: &BuiltinTargetAdminDesc
         subsystem: admin.subsystem(),
         service: descriptor.manifest().target_type,
         valid_keys: descriptor.valid_fields(),
+        secret_fields: descriptor.manifest().secret_fields,
         validator: validator_from_metadata(admin),
     }
 }

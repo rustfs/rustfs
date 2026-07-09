@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, System};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NodeCommon {
@@ -63,8 +64,63 @@ pub struct Cpus {
 }
 
 pub fn get_cpus() -> Cpus {
-    // todo
-    Cpus::default()
+    let mut sys = System::new_all();
+    sys.refresh_cpu_all();
+    let cores = available_parallelism_count();
+
+    let mut cpus: Vec<Cpu> = sys
+        .cpus()
+        .iter()
+        .enumerate()
+        .map(|(idx, cpu)| Cpu {
+            vendor_id: cpu.vendor_id().to_string(),
+            physical_id: idx.to_string(),
+            model_name: cpu.brand().to_string(),
+            mhz: frequency_to_mhz(cpu.frequency()),
+            cores,
+            ..Default::default()
+        })
+        .collect();
+
+    if cpus.is_empty() {
+        cpus.push(Cpu {
+            model_name: "unknown".to_string(),
+            cores: available_parallelism_count(),
+            ..Default::default()
+        });
+    }
+
+    let mut cpu_freq_stats: Vec<CpuFreqStats> = sys
+        .cpus()
+        .iter()
+        .enumerate()
+        .map(|(idx, cpu)| {
+            let frequency = cpu.frequency();
+            CpuFreqStats {
+                name: if cpu.name().is_empty() {
+                    format!("cpu{idx}")
+                } else {
+                    cpu.name().to_string()
+                },
+                cpuinfo_current_frequency: Some(frequency),
+                scaling_current_frequency: Some(frequency),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    if cpu_freq_stats.is_empty() {
+        cpu_freq_stats.push(CpuFreqStats {
+            name: "cpu0".to_string(),
+            ..Default::default()
+        });
+    }
+
+    Cpus {
+        cpus,
+        cpu_freq_stats,
+        ..Default::default()
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -197,8 +253,62 @@ pub struct MemInfo {
     limit: Option<u64>,
 }
 
-pub fn get_mem_info(_addr: &str) -> MemInfo {
-    MemInfo::default()
+pub fn get_mem_info(addr: &str) -> MemInfo {
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+
+    let total = sys.total_memory();
+    let used = sys.used_memory();
+    let total_swap = sys.total_swap();
+    let used_swap = sys.used_swap();
+
+    MemInfo {
+        node_common: NodeCommon {
+            addr: addr.to_string(),
+            error: None,
+        },
+        total: Some(total),
+        used: Some(used),
+        free: Some(total.saturating_sub(used)),
+        available: Some(sys.available_memory()),
+        swap_space_total: Some(total_swap),
+        swap_space_free: Some(total_swap.saturating_sub(used_swap)),
+        limit: Some(total),
+        ..Default::default()
+    }
+}
+
+pub fn collect_mem_stats() -> crate::MemStats {
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+
+    let process_memory = sys
+        .process(Pid::from_u32(std::process::id()))
+        .map(|process| process.memory())
+        .filter(|memory| *memory > 0)
+        .unwrap_or_else(|| sys.used_memory());
+
+    crate::MemStats {
+        alloc: process_memory,
+        total_alloc: sys.used_memory(),
+        mallocs: 0,
+        frees: 0,
+        heap_alloc: process_memory,
+    }
+}
+
+fn available_parallelism_count() -> u64 {
+    std::thread::available_parallelism()
+        .map(|parallelism| usize_to_u64_saturated(parallelism.get()))
+        .unwrap_or(1)
+}
+
+fn usize_to_u64_saturated(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn frequency_to_mhz(frequency: u64) -> f64 {
+    f64::from(u32::try_from(frequency).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
@@ -332,8 +442,10 @@ mod tests {
     fn test_get_cpus_function() {
         let cpus = get_cpus();
         assert!(cpus.node_common.addr.is_empty());
-        assert!(cpus.cpus.is_empty());
-        assert!(cpus.cpu_freq_stats.is_empty());
+        assert!(!cpus.cpus.is_empty());
+        assert!(cpus.cpus.iter().any(|cpu| cpu.cores > 0));
+        assert!(cpus.cpus.iter().any(|cpu| !cpu.model_name.is_empty()));
+        assert!(!cpus.cpu_freq_stats.is_empty());
     }
 
     #[test]
@@ -666,9 +778,11 @@ mod tests {
     #[test]
     fn test_get_mem_info_function() {
         let mem_info = get_mem_info("memory-server");
-        assert!(mem_info.node_common.addr.is_empty());
-        assert!(mem_info.total.is_none());
-        assert!(mem_info.used.is_none());
+        assert_eq!(mem_info.node_common.addr, "memory-server");
+        let total = mem_info.total.expect("total memory should be collected");
+        assert!(total > 0);
+        assert!(mem_info.used.is_some());
+        assert!(mem_info.available.is_some());
     }
 
     #[test]

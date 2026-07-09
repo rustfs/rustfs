@@ -15,13 +15,20 @@
 //! Migration of bucket metadata and IAM config from legacy format to RustFS format.
 
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
-use crate::bucket::replication::{decode_resync_file, encode_resync_file};
+use crate::bucket::replication::ReplicationMigrationBridge;
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
-use crate::store_api::{ListOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
+use crate::error::Error;
+use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::storage_api_contracts::{
+    bucket::{BucketOperations, BucketOptions},
+    list::{ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    object::{DeletedObject, EcstoreObjectIO, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete},
+    range::HTTPRangeSpec,
+};
 use http::HeaderMap;
+use rustfs_filemeta::FileInfo;
 use rustfs_policy::auth::UserIdentity;
 use rustfs_policy::policy::PolicyDoc;
-use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -39,6 +46,22 @@ const IAM_POLICIES_PREFIX: &str = "config/iam/policies/";
 const IAM_POLICY_DB_PREFIX: &str = "config/iam/policydb/";
 const REPLICATION_META_DIR: &str = ".replication";
 const RESYNC_META_FILE: &str = "resync.bin";
+
+type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
+type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
+type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
+type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+
+/// Callback used to decrypt an at-rest config blob during MinIO -> RustFS migration.
+///
+/// MinIO encrypts IAM identity/service-account files and the server config at rest
+/// with a key derived from the root credentials. The migration paths live in
+/// `ecstore`, which cannot depend on the IAM crate that owns the decryption keys,
+/// so the caller injects the decryption logic. Given raw bytes read from the
+/// legacy meta bucket, it returns the plaintext when a key succeeds, or `None`
+/// when the blob cannot be decrypted (in which case the raw bytes are used as-is,
+/// preserving the original plaintext-only behavior).
+pub type LegacyBlobDecryptFn = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CompatIamFormat {
@@ -167,8 +190,9 @@ fn normalize_bucket_meta_blob(path: &str, data: &[u8]) -> std::result::Result<Op
     if !is_resync_meta_path(path) {
         return Ok(None);
     }
-    let status = decode_resync_file(data).map_err(|err| format!("decode resync meta failed: {err}"))?;
-    encode_resync_file(&status)
+    let status =
+        ReplicationMigrationBridge::decode_resync_status(data).map_err(|err| format!("decode resync meta failed: {err}"))?;
+    ReplicationMigrationBridge::encode_resync_status(&status)
         .map(Some)
         .map_err(|err| format!("encode resync meta failed: {err}"))
 }
@@ -179,7 +203,23 @@ fn normalize_bucket_meta_blob(path: &str, data: &[u8]) -> std::result::Result<Op
 /// Skips buckets that already exist in RustFS (idempotent).
 pub async fn try_migrate_bucket_metadata<S>(store: Arc<S>)
 where
-    S: BucketOperations<Error = crate::error::Error> + ObjectIO + ObjectOperations,
+    S: BucketOperations<Error = crate::error::Error>
+        + ObjectIO<
+            Error = crate::error::Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = crate::error::Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
     let buckets_list = match store
         .list_bucket(&BucketOptions {
@@ -224,7 +264,7 @@ where
 
 async fn migrate_one_if_missing<S>(store: Arc<S>, opts: &ObjectOptions, headers: &HeaderMap, path: &str, label: &str)
 where
-    S: ObjectIO + ObjectOperations,
+    S: EcstoreObjectIO + EcstoreObjectOperations,
 {
     if store
         .get_object_info(RUSTFS_META_BUCKET, path, &ObjectOptions::default())
@@ -276,9 +316,32 @@ where
 /// Lists all objects under the IAM prefix in the source, copies each to the target if not present.
 /// Skips objects that already exist in RustFS (idempotent).
 /// If list_objects_v2 on the legacy bucket fails (e.g. format differs), migration is skipped.
-pub async fn try_migrate_iam_config<S>(store: Arc<S>)
+pub async fn try_migrate_iam_config<S>(store: Arc<S>, decrypt_fn: Option<LegacyBlobDecryptFn>)
 where
-    S: ListOperations + ObjectIO + ObjectOperations,
+    S: ListOperations<
+            Error = crate::error::Error,
+            ListObjectsV2Info = ListObjectsV2Info,
+            ListObjectVersionsInfo = ListObjectVersionsInfo,
+            ObjectInfoOrErr = ObjectInfoOrErr,
+            WalkOptions = WalkOptions,
+            WalkCancellation = tokio_util::sync::CancellationToken,
+            WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        > + ObjectIO<
+            Error = crate::error::Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = crate::error::Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
 {
     let opts = ObjectOptions {
         max_parity: true,
@@ -334,6 +397,13 @@ where
                     continue;
                 }
             };
+            // MinIO encrypts IAM identity/service-account files at rest. Decrypt
+            // before normalizing; fall back to the raw bytes when no key applies
+            // (plaintext blobs, or nothing to decrypt) so existing behavior holds.
+            let data = match &decrypt_fn {
+                Some(decrypt) => decrypt(&data).unwrap_or(data),
+                None => data,
+            };
             let data = match normalize_iam_config_blob(path, &data) {
                 Ok(Some(normalized)) => normalized,
                 Ok(None) => {
@@ -369,7 +439,7 @@ where
 mod tests {
     use super::{normalize_bucket_meta_blob, normalize_iam_config_blob};
     use crate::bucket::replication::{
-        BucketReplicationResyncStatus, ResyncStatusType, TargetReplicationResyncStatus, decode_resync_file, encode_resync_file,
+        BucketReplicationResyncStatus, ReplicationMigrationBridge, ResyncStatusType, TargetReplicationResyncStatus,
     };
     use std::collections::HashMap;
 
@@ -394,6 +464,36 @@ mod tests {
     }
 
     #[test]
+    fn test_encrypted_identity_requires_decrypt_before_normalize() {
+        // Reproduces the MinIO drop-in migration gap: an IAM identity file that
+        // MinIO encrypted at rest is NOT valid JSON, so normalize fails outright.
+        // The migration's decrypt callback must run first to recover it.
+        let path = "config/iam/users/alice/identity.json";
+        let plaintext = br#"{"version":1,"credentials":{"accessKey":"alice","secretKey":"alicesecret"}}"#;
+
+        // Simulate MinIO's at-rest encryption of the identity blob.
+        let ciphertext = rustfs_crypto::encrypt_data(b"root-secret-key", plaintext).expect("encrypt identity blob");
+
+        // Without decryption (old behavior): normalize can't parse ciphertext -> Err -> skipped.
+        assert!(
+            normalize_iam_config_blob(path, &ciphertext).is_err(),
+            "ciphertext must not parse as a JSON identity"
+        );
+
+        // With the decrypt callback recovering plaintext first: normalize succeeds.
+        let decrypt_fn: super::LegacyBlobDecryptFn =
+            std::sync::Arc::new(|data: &[u8]| rustfs_crypto::decrypt_data(b"root-secret-key", data).ok());
+        let recovered = decrypt_fn(&ciphertext).expect("callback should decrypt the identity blob");
+        assert_eq!(recovered, plaintext);
+
+        let normalized = normalize_iam_config_blob(path, &recovered)
+            .expect("normalize should succeed on decrypted plaintext")
+            .expect("identity path should be supported");
+        let v: serde_json::Value = serde_json::from_slice(&normalized).expect("output should be valid JSON");
+        assert!(v.get("updatedAt").is_some(), "normalize should backfill updatedAt");
+    }
+
+    #[test]
     fn test_normalize_bucket_meta_blob_resync_reencode() {
         let path = ".buckets/test/.replication/resync.bin";
         let mut status = BucketReplicationResyncStatus::new();
@@ -408,13 +508,131 @@ mod tests {
             },
         )]);
 
-        let input = encode_resync_file(&status).expect("encode should succeed");
+        let input = ReplicationMigrationBridge::encode_resync_status(&status).expect("encode should succeed");
         let output = normalize_bucket_meta_blob(path, &input)
             .expect("normalize should succeed")
             .expect("resync path should be normalized");
 
-        let decoded = decode_resync_file(&output).expect("decode should succeed");
+        let decoded = ReplicationMigrationBridge::decode_resync_status(&output).expect("decode should succeed");
         assert_eq!(decoded.id, 123);
         assert_eq!(decoded.targets_map["arn:replication::1:dest"].resync_id, "reset-1");
+    }
+
+    fn decode_hex(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex fixture"))
+            .collect()
+    }
+
+    /// backlog#580 Phase 2/4: end-to-end proof that `try_migrate_bucket_metadata`
+    /// pulls a real MinIO-written bucket-metadata blob from a `.minio.sys` layout
+    /// into `.rustfs.sys`, and that the migrated blob loads every config. Uses a
+    /// throwaway 4-drive local ECStore. Fixture: `tests/fixtures/minio/README.md`.
+    #[tokio::test]
+    async fn migrates_real_minio_bucket_metadata_end_to_end() {
+        use crate::bucket::metadata::{BUCKET_METADATA_FILE, BucketMetadata};
+        use crate::config::com::read_config;
+        use crate::disk::endpoint::Endpoint;
+        use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
+        use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+        use crate::object_api::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+        use crate::storage_api_contracts::object::{ObjectIO, ObjectOperations};
+        use crate::store::{ECStore, init_local_disks};
+        use rustfs_utils::path::SLASH_SEPARATOR;
+        use tokio::fs;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let blob = decode_hex(include_str!("../../tests/fixtures/minio/bucket_metadata.blob.hex"));
+
+        // --- Stand up a throwaway 4-drive local ECStore. ---
+        let base = std::path::PathBuf::from(format!("/tmp/rustfs_minio_migrate_test_{}", Uuid::new_v4()));
+        let disk_paths: Vec<_> = (1..=4).map(|i| base.join(format!("disk{i}"))).collect();
+        for p in &disk_paths {
+            fs::create_dir_all(p).await.unwrap();
+        }
+        let mut endpoints = Vec::new();
+        for (i, p) in disk_paths.iter().enumerate() {
+            let mut ep = Endpoint::try_from(p.to_str().unwrap()).unwrap();
+            ep.set_pool_index(0);
+            ep.set_set_index(0);
+            ep.set_disk_index(i);
+            endpoints.push(ep);
+        }
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "minio-migrate-test".to_string(),
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        }]);
+        init_local_disks(endpoint_pools.clone()).await.unwrap();
+        let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new())
+            .await
+            .unwrap();
+        let existing: Vec<String> = ecstore
+            .list_bucket(&BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), existing).await;
+
+        let meta_path = format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}interop{SLASH_SEPARATOR}{BUCKET_METADATA_FILE}");
+        let put_opts = ObjectOptions::default();
+
+        // --- Arrange the pre-migration state a MinIO import starts from: the ---
+        // bucket exists and its config lives under `.minio.sys`, while `.rustfs.sys`
+        // has no metadata for it yet.
+        ecstore.make_bucket("interop", &MakeBucketOptions::default()).await.unwrap();
+        let _ = ecstore
+            .delete_object(RUSTFS_META_BUCKET, &meta_path, ObjectOptions::default())
+            .await;
+        // MinIO leaves its `.minio.sys` meta volume on every drive; recreate it so
+        // the source object can be seeded through the object layer.
+        for p in &disk_paths {
+            fs::create_dir_all(p.join(MIGRATING_META_BUCKET)).await.ok();
+        }
+        let mut src = PutObjReader::from_vec(blob.clone());
+        ecstore
+            .put_object(MIGRATING_META_BUCKET, &meta_path, &mut src, &put_opts)
+            .await
+            .expect("seed .minio.sys bucket metadata");
+
+        // --- Run the real startup migration. ---
+        super::try_migrate_bucket_metadata(ecstore.clone()).await;
+
+        // --- The migrated `.rustfs.sys` blob must carry every MinIO config, ---
+        // byte-identical to the source (typed XML/JSON parsing of these fields is
+        // covered by the bucket-metadata parse-parity test).
+        let migrated = read_config(ecstore.clone(), &meta_path)
+            .await
+            .expect("read migrated bucket metadata");
+        BucketMetadata::check_header(&migrated).expect("migrated blob has a valid header");
+        let bm = BucketMetadata::unmarshal(&migrated[4..]).expect("unmarshal migrated bucket metadata");
+        let src = BucketMetadata::unmarshal(&blob[4..]).expect("unmarshal source bucket metadata");
+
+        assert_eq!(bm.name, "interop");
+        assert_eq!(bm.policy_config_json, src.policy_config_json, "policy migrated intact");
+        assert_eq!(bm.lifecycle_config_xml, src.lifecycle_config_xml, "lifecycle migrated intact");
+        assert_eq!(bm.object_lock_config_xml, src.object_lock_config_xml, "object-lock migrated intact");
+        assert_eq!(bm.versioning_config_xml, src.versioning_config_xml, "versioning migrated intact");
+        assert_eq!(bm.tagging_config_xml, src.tagging_config_xml, "tagging migrated intact");
+        assert_eq!(bm.quota_config_json, src.quota_config_json, "quota migrated intact");
+        assert_eq!(bm.notification_config_xml, src.notification_config_xml, "notification migrated intact");
+        assert_eq!(bm.encryption_config_xml, src.encryption_config_xml, "encryption migrated intact");
+        assert_eq!(bm.replication_config_xml, src.replication_config_xml, "replication migrated intact");
+        assert!(!bm.lifecycle_config_xml.is_empty(), "lifecycle present");
+        assert!(!bm.replication_config_xml.is_empty(), "replication present");
+
+        fs::remove_dir_all(&base).await.ok();
     }
 }

@@ -1,0 +1,34 @@
+---
+source: rustfs/src/admin/plugin_contract.rs
+expression: value
+---
+{
+  "diagnostic_counts": [
+    {
+      "code": "not_loaded_in_runtime",
+      "count": 1
+    }
+  ],
+  "instances": [
+    {
+      "account_id": "primary",
+      "config": {
+        "enable": "on",
+        "endpoint": "https://example.com/hook"
+      },
+      "diagnostic_codes": [
+        "not_loaded_in_runtime"
+      ],
+      "domain": "notify",
+      "enabled": true,
+      "id": "builtin:webhook:notify:primary",
+      "plugin_id": "builtin:webhook",
+      "service": "webhook",
+      "source": "config",
+      "status": "offline",
+      "subsystem": "notify_webhook"
+    }
+  ],
+  "next_marker": null,
+  "truncated": false
+}

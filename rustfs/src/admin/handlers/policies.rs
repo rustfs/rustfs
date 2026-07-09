@@ -14,6 +14,7 @@
 
 use super::iam_error::iam_error_to_s3_error;
 use crate::{
+    admin::runtime_sources::current_action_credentials,
     admin::{
         auth::validate_admin_request,
         handlers::site_replication::site_replication_iam_change_hook,
@@ -27,7 +28,6 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::is_err_no_such_user;
 use rustfs_iam::store::MappedPolicy;
 use rustfs_madmin::{
@@ -144,7 +144,7 @@ impl Operation for ListCannedPolicies {
             }
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -169,7 +169,7 @@ impl Operation for ListCannedPolicies {
         let body = serde_json::to_vec(&kvs).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -252,7 +252,7 @@ impl Operation for AddCannedPolicy {
         if policy.version.is_empty() {
             return Err(s3_error!(InvalidArgument, "policy version is required"));
         }
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -294,8 +294,8 @@ impl Operation for AddCannedPolicy {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -340,7 +340,7 @@ impl Operation for InfoCannedPolicy {
             return Err(s3_error!(InvalidArgument, "too many policies"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -360,7 +360,7 @@ impl Operation for InfoCannedPolicy {
         let body = serde_json::to_vec(&pd).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -401,7 +401,7 @@ impl Operation for RemoveCannedPolicy {
             return Err(s3_error!(InvalidArgument, "policy name is required"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -440,8 +440,8 @@ impl Operation for RemoveCannedPolicy {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -492,7 +492,7 @@ impl Operation for SetPolicyForUserOrGroup {
             return Err(s3_error!(InvalidArgument, "user or group is required"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -520,7 +520,7 @@ impl Operation for SetPolicyForUserOrGroup {
                 }
             };
 
-            let Some(sys_cred) = get_global_action_cred() else {
+            let Some(sys_cred) = current_action_credentials() else {
                 return Err(s3_error!(InternalError, "failed to load global credentials"));
             };
 
@@ -597,8 +597,8 @@ impl Operation for SetPolicyForUserOrGroup {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -825,7 +825,9 @@ async fn handle_builtin_policy_entities(req: S3Request<Body>) -> S3Result<S3Resp
 
     let query = parse_policy_entities_query(req.uri.query());
 
-    let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+    let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
+        return Err(s3_error!(InternalError, "iam not init"));
+    };
 
     let all_group_policy_mappings = collect_group_policy_mappings(&iam_store, &[]).await?;
     let users = iam_store.list_users().await.map_err(|e| {
@@ -930,12 +932,15 @@ async fn handle_builtin_policy_entities(req: S3Request<Body>) -> S3Result<S3Resp
     let (body, content_type) = encode_compatible_admin_payload(&req_path, &cred.secret_key, body)?;
 
     let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, content_type.parse().unwrap());
-    header.insert(CONTENT_LENGTH, body.len().to_string().parse().unwrap());
+    header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    header.insert(CONTENT_LENGTH, body.len().to_string().parse().expect("valid header value"));
     Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
 }
 
-async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool) -> S3Result<S3Response<(StatusCode, Body)>> {
+pub(crate) async fn handle_builtin_policy_association(
+    req: S3Request<Body>,
+    is_attach: bool,
+) -> S3Result<S3Response<(StatusCode, Body)>> {
     let Some(input_cred) = req.credentials else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
     };
@@ -959,7 +964,9 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
         .map_err(|e| s3_error!(InvalidRequest, "unmarshal policy association body failed, e: {:?}", e))?;
     validate_policy_association_req(&assoc_req)?;
 
-    let Ok(iam_store) = rustfs_iam::get() else { return Err(s3_error!(InternalError, "iam not init")) };
+    let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
+        return Err(s3_error!(InternalError, "iam not init"));
+    };
 
     let (target_name, is_group, existing_policies) = if !assoc_req.user.is_empty() {
         match iam_store.is_temp_user(&assoc_req.user).await {
@@ -982,7 +989,7 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
             }
         }
 
-        let Some(sys_cred) = get_global_action_cred() else {
+        let Some(sys_cred) = current_action_credentials() else {
             return Err(s3_error!(InternalError, "get global action cred failed"));
         };
 
@@ -1091,8 +1098,8 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
     let (body, content_type) = encode_compatible_admin_payload(&req_path, &cred.secret_key, body)?;
 
     let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, content_type.parse().unwrap());
-    header.insert(CONTENT_LENGTH, body.len().to_string().parse().unwrap());
+    header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    header.insert(CONTENT_LENGTH, body.len().to_string().parse().expect("valid header value"));
     Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
 }
 

@@ -375,23 +375,19 @@ pub fn calculate_adaptive_timeout(
         1.0 // No adjustment
     };
 
+    // Adaptive timeout bounds: 5 seconds minimum, 10 minutes maximum.
+    const MIN_SECS: f64 = 5.0;
+    const MAX_SECS: f64 = 600.0;
+
     // If we have historical rate data, use it for estimation
-    let estimated_duration = if let Some(rate) = historical_rate_bps {
-        if rate > 0 {
-            let estimated_secs = (object_size as f64 / rate as f64) * 1.2; // 20% buffer
-            Duration::from_secs_f64(estimated_secs)
-        } else {
-            base_timeout
-        }
-    } else {
-        base_timeout
+    let estimated_secs = match historical_rate_bps {
+        Some(rate) if rate > 0 => (object_size as f64 / rate as f64) * 1.2, // 20% buffer
+        _ => base_timeout.as_secs_f64(),
     };
 
-    // Apply timeout multiplier but clamp to reasonable bounds
-    let adaptive_duration = Duration::from_secs_f64(estimated_duration.as_secs_f64() * timeout_multiplier);
-
-    // Clamp to 5 seconds minimum and 10 minutes maximum
-    adaptive_duration.clamp(Duration::from_secs(5), Duration::from_secs(600))
+    // Clamp BEFORE constructing the Duration: `from_secs_f64` panics when the
+    // estimate overflows Duration (huge object_size with a tiny historical rate).
+    Duration::from_secs_f64((estimated_secs * timeout_multiplier).clamp(MIN_SECS, MAX_SECS))
 }
 
 /// Estimate bytes per second transfer rate.
@@ -433,6 +429,18 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_adaptive_timeout_extreme_estimate_does_not_panic() {
+        // A huge object with a tiny historical rate used to overflow
+        // Duration::from_secs_f64 and panic; it must clamp to the upper bound.
+        let timeout = calculate_adaptive_timeout(Duration::from_secs(30), Some(1), 0, u64::MAX);
+        assert_eq!(timeout, Duration::from_secs(600));
+
+        // Tiny estimates clamp to the lower bound.
+        let timeout = calculate_adaptive_timeout(Duration::from_secs(30), Some(u64::MAX), 0, 1);
+        assert_eq!(timeout, Duration::from_secs(5));
     }
 
     #[test]

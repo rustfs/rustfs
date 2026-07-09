@@ -1,0 +1,260 @@
+# =============================================================================
+# RustFS GET Optimization — Prometheus Alerting Rules
+# =============================================================================
+#
+# Import into Prometheus:
+#   1. Copy this file to your Prometheus rules directory
+#   2. Add to prometheus.yml:
+#        rule_files:
+#          - "prometheus-alert-rules.yaml"
+#   3. Validate: promtool check rules prometheus-alert-rules.yaml
+#   4. Reload:   curl -X POST http://localhost:9090/-/reload
+#
+# All metric names match those registered in crates/io-metrics/src/lib.rs
+# and documented in crates/ecstore/src/diagnostics/get.rs.
+#
+# Baseline comparison uses "offset 1d" — adjust to "offset 7d" for weekly
+# seasonality if your traffic pattern varies by day of week.
+# =============================================================================
+
+groups:
+  # ==========================================================================
+  # Critical alerts — immediate action required
+  # ==========================================================================
+  - name: rustfs-get-optimization-critical
+    interval: 30s
+    rules:
+      # ------------------------------------------------------------------
+      # 1. GetP99Regression
+      #    GET p99 latency exceeds 2x the baseline (same time yesterday)
+      #    sustained for 10 minutes.
+      #    Action: Roll back the GET optimization immediately.
+      # ------------------------------------------------------------------
+      - alert: GetP99Regression
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(rustfs_io_get_object_total_duration_seconds_bucket[5m])) by (le)
+          )
+          >
+          2
+          *
+          histogram_quantile(0.99,
+            sum(rate(rustfs_io_get_object_total_duration_seconds_bucket[5m] offset 1d)) by (le)
+          )
+        for: 10m
+        labels:
+          severity: critical
+          team: rustfs-storage
+          area: get-optimization
+        annotations:
+          summary: "GET p99 latency regression detected (>2x baseline for 10m)"
+          description: >-
+            The 99th-percentile GET object latency is {{ $value | humanizeDuration }}
+            which is more than double the baseline measured 24 hours ago.
+            This indicates a severe performance regression introduced by
+            a recent GET optimization change.
+          runbook_url: "https://internal.wiki/runbooks/rustfs/get-p99-regression"
+          action: >
+            1. Verify the regression is not caused by external factors
+               (disk health, network, load spike).
+            2. If confirmed optimization-related, roll back:
+               - Set RUSTFS_GET_CODEC_STREAMING=0
+               - Set RUSTFS_GET_METADATA_EARLY_STOP=0
+               - Restart affected nodes.
+            3. Collect flamegraphs and open a P0 incident.
+
+      # ------------------------------------------------------------------
+      # 2. PipelineFailureSpike
+      #    Pipeline failure rate exceeds 5x the baseline sustained for
+      #    5 minutes.  Covers all failure reasons: bitrot_mismatch,
+      #    decode_error, downstream_closed, io, read_quorum, timeout, etc.
+      #    Action: Investigate pipeline health and roll back if needed.
+      # ------------------------------------------------------------------
+      - alert: PipelineFailureSpike
+        expr: |
+          sum(rate(rustfs_io_get_object_pipeline_failures_total[5m]))
+          >
+          5
+          *
+          sum(rate(rustfs_io_get_object_pipeline_failures_total[5m] offset 1d))
+        for: 5m
+        labels:
+          severity: critical
+          team: rustfs-storage
+          area: get-optimization
+        annotations:
+          summary: "GET pipeline failure rate spike (>5x baseline for 5m)"
+          description: >-
+            The GET pipeline failure rate is {{ $value | printf "%.2f" }}/s,
+            more than 5x the baseline from 24 hours ago.
+            Failure reasons may include: bitrot_mismatch, decode_error,
+            downstream_closed, io, range_or_length_invalid, read_quorum,
+            short_read, timeout, unknown.
+          runbook_url: "https://internal.wiki/runbooks/rustfs/pipeline-failure-spike"
+          action: >
+            1. Check Grafana "GET Data Integrity" dashboard for failure
+               breakdown by reason label.
+            2. If decode_error or bitrot_mismatch dominates, stop
+               optimization and investigate data integrity.
+            3. If io or timeout dominates, check disk and network health.
+            4. Roll back optimization if failures persist.
+
+      # ------------------------------------------------------------------
+      # 3. BitrotMismatchSpike
+      #    Bitrot verification mismatch rate exceeds 3x baseline for
+      #    5 minutes.  This is a data-integrity signal — shard checksums
+      #    do not match after read.
+      #
+      #    The "bitrot_mismatch" reason is recorded on the
+      #    rustfs_io_get_object_pipeline_failures_total counter when a
+      #    StorageError::FileCorrupt or DiskError::FileCorrupt /
+      #    DiskError::PartMissingOrCorrupt is classified during the GET
+      #    pipeline (see classify_storage_error / classify_disk_error in
+      #    crates/ecstore/src/diagnostics/get.rs).
+      #
+      #    Action: Stop optimization, investigate data integrity urgently.
+      # ------------------------------------------------------------------
+      - alert: BitrotMismatchSpike
+        expr: |
+          sum(rate(rustfs_io_get_object_pipeline_failures_total{reason="bitrot_mismatch"}[5m]))
+          >
+          3
+          *
+          sum(rate(rustfs_io_get_object_pipeline_failures_total{reason="bitrot_mismatch"}[5m] offset 1d))
+        for: 5m
+        labels:
+          severity: critical
+          team: rustfs-storage
+          area: get-optimization
+        annotations:
+          summary: "Bitrot mismatch rate spike (>3x baseline for 5m)"
+          description: >-
+            The rate of pipeline failures classified as bitrot_mismatch is
+            {{ $value | printf "%.2f" }}/s, more than 3x the baseline from
+            24 hours ago.  This indicates shard checksum verification
+            failures (FileCorrupt / PartMissingOrCorrupt) which may point
+            to data corruption introduced by the GET optimization pipeline
+            (e.g., incorrect decode, buffer reuse bug).
+          runbook_url: "https://internal.wiki/runbooks/rustfs/bitrot-mismatch-spike"
+          action: >
+            1. Immediately disable codec streaming:
+               RUSTFS_GET_CODEC_STREAMING=0
+            2. Run "mc admin scan" on affected buckets to verify on-disk
+               integrity independent of the GET path.
+            3. Compare xl.meta checksums across erasure shards.
+            4. If corruption confirmed, initiate data recovery from parity.
+            5. Do NOT re-enable optimization until root cause is identified.
+
+  # ==========================================================================
+  # Warning alerts — investigation needed
+  # ==========================================================================
+  - name: rustfs-get-optimization-warning
+    interval: 30s
+    rules:
+      # ------------------------------------------------------------------
+      # 4. EarlyStopInsufficientQuorum
+      #    The metadata early-stop path is hitting "insufficient_quorum"
+      #    at a rate above 0.1/s for 5 minutes.  This means too many
+      #    disks are failing to return valid metadata in time.
+      #    Action: Check disk health and metadata fanout latency.
+      # ------------------------------------------------------------------
+      - alert: EarlyStopInsufficientQuorum
+        expr: |
+          sum(rate(rustfs_io_get_object_metadata_early_stop_total{reason="insufficient_quorum"}[5m]))
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: rustfs-storage
+          area: get-optimization
+        annotations:
+          summary: "Early-stop insufficient quorum rate elevated (>0.1/s for 5m)"
+          description: >-
+            The metadata early-stop path is returning "insufficient_quorum"
+            at {{ $value | printf "%.3f" }}/s.  This means the bounded
+            metadata fanout cannot gather enough valid responses before
+            the quorum deadline, suggesting disk or network issues.
+          runbook_url: "https://internal.wiki/runbooks/rustfs/early-stop-quorum"
+          action: >
+            1. Check disk health: mc admin info --json | jq '.disks'
+            2. Review rustfs_io_get_object_metadata_response_total by
+               outcome (error, timeout, disk_not_found) in Grafana.
+            3. Check rustfs_io_disk_permit_wait_duration_seconds for
+               I/O scheduler saturation.
+            4. If disks are healthy, consider increasing the early-stop
+               timeout or temporarily disabling early-stop.
+
+      # ------------------------------------------------------------------
+      # 5. CodecStreamingFallbackSpike
+      #    The codec streaming fallback rate is >10x baseline for 10
+      #    minutes.  This means the optimized codec streaming path is
+      #    being bypassed much more often than expected.
+      #    Action: Check fallback reasons and object eligibility.
+      # ------------------------------------------------------------------
+      - alert: CodecStreamingFallbackSpike
+        expr: |
+          sum(rate(rustfs_io_get_object_codec_streaming_fallback_total[5m]))
+          >
+          10
+          *
+          sum(rate(rustfs_io_get_object_codec_streaming_fallback_total[5m] offset 1d))
+        for: 10m
+        labels:
+          severity: warning
+          team: rustfs-storage
+          area: get-optimization
+        annotations:
+          summary: "Codec streaming fallback rate spike (>10x baseline for 10m)"
+          description: >-
+            The codec streaming fallback rate is {{ $value | printf "%.2f" }}/s,
+            more than 10x the baseline from 24 hours ago.  Fallback reasons
+            are labeled by "reason" — check Grafana for breakdown.
+            Common reasons: object too small, multipart not supported,
+            unsupported erasure layout, feature flag disabled.
+          runbook_url: "https://internal.wiki/runbooks/rustfs/codec-fallback-spike"
+          action: >
+            1. Query by reason label:
+               sum by (reason) (rate(rustfs_io_get_object_codec_streaming_fallback_total[5m]))
+            2. If dominated by a single reason, investigate why that
+               condition became more frequent (e.g., workload change,
+               configuration drift).
+            3. Cross-reference with rustfs_io_get_object_reader_path_total
+               to verify the fallback path (legacy_duplex) is healthy.
+            4. If fallback is expected (e.g., workload shifted to small
+               objects), update the alert baseline.
+
+      # ------------------------------------------------------------------
+      # 6. IoQueueSaturation
+      #    I/O queue utilization exceeds 90% for 5 minutes.  High
+      #    utilization causes disk permit wait latency to increase and
+      #    can cascade into pipeline timeouts.
+      #    Action: Check disk load and consider reducing concurrency.
+      # ------------------------------------------------------------------
+      - alert: IoQueueSaturation
+        expr: |
+          rustfs_io_queue_utilization_percent > 90
+        for: 5m
+        labels:
+          severity: warning
+          team: rustfs-storage
+          area: get-optimization
+        annotations:
+          summary: "I/O queue utilization >90% for 5m"
+          description: >-
+            The I/O queue utilization is {{ $value | printf "%.1f" }}%,
+            sustained above 90% for 5 minutes.  This indicates the disk
+            I/O scheduler is near saturation, which will increase
+            rustfs_io_disk_permit_wait_duration_seconds and may trigger
+            pipeline timeouts.
+          runbook_url: "https://internal.wiki/runbooks/rustfs/io-queue-saturation"
+          action: >
+            1. Check disk I/O metrics (iostat, node_exporter) for
+               individual disk saturation.
+            2. Review rustfs_io_queue_permits_in_use vs
+               rustfs_io_queue_permits_available for permit exhaustion.
+            3. Check rustfs_io_starvation_events for priority starvation.
+            4. If GET optimization increased concurrency, consider:
+               - Reducing RUSTFS_GET_PIPELINE_PARALLELISM
+               - Lowering RUSTFS_IO_QUEUE_PERMITS
+            5. If caused by background operations (ILM, healing), throttle
+               those before adjusting GET concurrency.

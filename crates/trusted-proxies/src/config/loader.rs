@@ -103,6 +103,12 @@ impl ConfigLoader {
         let private_networks =
             parse_ip_list_from_env(ENV_TRUSTED_PROXY_PRIVATE_NETWORKS, DEFAULT_TRUSTED_PROXY_PRIVATE_NETWORKS)?;
 
+        // Warn once at startup if the effective trusted set spans private/RFC1918
+        // (or IPv6 unique-local) ranges. This trusts every host inside those
+        // ranges to set forwarding headers, which is broad; operators should
+        // narrow it to the specific proxy addresses in front of this server.
+        Self::warn_on_private_trusted_networks(&proxies);
+
         Ok(TrustedProxyConfig::new(
             proxies,
             validation_mode,
@@ -111,6 +117,42 @@ impl ConfigLoader {
             enable_chain_check,
             private_networks,
         ))
+    }
+
+    /// Emits a one-time startup warning when the trusted proxy set includes
+    /// private/RFC1918 (or IPv6 unique-local) ranges.
+    fn warn_on_private_trusted_networks(proxies: &[TrustedProxy]) {
+        let private_trusted: Vec<String> = proxies
+            .iter()
+            .filter(|proxy| Self::is_private_trusted_entry(proxy))
+            .map(|proxy| proxy.to_string())
+            .collect();
+
+        if !private_trusted.is_empty() {
+            tracing::warn!(
+                event = "trusted_proxies.config",
+                component = "trusted_proxies",
+                subsystem = "config_loader",
+                result = "private_trust_warning",
+                private_networks = ?private_trusted,
+                "trusted proxy set includes private ranges; narrow RUSTFS_TRUSTED_PROXY_NETWORKS to the specific proxy addresses in front of this server to reduce client IP spoofing risk"
+            );
+        }
+    }
+
+    /// Returns true when a trusted proxy entry falls within a private/RFC1918
+    /// IPv4 range or an IPv6 unique-local (fc00::/7) range. Loopback and public
+    /// addresses are not flagged.
+    fn is_private_trusted_entry(proxy: &TrustedProxy) -> bool {
+        let ip = match proxy {
+            TrustedProxy::Single(ip) => *ip,
+            TrustedProxy::Cidr(network) => network.network(),
+        };
+
+        match ip {
+            IpAddr::V4(v4) => v4.is_private(),
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+        }
     }
 
     /// Loads cache configuration from environment variables.

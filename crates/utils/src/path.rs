@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -550,6 +551,52 @@ pub fn trim_etag(etag: &str) -> String {
     etag.trim_matches('"').to_string()
 }
 
+/// Returns `true` if `path` contains a `..` component (parent directory traversal).
+fn contains_parent_dir_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|component| component == "..")
+}
+
+/// Validates that an archive entry path does not escape the target bucket.
+///
+/// Rejects paths containing `..` components, root prefixes, or device/prefix
+/// components that would allow path traversal outside the extraction root.
+///
+/// Returns `Ok(())` if the path is safe, or `Err(message)` describing the violation.
+pub fn validate_extract_relative_path(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    if p.components()
+        .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir | Component::ParentDir))
+        || contains_parent_dir_component(p.to_string_lossy().as_ref())
+    {
+        return Err("archive entry path must stay within the target bucket".to_string());
+    }
+    Ok(())
+}
+
+/// Normalizes an archive entry key by applying a prefix, trimming slashes,
+/// and ensuring directory entries end with `/`.
+///
+/// Validates both the raw path and the final key against path traversal.
+///
+/// Returns `Ok(normalized_key)` or `Err(message)` if the path is unsafe.
+pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> Result<String, String> {
+    validate_extract_relative_path(path)?;
+    let path = path.trim_matches('/');
+    let mut key = match prefix {
+        Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
+        Some(prefix) => prefix.to_string(),
+        None => path.to_string(),
+    };
+
+    if is_dir && !key.ends_with('/') {
+        key.push('/');
+    }
+
+    validate_extract_relative_path(&key)?;
+
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,5 +964,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_validate_extract_relative_path_accepts_safe_paths() {
+        assert!(validate_extract_relative_path("file.txt").is_ok());
+        assert!(validate_extract_relative_path("dir/file.txt").is_ok());
+        assert!(validate_extract_relative_path("a/b/c").is_ok());
+        assert!(validate_extract_relative_path("").is_ok());
+    }
+
+    #[test]
+    fn test_validate_extract_relative_path_rejects_traversal() {
+        assert!(validate_extract_relative_path("../escape.txt").is_err());
+        assert!(validate_extract_relative_path("dir/../../../escape.txt").is_err());
+        assert!(validate_extract_relative_path("/absolute/path").is_err());
+        assert!(validate_extract_relative_path("dir/..").is_err());
+        assert!(validate_extract_relative_path("..").is_err());
+    }
+
+    #[test]
+    fn test_normalize_extract_entry_key_basic() {
+        assert_eq!(normalize_extract_entry_key("file.txt", None, false).unwrap(), "file.txt");
+        assert_eq!(normalize_extract_entry_key("file.txt", Some("prefix"), false).unwrap(), "prefix/file.txt");
+        assert_eq!(normalize_extract_entry_key("dir", None, true).unwrap(), "dir/");
+        assert_eq!(normalize_extract_entry_key("", Some("prefix"), false).unwrap(), "prefix");
+    }
+
+    #[test]
+    fn test_normalize_extract_entry_key_rejects_traversal() {
+        assert!(normalize_extract_entry_key("../escape.txt", None, false).is_err());
+        assert!(normalize_extract_entry_key("file.txt", Some("../bad"), false).is_err());
+        assert!(normalize_extract_entry_key("/absolute", None, false).is_err());
     }
 }

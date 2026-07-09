@@ -13,10 +13,19 @@
 // limitations under the License.
 
 mod reliant;
+mod storage_api;
 
 // Common utilities for all E2E tests
 #[cfg(test)]
 pub mod common;
+
+// In-process fault-injection primitives (disk offline/replacement, shard corruption)
+#[cfg(test)]
+pub mod chaos;
+
+// Reliability tests built on the fault-injection harness
+#[cfg(test)]
+mod reliability_disk_fault_test;
 
 #[cfg(test)]
 mod version_id_regression_test;
@@ -37,8 +46,16 @@ mod list_objects_duplicates_test;
 #[cfg(test)]
 mod quota_test;
 
+// Harness regression tests: console port isolation + fail-fast startup
+#[cfg(test)]
+mod server_startup_failfast_test;
+
 #[cfg(test)]
 mod bucket_policy_check_test;
+
+// Security boundary tests: DoS limits, SSRF prevention, concurrent-write integrity
+#[cfg(test)]
+mod security_boundary_test;
 
 /// IAM / bucket / STS session policy with `s3:ExistingObjectTag` conditions (E2E).
 #[cfg(test)]
@@ -51,6 +68,10 @@ mod anonymous_access_test;
 // Special characters in path test modules
 #[cfg(test)]
 mod special_chars_test;
+
+// Leading/duplicate slash key normalization tests (Issue #2427)
+#[cfg(test)]
+mod leading_slash_key_test;
 
 // Content-Encoding header preservation test
 #[cfg(test)]
@@ -81,6 +102,10 @@ mod delete_objects_versioning_test;
 // Regression test for signed DELETE Object?versionId requests without Content-Length.
 #[cfg(test)]
 mod delete_object_no_content_length_test;
+
+// Delete-marker visibility baseline for data-movement migration proof.
+#[cfg(test)]
+mod delete_marker_migration_semantics_test;
 
 // Regression test for Issue #2252: ListObjectVersions misses newest version after put -> delete -> put
 #[cfg(test)]
@@ -124,6 +149,9 @@ mod heal_erasure_disk_rebuild_test;
 #[cfg(test)]
 mod copy_object_metadata_test;
 
+#[cfg(test)]
+mod copy_object_version_restore_test;
+
 // S3 dummy-compat bucket API tests
 #[cfg(test)]
 mod bucket_logging_test;
@@ -154,5 +182,17 @@ mod admin_timeout_regression_test;
 
 #[cfg(test)]
 mod overwrite_cleanup_regression_test;
+
+// Regression test for backlog#601: `GET //` ListBuckets browser compatibility.
+#[cfg(test)]
+mod list_buckets_double_slash_test;
+
+// Regression test for backlog#629(b): region-aware CreateBucket SigV4.
+#[cfg(test)]
+mod create_bucket_region_test;
+
+// Regression coverage for backlog#618 item 8: copy-source invalid-date header.
+#[cfg(test)]
+mod copy_source_invalid_date_test;
 
 pub mod tls_gen;

@@ -12,36 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy object writer for optimized write operations.
+//! BytesMut-backed object writer for optimized write operations.
 //!
-//! This module provides a zero-copy writer that minimizes memory allocations
-//! and data copying during write operations.
+//! It uses `BytesMut` for efficient buffering; writes into that buffer may
+//! still copy input bytes. The historical `ZeroCopyObjectWriter` name remains
+//! available as a deprecated compatibility alias.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
-/// Zero-copy object writer for optimized write operations.
+/// BytesMut-backed object writer for optimized write operations.
 ///
 /// This writer minimizes memory allocations by:
 /// - Using BytesMut for efficient buffer growth
-/// - Supporting zero-copy data transfer via Bytes
+/// - Accepting `Bytes` inputs for efficient buffer handling
 /// - Optional integration with BytesPool for buffer reuse
 ///
 /// # Example
 ///
 /// ```ignore
-/// use rustfs_io_core::ZeroCopyObjectWriter;
+/// use rustfs_io_core::BytesMutWriter;
 /// use bytes::Bytes;
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let mut writer = ZeroCopyObjectWriter::new();
+///     let mut writer = BytesMutWriter::new();
 ///
-///     // Write with zero-copy
+///     // Write into the internal BytesMut buffer
 ///     let data = Bytes::from("hello world");
-///     writer.write_zero_copy(data).await?;
+///     writer.write_buffered(data).await?;
 ///
 ///     // Get the result as Bytes (zero-copy conversion)
 ///     let result = writer.into_bytes();
@@ -49,7 +50,7 @@ use tokio::io::AsyncWrite;
 ///     Ok(())
 /// }
 /// ```
-pub struct ZeroCopyObjectWriter {
+pub struct BytesMutWriter {
     /// Internal buffer using BytesMut for efficient growth
     buffer: BytesMut,
     /// Total bytes written
@@ -58,19 +59,23 @@ pub struct ZeroCopyObjectWriter {
     finalized: bool,
 }
 
-impl ZeroCopyObjectWriter {
-    /// Create a new zero-copy object writer with default capacity (8KB).
+/// Historical name for the BytesMut-backed object writer.
+#[deprecated(since = "1.0.0-beta.8", note = "use BytesMutWriter; writes append into a BytesMut buffer")]
+pub type ZeroCopyObjectWriter = BytesMutWriter;
+
+impl BytesMutWriter {
+    /// Create a new bytes-backed object writer with default capacity (8KB).
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let writer = ZeroCopyObjectWriter::new();
+    /// let writer = BytesMutWriter::new();
     /// ```
     pub fn new() -> Self {
         Self::with_capacity(8 * 1024)
     }
 
-    /// Create a new zero-copy object writer with specified capacity.
+    /// Create a new bytes-backed object writer with specified capacity.
     ///
     /// # Arguments
     ///
@@ -79,7 +84,7 @@ impl ZeroCopyObjectWriter {
     /// # Example
     ///
     /// ```ignore
-    /// let writer = ZeroCopyObjectWriter::with_capacity(64 * 1024);
+    /// let writer = BytesMutWriter::with_capacity(64 * 1024);
     /// ```
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -89,15 +94,14 @@ impl ZeroCopyObjectWriter {
         }
     }
 
-    /// Write data with zero-copy if possible.
+    /// Write data into the internal buffer.
     ///
-    /// This method attempts to write data without copying:
-    /// - If `data` is a Bytes slice, it may be appended without copying
-    /// - If `data` shares the same underlying buffer, no copy occurs
+    /// This method accepts `Bytes` for API compatibility, then appends the
+    /// bytes into the internal `BytesMut` buffer.
     ///
     /// # Arguments
     ///
-    /// * `data` - Data to write (as Bytes for zero-copy potential)
+    /// * `data` - Data to append to the internal buffer
     ///
     /// # Returns
     ///
@@ -108,20 +112,27 @@ impl ZeroCopyObjectWriter {
     ///
     /// ```ignore
     /// let data = Bytes::from("hello world");
-    /// let written = writer.write_zero_copy(data).await?;
+    /// let written = writer.write_buffered(data).await?;
     /// ```
-    pub async fn write_zero_copy(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
+    pub async fn write_buffered(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
         if self.finalized {
             return Err(ZeroCopyWriteError::Finalized("Cannot write to finalized writer".to_string()));
         }
 
         let len = data.len();
-        // Zero-copy: put Bytes into BytesMut
-        // If data shares the same underlying buffer, no copy occurs
         self.buffer.put(data);
 
         self.bytes_written += len;
         Ok(len)
+    }
+
+    /// Historical name for `write_buffered`.
+    #[deprecated(
+        since = "1.0.0-beta.8",
+        note = "use write_buffered; this method appends bytes into an internal buffer"
+    )]
+    pub async fn write_zero_copy(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
+        self.write_buffered(data).await
     }
 
     /// Write a slice of data.
@@ -228,15 +239,15 @@ impl ZeroCopyObjectWriter {
     }
 }
 
-impl Default for ZeroCopyObjectWriter {
+impl Default for BytesMutWriter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl std::fmt::Debug for ZeroCopyObjectWriter {
+impl std::fmt::Debug for BytesMutWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ZeroCopyObjectWriter")
+        f.debug_struct("BytesMutWriter")
             .field("buffer_len", &self.buffer.len())
             .field("buffer_capacity", &self.buffer.capacity())
             .field("bytes_written", &self.bytes_written)
@@ -245,10 +256,10 @@ impl std::fmt::Debug for ZeroCopyObjectWriter {
     }
 }
 
-/// AsyncWrite implementation for ZeroCopyObjectWriter.
+/// AsyncWrite implementation for BytesMutWriter.
 ///
 /// This allows the writer to be used with tokio's async I/O utilities.
-impl AsyncWrite for ZeroCopyObjectWriter {
+impl AsyncWrite for BytesMutWriter {
     fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, tokio::io::Error>> {
         if self.finalized {
             return Poll::Ready(Err(tokio::io::Error::new(
@@ -296,26 +307,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_writer() {
-        let writer = ZeroCopyObjectWriter::new();
+        let writer = BytesMutWriter::new();
         assert!(writer.is_empty());
         assert_eq!(writer.bytes_written(), 0);
         assert!(writer.capacity() >= 8 * 1024);
     }
 
     #[tokio::test]
-    async fn test_write_zero_copy() {
-        let mut writer = ZeroCopyObjectWriter::new();
+    async fn test_write_buffered() {
+        let mut writer = BytesMutWriter::new();
         let data = Bytes::from("hello world");
 
-        let written = writer.write_zero_copy(data).await.unwrap();
+        let written = writer.write_buffered(data).await.unwrap();
         assert_eq!(written, 11);
         assert_eq!(writer.bytes_written(), 11);
         assert_eq!(writer.as_slice(), b"hello world");
     }
 
     #[tokio::test]
+    async fn test_preferred_writer_alias() {
+        let mut writer = BytesMutWriter::new();
+        let written = writer
+            .write_buffered(Bytes::from("hello world"))
+            .await
+            .expect("write bytes through alias");
+
+        assert_eq!(written, 11);
+        assert_eq!(writer.as_slice(), b"hello world");
+    }
+
+    #[tokio::test]
     async fn test_write_slice() {
-        let mut writer = ZeroCopyObjectWriter::new();
+        let mut writer = BytesMutWriter::new();
         let data = b"hello world";
 
         let written = writer.write_slice(data).await.unwrap();
@@ -326,10 +349,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_into_bytes() {
-        let mut writer = ZeroCopyObjectWriter::new();
+        let mut writer = BytesMutWriter::new();
         let data = Bytes::from("hello world");
 
-        writer.write_zero_copy(data).await.unwrap();
+        writer.write_buffered(data).await.unwrap();
         let result = writer.into_bytes();
 
         assert_eq!(result.as_ref(), b"hello world");
@@ -337,26 +360,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_after_finalize() {
-        let mut writer = ZeroCopyObjectWriter::new();
+        let mut writer = BytesMutWriter::new();
         let data = Bytes::from("hello");
 
-        writer.write_zero_copy(data).await.unwrap();
+        writer.write_buffered(data).await.unwrap();
         let _result = writer.into_bytes();
 
         // Create new writer and try to write after finalize
-        let mut writer2 = ZeroCopyObjectWriter::new();
-        writer2.write_zero_copy(Bytes::from("test")).await.unwrap();
+        let mut writer2 = BytesMutWriter::new();
+        writer2.write_buffered(Bytes::from("test")).await.unwrap();
         let _ = writer2.into_bytes();
 
         // Writing to a consumed writer should work via new writer
-        let mut writer3 = ZeroCopyObjectWriter::new();
-        let result = writer3.write_zero_copy(Bytes::from("final")).await;
+        let mut writer3 = BytesMutWriter::new();
+        let result = writer3.write_buffered(Bytes::from("final")).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_clear() {
-        let mut writer = ZeroCopyObjectWriter::new();
+        let mut writer = BytesMutWriter::new();
         writer.write_slice(b"hello").await.unwrap();
 
         writer.clear();
@@ -368,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reserve() {
-        let mut writer = ZeroCopyObjectWriter::with_capacity(10);
+        let mut writer = BytesMutWriter::with_capacity(10);
         let initial_capacity = writer.capacity();
 
         writer.reserve(1000);
@@ -379,9 +402,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_writes() {
-        let mut writer = ZeroCopyObjectWriter::new();
+        let mut writer = BytesMutWriter::new();
 
-        writer.write_zero_copy(Bytes::from("hello ")).await.unwrap();
+        writer.write_buffered(Bytes::from("hello ")).await.unwrap();
         writer.write_slice(b"world").await.unwrap();
 
         assert_eq!(writer.as_slice(), b"hello world");
@@ -392,7 +415,7 @@ mod tests {
     async fn test_async_write() {
         use tokio::io::AsyncWriteExt;
 
-        let mut writer = ZeroCopyObjectWriter::new();
+        let mut writer = BytesMutWriter::new();
         let data = b"hello world";
 
         let written = writer.write(data).await.unwrap();
@@ -402,9 +425,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_debug() {
-        let writer = ZeroCopyObjectWriter::new();
+        let writer = BytesMutWriter::new();
         let debug_str = format!("{:?}", writer);
-        assert!(debug_str.contains("ZeroCopyObjectWriter"));
+        assert!(debug_str.contains("BytesMutWriter"));
         assert!(debug_str.contains("buffer_len"));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_legacy_writer_alias() {
+        let mut writer = ZeroCopyObjectWriter::new();
+        let written = writer.write_zero_copy(Bytes::from("hello")).await.unwrap();
+
+        assert_eq!(written, 5);
+        assert_eq!(writer.as_slice(), b"hello");
     }
 }

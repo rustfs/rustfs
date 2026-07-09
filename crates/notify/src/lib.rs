@@ -22,7 +22,6 @@ mod bucket_config_manager;
 mod config_manager;
 mod error;
 mod event;
-mod event_bridge;
 pub mod factory;
 mod global;
 pub mod integration;
@@ -36,23 +35,24 @@ mod runtime_facade;
 mod runtime_view;
 mod services;
 mod status_view;
-mod storage_compat;
+mod storage_api;
 
 pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
 pub use error::{LifecycleError, NotificationError};
-pub use event::{Event, EventArgs, EventArgsBuilder};
-pub use event_bridge::{LiveEventHistory, NotifyEventBridge};
+pub use event::{Event, EventArgs, EventArgsBuilder, NotifyObjectInfo};
 pub use global::{
     initialize, initialize_live_events, is_notification_system_initialized, notification_metrics_snapshot, notification_system,
     notification_target_metrics, notifier_global,
 };
 pub use integration::{NotificationMetricSnapshot, NotificationSystem, NotificationTargetMetricSnapshot};
-pub use pipeline::NotifyPipeline;
+pub use pipeline::{LiveEventHistory, NotifyEventBridge, NotifyPipeline};
 pub use rule_engine::NotifyRuleEngine;
 pub use rules::BucketNotificationConfig;
 pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;
 pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
-pub use storage_compat::NotifyObjectInfo;
+pub(crate) use storage_api::crate_boundary::{
+    read_notify_server_config_without_migrate, resolve_notify_object_store_handle, save_notify_server_config,
+};

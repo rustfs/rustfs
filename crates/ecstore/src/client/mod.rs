@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: S3 client compatibility models are kept while ECStore callers move to narrower facades.
+#![allow(dead_code)]
+
 pub mod admin_handler_utils;
 pub mod api_bucket_policy;
 pub mod api_error_response;
@@ -35,6 +38,7 @@ pub mod constants;
 pub mod credentials;
 pub mod object_api_utils;
 pub mod object_handlers_common;
+pub(crate) mod runtime_sources;
 pub mod signer_error;
 pub mod transition_api;
 pub mod utils;

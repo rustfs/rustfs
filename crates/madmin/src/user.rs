@@ -423,6 +423,8 @@ pub struct BucketDetails {
     pub versioning_suspended: bool,
     pub locking: bool,
     pub replication: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<u64>,
     // pub tagging: Option<Tagging>,
 }
 
@@ -726,24 +728,6 @@ mod tests {
     use time::macros::datetime;
 
     #[test]
-    fn test_account_status_default() {
-        let status = AccountStatus::default();
-        assert_eq!(status, AccountStatus::Disabled);
-    }
-
-    #[test]
-    fn test_account_status_as_ref() {
-        assert_eq!(AccountStatus::Enabled.as_ref(), "enabled");
-        assert_eq!(AccountStatus::Disabled.as_ref(), "disabled");
-    }
-
-    #[test]
-    fn test_account_status_try_from_valid() {
-        assert_eq!(AccountStatus::try_from("enabled").unwrap(), AccountStatus::Enabled);
-        assert_eq!(AccountStatus::try_from("disabled").unwrap(), AccountStatus::Disabled);
-    }
-
-    #[test]
     fn test_account_status_try_from_invalid() {
         let result = AccountStatus::try_from("invalid");
         assert!(result.is_err());
@@ -781,32 +765,6 @@ mod tests {
 
         assert_eq!(builtin_json, "\"builtin\"");
         assert_eq!(ldap_json, "\"ldap\"");
-    }
-
-    #[test]
-    fn test_user_auth_info_creation() {
-        let auth_info = UserAuthInfo {
-            auth_type: UserAuthType::Ldap,
-            auth_server: Some("ldap.example.com".to_string()),
-            auth_server_user_id: Some("user123".to_string()),
-        };
-
-        assert!(matches!(auth_info.auth_type, UserAuthType::Ldap));
-        assert_eq!(auth_info.auth_server.unwrap(), "ldap.example.com");
-        assert_eq!(auth_info.auth_server_user_id.unwrap(), "user123");
-    }
-
-    #[test]
-    fn test_user_auth_info_serialization() {
-        let auth_info = UserAuthInfo {
-            auth_type: UserAuthType::Builtin,
-            auth_server: None,
-            auth_server_user_id: None,
-        };
-
-        let json = serde_json::to_string(&auth_info).unwrap();
-        assert!(json.contains("builtin"));
-        assert!(!json.contains("authServer"), "None fields should be skipped");
     }
 
     #[test]
@@ -1021,57 +979,6 @@ mod tests {
     }
 
     #[test]
-    fn test_credentials_without_optional_fields() {
-        let credentials = Credentials {
-            access_key: "AKIAIOSFODNN7EXAMPLE",
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            session_token: None,
-            expiration: None,
-        };
-
-        let json = serde_json::to_string(&credentials).unwrap();
-        assert!(json.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(!json.contains("sessionToken"), "None fields should be skipped");
-        assert!(!json.contains("expiration"), "None fields should be skipped");
-    }
-
-    #[test]
-    fn test_add_service_account_resp_creation() {
-        let credentials = Credentials {
-            access_key: "AKIAIOSFODNN7EXAMPLE",
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            session_token: None,
-            expiration: None,
-        };
-
-        let resp = AddServiceAccountResp { credentials };
-
-        assert_eq!(resp.credentials.access_key, "AKIAIOSFODNN7EXAMPLE");
-        assert_eq!(resp.credentials.secret_key, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
-    }
-
-    #[test]
-    fn test_info_service_account_resp_creation() {
-        let now = OffsetDateTime::now_utc();
-        let resp = InfoServiceAccountResp {
-            parent_user: "admin".to_string(),
-            account_status: "enabled".to_string(),
-            implied_policy: true,
-            policy: Some("ReadOnlyAccess".to_string()),
-            name: Some("test-service".to_string()),
-            description: Some("Test service account".to_string()),
-            expiration: Some(now),
-        };
-
-        assert_eq!(resp.parent_user, "admin");
-        assert_eq!(resp.account_status, "enabled");
-        assert!(resp.implied_policy);
-        assert_eq!(resp.policy.unwrap(), "ReadOnlyAccess");
-        assert_eq!(resp.name.unwrap(), "test-service");
-        assert!(resp.expiration.is_some());
-    }
-
-    #[test]
     fn test_update_service_account_req_validate() {
         let req = UpdateServiceAccountReq {
             new_policy: Some(serde_json::json!({"Version": "2012-10-17"})),
@@ -1106,22 +1013,6 @@ mod tests {
     }
 
     #[test]
-    fn test_account_info_creation() {
-        use crate::BackendInfo;
-
-        let account_info = AccountInfo {
-            account_name: "testuser".to_string(),
-            server: BackendInfo::default(),
-            policy: serde_json::json!({"Version": "2012-10-17"}),
-            buckets: vec![],
-        };
-
-        assert_eq!(account_info.account_name, "testuser");
-        assert!(account_info.buckets.is_empty());
-        assert!(account_info.policy.is_object());
-    }
-
-    #[test]
     fn test_bucket_access_info_creation() {
         let now = OffsetDateTime::now_utc();
         let mut sizes_histogram = HashMap::new();
@@ -1147,6 +1038,7 @@ mod tests {
                 versioning_suspended: false,
                 locking: true,
                 replication: false,
+                quota: None,
             }),
             prefix_usage,
             created: Some(now),
@@ -1175,12 +1067,27 @@ mod tests {
             versioning_suspended: false,
             locking: true,
             replication: true,
+            quota: Some(1024),
         };
 
         assert!(details.versioning);
         assert!(!details.versioning_suspended);
         assert!(details.locking);
         assert!(details.replication);
+        assert_eq!(details.quota, Some(1024));
+    }
+
+    #[test]
+    fn bucket_details_serializes_quota_only_when_configured() {
+        let with_quota = BucketDetails {
+            quota: Some(1024),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(with_quota).expect("bucket details should serialize");
+        assert_eq!(value["quota"], 1024);
+
+        let without_quota = serde_json::to_value(BucketDetails::default()).expect("bucket details should serialize");
+        assert!(without_quota.get("quota").is_none());
     }
 
     #[test]

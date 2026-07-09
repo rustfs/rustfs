@@ -89,7 +89,7 @@ fn compute_default_max_blocking_threads() -> usize {
 /// ```no_run
 /// // tokio_runtime_builder is pub(crate) - call it from within the rustfs binary:
 /// // let builder = tokio_runtime_builder();
-/// // let runtime = builder.build().unwrap();
+/// // let runtime = builder.build().expect("operation should succeed");
 /// ```
 pub fn tokio_runtime_builder() -> tokio::runtime::Builder {
     let mut builder = tokio::runtime::Builder::new_multi_thread();

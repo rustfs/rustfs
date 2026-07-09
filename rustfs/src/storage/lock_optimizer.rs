@@ -381,9 +381,12 @@ pub fn is_lock_optimization_enabled() -> bool {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{LockOptimizeConfig, LockOptimizer, LockStats, OptimizedLockGuard};
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     #[test]
     fn test_lock_optimize_config_default() {

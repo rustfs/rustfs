@@ -215,7 +215,7 @@ impl RateLimiter {
     /// Returns (remaining, reset_timestamp) if successful,
     /// or SwiftError::TooManyRequests if rate limited
     pub fn check_rate_limit(&self, key: &str, rate_limit: &RateLimit) -> SwiftResult<(u32, u64)> {
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.lock().expect("operation should succeed");
 
         // Get or create bucket for this key
         let bucket = buckets.entry(key.to_string()).or_insert_with(|| TokenBucket::new(rate_limit));
@@ -241,7 +241,7 @@ impl RateLimiter {
 
     /// Get current rate limit status without consuming quota
     pub fn get_status(&self, key: &str, rate_limit: &RateLimit) -> (u32, u64) {
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.lock().expect("operation should succeed");
 
         let bucket = buckets.entry(key.to_string()).or_insert_with(|| TokenBucket::new(rate_limit));
 
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_parse_rate_limit_valid() {
-        let rate_limit = RateLimit::parse("1000/60").unwrap();
+        let rate_limit = RateLimit::parse("1000/60").expect("operation should succeed");
         assert_eq!(rate_limit.limit, 1000);
         assert_eq!(rate_limit.window_seconds, 60);
     }
@@ -362,7 +362,7 @@ mod tests {
 
         // Consume 10
         for _ in 0..10 {
-            bucket.try_consume().unwrap();
+            bucket.try_consume().expect("operation should succeed");
         }
 
         assert_eq!(bucket.remaining(), 90);
@@ -395,7 +395,7 @@ mod tests {
         let rate_limit = extract_rate_limit(&metadata);
         assert!(rate_limit.is_some());
 
-        let rate_limit = rate_limit.unwrap();
+        let rate_limit = rate_limit.expect("operation should succeed");
         assert_eq!(rate_limit.limit, 1000);
         assert_eq!(rate_limit.window_seconds, 60);
     }
@@ -408,7 +408,7 @@ mod tests {
         let rate_limit = extract_rate_limit(&metadata);
         assert!(rate_limit.is_some());
 
-        let rate_limit = rate_limit.unwrap();
+        let rate_limit = rate_limit.expect("operation should succeed");
         assert_eq!(rate_limit.limit, 100);
         assert_eq!(rate_limit.window_seconds, 60);
     }

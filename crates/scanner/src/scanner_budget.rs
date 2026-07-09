@@ -231,4 +231,23 @@ mod tests {
         assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Directories));
         assert!(budget.token().is_cancelled());
     }
+
+    #[test]
+    fn first_budget_cancellation_reason_remains_observable() {
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_objects: Some(1),
+                max_directories: Some(0),
+                ..Default::default()
+            },
+        );
+
+        budget.record_object_scanned();
+        assert!(!budget.try_start_directory());
+
+        assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Objects));
+        assert!(budget.token().is_cancelled());
+    }
 }

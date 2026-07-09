@@ -18,10 +18,12 @@ use rustfs_heal::heal::{
     utils,
 };
 
+mod storage_api;
+
+use storage_api::bug_fixes::{BucketInfo, DiskStore, Endpoint};
+
 #[test]
 fn test_heal_event_to_heal_request_no_panic() {
-    use rustfs_ecstore::disk::endpoint::Endpoint;
-
     // Test that invalid pool/set indices don't cause panic
     // Create endpoint using try_from or similar method
     let endpoint_result = Endpoint::try_from("http://localhost:9000");
@@ -45,8 +47,6 @@ fn test_heal_event_to_heal_request_no_panic() {
 
 #[test]
 fn test_heal_event_to_heal_request_valid_indices() {
-    use rustfs_ecstore::disk::endpoint::Endpoint;
-
     // Test that valid indices work correctly
     let endpoint_result = Endpoint::try_from("http://localhost:9000");
     if let Ok(mut endpoint) = endpoint_result {
@@ -162,7 +162,7 @@ fn test_path_to_str_helper() {
 
 #[test]
 fn test_heal_task_status_atomic_update() {
-    use rustfs_heal::heal::storage::{HealObjectInfo, HealStorageAPI};
+    use rustfs_heal::heal::storage::{HealListItem, HealObjectInfo, HealStorageAPI};
     use rustfs_heal::heal::task::{HealOptions, HealRequest, HealTask, HealTaskStatus};
     use std::sync::Arc;
 
@@ -188,22 +188,19 @@ fn test_heal_task_status_atomic_update() {
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(vec![])
         }
-        async fn get_disk_status(
-            &self,
-            _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint,
-        ) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
+        async fn get_disk_status(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
             Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
         }
-        async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> rustfs_heal::Result<()> {
+        async fn format_disk(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<()> {
             Ok(())
         }
-        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<rustfs_storage_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
         }
         async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
             Ok(())
         }
-        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<rustfs_storage_api::BucketInfo>> {
+        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
             Ok(vec![])
         }
         async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
@@ -237,7 +234,7 @@ fn test_heal_task_status_atomic_update() {
         ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_heal::Result<Vec<String>> {
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_heal::Result<Vec<HealListItem>> {
             Ok(vec![])
         }
         async fn list_objects_for_heal_page(
@@ -245,10 +242,10 @@ fn test_heal_task_status_atomic_update() {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
-        ) -> rustfs_heal::Result<(Vec<String>, Option<String>, bool)> {
+        ) -> rustfs_heal::Result<(Vec<HealListItem>, Option<String>, bool)> {
             Ok((vec![], None, false))
         }
-        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<rustfs_ecstore::disk::DiskStore> {
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<DiskStore> {
             Err(rustfs_heal::Error::other("Not implemented in mock"))
         }
     }
@@ -280,7 +277,7 @@ fn test_heal_task_status_atomic_update() {
 
 #[tokio::test]
 async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
-    use rustfs_heal::heal::storage::{DiskStatus, HealObjectInfo, HealStorageAPI};
+    use rustfs_heal::heal::storage::{DiskStatus, HealListItem, HealObjectInfo, HealStorageAPI};
     use rustfs_heal::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType};
     use std::sync::{
         Arc,
@@ -318,15 +315,15 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> rustfs_heal::Result<DiskStatus> {
+        async fn get_disk_status(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<DiskStatus> {
             Ok(DiskStatus::Ok)
         }
 
-        async fn format_disk(&self, _endpoint: &rustfs_ecstore::disk::endpoint::Endpoint) -> rustfs_heal::Result<()> {
+        async fn format_disk(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<()> {
             Ok(())
         }
 
-        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<rustfs_storage_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
         }
 
@@ -334,7 +331,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Ok(())
         }
 
-        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<rustfs_storage_api::BucketInfo>> {
+        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
             Ok(Vec::new())
         }
 
@@ -379,7 +376,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
 
-        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_heal::Result<Vec<String>> {
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> rustfs_heal::Result<Vec<HealListItem>> {
             Ok(Vec::new())
         }
 
@@ -388,11 +385,11 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             _bucket: &str,
             _prefix: &str,
             _continuation_token: Option<&str>,
-        ) -> rustfs_heal::Result<(Vec<String>, Option<String>, bool)> {
+        ) -> rustfs_heal::Result<(Vec<HealListItem>, Option<String>, bool)> {
             Ok((Vec::new(), None, false))
         }
 
-        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<rustfs_ecstore::disk::DiskStore> {
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<DiskStore> {
             Err(rustfs_heal::Error::other("not implemented"))
         }
     }

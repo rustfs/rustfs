@@ -32,6 +32,9 @@ lazy_static::lazy_static! {
 pub fn check_bucket_name_common(bucket_name: &str, strict: bool) -> Result<()> {
     let bucket_name_trimmed = bucket_name.trim();
 
+    if bucket_name_trimmed != bucket_name {
+        return Err(Error::other("Bucket name cannot contain leading or trailing whitespace"));
+    }
     if bucket_name_trimmed.is_empty() {
         return Err(Error::other("Bucket name cannot be empty"));
     }
@@ -137,25 +140,9 @@ pub fn has_bad_path_component(path: &str) -> bool {
             i += 1;
         }
 
-        // Trim whitespace of segment
-        let mut segment_start = start;
-        let mut segment_end = i;
-
-        while segment_start < segment_end && bytes[segment_start].is_ascii_whitespace() {
-            segment_start += 1;
-        }
-        while segment_end > segment_start && bytes[segment_end - 1].is_ascii_whitespace() {
-            segment_end -= 1;
-        }
-
-        // Check for ".." or "."
-        match segment_end - segment_start {
-            2 if segment_start + 1 < n && bytes[segment_start] == b'.' && bytes[segment_start + 1] == b'.' => {
-                return true;
-            }
-            1 if bytes[segment_start] == b'.' => {
-                return true;
-            }
+        // Trim whitespace of segment and check for ".." or "."
+        match path[start..i].trim() {
+            "." | ".." => return true,
             _ => {}
         }
 
@@ -196,6 +183,29 @@ pub fn is_valid_object_name(object: &str) -> bool {
     is_valid_object_prefix(object)
 }
 
+/// Reserved DOS device names that shadow regular files on Windows, even when
+/// an extension is appended (e.g. `NUL.txt` resolves to the `NUL` device).
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
+    "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Returns true when `object` contains a path segment that NTFS can store but
+/// the Win32 API cannot address afterwards (issue #3449): segments ending in a
+/// dot or a space, and reserved DOS device names — bare or with an extension
+/// (`NUL.txt`), matching classic Win32 path resolution semantics.
+pub fn object_name_has_windows_incompatible_segment(object: &str) -> bool {
+    object.split(['/', '\\']).any(|segment| {
+        if segment.ends_with('.') || segment.ends_with(' ') {
+            return true;
+        }
+        // Device names are matched on the part before the first dot, with
+        // trailing spaces ignored (so `NUL .txt` is also reserved).
+        let base = segment.split('.').next().unwrap_or(segment).trim_end_matches(' ');
+        WINDOWS_RESERVED_NAMES.iter().any(|name| base.eq_ignore_ascii_case(name))
+    })
+}
+
 pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<()> {
     if object.len() > 1024 {
         return Err(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned()));
@@ -216,6 +226,12 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
             || object.contains('>')
         // || object.contains('\\')
         {
+            return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
+        }
+
+        // Reject names that NTFS would happily create but the Win32 path
+        // layer cannot read back (os error 3), e.g. `baddir.` or `NUL.txt`.
+        if object_name_has_windows_incompatible_segment(object) {
             return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
         }
     }
@@ -436,6 +452,9 @@ mod tests {
         assert!(!is_valid_object_prefix("prefix/./other"));
         assert!(!is_valid_object_prefix("a/../b/../c"));
         assert!(!is_valid_object_prefix("a/./b/./c"));
+        assert!(!is_valid_object_prefix("\x0b./object"));
+        assert!(!is_valid_object_prefix("prefix/\x0b../object"));
+        assert!(!is_valid_object_prefix("\x0b.\\\\object"));
 
         // Invalid cases - double slashes
         assert!(!is_valid_object_prefix("prefix//with//double//slashes"));
@@ -453,6 +472,89 @@ mod tests {
     }
 
     #[test]
+    fn test_object_name_has_windows_incompatible_segment() {
+        // Segments ending in a dot are writable on NTFS but unreadable via Win32 paths.
+        assert!(object_name_has_windows_incompatible_segment("baddir."));
+        assert!(object_name_has_windows_incompatible_segment("dir1/dir2/baddir."));
+        assert!(object_name_has_windows_incompatible_segment("dir1/baddir./file.txt"));
+        assert!(object_name_has_windows_incompatible_segment("file.txt."));
+
+        // Segments ending in a space.
+        assert!(object_name_has_windows_incompatible_segment("file.txt "));
+        assert!(object_name_has_windows_incompatible_segment("dir /file.txt"));
+
+        // Reserved DOS device names, bare and case-insensitive.
+        assert!(object_name_has_windows_incompatible_segment("NUL"));
+        assert!(object_name_has_windows_incompatible_segment("nul"));
+        assert!(object_name_has_windows_incompatible_segment("CON"));
+        assert!(object_name_has_windows_incompatible_segment("prn"));
+        assert!(object_name_has_windows_incompatible_segment("Aux"));
+        assert!(object_name_has_windows_incompatible_segment("COM1"));
+        assert!(object_name_has_windows_incompatible_segment("com9"));
+        assert!(object_name_has_windows_incompatible_segment("LPT1"));
+        assert!(object_name_has_windows_incompatible_segment("lpt9"));
+        assert!(object_name_has_windows_incompatible_segment("dir/NUL/file.txt"));
+
+        // Reserved device names with an extension still resolve to the device.
+        assert!(object_name_has_windows_incompatible_segment("NUL.txt"));
+        assert!(object_name_has_windows_incompatible_segment("dir/aux.log"));
+        assert!(object_name_has_windows_incompatible_segment("con.tar.gz"));
+        assert!(object_name_has_windows_incompatible_segment("com1.dat"));
+        assert!(object_name_has_windows_incompatible_segment("NUL .txt"));
+
+        // Backslash-separated segments are checked as well.
+        assert!(object_name_has_windows_incompatible_segment("dir\\baddir.\\file.txt"));
+        assert!(object_name_has_windows_incompatible_segment("dir\\nul"));
+
+        // Valid names must not be flagged.
+        assert!(!object_name_has_windows_incompatible_segment("file.txt"));
+        assert!(!object_name_has_windows_incompatible_segment("dir.name/file"));
+        assert!(!object_name_has_windows_incompatible_segment("path/to/file.tar.gz"));
+        assert!(!object_name_has_windows_incompatible_segment("nullable"));
+        assert!(!object_name_has_windows_incompatible_segment("CONSOLE"));
+        assert!(!object_name_has_windows_incompatible_segment("com10"));
+        assert!(!object_name_has_windows_incompatible_segment("com0"));
+        assert!(!object_name_has_windows_incompatible_segment("lpt"));
+        assert!(!object_name_has_windows_incompatible_segment("aux-data/file"));
+        assert!(!object_name_has_windows_incompatible_segment("object with spaces inside"));
+        assert!(!object_name_has_windows_incompatible_segment(""));
+    }
+
+    #[test]
+    fn test_check_object_name_windows_incompatible_segments() {
+        // Rejected on Windows (would be written but unreadable, issue #3449);
+        // valid on non-Windows platforms.
+        for object in [
+            "baddir.",
+            "dir1/dir2/baddir.",
+            "dir1/baddir./file.txt",
+            "file.txt ",
+            "NUL",
+            "nul.txt",
+            "COM1",
+            "dir/LPT9.log",
+        ] {
+            let result = check_object_name_for_length_and_slash("test-bucket", object);
+            if cfg!(target_os = "windows") {
+                assert!(
+                    matches!(result, Err(StorageError::ObjectNameInvalid(..))),
+                    "object name must be rejected on Windows: {object:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "object name must remain valid on non-Windows: {object:?}");
+            }
+        }
+
+        // Valid on every platform.
+        for object in ["file.txt", "dir.name/file", "nullable", "CONSOLE", "com10"] {
+            assert!(
+                check_object_name_for_length_and_slash("test-bucket", object).is_ok(),
+                "object name must be valid on all platforms: {object:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_check_bucket_and_object_names() {
         // Valid names
         assert!(check_bucket_and_object_names("valid-bucket", "valid-object").is_ok());
@@ -463,6 +565,26 @@ mod tests {
 
         // Invalid object names
         assert!(check_bucket_and_object_names("valid-bucket", "").is_err());
+    }
+
+    #[test]
+    fn test_check_bucket_name_rejects_leading_and_trailing_whitespace() {
+        for bucket in [
+            " valid-bucket",
+            "valid-bucket ",
+            "valid-bucket\n",
+            "valid-bucket\u{b}",
+            "\u{c}valid-bucket\u{c}",
+        ] {
+            assert!(
+                check_valid_bucket_name_strict(bucket).is_err(),
+                "bucket name with leading or trailing whitespace must be rejected: {bucket:?}"
+            );
+            assert!(
+                check_valid_bucket_name(bucket).is_err(),
+                "legacy bucket validation must reject leading or trailing whitespace: {bucket:?}"
+            );
+        }
     }
 
     #[test]

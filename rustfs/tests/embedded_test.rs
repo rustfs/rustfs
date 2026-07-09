@@ -38,7 +38,11 @@ fn s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
 #[tokio::test]
 async fn test_embedded_server_basic_s3_operations() {
     // 1. Pick a free port and start the embedded server.
-    let port = find_available_port().expect("find free port");
+    let port = match find_available_port() {
+        Ok(port) => port,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("find free port: {err}"),
+    };
     let server = RustFSServerBuilder::new()
         .address(format!("127.0.0.1:{port}"))
         .access_key("testaccesskey")

@@ -30,6 +30,14 @@ pub static GLOBAL_OUTBOUND_TLS_GENERATION: LazyLock<AtomicU64> = LazyLock::new(|
 /// Global initialization time of the RustFS node.
 pub static GLOBAL_INIT_TIME: LazyLock<RwLock<Option<DateTime<Utc>>>> = LazyLock::new(|| RwLock::new(None));
 
+/// Log level to use when reporting cached gRPC connection eviction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionEvictionLogLevel {
+    Warn,
+    Info,
+    Debug,
+}
+
 /// Set the global local node name.
 ///
 /// # Arguments
@@ -68,6 +76,16 @@ pub async fn set_global_addr(addr: &str) {
     *GLOBAL_RUSTFS_ADDR.write().await = addr.to_string();
 }
 
+/// Get the global RustFS host.
+pub async fn get_global_rustfs_host() -> String {
+    GLOBAL_RUSTFS_HOST.read().await.clone()
+}
+
+/// Get the global RustFS address used for gRPC connections.
+pub async fn get_global_addr() -> String {
+    GLOBAL_RUSTFS_ADDR.read().await.clone()
+}
+
 /// Set the global root CA certificate for outbound gRPC clients.
 /// This certificate is used to validate server TLS certificates.
 /// When set to None, clients use the system default root CAs.
@@ -78,6 +96,16 @@ pub async fn set_global_root_cert(cert: Vec<u8>) {
     *GLOBAL_ROOT_CERT.write().await = Some(cert);
 }
 
+/// Clear the global root CA certificate for outbound gRPC clients.
+pub async fn clear_global_root_cert() {
+    *GLOBAL_ROOT_CERT.write().await = None;
+}
+
+/// Get the global root CA certificate for outbound gRPC clients.
+pub async fn get_global_root_cert() -> Option<Vec<u8>> {
+    GLOBAL_ROOT_CERT.read().await.clone()
+}
+
 /// Set the global mTLS identity (cert+key PEM) for outbound gRPC clients.
 /// When set, clients will present this identity to servers requesting/requiring mTLS.
 /// When None, clients proceed with standard server-authenticated TLS.
@@ -86,6 +114,11 @@ pub async fn set_global_root_cert(cert: Vec<u8>) {
 /// * `identity` - An optional MtlsIdentityPem struct containing the cert and key PEM.
 pub async fn set_global_mtls_identity(identity: Option<MtlsIdentityPem>) {
     *GLOBAL_MTLS_IDENTITY.write().await = identity;
+}
+
+/// Get the global mTLS identity for outbound gRPC clients.
+pub async fn get_global_mtls_identity() -> Option<MtlsIdentityPem> {
+    GLOBAL_MTLS_IDENTITY.read().await.clone()
 }
 
 /// Set the global outbound TLS generation.
@@ -105,13 +138,44 @@ pub fn get_global_outbound_tls_generation() -> u64 {
 /// # Arguments
 /// * `addr` - The address of the connection to evict.
 pub async fn evict_connection(addr: &str) {
+    evict_connection_with_log_level(addr, ConnectionEvictionLogLevel::Info).await;
+}
+
+/// Evict a stale/dead connection from the global connection cache with an explicit log level.
+pub async fn evict_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) {
     let removed = GLOBAL_CONN_MAP.write().await.remove(addr);
     if removed.is_some() {
-        tracing::info!(
-            addr = %addr,
-            "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
-        );
+        match log_level {
+            ConnectionEvictionLogLevel::Warn => {
+                tracing::warn!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+            ConnectionEvictionLogLevel::Info => {
+                tracing::info!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+            ConnectionEvictionLogLevel::Debug => {
+                tracing::debug!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+        }
     }
+}
+
+/// Get a cached gRPC connection for the given address.
+pub async fn cached_connection(addr: &str) -> Option<Channel> {
+    GLOBAL_CONN_MAP.read().await.get(addr).cloned()
+}
+
+/// Cache a gRPC connection for the given address.
+pub async fn cache_connection(addr: String, channel: Channel) {
+    GLOBAL_CONN_MAP.write().await.insert(addr, channel);
 }
 
 /// Check if a connection exists in the cache for the given address.

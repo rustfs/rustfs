@@ -40,9 +40,9 @@ use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
-use crate::telemetry::guard::{MemoryProfilingAgent, OtelGuard, ProfilingAgent};
+use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
-use crate::telemetry::recorder::Recorder;
+use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 // Import helper functions from local.rs (sibling module)
@@ -54,7 +54,7 @@ use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig
 use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider,
-    metrics::{PeriodicReader, SdkMeterProvider},
+    metrics::{Aggregation, Instrument, PeriodicReader, SdkMeterProvider, Stream},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
 use percent_encoding::percent_decode_str;
@@ -65,10 +65,23 @@ use rustfs_config::{
 };
 use std::collections::HashMap;
 use std::{fs, io::IsTerminal, time::Duration};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+
+const GET_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_io_get_object_request_duration_seconds",
+    "rustfs_io_get_object_total_duration_seconds",
+    "rustfs_io_get_object_total_duration_seconds_with_path",
+    "rustfs_io_get_object_stage_duration_seconds",
+    "rustfs_io_get_object_stage_duration_seconds_by_size",
+];
+
+const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
@@ -102,65 +115,28 @@ pub(super) fn init_observability_http(
     // service identity and deployment metadata.
     let res = build_resource(config);
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME).to_owned();
-    let use_stdout = config.use_stdout.unwrap_or(!is_production);
+    let use_stdout = resolve_otlp_use_stdout(config.use_stdout, is_production);
     let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
     let sampler = build_tracer_sampler(sample_ratio);
 
     // ── Endpoint resolution ───────────────────────────────────────────────────
     // Each signal may have a dedicated endpoint; if absent, fall back to the
     // root endpoint with the standard OTLP path suffix appended.
-    let root_ep = config.endpoint.clone();
+    let root_ep = normalize_otlp_root_endpoint(&config.endpoint);
 
-    let trace_ep: String = config
-        .trace_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/traces")
-            } else {
-                String::new()
-            }
-        });
-
-    let metric_ep: String = config
-        .metric_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/metrics")
-            } else {
-                String::new()
-            }
-        });
+    let trace_ep = resolve_signal_endpoint(config.trace_endpoint.as_deref(), root_ep, "/v1/traces");
+    let metric_ep = resolve_signal_endpoint(config.metric_endpoint.as_deref(), root_ep, "/v1/metrics");
 
     // If `log_endpoint` is not explicitly set, fall back to `root_ep/v1/logs`
     // only when a root endpoint exists. An empty result intentionally triggers
     // the file-logging path below instead of silently disabling application logs.
-    let log_ep: String = config
-        .log_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/logs")
-            } else {
-                String::new()
-            }
-        });
+    let log_ep = resolve_signal_endpoint(config.log_endpoint.as_deref(), root_ep, "/v1/logs");
 
     // ── Tracer provider (HTTP) ────────────────────────────────────────────────
     let tracer_provider = build_tracer_provider(&trace_ep, config, res.clone(), sampler, use_stdout)?;
 
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
-
-    let profiling_agent = init_profiler(config);
-    let memory_profiling_agent = init_memory_profiler(config);
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
     // Logging is the only signal that may intentionally route to either OTLP
@@ -179,7 +155,7 @@ pub(super) fn init_observability_http(
         // Init OTLP logger logic.
         // We initialize the OTLP collector and honor the configured stdout setting
         // (e.g. via RUSTFS_OBS_USE_STDOUT / config.use_stdout) when building the provider.
-        logger_provider = build_logger_provider(&log_ep, config, res, false)?;
+        logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
 
         // Build bridge to capture `tracing` events.
         otel_bridge = logger_provider
@@ -283,7 +259,8 @@ pub(super) fn init_observability_http(
         .with(tracer_layer)
         .with(otel_bridge)
         .with(metrics_layer)
-        .init();
+        .try_init()
+        .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     counter!("rustfs_start_total").increment(1);
     info!(
@@ -303,8 +280,7 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
-        profiling_agent,
-        memory_profiling_agent,
+        profiling_agent: None,
         tracing_guard,
         stdout_guard,
         cleanup_handle,
@@ -375,10 +351,31 @@ fn build_tracer_provider(
 /// disappear due to configuration mistakes.
 fn build_tracer_sampler(sample_ratio: f64) -> Sampler {
     if sample_ratio.is_finite() && (0.0..=1.0).contains(&sample_ratio) {
-        Sampler::TraceIdRatioBased(sample_ratio)
+        Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(sample_ratio)))
     } else {
-        Sampler::AlwaysOn
+        Sampler::ParentBased(Box::new(Sampler::AlwaysOn))
     }
+}
+
+fn resolve_otlp_use_stdout(config_use_stdout: Option<bool>, is_production: bool) -> bool {
+    config_use_stdout.unwrap_or(!is_production)
+}
+
+fn normalize_otlp_root_endpoint(root_ep: &str) -> &str {
+    root_ep.trim_end_matches('/')
+}
+
+fn resolve_signal_endpoint(signal_endpoint: Option<&str>, root_ep: &str, suffix: &str) -> String {
+    signal_endpoint
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if root_ep.is_empty() {
+                String::new()
+            } else {
+                format!("{root_ep}{suffix}")
+            }
+        })
 }
 
 /// Build an optional [`SdkMeterProvider`] for the given metrics endpoint.
@@ -414,15 +411,18 @@ fn build_meter_provider(
         .build()
         .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
 
-    let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
+    let meter_interval = resolve_meter_interval(config);
 
     let (provider, recorder) = Recorder::builder(service_name.to_string())
         .with_meter_provider(|b: opentelemetry_sdk::metrics::MeterProviderBuilder| {
-            let b = b.with_resource(res).with_reader(
-                PeriodicReader::builder(exporter)
-                    .with_interval(Duration::from_secs(meter_interval))
-                    .build(),
-            );
+            let b = b
+                .with_resource(res)
+                .with_reader(
+                    PeriodicReader::builder(exporter)
+                        .with_interval(Duration::from_secs(meter_interval))
+                        .build(),
+                )
+                .with_view(get_object_duration_histogram_view);
             if use_stdout {
                 b.with_reader(create_periodic_reader(meter_interval))
             } else {
@@ -432,9 +432,27 @@ fn build_meter_provider(
         .build();
 
     global::set_meter_provider(provider.clone());
-    metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+    install_process_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
     set_observability_metric_enabled(true);
     Ok(Some(provider))
+}
+
+fn get_object_duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
+    if !is_get_object_duration_histogram_metric(instrument.name()) {
+        return None;
+    }
+
+    Stream::builder()
+        .with_aggregation(Aggregation::ExplicitBucketHistogram {
+            boundaries: GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.to_vec(),
+            record_min_max: true,
+        })
+        .build()
+        .ok()
+}
+
+fn is_get_object_duration_histogram_metric(name: &str) -> bool {
+    GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name)
 }
 
 /// Build an optional [`SdkLoggerProvider`] for the given log endpoint.
@@ -484,7 +502,7 @@ fn build_logger_provider(
     feature = "pyroscope",
     any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
 ))]
-fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
+pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -496,10 +514,19 @@ fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
         return None;
     }
 
-    let endpoint = config.profiling_endpoint.as_ref()?.as_str();
-    if endpoint.is_empty() {
+    let Some(endpoint) = config
+        .profiling_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    else {
+        warn!(
+            backend = "pyroscope",
+            result = "profiling_endpoint_missing",
+            "Profiling export is enabled but no profiling endpoint was configured"
+        );
         return None;
-    }
+    };
 
     // Configure Pyroscope Agent
     let backend = pprof_backend(PprofConfig::default(), BackendConfig::default());
@@ -507,15 +534,33 @@ fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     let version = config.service_version.as_deref().unwrap_or(VERSION);
     let sample_rate = 100; // 100 Hz
 
-    let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
+    let agent = match PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
         .tags(vec![("version", version), ("profile_type", "cpu")])
         .build()
-        .ok()?;
+    {
+        Ok(agent) => agent,
+        Err(err) => {
+            warn!(
+                backend = "pyroscope",
+                endpoint,
+                result = "profiling_agent_build_failed",
+                error = %err,
+                "Profiling export agent initialization failed"
+            );
+            return None;
+        }
+    };
 
     match agent.start() {
         Ok(agent) => Some(agent),
         Err(err) => {
-            eprintln!("Pyroscope agent start error: {err:?}");
+            warn!(
+                backend = "pyroscope",
+                endpoint,
+                result = "profiling_agent_start_failed",
+                error = ?err,
+                "Profiling export agent failed to start"
+            );
             None
         }
     }
@@ -525,66 +570,18 @@ fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     feature = "pyroscope",
     any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
 )))]
-fn init_profiler(_config: &OtelConfig) -> Option<ProfilingAgent> {
-    None
-}
-
-/// Initialise a Pyroscope agent for continuous **memory** profiling via jemalloc.
-///
-/// This is only available on `linux + gnu + x86_64` where tikv-jemallocator
-/// is the global allocator and `jemalloc_pprof::PROF_CTL` is accessible.
-///
-/// Returns `None` when profiling export is disabled, the endpoint is missing,
-/// jemalloc profiling is not activated, or the agent fails to build/start.
-#[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-fn init_memory_profiler(config: &OtelConfig) -> Option<MemoryProfilingAgent> {
-    use pyroscope::backend::jemalloc_backend;
-    use pyroscope::pyroscope::PyroscopeAgentBuilder;
-    use rustfs_config::VERSION;
-
-    if !config
+pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
+    if config
         .profiling_export_enabled
         .unwrap_or(rustfs_config::DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
     {
-        return None;
+        warn!(
+            backend = "pyroscope",
+            result = "profiling_feature_not_compiled",
+            required_feature = "pyroscope",
+            "Profiling export is enabled but this binary was built without Pyroscope support"
+        );
     }
-
-    let endpoint = config.profiling_endpoint.as_ref()?.as_str();
-    if endpoint.is_empty() {
-        return None;
-    }
-
-    // Verify jemalloc profiling is available and activated
-    {
-        let prof_ctl = jemalloc_pprof::PROF_CTL.as_ref()?;
-        let ctl = prof_ctl.try_lock().ok()?;
-        if !ctl.activated() {
-            eprintln!("Memory profiling skipped: jemalloc profiling is not activated");
-            return None;
-        }
-    }
-
-    let backend = jemalloc_backend();
-    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
-    let version = config.service_version.as_deref().unwrap_or(VERSION);
-    let sample_rate = 100;
-
-    let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
-        .tags(vec![("version", version), ("profile_type", "memory")])
-        .build()
-        .ok()?;
-
-    match agent.start() {
-        Ok(agent) => Some(agent),
-        Err(err) => {
-            eprintln!("Memory profiling agent start error: {err:?}");
-            None
-        }
-    }
-}
-
-#[cfg(not(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-fn init_memory_profiler(_config: &OtelConfig) -> Option<MemoryProfilingAgent> {
     None
 }
 
@@ -596,6 +593,22 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
     PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default())
         .with_interval(Duration::from_secs(interval))
         .build()
+}
+
+fn resolve_meter_interval(config: &OtelConfig) -> u64 {
+    match config.meter_interval {
+        Some(0) => {
+            warn!(
+                result = "invalid_meter_interval",
+                configured_seconds = 0_u64,
+                fallback_seconds = METER_INTERVAL,
+                "Metrics export interval is invalid; using default interval"
+            );
+            METER_INTERVAL
+        }
+        Some(interval) => interval,
+        None => METER_INTERVAL,
+    }
 }
 
 fn resolve_signal_headers(common_headers: Option<&str>, signal_headers: Option<&str>) -> HashMap<String, String> {
@@ -639,23 +652,33 @@ mod tests {
     /// Valid ratios should produce trace-id-ratio sampling.
     fn test_build_tracer_sampler_uses_trace_ratio_for_valid_values() {
         let sampler = build_tracer_sampler(0.0);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
 
         let sampler = build_tracer_sampler(1.0);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
 
         let sampler = build_tracer_sampler(0.5);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
     }
 
     #[test]
     /// Invalid ratios should degrade to the safest non-dropping sampler.
     fn test_build_tracer_sampler_rejects_invalid_ratio_with_always_on() {
         let sampler = build_tracer_sampler(-0.1);
-        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("AlwaysOn"));
 
         let sampler = build_tracer_sampler(1.2);
-        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("AlwaysOn"));
     }
 
     #[test]
@@ -686,5 +709,58 @@ mod tests {
         assert_eq!(resolve_signal_timeout(None, None), None);
         assert_eq!(resolve_signal_timeout(Some(0), None), None);
         assert_eq!(resolve_signal_timeout(None, Some(0)), None);
+    }
+
+    #[test]
+    fn test_normalize_otlp_root_endpoint_trims_trailing_slashes() {
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318/"), "http://collector:4318");
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318///"), "http://collector:4318");
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318"), "http://collector:4318");
+    }
+
+    #[test]
+    fn test_resolve_signal_endpoint_avoids_double_slashes() {
+        assert_eq!(
+            resolve_signal_endpoint(None, normalize_otlp_root_endpoint("http://collector:4318/"), "/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            resolve_signal_endpoint(Some("http://custom:4318/v1/custom"), "http://collector:4318", "/v1/traces"),
+            "http://custom:4318/v1/custom"
+        );
+        assert_eq!(resolve_signal_endpoint(None, "", "/v1/traces"), "");
+    }
+
+    #[test]
+    fn test_resolve_otlp_use_stdout_honors_config_or_environment_default() {
+        assert!(resolve_otlp_use_stdout(Some(true), true));
+        assert!(!resolve_otlp_use_stdout(Some(false), false));
+        assert!(resolve_otlp_use_stdout(None, false));
+        assert!(!resolve_otlp_use_stdout(None, true));
+    }
+
+    #[test]
+    fn test_resolve_meter_interval_rejects_zero() {
+        let config = OtelConfig {
+            meter_interval: Some(0),
+            ..OtelConfig::default()
+        };
+
+        assert_eq!(resolve_meter_interval(&config), METER_INTERVAL);
+    }
+
+    #[test]
+    fn test_get_object_duration_histogram_metric_match_is_scoped() {
+        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_stage_duration_seconds"));
+        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_request_duration_seconds"));
+        assert!(!is_get_object_duration_histogram_metric("rustfs_io_put_object_request_duration_seconds"));
+        assert!(!is_get_object_duration_histogram_metric("rustfs_io_get_object_response_size_bytes"));
+    }
+
+    #[test]
+    fn test_get_object_duration_histogram_buckets_are_sorted() {
+        assert!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.first(), Some(&0.0001));
+        assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.last(), Some(&10.0));
     }
 }

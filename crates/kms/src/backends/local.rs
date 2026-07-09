@@ -24,6 +24,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
 };
+use argon2::{Algorithm, Argon2, Params, Version};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jiff::Zoned;
@@ -36,6 +37,13 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+const LOCAL_KMS_MASTER_KEY_SALT_FILE: &str = ".master-key.salt";
+const LOCAL_KMS_MASTER_KEY_SALT_LEN: usize = 16;
+const LOCAL_KMS_MASTER_KEY_LEN: usize = 32;
+const LOCAL_KMS_ARGON2_M_COST_KIB: u32 = 19 * 1024;
+const LOCAL_KMS_ARGON2_T_COST: u32 = 2;
+const LOCAL_KMS_ARGON2_P_COST: u32 = 1;
+
 /// Local KMS client that stores keys in local files
 pub struct LocalKmsClient {
     config: LocalConfig,
@@ -45,6 +53,15 @@ pub struct LocalKmsClient {
     master_cipher: Option<Aes256Gcm>,
     /// DEK encryption implementation
     dek_crypto: AesDekCrypto,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum StoredKeyProtection {
+    #[default]
+    LegacyUnspecified,
+    EncryptedMasterKey,
+    PlaintextDevOnly,
 }
 
 /// Serializable representation of a master key stored on disk
@@ -66,23 +83,26 @@ struct StoredMasterKey {
     encrypted_key_material: String,
     /// Nonce used for encryption
     nonce: Vec<u8>,
+    #[serde(default)]
+    at_rest_protection: StoredKeyProtection,
 }
 
 impl LocalKmsClient {
     /// Create a new local KMS client
     pub async fn new(config: LocalConfig) -> Result<Self> {
         // Create key directory if it doesn't exist
-        if !config.key_dir.exists() {
+        if !fs::try_exists(&config.key_dir).await? {
             fs::create_dir_all(&config.key_dir).await?;
             debug!(path = ?config.key_dir, "KMS key directory created");
         }
 
         // Initialize master cipher if master key is provided
         let master_cipher = if let Some(ref master_key) = config.master_key {
-            let key = Self::derive_master_key(master_key)?;
+            let salt = Self::load_or_create_master_key_salt(&config).await?;
+            let key = Self::derive_master_key(master_key, &salt)?;
             Some(Aes256Gcm::new(&key))
         } else {
-            warn!("No master key provided - stored keys will not be encrypted at rest");
+            warn!("No master key provided - local KMS key material will use explicit plaintext-dev-only storage");
             None
         };
 
@@ -94,17 +114,60 @@ impl LocalKmsClient {
         })
     }
 
-    /// Derive a 256-bit key from the master key string
-    fn derive_master_key(master_key: &str) -> Result<Key<Aes256Gcm>> {
-        use sha2::{Digest, Sha256};
-
-        let mut hasher = Sha256::new();
-        hasher.update(master_key.as_bytes());
-        hasher.update(b"rustfs-kms-local"); // Salt to prevent rainbow tables
-        let hash = hasher.finalize();
-        let key = Key::<Aes256Gcm>::try_from(hash.as_slice())
-            .map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
+    /// Derive a 256-bit key from the master key string using a persistent Argon2id salt.
+    fn derive_master_key(master_key: &str, salt: &[u8]) -> Result<Key<Aes256Gcm>> {
+        let params = Params::new(
+            LOCAL_KMS_ARGON2_M_COST_KIB,
+            LOCAL_KMS_ARGON2_T_COST,
+            LOCAL_KMS_ARGON2_P_COST,
+            Some(LOCAL_KMS_MASTER_KEY_LEN),
+        )
+        .map_err(|err| KmsError::configuration_error(format!("invalid local KMS Argon2 params: {err}")))?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut derived = [0u8; LOCAL_KMS_MASTER_KEY_LEN];
+        argon2
+            .hash_password_into(master_key.as_bytes(), salt, &mut derived)
+            .map_err(|err| KmsError::cryptographic_error("argon2id_kdf", err.to_string()))?;
+        let key = Key::<Aes256Gcm>::from(derived);
         Ok(key)
+    }
+
+    fn master_key_salt_path(config: &LocalConfig) -> PathBuf {
+        config.key_dir.join(LOCAL_KMS_MASTER_KEY_SALT_FILE)
+    }
+
+    async fn load_or_create_master_key_salt(config: &LocalConfig) -> Result<[u8; LOCAL_KMS_MASTER_KEY_SALT_LEN]> {
+        let salt_path = Self::master_key_salt_path(config);
+        if fs::try_exists(&salt_path).await? {
+            let bytes = fs::read(&salt_path).await?;
+            return bytes.try_into().map_err(|_| {
+                KmsError::configuration_error(format!(
+                    "Local KMS master key salt at {} must be exactly {} bytes",
+                    salt_path.display(),
+                    LOCAL_KMS_MASTER_KEY_SALT_LEN
+                ))
+            });
+        }
+
+        let mut salt = [0u8; LOCAL_KMS_MASTER_KEY_SALT_LEN];
+        rand::rng().fill(&mut salt[..]);
+        fs::write(&salt_path, salt).await?;
+        Self::set_file_permissions(&salt_path, config.file_permissions).await?;
+        debug!(path = ?salt_path, "Local KMS master key salt created");
+        Ok(salt)
+    }
+
+    async fn set_file_permissions(path: &std::path::Path, permissions: Option<u32>) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(mode) = permissions {
+            use std::os::unix::fs::PermissionsExt;
+
+            let perms = std::fs::Permissions::from_mode(mode);
+            fs::set_permissions(path, perms).await?;
+        }
+
+        let _ = permissions;
+        Ok(())
     }
 
     /// Get the file path for a master key
@@ -115,36 +178,56 @@ impl LocalKmsClient {
     /// Decode and decrypt a stored key file, returning both the metadata and decrypted key material
     async fn decode_stored_key(&self, key_id: &str) -> Result<(StoredMasterKey, Vec<u8>)> {
         let key_path = self.master_key_path(key_id);
-        if !key_path.exists() {
+        if !fs::try_exists(&key_path).await? {
             return Err(KmsError::key_not_found(key_id));
         }
 
         let content = fs::read(&key_path).await?;
         let stored_key: StoredMasterKey = serde_json::from_slice(&content)?;
 
-        // Decrypt key material if master cipher is available
-        let key_material = if let Some(ref cipher) = self.master_cipher {
-            if stored_key.nonce.len() != 12 {
-                return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+        let encrypted_bytes = BASE64
+            .decode(&stored_key.encrypted_key_material)
+            .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))?;
+
+        let effective_protection = if stored_key.at_rest_protection == StoredKeyProtection::LegacyUnspecified {
+            if stored_key.nonce.is_empty() {
+                StoredKeyProtection::PlaintextDevOnly
+            } else {
+                StoredKeyProtection::EncryptedMasterKey
             }
-
-            let mut nonce_array = [0u8; 12];
-            nonce_array.copy_from_slice(&stored_key.nonce);
-            let nonce = Nonce::from(nonce_array);
-
-            // Decode base64 string to bytes
-            let encrypted_bytes = BASE64
-                .decode(&stored_key.encrypted_key_material)
-                .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))?;
-
-            cipher
-                .decrypt(&nonce, encrypted_bytes.as_ref())
-                .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
         } else {
-            // Decode base64 string to bytes when no encryption
-            BASE64
-                .decode(&stored_key.encrypted_key_material)
-                .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))?
+            stored_key.at_rest_protection
+        };
+
+        // Decrypt key material if master cipher is available.
+        let key_material = match effective_protection {
+            StoredKeyProtection::EncryptedMasterKey => {
+                let cipher = self.master_cipher.as_ref().ok_or_else(|| {
+                    KmsError::configuration_error(format!(
+                        "Local KMS key {key_id} is encrypted at rest and requires a configured master key"
+                    ))
+                })?;
+                if stored_key.nonce.len() != 12 {
+                    return Err(KmsError::cryptographic_error("nonce", "Invalid nonce length"));
+                }
+
+                let mut nonce_array = [0u8; 12];
+                nonce_array.copy_from_slice(&stored_key.nonce);
+                let nonce = Nonce::from(nonce_array);
+
+                cipher
+                    .decrypt(&nonce, encrypted_bytes.as_ref())
+                    .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?
+            }
+            StoredKeyProtection::PlaintextDevOnly | StoredKeyProtection::LegacyUnspecified => {
+                if self.master_cipher.is_some() && stored_key.at_rest_protection == StoredKeyProtection::PlaintextDevOnly {
+                    warn!(
+                        key_id,
+                        "Local KMS loaded plaintext-dev-only key material while a master key is configured"
+                    );
+                }
+                encrypted_bytes
+            }
         };
 
         Ok((stored_key, key_material))
@@ -173,7 +256,7 @@ impl LocalKmsClient {
         let key_path = self.master_key_path(&master_key.key_id);
 
         // Encrypt key material if master cipher is available
-        let (encrypted_key_material, nonce) = if let Some(ref cipher) = self.master_cipher {
+        let (encrypted_key_material, nonce, at_rest_protection) = if let Some(ref cipher) = self.master_cipher {
             let mut nonce_bytes = [0u8; 12];
             rand::rng().fill(&mut nonce_bytes[..]);
             let nonce = Nonce::from(nonce_bytes);
@@ -182,10 +265,13 @@ impl LocalKmsClient {
                 .encrypt(&nonce, key_material)
                 .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;
             // Encode encrypted bytes to base64 string
-            (BASE64.encode(&encrypted), nonce.to_vec())
+            (BASE64.encode(&encrypted), nonce.to_vec(), StoredKeyProtection::EncryptedMasterKey)
         } else {
-            // Encode key material to base64 string when no encryption
-            (BASE64.encode(key_material), Vec::new())
+            warn!(
+                key_id = %master_key.key_id,
+                "Local KMS is storing key material as plaintext-dev-only because no master key is configured"
+            );
+            (BASE64.encode(key_material), Vec::new(), StoredKeyProtection::PlaintextDevOnly)
         };
 
         let stored_key = StoredMasterKey {
@@ -201,6 +287,7 @@ impl LocalKmsClient {
             created_by: master_key.created_by.clone(),
             encrypted_key_material,
             nonce,
+            at_rest_protection,
         };
 
         let content = serde_json::to_vec_pretty(&stored_key)?;
@@ -208,14 +295,7 @@ impl LocalKmsClient {
         // Write to temporary file first, then rename for atomicity
         let temp_path = key_path.with_extension("tmp");
         fs::write(&temp_path, &content).await?;
-
-        // Set file permissions if specified
-        #[cfg(unix)]
-        if let Some(permissions) = self.config.file_permissions {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(permissions);
-            std::fs::set_permissions(&temp_path, perms)?;
-        }
+        Self::set_file_permissions(&temp_path, self.config.file_permissions).await?;
 
         fs::rename(&temp_path, &key_path).await?;
 
@@ -444,9 +524,10 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Active;
 
-        // For simplicity, we'll regenerate key material
-        // In a real implementation, we'd preserve the original key material
-        let key_material = generate_key_material(&master_key.algorithm)?;
+        // Preserve the existing key material. Regenerating it on a pure status change would
+        // destroy the original master key and make every DEK ever wrapped by it permanently
+        // undecryptable (silent data loss).
+        let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -463,7 +544,9 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Disabled;
 
-        let key_material = generate_key_material(&master_key.algorithm)?;
+        // Preserve the existing key material (see enable_key): a status change must never
+        // regenerate the master key, or every DEK wrapped by it becomes undecryptable.
+        let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -485,7 +568,10 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::PendingDeletion;
 
-        let key_material = generate_key_material(&master_key.algorithm)?;
+        // Preserve the existing key material (see enable_key): scheduling deletion must not
+        // regenerate the master key, or cancelling the deletion later would recover a key that
+        // can no longer decrypt existing data.
+        let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -502,7 +588,9 @@ impl KmsClient for LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         master_key.status = KeyStatus::Active;
 
-        let key_material = generate_key_material(&master_key.algorithm)?;
+        // Preserve the existing key material (see enable_key): cancelling deletion must recover
+        // the ORIGINAL key, not mint a new one that cannot decrypt existing data.
+        let key_material = self.get_key_material(key_id).await?;
         self.save_master_key(&master_key, &key_material).await?;
 
         // Update cache
@@ -860,6 +948,17 @@ mod tests {
         (client, temp_dir)
     }
 
+    async fn create_dev_mode_client() -> (LocalKmsClient, TempDir) {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: None,
+            file_permissions: Some(0o600),
+        };
+        let client = LocalKmsClient::new(config).await.expect("Failed to create dev-mode client");
+        (client, temp_dir)
+    }
+
     #[tokio::test]
     async fn test_key_lifecycle() {
         let (client, _temp_dir) = create_test_client().await;
@@ -930,6 +1029,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_state_transitions_preserve_master_key_material() {
+        // Regression: enable/disable/schedule_deletion/cancel_deletion previously regenerated the
+        // master key material on a pure status change, permanently destroying the ability to
+        // decrypt any DEK wrapped by that key. A status cycle must preserve the material.
+        let (client, _temp_dir) = create_test_client().await;
+
+        let key_id = "state-cycle-key";
+        client.create_key(key_id, "AES_256", None).await.expect("create");
+
+        let request = GenerateKeyRequest::new(key_id.to_string(), "AES_256".to_string())
+            .with_context("bucket".to_string(), "b".to_string());
+        let data_key = client.generate_data_key(&request, None).await.expect("generate data key");
+        let ciphertext = data_key.ciphertext.clone();
+        let plaintext = data_key.plaintext.clone().expect("no plaintext");
+
+        // Cycle through every status-changing method the fix touches.
+        client.disable_key(key_id, None).await.expect("disable");
+        client.enable_key(key_id, None).await.expect("enable");
+        client
+            .schedule_key_deletion(key_id, 7, None)
+            .await
+            .expect("schedule deletion");
+        client.cancel_key_deletion(key_id, None).await.expect("cancel deletion");
+
+        // Pre-fix, each of those regenerated the master key, so this unwrap fails with an AEAD
+        // error. Post-fix, the original material is preserved and the DEK still decrypts.
+        let decrypt_request = DecryptRequest::new(ciphertext).with_context("bucket".to_string(), "b".to_string());
+        let decrypted = client
+            .decrypt(&decrypt_request, None)
+            .await
+            .expect("DEK must still decrypt after status transitions");
+        assert_eq!(decrypted, plaintext, "master key material must survive status transitions");
+    }
+
+    #[tokio::test]
     async fn test_encryption_operations() {
         let (client, _temp_dir) = create_test_client().await;
 
@@ -952,14 +1086,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_master_key_accepts_legacy_rfc3339_timestamp() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    async fn test_encrypted_master_key_storage_uses_explicit_protection_and_salt() {
+        let (client, _temp_dir) = create_test_client().await;
+        client
+            .create_key("encrypted-key", "AES_256", None)
+            .await
+            .expect("Failed to create encrypted key");
+
+        let salt = fs::read(LocalKmsClient::master_key_salt_path(&client.config))
+            .await
+            .expect("master key salt should exist");
+        assert_eq!(salt.len(), LOCAL_KMS_MASTER_KEY_SALT_LEN);
+
+        let stored: StoredMasterKey = serde_json::from_slice(
+            &fs::read(client.master_key_path("encrypted-key"))
+                .await
+                .expect("stored key should exist"),
+        )
+        .expect("stored encrypted key should deserialize");
+        assert_eq!(stored.at_rest_protection, StoredKeyProtection::EncryptedMasterKey);
+        assert_eq!(stored.nonce.len(), 12);
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_dev_only_storage_is_explicit_and_loadable() {
+        let (client, _temp_dir) = create_dev_mode_client().await;
+        client
+            .create_key("plaintext-key", "AES_256", None)
+            .await
+            .expect("Failed to create plaintext-dev-only key");
+
+        let stored: StoredMasterKey = serde_json::from_slice(
+            &fs::read(client.master_key_path("plaintext-key"))
+                .await
+                .expect("stored key should exist"),
+        )
+        .expect("stored plaintext key should deserialize");
+        assert_eq!(stored.at_rest_protection, StoredKeyProtection::PlaintextDevOnly);
+        assert!(stored.nonce.is_empty(), "plaintext-dev-only keys should not store a nonce");
+
+        let key_info = client
+            .describe_key("plaintext-key", None)
+            .await
+            .expect("plaintext-dev-only key should remain readable");
+        assert_eq!(key_info.key_id, "plaintext-key");
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_key_requires_master_key_to_load() {
+        let (client, temp_dir) = create_test_client().await;
+        client
+            .create_key("encrypted-key", "AES_256", None)
+            .await
+            .expect("Failed to create encrypted key");
+
         let config = LocalConfig {
             key_dir: temp_dir.path().to_path_buf(),
             master_key: None,
             file_permissions: Some(0o600),
         };
-        let client = LocalKmsClient::new(config).await.expect("Failed to create client");
+        let client_without_master = LocalKmsClient::new(config)
+            .await
+            .expect("client without master key should still initialize in dev-mode tests");
+
+        let err = client_without_master
+            .describe_key("encrypted-key", None)
+            .await
+            .expect_err("encrypted key should require a master key to read");
+        assert!(err.to_string().contains("requires a configured master key"));
+    }
+
+    #[tokio::test]
+    async fn test_load_master_key_accepts_legacy_rfc3339_timestamp() {
+        let (client, _temp_dir) = create_dev_mode_client().await;
 
         let stored_key = serde_json::json!({
             "key_id": "legacy-key",
@@ -984,5 +1183,43 @@ mod tests {
         let key_info = client.load_master_key("legacy-key").await.expect("legacy key should load");
         assert_eq!(key_info.key_id, "legacy-key");
         assert_eq!(key_info.created_at.time_zone().iana_name(), Some("UTC"));
+    }
+
+    #[tokio::test]
+    async fn test_load_master_key_accepts_legacy_encrypted_record_without_protection_field() {
+        let (client, temp_dir) = create_test_client().await;
+        client
+            .create_key("legacy-encrypted-key", "AES_256", None)
+            .await
+            .expect("Failed to create encrypted key");
+
+        let key_path = client.master_key_path("legacy-encrypted-key");
+        let mut stored_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&key_path).await.expect("stored key should exist"))
+                .expect("stored key should deserialize");
+        stored_json
+            .as_object_mut()
+            .expect("stored key should be an object")
+            .remove("at_rest_protection");
+        fs::write(
+            &key_path,
+            serde_json::to_vec_pretty(&stored_json).expect("legacy record should serialize"),
+        )
+        .await
+        .expect("legacy record should be writable");
+
+        let legacy_client = LocalKmsClient::new(LocalConfig {
+            key_dir: temp_dir.path().to_path_buf(),
+            master_key: Some("test-master-key".to_string()),
+            file_permissions: Some(0o600),
+        })
+        .await
+        .expect("legacy client should initialize");
+
+        let key_info = legacy_client
+            .describe_key("legacy-encrypted-key", None)
+            .await
+            .expect("legacy encrypted record should remain readable");
+        assert_eq!(key_info.key_id, "legacy-encrypted-key");
     }
 }

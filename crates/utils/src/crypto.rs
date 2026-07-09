@@ -84,7 +84,7 @@ pub fn is_sha256_checksum(s: &str) -> bool {
 /// A 20-byte array containing the HMAC-SHA1 hash of the input data using the provided key
 ///
 pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
-    let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).unwrap();
+    let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).expect("operation should succeed");
     m.update(data.as_ref());
     m.finalize().into_bytes().into()
 }
@@ -100,7 +100,7 @@ pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
 /// A 32-byte array containing the HMAC-SHA256 hash of the input data using the provided key
 ///
 pub fn hmac_sha256(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 32] {
-    let mut m = Hmac::<Sha256>::new_from_slice(key.as_ref()).unwrap();
+    let mut m = Hmac::<Sha256>::new_from_slice(key.as_ref()).expect("operation should succeed");
     m.update(data.as_ref());
     m.finalize().into_bytes().into()
 }
@@ -149,8 +149,8 @@ fn test_base64_encoding_decoding() {
 
     println!("Encoded: {}", &encoded_string);
 
-    let decoded_bytes = base64_decode_url_safe_no_pad(encoded_string.as_bytes()).unwrap();
-    let decoded_string = String::from_utf8(decoded_bytes).unwrap();
+    let decoded_bytes = base64_decode_url_safe_no_pad(encoded_string.as_bytes()).expect("operation should succeed");
+    let decoded_string = String::from_utf8(decoded_bytes).expect("operation should succeed");
 
     assert_eq!(decoded_string, original_uuid_timestamp)
 }

@@ -52,7 +52,7 @@
 //! };
 //!
 //! if let Some(material) = sse_encryption(request).await? {
-//!     metadata.extend(encryption_material_to_metadata(&material));
+//!     metadata.extend(encryption_material_to_metadata(&material)?);
 //! }
 //!
 //! // Unified decryption API
@@ -69,7 +69,10 @@
 //! }
 //! ```
 
-use crate::storage::storage_compat::ecstore::error::StorageError;
+use super::StorageError;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+#[cfg(feature = "rio-v2")]
+use aes_gcm::aead::Payload;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -77,12 +80,14 @@ use aes_gcm::{
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 #[cfg(feature = "rio-v2")]
+use chacha20poly1305::ChaCha20Poly1305;
+#[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use http::{HeaderMap, HeaderValue};
 use rand::Rng;
 #[cfg(feature = "rio-v2")]
 use rand::RngExt;
-use rustfs_kms::{DataKey, service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
+use rustfs_kms::{DataKey, types::ObjectEncryptionContext};
 use rustfs_utils::get_env_opt_str;
 use s3s::S3ErrorCode;
 use s3s::dto::ServerSideEncryption;
@@ -117,6 +122,8 @@ const DARE_VERSION_20: u8 = 0x20;
 #[cfg(feature = "rio-v2")]
 const DARE_CIPHER_AES_256_GCM: u8 = 0x00;
 #[cfg(feature = "rio-v2")]
+const DARE_CIPHER_CHACHA20_POLY1305: u8 = 0x01;
+#[cfg(feature = "rio-v2")]
 const DARE_HEADER_SIZE: usize = 16;
 #[cfg(feature = "rio-v2")]
 const DARE_TAG_SIZE: usize = 16;
@@ -127,9 +134,9 @@ const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
 #[cfg(feature = "rio-v2")]
 const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation";
 
+use super::Error;
+use super::get_bucket_sse_config;
 use crate::error::ApiError;
-use crate::storage::storage_compat::ecstore::bucket::metadata_sys;
-use crate::storage::storage_compat::ecstore::error::Error;
 use rustfs_utils::http::headers::{
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
@@ -213,7 +220,7 @@ async fn prepare_sse_configuration(
     }
 
     // Get bucket default encryption configuration.
-    let bucket_sse_config_result = metadata_sys::get_sse_config(bucket).await;
+    let bucket_sse_config_result = get_bucket_sse_config(bucket).await;
     debug!(
         component = LOG_COMPONENT_STORAGE,
         subsystem = LOG_SUBSYSTEM_SSE,
@@ -244,9 +251,9 @@ async fn prepare_sse_configuration(
                 })
             })
         });
-        if effective_sse.is_none() {
+        let Some(effective_sse) = effective_sse else {
             return Ok(None);
-        }
+        };
 
         debug!(
             component = LOG_COMPONENT_STORAGE,
@@ -258,7 +265,7 @@ async fn prepare_sse_configuration(
             "Resolved effective SSE configuration"
         );
 
-        let effective_kms_key_id = resolve_effective_kms_key_id(effective_sse.as_ref(), ssekms_key_id, || {
+        let effective_kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), ssekms_key_id, || {
             bucket_sse_config.rules.first().and_then(|rule| {
                 rule.apply_server_side_encryption_by_default
                     .as_ref()
@@ -267,7 +274,7 @@ async fn prepare_sse_configuration(
         });
 
         Ok(Some(SseConfiguration {
-            effective_sse: effective_sse.unwrap(),
+            effective_sse,
             effective_kms_key_id,
         }))
     } else if let Err(e) = bucket_sse_config_result {
@@ -745,30 +752,16 @@ pub struct ManagedSealedKey {
 }
 
 impl EncryptionMaterial {
-    pub fn write_encryption(
-        &self,
-        multipart_part_number: Option<usize>,
-    ) -> crate::storage::storage_compat::ecstore::rio::WriteEncryption {
+    pub fn write_encryption(&self, multipart_part_number: Option<usize>) -> super::WriteEncryption {
         match (self.key_kind, multipart_part_number) {
             (EncryptionKeyKind::Object, Some(part_number)) => {
-                crate::storage::storage_compat::ecstore::rio::WriteEncryption::multipart_object_key(
-                    self.key_bytes,
-                    part_number as u32,
-                )
+                super::WriteEncryption::multipart_object_key(self.key_bytes, part_number as u32)
             }
-            (EncryptionKeyKind::Object, None) => {
-                crate::storage::storage_compat::ecstore::rio::WriteEncryption::singlepart_object_key(self.key_bytes)
-            }
+            (EncryptionKeyKind::Object, None) => super::WriteEncryption::singlepart_object_key(self.key_bytes),
             (EncryptionKeyKind::Direct, Some(part_number)) => {
-                crate::storage::storage_compat::ecstore::rio::WriteEncryption::multipart(
-                    self.key_bytes,
-                    self.base_nonce,
-                    part_number,
-                )
+                super::WriteEncryption::multipart(self.key_bytes, self.base_nonce, part_number)
             }
-            (EncryptionKeyKind::Direct, None) => {
-                crate::storage::storage_compat::ecstore::rio::WriteEncryption::singlepart(self.key_bytes, self.base_nonce)
-            }
+            (EncryptionKeyKind::Direct, None) => super::WriteEncryption::singlepart(self.key_bytes, self.base_nonce),
         }
     }
 }
@@ -832,6 +825,36 @@ fn decode_minio_kms_context(metadata: &HashMap<String, String>) -> Result<Option
 }
 
 #[cfg(feature = "rio-v2")]
+fn is_supported_sealed_object_key_cipher(cipher: u8) -> bool {
+    matches!(cipher, DARE_CIPHER_AES_256_GCM | DARE_CIPHER_CHACHA20_POLY1305)
+}
+
+#[cfg(feature = "rio-v2")]
+fn decrypt_sealed_object_key_payload(sealing_key: [u8; 32], header: &[u8], sealed_key: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let nonce = &header[4..16];
+    let ciphertext = &sealed_key[DARE_HEADER_SIZE..];
+    let aad = &header[..4];
+    match header[1] {
+        DARE_CIPHER_AES_256_GCM => {
+            let cipher = Aes256Gcm::new_from_slice(&sealing_key)
+                .map_err(|err| ApiError::from(StorageError::other(format!("Invalid AES-GCM sealing key: {err}"))))?;
+            let nonce = Nonce::try_from(nonce)
+                .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
+            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
+        }
+        DARE_CIPHER_CHACHA20_POLY1305 => {
+            let cipher = ChaCha20Poly1305::new_from_slice(&sealing_key)
+                .map_err(|err| ApiError::from(StorageError::other(format!("Invalid ChaCha20-Poly1305 sealing key: {err}"))))?;
+            let nonce = chacha20poly1305::Nonce::try_from(nonce)
+                .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
+            cipher.decrypt(&nonce, Payload { msg: ciphertext, aad })
+        }
+        _ => return Err(ApiError::from(StorageError::other("Unsupported sealed object-key DARE header"))),
+    }
+    .map_err(|err| ApiError::from(StorageError::other(format!("Failed to unseal object key: {err}"))))
+}
+
+#[cfg(feature = "rio-v2")]
 fn canonical_sse_path(bucket: &str, object: &str) -> String {
     let bucket = bucket.trim_matches('/');
     let object = object.trim_matches('/');
@@ -845,17 +868,18 @@ fn canonical_sse_path(bucket: &str, object: &str) -> String {
 }
 
 #[cfg(feature = "rio-v2")]
-fn derive_object_key(external_key: [u8; 32]) -> [u8; 32] {
+fn derive_object_key(external_key: [u8; 32]) -> Result<[u8; 32], ApiError> {
     let mut random = [0u8; 32];
     rand::rng().fill(&mut random);
 
-    let mut mac = HmacSha256::new_from_slice(&external_key).expect("32-byte HMAC key");
+    let mut mac = HmacSha256::new_from_slice(&external_key)
+        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid HMAC key for object-key derivation: {err}"))))?;
     mac.update(OBJECT_KEY_DERIVATION_CONTEXT);
     mac.update(&random);
 
     let mut object_key = [0u8; 32];
     object_key.copy_from_slice(mac.finalize().into_bytes().as_slice());
-    object_key
+    Ok(object_key)
 }
 
 #[cfg(feature = "rio-v2")]
@@ -865,8 +889,9 @@ fn derive_sealing_key(
     domain: &str,
     bucket: &str,
     object: &str,
-) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(&external_key).expect("32-byte HMAC key");
+) -> Result<[u8; 32], ApiError> {
+    let mut mac = HmacSha256::new_from_slice(&external_key)
+        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid HMAC key for sealing-key derivation: {err}"))))?;
     mac.update(&iv);
     mac.update(domain.as_bytes());
     mac.update(MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.as_bytes());
@@ -874,7 +899,7 @@ fn derive_sealing_key(
 
     let mut sealing_key = [0u8; 32];
     sealing_key.copy_from_slice(mac.finalize().into_bytes().as_slice());
-    sealing_key
+    Ok(sealing_key)
 }
 
 #[cfg(feature = "rio-v2")]
@@ -887,7 +912,7 @@ fn seal_object_key(
 ) -> Result<ManagedSealedKey, ApiError> {
     let mut iv = [0u8; SEALED_KEY_IV_SIZE];
     rand::rng().fill(&mut iv);
-    let sealing_key = derive_sealing_key(external_key, iv, managed_sse_domain(sse_type), bucket, object);
+    let sealing_key = derive_sealing_key(external_key, iv, managed_sse_domain(sse_type), bucket, object)?;
 
     let mut header = [0u8; DARE_HEADER_SIZE];
     header[0] = DARE_VERSION_20;
@@ -928,27 +953,15 @@ fn unseal_object_key(
     object: &str,
 ) -> Result<[u8; 32], ApiError> {
     let header = &sealed.sealed_key[..DARE_HEADER_SIZE];
-    if header[0] != DARE_VERSION_20 || header[1] != DARE_CIPHER_AES_256_GCM {
+    if header[0] != DARE_VERSION_20 || !is_supported_sealed_object_key_cipher(header[1]) {
         return Err(ApiError::from(StorageError::other("Unsupported sealed object-key DARE header")));
     }
     if u16::from_le_bytes([header[2], header[3]]) != 31 || header[4] & 0x80 == 0 {
         return Err(ApiError::from(StorageError::other("Invalid sealed object-key payload header")));
     }
 
-    let sealing_key = derive_sealing_key(external_key, sealed.iv, managed_sse_domain(sse_type), bucket, object);
-    let cipher = Aes256Gcm::new_from_slice(&sealing_key)
-        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid sealing key: {err}"))))?;
-    let nonce = Nonce::try_from(&header[4..16])
-        .map_err(|_| ApiError::from(StorageError::other("Invalid sealed object-key package nonce")))?;
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            aes_gcm::aead::Payload {
-                msg: &sealed.sealed_key[DARE_HEADER_SIZE..],
-                aad: &header[..4],
-            },
-        )
-        .map_err(|err| ApiError::from(StorageError::other(format!("Failed to unseal object key: {err}"))))?;
+    let sealing_key = derive_sealing_key(external_key, sealed.iv, managed_sse_domain(sse_type), bucket, object)?;
+    let plaintext = decrypt_sealed_object_key_payload(sealing_key, header, &sealed.sealed_key)?;
 
     let object_key: [u8; 32] = plaintext
         .as_slice()
@@ -1007,7 +1020,7 @@ pub(crate) fn build_ssec_read_headers(
     headers
 }
 
-pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap<String, String> {
+pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<HashMap<String, String>, ApiError> {
     let mut metadata = HashMap::new();
 
     match material.sse_type {
@@ -1027,6 +1040,21 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
                 metadata.insert(SSEC_ORIGINAL_SIZE_HEADER.to_string(), original_size.to_string());
             }
 
+            // Persist the random base nonce for the SSE-C Direct scheme (default,
+            // non-`rio-v2` build) so decrypt can read it back instead of recomputing a
+            // deterministic value. Written under both the RustFS and MinIO keys per repo
+            // convention. This covers single-PUT persistence and multipart-session
+            // persistence (CreateMultipartUpload builds session metadata here). Under
+            // `rio-v2` the SSE-C path uses `EncryptionKeyKind::Object` and the sealed-key
+            // block below, so this branch is not taken.
+            if material.key_kind == EncryptionKeyKind::Direct {
+                metadata.insert(INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(material.base_nonce));
+                metadata.insert(
+                    MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+                    BASE64_STANDARD.encode(material.base_nonce),
+                );
+            }
+
             #[cfg(feature = "rio-v2")]
             if let Some(sealed) = &material.managed_sealed_key {
                 metadata.insert(MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode(sealed.iv));
@@ -1044,7 +1072,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
             let encrypted_data_key = material
                 .encrypted_data_key
                 .as_deref()
-                .expect("managed SSE materials must carry an encrypted data key");
+                .ok_or_else(|| ApiError::from(StorageError::other("managed SSE materials must carry an encrypted data key")))?;
             metadata.insert(
                 "x-amz-server-side-encryption".to_string(),
                 material.server_side_encryption.as_str().to_string(),
@@ -1139,7 +1167,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
         }
     }
 
-    metadata
+    Ok(metadata)
 }
 
 // ============================================================================
@@ -1364,7 +1392,7 @@ async fn apply_ssec_prepare_encryption_material(
             key: sse_key,
             key_md5: sse_key_md5.clone(),
         })?;
-        let object_key = derive_object_key(validated.key_bytes);
+        let object_key = derive_object_key(validated.key_bytes)?;
         let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
         (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
     } else {
@@ -1374,7 +1402,15 @@ async fn apply_ssec_prepare_encryption_material(
     #[cfg(not(feature = "rio-v2"))]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
         let _ = (bucket, key, sse_key);
-        ([0; 32], [0; 12], EncryptionKeyKind::Direct, None)
+        // Generate a real random nonce for the multipart session and persist it (see
+        // `encryption_material_to_metadata`). Every part of this upload reads the same
+        // persisted nonce back via `apply_ssec_decryption_material`, so all parts share one
+        // nonce without reintroducing the deterministic (bucket, key) reuse hazard.
+        // key_bytes stays a placeholder here: it is neither used for encryption nor persisted;
+        // the real customer key is validated per part on upload.
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut base_nonce);
+        ([0; 32], base_nonce, EncryptionKeyKind::Direct, None)
     };
 
     Ok(EncryptionMaterial {
@@ -1411,14 +1447,21 @@ async fn apply_ssec_encryption_material(
 
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let object_key = derive_object_key(validated.key_bytes);
+        let object_key = derive_object_key(validated.key_bytes)?;
         let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
         (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
     };
 
     #[cfg(not(feature = "rio-v2"))]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let base_nonce = generate_ssec_nonce(bucket, key);
+        // Use a fresh random nonce per encryption. A deterministic nonce derived from
+        // (bucket, key) would repeat whenever the same object is overwritten under the same
+        // SSE-C key, reusing an identical (key, nonce) pair and catastrophically breaking
+        // AES-256-GCM. The nonce is persisted (see `encryption_material_to_metadata`) and read
+        // back on decrypt (see `apply_ssec_decryption_material`).
+        let _ = (bucket, key);
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut base_nonce);
         (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct, None)
     };
 
@@ -1437,6 +1480,23 @@ async fn apply_ssec_encryption_material(
         managed_kms_context: None,
         managed_sealed_key,
     })
+}
+
+/// Resolve the SSE-C Direct base nonce for decryption.
+///
+/// New objects persist a random nonce at encryption time (see
+/// `encryption_material_to_metadata`) under `INTERNAL_ENCRYPTION_IV_HEADER` (preferred) or,
+/// for MinIO interop, `MINIO_INTERNAL_ENCRYPTION_IV_HEADER`. Legacy objects written before
+/// random nonces were persisted carry no stored IV; for those we fall back to the
+/// deterministic `generate_ssec_nonce(bucket, key)` value they were originally encrypted
+/// with, so previously stored objects still decrypt correctly.
+fn read_stored_ssec_nonce(metadata: &HashMap<String, String>, bucket: &str, key: &str) -> [u8; 12] {
+    metadata
+        .get(INTERNAL_ENCRYPTION_IV_HEADER)
+        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER))
+        .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+        .and_then(|bytes| <[u8; 12]>::try_from(bytes.as_slice()).ok())
+        .unwrap_or_else(|| generate_ssec_nonce(bucket, key))
 }
 
 async fn apply_ssec_decryption_material(
@@ -1468,13 +1528,13 @@ async fn apply_ssec_decryption_material(
             EncryptionKeyKind::Object,
         )
     } else {
-        let base_nonce = generate_ssec_nonce(bucket, key);
+        let base_nonce = read_stored_ssec_nonce(metadata, bucket, key);
         (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct)
     };
 
     #[cfg(not(feature = "rio-v2"))]
     let (key_bytes, base_nonce, key_kind) = {
-        let base_nonce = generate_ssec_nonce(bucket, key);
+        let base_nonce = read_stored_ssec_nonce(metadata, bucket, key);
         (validated.key_bytes, base_nonce, EncryptionKeyKind::Direct)
     };
 
@@ -1520,7 +1580,7 @@ async fn apply_managed_encryption_material(
     let mut kms_key_candidate = kms_key_id.clone();
     if kms_key_candidate.is_none() {
         // Try to get default key from KMS service (if available)
-        if let Some(service) = get_global_encryption_service().await {
+        if let Some(service) = runtime_sources::current_encryption_service().await {
             kms_key_candidate = service.get_default_key_id().cloned();
         }
     }
@@ -1547,7 +1607,7 @@ async fn apply_managed_encryption_material(
     let algorithm = server_side_encryption.as_str().to_string();
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let object_key = derive_object_key(data_key.plaintext_key);
+        let object_key = derive_object_key(data_key.plaintext_key)?;
         let sealed_key = seal_object_key(object_key, data_key.plaintext_key, encryption_type, bucket, key)?;
         (object_key, [0u8; 12], EncryptionKeyKind::Object, Some(sealed_key))
     };
@@ -1613,7 +1673,7 @@ async fn apply_managed_decryption_material(
                 .cloned()
                 .unwrap_or_else(|| "AES256".to_string()),
         )
-    } else if let Some(service) = get_global_encryption_service().await {
+    } else if let Some(service) = runtime_sources::current_encryption_service().await {
         // Production mode: use service for metadata parsing
         let parsed = service
             .headers_to_metadata(&normalized_metadata)
@@ -1667,10 +1727,22 @@ async fn apply_managed_decryption_material(
 
     // Use factory pattern to get provider (test or production mode)
     let provider = get_sse_dek_provider().await?;
+    #[cfg(feature = "rio-v2")]
+    let decrypted_data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
+        provider
+            .decrypt_legacy_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
+            .await
+    } else {
+        provider
+            .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
+            .await
+    };
+    #[cfg(not(feature = "rio-v2"))]
     let decrypted_data_key = provider
         .decrypt_sse_dek(&encrypted_data_key, &kms_key_id, &object_context)
-        .await
-        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
+        .await;
+    let decrypted_data_key =
+        decrypted_data_key.map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {e}"))))?;
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind) = if let Some(sealed_key) = minio_sealed_key {
         (
@@ -1748,6 +1820,17 @@ pub trait SseDekProvider: Send + Sync {
         kms_key_id: &str,
         context: &ObjectEncryptionContext,
     ) -> Result<[u8; 32], ApiError>;
+
+    /// Decrypt a DEK from positively identified legacy managed metadata.
+    #[cfg(feature = "rio-v2")]
+    async fn decrypt_legacy_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        kms_key_id: &str,
+        context: &ObjectEncryptionContext,
+    ) -> Result<[u8; 32], ApiError> {
+        self.decrypt_sse_dek(encrypted_dek, kms_key_id, context).await
+    }
 }
 
 // ============================================================================
@@ -1755,20 +1838,45 @@ pub trait SseDekProvider: Send + Sync {
 // ============================================================================
 
 /// Production KMS-backed DEK provider
-/// Resolves the latest global ObjectEncryptionService on each call.
-struct KmsSseDekProvider;
+/// Resolves the latest ObjectEncryptionService on each call.
+struct KmsSseDekProvider {
+    #[cfg(test)]
+    service_manager: Option<Arc<rustfs_kms::KmsServiceManager>>,
+}
 
 impl KmsSseDekProvider {
     /// Create a new KMS-backed provider
     pub async fn new() -> Result<Self, ApiError> {
-        Self::current_service()
+        let provider = Self {
+            #[cfg(test)]
+            service_manager: None,
+        };
+        provider
+            .current_service()
             .await
             .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
-        Ok(Self)
+        Ok(provider)
     }
 
-    async fn current_service() -> Option<Arc<rustfs_kms::service::ObjectEncryptionService>> {
-        get_global_encryption_service().await
+    #[cfg(test)]
+    async fn new_with_service_manager(service_manager: Arc<rustfs_kms::KmsServiceManager>) -> Result<Self, ApiError> {
+        let provider = Self {
+            service_manager: Some(service_manager),
+        };
+        provider
+            .current_service()
+            .await
+            .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
+        Ok(provider)
+    }
+
+    async fn current_service(&self) -> Option<Arc<rustfs_kms::service::ObjectEncryptionService>> {
+        #[cfg(test)]
+        if let Some(service_manager) = &self.service_manager {
+            return service_manager.get_encryption_service().await;
+        }
+
+        runtime_sources::current_encryption_service().await
     }
 }
 
@@ -1780,7 +1888,8 @@ impl SseDekProvider for KmsSseDekProvider {
         kms_key_id: &str,
     ) -> Result<(DataKey, Vec<u8>), ApiError> {
         let kms_key_option = Some(kms_key_id.to_string());
-        let service = Self::current_service()
+        let service = self
+            .current_service()
             .await
             .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
         let (data_key, encrypted_data_key) = service
@@ -1797,13 +1906,33 @@ impl SseDekProvider for KmsSseDekProvider {
         _kms_key_id: &str,
         context: &ObjectEncryptionContext,
     ) -> Result<[u8; 32], ApiError> {
-        let service = Self::current_service()
+        let service = self
+            .current_service()
             .await
             .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
         let data_key = service
             .decrypt_data_key(encrypted_dek, context)
             .await
             .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt data key: {}", e))))?;
+
+        Ok(data_key.plaintext_key)
+    }
+
+    #[cfg(feature = "rio-v2")]
+    async fn decrypt_legacy_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        _kms_key_id: &str,
+        _context: &ObjectEncryptionContext,
+    ) -> Result<[u8; 32], ApiError> {
+        let service = self
+            .current_service()
+            .await
+            .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
+        let data_key = service
+            .decrypt_legacy_data_key(encrypted_dek)
+            .await
+            .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decrypt legacy data key: {e}"))))?;
 
         Ok(data_key.plaintext_key)
     }
@@ -1843,6 +1972,33 @@ pub(crate) struct TestSseDekProvider {
     master_key: [u8; 32],
 }
 
+/// Parse the base64-encoded 32-byte master key from `__RUSTFS_SSE_SIMPLE_CMK`.
+///
+/// Returns an error (never crashes) for a missing, non-base64, wrong-length, or
+/// all-zero key so callers on the request path can fail the request instead of
+/// taking the whole server down (backlog#806).
+fn parse_simple_sse_cmk(cmk_value: &str) -> Result<[u8; 32], ApiError> {
+    let trimmed = cmk_value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::from(StorageError::other(
+            "SSE simple mode requires __RUSTFS_SSE_SIMPLE_CMK to be set to a base64-encoded 32-byte key",
+        )));
+    }
+    let decoded = BASE64_STANDARD
+        .decode(trimmed)
+        .map_err(|e| ApiError::from(StorageError::other(format!("__RUSTFS_SSE_SIMPLE_CMK must be valid base64: {e}"))))?;
+    let master_key: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+        ApiError::from(StorageError::other(format!(
+            "__RUSTFS_SSE_SIMPLE_CMK must decode to exactly 32 bytes, got {} bytes",
+            v.len()
+        )))
+    })?;
+    if master_key == [0u8; 32] {
+        return Err(ApiError::from(StorageError::other("__RUSTFS_SSE_SIMPLE_CMK must not be an all-zero key")));
+    }
+    Ok(master_key)
+}
+
 impl TestSseDekProvider {
     /// Create a SimpleSseDekProvider with a predefined key (for testing)
     #[cfg(test)]
@@ -1850,41 +2006,15 @@ impl TestSseDekProvider {
         Self { master_key }
     }
 
-    pub fn new() -> Self {
-        let cmk_value = std::env::var("__RUSTFS_SSE_SIMPLE_CMK").unwrap_or_else(|_| "".to_string());
-
-        let master_key = if !cmk_value.is_empty() {
-            match BASE64_STANDARD.decode(cmk_value.trim()) {
-                Ok(v) => {
-                    let decoded_len = v.len();
-                    match v.try_into() {
-                        Ok(arr) => {
-                            tracing::info!("Successfully loaded SSE master key (32 bytes)");
-                            arr
-                        }
-                        Err(_) => {
-                            tracing::error!("Failed to load master key: decoded key is not 32 bytes (got {decoded_len} bytes)");
-                            [0u8; 32]
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to load master key: invalid base64 encoding: {e}");
-                    [0u8; 32]
-                }
-            }
-        } else {
-            [0u8; 32]
-        };
-
-        if master_key == [0u8; 32] {
-            tracing::error!(
-                "No valid SSE master key loaded. Set __RUSTFS_SSE_SIMPLE_CMK environment variable to a base64-encoded 32-byte key."
-            );
-            std::process::exit(1);
-        }
-
-        Self { master_key }
+    pub fn new() -> Result<Self, ApiError> {
+        let cmk_value = std::env::var("__RUSTFS_SSE_SIMPLE_CMK").unwrap_or_default();
+        // A missing/invalid key must surface as a request error, never crash the
+        // whole server: `TestSseDekProvider::new` is reached from the SSE request
+        // path (get_sse_dek_provider), so `process::exit(1)` here turned a bad
+        // `__RUSTFS_SSE_SIMPLE_CMK` into a process crash-loop DoS (backlog#806).
+        let master_key = parse_simple_sse_cmk(&cmk_value)?;
+        tracing::info!("Successfully loaded SSE master key (32 bytes)");
+        Ok(Self { master_key })
     }
 
     /// Create a local SSE DEK provider for SSE-S3 when KMS is not configured.
@@ -2028,7 +2158,7 @@ static GLOBAL_SSE_DEK_PROVIDER: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>
 ///     .await?;
 /// ```
 pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError> {
-    if get_global_encryption_service().await.is_some() {
+    if runtime_sources::current_encryption_service().await.is_some() {
         debug!("Using KmsSseDekProvider (KMS configured)");
         return Ok(Arc::new(KmsSseDekProvider::new().await?));
     }
@@ -2046,7 +2176,7 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
     // Determine provider: KMS when available, else test env, else local SSE-S3 fallback (no KMS)
     let provider: Arc<dyn SseDekProvider> = if std::env::var("__RUSTFS_SSE_SIMPLE_CMK").is_ok() {
         debug!("Using SimpleSseDekProvider (test mode) based on __RUSTFS_SSE_SIMPLE_CMK");
-        Arc::new(TestSseDekProvider::new())
+        Arc::new(TestSseDekProvider::new()?)
     } else {
         debug!("Using local SSE-S3 provider (KMS not configured)");
         Arc::new(TestSseDekProvider::new_for_local_sse()?)
@@ -2072,6 +2202,14 @@ pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError>
 pub fn reset_sse_dek_provider() {
     if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
         *slot = None;
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "rio-v2")]
+pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
+    if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
+        *slot = Some(provider);
     }
 }
 
@@ -2118,12 +2256,20 @@ pub fn mark_encrypted_multipart_metadata(metadata: &mut HashMap<String, String>)
     metadata.insert(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), String::new());
 }
 
-fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
+pub(crate) fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
     metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER)
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
+}
+
+#[cfg(feature = "rio-v2")]
+fn is_legacy_rustfs_managed_metadata(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
+        && metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER)
+        && !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
+        && !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
 }
 
 #[cfg(feature = "rio-v2")]
@@ -2340,11 +2486,63 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
-    use http::HeaderValue;
+    #[cfg(feature = "rio-v2")]
+    use super::{
+        DARE_CIPHER_AES_256_GCM, DARE_CIPHER_CHACHA20_POLY1305, MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM, SEALED_KEY_IV_SIZE,
+        SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
+    };
+    use super::{
+        DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest, INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
+        INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsSseDekProvider,
+        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        PrepareEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER, SSEType, SseDekProvider, SsecParams, StorageError,
+        TestSseDekProvider, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
+        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
+        map_get_object_reader_error, mark_encrypted_multipart_metadata, normalize_managed_metadata, reset_sse_dek_provider,
+        resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
+        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params,
+        verify_ssec_key_match,
+    };
+
+    #[test]
+    fn parse_simple_sse_cmk_rejects_bad_keys_without_crashing() {
+        // Empty / whitespace-only.
+        assert!(super::parse_simple_sse_cmk("").is_err());
+        assert!(super::parse_simple_sse_cmk("   ").is_err());
+        // Not valid base64.
+        assert!(super::parse_simple_sse_cmk("@@@not-base64@@@").is_err());
+        // Valid base64 but wrong length (16 bytes).
+        let short = BASE64_STANDARD.encode([1u8; 16]);
+        assert!(super::parse_simple_sse_cmk(&short).is_err());
+        // All-zero 32-byte key is rejected.
+        let zero = BASE64_STANDARD.encode([0u8; 32]);
+        assert!(super::parse_simple_sse_cmk(&zero).is_err());
+    }
+
+    #[test]
+    fn parse_simple_sse_cmk_accepts_valid_32_byte_key() {
+        let mut key = [0u8; 32];
+        key[0] = 7;
+        let encoded = BASE64_STANDARD.encode(key);
+        let got = super::parse_simple_sse_cmk(&encoded).expect("valid 32-byte key must parse");
+        assert_eq!(got, key);
+    }
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use http::{HeaderMap, HeaderValue};
+    use rustfs_kms::types::ObjectEncryptionContext;
     use rustfs_rio::{DecryptReader, EncryptReader};
-    use std::sync::OnceLock;
+    use rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT;
+    use s3s::S3ErrorCode;
+    use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, ServerSideEncryption};
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
     use temp_env::async_with_vars;
     use tokio::sync::Mutex;
 
@@ -2675,9 +2873,216 @@ mod tests {
             .await
             .expect("prepare should accept ssec headers");
         assert!(material.is_some());
-        let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"));
+        let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"))
+            .expect("ssec metadata should be generated");
         assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
         assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
+    }
+
+    // ------------------------------------------------------------------------
+    // SSE-C Direct (default, non-`rio-v2` build) random-nonce persistence
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(feature = "rio-v2"))]
+    async fn ssec_direct_put_metadata(
+        bucket: &str,
+        key: &str,
+        customer_key: &str,
+        customer_key_md5: &str,
+    ) -> HashMap<String, String> {
+        let material = sse_encryption(EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key.to_string()),
+            sse_customer_key_md5: Some(customer_key_md5.to_string()),
+            content_size: 128,
+        })
+        .await
+        .expect("sse-c encryption")
+        .expect("sse-c material");
+        assert_eq!(material.key_kind, EncryptionKeyKind::Direct);
+        encryption_material_to_metadata(&material).expect("sse-c metadata should serialize")
+    }
+
+    // (a) Overwriting the same bucket/key under the same SSE-C key must persist a DIFFERENT
+    // random IV each time, and each stored IV must be read back on decrypt. This is the core
+    // of the fix: no (key, nonce) reuse across overwrites.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn test_ssec_direct_random_nonce_is_unique_per_put_and_read_back() {
+        let bucket = "bucket";
+        let key = "object";
+        let customer_key_bytes = [0x24u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+
+        let metadata_one = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
+        let metadata_two = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
+
+        let iv_one = metadata_one
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
+            .expect("first put persists a random IV");
+        let iv_two = metadata_two
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
+            .expect("second put persists a random IV");
+
+        assert_ne!(iv_one, iv_two, "overwriting the same object must not reuse the nonce");
+
+        // Dual-key persistence for MinIO interop: both headers carry the same value.
+        assert_eq!(metadata_one.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER), Some(iv_one));
+        assert_eq!(metadata_two.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER), Some(iv_two));
+
+        for (metadata, iv) in [(&metadata_one, iv_one), (&metadata_two, iv_two)] {
+            let decrypted = super::apply_ssec_decryption_material(bucket, key, metadata, &customer_key, &customer_key_md5)
+                .await
+                .expect("sse-c decryption material");
+            assert_eq!(
+                BASE64_STANDARD.encode(decrypted.base_nonce),
+                *iv,
+                "decrypt must read the persisted random nonce back"
+            );
+            assert_eq!(decrypted.key_bytes, customer_key_bytes);
+        }
+    }
+
+    // (b) Legacy compatibility: objects encrypted before this change carry no IV header. Decrypt
+    // must fall back to the deterministic `generate_ssec_nonce(bucket, key)` they were encrypted
+    // with, so previously stored objects keep decrypting.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn test_ssec_direct_legacy_object_without_iv_falls_back_to_deterministic_nonce() {
+        let bucket = "bucket";
+        let key = "object";
+        let customer_key_bytes = [0x24u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+
+        let mut metadata = HashMap::new();
+        metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
+        assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(!metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_IV_HEADER));
+
+        let decrypted = super::apply_ssec_decryption_material(bucket, key, &metadata, &customer_key, &customer_key_md5)
+            .await
+            .expect("sse-c decryption material");
+
+        assert_eq!(
+            decrypted.base_nonce,
+            generate_ssec_nonce(bucket, key),
+            "legacy objects must decrypt via the deterministic nonce fallback"
+        );
+    }
+
+    // (c) Byte-level round trip: data encrypted with the material's key + persisted nonce must
+    // decrypt with the key + nonce resolved from the stored metadata.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn test_ssec_direct_persisted_nonce_round_trips_plaintext() {
+        use aes_gcm::{
+            Aes256Gcm, Nonce,
+            aead::{Aead, KeyInit},
+        };
+
+        let bucket = "bucket";
+        let key = "object";
+        let customer_key_bytes = [0x51u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+        let plaintext = b"attack at dawn - sse-c round trip".to_vec();
+
+        let metadata = ssec_direct_put_metadata(bucket, key, &customer_key, &customer_key_md5).await;
+
+        // Encrypt with the key + nonce that were persisted at PUT time.
+        let enc_iv = BASE64_STANDARD
+            .decode(metadata.get(INTERNAL_ENCRYPTION_IV_HEADER).expect("persisted IV"))
+            .expect("valid base64 IV");
+        let cipher = Aes256Gcm::new_from_slice(&customer_key_bytes).expect("cipher");
+        let ciphertext = cipher
+            .encrypt(&Nonce::try_from(enc_iv.as_slice()).expect("nonce"), plaintext.as_ref())
+            .expect("encrypt");
+
+        // Resolve key + nonce purely from stored metadata (as decrypt does in production).
+        let decrypted_material = super::apply_ssec_decryption_material(bucket, key, &metadata, &customer_key, &customer_key_md5)
+            .await
+            .expect("sse-c decryption material");
+        let dec_cipher = Aes256Gcm::new_from_slice(&decrypted_material.key_bytes).expect("cipher");
+        let recovered = dec_cipher
+            .decrypt(
+                &Nonce::try_from(decrypted_material.base_nonce.as_slice()).expect("nonce"),
+                ciphertext.as_ref(),
+            )
+            .expect("decrypt with resolved key + nonce");
+
+        assert_eq!(recovered, plaintext);
+    }
+
+    // (d) Multipart: the random nonce generated at CreateMultipartUpload is persisted in the
+    // session metadata, and every part resolves the SAME nonce via `sse_decryption` on that
+    // session metadata. Parts must never diverge, and the value must not be deterministic.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn test_ssec_direct_multipart_all_parts_share_one_persisted_nonce() {
+        let bucket = "bucket";
+        let key = "object";
+        let customer_key_bytes = [0x33u8; 32];
+        let customer_key = BASE64_STANDARD.encode(customer_key_bytes);
+        let customer_key_md5 = BASE64_STANDARD.encode(md5::compute(customer_key_bytes).0);
+
+        let material = sse_prepare_encryption(PrepareEncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key.clone()),
+            sse_customer_key_md5: Some(customer_key_md5.clone()),
+        })
+        .await
+        .expect("prepare ssec")
+        .expect("prepare material");
+        assert_eq!(material.key_kind, EncryptionKeyKind::Direct);
+
+        let session_metadata = encryption_material_to_metadata(&material).expect("session metadata should serialize");
+        let session_iv = session_metadata
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
+            .expect("multipart session persists a random IV")
+            .clone();
+        // Random, not the deterministic bucket/key derivation.
+        assert_ne!(
+            BASE64_STANDARD.decode(&session_iv).expect("valid IV")[..],
+            generate_ssec_nonce(bucket, key)[..]
+        );
+
+        let resolve_part_nonce = |part_number: usize| {
+            let session_metadata = session_metadata.clone();
+            let customer_key = customer_key.clone();
+            let customer_key_md5 = customer_key_md5.clone();
+            async move {
+                let _ = part_number;
+                sse_decryption(DecryptionRequest {
+                    bucket,
+                    key,
+                    metadata: &session_metadata,
+                    sse_customer_key: Some(&customer_key),
+                    sse_customer_key_md5: Some(&customer_key_md5),
+                })
+                .await
+                .expect("part decryption")
+                .expect("part material")
+                .base_nonce
+            }
+        };
+
+        let part_one_nonce = resolve_part_nonce(1).await;
+        let part_two_nonce = resolve_part_nonce(2).await;
+
+        assert_eq!(part_one_nonce, part_two_nonce, "all parts of one upload must share the persisted nonce");
+        assert_eq!(BASE64_STANDARD.encode(part_one_nonce), session_iv);
     }
 
     #[cfg(feature = "rio-v2")]
@@ -2706,7 +3111,7 @@ mod tests {
             .expect("ssec metadata should be generated");
         assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("ssec metadata should serialize");
         assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_IV_HEADER));
         assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
     }
@@ -2726,7 +3131,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("ssec original-size metadata should serialize");
 
         assert_eq!(metadata.get(SSEC_ORIGINAL_SIZE_HEADER).map(String::as_str), Some("1024"));
     }
@@ -2832,7 +3238,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("managed SSE metadata should serialize");
 
         assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
         assert_eq!(
@@ -2873,6 +3280,11 @@ mod tests {
             .await
             .expect("kms test key should be created");
 
+        let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
+            .await
+            .expect("kms provider should initialize from the configured test manager");
+        super::set_sse_dek_provider_for_test(Arc::new(provider));
+
         let client_context = HashMap::from([("tenant".to_string(), "alpha".to_string())]);
         let request = EncryptionRequest {
             bucket: "bucket",
@@ -2890,7 +3302,7 @@ mod tests {
             .await
             .expect("sse-kms encryption")
             .expect("managed sse-kms material");
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
         let encoded_context = metadata
             .get(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
             .expect("minio kms context header should exist");
@@ -2953,7 +3365,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("managed SSE metadata should serialize");
 
         assert_eq!(
             metadata.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER).map(String::as_str),
@@ -3001,7 +3414,7 @@ mod tests {
 
                 let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
                 let material = material.expect("managed sse-s3 encryption should return material");
-                let metadata = encryption_material_to_metadata(&material);
+                let metadata = encryption_material_to_metadata(&material).expect("managed SSE-S3 metadata should serialize");
 
                 assert_eq!(material.kms_key_id, None);
                 assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
@@ -3028,6 +3441,23 @@ mod tests {
         assert!(!metadata.contains_key("x-rustfs-encryption-key"));
         assert!(!metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER));
         assert!(metadata.contains_key("content-type"));
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[test]
+    fn test_legacy_managed_metadata_excludes_sealed_keys() {
+        let legacy_metadata = HashMap::from([
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "encrypted-dek".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "nonce".to_string()),
+        ]);
+        assert!(is_legacy_rustfs_managed_metadata(&legacy_metadata));
+
+        let sealed_metadata = HashMap::from([
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "encrypted-dek".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "nonce".to_string()),
+            (MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(), "sealed-key".to_string()),
+        ]);
+        assert!(!is_legacy_rustfs_managed_metadata(&sealed_metadata));
     }
 
     #[cfg(feature = "rio-v2")]
@@ -3094,7 +3524,7 @@ mod tests {
                     .expect("managed sse material");
                 assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-                let metadata = encryption_material_to_metadata(&material);
+                let metadata = encryption_material_to_metadata(&material).expect("managed SSE metadata should serialize");
                 assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER));
                 assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
 
@@ -3128,6 +3558,14 @@ mod tests {
     }
 
     #[cfg(feature = "rio-v2")]
+    #[test]
+    fn test_supported_sealed_object_key_cipher_accepts_current_minio_fixture_value() {
+        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_AES_256_GCM));
+        assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_CHACHA20_POLY1305));
+        assert!(!is_supported_sealed_object_key_cipher(0x02));
+    }
+
+    #[cfg(feature = "rio-v2")]
     #[tokio::test]
     async fn test_ssec_rio_v2_uses_sealed_object_key_metadata_roundtrip() {
         let customer_key_bytes = [0x42u8; 32];
@@ -3151,7 +3589,7 @@ mod tests {
 
         assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("sse-c metadata should serialize");
         assert_eq!(
             metadata.get(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER).map(String::as_str),
             Some(MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM)
@@ -3606,7 +4044,9 @@ mod tests {
             .await
             .expect("first key should be created");
 
-        let provider = KmsSseDekProvider::new().await.expect("provider should initialize");
+        let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
+            .await
+            .expect("provider should initialize");
         let context = ObjectEncryptionContext::new("bucket".to_string(), "object".to_string());
         provider
             .generate_sse_dek(&context, "first-key")

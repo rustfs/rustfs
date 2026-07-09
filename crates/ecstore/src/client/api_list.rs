@@ -26,12 +26,12 @@ use crate::client::{
     credentials,
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
+use crate::storage_api_contracts::bucket::BucketInfo;
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Body;
 use hyper::body::Bytes;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
-use rustfs_storage_api::BucketInfo;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -133,7 +133,7 @@ impl TransitionClient {
                 body_vec.extend_from_slice(data);
             }
         }
-        let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8(body_vec).unwrap()) {
+        let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8_lossy(&body_vec)) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));

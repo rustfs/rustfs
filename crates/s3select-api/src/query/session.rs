@@ -20,11 +20,11 @@ use datafusion::{
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     },
-    execution::{SessionStateBuilder, context::SessionState, runtime_env::RuntimeEnvBuilder},
+    execution::{SessionStateBuilder, config::SessionConfig, context::SessionState, runtime_env::RuntimeEnvBuilder},
+    object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path},
     parquet::arrow::ArrowWriter,
     prelude::SessionContext,
 };
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use std::sync::Arc;
 use tracing::error;
 
@@ -48,9 +48,22 @@ pub struct SessionCtxDesc {
 #[derive(Default)]
 pub struct SessionCtxFactory {
     pub is_test: bool,
+    pub target_partitions: usize,
 }
 
 impl SessionCtxFactory {
+    pub fn new(is_test: bool) -> Self {
+        Self {
+            is_test,
+            target_partitions: 0,
+        }
+    }
+
+    pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
+        self.target_partitions = target_partitions;
+        self
+    }
+
     pub async fn create_session_ctx(&self, context: &Context) -> QueryResult<SessionCtx> {
         let df_session_ctx = self.build_df_session_context(context).await?;
 
@@ -64,7 +77,9 @@ impl SessionCtxFactory {
         let path = format!("s3://{}", context.input.bucket);
         let store_url = url::Url::parse(&path).unwrap();
         let rt = RuntimeEnvBuilder::new().build()?;
+        let config = SessionConfig::new().with_target_partitions(self.target_partitions);
         let df_session_state = SessionStateBuilder::new()
+            .with_config(config)
             .with_runtime_env(Arc::new(rt))
             .with_default_features();
 
@@ -110,7 +125,7 @@ impl SessionCtxFactory {
                 QueryError::StoreError { e: e.to_string() }
             })?;
 
-            df_session_state.with_object_store(&store_url, Arc::new(store)).build()
+            df_session_state.with_object_store(&store_url, store).build()
         } else {
             let store: EcObjectStore =
                 EcObjectStore::new(context.input.clone()).map_err(|_| QueryError::NotImplemented { err: String::new() })?;
@@ -177,4 +192,62 @@ fn test_parquet_batch(
         ],
     )
     .map_err(|e| QueryError::StoreError { e: e.to_string() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s3s::dto::{
+        CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
+        SelectObjectContentRequest,
+    };
+
+    fn test_context() -> Context {
+        Context {
+            input: Arc::new(SelectObjectContentInput {
+                bucket: "test-bucket".to_string(),
+                expected_bucket_owner: None,
+                key: "test.csv".to_string(),
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                request: SelectObjectContentRequest {
+                    expression: "SELECT * FROM S3Object".to_string(),
+                    expression_type: ExpressionType::from_static("SQL"),
+                    input_serialization: InputSerialization {
+                        csv: Some(CSVInput::default()),
+                        ..Default::default()
+                    },
+                    output_serialization: OutputSerialization {
+                        csv: Some(CSVOutput::default()),
+                        ..Default::default()
+                    },
+                    request_progress: None,
+                    scan_range: None,
+                },
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_factory_applies_target_partitions() {
+        let factory = SessionCtxFactory::new(true).with_target_partitions(3);
+        let session = factory
+            .create_session_ctx(&test_context())
+            .await
+            .expect("session should be created with configured target partitions");
+
+        assert_eq!(session.inner().config().target_partitions(), 3);
+    }
+
+    #[tokio::test]
+    async fn session_factory_zero_target_partitions_uses_datafusion_default() {
+        let factory = SessionCtxFactory::new(true);
+        let session = factory
+            .create_session_ctx(&test_context())
+            .await
+            .expect("session should be created with default target partitions");
+
+        assert_eq!(session.inner().config().target_partitions(), SessionConfig::new().target_partitions());
+    }
 }

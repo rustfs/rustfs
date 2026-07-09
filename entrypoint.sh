@@ -21,6 +21,151 @@ else
   set -- /usr/bin/rustfs "$@"
 fi
 
+DEFAULT_ROOT_CREDENTIAL="rustfsadmin"
+
+resolve_credential_source() {
+  CREDENTIAL_ENV_NAME="$1"
+  CREDENTIAL_FILE_ENV_NAME="$2"
+  CREDENTIAL_VALUE_OPTION="$3"
+  CREDENTIAL_FILE_OPTION="$4"
+  shift 4
+
+  CREDENTIAL_DIRECT_SET=false
+  CREDENTIAL_DIRECT_VALUE=""
+  CREDENTIAL_FILE_SET=false
+  CREDENTIAL_FILE_VALUE=""
+
+  eval "CREDENTIAL_ENV_VALUE=\${$CREDENTIAL_ENV_NAME:-}"
+  eval "CREDENTIAL_ENV_FILE_VALUE=\${$CREDENTIAL_FILE_ENV_NAME:-}"
+
+  if [ -n "$CREDENTIAL_ENV_VALUE" ]; then
+    CREDENTIAL_DIRECT_SET=true
+    CREDENTIAL_DIRECT_VALUE="$CREDENTIAL_ENV_VALUE"
+  fi
+
+  if [ -n "$CREDENTIAL_ENV_FILE_VALUE" ]; then
+    CREDENTIAL_FILE_SET=true
+    CREDENTIAL_FILE_VALUE="$CREDENTIAL_ENV_FILE_VALUE"
+  fi
+
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    case "$arg" in
+      --)
+        break
+        ;;
+      --"$CREDENTIAL_VALUE_OPTION"=*)
+        CREDENTIAL_DIRECT_SET=true
+        CREDENTIAL_DIRECT_VALUE="${arg#*=}"
+        ;;
+      --"$CREDENTIAL_VALUE_OPTION")
+        shift
+        if [ "$#" -eq 0 ]; then
+          echo "error:--$CREDENTIAL_VALUE_OPTION requires a value."
+          return
+        fi
+        CREDENTIAL_DIRECT_SET=true
+        CREDENTIAL_DIRECT_VALUE="$1"
+        ;;
+      --"$CREDENTIAL_FILE_OPTION"=*)
+        CREDENTIAL_FILE_SET=true
+        CREDENTIAL_FILE_VALUE="${arg#*=}"
+        ;;
+      --"$CREDENTIAL_FILE_OPTION")
+        shift
+        if [ "$#" -eq 0 ]; then
+          echo "error:--$CREDENTIAL_FILE_OPTION requires a value."
+          return
+        fi
+        CREDENTIAL_FILE_SET=true
+        CREDENTIAL_FILE_VALUE="$1"
+        ;;
+    esac
+
+    shift
+  done
+
+  if [ "$CREDENTIAL_DIRECT_SET" = "true" ] && [ "$CREDENTIAL_FILE_SET" = "true" ]; then
+    echo "conflict"
+    return
+  fi
+
+  if [ "$CREDENTIAL_DIRECT_SET" = "true" ]; then
+    echo "value:$CREDENTIAL_DIRECT_VALUE"
+    return
+  fi
+
+  if [ "$CREDENTIAL_FILE_SET" = "true" ]; then
+    echo "file:$CREDENTIAL_FILE_VALUE"
+    return
+  fi
+
+  echo "missing"
+}
+
+validate_credential_source() {
+  CREDENTIAL_NAME="$1"
+  FILE_NAME="$2"
+  CREDENTIAL_SOURCE="$3"
+
+  case "$CREDENTIAL_SOURCE" in
+    error:*)
+      echo "ERROR: ${CREDENTIAL_SOURCE#error:}" >&2
+      exit 1
+      ;;
+    conflict)
+      echo "ERROR: Set either $CREDENTIAL_NAME or $FILE_NAME, not both." >&2
+      exit 1
+      ;;
+    missing)
+      echo "ERROR: $CREDENTIAL_NAME or $FILE_NAME must be set explicitly for container startup." >&2
+      exit 1
+      ;;
+    value:*)
+      CREDENTIAL_VALUE="${CREDENTIAL_SOURCE#value:}"
+      if [ -z "$CREDENTIAL_VALUE" ]; then
+        echo "ERROR: $CREDENTIAL_NAME must not be empty." >&2
+        exit 1
+      fi
+      if [ "$CREDENTIAL_VALUE" = "$DEFAULT_ROOT_CREDENTIAL" ]; then
+        echo "ERROR: $CREDENTIAL_NAME must not use the default $DEFAULT_ROOT_CREDENTIAL credential." >&2
+        exit 1
+      fi
+      ;;
+    file:*)
+      CREDENTIAL_FILE="${CREDENTIAL_SOURCE#file:}"
+      if [ -z "$CREDENTIAL_FILE" ]; then
+        echo "ERROR: $FILE_NAME must not be empty." >&2
+        exit 1
+      fi
+      if [ ! -r "$CREDENTIAL_FILE" ]; then
+        echo "ERROR: $FILE_NAME points to an unreadable file." >&2
+        exit 1
+      fi
+      if IFS= read -r CREDENTIAL_FILE_CONTENT < "$CREDENTIAL_FILE"; then
+        :
+      else
+        CREDENTIAL_FILE_CONTENT=""
+      fi
+      if [ -z "$CREDENTIAL_FILE_CONTENT" ]; then
+        echo "ERROR: $FILE_NAME must not be empty." >&2
+        exit 1
+      fi
+      if [ "$CREDENTIAL_FILE_CONTENT" = "$DEFAULT_ROOT_CREDENTIAL" ]; then
+        echo "ERROR: $FILE_NAME must not contain the default $DEFAULT_ROOT_CREDENTIAL credential." >&2
+        exit 1
+      fi
+      ;;
+  esac
+}
+
+if [ "$1" = "/usr/bin/rustfs" ]; then
+  ACCESS_SOURCE=$(resolve_credential_source "RUSTFS_ACCESS_KEY" "RUSTFS_ACCESS_KEY_FILE" "access-key" "access-key-file" "$@")
+  SECRET_SOURCE=$(resolve_credential_source "RUSTFS_SECRET_KEY" "RUSTFS_SECRET_KEY_FILE" "secret-key" "secret-key-file" "$@")
+  validate_credential_source "RUSTFS_ACCESS_KEY" "RUSTFS_ACCESS_KEY_FILE" "$ACCESS_SOURCE"
+  validate_credential_source "RUSTFS_SECRET_KEY" "RUSTFS_SECRET_KEY_FILE" "$SECRET_SOURCE"
+fi
+
 # 2) Process data volumes (separate from log directory)
 DATA_VOLUMES=""
 process_data_volumes() {
@@ -111,11 +256,6 @@ process_log_directory() {
 # Execute the separate processes
 process_data_volumes
 process_log_directory
-
-# 4) Default credentials warning
-if [ "${RUSTFS_ACCESS_KEY:-}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY:-}" = "rustfsadmin" ]; then
-  echo "!!!WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY. Override them in production!"
-fi
 
 # 5) Append DATA_VOLUMES only if no data paths in arguments
 # Check if any argument looks like a data path (starts with / and not an option)

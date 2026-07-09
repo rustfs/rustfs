@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -32,8 +33,6 @@ use parking_lot::Mutex;
 use reqwest::{Client, StatusCode, Url};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use rustfs_utils::egress::validate_outbound_url;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::{
     fmt,
     marker::PhantomData,
@@ -132,7 +131,7 @@ impl WebhookArgs {
 /// A target that sends events to a webhook
 pub struct WebhookTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: WebhookArgs,
@@ -152,7 +151,7 @@ where
 
 impl<E> WebhookTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     /// Clones the WebhookTarget, creating a new instance with the same configuration
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
@@ -224,6 +223,12 @@ where
     fn build_http_client(args: &WebhookArgs) -> Result<Client, TargetError> {
         let mut client_builder = Client::builder()
             .timeout(Duration::from_secs(30))
+            // SSRF hardening (backlog#974): never follow HTTP redirects on webhook delivery.
+            // reqwest follows up to 10 redirects by default, which lets a malicious or
+            // compromised endpoint use a 3xx response to bounce the outbound request to an
+            // internal address (e.g. the cloud metadata service at 169.254.169.254),
+            // bypassing the outbound-endpoint validation performed on the configured URL.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(crate::get_user_agent(crate::ServiceType::Basis));
         #[cfg(test)]
         {
@@ -447,6 +452,10 @@ where
         })?;
 
         let status = resp.status();
+        // Drain the response body so the underlying connection is returned to the
+        // pool and can be reused (keep-alive) instead of being closed mid-stream
+        // (backlog#983). The body content is not needed for delivery accounting.
+        let _ = resp.bytes().await;
         if status.is_success() {
             debug!(
                 event = EVENT_WEBHOOK_DELIVERY_STATE,
@@ -459,6 +468,14 @@ where
             );
             self.delivery_counters.record_success();
             Ok(())
+        } else if status.is_redirection() {
+            // SSRF hardening (backlog#974): redirects are intentionally not followed
+            // (see build_http_client). Treat a 3xx response as a delivery failure rather
+            // than silently chasing the redirect to a potentially internal target.
+            Err(TargetError::Request(format!(
+                "{} returned redirect '{}'; redirects are not followed for webhook delivery",
+                self.args.endpoint, status
+            )))
         } else if status == StatusCode::FORBIDDEN {
             Err(TargetError::Authentication(format!(
                 "{} returned '{}', please check if your auth token is correctly set",
@@ -476,7 +493,7 @@ where
 #[async_trait]
 impl<E> Target<E> for WebhookTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -643,7 +660,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for WebhookTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Client;
 
@@ -833,5 +850,47 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("not allowed"));
+    }
+
+    // SSRF hardening regression (backlog#974): the delivery client must not follow HTTP
+    // redirects, otherwise a 3xx from the endpoint could bounce the outbound request to an
+    // internal address (e.g. the cloud metadata service) and bypass endpoint validation.
+    #[tokio::test]
+    async fn test_webhook_client_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Minimal HTTP server on an ephemeral loopback port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Serve exactly one request with a 302 pointing at an internal metadata address.
+        // If the client followed the redirect it would issue a second request to that
+        // (unreachable) target instead of returning the 3xx status.
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response =
+                    "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client = WebhookTarget::<serde_json::Value>::build_http_client(&base_args()).expect("build client");
+
+        let resp = client
+            .post(format!("http://{addr}/hook"))
+            .body("{}")
+            .send()
+            .await
+            .expect("request should complete without following the redirect");
+
+        // Redirects are disabled, so the 3xx is surfaced as-is rather than chased to the
+        // internal Location target.
+        assert_eq!(resp.status().as_u16(), 302, "webhook client must not follow redirects");
+
+        handle.join().expect("mock server thread");
     }
 }

@@ -47,10 +47,11 @@ pub mod request_guard;
 pub use io_schedule::{
     IO_PRIORITY_METRICS, IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus,
     IoSchedulerConfig, IoStrategy, get_advanced_buffer_size, get_buffer_size_opt_in, get_concurrency_aware_buffer_size,
+    get_put_concurrency_aware_buffer_size,
 };
 
 // Request tracking
-pub use request_guard::GetObjectGuard;
+pub use request_guard::{GetObjectGuard, PutObjectGuard};
 
 // Concurrency manager
 pub use manager::ConcurrencyManager;
@@ -86,6 +87,11 @@ pub fn get_concurrency_manager() -> &'static ConcurrencyManager {
 #[allow(dead_code)]
 pub fn reset_active_get_requests() {
     io_schedule::ACTIVE_GET_REQUESTS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[allow(dead_code)]
+pub fn reset_active_put_requests() {
+    io_schedule::ACTIVE_PUT_REQUESTS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Create a new I/O scheduler with default configuration.
