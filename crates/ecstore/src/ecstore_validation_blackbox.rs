@@ -492,3 +492,179 @@ async fn blackbox_issue3031_diag_covers_put_success_cleanup_and_error_summary() 
     })
     .await;
 }
+
+/// rustfs/backlog#1009: the `put_object` old-size backfill must reproduce, for
+/// every PUT shape, exactly what the app layer's pre-PUT `get_object_info`
+/// lookup would have observed — that is the invariant that lets the app skip
+/// the lookup without changing a single usage-accounting number.
+mod old_current_size_backfill {
+    use super::*;
+    use crate::disk::OldCurrentSize;
+    use crate::error::is_err_object_not_found;
+    use crate::set_disk::SetDisks;
+
+    /// What the pre-PUT lookup would report right now for `object`.
+    async fn prelookup_expectation(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) -> OldCurrentSize {
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        match set_disks.get_object_info(bucket, object, &opts).await {
+            Ok(object_info) => OldCurrentSize::Present(object_info.size),
+            Err(err) => {
+                assert!(is_err_object_not_found(&err), "prelookup expectation hit unexpected error: {err:?}");
+                OldCurrentSize::Absent
+            }
+        }
+    }
+
+    async fn put_and_backfill(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        len: usize,
+        opts: &ObjectOptions,
+    ) -> Option<OldCurrentSize> {
+        let payload = (0..len).map(|idx| ((idx * 31) % 251) as u8).collect::<Vec<_>>();
+        let mut reader = PutObjReader::from_vec(payload);
+        let (_object_info, backfill) = set_disks
+            .put_object_with_old_current_size(bucket, object, &mut reader, opts)
+            .await
+            .expect("put_object should succeed");
+        backfill
+    }
+
+    #[tokio::test]
+    async fn backfill_matches_prelookup_for_every_put_shape() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "bb-old-current-size";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        // Fresh key (inline-sized): both the lookup and the backfill say Absent.
+        let object = "object.bin";
+        assert_eq!(prelookup_expectation(&set_disks, bucket, object).await, OldCurrentSize::Absent);
+        assert_eq!(
+            put_and_backfill(&set_disks, bucket, object, 1024, &opts).await,
+            Some(OldCurrentSize::Absent)
+        );
+
+        // Unversioned inline overwrite: the previous live size must surface.
+        let expected = prelookup_expectation(&set_disks, bucket, object).await;
+        assert_eq!(expected, OldCurrentSize::Present(1024));
+        assert_eq!(put_and_backfill(&set_disks, bucket, object, 2048, &opts).await, Some(expected));
+
+        // Non-inline overwrite (payload above the inline block threshold).
+        let expected = prelookup_expectation(&set_disks, bucket, object).await;
+        assert_eq!(expected, OldCurrentSize::Present(2048));
+        assert_eq!(
+            put_and_backfill(&set_disks, bucket, object, BLOCK_SIZE_V2 + 123, &opts).await,
+            Some(expected)
+        );
+
+        // Overwriting a non-inline object reports its size back.
+        let expected = prelookup_expectation(&set_disks, bucket, object).await;
+        assert_eq!(expected, OldCurrentSize::Present((BLOCK_SIZE_V2 + 123) as i64));
+        assert_eq!(put_and_backfill(&set_disks, bucket, object, 64, &opts).await, Some(expected));
+
+        // Versioned writes: a new version over a live latest reports the
+        // latest's size, not the incoming version's.
+        let versioned = "versioned.bin";
+        let first_version_opts = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            version_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            put_and_backfill(&set_disks, bucket, versioned, 111, &first_version_opts).await,
+            Some(OldCurrentSize::Absent)
+        );
+        let expected = prelookup_expectation(&set_disks, bucket, versioned).await;
+        assert_eq!(expected, OldCurrentSize::Present(111));
+        let second_version_opts = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            version_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            put_and_backfill(&set_disks, bucket, versioned, 222, &second_version_opts).await,
+            Some(expected)
+        );
+
+        // Delete-marker latest: today's lookup returns the marker as
+        // Ok(size 0) — NOT not-found — and delete-marker creation never
+        // decremented objects_count, so the backfill must reproduce
+        // Present(0) to keep versioned accounting identical.
+        set_disks
+            .delete_object(
+                bucket,
+                versioned,
+                ObjectOptions {
+                    no_lock: true,
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned delete should create a delete marker");
+        let expected = prelookup_expectation(&set_disks, bucket, versioned).await;
+        assert_eq!(expected, OldCurrentSize::Present(0));
+        let third_version_opts = ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            version_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            put_and_backfill(&set_disks, bucket, versioned, 333, &third_version_opts).await,
+            Some(expected)
+        );
+    }
+
+    /// Sub-quorum divergence through the real set-level fanout: when only 2 of
+    /// 4 disks can still decode the destination's xl.meta (write quorum is 3),
+    /// the PUT must still commit but the backfill must come back unknown —
+    /// never a fabricated `Absent`/`Present` from a below-quorum vote.
+    #[tokio::test]
+    async fn backfill_is_unknown_below_quorum_but_put_succeeds() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "bb-old-current-subquorum";
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        let object = "object.bin";
+        assert_eq!(
+            put_and_backfill(&set_disks, bucket, object, 1024, &opts).await,
+            Some(OldCurrentSize::Absent)
+        );
+
+        // Corrupt the committed xl.meta on two disks: those observations turn
+        // unknown, leaving 2 definite votes < write quorum 3.
+        {
+            let disks = set_disks.disks.read().await;
+            for disk in disks.iter().flatten().take(2) {
+                let meta_path = disk.path().join(bucket).join(object).join("xl.meta");
+                fs::write(&meta_path, b"not-an-xl-meta")
+                    .await
+                    .expect("xl.meta should be overwritable with garbage");
+            }
+        }
+
+        let backfill = put_and_backfill(&set_disks, bucket, object, 2048, &opts).await;
+        assert_eq!(backfill, None, "a below-quorum vote must surface as unknown");
+    }
+}

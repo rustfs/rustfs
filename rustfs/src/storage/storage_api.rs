@@ -360,9 +360,9 @@ pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_data_usage_from_backend,
         record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-        record_bucket_object_write_memory, refresh_bucket_usage_from_object_layer,
-        refresh_versioned_bucket_usage_from_object_layer, remove_bucket_usage_from_backend,
-        replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
+        record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
+        refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
+        remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
     };
 }
 
@@ -370,8 +370,8 @@ pub(crate) mod ecstore_data_usage {
 pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
+        FileInfoVersions, FileReader, FileWriter, OldCurrentSize, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
+        ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
         validate_batch_read_version_item_count,
     };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
@@ -531,6 +531,7 @@ pub(crate) type BatchReadVersionResp = ecstore_disk::BatchReadVersionResp;
 pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
+pub(crate) type OldCurrentSize = ecstore_disk::OldCurrentSize;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type ReplicationStatusType = ecstore_bucket::replication::ReplicationStatusType;
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;

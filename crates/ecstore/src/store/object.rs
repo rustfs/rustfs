@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::disk::OldCurrentSize;
 use crate::set_disk::{
     get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
     is_lock_optimization_enabled, is_object_lock_diag_enabled,
@@ -718,7 +719,7 @@ impl ECStore {
         object: &str,
         data: &mut PutObjReader,
         opts: &ObjectOptions,
-    ) -> Result<ObjectInfo> {
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         check_put_object_args(bucket, object)?;
 
         let object = encode_dir_object(object);
@@ -726,7 +727,9 @@ impl ECStore {
         // Keep PUT atomic-read friendly: SetDisks takes the object write lock only
         // around precondition checks and the final rename/commit.
         if self.single_pool() {
-            return self.pools[0].put_object(bucket, object.as_str(), data, opts).await;
+            return self.pools[0]
+                .put_object_with_old_current_size(bucket, object.as_str(), data, opts)
+                .await;
         }
 
         let idx = if opts.data_movement && opts.version_id.is_some() {
@@ -744,7 +747,9 @@ impl ECStore {
             ));
         }
 
-        self.pools[idx].put_object(bucket, &object, data, opts).await
+        self.pools[idx]
+            .put_object_with_old_current_size(bucket, &object, data, opts)
+            .await
     }
 
     #[instrument(skip(self))]

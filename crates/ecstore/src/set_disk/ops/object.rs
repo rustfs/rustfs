@@ -21,6 +21,8 @@
 
 use super::super::*;
 
+use crate::disk::OldCurrentSize;
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type Error = Error;
@@ -556,8 +558,29 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         Ok(reader)
     }
 
-    #[tracing::instrument(skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.put_object_with_old_current_size(bucket, object, data, opts)
+            .await
+            .map(|(object_info, _)| object_info)
+    }
+}
+
+impl SetDisks {
+    /// `put_object` plus the destination key's previous current-version size,
+    /// quorum-reduced from the dst `xl.meta` copies `rename_data` reads while
+    /// committing (rustfs/backlog#1009). `None` means unknown (mixed-version
+    /// peers, unparsable metadata, or sub-quorum divergence) — callers must
+    /// fall back to degraded accounting, never assume "absent". The extra
+    /// value is deliberately *not* part of `ObjectInfo`, which feeds S3
+    /// responses, event payloads, replication, and ILM verbatim.
+    #[tracing::instrument(skip(self, data,))]
+    pub async fn put_object_with_old_current_size(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         crate::hp_guard!("SetDisks::put_object");
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
@@ -629,7 +652,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
-        let result: Result<ObjectInfo> = async {
+        let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = async {
             let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
             let put_object_size = known_put_object_storage_size(data.size());
@@ -888,7 +911,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
 
             let rename_stage_start = Instant::now();
-            let (online_disks, _, op_old_dir, cleanup_disks) = Self::rename_data(
+            let (online_disks, _, op_old_dir, cleanup_disks, old_current_size) = Self::rename_data(
                 &shuffle_disks,
                 RUSTFS_META_TMP_BUCKET,
                 tmp_dir.as_str(),
@@ -1023,7 +1046,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 );
             }
 
-            Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
+            Ok((
+                ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended),
+                old_current_size,
+            ))
         }
         .await;
 
