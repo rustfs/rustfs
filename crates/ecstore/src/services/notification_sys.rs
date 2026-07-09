@@ -346,25 +346,44 @@ impl NotificationSys {
             let endpoints = endpoints.clone();
             let cache = self.peer_admin_caches.get(idx);
             futures.push(async move {
-                if let Some(client) = client {
-                    let host = client.host.to_string();
-                    match timeout(peer_timeout, client.server_info()).await {
-                        Ok(Ok(info)) => {
-                            update_server_info_cache(cache, &host, &info);
-                            info
-                        }
-                        Ok(Err(err)) => {
-                            warn!("peer {} server_info failed: {}", host, err);
-                            handle_server_info_failure(cache, &host, &endpoints)
-                        }
-                        Err(_) => {
-                            warn!("peer {} server_info timed out after {:?}", host, peer_timeout);
-                            client.evict_connection().await;
-                            handle_server_info_failure(cache, &host, &endpoints)
-                        }
+                let Some(client) = client else {
+                    return ServerProperties::default();
+                };
+                let host = client.host.to_string();
+
+                // First attempt. A single evicted or half-open internode channel
+                // is enough to fail one probe and, before retrying, would drop
+                // the member to unknown/offline for this whole snapshot. So on any
+                // first-attempt failure we evict the channel and re-dial once
+                // before falling back (rustfs/backlog#1049, P1-B).
+                match timeout(peer_timeout, client.server_info()).await {
+                    Ok(Ok(info)) => {
+                        update_server_info_cache(cache, &host, &info);
+                        return info;
                     }
-                } else {
-                    ServerProperties::default()
+                    Ok(Err(err)) => debug!("peer {host} server_info failed (attempt 1/2): {err}"),
+                    Err(_) => debug!("peer {host} server_info timed out (attempt 1/2) after {peer_timeout:?}"),
+                }
+
+                // Drop the suspect channel so the retry re-dials on a fresh
+                // connection instead of reusing the bad one.
+                client.evict_connection().await;
+
+                // Second and final attempt on the fresh channel.
+                match timeout(peer_timeout, client.server_info()).await {
+                    Ok(Ok(info)) => {
+                        update_server_info_cache(cache, &host, &info);
+                        info
+                    }
+                    Ok(Err(err)) => {
+                        warn!("peer {host} server_info failed after retry: {err}");
+                        handle_server_info_failure(cache, &host, &endpoints)
+                    }
+                    Err(_) => {
+                        warn!("peer {host} server_info timed out after retry ({peer_timeout:?})");
+                        client.evict_connection().await;
+                        handle_server_info_failure(cache, &host, &endpoints)
+                    }
                 }
             });
         }
