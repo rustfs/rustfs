@@ -93,6 +93,29 @@ impl RemoteClient {
         resource_summary == ".rustfs.sys/leader.lock@latest"
     }
 
+    /// Classify a `tonic::Status` as a transport-level failure of the cached channel.
+    ///
+    /// Only genuine connection problems (connect refused/reset, keepalive/deadline
+    /// on the channel itself, cancelled in-flight streams) justify evicting and
+    /// re-dialing the cached channel. A broken transport surfaces either as one of
+    /// the codes below or carries the underlying hyper/h2 error as its `source`.
+    ///
+    /// Server-produced application statuses (`Unauthenticated`/`PermissionDenied`
+    /// from the signature interceptor, `Internal`/`FailedPrecondition` when the
+    /// peer's lock service is not ready yet, `InvalidArgument`, `ResourceExhausted`,
+    /// `Unimplemented`, ...) are reconstructed from grpc-status trailers on the
+    /// client and have no `source`. Evicting the channel for those cannot help —
+    /// the channel is healthy — and only churns the connection while advancing the
+    /// peer toward the offline threshold. See issue #4567.
+    fn is_transport_failure(status: &tonic::Status) -> bool {
+        use tonic::Code;
+        std::error::Error::source(status).is_some()
+            || matches!(
+                status.code(),
+                Code::Unavailable | Code::DeadlineExceeded | Code::Unknown | Code::Cancelled
+            )
+    }
+
     async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str) {
         let log_level = if Self::is_scanner_leader_lock(resource_summary) {
             debug!(
@@ -148,6 +171,12 @@ impl RemoteClient {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => {
                 let reason = err.to_string();
+                // Only evict (and re-dial) the cached channel when the failure is a genuine
+                // transport problem. A server-produced application status (auth denied, peer
+                // lock service not ready, invalid args, ...) arrives on a perfectly healthy
+                // channel; evicting it just churns the connection and pushes the peer toward
+                // the offline threshold for no benefit. See issue #4567.
+                let transport_failure = Self::is_transport_failure(&err);
                 if Self::is_scanner_leader_lock(resource_summary) {
                     debug!(
                         addr = %self.addr,
@@ -156,6 +185,7 @@ impl RemoteClient {
                         resource_summary,
                         tonic_code = ?err.code(),
                         tonic_message = err.message(),
+                        transport_failure,
                         "Remote lock RPC returned tonic error for scanner leader lock"
                     );
                 } else {
@@ -166,10 +196,13 @@ impl RemoteClient {
                         resource_summary,
                         tonic_code = ?err.code(),
                         tonic_message = err.message(),
+                        transport_failure,
                         "Remote lock RPC returned tonic error"
                     );
                 }
-                self.evict_connection(op, &reason, resource_summary).await;
+                if transport_failure {
+                    self.evict_connection(op, &reason, resource_summary).await;
+                }
                 Err(LockError::internal(format!("{op} RPC failed: {reason}")))
             }
             Err(_) => {
@@ -779,6 +812,47 @@ mod tests {
         .await;
 
         accept_task.abort();
+    }
+
+    #[test]
+    fn test_is_transport_failure_classifies_only_channel_level_errors() {
+        use tonic::{Code, Status};
+
+        // Genuine transport failures: broken/unusable channel.
+        for code in [Code::Unavailable, Code::DeadlineExceeded, Code::Unknown, Code::Cancelled] {
+            assert!(
+                RemoteClient::is_transport_failure(&Status::new(code, "boom")),
+                "{code:?} should be treated as a transport failure"
+            );
+        }
+
+        // A status carrying an underlying transport error as its source is a transport failure
+        // regardless of code (tonic reports connection/h2 breakage this way).
+        let sourced = Status::from_error(Box::new(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")));
+        assert!(
+            RemoteClient::is_transport_failure(&sourced),
+            "a status with an underlying transport source should be a transport failure"
+        );
+
+        // Server-produced application statuses arrive on a healthy channel and must NOT evict it.
+        for code in [
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+            Code::Internal,
+            Code::FailedPrecondition,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::ResourceExhausted,
+            Code::Unimplemented,
+            Code::Aborted,
+            Code::OutOfRange,
+        ] {
+            assert!(
+                !RemoteClient::is_transport_failure(&Status::new(code, "denied")),
+                "{code:?} is an application status and must not be treated as a transport failure"
+            );
+        }
     }
 
     #[test]
