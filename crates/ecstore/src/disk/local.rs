@@ -2288,7 +2288,35 @@ pub(crate) struct UringBackend {
     root: PathBuf,
     inner: StdBackend,
     driver: Arc<rustfs_uring::UringDriver>,
+    /// Runtime degradation latch (backlog#1101). Starts `true`; once a read
+    /// returns a restriction-class errno (io_uring became unusable on this
+    /// disk), it is set `false` and all further reads go straight to
+    /// `StdBackend` — no more per-read io_uring attempts. Mirrors
+    /// [`DirectIoReadState::supported`].
+    active: std::sync::atomic::AtomicBool,
     fallback_logged: std::sync::atomic::AtomicBool,
+}
+
+/// Disks whose io_uring probe failed, so `UringBackend::try_new` can skip
+/// re-probing them on reconnect (per-disk probe cache, backlog#1101). A probe
+/// creates a ring and spawns a driver thread; caching the negative result
+/// avoids repeating that on every `LocalDisk` reconstruction of a disk that
+/// does not support io_uring.
+#[cfg(target_os = "linux")]
+static URING_UNSUPPORTED_DISKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// True when a runtime io_uring read error means io_uring itself is unusable on
+/// this disk (→ latch off), as opposed to a per-read/file error `StdBackend`
+/// would hit too (backlog#1101). Restriction-class errnos only; data errors
+/// (EIO), missing files, and parameter errors do NOT latch. Mirrors the shape
+/// of [`is_direct_io_unsupported`].
+#[cfg(target_os = "linux")]
+fn is_io_uring_unsupported(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -2306,6 +2334,15 @@ impl UringBackend {
     /// to `StdBackend`. A restricted-environment errno degrades quietly; an
     /// unexpected errno is surfaced as a warning (both still fall back).
     pub(crate) fn try_new(root: PathBuf) -> Option<Self> {
+        // Per-disk probe cache: skip a disk already known not to support
+        // io_uring (backlog#1101).
+        if URING_UNSUPPORTED_DISKS
+            .lock()
+            .expect("uring probe cache mutex poisoned")
+            .contains(&root)
+        {
+            return None;
+        }
         match rustfs_uring::UringDriver::probe_and_start(URING_QUEUE_DEPTH) {
             Ok(driver) => {
                 info!(
@@ -2318,6 +2355,7 @@ impl UringBackend {
                     inner: StdBackend::new(root.clone()),
                     root,
                     driver: Arc::new(driver),
+                    active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                 })
             }
@@ -2339,6 +2377,10 @@ impl UringBackend {
                         "io_uring probe failed unexpectedly; using StdBackend"
                     );
                 }
+                URING_UNSUPPORTED_DISKS
+                    .lock()
+                    .expect("uring probe cache mutex poisoned")
+                    .insert(root);
                 None
             }
         }
@@ -2378,11 +2420,18 @@ impl UringBackend {
             return Ok(Bytes::new());
         }
 
-        let bytes = self
-            .driver
-            .read_at(Arc::new(file), offset_u64, length)
-            .await
-            .map_err(DiskError::from)?;
+        let bytes = match self.driver.read_at(Arc::new(file), offset_u64, length).await {
+            Ok(bytes) => bytes,
+            Err(io_err) => {
+                // Latch io_uring off for this disk if the errno says the
+                // subsystem is unusable (backlog#1101); the caller falls back
+                // to StdBackend for this and every future read.
+                if is_io_uring_unsupported(&io_err) {
+                    self.active.store(false, Ordering::Relaxed);
+                }
+                return Err(DiskError::from(io_err));
+            }
+        };
         if bytes.len() != length {
             return Err(DiskError::other("io_uring returned a short read"));
         }
@@ -2401,14 +2450,21 @@ impl LocalIoBackend for UringBackend {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<Bytes> {
+        // Latched off (backlog#1101): io_uring proved unusable on this disk, so
+        // skip it entirely and read via StdBackend.
+        if !self.active.load(Ordering::Relaxed) {
+            return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+        }
         match self.pread_uring(volume, path, offset, length).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
                 if !self.fallback_logged.swap(true, Ordering::Relaxed) {
+                    let latched = !self.active.load(Ordering::Relaxed);
                     debug!(
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
                         error = ?err,
+                        latched_off = latched,
                         "io_uring read fell back to StdBackend (logged once per disk)"
                     );
                 }
@@ -11161,6 +11217,58 @@ mod test {
             let expected = content.slice(offset..offset + length);
             assert_eq!(got, expected, "uring read mismatch at offset={offset} length={length}");
         }
+    }
+
+    /// The runtime degradation latch classifier (backlog#1101): only
+    /// restriction-class errnos latch io_uring off; data/parameter/missing-file
+    /// errors do not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_uring_unsupported_classifies_restriction_errnos_only() {
+        use std::io::Error;
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert!(is_io_uring_unsupported(&Error::from_raw_os_error(errno)), "errno {errno} should latch");
+        }
+        for errno in [libc::EIO, libc::EINVAL, libc::ENOENT, libc::EAGAIN] {
+            assert!(!is_io_uring_unsupported(&Error::from_raw_os_error(errno)), "errno {errno} must not latch");
+        }
+        assert!(!is_io_uring_unsupported(&Error::other("driver gone")));
+    }
+
+    /// Once io_uring is latched off (backlog#1101), reads still return correct
+    /// bytes via StdBackend. Lay out the disk with LocalDisk, then read the same
+    /// root through a UringBackend with the latch tripped.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_backend_latched_off_reads_via_std() {
+        use std::sync::atomic::Ordering;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+        let content: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect();
+        let content = Bytes::from(content);
+
+        {
+            let endpoint = Endpoint::try_from(root.to_string_lossy().as_ref()).expect("operation should succeed");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+            disk.make_volume("test-volume").await.expect("operation should succeed");
+            disk.write_all("test-volume", "blob.bin", content.clone())
+                .await
+                .expect("operation should succeed");
+        }
+
+        // Skip if io_uring is unavailable on this host (restricted env).
+        let Some(backend) = UringBackend::try_new(root) else {
+            return;
+        };
+        backend.active.store(false, Ordering::Relaxed);
+
+        let got = backend
+            .pread_bytes("test-volume", "blob.bin", 100, 512, None)
+            .await
+            .expect("latched-off read must succeed via StdBackend");
+        assert_eq!(got, content.slice(100..612), "latched-off read returned wrong bytes");
     }
 
     /// The O_DIRECT read path must return the same bytes as the buffered
