@@ -1047,7 +1047,7 @@ fn handle_peer_failure(
             );
         }
         return Some(StorageInfo {
-            disks: get_offline_disks(host, endpoints),
+            disks: synthesized_disks(host, endpoints, ItemState::Offline),
             ..Default::default()
         });
     }
@@ -1081,14 +1081,21 @@ fn update_storage_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, 
 }
 
 /// Handle a peer failure for server_info: return cached data if available,
-/// or mark offline only after consecutive failures exceed the threshold.
+/// or mark the member unknown/offline depending on how many consecutive
+/// probes have failed.
+///
+/// Below the failure threshold with no cached snapshot the member is reported
+/// as `unknown` (not `offline`, and not the misleading `initializing` used
+/// previously): the probe missed this cycle but the member is not confirmed
+/// down. The synthesized entry still carries one drive per endpoint so the
+/// pool's drive totals stay balanced (rustfs/backlog#1049).
 fn handle_server_info_failure(
     cache: Option<&Mutex<PeerAdminCache>>,
     host: &str,
     endpoints: &EndpointServerPools,
 ) -> ServerProperties {
     let Some(cache) = cache else {
-        return initializing_server_properties(host);
+        return unknown_server_properties(host, endpoints);
     };
 
     let mut c = match cache.lock() {
@@ -1139,7 +1146,7 @@ fn handle_server_info_failure(
         return offline_server_properties(host, endpoints);
     }
 
-    initializing_server_properties(host)
+    unknown_server_properties(host, endpoints)
 }
 
 fn update_server_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, info: &ServerProperties) {
@@ -1166,10 +1173,14 @@ fn update_server_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, i
     c.server_failures = 0;
 }
 
-fn initializing_server_properties(host: &str) -> ServerProperties {
+/// A member that could not be probed this cycle and is not confirmed down.
+/// Carries the endpoint's drives (marked `unknown`) so the pool's drive totals
+/// stay balanced instead of the member's drives vanishing from the summary.
+fn unknown_server_properties(host: &str, endpoints: &EndpointServerPools) -> ServerProperties {
     ServerProperties {
         endpoint: host.to_string(),
-        state: ItemState::Initializing.to_string().to_owned(),
+        state: ItemState::Unknown.to_string().to_owned(),
+        disks: synthesized_disks(host, endpoints, ItemState::Unknown),
         ..Default::default()
     }
 }
@@ -1180,20 +1191,23 @@ fn offline_server_properties(host: &str, endpoints: &EndpointServerPools) -> Ser
         version: get_commit_id(),
         endpoint: host.to_string(),
         state: ItemState::Offline.to_string().to_owned(),
-        disks: get_offline_disks(host, endpoints),
+        disks: synthesized_disks(host, endpoints, ItemState::Offline),
         ..Default::default()
     }
 }
 
-fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec<rustfs_madmin::Disk> {
-    let mut offline_disks = Vec::new();
+/// Enumerate the drives a host owns from the pool topology, tagged with the
+/// given member state. Used to synthesize drive entries for a member whose
+/// properties RPC could not be answered, so summary counters stay complete.
+fn synthesized_disks(host: &str, endpoints: &EndpointServerPools, state: ItemState) -> Vec<rustfs_madmin::Disk> {
+    let mut disks = Vec::new();
 
     for pool in endpoints.as_ref() {
         for ep in pool.endpoints.as_ref() {
-            if (offline_host.is_empty() && ep.is_local) || offline_host == ep.host_port() {
-                offline_disks.push(rustfs_madmin::Disk {
+            if (host.is_empty() && ep.is_local) || host == ep.host_port() {
+                disks.push(rustfs_madmin::Disk {
                     endpoint: ep.to_string(),
-                    state: ItemState::Offline.to_string().to_owned(),
+                    state: state.to_string().to_owned(),
                     pool_index: ep.pool_idx,
                     set_index: ep.set_idx,
                     disk_index: ep.disk_idx,
@@ -1203,7 +1217,7 @@ fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec
         }
     }
 
-    offline_disks
+    disks
 }
 
 fn aggregate_notification_failures(operation: &str, failures: Vec<String>) -> Result<()> {
@@ -1474,13 +1488,19 @@ mod tests {
     }
 
     #[test]
-    fn handle_server_info_failure_returns_initializing_before_threshold_without_cache() {
+    fn handle_server_info_failure_returns_unknown_before_threshold_without_cache() {
         let cache = Mutex::new(PeerAdminCache::new());
         let endpoints = EndpointServerPools::default();
 
         let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints);
         assert_eq!(result.endpoint, "peer-1");
-        assert_eq!(result.state, ItemState::Initializing.to_string());
+        // A probe miss below the threshold is "unknown" (not confirmed down,
+        // and not the misleading "initializing"): rustfs/backlog#1049.
+        assert_eq!(result.state, ItemState::Unknown.to_string());
+        // The default (empty) pool has no topology entry for this host, so no
+        // drives are synthesized here; the drive-synthesis and counter-balance
+        // behavior is exercised by the get_online_offline_disks_stats tests in
+        // admin_server_info.
         assert!(result.disks.is_empty());
         assert_eq!(cache.lock().unwrap().server_failures, 1);
     }
@@ -1568,7 +1588,7 @@ mod tests {
 
         let server_result = handle_server_info_failure(Some(&server_cache), "peer-1", &endpoints);
         assert_eq!(server_result.endpoint, "peer-1");
-        assert_eq!(server_result.state, ItemState::Initializing.to_string());
+        assert_eq!(server_result.state, ItemState::Unknown.to_string());
     }
 
     #[test]
