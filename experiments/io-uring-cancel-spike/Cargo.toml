@@ -1,0 +1,20 @@
+[package]
+name = "io-uring-cancel-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Spike 0 for backlog#894 (P2 io_uring read backend): cancel-safety / buffer-ownership prototype. NOT production code."
+
+# Deliberately a standalone workspace: P2 is deferred (P1.5 NO-GO), so the
+# io-uring crate must not enter the main rustfs Cargo.lock or build graph.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
