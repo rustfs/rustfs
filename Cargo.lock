@@ -8892,6 +8892,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "proptest",
+ "quick-xml",
  "rand 0.10.2",
  "rcgen",
  "reqwest",
