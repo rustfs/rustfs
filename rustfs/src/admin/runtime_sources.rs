@@ -69,7 +69,7 @@ pub(crate) fn object_store_from_extensions(extensions: &http::Extensions) -> Opt
         .or_else(current_object_store_handle)
 }
 
-pub(crate) fn current_notification_system() -> Option<&'static NotificationSys> {
+pub(crate) fn current_notification_system() -> Option<Arc<NotificationSys>> {
     let context = current_app_context();
     current_notification_system_for_context(context.as_deref())
 }

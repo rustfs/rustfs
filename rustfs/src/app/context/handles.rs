@@ -178,7 +178,7 @@ impl NotifyInterface for NotifyHandle {
 pub struct NotificationSystemHandle;
 
 impl NotificationSystemInterface for NotificationSystemHandle {
-    fn handle(&self) -> Option<&'static NotificationSys> {
+    fn handle(&self) -> Option<Arc<NotificationSys>> {
         runtime_sources::notification_system()
     }
 }

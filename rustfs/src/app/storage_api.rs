@@ -206,7 +206,7 @@ pub(crate) mod runtime {
         crate::storage::storage_api::set_object_store_resolver(resolver)
     }
 
-    pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
+    pub(crate) fn get_global_notification_sys() -> Option<std::sync::Arc<NotificationSys>> {
         crate::storage::storage_api::get_global_notification_sys()
     }
 
