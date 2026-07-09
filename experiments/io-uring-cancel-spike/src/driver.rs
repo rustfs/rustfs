@@ -17,9 +17,9 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -94,6 +94,63 @@ impl ProbeFailure {
             err.raw_os_error(),
             Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
         )
+    }
+}
+
+/// Submission-side backpressure (C10, rustfs/backlog#1060).
+///
+/// Bounds in-flight ops so the count can never exceed CQ capacity, and — the
+/// load-bearing part — releases a permit at the CQE (pending-table removal),
+/// NOT at future drop. Tying a permit to the future (the natural RAII shape)
+/// would let a quorum dropping many futures return permits while their orphan
+/// buffers still sit in the pending table awaiting slow-disk CQEs, decoupling
+/// the permit count from resident memory and reopening the memory-DoS surface.
+/// P2 uses a tokio `Semaphore` with `acquire_owned`; the RELEASE POINT is what
+/// matters and must stay at the CQE.
+struct Backpressure {
+    state: Mutex<BpState>,
+    cv: Condvar,
+}
+
+struct BpState {
+    permits: usize,
+    shutdown: bool,
+}
+
+impl Backpressure {
+    fn new(permits: usize) -> Self {
+        Self {
+            state: Mutex::new(BpState { permits, shutdown: false }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Block until a permit is free. Returns false if the driver has shut down
+    /// (so submit stops blocking forever once the driver is gone).
+    fn acquire(&self) -> bool {
+        let mut g = self.state.lock().expect("backpressure mutex poisoned");
+        loop {
+            if g.shutdown {
+                return false;
+            }
+            if g.permits > 0 {
+                g.permits -= 1;
+                return true;
+            }
+            g = self.cv.wait(g).expect("backpressure mutex poisoned");
+        }
+    }
+
+    fn release(&self) {
+        let mut g = self.state.lock().expect("backpressure mutex poisoned");
+        g.permits += 1;
+        self.cv.notify_one();
+    }
+
+    fn shutdown(&self) {
+        let mut g = self.state.lock().expect("backpressure mutex poisoned");
+        g.shutdown = true;
+        self.cv.notify_all();
     }
 }
 
@@ -232,6 +289,7 @@ pub struct UringDriver {
     handle: Option<JoinHandle<()>>,
     stats: Arc<DriverStats>,
     next_id: AtomicU64,
+    bp: Arc<Backpressure>,
 }
 
 impl UringDriver {
@@ -253,9 +311,13 @@ impl UringDriver {
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(DriverStats::default());
         let thread_stats = Arc::clone(&stats);
+        // Cap in-flight at the SQ depth (entries), which is < CQ capacity
+        // (2*entries), so CQ overflow is structurally unreachable (C5/C10).
+        let bp = Arc::new(Backpressure::new(entries as usize));
+        let thread_bp = Arc::clone(&bp);
         let handle = std::thread::Builder::new()
             .name("uring-spike-driver".into())
-            .spawn(move || drive(ring, rx, thread_stats))
+            .spawn(move || drive(ring, rx, thread_stats, thread_bp))
             .expect("spawn driver thread");
 
         Ok(Self {
@@ -263,6 +325,7 @@ impl UringDriver {
             handle: Some(handle),
             stats,
             next_id: AtomicU64::new(1),
+            bp,
         })
     }
 
@@ -323,15 +386,34 @@ impl UringDriver {
             };
         }
 
-        // If the driver already shut down, the send fails and `done` is
-        // dropped, which the caller observes as a driver-gone error.
-        let _ = self.tx.send(Msg::Read {
-            id,
-            file,
-            offset,
-            len,
-            done,
-        });
+        // Acquire a backpressure permit BEFORE handing the op to the driver;
+        // the driver releases it at the CQE (C10, rustfs/backlog#1060). This
+        // blocks the caller once `entries` ops are in flight, bounding both
+        // in-flight count (< CQ capacity) and resident buffer memory.
+        if !self.bp.acquire() {
+            let _ = done.send(Err(io::Error::other("uring driver shut down")));
+            return ReadHandle {
+                id,
+                rx,
+                tx: self.tx.clone(),
+                finished: false,
+                cancel_on_drop: false,
+            };
+        }
+
+        // If the driver shut down between acquire and send, give the permit
+        // back — no CQE will ever release it. `done` is dropped with the
+        // returned Msg, which the caller observes as a driver-gone error.
+        if self.tx.send(Msg::Read { id, file, offset, len, done }).is_err() {
+            self.bp.release();
+            return ReadHandle {
+                id,
+                rx,
+                tx: self.tx.clone(),
+                finished: false,
+                cancel_on_drop: false,
+            };
+        }
         ReadHandle {
             id,
             rx,
@@ -527,7 +609,7 @@ enum ReapStep {
     Resubmit(io_uring::squeue::Entry),
 }
 
-fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
+fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>, bp: Arc<Backpressure>) {
     let mut state = DriverState {
         ring,
         pending: HashMap::new(),
@@ -570,6 +652,8 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                 } => {
                     if shutting_down {
                         let _ = done.send(Err(io::Error::other("uring driver shutting down")));
+                        // The op never became in-flight; return its permit.
+                        bp.release();
                         continue;
                     }
                     let mut buf = vec![0u8; len];
@@ -718,6 +802,9 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                         Err(_) => stats.orphan_reclaimed.fetch_add(1, Ordering::SeqCst),
                     };
                     stats.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    // Release the permit HERE, at the CQE (pending removed),
+                    // not at future drop (C10, rustfs/backlog#1060).
+                    bp.release();
                 }
                 ReapStep::Resubmit(sqe) => state.backlog.push_back(sqe),
             }
@@ -740,6 +827,7 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
         //    blocking forever (C4, rustfs/backlog#1055).
         if shutting_down {
             if state.pending.is_empty() && state.backlog.is_empty() {
+                bp.shutdown(); // unblock any submit() waiter before we exit
                 return; // clean drain: DriverState drops normally, ring unmaps.
             }
             let deadline = *drain_deadline.get_or_insert_with(|| Instant::now() + DRAIN_TIMEOUT);
@@ -753,6 +841,7 @@ fn drive(ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
                      leaking ring + buffers to stay memory-safe",
                     state.pending.len()
                 );
+                bp.shutdown(); // unblock any submit() waiter
                 std::mem::forget(state);
                 return;
             }
