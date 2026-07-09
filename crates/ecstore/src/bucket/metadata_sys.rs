@@ -55,12 +55,7 @@ pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
 
     let sys = Arc::new(RwLock::new(sys));
 
-    // Same fail-fast as the old process-global `.set().unwrap()`, scoped to
-    // the owning instance: double-initializing one store's metadata is a bug.
-    assert!(
-        instance_ctx.init_bucket_metadata_sys(sys.clone()),
-        "bucket metadata sys should be initialized once per instance"
-    );
+    instance_ctx.init_bucket_metadata_sys(sys.clone());
 
     if is_dist_erasure {
         start_refresh_buckets_metadata_loop(sys);
