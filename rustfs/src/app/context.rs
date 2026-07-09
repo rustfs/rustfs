@@ -783,6 +783,10 @@ mod tests {
         fn get(&self) -> Option<Credentials> {
             self.credentials.clone()
         }
+
+        fn publish(&self, _credentials: Credentials) -> bool {
+            false
+        }
     }
 
     struct TestRegionInterface {
