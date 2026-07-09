@@ -26,81 +26,13 @@
 //!   report per-key results, versioned batch deletes still create delete
 //!   markers and preserve the underlying version.
 
-use super::storage_api::test::bucket::metadata_sys;
-use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+use super::gating_test_env::shared_gating_ecstore;
+use super::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use super::storage_api::test::contract::object::{ObjectIO as _, ObjectOperations as _};
-use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use super::storage_api::test::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::storage::storage_api::{StorageObjectLockDeleteOptions, StorageObjectToDelete as ObjectToDelete};
 use serial_test::serial;
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use tempfile::TempDir;
-use tokio::fs;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-static DELETE_GATING_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = OnceLock::new();
-
-async fn setup_delete_gating_env() -> Arc<ECStore> {
-    if let Some((_paths, store, _)) = DELETE_GATING_ENV.get() {
-        return store.clone();
-    }
-
-    let temp_dir = TempDir::new().expect("create temp dir for delete gating test");
-    let temp_path = temp_dir.path().to_path_buf();
-
-    let disk_paths = vec![
-        temp_path.join("disk1"),
-        temp_path.join("disk2"),
-        temp_path.join("disk3"),
-        temp_path.join("disk4"),
-    ];
-    for disk_path in &disk_paths {
-        fs::create_dir_all(disk_path).await.unwrap();
-    }
-
-    let mut endpoints = Vec::new();
-    for (i, disk_path) in disk_paths.iter().enumerate() {
-        let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(i);
-        endpoints.push(endpoint);
-    }
-
-    let pool_endpoints = PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: 4,
-        endpoints: Endpoints::from(endpoints),
-        cmd_line: "delete-objects-stat-gating-test".to_string(),
-        platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
-    };
-
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
-        .await
-        .unwrap();
-
-    let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let buckets_list = ecstore
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
-
-    let _ = DELETE_GATING_ENV.set((disk_paths, ecstore.clone(), temp_dir));
-    ecstore
-}
 
 fn compliance_retention_metadata() -> std::collections::HashMap<String, String> {
     let retain_until = time::OffsetDateTime::now_utc() + time::Duration::days(30);
@@ -118,7 +50,7 @@ fn compliance_retention_metadata() -> std::collections::HashMap<String, String> 
 #[tokio::test]
 #[serial]
 async fn object_lock_bucket_batch_delete_keeps_held_lock_protection() {
-    let ecstore = setup_delete_gating_env().await;
+    let ecstore = shared_gating_ecstore().await;
     let bucket = format!("hp8-lock-{}", Uuid::new_v4());
 
     ecstore
@@ -188,7 +120,7 @@ async fn object_lock_bucket_batch_delete_keeps_held_lock_protection() {
 #[tokio::test]
 #[serial]
 async fn non_lock_versioned_bucket_batch_delete_still_creates_delete_marker() {
-    let ecstore = setup_delete_gating_env().await;
+    let ecstore = shared_gating_ecstore().await;
     let bucket = format!("hp8-versioned-{}", Uuid::new_v4());
 
     ecstore
@@ -263,7 +195,7 @@ async fn non_lock_versioned_bucket_batch_delete_still_creates_delete_marker() {
 #[tokio::test]
 #[serial]
 async fn non_lock_unversioned_bucket_batch_delete_reports_per_key_results() {
-    let ecstore = setup_delete_gating_env().await;
+    let ecstore = shared_gating_ecstore().await;
     let bucket = format!("hp8-plain-{}", Uuid::new_v4());
 
     ecstore
