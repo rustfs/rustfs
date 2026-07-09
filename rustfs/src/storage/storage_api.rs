@@ -780,6 +780,12 @@ pub(crate) fn bootstrap_instance_ctx() -> Arc<InstanceContext> {
     ecstore_runtime::bootstrap_ctx()
 }
 
+/// Construct a fresh per-server instance context (backlog#1052 S5): a second
+/// embedded server owns its own erasure/region/endpoint/deployment id cells.
+pub(crate) fn new_instance_ctx() -> Arc<InstanceContext> {
+    Arc::new(InstanceContext::new())
+}
+
 pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
     ecstore_storage::init_lock_clients(endpoint_pools);
 }

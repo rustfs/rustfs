@@ -230,6 +230,11 @@ impl AppContext {
         self.action_credentials.clone()
     }
 
+    /// Publish this context's own root credentials (backlog#1052 S6).
+    pub fn publish_action_credentials(&self, credentials: rustfs_credentials::Credentials) -> bool {
+        self.action_credentials.publish(credentials)
+    }
+
     pub fn region(&self) -> Arc<dyn RegionInterface> {
         self.region.clone()
     }
@@ -341,10 +346,23 @@ static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();
 
 /// Initialize global application context once and return the canonical instance.
 pub fn init_global_app_context(context: AppContext) -> Arc<AppContext> {
-    let context = APP_CONTEXT_SINGLETON.get_or_init(|| Arc::new(context)).clone();
-    let resolver_context = context.clone();
+    publish_global_app_context(Arc::new(context))
+}
+
+/// Publish an already-constructed application context as the process default,
+/// first-writer-wins (backlog#1052 S6).
+///
+/// A per-server startup constructs its own context and installs it into its
+/// own [`ServerContextSlot`](super::server_slot::ServerContextSlot); it also
+/// calls this so the *first* server's context becomes the ambient default that
+/// legacy free-function readers resolve. Later servers publish too, but the
+/// `OnceLock` keeps the first — their own slot already carries their context,
+/// so their request path stays isolated regardless.
+pub fn publish_global_app_context(context: Arc<AppContext>) -> Arc<AppContext> {
+    let canonical = APP_CONTEXT_SINGLETON.get_or_init(|| context).clone();
+    let resolver_context = canonical.clone();
     let _ = set_object_store_resolver(Arc::new(move || Some(resolver_context.object_store())));
-    context
+    canonical
 }
 
 /// Get global application context if it has been initialized.

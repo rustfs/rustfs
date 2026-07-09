@@ -212,14 +212,21 @@ pub(crate) async fn init_embedded_startup_listen_context(
         ));
     }
 
-    startup_runtime_sources::init_action_credentials(config.access_key.clone(), config.secret_key.clone())
+    // Embedded startup tolerates already-initialized credentials so multiple
+    // servers can coexist (backlog#1052 S5). Per-server dispatch owns the
+    // real credentials via ActionCredentialHandle; the global only needs to
+    // remember the first server's identity for ambient readers.
+    startup_runtime_sources::publish_action_credentials_tolerant(config.access_key.clone(), config.secret_key.clone())
         .map_err(|err| Error::other(format!("credentials: {err:?}")))?;
 
     if let Some(region_str) = &config.region {
-        region_str
+        let region = region_str
             .parse::<s3s::region::Region>()
-            .map(|region| startup_runtime_sources::publish_region(instance_ctx, region))
             .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))?;
+        // The instance context is per-server, so region publication cannot
+        // panic on a second embedded server; the process still has one region
+        // for legacy ambient readers.
+        instance_ctx.set_region(region);
     }
 
     startup_runtime_sources::publish_server_port(server_addr.port());

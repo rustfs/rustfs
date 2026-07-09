@@ -16,6 +16,7 @@ use crate::{
     server::ShutdownHandle,
     startup_lifecycle::{
         EmbeddedStartupGuard, embedded_endpoint_address, log_embedded_server_ready, publish_embedded_startup_ready,
+        release_embedded_startup_guard,
     },
     startup_runtime_hooks::init_embedded_runtime_hooks,
     startup_server::{
@@ -114,7 +115,15 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
     // EMBEDDED_SERVER_STARTED guard); once the request path and app subsystems
     // are per-server too (backlog#1052 S2–S4), each server constructs its own
     // context here instead.
-    let instance_ctx = bootstrap_instance_ctx();
+    // The first embedded server adopts the process bootstrap context so the
+    // process-wide facades (current_ctx()) see live state; a second embedded
+    // server constructs its own context to avoid the write-once panics on
+    // region/endpoints/deployment id (backlog#1052 S5).
+    let instance_ctx = if bootstrap_instance_ctx().region().is_some() {
+        crate::storage_api::startup::storage::new_instance_ctx()
+    } else {
+        bootstrap_instance_ctx()
+    };
     // This server's request-path context slot (backlog#1052 S2).
     let server_ctx = ServerContextSlot::new();
 
@@ -163,6 +172,7 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         }
     };
 
+    let credentials_slot = server_ctx.clone();
     let service_runtime = init_embedded_startup_runtime_services(
         &config,
         endpoint_pools,
@@ -177,6 +187,12 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         init_error(err)
     })?;
 
+    // Publish this server's root credentials into its own application context
+    // (backlog#1052 S6) so its request path authenticates against its own
+    // identity — a second embedded server no longer falls back to the first
+    // server's process-global credentials.
+    publish_embedded_server_credentials(&credentials_slot, &identity.access_key, &identity.secret_key);
+
     publish_embedded_startup_ready(service_runtime.iam_bootstrap, listen_context.readiness.as_ref())
         .await
         .map_err(|err| {
@@ -185,6 +201,10 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
         })?;
 
     log_embedded_server_ready(embedded_endpoint_address(bound_addr));
+
+    // Startup handed off successfully — release the guard so a second server
+    // in this process can begin its own startup (backlog#1052 S5).
+    release_embedded_startup_guard();
 
     Ok(EmbeddedStartedServer {
         bound_addr,
@@ -199,6 +219,18 @@ pub(crate) async fn run_embedded_startup(args: EmbeddedStartupArgs) -> Result<Em
 
 fn init_error(err: impl std::fmt::Display) -> EmbeddedStartupError {
     EmbeddedStartupError::Init(err.to_string())
+}
+
+/// Seed a server's own root credentials into its application context so its
+/// request path validates keys against its own identity (backlog#1052 S6).
+fn publish_embedded_server_credentials(server_ctx: &ServerContextSlot, access_key: &str, secret_key: &str) {
+    if let Some(app_context) = server_ctx.app_context() {
+        app_context.publish_action_credentials(rustfs_credentials::Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            ..Default::default()
+        });
+    }
 }
 
 #[cfg(test)]

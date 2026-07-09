@@ -40,3 +40,18 @@ pub(crate) fn default_multipart_usecase() -> DefaultMultipartUsecase {
 pub(crate) fn default_object_usecase() -> DefaultObjectUsecase {
     DefaultObjectUsecase::from_global()
 }
+
+/// Resolve the object use-case for a server's request path (backlog#1052 S6):
+/// bind it to the server's own application context so it resolves that
+/// server's store instead of the ambient process default.
+pub(crate) fn object_usecase_for(fs: &crate::storage::ecfs::FS) -> DefaultObjectUsecase {
+    DefaultObjectUsecase::with_context(fs.server_ctx().app_context())
+}
+
+pub(crate) fn bucket_usecase_for(fs: &crate::storage::ecfs::FS) -> DefaultBucketUsecase {
+    DefaultBucketUsecase::with_context(fs.server_ctx().app_context())
+}
+
+pub(crate) fn multipart_usecase_for(fs: &crate::storage::ecfs::FS) -> DefaultMultipartUsecase {
+    DefaultMultipartUsecase::with_context(fs.server_ctx().app_context())
+}
