@@ -2336,6 +2336,14 @@ impl DefaultObjectUsecase {
         }
     }
 
+    /// Build the use-case bound to an explicit application context
+    /// (backlog#1052 S6): the per-server request path passes its own context
+    /// so the use-case resolves that server's store; `None` falls back to the
+    /// ambient default.
+    pub fn with_context(context: Option<std::sync::Arc<crate::runtime_sources::AppContext>>) -> Self {
+        Self { context }
+    }
+
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
         self.context.as_ref().and_then(|context| context.bucket_metadata().handle())
     }

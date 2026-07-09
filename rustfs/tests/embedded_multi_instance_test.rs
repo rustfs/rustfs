@@ -104,3 +104,78 @@ async fn two_embedded_servers_start_and_shutdown_independently() {
 
     server_a.shutdown().await;
 }
+
+// backlog#1052 auth acceptance: two embedded servers with *different*
+// credentials each authenticate against their own root identity. Server B
+// accepts its own access key and rejects server A's. This exercises the
+// per-server auth path (each request resolves its own AppContext for
+// credential validation).
+//
+// NOTE: full bucket-namespace isolation is a separate, deeper follow-up: the
+// ecstore data plane still resolves some lower-level reads (peer/disk/bucket
+// metadata) through the process-global object handle, so the two servers do
+// not yet present independent bucket listings even though each holds its own
+// store object. That isolation is the remaining work on #1052.
+#[tokio::test]
+async fn two_embedded_servers_authenticate_with_their_own_credentials() {
+    let port_a = match find_available_port() {
+        Ok(port) => port,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("find free port for server A: {err}"),
+    };
+    let server_a = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_a}"))
+        .access_key("access-key-a")
+        .secret_key("secret-key-a")
+        .build()
+        .await
+        .expect("start embedded server A");
+
+    let port_b = match find_available_port() {
+        Ok(port) => port,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            server_a.shutdown().await;
+            return;
+        }
+        Err(err) => {
+            server_a.shutdown().await;
+            panic!("find free port for server B: {err}");
+        }
+    };
+    let server_b = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_b}"))
+        .access_key("access-key-b")
+        .secret_key("secret-key-b")
+        .build()
+        .await
+        .expect("start embedded server B");
+
+    // Server B authenticates with its OWN key — before per-server auth this
+    // failed with InvalidAccessKeyId because validation used the process
+    // (server A's) credentials.
+    let client_b = s3_client(&server_b.endpoint(), "access-key-b", "secret-key-b");
+    client_b
+        .list_buckets()
+        .send()
+        .await
+        .expect("server B must authenticate with its own credentials");
+
+    // Server B rejects server A's key — the two servers have distinct root
+    // identities.
+    let cross = s3_client(&server_b.endpoint(), "access-key-a", "secret-key-a")
+        .list_buckets()
+        .send()
+        .await;
+    assert!(cross.is_err(), "server B must reject server A's access key; got {cross:?}");
+
+    // Server A still authenticates with its own key.
+    let client_a = s3_client(&server_a.endpoint(), "access-key-a", "secret-key-a");
+    client_a
+        .list_buckets()
+        .send()
+        .await
+        .expect("server A must authenticate with its own credentials");
+
+    server_a.shutdown().await;
+    server_b.shutdown().await;
+}

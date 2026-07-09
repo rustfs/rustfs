@@ -17,7 +17,7 @@ use super::ecfs::FS;
 use super::{
     PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
 };
-use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_info, get_session_token};
+use crate::auth::{check_key_valid_with_context, get_condition_values_with_query_and_client_info, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
@@ -919,9 +919,18 @@ impl S3Access for FS {
         //     // cx.extensions_mut(),
         // );
 
+        // Resolve auth against this server's context (backlog#1052 S6) so a
+        // second embedded server validates keys against its own root identity
+        // and IAM domain; the slot resolves the process default when it has
+        // not been installed, keeping single-instance behavior unchanged.
+        let app_context = self.server_ctx().app_context();
         let (cred, is_owner) = if let Some(input_cred) = cx.credentials() {
-            let (cred, is_owner) =
-                check_key_valid(get_session_token(cx.uri(), cx.headers()).unwrap_or_default(), &input_cred.access_key).await?;
+            let (cred, is_owner) = check_key_valid_with_context(
+                get_session_token(cx.uri(), cx.headers()).unwrap_or_default(),
+                &input_cred.access_key,
+                app_context.as_deref(),
+            )
+            .await?;
             (Some(cred), is_owner)
         } else {
             (None, false)
@@ -929,15 +938,23 @@ impl S3Access for FS {
 
         let request_context = cx.extensions_mut().get::<RequestContext>().cloned();
 
+        let region = app_context
+            .as_deref()
+            .and_then(|context| context.region().get())
+            .or_else(runtime_sources::current_region);
+
         let req_info = ReqInfo {
             cred,
             is_owner,
-            region: runtime_sources::current_region(),
+            region,
             request_context,
             ..Default::default()
         };
 
+        // Publish this server's context slot so downstream data-plane handlers
+        // resolve the same store (backlog#1052 S6).
         let ext = cx.extensions_mut();
+        ext.insert(self.server_ctx().clone());
         ext.insert(req_info);
         license_check().map_err(|er| match er.kind() {
             std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
