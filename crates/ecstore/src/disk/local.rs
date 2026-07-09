@@ -3802,6 +3802,23 @@ impl LocalDisk {
                             true,
                             if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
                         );
+                    } else if !is_dir_obj {
+                        // backlog#1042: in a non-recursive (delimiter) listing a plain
+                        // object `a` can ALSO be a prefix `a/` when sibling objects such
+                        // as `a/b` live under it. The object was emitted above (it becomes
+                        // Contents); emit the prefix dir `a/` too so the upstream fold
+                        // surfaces it as a CommonPrefix (matching S3 delimiter semantics).
+                        // The probe only reports true when `a/` holds a listing entry
+                        // other than object `a` itself, so leaf objects (the common case)
+                        // schedule nothing and pay a single list_dir.
+                        if self
+                            .object_prefix_has_sibling_listing_entry(&opts.bucket, &meta.name, res.as_ref())
+                            .await?
+                        {
+                            let mut dir_name = meta.name.clone();
+                            dir_name.push_str(SLASH_SEPARATOR);
+                            schedule_dir(&mut dir_stack, dir_name, true, None);
+                        }
                     }
                 }
                 Err(err) => {
@@ -3936,6 +3953,48 @@ impl LocalDisk {
                 if !data_dirs_to_skip.contains(&child) {
                     stack.push(path_join_buf(&[current.as_str(), child.as_str()]));
                 }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// backlog#1042 helper for non-recursive (delimiter) listings. Given an object
+    /// directory `obj_dir` (e.g. `a`, which holds `a/xl.meta`), decide whether it
+    /// ALSO acts as a prefix — i.e. contains a listing entry other than the object
+    /// itself, such as a sibling object `a/b`. The object's own `xl.meta` and data
+    /// dirs belong to the object, not to a child prefix, so they are skipped.
+    /// Returns false for leaf objects (the common case), so they incur only a
+    /// single `list_dir` and no descent.
+    async fn object_prefix_has_sibling_listing_entry(&self, bucket: &str, obj_dir: &str, metadata: &[u8]) -> Result<bool> {
+        let mut data_dirs_to_skip = HashSet::new();
+        if let Ok(file_meta) = FileMeta::load(metadata)
+            && let Ok(data_dirs) = file_meta.get_data_dirs()
+        {
+            for data_dir in data_dirs.iter().flatten() {
+                data_dirs_to_skip.insert(data_dir.to_string());
+            }
+        }
+
+        let entries = match self.list_dir("", bucket, obj_dir, -1).await {
+            Ok(entries) => entries,
+            Err(err) if err == DiskError::VolumeNotFound || err == Error::FileNotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
+
+        for entry in entries {
+            // Only child directories can introduce a sibling listing entry; the
+            // object's own `xl.meta` (a plain file) is not a child prefix.
+            if !entry.ends_with(SLASH_SEPARATOR) {
+                continue;
+            }
+            let child = entry.trim_end_matches(SLASH_SEPARATOR);
+            if child.is_empty() || data_dirs_to_skip.contains(child) {
+                continue;
+            }
+            let child_path = path_join_buf(&[obj_dir, child]);
+            if self.directory_has_visible_listing_entry(bucket, &child_path).await? {
+                return Ok(true);
             }
         }
 
@@ -8610,6 +8669,109 @@ mod test {
 
         let versioned_hidden_names = scan_names(&disk, bucket, "hidden/", true).await;
         assert!(versioned_hidden_names.contains(&"hidden/nested/".to_string()));
+    }
+
+    /// backlog#1042: in a non-recursive (delimiter) listing a plain object `a`
+    /// and a sibling object `a/b` under the same-named prefix must BOTH appear —
+    /// `a` as an object (Contents) and `a/` as a prefix dir (CommonPrefix). A leaf
+    /// object with no sibling must NOT gain a spurious prefix.
+    #[tokio::test]
+    async fn test_scan_dir_nonrecursive_object_and_sibling_prefix_coexist() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn visible_object_metadata(name: &str, version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("visible metadata should encode")
+        }
+
+        async fn scan_entries(disk: &LocalDisk, bucket: &str, base_dir: &str) -> Vec<(String, bool)> {
+            let (reader, mut writer) = tokio::io::duplex(4096);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: base_dir.to_string(),
+                recursive: false,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .map(|entry| (entry.name.clone(), entry.is_object()))
+                .collect()
+        }
+
+        let dir = tempdir().expect("tempdir should be created");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        // Object `a` at bucket/a/xl.meta.
+        let obj_a = bucket_dir.join("a");
+        fs::create_dir_all(&obj_a).await.expect("object a dir should be created");
+        fs::write(
+            obj_a.join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        )
+        .await
+        .expect("object a metadata should be written");
+
+        // Sibling object `a/b` at bucket/a/b/xl.meta — makes `a/` a real prefix.
+        let obj_ab = bucket_dir.join("a/b");
+        fs::create_dir_all(&obj_ab).await.expect("object a/b dir should be created");
+        fs::write(
+            obj_ab.join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("a/b", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        )
+        .await
+        .expect("object a/b metadata should be written");
+
+        // Leaf object `c` at bucket/c/xl.meta — must NOT produce a prefix `c/`.
+        let obj_c = bucket_dir.join("c");
+        fs::create_dir_all(&obj_c).await.expect("object c dir should be created");
+        fs::write(
+            obj_c.join(STORAGE_FORMAT_FILE),
+            visible_object_metadata("c", "cccccccc-cccc-cccc-cccc-cccccccccccc"),
+        )
+        .await
+        .expect("object c metadata should be written");
+
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let entries = scan_entries(&disk, bucket, "").await;
+
+        assert!(
+            entries.iter().any(|(name, is_object)| name == "a" && *is_object),
+            "object `a` must be emitted as an object, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|(name, is_object)| name == "a/" && !*is_object),
+            "prefix `a/` must be emitted as a dir because sibling `a/b` exists, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|(name, is_object)| name == "c" && *is_object),
+            "leaf object `c` must be emitted as an object, got {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|(name, _)| name == "c/"),
+            "leaf object `c` must not produce a spurious prefix `c/`, got {entries:?}"
+        );
     }
 
     #[cfg(unix)]
