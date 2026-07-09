@@ -56,6 +56,7 @@ async fn start_rustfs_with_compression(env: &mut RustFSTestEnvironment) -> Resul
 
     let binary_path = rustfs_binary_path();
     let process = Command::new(&binary_path)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_COMPRESSION_ENABLED", "true")
         .args([
             "--address",

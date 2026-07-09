@@ -151,6 +151,7 @@ pub async fn test_webdav_core_operations() -> Result<()> {
     let mut server_process = Command::new(&binary_path)
         .arg("--address")
         .arg(S3_TEST_ADDRESS)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_WEBDAV_ENABLE", "true")
         .env("RUSTFS_WEBDAV_ADDRESS", WEBDAV_ADDRESS)
         .env("RUSTFS_WEBDAV_TLS_ENABLED", "false") // No TLS for testing

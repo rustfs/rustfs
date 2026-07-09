@@ -27,8 +27,8 @@ use russh::client::{self, Handle};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use rustfs_config::{
-    ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT, ENV_SFTP_PART_SIZE,
-    ENV_SFTP_READ_ONLY,
+    ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT,
+    ENV_SFTP_PART_SIZE, ENV_SFTP_READ_ONLY,
 };
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -152,6 +152,7 @@ pub async fn test_sftp_core_operations() -> Result<()> {
         .ok_or_else(|| anyhow!("host key dir path is not utf-8"))?;
     let mut server_process = ServerProcess::new(
         Command::new(&binary_path)
+            .env(ENV_CONSOLE_ENABLE, "false")
             .env(ENV_SFTP_ENABLE, "true")
             .env(ENV_SFTP_ADDRESS, SFTP_ADDRESS)
             .env(ENV_SFTP_HOST_KEY_DIR, host_key_dir_str)
@@ -504,6 +505,7 @@ pub async fn test_sftp_idle_timeout_disconnects() -> Result<()> {
         .ok_or_else(|| anyhow!("host key dir path is not utf-8"))?;
     let mut server_process = ServerProcess::new(
         Command::new(&binary_path)
+            .env(ENV_CONSOLE_ENABLE, "false")
             .env(ENV_SFTP_ENABLE, "true")
             .env(ENV_SFTP_ADDRESS, IDLE_SFTP_ADDRESS)
             .env(ENV_SFTP_HOST_KEY_DIR, host_key_dir_str)
