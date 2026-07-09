@@ -888,6 +888,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                         "GetObject streaming body ended before expected length"
                     );
                     self.finish_err();
+                    // The inner reader signalled a clean EOF before delivering the full
+                    // Content-Length. Returning Ok here would hand the client a truncated body
+                    // under a full Content-Length: the peer treats the short body as complete
+                    // (e.g. `mc mirror` writes a short file and considers it done — the
+                    // "incomplete data mirroring" in issue #2955). Surface an error instead so
+                    // the transfer fails loudly and the client retries rather than persisting
+                    // truncated data.
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "get object streaming body ended before the expected content length",
+                    )));
                 } else {
                     self.completed = true;
                     self.finish_ok();
@@ -7206,6 +7217,39 @@ mod tests {
             .expect("complete streaming body should read successfully");
 
         assert_eq!(out, b"hello");
+        assert_eq!(GetObjectGuard::concurrent_count(), initial);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_streaming_reader_errors_on_short_eof() {
+        use tokio::io::AsyncReadExt;
+
+        // The inner reader delivers 5 bytes then a clean EOF, but the advertised
+        // Content-Length is 10. The reader must surface an error rather than a clean EOF, so
+        // the client sees a failed transfer instead of silently persisting a truncated body
+        // (the "incomplete data mirroring" of #2955).
+        let initial = GetObjectGuard::concurrent_count();
+        let guard = GetObjectGuard::new();
+        assert_eq!(GetObjectGuard::concurrent_count(), initial + 1);
+
+        let mut reader = GetObjectStreamingReader::new(
+            std::io::Cursor::new(b"short".to_vec()),
+            "test-bucket",
+            "truncated-object",
+            10,
+            Duration::ZERO,
+            GetObjectBodyLifecycle::tracked(guard),
+        );
+        let mut out = Vec::new();
+        let err = reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("short body under a larger Content-Length must fail the stream");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(out, b"short", "bytes read before the short EOF are still delivered");
+
+        drop(reader);
         assert_eq!(GetObjectGuard::concurrent_count(), initial);
     }
 
