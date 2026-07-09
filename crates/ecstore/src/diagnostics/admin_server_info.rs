@@ -21,7 +21,8 @@ use crate::data_usage::load_data_usage_cache;
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use rustfs_common::heal_channel::DriveState;
 use rustfs_madmin::{
-    BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, MemStats, ServerProperties,
+    BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, ITEM_UNKNOWN, InfoMessage, MemStats,
+    ServerProperties,
 };
 use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
@@ -276,7 +277,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         for server in servers.iter() {
             all_disks.extend(server.disks.clone());
         }
-        let (online_disks, offline_disks) = get_online_offline_disks_stats(&all_disks);
+        let (online_disks, offline_disks, unknown_disks) = get_online_offline_disks_stats(&all_disks);
 
         let after5 = OffsetDateTime::now_utc();
 
@@ -285,6 +286,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
             backend_type: rustfs_madmin::BackendType::ErasureType,
             online_disks: online_disks.sum(),
             offline_disks: offline_disks.sum(),
+            unknown_disks: unknown_disks.sum(),
             standard_sc_parity: backend_info.standard_sc_parity,
             rr_sc_parity: backend_info.rr_sc_parity,
             total_sets: backend_info.total_sets,
@@ -318,19 +320,32 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
     }
 }
 
-fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, BackendDisks) {
+/// Classify every drive into online / offline / unknown buckets.
+///
+/// `unknown` holds drives synthesized for a member whose properties RPC could
+/// not be answered this cycle but which is not confirmed offline. Keeping them
+/// out of the `offline` bucket means a transient probe miss no longer inflates
+/// the offline count for a healthy member, while `online + offline + unknown`
+/// still sums to the pool's total drive count (rustfs/backlog#1049).
+fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, BackendDisks, BackendDisks) {
     let mut online_disks: HashMap<String, usize> = HashMap::new();
     let mut offline_disks: HashMap<String, usize> = HashMap::new();
+    let mut unknown_disks: HashMap<String, usize> = HashMap::new();
 
     for disk in disks_info {
         let ep = &disk.endpoint;
         offline_disks.entry(ep.clone()).or_insert(0);
         online_disks.entry(ep.clone()).or_insert(0);
+        unknown_disks.entry(ep.clone()).or_insert(0);
     }
 
     for disk in disks_info {
         let ep = &disk.endpoint;
         let state = &disk.state;
+        if *state == ITEM_UNKNOWN {
+            *unknown_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
+            continue;
+        }
         if *state != DriveState::Ok.to_string() && *state != DriveState::Unformatted.to_string() {
             *offline_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
             continue;
@@ -345,8 +360,11 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
         }
     }
 
-    if disks_info.len() == (root_disk_count + offline_disks.values().sum::<usize>()) {
-        return (BackendDisks(online_disks), BackendDisks(offline_disks));
+    // When every non-offline, non-unknown drive is a root mount, leave the
+    // online tally as-is instead of demoting all of them (matches the prior
+    // behavior; the unknown bucket is simply carried through untouched).
+    if disks_info.len() == (root_disk_count + offline_disks.values().sum::<usize>() + unknown_disks.values().sum::<usize>()) {
+        return (BackendDisks(online_disks), BackendDisks(offline_disks), BackendDisks(unknown_disks));
     }
 
     for disk in disks_info {
@@ -357,7 +375,7 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
         }
     }
 
-    (BackendDisks(online_disks), BackendDisks(offline_disks))
+    (BackendDisks(online_disks), BackendDisks(offline_disks), BackendDisks(unknown_disks))
 }
 
 async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, ErasureSetInfo>>> {
@@ -413,8 +431,45 @@ mod tests {
     use serial_test::serial;
 
     use crate::runtime::sources as runtime_sources;
+    use rustfs_madmin::{Disk, ITEM_OFFLINE, ITEM_UNKNOWN};
 
-    use super::{get_local_server_property, get_server_info};
+    use super::{get_local_server_property, get_online_offline_disks_stats, get_server_info};
+
+    fn disk_with_state(endpoint: &str, state: &str) -> Disk {
+        Disk {
+            endpoint: endpoint.to_string(),
+            state: state.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disk_stats_split_unknown_into_its_own_bucket() {
+        // A member whose properties RPC could not be answered contributes
+        // drives tagged `unknown`. They must land in the unknown bucket, not
+        // inflate `offline`, and the three buckets must still account for every
+        // drive so the summary stays balanced (rustfs/backlog#1049).
+        //
+        // A live drive reports the DriveState string "ok"; only "ok"/"unformatted"
+        // count as online.
+        let disks = vec![
+            disk_with_state("http://n1:9000/data", "ok"),
+            disk_with_state("http://n2:9000/data", "ok"),
+            disk_with_state("http://n3:9000/data", ITEM_OFFLINE),
+            disk_with_state("http://n4:9000/data", ITEM_UNKNOWN),
+        ];
+
+        let (online, offline, unknown) = get_online_offline_disks_stats(&disks);
+
+        assert_eq!(online.sum(), 2, "the two healthy drives are online");
+        assert_eq!(offline.sum(), 1, "only the confirmed-offline drive is offline");
+        assert_eq!(unknown.sum(), 1, "the unreachable member's drive is unknown, not offline");
+        assert_eq!(
+            online.sum() + offline.sum() + unknown.sum(),
+            disks.len(),
+            "online + offline + unknown must equal the total drive count"
+        );
+    }
 
     #[serial]
     #[tokio::test]
