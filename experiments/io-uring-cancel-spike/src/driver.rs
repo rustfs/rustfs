@@ -273,32 +273,92 @@ fn probe_real_read(ring: &mut IoUring) -> io::Result<()> {
         std::process::id(),
         PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = (|| {
+
+    // File setup runs BEFORE any SQE is submitted, so its errors early-return
+    // safely — nothing is in flight yet.
+    let file = match (|| -> io::Result<File> {
         std::fs::write(&path, &pattern)?;
-        let file = File::open(&path)?;
-        let mut buf = vec![0u8; pattern.len()];
-        let sqe = opcode::Read::new(types::Fd(file.as_raw_fd()), buf.as_mut_ptr(), buf.len() as u32)
-            .offset(0)
-            .build()
-            .user_data(0xB0BE);
-        // SAFETY: `buf` and `file` outlive the synchronous wait below.
-        unsafe {
-            ring.submission()
-                .push(&sqe)
-                .map_err(|_| io::Error::other("probe: submission queue full"))?;
+        File::open(&path)
+    })() {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
         }
-        ring.submit_and_wait(1)?;
-        let cqe = ring.completion().next().ok_or_else(|| io::Error::other("probe: no CQE"))?;
-        if cqe.result() < 0 {
-            return Err(io::Error::from_raw_os_error(-cqe.result()));
+    };
+
+    let mut buf = vec![0u8; pattern.len()];
+    let sqe = opcode::Read::new(types::Fd(file.as_raw_fd()), buf.as_mut_ptr(), buf.len() as u32)
+        .offset(0)
+        .build()
+        .user_data(0xB0BE);
+
+    // SAFETY: a push failure means the kernel never accepted the SQE, so
+    // `buf`/`file` may be dropped safely on this early return.
+    if unsafe { ring.submission().push(&sqe) }.is_err() {
+        let _ = std::fs::remove_file(&path);
+        return Err(io::Error::other("probe: submission queue full"));
+    }
+
+    // C1 (backlog#1053): once the SQE is handed to the kernel, the read may be
+    // punted to io-wq and write into `buf` at ANY later point. Until its CQE
+    // arrives, `buf`/`file` must NOT be dropped and the ring must NOT be
+    // unmapped — otherwise the kernel writes into freed memory (UAF). The
+    // probe path has no pending-table backstop, so we must drain to the CQE
+    // here, and any early exit first leaks the buffer ("leak over UAF").
+    let res = match drain_probe_cqe(ring) {
+        Ok(res) => res,
+        Err(e) => {
+            // We could not confirm the op terminated. Leak `buf` (the actual
+            // UAF hazard: the kernel may still write 512 bytes into it) and,
+            // defensively, `file`. Leaking one 512-byte startup-probe buffer
+            // is trivially cheaper than a silent heap corruption. The ring is
+            // dropped by the caller's `?`; unmapping the ring is safe on its
+            // own (closing the ring fd triggers kernel-side teardown) — only
+            // the user buffer must survive.
+            std::mem::forget(buf);
+            std::mem::forget(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
         }
-        if cqe.result() as usize != pattern.len() || buf != pattern {
-            return Err(io::Error::other("probe: read completed but data mismatched"));
-        }
+    };
+
+    // The CQE has arrived: the kernel is done with `buf`, so dropping it and
+    // `file` below is now safe.
+    let outcome = if res < 0 {
+        Err(io::Error::from_raw_os_error(-res))
+    } else if res as usize != pattern.len() || buf != pattern {
+        Err(io::Error::other("probe: read completed but data mismatched"))
+    } else {
         Ok(())
-    })();
+    };
     let _ = std::fs::remove_file(&path);
-    result
+    outcome
+}
+
+/// Wait for the probe SQE's CQE and return its raw result.
+///
+/// The SQE has already been pushed; this only drains it. `submit_and_wait`
+/// interrupted by a signal returns EINTR — since the kernel consumed the SQE
+/// atomically before the wait phase, we retry the WAIT only and never re-push
+/// (C8, backlog#1059). A bounded attempt count keeps a probe that hit a hung
+/// device from blocking forever; exhausting it returns an error that drives
+/// the caller's leak-over-UAF fallback.
+fn drain_probe_cqe(ring: &mut IoUring) -> io::Result<i32> {
+    const MAX_WAIT_ATTEMPTS: u32 = 4096;
+    for _ in 0..MAX_WAIT_ATTEMPTS {
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            // Signal interrupted the wait; the SQE is already in flight, so
+            // just wait again (do NOT re-push).
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(cqe) = ring.completion().next() {
+            return Ok(cqe.result());
+        }
+    }
+    Err(io::Error::other("probe: no CQE after bounded wait"))
 }
 
 fn drive(mut ring: IoUring, rx: mpsc::Receiver<Msg>, stats: Arc<DriverStats>) {
