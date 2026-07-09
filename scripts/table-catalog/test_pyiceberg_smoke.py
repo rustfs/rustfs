@@ -336,11 +336,11 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             if (method, path) == ("GET", config_path):
                 return {"version": 1}
             if (method, path) == ("POST", maintenance_path):
-                return {"job": {"job-id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
+                return {"job": {"job_id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("GET", job_path):
                 return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("POST", quarantine_path):
-                return {"action": "INSPECT", "report": {"job": {"job-id": "job-1"}}}
+                return {"action": "INSPECT", "report": {"job": {"job_id": "job-1"}}}
             if (method, path) == ("GET", scheduler_path):
                 return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1", "audit-events": [{"action": "PLANNED"}]}]}
             if (method, path) == ("POST", scheduler_run_path):
@@ -406,11 +406,11 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             if (method, path) == ("GET", config_path):
                 return {"version": 1}
             if (method, path) == ("POST", maintenance_path):
-                return {"job": {"job-id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
+                return {"job": {"job_id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("GET", pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1")):
                 return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("POST", quarantine_path):
-                return {"action": "INSPECT", "report": {"job": {"job-id": "job-1"}}}
+                return {"action": "INSPECT", "report": {"job": {"job_id": "job-1"}}}
             if (method, path) == ("GET", scheduler_path):
                 return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1", "audit-events": [{"action": "PLANNED"}]}]}
             if (method, path) == ("POST", scheduler_run_path):

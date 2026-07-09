@@ -1185,6 +1185,15 @@ def run_view_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
                 raise
 
 
+def maintenance_job_id(job: object) -> str | None:
+    if not isinstance(job, dict):
+        return None
+    value = job.get("job-id") or job.get("job_id")
+    if not isinstance(value, str) or not value:
+        return None
+    return value
+
+
 def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     config_path = table_endpoint_path(args, "/maintenance/config")
     scheduler_path = table_endpoint_path(args, "/maintenance/scheduler")
@@ -1202,21 +1211,22 @@ def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
         {"retain-recent-metadata-files": 1, "delete": False},
     )
     job = report.get("job")
-    if not isinstance(job, dict) or not job.get("job-id"):
+    job_id = maintenance_job_id(job)
+    if job_id is None:
         raise RuntimeError("maintenance metadata endpoint did not return a job id")
     audit_events = report.get("audit-events")
     if not isinstance(audit_events, list) or not audit_events:
         raise RuntimeError("maintenance metadata endpoint did not return audit events")
     if not any(isinstance(event, dict) and event.get("action") == "PLANNED" for event in audit_events):
         raise RuntimeError("maintenance metadata endpoint did not report a planning audit event")
-    job_report = signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}"))
+    job_report = signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job_id}"))
     if not isinstance(job_report.get("audit-events"), list):
         raise RuntimeError("maintenance job endpoint did not return audit events")
     quarantine = signed_rest_request(
         args,
         deps,
         "POST",
-        table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}/quarantine"),
+        table_endpoint_path(args, f"/maintenance/jobs/{job_id}/quarantine"),
         {"action": "INSPECT"},
     )
     if quarantine.get("action") != "INSPECT" or not isinstance(quarantine.get("report"), dict):
