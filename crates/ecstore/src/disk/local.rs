@@ -78,8 +78,18 @@ const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMAT
 const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT: u64 = 2;
 const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: u64 = 100;
 
-fn inline_metadata_rollback_dir(version_id: Uuid) -> Uuid {
-    Uuid::from_u128(version_id.as_u128() ^ INLINE_METADATA_ROLLBACK_DIR_XOR)
+fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
+    let used_data_dirs: HashSet<Uuid> = meta.get_data_dirs().unwrap_or_default().into_iter().flatten().collect();
+    let base = version_id.as_u128() ^ INLINE_METADATA_ROLLBACK_DIR_XOR;
+    let mut salt = 0u128;
+
+    loop {
+        let candidate = Uuid::from_u128(base ^ salt);
+        if !candidate.is_nil() && !used_data_dirs.contains(&candidate) {
+            return candidate;
+        }
+        salt = salt.wrapping_add(1);
+    }
 }
 
 fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
@@ -5488,7 +5498,7 @@ impl DiskAPI for LocalDisk {
             let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
             let rollback_data_dir = has_old_data_dir.or_else(|| {
                 if old_version_exists && has_dst_buf.is_some() {
-                    Some(inline_metadata_rollback_dir(version_id))
+                    Some(inline_metadata_rollback_dir(version_id, &xlmeta))
                 } else {
                     None
                 }
@@ -5682,7 +5692,11 @@ impl DiskAPI for LocalDisk {
                     if !dir.starts_with(&dst_volume_dir) {
                         break;
                     }
-                    os::fsync_dir(dir).await.map_err(to_file_error)?;
+                    if let Err(err) = os::fsync_dir(dir).await {
+                        rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
+                            .map_err(to_file_error)?;
+                        return Err(to_file_error(err).into());
+                    }
                     if dir == dst_volume_dir.as_path() {
                         break;
                     }
@@ -5752,7 +5766,7 @@ impl DiskAPI for LocalDisk {
                 let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
                 let rollback_data_dir = old_data_dir.or_else(|| {
                     if old_version_exists && has_dst_buf.is_some() {
-                        Some(inline_metadata_rollback_dir(version_id))
+                        Some(inline_metadata_rollback_dir(version_id, &xlmeta))
                     } else {
                         None
                     }
@@ -5852,7 +5866,10 @@ impl DiskAPI for LocalDisk {
                         if !ancestor_dir.starts_with(&bucket_dir) {
                             break;
                         }
-                        os::fsync_dir_std(ancestor_dir)?;
+                        if let Err(err) = os::fsync_dir_std(ancestor_dir) {
+                            rollback_committed_rename_std(&dst, None, rollback_data_dir)?;
+                            return Err(err);
+                        }
                         if ancestor_dir == bucket_dir.as_path() {
                             break;
                         }
@@ -6601,6 +6618,21 @@ mod test {
         let mut meta = FileMeta::default();
         meta.add_version(fi).expect("test metadata should accept file info");
         meta.marshal_msg().expect("test metadata should encode")
+    }
+
+    #[test]
+    fn inline_metadata_rollback_dir_avoids_real_data_dir_collision() {
+        let target_version = Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("version id should parse");
+        let colliding_dir = Uuid::from_u128(target_version.as_u128() ^ INLINE_METADATA_ROLLBACK_DIR_XOR);
+        let other_version = Uuid::parse_str("66666666-7777-8888-9999-aaaaaaaaaaaa").expect("version id should parse");
+
+        let mut meta = FileMeta::new();
+        meta.add_version(test_file_info("object", other_version, Some(colliding_dir), None))
+            .expect("test metadata should accept file info");
+
+        let rollback_dir = inline_metadata_rollback_dir(target_version, &meta);
+        assert_ne!(rollback_dir, colliding_dir);
+        assert!(!rollback_dir.is_nil());
     }
 
     async fn ensure_test_volume(disk: &LocalDisk, volume: &str) {
@@ -8685,7 +8717,7 @@ mod test {
             .await
             .expect("existing metadata should be written");
 
-        disk.delete_versions_internal(bucket, object, &[missing_fi, existing_fi])
+        disk.delete_versions_internal(bucket, object, &[missing_fi, existing_fi], &DeleteOptions::default())
             .await
             .expect("missing non-deleted version should not abort deletion");
 

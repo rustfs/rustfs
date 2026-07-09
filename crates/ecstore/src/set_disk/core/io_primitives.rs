@@ -1784,7 +1784,7 @@ pub(in crate::set_disk) fn should_allow_metadata_early_stop(
     }
 
     (is_get_metadata_early_stop_enabled() && version_id.is_empty() && !healing && !incl_free_versions)
-        || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing)
+        || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing && !incl_free_versions)
 }
 
 /// Final gate for the metadata early-stop fast path.
