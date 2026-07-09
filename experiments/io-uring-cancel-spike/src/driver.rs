@@ -51,9 +51,28 @@ pub enum ProbeFailure {
 }
 
 impl ProbeFailure {
-    /// True when the errno belongs to the "expected restriction" class that
-    /// P2 maps to permanent per-disk fallback: EACCES/EPERM/ENOSYS/EINVAL/
-    /// EOPNOTSUPP. Anything else would be a genuine bug worth surfacing.
+    /// True when the **probe-time** errno belongs to the "expected
+    /// restriction" class that P2 maps to permanent per-disk fallback:
+    /// EACCES/EPERM/ENOSYS/EINVAL/EOPNOTSUPP. Anything else is a genuine bug
+    /// worth surfacing.
+    ///
+    /// IMPORTANT (C7, rustfs/backlog#1059): this classification is valid ONLY
+    /// for a one-shot startup probe, where these errnos unambiguously mean
+    /// "io_uring is unusable here" (gVisor/seccomp/old kernel). Runtime
+    /// per-op errnos have different semantics and MUST NOT reuse this class.
+    /// In particular EINVAL is triple-meaning at runtime — offset > i64::MAX
+    /// (signed loff_t), O_DIRECT buffer/offset/len misalignment (P2 will use
+    /// O_DIRECT), and setup `entries` over the cap — none of which imply the
+    /// disk should be permanently degraded off io_uring. P2's degradation
+    /// contract must split errnos into three classes:
+    ///
+    ///   * probe-time restriction  -> degrade this disk to the std backend;
+    ///   * runtime parameter error -> return the error to the caller (and,
+    ///     for a suspected bug, re-verify once via std pread) — never latch;
+    ///   * transient (EINTR/EAGAIN) -> retry, never surface.
+    ///
+    /// See `submit` for the offset guard that keeps a caller arithmetic bug
+    /// from ever reaching the kernel as a runtime EINVAL.
     pub fn is_expected_restriction(&self) -> bool {
         let err = match self {
             ProbeFailure::Setup(e) | ProbeFailure::ReadOp(e) => e,
@@ -215,6 +234,28 @@ impl UringDriver {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         assert_eq!(id & CANCEL_BIT, 0, "op id overflowed into the cancel bit");
         let (done, rx) = oneshot::channel();
+
+        // Reject an offset the kernel would answer with a runtime EINVAL that
+        // must NOT be mistaken for an environment restriction (C7,
+        // rustfs/backlog#1059). The kernel reads `off` as a signed loff_t, so
+        // offset > i64::MAX becomes a negative ki_pos → EINVAL. A caller
+        // offset-arithmetic bug has to surface as an error here, never as a
+        // permanent per-disk fallback. CURRENT_POSITION is the reserved
+        // read(2) sentinel and bypasses this check.
+        if offset != CURRENT_POSITION && offset > i64::MAX as u64 {
+            let _ = done.send(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offset exceeds i64::MAX (kernel loff_t is signed)",
+            )));
+            return ReadHandle {
+                id,
+                rx,
+                tx: self.tx.clone(),
+                finished: false,
+                cancel_on_drop: false,
+            };
+        }
+
         // If the driver already shut down, the send fails and `done` is
         // dropped, which the caller observes as a driver-gone error.
         let _ = self.tx.send(Msg::Read {
