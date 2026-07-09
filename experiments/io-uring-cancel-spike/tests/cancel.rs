@@ -219,7 +219,12 @@ async fn cancel_stress_accounts_for_every_buffer() {
 
     let snap = driver.shutdown();
     assert_eq!(snap.submitted, OPS as u64);
-    assert_eq!(snap.delivered, (OPS / 2) as u64);
+    // The exact split delivered == OPS/2 was flaky (C18, rustfs/backlog#1066):
+    // an even-i read can finish between read_at returning and drop(handle),
+    // delivering to the still-live receiver and flipping the split — all while
+    // the ownership model behaves correctly. Only the conservation identity is
+    // deterministic; the kept half guarantees delivered >= OPS/2.
+    assert!(snap.delivered >= (OPS / 2) as u64, "kept half not all delivered: {snap:?}");
     assert_eq!(
         snap.delivered + snap.orphan_reclaimed,
         OPS as u64,
@@ -431,4 +436,34 @@ async fn pipe_half_close_reads_eof() {
     let got = handle.await.expect("pipe EOF read");
     assert!(got.is_empty(), "closed-pipe read should be empty EOF, got {}", got.len());
     driver.shutdown();
+}
+
+/// Drop-without-shutdown path (C17, rustfs/backlog#1066): every other test ends
+/// via explicit shutdown(), so the UringDriver `Drop` impl's live-thread branch
+/// was never exercised. Drop the driver directly with ops still in flight; the
+/// Drop must send Shutdown BEFORE joining (send-after-join would deadlock at
+/// recv), cancel + drain the in-flight ops, and join — the held futures then
+/// resolve to ECANCELED. A regression (join-first, or an unbounded hang) makes
+/// this test hang.
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_without_shutdown_drains_and_cancels() {
+    let Some(driver) = driver_or_skip("drop_without_shutdown_drains_and_cancels") else {
+        return;
+    };
+    let (pipe_read, pipe_write) = os_pipe();
+    let h1 = driver.read_current(Arc::clone(&pipe_read), 1024);
+    let h2 = driver.read_current(Arc::clone(&pipe_read), 1024);
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == 2).await,
+        "reads never reached in-flight state"
+    );
+
+    // No shutdown() — exercise Drop directly.
+    drop(driver);
+
+    for h in [h1, h2] {
+        let err = h.await.expect_err("blocked pipe read cannot have succeeded");
+        assert_eq!(err.raw_os_error(), Some(libc::ECANCELED), "unexpected error: {err:?}");
+    }
+    drop(pipe_write);
 }
