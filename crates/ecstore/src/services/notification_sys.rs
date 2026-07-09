@@ -47,6 +47,10 @@ struct PeerAdminCache {
     last_server_info: Option<ServerProperties>,
     storage_failures: u32,
     server_failures: u32,
+    /// When the last successful server_info probe landed. Used to stop a stale
+    /// cached `online` snapshot from being served indefinitely while a peer is
+    /// actually down (rustfs/backlog#1049 P2).
+    last_server_success: Option<SystemTime>,
 }
 
 impl PeerAdminCache {
@@ -56,9 +60,15 @@ impl PeerAdminCache {
             last_server_info: None,
             storage_failures: 0,
             server_failures: 0,
+            last_server_success: None,
         }
     }
 }
+
+/// A cached `online` snapshot older than this is no longer trusted on a probe
+/// failure: rather than reporting a stale `online`, the member falls through to
+/// the live unknown/degraded/offline classification (rustfs/backlog#1049 P2).
+const SERVER_INFO_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 
 lazy_static! {
     pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<NotificationSys> = OnceLock::new();
@@ -347,8 +357,17 @@ impl NotificationSys {
             let endpoints = endpoints.clone();
             let cache = self.peer_admin_caches.get(idx);
             futures.push(async move {
+                // `peer_clients` comes from `new_clients`, which only ever pushes
+                // `Some(client)` (local hosts are excluded, not slotted as
+                // `None`), so this branch is unreachable in practice. Kept as a
+                // defensive fallback: report an explicit `unknown` state rather
+                // than a blank `default()` entry, so it can never contribute a
+                // hollow row to `servers[]` (rustfs/backlog#1049 P3).
                 let Some(client) = client else {
-                    return ServerProperties::default();
+                    return ServerProperties {
+                        state: ItemState::Unknown.to_string().to_owned(),
+                        ..Default::default()
+                    };
                 };
                 let host = client.host.to_string();
 
@@ -1201,14 +1220,25 @@ fn handle_server_info_failure(
     if let Some(ref cached) = c.last_server_info
         && c.server_failures < CONSECUTIVE_FAILURE_THRESHOLD
     {
+        if cached_snapshot_is_fresh(c.last_server_success) {
+            debug!(
+                event = "peer_probe_failure",
+                peer = host,
+                consecutive_failures = c.server_failures,
+                threshold = CONSECUTIVE_FAILURE_THRESHOLD,
+                "peer server_info probe failed; returning cached state until the offline threshold is reached"
+            );
+            return cached.clone();
+        }
+        // The cached snapshot is too old to keep reporting as `online`; fall
+        // through to the live unknown/degraded/offline classification below
+        // instead of masking a down peer with a stale success (P2).
         debug!(
-            event = "peer_probe_failure",
+            event = "peer_cache_stale",
             peer = host,
-            consecutive_failures = c.server_failures,
-            threshold = CONSECUTIVE_FAILURE_THRESHOLD,
-            "peer server_info probe failed; returning cached state until the offline threshold is reached"
+            max_age_secs = SERVER_INFO_CACHE_MAX_AGE.as_secs(),
+            "cached server_info snapshot is stale; reclassifying from live signals instead of reporting stale online"
         );
-        return cached.clone();
     }
 
     if c.server_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
@@ -1284,7 +1314,21 @@ fn update_server_info_cache(cache: Option<&Mutex<PeerAdminCache>>, host: &str, i
         );
     }
     c.last_server_info = Some(info.clone());
+    c.last_server_success = Some(SystemTime::now());
     c.server_failures = 0;
+}
+
+/// Whether a cached server_info snapshot is recent enough to still report as
+/// `online` on a probe failure. A missing timestamp means no age information is
+/// available (e.g. a snapshot set without going through the success path in a
+/// test); such a snapshot is treated as fresh to preserve the prior behavior,
+/// while a clock that went backwards is treated as stale. See P2 in
+/// rustfs/backlog#1049.
+fn cached_snapshot_is_fresh(last_success: Option<SystemTime>) -> bool {
+    match last_success {
+        Some(at) => at.elapsed().map(|age| age < SERVER_INFO_CACHE_MAX_AGE).unwrap_or(false),
+        None => true,
+    }
 }
 
 /// A member that could not be probed this cycle and is not confirmed down.
@@ -1557,6 +1601,7 @@ mod tests {
             last_server_info: None,
             storage_failures: 0,
             server_failures: 0,
+            last_server_success: None,
         });
         let endpoints = EndpointServerPools::default();
 
@@ -1584,6 +1629,7 @@ mod tests {
             last_server_info: None,
             storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
             server_failures: 0,
+            last_server_success: None,
         });
         let endpoints = EndpointServerPools::default();
 
@@ -1606,6 +1652,7 @@ mod tests {
             last_server_info: Some(cached_props),
             storage_failures: 0,
             server_failures: 0,
+            last_server_success: None,
         });
         let endpoints = EndpointServerPools::default();
 
@@ -1613,6 +1660,45 @@ mod tests {
         assert_eq!(result.endpoint, "peer-1");
         assert_eq!(result.state, "online");
         assert_eq!(cache.lock().unwrap().server_failures, 1);
+    }
+
+    #[test]
+    fn handle_server_info_failure_does_not_serve_stale_cached_online() {
+        // A single failure with a cached snapshot would normally return the
+        // cached `online`, but if that snapshot is older than the max age we
+        // must not keep reporting online — fall through to `unknown` instead of
+        // masking a possibly-down peer (rustfs/backlog#1049 P2).
+        let cached_props = ServerProperties {
+            endpoint: "peer-1".to_string(),
+            state: "online".to_string(),
+            ..Default::default()
+        };
+        let stale_at = SystemTime::now()
+            .checked_sub(SERVER_INFO_CACHE_MAX_AGE + Duration::from_secs(1))
+            .expect("test clock underflow");
+
+        let cache = Mutex::new(PeerAdminCache {
+            last_storage_info: None,
+            last_server_info: Some(cached_props),
+            storage_failures: 0,
+            server_failures: 0,
+            last_server_success: Some(stale_at),
+        });
+        let endpoints = EndpointServerPools::default();
+
+        let result = handle_server_info_failure(Some(&cache), "peer-1", &endpoints, None);
+        assert_eq!(result.state, ItemState::Unknown.to_string());
+        assert_eq!(cache.lock().unwrap().server_failures, 1);
+    }
+
+    #[test]
+    fn cached_snapshot_freshness_respects_age_and_missing_timestamp() {
+        assert!(cached_snapshot_is_fresh(None), "no timestamp is treated as fresh");
+        assert!(cached_snapshot_is_fresh(Some(SystemTime::now())), "a just-now success is fresh");
+        let stale = SystemTime::now()
+            .checked_sub(SERVER_INFO_CACHE_MAX_AGE + Duration::from_secs(1))
+            .expect("test clock underflow");
+        assert!(!cached_snapshot_is_fresh(Some(stale)), "an old success is stale");
     }
 
     #[test]
@@ -1646,6 +1732,7 @@ mod tests {
             last_server_info: Some(cached_props),
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+            last_server_success: None,
         });
         let endpoints = EndpointServerPools::default();
 
@@ -1664,6 +1751,7 @@ mod tests {
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+            last_server_success: None,
         });
         let endpoints = EndpointServerPools::default();
         let health = PeerDiskHealth {
@@ -1691,6 +1779,7 @@ mod tests {
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+            last_server_success: None,
         });
         let endpoints = EndpointServerPools::default();
         let health = PeerDiskHealth {
@@ -1713,6 +1802,7 @@ mod tests {
             last_server_info: None,
             storage_failures: 2,
             server_failures: 2,
+            last_server_success: None,
         });
 
         {
@@ -1737,6 +1827,7 @@ mod tests {
             }),
             storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
             server_failures: 0,
+            last_server_success: None,
         });
         let endpoints = EndpointServerPools::default();
 
@@ -1778,12 +1869,14 @@ mod tests {
             last_server_info: None,
             storage_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
             server_failures: 0,
+            last_server_success: None,
         });
         let server_cache = Mutex::new(PeerAdminCache {
             last_storage_info: None,
             last_server_info: None,
             storage_failures: 0,
             server_failures: CONSECUTIVE_FAILURE_THRESHOLD - 1,
+            last_server_success: None,
         });
         let endpoints = EndpointServerPools::default();
 
