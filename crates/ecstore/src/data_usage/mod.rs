@@ -689,6 +689,34 @@ async fn record_bucket_object_write_memory_inner(
     entry.stale_snapshot_pending = false;
 }
 
+/// Degraded in-memory update for an object write whose previous current size
+/// could not be determined (rustfs/backlog#1009: the pre-PUT lookup was
+/// skipped and the rename_data backfill came back unknown — mixed-version
+/// peers or sub-quorum metadata divergence). Applies only the components that
+/// are correct regardless of the previous state: the new bytes always count,
+/// and a versioned write always adds a version. objects_count (and the
+/// non-versioned overwrite's old-size subtraction) are left to the next
+/// scanner refresh, which replaces this cache with authoritative numbers.
+pub async fn record_bucket_object_write_unknown_previous_memory(bucket: &str, new_size: u64, creates_new_version: bool) {
+    ensure_bucket_usage_cached(bucket).await;
+
+    let mut cache = memory_cache().write().await;
+    let entry = cache
+        .entry(bucket.to_string())
+        .or_insert_with(|| cached_bucket_usage_now(BucketUsageInfo::default()));
+
+    entry.usage.size = entry.usage.size.saturating_add(new_size);
+    if creates_new_version {
+        entry.usage.versions_count = entry.usage.versions_count.saturating_add(1);
+    }
+
+    let now = SystemTime::now();
+    entry.refreshed_at = now;
+    entry.usage_updated_at = now;
+    entry.dirty = true;
+    entry.stale_snapshot_pending = false;
+}
+
 /// Fast in-memory increment for immediate quota consistency.
 pub async fn increment_bucket_usage_memory(bucket: &str, size_increment: u64) {
     record_bucket_object_write_memory(bucket, None, size_increment).await;
@@ -1454,6 +1482,57 @@ mod tests {
         let persisted = data_usage_info_for_test("bucket-a", 1, 10, SystemTime::now() - Duration::from_secs(10));
         replace_bucket_usage_memory_from_info(&persisted).await;
         record_bucket_object_version_write_memory("bucket-a", Some(10), 20).await;
+
+        let mut response = persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 1);
+        assert_eq!(response.versions_total_count, 2);
+        assert_eq!(response.objects_total_size, 30);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.versions_count, usage.size)),
+            Some((1, 2, 30))
+        );
+    }
+
+    /// rustfs/backlog#1009: with an unknown previous state, only the
+    /// always-correct components are recorded — bytes are added and a
+    /// versioned write adds a version, but objects_count never moves.
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_unknown_previous_adds_size_only_for_unversioned_write() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 1, 10, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_write_unknown_previous_memory("bucket-a", 20, false).await;
+
+        let mut response = persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 1);
+        assert_eq!(response.versions_total_count, 1);
+        assert_eq!(response.objects_total_size, 30);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.versions_count, usage.size)),
+            Some((1, 1, 30))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn memory_overlay_unknown_previous_adds_size_and_version_for_versioned_write() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 1, 10, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_write_unknown_previous_memory("bucket-a", 20, true).await;
 
         let mut response = persisted.clone();
         apply_bucket_usage_memory_overlay(&mut response).await;

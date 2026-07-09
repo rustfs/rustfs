@@ -19,7 +19,6 @@ use rustfs_io_metrics::buffered_write;
 
 use crate::storage_api::table::get_bucket_metadata;
 
-use super::storage_api::object_usecase::ECStore;
 use super::storage_api::object_usecase::access::{
     PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
 };
@@ -64,7 +63,7 @@ use super::storage_api::object_usecase::contract::object::{ObjectIO as _, Object
 use super::storage_api::object_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::object_usecase::data_usage::{
     record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-    record_bucket_object_write_memory,
+    record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
 };
 use super::storage_api::object_usecase::deadlock_detector;
 use super::storage_api::object_usecase::ecfs::FS;
@@ -93,6 +92,7 @@ use super::storage_api::object_usecase::sse::{
 };
 use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
     RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
     parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
@@ -3510,26 +3510,42 @@ impl DefaultObjectUsecase {
         )
         .await?;
 
-        let current_opts: ObjectOptions = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
-        let previous_current_info = {
-            crate::hp_guard!("S3::put_object_prelookup");
-            store.get_object_info(&bucket, &key, &current_opts).await
-        };
-        let previous_current_size = match previous_current_info {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&existing_obj_info, &opts)?;
-                Some(existing_obj_info.size.max(0) as u64)
-            }
-            Err(err) => {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+        // rustfs/backlog#1009: the pre-PUT lookup has exactly two consumers —
+        // the existing-object WORM validation and usage accounting's
+        // previous_current_size. When the bucket has no object locking (WORM is
+        // a provable no-op; the gate fails closed on metadata errors) and the
+        // PUT targets the latest version (no explicit version_id from internal
+        // replication), the lookup is skipped and accounting is backfilled from
+        // the dst xl.meta that rename_data already reads, saving a full-disk
+        // metadata fanout per PUT.
+        let prelookup_required = version_id.is_some() || put_prelookup_worm_gate(&bucket).await;
+        // Outer None = prelookup skipped (accounting comes from the commit
+        // backfill); Some(inner) = the previous current size as observed by the
+        // lookup, with the pre-#1009 semantics kept bit-for-bit.
+        let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
+            let current_opts: ObjectOptions = internal_object_info_lookup_opts(
+                get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+            let previous_current_info = {
+                crate::hp_guard!("S3::put_object_prelookup");
+                store.get_object_info(&bucket, &key, &current_opts).await
+            };
+            Some(match previous_current_info {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&existing_obj_info, &opts)?;
+                    Some(existing_obj_info.size.max(0) as u64)
                 }
-                None
-            }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+                    None
+                }
+            })
+        } else {
+            None
         };
 
         let actual_size = size;
@@ -3713,8 +3729,8 @@ impl DefaultObjectUsecase {
             }
         });
 
-        let obj_info = match store
-            .put_object(&bucket, &key, &mut reader, &opts)
+        let (obj_info, backfilled_old_current_size) = match store
+            .put_object_with_old_current_size(&bucket, &key, &mut reader, &opts)
             .await
             .map_err(ApiError::from)
         {
@@ -3764,11 +3780,35 @@ impl DefaultObjectUsecase {
         let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
 
         let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        // Fast in-memory update for immediate quota and admin usage consistency
-        if put_versioned {
-            record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
-        } else {
-            record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+        // Fast in-memory update for immediate quota and admin usage consistency.
+        // The previous current size comes from the prelookup when it ran,
+        // otherwise from the rename_data backfill (rustfs/backlog#1009); the
+        // backfill reproduces the lookup's observation bit for bit (latest
+        // version's ObjectInfo.size — 0 for a delete-marker latest — or
+        // not-found → None).
+        match prelookup_previous_current_size.or_else(|| previous_current_size_from_backfill(backfilled_old_current_size)) {
+            Some(previous_current_size) => {
+                if put_versioned {
+                    record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                } else {
+                    record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                }
+            }
+            None => {
+                // Neither source could determine the previous state (peers
+                // predating the backfill field during a rolling upgrade, or
+                // sub-quorum metadata divergence). Record the components that
+                // are correct regardless; the next authoritative scanner
+                // refresh replaces the in-memory numbers.
+                debug!(
+                    target: "rustfs::app::object_usecase",
+                    bucket = %bucket,
+                    key = %key,
+                    put_versioned,
+                    "put_object old-size backfill unknown; recording degraded usage delta"
+                );
+                record_bucket_object_write_unknown_previous_memory(&bucket, obj_info.size.max(0) as u64, put_versioned).await;
+            }
         }
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
@@ -6567,6 +6607,28 @@ async fn bucket_object_locking_enabled(bucket: &str) -> bool {
         .is_ok_and(|metadata| metadata.object_locking())
 }
 
+/// Fail-closed WORM gate for skipping the pre-PUT lookup
+/// (rustfs/backlog#1009): a bucket-metadata read failure counts as "locking
+/// enabled" so the existing-object lock validation can never silently
+/// disappear on a degraded metadata subsystem.
+pub(super) async fn put_prelookup_worm_gate(bucket: &str) -> bool {
+    match get_bucket_metadata(bucket).await {
+        Ok(metadata) => metadata.object_locking(),
+        Err(_) => true,
+    }
+}
+
+/// rustfs/backlog#1009: map the rename_data old-size backfill onto the
+/// `previous_current_size` value the usage-accounting helpers expect. Outer
+/// `None` = unknown (no quorum agreement, or a peer predates the field) — the
+/// caller must fall back to the degraded accounting path.
+fn previous_current_size_from_backfill(backfill: Option<OldCurrentSize>) -> Option<Option<u64>> {
+    backfill.map(|observation| match observation {
+        OldCurrentSize::Present(size) => Some(size.max(0) as u64),
+        OldCurrentSize::Absent => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6660,6 +6722,19 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), ObjectLockLegalHoldStatus::ON.to_string());
         object_info_with_lock_metadata(metadata)
+    }
+
+    /// rustfs/backlog#1009: the backfill→accounting mapping must mirror the
+    /// prelookup exactly — a live latest version maps to `Some(size)` (clamped
+    /// at 0 like the prelookup's `.max(0)`), absent/delete-marker maps to
+    /// `None`, and an unknown backfill maps to outer `None` so the caller
+    /// takes the degraded path instead of fabricating "new object".
+    #[test]
+    fn previous_current_size_from_backfill_mirrors_prelookup_semantics() {
+        assert_eq!(previous_current_size_from_backfill(Some(OldCurrentSize::Present(42))), Some(Some(42)));
+        assert_eq!(previous_current_size_from_backfill(Some(OldCurrentSize::Present(-7))), Some(Some(0)));
+        assert_eq!(previous_current_size_from_backfill(Some(OldCurrentSize::Absent)), Some(None));
+        assert_eq!(previous_current_size_from_backfill(None), None);
     }
 
     #[test]

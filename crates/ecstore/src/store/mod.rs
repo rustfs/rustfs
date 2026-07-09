@@ -386,9 +386,31 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        let result =
-            enqueue_transition_after_write(self.handle_put_object(bucket, object, data, opts).await, LcEventSrc::S3PutObject)
-                .await;
+        self.put_object_with_old_current_size(bucket, object, data, opts)
+            .await
+            .map(|(object_info, _)| object_info)
+    }
+}
+
+impl ECStore {
+    /// `put_object` plus the rename_data old-size backfill
+    /// (rustfs/backlog#1009); see `SetDisks::put_object_with_old_current_size`.
+    /// Post-write hooks (immediate ILM transition enqueue, list-cache
+    /// invalidation) match the plain `put_object` path exactly.
+    #[instrument(level = "debug", skip(self, data))]
+    pub async fn put_object_with_old_current_size(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        let result = match self.handle_put_object(bucket, object, data, opts).await {
+            Ok((object_info, old_current_size)) => enqueue_transition_after_write(Ok(object_info), LcEventSrc::S3PutObject)
+                .await
+                .map(|object_info| (object_info, old_current_size)),
+            Err(err) => Err(err),
+        };
         if result.is_ok() {
             list_objects::observe_list_objects_mutation(self, bucket).await;
         }

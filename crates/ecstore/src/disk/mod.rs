@@ -839,10 +839,43 @@ pub struct DiskOption {
     pub health_check: bool,
 }
 
+/// Per-disk observation of the destination key's *current* (latest) version
+/// in the dst `xl.meta` that `rename_data` reads before it commits the
+/// incoming version (rustfs/backlog#1009). Mirrors the pre-PUT
+/// `get_object_info` outcome — which the app layer previously obtained with an
+/// extra full-disk fanout — bit for bit: `Absent` iff that lookup would report
+/// object-not-found (missing xl.meta, or only hidden free versions), and
+/// `Present(size)` iff it would return `Ok` with `ObjectInfo.size == size`.
+/// Note a delete-marker latest is `Present(0)`, not `Absent`: the lookup
+/// returns markers as `Ok(size 0)` and delete-marker accounting never
+/// decrements objects_count, so `Present(0)` is what keeps usage numbers
+/// identical.
+///
+/// The parity target is the set-level (`SetDisks`) lookup. Two app-visible
+/// lookup variants deviated from it and from each other — the multi-pool
+/// `ECStore` path converts a delete-marker latest to not-found, and
+/// directory-key lookups pin the nil version — and both deviations
+/// over-incremented objects_count relative to delete-marker accounting, so
+/// the backfill standardizes on the self-consistent set-level answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OldCurrentSize {
+    /// The pre-PUT lookup would have reported object-not-found for this key.
+    Absent,
+    /// The pre-PUT lookup would have returned `Ok` with this `ObjectInfo.size`
+    /// (0 for a delete-marker latest).
+    Present(i64),
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RenameDataResp {
     pub old_data_dir: Option<Uuid>,
     pub sign: Option<Vec<u8>>,
+    /// `None` means unknown — the disk could not determine the previous
+    /// current version (pre-#1009 peer on the wire, or an existing dst
+    /// `xl.meta` that failed to parse). Consumers must treat unknown as
+    /// "cannot vote", never as `Absent`.
+    #[serde(default)]
+    pub old_current_size: Option<OldCurrentSize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1229,10 +1262,56 @@ mod tests {
         let resp = RenameDataResp {
             old_data_dir: Some(uuid),
             sign: Some(signature.clone()),
+            old_current_size: Some(OldCurrentSize::Present(42)),
         };
 
         assert_eq!(resp.old_data_dir, Some(uuid));
         assert_eq!(resp.sign, Some(signature));
+        assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(42)));
+    }
+
+    /// rustfs/backlog#1009: `old_current_size` must survive a named-msgpack
+    /// round trip (the internode RPC encoding) for every variant.
+    #[test]
+    fn test_rename_data_resp_old_current_size_msgpack_roundtrip() {
+        for old_current_size in [None, Some(OldCurrentSize::Absent), Some(OldCurrentSize::Present(1337))] {
+            let resp = RenameDataResp {
+                old_data_dir: Some(Uuid::new_v4()),
+                sign: Some(vec![0x01, 0x02, 0x03]),
+                old_current_size,
+            };
+
+            let encoded = rmp_serde::encode::to_vec_named(&resp).expect("named msgpack should encode");
+            let decoded: RenameDataResp = rmp_serde::decode::from_slice(&encoded).expect("named msgpack should decode");
+
+            assert_eq!(decoded.old_data_dir, resp.old_data_dir);
+            assert_eq!(decoded.sign, resp.sign);
+            assert_eq!(decoded.old_current_size, resp.old_current_size);
+        }
+    }
+
+    /// rustfs/backlog#1009: a payload from a peer that predates
+    /// `old_current_size` must decode with the field defaulting to `None`
+    /// (unknown), keeping mixed-version clusters wire-compatible.
+    #[test]
+    fn test_rename_data_resp_decodes_payload_without_old_current_size() {
+        #[derive(Serialize)]
+        struct LegacyRenameDataResp {
+            old_data_dir: Option<Uuid>,
+            sign: Option<Vec<u8>>,
+        }
+
+        let legacy = LegacyRenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: Some(vec![0x0a, 0x0b]),
+        };
+
+        let encoded = rmp_serde::encode::to_vec_named(&legacy).expect("legacy named msgpack should encode");
+        let decoded: RenameDataResp = rmp_serde::decode::from_slice(&encoded).expect("legacy payload should decode");
+
+        assert_eq!(decoded.old_data_dir, legacy.old_data_dir);
+        assert_eq!(decoded.sign, legacy.sign);
+        assert_eq!(decoded.old_current_size, None);
     }
 
     /// Test constants

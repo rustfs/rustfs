@@ -389,6 +389,22 @@ impl crate::storage_api_contracts::object::ObjectIO for Sets {
     }
 }
 
+impl Sets {
+    /// `put_object` plus the rename_data old-size backfill
+    /// (rustfs/backlog#1009); see `SetDisks::put_object_with_old_current_size`.
+    pub async fn put_object_with_old_current_size(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        self.get_disks_by_key(object)
+            .put_object_with_old_current_size(bucket, object, data, opts)
+            .await
+    }
+}
+
 #[async_trait::async_trait]
 impl BucketOperations for Sets {
     type Error = Error;

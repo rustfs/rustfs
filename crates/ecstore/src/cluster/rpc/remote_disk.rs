@@ -3060,6 +3060,7 @@ mod tests {
         let response = RenameDataResp {
             old_data_dir: Some(Uuid::new_v4()),
             sign: Some(vec![1_u8; 32]),
+            old_current_size: Some(crate::disk::OldCurrentSize::Present(4096)),
         };
         let json = serde_json::to_vec(&response).expect("rename data response json should encode");
         let named_msgpack = encode_msgpack_named(&response).expect("rename data response named msgpack should encode");
