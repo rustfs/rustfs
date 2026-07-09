@@ -23,7 +23,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -256,4 +256,88 @@ async fn shutdown_drains_in_flight_ops() {
     }
 
     drop(pipe_write);
+}
+
+/// Invariant 2 regression (C20, rustfs/backlog#1064): the pending table — not
+/// the caller — owns the fd. Deleting `Pending.file` used to leave every test
+/// green because each test kept its own Arc<File> alive; this pins it. Drop the
+/// caller's Arc while the op is in flight (bare drop, no cancel) and assert the
+/// fd is STILL open: only the pending table's clone keeps it alive. If that
+/// field were removed, the File would close the fd and F_GETFD returns EBADF.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_table_owns_fd_after_caller_drop() {
+    let Some(driver) = driver_or_skip("pending_table_owns_fd_after_caller_drop") else {
+        return;
+    };
+    let (pipe_read, mut pipe_write) = os_pipe();
+    let raw_fd = pipe_read.as_raw_fd();
+
+    let handle = driver.read_current(Arc::clone(&pipe_read), 64).without_cancel_on_drop();
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == 1).await,
+        "read never reached in-flight state"
+    );
+
+    // The pending table is now the ONLY owner of the fd.
+    drop(handle);
+    drop(pipe_read);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // SAFETY: F_GETFD only queries the descriptor; it neither closes nor
+    // mutates it.
+    let rc = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+    assert_ne!(
+        rc,
+        -1,
+        "fd was closed while an op is in flight — the pending table does not own it \
+         (invariant 2 unprotected): {}",
+        std::io::Error::last_os_error()
+    );
+
+    // Complete the op so the driver reclaims cleanly.
+    pipe_write.write_all(&[0x5A; 64]).expect("pipe write");
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == 0).await,
+        "op was not reclaimed at CQE"
+    );
+    driver.shutdown();
+}
+
+/// Memory-safety integrity (C14, rustfs/backlog#1064): while an orphaned
+/// blocked-pipe read holds a driver-owned buffer in flight the whole time, many
+/// delivered reads must still come back byte-exact — the kernel writing into
+/// the orphan's still-owned buffer must not corrupt anything, and the orphan
+/// buffer must NOT be reclaimed before its own CQE. This is a direct
+/// data-integrity observation, not just a counter identity. (A driver-level
+/// poison/canary leg is a P2 acceptance-matrix item; ASAN cannot see a kernel
+/// write into a freed buffer, so it is not the mechanism.)
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_in_flight_does_not_corrupt_delivered_reads() {
+    let Some(driver) = driver_or_skip("orphan_in_flight_does_not_corrupt_delivered_reads") else {
+        return;
+    };
+    let (pipe_read, mut pipe_write) = os_pipe();
+    let orphan = driver.read_current(Arc::clone(&pipe_read), 4096).without_cancel_on_drop();
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == 1).await,
+        "orphan never reached in-flight state"
+    );
+    drop(orphan); // bare drop: buffer stays owned by the driver until its CQE
+
+    const LEN: usize = 1 << 20;
+    let content = make_content(LEN);
+    let (path, file) = temp_file_with(&content, "canary");
+    for i in 0..64usize {
+        let offset = (i * 9_973) % (LEN - 4096);
+        let got = driver
+            .read_at(Arc::clone(&file), offset as u64, 4096)
+            .await
+            .expect("read failed");
+        assert_eq!(got, &content[offset..offset + 4096], "delivered read corrupted at offset {offset}");
+    }
+    assert_eq!(driver.stats().orphan_reclaimed, 0, "orphan buffer reclaimed before its CQE");
+
+    pipe_write.write_all(&[0u8; 512]).expect("pipe write");
+    driver.shutdown();
+    let _ = std::fs::remove_file(path);
 }
