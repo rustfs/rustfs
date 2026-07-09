@@ -341,3 +341,94 @@ async fn orphan_in_flight_does_not_corrupt_delivered_reads() {
     driver.shutdown();
     let _ = std::fs::remove_file(path);
 }
+
+/// CQ-overflow safety (C15, rustfs/backlog#1065). With backpressure capping
+/// in-flight at the SQ depth (64) below CQ capacity (128), overflow is
+/// structurally unreachable. Drive far more ops than CQ capacity through and
+/// assert the kernel overflow counter stays 0 and every op is delivered.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_cq_overflow_under_load() {
+    let Some(driver) = driver_or_skip("no_cq_overflow_under_load") else {
+        return;
+    };
+    const LEN: usize = 8 << 20;
+    const OPS: usize = 300; // > CQ capacity (128) many times over
+    const READ_LEN: usize = 4096;
+    let content = make_content(LEN);
+    let (path, file) = temp_file_with(&content, "overflow");
+
+    let mut kept = Vec::new();
+    for i in 0..OPS {
+        let offset = (i * 4_093) % (LEN - READ_LEN);
+        kept.push((offset, driver.read_at(Arc::clone(&file), offset as u64, READ_LEN)));
+    }
+    for (offset, handle) in kept {
+        let got = handle.await.expect("read failed");
+        assert_eq!(got, &content[offset..offset + READ_LEN], "mismatch at offset {offset}");
+    }
+
+    let snap = driver.shutdown();
+    assert_eq!(snap.cq_overflow, 0, "CQ overflowed under load: {snap:?}");
+    assert_eq!(snap.delivered, OPS as u64);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Boundary reads on a regular file (C16, rustfs/backlog#1065): len==0, read at
+/// EOF, a cross-EOF short read delivered to a live receiver (exercises the C9
+/// resubmit loop), and the rejected huge-len / huge-offset guards (C6/C7).
+#[tokio::test(flavor = "multi_thread")]
+async fn boundary_reads() {
+    let Some(driver) = driver_or_skip("boundary_reads") else {
+        return;
+    };
+    const LEN: usize = 4096;
+    let content = make_content(LEN);
+    let (path, file) = temp_file_with(&content, "boundary");
+
+    // len == 0 → empty Ok.
+    let got = driver.read_at(Arc::clone(&file), 0, 0).await.expect("len=0 read");
+    assert!(got.is_empty(), "len=0 should return empty, got {}", got.len());
+
+    // offset == file size → EOF → empty Ok.
+    let got = driver.read_at(Arc::clone(&file), LEN as u64, 128).await.expect("EOF read");
+    assert!(got.is_empty(), "read at EOF should be empty, got {}", got.len());
+
+    // Read spanning past EOF → the available tail bytes, delivered to a live
+    // receiver via the resubmit-then-EOF path.
+    let got = driver.read_at(Arc::clone(&file), (LEN - 10) as u64, 100).await.expect("cross-EOF read");
+    assert_eq!(got, &content[LEN - 10..LEN], "cross-EOF read should return the tail only");
+
+    // len > MAX_RW_COUNT → rejected (C6); offset > i64::MAX → rejected (C7).
+    let err = driver
+        .read_at(Arc::clone(&file), 0, (1usize << 32) + 1)
+        .await
+        .expect_err("huge len must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "huge len error: {err:?}");
+    let err = driver
+        .read_at(Arc::clone(&file), (i64::MAX as u64) + 1, 16)
+        .await
+        .expect_err("huge offset must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "huge offset error: {err:?}");
+
+    driver.shutdown();
+    let _ = std::fs::remove_file(path);
+}
+
+/// Pipe half-close boundary (C16, rustfs/backlog#1065): an in-flight read whose
+/// write end is closed observes EOF (res=0) and returns empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn pipe_half_close_reads_eof() {
+    let Some(driver) = driver_or_skip("pipe_half_close_reads_eof") else {
+        return;
+    };
+    let (pipe_read, pipe_write) = os_pipe();
+    let handle = driver.read_current(Arc::clone(&pipe_read), 128);
+    assert!(
+        wait_until(Duration::from_secs(2), || driver.stats().in_flight == 1).await,
+        "read never reached in-flight state"
+    );
+    drop(pipe_write); // close write end → blocked read observes EOF
+    let got = handle.await.expect("pipe EOF read");
+    assert!(got.is_empty(), "closed-pipe read should be empty EOF, got {}", got.len());
+    driver.shutdown();
+}
