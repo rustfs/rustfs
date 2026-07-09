@@ -156,7 +156,7 @@ spec:
       {{- if .Values.mtls.enabled }}
         - name: server-cert
           secret:
-            secretName: rustfs-server-tls
+            secretName: {{ include "rustfs.fullname" . }}-server-tls
             items:
               - key: tls.crt
                 path: rustfs_cert.pem
@@ -166,7 +166,7 @@ spec:
                 path: ca.crt
         - name: client-cert
           secret:
-            secretName: rustfs-client-tls
+            secretName: {{ include "rustfs.fullname" . }}-client-tls
             items:
               - key: tls.crt
                 path: client_cert.pem
