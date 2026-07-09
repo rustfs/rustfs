@@ -2674,7 +2674,7 @@ impl SetDisks {
     /// destination's previous current version to one set-level value, mirroring
     /// `reduce_common_data_dir`: the observation reported by at least
     /// `write_quorum` disks wins; anything short of that (disk errors, unknown
-    /// votes from pre-#1009 peers or unparseable metadata, genuine divergence)
+    /// votes from pre-#1009 peers or unparsable metadata, genuine divergence)
     /// yields `None` (unknown). Unknown per-disk entries never vote.
     pub(in crate::set_disk) fn reduce_common_old_current_size(
         old_current_sizes: &[Option<OldCurrentSize>],

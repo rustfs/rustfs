@@ -569,7 +569,7 @@ impl SetDisks {
     /// `put_object` plus the destination key's previous current-version size,
     /// quorum-reduced from the dst `xl.meta` copies `rename_data` reads while
     /// committing (rustfs/backlog#1009). `None` means unknown (mixed-version
-    /// peers, unparseable metadata, or sub-quorum divergence) — callers must
+    /// peers, unparsable metadata, or sub-quorum divergence) — callers must
     /// fall back to degraded accounting, never assume "absent". The extra
     /// value is deliberately *not* part of `ObjectInfo`, which feeds S3
     /// responses, event payloads, replication, and ILM verbatim.

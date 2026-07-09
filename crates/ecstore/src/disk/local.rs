@@ -5071,18 +5071,18 @@ impl DiskAPI for LocalDisk {
             // and gets overwritten by the commit below (pre-existing behavior);
             // track that so the old-size observation reports unknown instead of
             // a false `Absent` (rustfs/backlog#1009).
-            let mut dst_meta_unparseable = false;
+            let mut dst_meta_unparsable = false;
             if let Some(dst_buf) = has_dst_buf.as_ref() {
                 if FileMeta::is_xl2_v1_format(dst_buf)
                     && let Ok(nmeta) = FileMeta::load(dst_buf)
                 {
                     xlmeta = nmeta
                 } else {
-                    dst_meta_unparseable = true;
+                    dst_meta_unparsable = true;
                 }
             }
 
-            let old_current_size = if dst_meta_unparseable {
+            let old_current_size = if dst_meta_unparsable {
                 None
             } else {
                 observe_old_current_size(has_dst_buf.is_some(), &xlmeta)
@@ -5321,21 +5321,21 @@ impl DiskAPI for LocalDisk {
                 };
 
                 let mut xlmeta = FileMeta::new();
-                // Same as the non-inline branch: an unparseable existing dst
+                // Same as the non-inline branch: an unparsable existing dst
                 // xl.meta must surface as unknown, not `Absent`
                 // (rustfs/backlog#1009).
-                let mut dst_meta_unparseable = false;
+                let mut dst_meta_unparsable = false;
                 if let Some(ref buf) = has_dst_buf {
                     if FileMeta::is_xl2_v1_format(buf)
                         && let Ok(nmeta) = FileMeta::load(buf)
                     {
                         xlmeta = nmeta
                     } else {
-                        dst_meta_unparseable = true;
+                        dst_meta_unparsable = true;
                     }
                 }
 
-                let old_current_size = if dst_meta_unparseable {
+                let old_current_size = if dst_meta_unparsable {
                     None
                 } else {
                     observe_old_current_size(has_dst_buf.is_some(), &xlmeta)
@@ -7819,7 +7819,7 @@ mod test {
         }
 
         #[tokio::test]
-        async fn inline_rename_data_reports_unknown_for_unparseable_dst_meta() {
+        async fn inline_rename_data_reports_unknown_for_unparsable_dst_meta() {
             let dir = tempdir().expect("temp dir should be created");
             let disk = test_disk(&dir).await;
 
@@ -7886,11 +7886,11 @@ mod test {
             assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(5)));
         }
 
-        /// Twin of the inline unparseable-dst test: the `dst_meta_unparseable`
+        /// Twin of the inline unparsable-dst test: the `dst_meta_unparsable`
         /// tracking is duplicated per branch, so the non-inline copy needs its
         /// own regression coverage.
         #[tokio::test]
-        async fn non_inline_rename_data_reports_unknown_for_unparseable_dst_meta() {
+        async fn non_inline_rename_data_reports_unknown_for_unparsable_dst_meta() {
             let dir = tempdir().expect("temp dir should be created");
             let disk = test_disk(&dir).await;
 
