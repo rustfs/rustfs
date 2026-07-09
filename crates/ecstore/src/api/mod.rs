@@ -326,6 +326,7 @@ pub mod global {
 }
 
 pub mod runtime {
+    pub use crate::runtime::instance::{InstanceContext, bootstrap_ctx};
     pub use crate::runtime::sources::{
         boot_time, bucket_monitor, deployment_id, endpoint_pools, expiry_state_handle, first_cluster_node_is_local,
         global_lock_client, global_lock_clients, global_tier_config_mgr, local_disk_map_read, object_store_handle, region,
@@ -389,8 +390,9 @@ pub mod store_list {
 pub mod storage {
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
-        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_lock_clients,
-        prewarm_local_disk_id_map,
+        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,
+        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+        prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 

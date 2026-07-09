@@ -103,6 +103,21 @@ impl Sets {
         pool_idx: usize,
         parity_count: usize,
     ) -> Result<Arc<Self>> {
+        Self::new_with_instance_ctx(disks, endpoints, fm, pool_idx, parity_count, bootstrap_ctx()).await
+    }
+
+    /// Build the pool's sets bound to an explicit instance context (Phase 5
+    /// follow-up, backlog#1052). The legacy [`Sets::new`] entry adopts the
+    /// process bootstrap context; a store constructed around its own context
+    /// passes it here so the whole object graph shares one cell.
+    pub async fn new_with_instance_ctx(
+        disks: Vec<Option<DiskStore>>,
+        endpoints: &PoolEndpoints,
+        fm: &FormatV3,
+        pool_idx: usize,
+        parity_count: usize,
+        instance_ctx: Arc<InstanceContext>,
+    ) -> Result<Arc<Self>> {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
@@ -127,8 +142,8 @@ impl Sets {
                     continue;
                 }
 
-                if disk.as_ref().unwrap().is_local() && runtime_sources::setup_is_dist_erasure().await {
-                    let local_disk = runtime_sources::local_disk_set_drive(pool_idx, i, j).await;
+                if disk.as_ref().unwrap().is_local() && instance_ctx.is_dist_erasure().await {
+                    let local_disk = runtime_sources::local_disk_set_drive(&instance_ctx, pool_idx, i, j).await;
 
                     if local_disk.is_none() {
                         warn!("sets new set_drive {}-{} local_disk is none", i, j);
@@ -163,7 +178,7 @@ impl Sets {
                 .as_ref()
                 .map(|registry| registry.clients_for_endpoints(&set_endpoints))
                 .unwrap_or_default();
-            let set_disks = SetDisks::new(
+            let set_disks = SetDisks::new_with_instance_ctx(
                 runtime_sources::local_node_name().await,
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
@@ -173,6 +188,7 @@ impl Sets {
                 set_endpoints,
                 fm.clone(),
                 lockers,
+                instance_ctx.clone(),
             )
             .await;
 
@@ -193,10 +209,7 @@ impl Sets {
             default_parity_count: parity_count,
             distribution_algo: fm.erasure.distribution_algo.clone(),
             exit_signal: Some(tx),
-            // Single-instance: same bootstrap context the owning ECStore adopts
-            // (constructed before the store, so sourced here directly). Slice 8
-            // threads a per-instance context in for true multi-instance.
-            ctx: bootstrap_ctx(),
+            ctx: instance_ctx,
         });
 
         let asets = sets.clone();
@@ -1460,6 +1473,67 @@ mod tests {
             res.before.drives[2].state,
             DriveState::Missing.to_string(),
             "unformatted disk must be Missing on its real index, not on a placeholder"
+        );
+    }
+
+    fn instance_ctx_test_pool_endpoints() -> (FormatV3, PoolEndpoints) {
+        let format = FormatV3::new(1, 2);
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data0").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data1").expect("second endpoint should parse"),
+        ];
+        let pool_endpoints = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "instance-ctx-adoption-test".to_string(),
+            platform: "test".to_string(),
+        };
+        (format, pool_endpoints)
+    }
+
+    // Phase 5 follow-up (backlog#1052): a pool built through the ctx-explicit
+    // constructor carries the caller's context through Sets AND every SetDisks,
+    // so nothing in the object graph silently binds to the process bootstrap.
+    #[tokio::test]
+    async fn sets_new_with_instance_ctx_threads_context_through_graph() {
+        let (format, pool_endpoints) = instance_ctx_test_pool_endpoints();
+        let instance_ctx = Arc::new(InstanceContext::new());
+
+        let sets = Sets::new_with_instance_ctx(vec![None, None], &pool_endpoints, &format, 0, 1, instance_ctx.clone())
+            .await
+            .expect("sets should build with empty disks");
+
+        assert!(
+            Arc::ptr_eq(sets.instance_ctx(), &instance_ctx),
+            "Sets must adopt the explicitly passed instance context"
+        );
+        for set_disks in &sets.disk_set {
+            assert!(
+                Arc::ptr_eq(set_disks.instance_ctx(), &instance_ctx),
+                "every SetDisks must adopt the explicitly passed instance context"
+            );
+        }
+        assert!(
+            !Arc::ptr_eq(sets.instance_ctx(), &bootstrap_ctx()),
+            "a fresh context must not alias the process bootstrap context"
+        );
+    }
+
+    // The legacy constructor keeps single-instance behavior byte-for-byte: it
+    // still adopts the process bootstrap context.
+    #[tokio::test]
+    async fn sets_new_legacy_adopts_bootstrap_context() {
+        let (format, pool_endpoints) = instance_ctx_test_pool_endpoints();
+
+        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1)
+            .await
+            .expect("sets should build with empty disks");
+
+        assert!(
+            Arc::ptr_eq(sets.instance_ctx(), &bootstrap_ctx()),
+            "legacy Sets::new must keep adopting the process bootstrap context"
         );
     }
 }

@@ -389,15 +389,14 @@ pub(crate) mod ecstore_event {
 
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
-        set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
-        update_erasure_type,
+        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
     };
 }
 
 pub(crate) mod ecstore_runtime {
     pub(crate) use rustfs_ecstore::api::runtime::{
-        boot_time, bucket_monitor, deployment_id, endpoint_pools, global_lock_client, global_lock_clients,
-        global_tier_config_mgr, region, rustfs_port, setup_is_dist_erasure,
+        InstanceContext, boot_time, bootstrap_ctx, bucket_monitor, deployment_id, endpoint_pools, global_lock_client,
+        global_lock_clients, global_tier_config_mgr, region, rustfs_port, setup_is_dist_erasure,
     };
 }
 
@@ -450,9 +449,11 @@ pub(crate) mod ecstore_set_disk {
 }
 
 pub(crate) mod ecstore_storage {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
-        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_lock_clients,
-        prewarm_local_disk_id_map,
+        ECStore, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks_with_instance_ctx,
+        init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 
@@ -516,13 +517,15 @@ pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
+pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
 pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_sys::ObjectLockBlockReason;
 pub(crate) type ObjectStoreResolver = dyn Fn() -> Option<Arc<ECStore>> + Send + Sync + 'static;
-pub(crate) type PolicySys = ecstore_bucket::policy_sys::PolicySys;
+#[cfg(test)]
 pub(crate) type PoolEndpoints = ecstore_layout::PoolEndpoints;
+pub(crate) type PolicySys = ecstore_bucket::policy_sys::PolicySys;
 pub(crate) type WorkloadAdmissionSnapshotProviderRef = rustfs_ecstore::WorkloadAdmissionSnapshotProviderRef;
 pub(crate) type QuotaError = ecstore_bucket::quota::QuotaError;
 pub(crate) type RawFileInfo = rustfs_filemeta::RawFileInfo;
@@ -535,7 +538,6 @@ pub(crate) type OldCurrentSize = ecstore_disk::OldCurrentSize;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type ReplicationStatusType = ecstore_bucket::replication::ReplicationStatusType;
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
-pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
 pub(crate) use ecstore_disk::validate_batch_read_version_item_count;
@@ -757,8 +759,24 @@ pub(crate) fn global_config_init_error_is_deterministic(err: &Error) -> bool {
     ecstore_config::com::is_server_config_corrupt_error(err)
 }
 
+pub(crate) async fn init_local_disks_with_instance_ctx(
+    instance_ctx: &Arc<InstanceContext>,
+    endpoint_pools: EndpointServerPools,
+) -> Result<()> {
+    ecstore_storage::init_local_disks_with_instance_ctx(instance_ctx, endpoint_pools).await
+}
+
+/// Test-only legacy entry: registers disks into the ambient (process-default)
+/// context, matching what pre-#1052 production startup did.
+#[cfg(test)]
 pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
     ecstore_storage::init_local_disks(endpoint_pools).await
+}
+
+/// The process-level bootstrap instance context that single-instance startup
+/// threads through the storage foundation (Phase 5 follow-up, backlog#1052).
+pub(crate) fn bootstrap_instance_ctx() -> Arc<InstanceContext> {
+    ecstore_runtime::bootstrap_ctx()
 }
 
 pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
@@ -773,8 +791,8 @@ pub(crate) async fn read_config(api: Arc<ECStore>, file: &str) -> Result<Vec<u8>
     ecstore_config::com::read_config(api, file).await
 }
 
-pub(crate) async fn prewarm_local_disk_id_map() {
-    ecstore_storage::prewarm_local_disk_id_map().await;
+pub(crate) async fn prewarm_local_disk_id_map_with_instance_ctx(instance_ctx: &Arc<InstanceContext>) {
+    ecstore_storage::prewarm_local_disk_id_map_with_instance_ctx(instance_ctx).await;
 }
 
 pub(crate) fn replication_queue_current_count() -> Option<i64> {
@@ -793,14 +811,6 @@ pub(crate) fn shutdown_background_monitors() {
     rustfs_ecstore::shutdown_background_monitors();
 }
 
-pub(crate) fn set_global_endpoints(endpoints: Vec<PoolEndpoints>) {
-    ecstore_global::set_global_endpoints(endpoints);
-}
-
-pub(crate) fn set_global_region(region: s3s::region::Region) {
-    ecstore_global::set_global_region(region);
-}
-
 pub(crate) fn set_global_rustfs_port(value: u16) {
     ecstore_global::set_global_rustfs_port(value);
 }
@@ -813,10 +823,6 @@ pub(crate) async fn try_migrate_server_config(store: Arc<ECStore>) {
     let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
         Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
     ecstore_config::try_migrate_server_config(store, Some(decrypt_fn)).await;
-}
-
-pub(crate) async fn update_erasure_type(setup_type: SetupType) {
-    ecstore_global::update_erasure_type(setup_type).await;
 }
 
 pub(crate) trait StorageDiskRpcExt {

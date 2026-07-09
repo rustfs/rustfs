@@ -20,6 +20,7 @@ use std::{
 
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
+use crate::runtime::instance::InstanceContext;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState},
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
@@ -33,8 +34,8 @@ use crate::{
         TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
         get_global_endpoints, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region,
         get_global_tier_config_mgr, global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd,
-        is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id, set_global_lock_client,
-        set_global_lock_clients, set_object_layer, update_erasure_type,
+        is_first_cluster_node_local, resolve_object_store_handle, set_global_lock_client, set_global_lock_clients,
+        set_object_layer, update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::event_notification::EventNotifier,
@@ -278,12 +279,6 @@ pub(crate) fn replication_runtime_initialized() -> bool {
     crate::runtime::global::current_ctx().replication_initialized()
 }
 
-pub(crate) fn ensure_deployment_id(deployment_id: Uuid) {
-    if get_global_deployment_id().is_none() {
-        set_global_deployment_id(deployment_id);
-    }
-}
-
 pub fn global_lock_client() -> Option<Arc<dyn LockClient>> {
     get_global_lock_client()
 }
@@ -419,8 +414,8 @@ pub(crate) async fn clear_local_disk_id_map_for_test() {
     local_disk_id_map_handle().write().await.clear();
 }
 
-pub(crate) async fn record_local_disk_id(disk_id: Uuid, endpoint: String) {
-    local_disk_id_map_handle().write().await.insert(disk_id, endpoint);
+pub(crate) async fn record_local_disk_id(instance_ctx: &Arc<InstanceContext>, disk_id: Uuid, endpoint: String) {
+    instance_ctx.local_disk_id_map().write().await.insert(disk_id, endpoint);
 }
 
 pub(crate) async fn replace_local_disk_id(previous: Option<Uuid>, current: Option<Uuid>, endpoint: String) {
@@ -434,8 +429,8 @@ pub(crate) async fn replace_local_disk_id(previous: Option<Uuid>, current: Optio
     }
 }
 
-pub(crate) async fn record_local_disks(disks: Vec<DiskStore>) {
-    let map = local_disk_map_handle();
+pub(crate) async fn record_local_disks(instance_ctx: &Arc<InstanceContext>, disks: Vec<DiskStore>) {
+    let map = instance_ctx.local_disk_map();
     let mut global_local_disk_map = map.write().await;
     for disk in disks {
         let path = disk.endpoint().to_string();
@@ -443,8 +438,13 @@ pub(crate) async fn record_local_disks(disks: Vec<DiskStore>) {
     }
 }
 
-pub(crate) async fn local_disk_set_drive(pool_idx: usize, set_idx: usize, disk_idx: usize) -> Option<DiskStore> {
-    local_disk_set_drives_handle().read().await[pool_idx][set_idx][disk_idx].clone()
+pub(crate) async fn local_disk_set_drive(
+    instance_ctx: &Arc<InstanceContext>,
+    pool_idx: usize,
+    set_idx: usize,
+    disk_idx: usize,
+) -> Option<DiskStore> {
+    instance_ctx.local_disk_set_drives().read().await[pool_idx][set_idx][disk_idx].clone()
 }
 
 pub(crate) async fn local_disk_for_endpoint(endpoint: &Endpoint) -> Option<DiskStore> {
@@ -488,8 +488,12 @@ pub(crate) async fn local_disk_entries() -> Vec<Option<DiskStore>> {
     local_disk_map_handle().read().await.values().cloned().collect()
 }
 
-pub(crate) async fn initialize_local_disk_maps(endpoint_pools: EndpointServerPools, opt: &DiskOption) -> Result<()> {
-    let set_drives = local_disk_set_drives_handle();
+pub(crate) async fn initialize_local_disk_maps(
+    instance_ctx: &Arc<InstanceContext>,
+    endpoint_pools: EndpointServerPools,
+    opt: &DiskOption,
+) -> Result<()> {
+    let set_drives = instance_ctx.local_disk_set_drives();
     let mut global_set_drives = set_drives.write().await;
     for pool_eps in endpoint_pools.as_ref().iter() {
         let mut set_count_drives = Vec::with_capacity(pool_eps.set_count);
@@ -500,7 +504,7 @@ pub(crate) async fn initialize_local_disk_maps(endpoint_pools: EndpointServerPoo
         global_set_drives.push(set_count_drives);
     }
 
-    let map = local_disk_map_handle();
+    let map = instance_ctx.local_disk_map();
     let mut global_local_disk_map = map.write().await;
 
     for pool_eps in endpoint_pools.as_ref().iter() {

@@ -1744,10 +1744,39 @@ impl SetDisks {
         format: FormatV3,
         lockers: Vec<Arc<dyn LockClient>>,
     ) -> Arc<Self> {
-        // Single-instance sources the process bootstrap context (the one the
-        // owning ECStore adopts). Slice 8 threads a per-instance context in for
-        // true multi-instance.
-        let ctx = bootstrap_ctx();
+        Self::new_with_instance_ctx(
+            locker_owner,
+            disks,
+            set_drive_count,
+            default_parity_count,
+            set_index,
+            pool_index,
+            set_endpoints,
+            format,
+            lockers,
+            bootstrap_ctx(),
+        )
+        .await
+    }
+
+    /// Build a set bound to an explicit instance context (Phase 5 follow-up,
+    /// backlog#1052). The legacy [`SetDisks::new`] entry adopts the process
+    /// bootstrap context; a store constructed around its own context threads it
+    /// down here so the whole object graph shares one cell.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_instance_ctx(
+        locker_owner: String,
+        disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
+        set_drive_count: usize,
+        default_parity_count: usize,
+        set_index: usize,
+        pool_index: usize,
+        set_endpoints: Vec<Endpoint>,
+        format: FormatV3,
+        lockers: Vec<Arc<dyn LockClient>>,
+        instance_ctx: Arc<InstanceContext>,
+    ) -> Arc<Self> {
+        let ctx = instance_ctx;
         Arc::new(SetDisks {
             locker_owner,
             disks,

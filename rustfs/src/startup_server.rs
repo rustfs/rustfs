@@ -17,6 +17,7 @@ use crate::{
     config::Config,
     server::{ServiceState, ServiceStateManager, ShutdownHandle, start_http_server},
     startup_runtime_sources,
+    storage_api::startup::runtime_sources::InstanceContext,
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -76,14 +77,17 @@ pub(crate) struct StartupHttpServers {
     pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
 }
 
-pub(crate) async fn init_startup_listen_context(config: &Config) -> Result<StartupListenContext> {
+pub(crate) async fn init_startup_listen_context(
+    config: &Config,
+    instance_ctx: &Arc<InstanceContext>,
+) -> Result<StartupListenContext> {
     log_sanitized_server_config(config);
     let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region_str) = &config.region {
         region_str
             .parse::<s3s::region::Region>()
-            .map(startup_runtime_sources::publish_region)
+            .map(|region| startup_runtime_sources::publish_region(instance_ctx, region))
             .map_err(|err| Error::other(format!("invalid region '{}': {}", region_str, err)))?;
     }
 
@@ -191,7 +195,10 @@ pub(crate) fn find_embedded_available_port() -> Result<u16> {
     Err(last_err.unwrap_or_else(|| Error::other("failed to reserve an embedded TCP port")))
 }
 
-pub(crate) async fn init_embedded_startup_listen_context(config: &Config) -> Result<EmbeddedStartupListenContext> {
+pub(crate) async fn init_embedded_startup_listen_context(
+    config: &Config,
+    instance_ctx: &Arc<InstanceContext>,
+) -> Result<EmbeddedStartupListenContext> {
     let readiness = Arc::new(GlobalReadiness::new());
 
     let server_addr =
@@ -210,7 +217,7 @@ pub(crate) async fn init_embedded_startup_listen_context(config: &Config) -> Res
     if let Some(region_str) = &config.region {
         region_str
             .parse::<s3s::region::Region>()
-            .map(startup_runtime_sources::publish_region)
+            .map(|region| startup_runtime_sources::publish_region(instance_ctx, region))
             .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))?;
     }
 
