@@ -16,6 +16,7 @@
 
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::app::storage_api::object_usecase::StorageObjectInfo;
+use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps as _;
 use rustfs_object_data_cache::{ObjectDataCacheBodyVariant, ObjectDataCacheGetPlan, ObjectDataCacheGetRequest};
 
 /// App-layer GET request snapshot used for cache planning.
@@ -53,7 +54,14 @@ pub(crate) fn build_get_object_body_cache_plan(
         || request.info.delete_marker
         || request.info.version_only
         || request.info.metadata_only
-        || request.response_content_length < 0
+        // Remote (transitioned) objects are served from the warm tier; the
+        // ecstore hook already refuses them (hook.rs is_remote()), so the
+        // usecase-layer planner must exclude them too for a uniform contract.
+        || request.info.is_remote()
+        // Zero-length bodies save no I/O — ecstore returns an empty body before
+        // the hook probe — so admitting them only creates useless entries and
+        // inflates hit metrics. Mirrors should_buffer_get_object_in_memory_with_threshold.
+        || request.response_content_length <= 0
     {
         return GetObjectBodyCachePlan::Skip;
     }
@@ -169,6 +177,62 @@ mod tests {
                 key: "object",
                 info: &info,
                 response_content_length: 4,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        );
+
+        assert!(matches!(plan, GetObjectBodyCachePlan::Skip));
+    }
+
+    #[test]
+    fn plan_skips_remote_transitioned_objects() {
+        // backlog#1138: transitioned (remote-tier) objects are served from the
+        // warm backend; the ecstore hook already refuses them, so the
+        // usecase-layer planner must exclude them too for a uniform contract.
+        let adapter = enabled_adapter();
+        let mut info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            ..Default::default()
+        };
+        info.transitioned_object.status = "complete".to_string();
+
+        let plan = build_get_object_body_cache_plan(
+            &adapter,
+            GetObjectBodyCacheRequest {
+                bucket: "bucket",
+                key: "object",
+                info: &info,
+                response_content_length: 4,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        );
+
+        assert!(matches!(plan, GetObjectBodyCachePlan::Skip));
+    }
+
+    #[test]
+    fn plan_skips_zero_length_objects() {
+        // backlog#1142: ecstore returns an empty body before the hook probe, so
+        // a zero-length GET saves no I/O; admitting it only inflates hit metrics.
+        let adapter = enabled_adapter();
+        let info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 0,
+            ..Default::default()
+        };
+
+        let plan = build_get_object_body_cache_plan(
+            &adapter,
+            GetObjectBodyCacheRequest {
+                bucket: "bucket",
+                key: "object",
+                info: &info,
+                response_content_length: 0,
                 has_range: false,
                 part_number: None,
                 encryption_applied: false,
