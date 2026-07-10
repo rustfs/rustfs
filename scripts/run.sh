@@ -116,9 +116,13 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # dial9 Tokio Runtime Telemetry Configuration
 # ============================================================================
 # dial9 captures Tokio runtime-level events (poll start/end, worker park/unpark,
-# task spawn/terminate) into binary trace segments. It sees executor-level faults
-# — a long poll stalling a worker, a task that never yields — that request-level
-# metrics and spans cannot.
+# task spawn/terminate) into binary trace segments. It sees long polls that stall
+# a worker — something request-level metrics and spans cannot show.
+#
+# It does NOT see a drive stall: RustFS does its disk I/O on the blocking pool
+# and via io_uring, never on an async worker, so a slow drive does not lengthen
+# any poll. Measured: injecting 200ms of drive latency cut throughput by 64% and
+# left the poll-duration distribution unchanged.
 #
 # This is an on-demand profiler, not always-on telemetry:
 #
@@ -126,8 +130,9 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 #   which enables the `dial9` feature and `--cfg tokio_unstable`. Setting the
 #   variables below on a stock binary logs a warning and changes nothing.
 # - Trace segments are written continuously, and the oldest are deleted once
-#   MAX_FILE_SIZE * ROTATION_COUNT bytes are retained. Under a high poll rate
-#   that budget can wrap in minutes — size it against the window you need.
+#   MAX_FILE_SIZE * ROTATION_COUNT bytes are retained. Measured at ~0.16 MiB/s
+#   under a 66 MiB/s warp workload, so the default 1 GiB budget wraps after
+#   roughly 108 minutes. Scale that by your event rate.
 # - Turn it off again when the investigation is over.
 #
 # See docs/operations/dial9-runtime-profiling.md.
@@ -148,12 +153,6 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # MAX_FILE_SIZE * ROTATION_COUNT; older segments are evicted, not kept.
 #export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=10
 
-# Capture async backtraces of tasks that stall (default: false).
-# Needs a binary built with the `dial9-taskdump` feature (Linux only).
-#export RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED=true
-# Mean idle duration for task-dump Poisson sampling, in ms (default: 10)
-#export RUSTFS_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS=10
-
 # S3 upload is NOT available: dial9's uploader depends on a rustls-webpki with
 # known CVEs, so the feature is not built. These are parsed and warned about,
 # never honoured. Collect segments from OUTPUT_DIR instead.
@@ -165,10 +164,10 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 #export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR="$current_dir/deploy/telemetry"
 
 # --- Scenario 2: investigating a worker stall ---
-# Task dumps show where stalled tasks are parked. Keep the run short.
+# Trace shows which task held a worker and for how long, but not where it was
+# stuck: task dumps need dial9's own spawner (see backlog#1157 D9-16).
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 #export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR=/tmp/rustfs-telemetry-investigation
-#export RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED=true
 #export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=3
 
 export OTEL_INSTRUMENTATION_NAME="rustfs"
