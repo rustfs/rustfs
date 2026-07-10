@@ -63,6 +63,8 @@ make pre-commit
 make setup-hooks
 ```
 
+> `make test` requires [cargo-nextest](https://nexte.st) (CI runs it and only nextest honours `.config/nextest.toml` test-groups). Install it with `cargo install cargo-nextest --locked` or a prebuilt binary (see https://nexte.st/docs/installation/). To run the plain `cargo test` fallback anyway (results not authoritative — serialization semantics differ from CI), set `RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1`.
+
 ### 🔒 Automated Pre-commit Hooks
 
 This project includes a pre-commit hook that automatically runs before each commit to ensure:
