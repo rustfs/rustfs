@@ -3108,3 +3108,247 @@ mod body_cache_hook_gate_tests {
         assert_eq!(full_object_plaintext_len(&None, &ObjectOptions::default(), &info), None);
     }
 }
+
+#[cfg(test)]
+mod body_cache_hook_e2e_tests {
+    //! End-to-end regression coverage for the two merged P0 data-corruption
+    //! fixes, driving the *real* `get_object_reader` gate + probe + reader
+    //! construction rather than the `full_object_plaintext_len` predicate in
+    //! isolation. The predicate-only tests above cannot catch a caller that
+    //! opens a new shortcut serving the cached body directly — which was the
+    //! original form of both P0s (backlog#1108 / #1109) and the reason ODC-21
+    //! (backlog#1126) made the hook re-registrable so these tests can install a
+    //! deterministic hook.
+    //!
+    //! A stand-in `GetObjectBodyCacheHook` plays the app-layer cache: the
+    //! adapter itself lives above ecstore and cannot be reached from here, but
+    //! the hook trait is exactly the production injection point, so exercising
+    //! it through `get_object_reader` is a true end-to-end test of the ecstore
+    //! side (gate decision -> probe -> served bytes and published size).
+    //!
+    //! The tests share one process-global hook slot, so they serialize under a
+    //! single key and clear the slot on the way out; each uses a unique
+    //! bucket/object and the hook returns `None` for anything else, so a stray
+    //! concurrent GET in another test is unaffected.
+
+    use crate::ecstore_validation_blackbox::make_local_set_disks;
+    use crate::io_support::rio::{HashReader, compression_metadata_value, compression_reader};
+    use crate::object_api::{
+        GetObjectBodyCacheHook, ObjectInfo, ObjectOptions, PutObjReader, clear_get_object_body_cache_hook,
+        register_get_object_body_cache_hook,
+    };
+    use crate::set_disk::SetDisks;
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::object::ObjectIO as _;
+    use bytes::Bytes;
+    use http::HeaderMap;
+    use rustfs_utils::CompressionAlgorithm;
+    use rustfs_utils::http::{SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, insert_str};
+    use std::collections::HashMap;
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use tokio::io::AsyncReadExt as _;
+
+    /// A stand-in for the app-layer object-data cache: returns `body` only for
+    /// the one primed key, mirroring how the real adapter answers a probe.
+    struct PrimedBodyHook {
+        bucket: String,
+        object: String,
+        body: Bytes,
+    }
+
+    #[async_trait::async_trait]
+    impl GetObjectBodyCacheHook for PrimedBodyHook {
+        async fn lookup(&self, bucket: &str, object: &str, _info: &ObjectInfo) -> Option<Bytes> {
+            (bucket == self.bucket && object == self.object).then(|| self.body.clone())
+        }
+    }
+
+    /// Registers a primed hook and clears it on drop so no hook leaks into an
+    /// unrelated test sharing the process-global slot.
+    struct HookGuard;
+    impl HookGuard {
+        fn install(bucket: &str, object: &str, body: Bytes) -> Self {
+            register_get_object_body_cache_hook(Arc::new(PrimedBodyHook {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                body,
+            }));
+            HookGuard
+        }
+    }
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            clear_get_object_body_cache_hook();
+        }
+    }
+
+    /// Compresses `plaintext` with the same codec the real PUT path uses, so
+    /// the stored bytes round-trip through `get_object_reader`'s decompressor.
+    async fn compress(plaintext: &[u8]) -> Vec<u8> {
+        let mut reader = compression_reader(Cursor::new(plaintext.to_vec()), CompressionAlgorithm::default(), false);
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("compress plaintext");
+        compressed
+    }
+
+    /// Writes a genuinely compressed object: the stored data is `compressed`
+    /// and the metadata marks it compressed with `plaintext.len()` as the
+    /// decompressed length, exactly as the app-layer compress path records it.
+    async fn put_compressed_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, plaintext: &[u8], compressed: &[u8]) {
+        let mut user_defined = HashMap::new();
+        insert_str(
+            &mut user_defined,
+            SUFFIX_COMPRESSION,
+            compression_metadata_value(CompressionAlgorithm::default()),
+        );
+        insert_str(&mut user_defined, SUFFIX_ACTUAL_SIZE, plaintext.len().to_string());
+
+        let opts = ObjectOptions {
+            no_lock: true,
+            user_defined,
+            ..Default::default()
+        };
+        let stream = HashReader::from_stream(
+            Cursor::new(compressed.to_vec()),
+            compressed.len() as i64, // stored (compressed) size
+            plaintext.len() as i64,  // actual (decompressed) size
+            None,
+            None,
+            false,
+        )
+        .expect("hash reader over compressed bytes");
+        let mut reader = PutObjReader::new(stream);
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("compressed object should be written");
+    }
+
+    async fn read_to_vec(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, opts: &ObjectOptions) -> (Vec<u8>, i64) {
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), opts)
+            .await
+            .expect("object reader should open");
+        let published_size = reader.object_info.size;
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("object should stream");
+        (body, published_size)
+    }
+
+    /// A compressible payload large enough to guarantee stored != plaintext and
+    /// to keep the object off the inline / direct-memory fast paths.
+    fn compressible_plaintext() -> Vec<u8> {
+        b"rustfs-body-cache-e2e-regression-".repeat(20_000)
+    }
+
+    /// backlog#1108: a raw data-movement read (decommission/rebalance copy) must
+    /// yield the STORED (compressed) representation, never the cached plaintext.
+    /// Serving the cache here writes decompressed bytes into the destination
+    /// pool under the compressed object's metadata — silent corruption.
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn raw_data_movement_read_serves_stored_bytes_not_cached_plaintext() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "e2e-body-cache-raw-move";
+        let object = "compressed.bin";
+        let plaintext = compressible_plaintext();
+        let compressed = compress(&plaintext).await;
+        assert_ne!(compressed, plaintext, "fixture must be genuinely compressed");
+        put_compressed_object(&set_disks, bucket, object, &plaintext, &compressed).await;
+
+        // Prime the cache with the DECOMPRESSED plaintext.
+        let _guard = HookGuard::install(bucket, object, Bytes::from(plaintext.clone()));
+
+        // decommission_object_migration_read_opts sets both raw_data_movement_read
+        // and data_movement; ReadPlan keys the stored-bytes path on the former.
+        let opts = ObjectOptions {
+            no_lock: true,
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+        let (body, published_size) = read_to_vec(&set_disks, bucket, object, &opts).await;
+
+        assert_eq!(body, compressed, "raw data-movement read must return the stored compressed bytes");
+        assert_ne!(body, plaintext, "raw data-movement read must NOT return the cached plaintext");
+        assert_eq!(published_size, compressed.len() as i64, "raw read must publish the stored size");
+    }
+
+    /// backlog#1109: on a cache hit for a compressed object the served
+    /// `object_info.size` must be the DECOMPRESSED length (what
+    /// ReadTransform::Compressed publishes), and the streamed body length must
+    /// match it. UploadPartCopy reads the copy length straight off this field.
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn compressed_cache_hit_publishes_decompressed_size() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "e2e-body-cache-compressed";
+        let object = "compressed.bin";
+        let plaintext = compressible_plaintext();
+        let compressed = compress(&plaintext).await;
+        assert_ne!(compressed, plaintext, "fixture must be genuinely compressed");
+        put_compressed_object(&set_disks, bucket, object, &plaintext, &compressed).await;
+
+        let normal_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        // Control: with no hook the real decode path must decompress to the
+        // plaintext and publish the decompressed length. This also proves the
+        // fixture round-trips (stored compressed bytes -> plaintext).
+        clear_get_object_body_cache_hook();
+        let (control_body, control_size) = read_to_vec(&set_disks, bucket, object, &normal_opts).await;
+        assert_eq!(control_body, plaintext, "real read must decompress to the plaintext");
+        assert_eq!(control_size, plaintext.len() as i64, "real read must publish the decompressed size");
+
+        // Hit: prime with the plaintext and read normally. The probe must serve
+        // it AND republish the decompressed length, not the stored size.
+        let _guard = HookGuard::install(bucket, object, Bytes::from(plaintext.clone()));
+        let (hit_body, hit_size) = read_to_vec(&set_disks, bucket, object, &normal_opts).await;
+        assert_eq!(
+            hit_size,
+            plaintext.len() as i64,
+            "cache hit must publish the decompressed size (backlog#1109)"
+        );
+        assert_ne!(hit_size, compressed.len() as i64, "cache hit must not publish the stored compressed size");
+        assert_eq!(hit_body.len() as i64, hit_size, "streamed length must equal the published size");
+        assert_eq!(hit_body, plaintext, "cache hit must stream the plaintext");
+    }
+
+    /// backlog#1146: a restore read forces ReadPlan down the Plain branch, so a
+    /// compressed object yields its STORED bytes under the compressed size. The
+    /// cache (holding plaintext) must not be served.
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn restore_read_serves_stored_bytes_not_cached_plaintext() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "e2e-body-cache-restore";
+        let object = "compressed.bin";
+        let plaintext = compressible_plaintext();
+        let compressed = compress(&plaintext).await;
+        assert_ne!(compressed, plaintext, "fixture must be genuinely compressed");
+        put_compressed_object(&set_disks, bucket, object, &plaintext, &compressed).await;
+
+        let _guard = HookGuard::install(bucket, object, Bytes::from(plaintext.clone()));
+
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        opts.transition.restore_request.days = Some(1);
+        let (body, published_size) = read_to_vec(&set_disks, bucket, object, &opts).await;
+
+        assert_eq!(body, compressed, "restore read must return the stored compressed bytes");
+        assert_ne!(body, plaintext, "restore read must NOT return the cached plaintext");
+        assert_eq!(
+            published_size,
+            compressed.len() as i64,
+            "restore read must publish the stored compressed size"
+        );
+    }
+}
