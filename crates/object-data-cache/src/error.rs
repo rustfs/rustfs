@@ -73,6 +73,10 @@ pub enum ObjectDataCacheConfigError {
     #[error("object data cache identity_keys_max must be greater than 0")]
     ZeroIdentityKeysMax,
 
+    /// A single-key identity budget evicts the previous key on every fill.
+    #[error("object data cache identity_keys_max must be at least 2")]
+    IdentityKeysMaxTooSmall,
+
     /// Failed to resolve a non-zero cache capacity from the runtime environment.
     #[error("object data cache could not resolve a positive max capacity")]
     ZeroResolvedMaxBytes,

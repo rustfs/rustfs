@@ -91,7 +91,8 @@ pub struct ObjectDataCacheConfig {
     pub fill_concurrency_per_cpu: u16,
     /// Absolute fill concurrency cap.
     pub fill_concurrency_max: u16,
-    /// Conservative cap for keys attached to one object identity.
+    /// Conservative cap for keys attached to one object identity. Must be at
+    /// least 2: the index admits a new key by evicting the oldest one.
     pub identity_keys_max: u16,
 }
 
@@ -229,6 +230,13 @@ impl ObjectDataCacheConfig {
             return Err(ObjectDataCacheConfigError::ZeroIdentityKeysMax);
         }
 
+        // The identity index evicts the oldest key to admit a new one, so a
+        // budget of 1 evicts the previous key on every fill and can never hold
+        // two live keys of one object at once.
+        if self.identity_keys_max < 2 {
+            return Err(ObjectDataCacheConfigError::IdentityKeysMaxTooSmall);
+        }
+
         Ok(())
     }
 }
@@ -336,6 +344,30 @@ mod tests {
             .expect_err("max fill concurrency must not be smaller than per-cpu factor");
 
         assert_eq!(err, ObjectDataCacheConfigError::FillConcurrencyMaxTooSmall);
+    }
+
+    #[test]
+    fn validate_rejects_single_key_identity_budget() {
+        let config = ObjectDataCacheConfig {
+            identity_keys_max: 1,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("a one-key identity budget evicts the previous key on every fill");
+
+        assert_eq!(err, ObjectDataCacheConfigError::IdentityKeysMaxTooSmall);
+    }
+
+    #[test]
+    fn validate_accepts_two_key_identity_budget() {
+        let config = ObjectDataCacheConfig {
+            identity_keys_max: 2,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]
