@@ -25,6 +25,12 @@
 use super::super::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// Background walks skip the total timeout, so the per-read stall budget is what
+/// catches a drive that stops answering. Keep it generous: a heal walk is not
+/// latency-sensitive, and one slow read is not a dead drive.
+const BACKGROUND_WALKDIR_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A single `(object, version)` unit surfaced by the disk-walk union enumerator.
 ///
@@ -199,6 +205,7 @@ impl SetDisks {
             report_not_found: false,
             per_disk_limit: 0,
             skip_walkdir_total_timeout: true,
+            walkdir_stall_timeout: Some(BACKGROUND_WALKDIR_STALL_TIMEOUT),
             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                 let collector = agreed_collector.clone();
                 Box::pin(async move {
