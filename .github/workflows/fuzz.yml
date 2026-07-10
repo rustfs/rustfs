@@ -48,7 +48,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
-  RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
+  # Fuzz targets build without the dial9 feature, so tokio_unstable is not needed.
+  RUSTFLAGS: "-C target-feature=-crt-static"
 
 jobs:
   cancel-closed-pr-runs:

@@ -17,7 +17,7 @@ use crate::startup_runtime_sources;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::future::Future;
 use std::io::Result;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -35,24 +35,39 @@ pub(crate) fn log_startup_runtime_diagnostics() {
 }
 
 fn log_dial9_runtime_status() {
-    if rustfs_obs::dial9::is_enabled() {
-        info!(
+    let supported = rustfs_obs::dial9::is_supported();
+    let configured = rustfs_obs::dial9::is_configured();
+
+    match (supported, configured) {
+        (true, true) => info!(
             target: "rustfs::main",
             event = EVENT_DIAL9_RUNTIME_STATUS,
             component = LOG_COMPONENT_MAIN,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             enabled = true,
             "Dial9 Tokio runtime telemetry is enabled"
-        );
-    } else {
-        debug!(
+        ),
+        // Requested but unavailable. This is the case an operator most needs to
+        // see: the process otherwise runs to completion recording nothing.
+        (false, true) => warn!(
             target: "rustfs::main",
             event = EVENT_DIAL9_RUNTIME_STATUS,
             component = LOG_COMPONENT_MAIN,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             enabled = false,
+            supported = false,
+            remedy = "rebuild with --features dial9 (see `make build-profiling`)",
+            "Dial9 Tokio runtime telemetry is configured but not compiled into this binary"
+        ),
+        (_, false) => debug!(
+            target: "rustfs::main",
+            event = EVENT_DIAL9_RUNTIME_STATUS,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            enabled = false,
+            supported,
             "Dial9 Tokio runtime telemetry is disabled"
-        );
+        ),
     }
 }
 
