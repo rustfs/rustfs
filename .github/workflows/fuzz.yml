@@ -17,13 +17,16 @@ name: Fuzz
 on:
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
+    # PR trigger is intentionally narrow: only changes to the fuzz harness
+    # itself gate a PR. Broad crate paths (ecstore/filemeta/utils/policy/…)
+    # are covered by the nightly `schedule` run below, which fuzzes against
+    # whatever landed on main. Widening these paths previously queued a
+    # ~45min fuzz-build on nearly every PR and is why this workflow was
+    # disabled; do not re-add crate paths here.
     paths:
       - "fuzz/**"
       - "scripts/fuzz/**"
       - ".github/workflows/fuzz.yml"
-      - "crates/ecstore/**"
-      - "crates/filemeta/**"
-      - "crates/utils/**"
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
@@ -96,7 +99,11 @@ jobs:
         run: |
           binary_root="fuzz/prebuilt/${CARGO_BUILD_TARGET}/release"
           mkdir -p "${binary_root}"
-          for target in path_containment bucket_validation local_metadata; do
+          # Keep this list in sync with the smoke/nightly matrices and
+          # scripts/fuzz/run.sh default target set (all 5 buildable bins in
+          # fuzz/Cargo.toml). The *_storage_api.rs files are `mod` submodules
+          # of their parent targets, not standalone bins.
+          for target in archive_extract bucket_validation local_metadata path_containment policy_ingress; do
             install -Dm755 "fuzz/target/${CARGO_BUILD_TARGET}/release/${target}" "${binary_root}/${target}"
           done
 
@@ -105,9 +112,11 @@ jobs:
         with:
           name: fuzz-prebuilt-binaries-${{ github.run_number }}
           path: |
-            fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/path_containment
+            fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/archive_extract
             fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/bucket_validation
             fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/local_metadata
+            fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/path_containment
+            fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/policy_ingress
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
@@ -126,8 +135,10 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # One job per target runs in parallel, so wall-clock time is per-target
+      # (~60s fuzz + download/chmod overhead), not the sum across the matrix.
       matrix:
-        target: [path_containment, bucket_validation, local_metadata]
+        target: [archive_extract, bucket_validation, local_metadata, path_containment, policy_ingress]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -169,6 +180,10 @@ jobs:
   nightly-fuzz-corpus:
     name: "Nightly / ${{ matrix.target }}"
     needs: fuzz-build
+    # TODO(ci-8): when the schedule-failure-issue composite action lands,
+    # add a step here (or a dependent job) that opens/updates a GitHub issue
+    # on nightly failure. ci-8 is the single alerting mechanism for all
+    # scheduled workflows; do not self-roll alerting in this workflow.
     if: >
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' &&
@@ -178,7 +193,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [path_containment, bucket_validation, local_metadata]
+        target: [archive_extract, bucket_validation, local_metadata, path_containment, policy_ingress]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
