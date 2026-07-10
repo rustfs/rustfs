@@ -2586,6 +2586,30 @@ fn is_io_uring_fd_cache_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_IO_URING_FD_CACHE, DEFAULT_RUSTFS_IO_URING_FD_CACHE)
 }
 
+/// Drop `offset..offset+length` from the page cache after an io_uring read,
+/// mirroring what `StdBackend::pread_bytes` does for the same range
+/// (backlog#1145).
+///
+/// The reclaim is a deliberate policy — large object reads are usually cold, and
+/// keeping them resident evicts everything else — gated by
+/// `RUSTFS_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE` (on by default) above
+/// `RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD` (4 MiB). It is not an artifact of
+/// how StdBackend happens to read, so enabling io_uring must not silently turn it
+/// off. Errors surface exactly as they do on the StdBackend path.
+#[cfg(target_os = "linux")]
+fn reclaim_read_range(file: &std::fs::File, offset: u64, length: usize) -> Result<()> {
+    use core::num::NonZeroU64;
+    use rustix::fs::{Advice, fadvise};
+
+    let length = u64::try_from(length).map_err(|_| DiskError::other("read reclaim length overflow"))?;
+    let Some(length) = NonZeroU64::new(length) else {
+        return Ok(());
+    };
+    fadvise(file, offset, Some(length), Advice::DontNeed)
+        .map_err(std::io::Error::from)
+        .map_err(DiskError::from)
+}
+
 /// A cached descriptor is keyed by the open flags too: the O_DIRECT and buffered
 /// read paths must never hand each other a descriptor opened the other way.
 /// Only the buffered path caches today, so `direct` is always `false`; keeping it
@@ -2885,6 +2909,8 @@ impl UringBackend {
             return Ok(Bytes::new());
         }
 
+        // The driver consumes the handle; keep one for the post-read reclaim.
+        let file_for_reclaim = Arc::clone(&file);
         let bytes = match self.driver.read_at(file, offset_u64, length).await {
             Ok(bytes) => bytes,
             Err(io_err) => {
@@ -2903,6 +2929,11 @@ impl UringBackend {
             // miss path's `meta.len() < end_offset` check rejects, so report the
             // same error whether or not the descriptor came from the cache.
             return Err(DiskError::FileCorrupt);
+        }
+        // Same page-cache policy as StdBackend: an io_uring read must not leave a
+        // large shard resident just because it took a different code path.
+        if should_reclaim_file_cache_after_read(length) {
+            reclaim_read_range(&file_for_reclaim, offset_u64, length)?;
         }
         Ok(Bytes::from(bytes))
     }
@@ -2989,7 +3020,9 @@ impl UringBackend {
             return Ok(Bytes::new());
         }
 
-        let bytes = match self.driver.read_at_direct(Arc::new(file), offset_u64, length, align).await {
+        let file = Arc::new(file);
+        let file_for_reclaim = Arc::clone(&file);
+        let bytes = match self.driver.read_at_direct(file, offset_u64, length, align).await {
             Ok(bytes) => bytes,
             Err(io_err) => {
                 if is_io_uring_unsupported(&io_err) {
@@ -3000,6 +3033,11 @@ impl UringBackend {
         };
         if bytes.len() != length {
             return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
+        }
+        // O_DIRECT should leave nothing resident, but a filesystem that quietly
+        // buffered the read still has to honour the reclaim policy.
+        if should_reclaim_file_cache_after_read(length) {
+            reclaim_read_range(&file_for_reclaim, offset_u64, length)?;
         }
         Ok(Bytes::from(bytes))
     }
@@ -13207,6 +13245,111 @@ mod test {
             },
         )
         .await;
+    }
+
+    /// Pages of `path` still resident in the page cache, via `mincore(2)`.
+    /// `mincore` reports residency without faulting anything in, so measuring
+    /// cannot perturb what it measures.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn resident_pages(path: &std::path::Path) -> usize {
+        use memmap2::MmapOptions;
+        let file = std::fs::File::open(path).expect("operation should succeed");
+        let len = file.metadata().expect("operation should succeed").len() as usize;
+        // SAFETY: read-only map of a regular file we just opened; the map is only
+        // used as a page-aligned address range for mincore, never dereferenced.
+        let map = unsafe { MmapOptions::new().len(len).map(&file).expect("operation should succeed") };
+        let page = mmap_page_size().expect("page size should be available") as usize;
+        let mut vec = vec![0u8; len.div_ceil(page)];
+        // SAFETY: `map.as_ptr()` is page-aligned and `len` bytes long; `vec` has
+        // one byte per page of that range, which is what mincore writes.
+        let rc = unsafe { libc::mincore(map.as_ptr() as *mut libc::c_void, len, vec.as_mut_ptr()) };
+        assert_eq!(rc, 0, "mincore failed: {}", std::io::Error::last_os_error());
+        vec.iter().filter(|b| *b & 1 == 1).count()
+    }
+
+    /// Enabling io_uring must not silently disable the page-cache reclaim policy
+    /// (backlog#1145).
+    ///
+    /// `StdBackend::pread_bytes` calls `fadvise(DONTNEED)` after a read at or
+    /// above `RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD` (4 MiB, on by default):
+    /// large object reads are usually cold, and leaving them resident evicts
+    /// everything else. That is a deliberate policy, not a side effect of how
+    /// StdBackend reads — so the io_uring path owes the same behavior.
+    ///
+    /// The test measures the policy rather than the call: it reads an 8 MiB file
+    /// through each backend and asks `mincore` how much of it stayed resident.
+    /// The reclaim-disabled case is the non-vacuity gate — if residency were not
+    /// observable there, a backend that never reclaimed would pass silently.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn io_uring_reclaims_page_cache_exactly_like_std() {
+        use tempfile::tempdir;
+
+        // Above the 4 MiB default threshold, so the policy applies.
+        const LEN: usize = 8 << 20;
+        let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+        let (volume, object) = ("bucket", "obj/dd/part.1");
+        std::fs::create_dir_all(root.join(volume).join("obj/dd")).expect("operation should succeed");
+        let file_path = root.join(volume).join(object);
+        std::fs::write(&file_path, vec![7u8; LEN]).expect("operation should succeed");
+        // DONTNEED skips dirty pages; make them clean so residency reflects the
+        // reclaim and not writeback timing.
+        std::fs::File::open(&file_path)
+            .expect("operation should succeed")
+            .sync_all()
+            .expect("operation should succeed");
+
+        let total_pages = LEN.div_ceil(mmap_page_size().expect("page size should be available") as usize);
+
+        let std_backend: Arc<dyn LocalIoBackend> = Arc::new(StdBackend::new(root.clone()));
+        let uring_backend: Option<Arc<dyn LocalIoBackend>> =
+            UringBackend::try_new(root.clone()).map(|b| Arc::new(b) as Arc<dyn LocalIoBackend>);
+        if uring_backend.is_none() {
+            eprintln!("SKIP io_uring half: io_uring unavailable (restricted environment)");
+        }
+
+        // `residency_after` reads the whole file first so the pages are certainly
+        // resident going in; whatever remains afterwards is the backend's doing.
+        async fn residency_after(backend: &Arc<dyn LocalIoBackend>, path: &std::path::Path, volume: &str, object: &str) -> usize {
+            let _ = std::fs::read(path).expect("operation should succeed");
+            let got = backend
+                .pread_bytes(volume, object, 0, LEN, None)
+                .await
+                .expect("operation should succeed");
+            assert_eq!(got.len(), LEN, "the read itself must still return every byte");
+            resident_pages(path)
+        }
+
+        for (name, backend) in [Some(("std", &std_backend)), uring_backend.as_ref().map(|b| ("uring", b))]
+            .into_iter()
+            .flatten()
+        {
+            // Policy ON (the default): the range must not stay resident.
+            let resident = temp_env::async_with_vars(
+                [(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true"))],
+                residency_after(backend, &file_path, volume, object),
+            )
+            .await;
+            assert!(
+                resident <= total_pages / 10,
+                "{name}: reclaim is on, so the read range must not stay resident; {resident}/{total_pages} pages remain"
+            );
+
+            // Policy OFF: the pages must stay. This proves the assertion above can
+            // actually fail — without it, a backend that never reclaims would pass.
+            let resident = temp_env::async_with_vars(
+                [(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("false"))],
+                residency_after(backend, &file_path, volume, object),
+            )
+            .await;
+            assert!(
+                resident >= total_pages / 2,
+                "{name}: reclaim is off, so the range must stay resident — otherwise this test \
+                 cannot observe reclaim at all; only {resident}/{total_pages} pages remain"
+            );
+        }
     }
 
     /// O_DIRECT interop (backlog#1102): with BOTH io_uring and O_DIRECT enabled,
