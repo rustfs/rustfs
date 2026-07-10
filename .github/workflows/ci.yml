@@ -155,8 +155,17 @@ jobs:
 
       - name: Run tests
         run: |
-          cargo nextest run --all --exclude e2e_test
+          cargo nextest run --profile ci --all --exclude e2e_test
           cargo test --all --doc
+
+      - name: Upload test junit report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: junit-test-and-lint-${{ github.run_number }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 3
+          if-no-files-found: ignore
 
       # Explicit gate for migration-critical suites. These tests already ran in
       # the full nextest pass above; a single filtered nextest invocation keeps
@@ -168,6 +177,9 @@ jobs:
       # selected-test count against the committed floor in
       # .config/migration-gate-floor.txt before running the gate; renames or
       # removals must update that file consciously (see the script header).
+      # Kept on the default profile (no --profile ci): a second --profile ci run
+      # would clobber target/nextest/ci/junit.xml, and none of these tests are
+      # quarantined so they gain nothing from the ci profile's retry overrides.
       - name: Run rebalance/decommission migration proofs
         run: ./scripts/check_migration_gate_count.sh
 

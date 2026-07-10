@@ -55,6 +55,8 @@ docs/*
 !docs/architecture/**
 !docs/operations/
 !docs/operations/**
+!docs/testing/
+!docs/testing/**
 !docs/superpowers/
 !docs/superpowers/**
 docs/heal-scanner-logging-governance.md

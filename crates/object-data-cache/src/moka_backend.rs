@@ -23,6 +23,7 @@ use crate::stats::ObjectDataCacheStats;
 use bytes::Bytes;
 use moka::future::{Cache, FutureExt};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Weighted Moka backend for reusable object bodies.
 #[derive(Debug)]
@@ -31,6 +32,9 @@ pub struct MokaBackend {
     index: Arc<ObjectDataCacheIdentityIndex>,
     singleflight: ObjectDataCacheSingleflight,
     memory_gate: ObjectDataCacheMemoryGate,
+    /// Bounds the number of concurrent distinct-key fills. Singleflight only
+    /// dedups per key, so without this limiter distinct-key fills are unbounded.
+    fill_semaphore: Arc<Semaphore>,
     /// Test-only barrier that pauses a fill between the index insert and the
     /// cache insert so the fill-vs-invalidation race can be driven deterministically.
     #[cfg(test)]
@@ -87,6 +91,15 @@ impl MokaBackend {
         let ttl = config.ttl;
         let time_to_idle = config.time_to_idle;
 
+        // Size the fill-concurrency limiter to
+        // min(fill_concurrency_per_cpu * available_parallelism, fill_concurrency_max).
+        // Both knobs are validated as non-zero, so the result is at least 1.
+        let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let fill_permits = usize::from(config.fill_concurrency_per_cpu)
+            .saturating_mul(parallelism)
+            .min(usize::from(config.fill_concurrency_max))
+            .max(1);
+
         // The identity index tracks the keys cached per object so that
         // invalidation can find them without a full-cache scan. Moka evicts
         // entries on its own (TTL, time-to-idle, capacity-LRU) without going
@@ -131,6 +144,7 @@ impl MokaBackend {
             index,
             singleflight: ObjectDataCacheSingleflight::new(Arc::clone(&stats)),
             memory_gate: ObjectDataCacheMemoryGate::new(config, stats),
+            fill_semaphore: Arc::new(Semaphore::new(fill_permits)),
             #[cfg(test)]
             fill_barrier: std::sync::Mutex::new(None),
         })
@@ -172,16 +186,26 @@ impl MokaBackend {
             return ObjectDataCacheFillResult::SkippedNotCacheable;
         };
 
-        let fill_state = self.singleflight.acquire(key.clone()).await;
-        let ObjectDataCacheSingleflightAcquire::Leader(leader) = fill_state else {
-            let ObjectDataCacheSingleflightAcquire::Waiter(waiter) = fill_state else {
-                unreachable!();
-            };
-            return waiter.wait().await;
+        // The caller already owns the body, so a non-leader gains nothing by
+        // waiting for another request's leader — it just skips its own fill.
+        // Report it as JoinedInflightFill (ODC-18): it did no fill work, so it
+        // must not be counted as an insert or record fill bytes. It also does
+        // NOT wait for the leader — waiting only matters when the joiner needs
+        // the result value, which the GET path never does (ODC-15).
+        let ObjectDataCacheSingleflightAcquire::Leader(leader) = self.singleflight.try_acquire(key.clone()) else {
+            return ObjectDataCacheFillResult::JoinedInflightFill;
+        };
+
+        // Bound distinct-key fill concurrency after winning leadership and
+        // before the memory-gate check. Reject rather than queue: queuing would
+        // reintroduce the GET-latency coupling this path is meant to avoid.
+        let permit = match Arc::clone(&self.fill_semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return leader.finish(ObjectDataCacheFillResult::SkippedFillConcurrency),
         };
 
         if !self.memory_gate.allows_fill(u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
-            return leader.finish(ObjectDataCacheFillResult::SkippedMemoryPressure).await;
+            return leader.finish(ObjectDataCacheFillResult::SkippedMemoryPressure);
         }
 
         let identity = ObjectDataCacheIdentity::new(Arc::clone(&key.bucket), Arc::clone(&key.object));
@@ -196,14 +220,17 @@ impl MokaBackend {
 
         // Build the entry up front so its Arc pointer can serve as the
         // generation token registered in the index alongside the key.
-        let entry = Arc::new(ObjectDataCacheEntry::new(bytes, key.size, Arc::clone(&key.etag)));
+        let entry = Arc::new(ObjectDataCacheEntry::new(bytes));
         let token = Arc::as_ptr(&entry) as ObjectDataCacheKeyToken;
 
         // Run the register/insert/recheck/undo sequence in a spawned task and
-        // await its handle. If the enclosing GET future is dropped (client
-        // disconnect) while we await, the JoinHandle is detached but the task
-        // still finishes the recheck and undo, so a stale body cannot survive
-        // with no index entry. Dropping the leader still unblocks waiters.
+        // await its handle. The GET path already detaches the whole fill from
+        // the response future (ODC-15), but this inner spawn is still required:
+        // once the index key is registered, the recheck/undo must complete even
+        // if the enclosing fill future is aborted (e.g. the detached fill task
+        // is cancelled). Aborting the outer future then only detaches this
+        // JoinHandle; the task still finishes the undo, so a stale body cannot
+        // survive with no index entry. Dropping the leader releases the key.
         let cache = self.cache.clone();
         let index = Arc::clone(&self.index);
         let fill_key = key.clone();
@@ -212,6 +239,9 @@ impl MokaBackend {
         let fill_barrier = self.fill_barrier.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
         let handle = tokio::spawn(async move {
+            // Hold the fill-concurrency permit until the register/insert/undo
+            // sequence completes, then release it on task exit.
+            let _permit = permit;
             // Register the key in the identity index BEFORE the entry becomes
             // visible in the cache, so a concurrent invalidation always finds it.
             match index.insert(fill_identity.clone(), fill_key.clone(), token).await {
@@ -243,7 +273,7 @@ impl MokaBackend {
 
         let result = handle.await.unwrap_or(ObjectDataCacheFillResult::SkippedInvalidationRace);
 
-        leader.finish(result).await
+        leader.finish(result)
     }
 
     /// Conservatively invalidates all cached keys matching the object identity.
@@ -254,11 +284,20 @@ impl MokaBackend {
     /// needed when the index has no entry for the identity.
     pub async fn invalidate_object(&self, identity: &ObjectDataCacheIdentity) -> ObjectDataCacheInvalidationResult {
         let keys_to_remove = self.index.remove_identity(identity).await;
+        // ODC-36: report the removal count so the facade can label the
+        // invalidation outcome (removed vs noop) and skip the gauge refresh on
+        // the no-op path. The vast majority of invalidations touch identities
+        // that were never cached.
+        let removed = keys_to_remove.len();
         for key in keys_to_remove {
             self.cache.remove(&key).await;
         }
 
-        ObjectDataCacheInvalidationResult::Success
+        if removed > 0 {
+            ObjectDataCacheInvalidationResult::Removed { keys: removed }
+        } else {
+            ObjectDataCacheInvalidationResult::NoOp
+        }
     }
 }
 
@@ -287,7 +326,9 @@ mod tests {
             ttl: Duration::from_millis(100),
             time_to_idle: Duration::from_millis(100),
             min_free_memory_percent: 0,
-            fill_concurrency_per_cpu: 1,
+            // >= 2 so concurrent-fill tests get at least two permits even on a
+            // single-CPU CI runner (permits = min(per_cpu * parallelism, max)).
+            fill_concurrency_per_cpu: 2,
             fill_concurrency_max: 32,
             identity_keys_max: 16,
         }
@@ -335,15 +376,30 @@ mod tests {
         let _ = backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
         let _ = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
 
+        // object-a has exactly one cached key, so invalidation reports Removed { keys: 1 }.
         let result = backend
             .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "object-a"))
             .await;
         let lookup_a = backend.lookup_body(&plan_a).await;
         let lookup_b = backend.lookup_body(&plan_b).await;
 
-        assert!(matches!(result, ObjectDataCacheInvalidationResult::Success));
+        assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
         assert!(matches!(lookup_a, ObjectDataCacheLookup::Miss));
         assert!(matches!(lookup_b, ObjectDataCacheLookup::Hit(_)));
+    }
+
+    // ODC-36: invalidating an identity that was never cached reports NoOp so the
+    // facade can skip the cache-state gauge refresh on the common no-op path.
+    #[tokio::test]
+    async fn moka_backend_invalidate_uncached_identity_is_noop() {
+        let backend =
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+
+        let result = backend
+            .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "never-cached"))
+            .await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::NoOp);
     }
 
     #[tokio::test]
@@ -422,26 +478,81 @@ mod tests {
         assert_eq!(stats.snapshot().memory_pressure_events, 1);
     }
 
-    #[tokio::test]
-    async fn moka_backend_singleflight_waiter_observes_leader_result() {
-        let stats = Arc::new(ObjectDataCacheStats::default());
-        let backend = Arc::new(MokaBackend::new(&enabled_config(), Arc::clone(&stats)).expect("moka backend should build"));
+    // ODC-15 + ODC-18: a concurrent duplicate fill for the same key must NOT
+    // wait for the in-flight leader (it already owns the body), and it must be
+    // reported as JoinedInflightFill — not Inserted — so it records no fill
+    // work and cannot inflate the inserted count/bytes for one real insert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moka_backend_duplicate_fill_same_key_joins_without_waiting() {
+        let backend = Arc::new(
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
+        );
         let plan = cacheable_plan("object", "etag-a");
-        let leader_plan = plan.clone();
-        let plan_clone = plan.clone();
-        let first = Arc::clone(&backend);
-        let second = Arc::clone(&backend);
+        let barrier = backend.install_fill_barrier();
 
-        let leader = tokio::spawn(async move { first.fill_body(&leader_plan, Bytes::from_static(b"hello")).await });
-        let waiter = tokio::spawn(async move { second.fill_body(&plan_clone, Bytes::from_static(b"hello")).await });
+        let fill_a = {
+            let backend = Arc::clone(&backend);
+            let plan = plan.clone();
+            tokio::spawn(async move { backend.fill_body(&plan, Bytes::from_static(b"hello")).await })
+        };
 
-        let leader_result = leader.await.expect("leader task should complete");
-        let waiter_result = waiter.await.expect("waiter task should complete");
-        let lookup = backend.lookup_body(&plan).await;
+        // A has registered its singleflight key and parked before the cache
+        // insert. A second fill for the same key must join (skip) right away.
+        barrier.wait_until_reached().await;
+        let fill_b = backend.fill_body(&plan, Bytes::from_static(b"hello")).await;
+        assert_eq!(
+            fill_b,
+            ObjectDataCacheFillResult::JoinedInflightFill,
+            "a duplicate fill must join the in-flight leader (not insert), and not wait for it"
+        );
 
-        assert_eq!(leader_result, ObjectDataCacheFillResult::Inserted);
-        assert_eq!(waiter_result, ObjectDataCacheFillResult::Inserted);
-        assert!(matches!(lookup, ObjectDataCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"hello"));
+        barrier.release();
+        let fill_a = fill_a.await.expect("leader fill task should complete");
+        assert_eq!(fill_a, ObjectDataCacheFillResult::Inserted);
+        assert!(matches!(backend.lookup_body(&plan).await, ObjectDataCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"hello"));
+    }
+
+    // ODC-11: the fill-concurrency limiter must reject (not queue) once
+    // saturated. With a single permit, an in-flight fill for one key holds the
+    // permit; a concurrent fill for a DISTINCT key is rejected immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moka_backend_rejects_fill_when_concurrency_saturated() {
+        let mut config = enabled_config();
+        // One permit: min(per_cpu * parallelism, max) == min(N, 1) == 1.
+        config.fill_concurrency_per_cpu = 1;
+        config.fill_concurrency_max = 1;
+        let backend =
+            Arc::new(MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"));
+        let plan_a = versioned_plan("object", "v1", "etag-a");
+        let plan_b = versioned_plan("object", "v2", "etag-b");
+
+        let barrier = backend.install_fill_barrier();
+
+        let fill_a = {
+            let backend = Arc::clone(&backend);
+            let plan_a = plan_a.clone();
+            tokio::spawn(async move { backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await })
+        };
+
+        // A holds the only permit and is parked before the cache insert. Clear
+        // the barrier so B (a distinct key) runs without pausing; B must be
+        // rejected by the saturated limiter rather than queue behind A.
+        barrier.wait_until_reached().await;
+        *backend.fill_barrier.lock().unwrap() = None;
+        let fill_b = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
+        assert_eq!(
+            fill_b,
+            ObjectDataCacheFillResult::SkippedFillConcurrency,
+            "a distinct-key fill must be rejected, not queued, when the limiter is saturated"
+        );
+        assert!(
+            matches!(backend.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss),
+            "a rejected fill must not populate the cache"
+        );
+
+        barrier.release();
+        let fill_a = fill_a.await.expect("leader fill task should complete");
+        assert_eq!(fill_a, ObjectDataCacheFillResult::Inserted);
     }
 
     // ODC-12(1): the first refill after a TTL expiry must not self-destruct.
