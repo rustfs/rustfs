@@ -65,6 +65,15 @@ impl ObjectDataCacheSingleflight {
             finished: false,
         })
     }
+
+    /// Returns whether a leader fill is currently in flight for the key.
+    ///
+    /// Used by the fill hot path to keep another in-flight fill's index key
+    /// (a different key under the same identity that has registered in the index
+    /// but not yet published its cache entry) from being pruned as stale.
+    pub fn has_inflight(&self, key: &ObjectDataCacheKey) -> bool {
+        lock_fills(&self.fills).contains_key(key)
+    }
 }
 
 /// Leader or waiter result from the singleflight map.
