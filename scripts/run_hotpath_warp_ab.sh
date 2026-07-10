@@ -186,10 +186,15 @@ build_ref_binary() {
   local ref="$1" dest="$OUT_DIR/rustfs-baseline"
   if [[ -n "$BASELINE_BIN" ]]; then echo "$BASELINE_BIN"; return; fi
   local wt="$OUT_DIR/baseline-worktree"
-  run git worktree add --detach "$wt" "$ref"
-  run bash -c "cd '$wt' && cargo build --release --bin rustfs"
-  run cp "$wt/target/release/rustfs" "$dest" 2>/dev/null || true
-  run git worktree remove --force "$wt" 2>/dev/null || true
+  # This function returns the binary path on stdout, so every command's
+  # stdout must be routed to stderr: `git worktree add` prints "HEAD is now
+  # at …" on stdout, which polluted the captured path and made the rig exec
+  # a two-line string as the binary (2026-07-10 dispatch run failure).
+  run git worktree add --detach "$wt" "$ref" >&2
+  run bash -c "cd '$wt' && cargo build --release --bin rustfs" >&2
+  run cp "$wt/target/release/rustfs" "$dest" 2>/dev/null >&2 || true
+  run git worktree remove --force "$wt" 2>/dev/null >&2 || true
+  [[ "$DRY_RUN" == "true" || -x "$dest" ]] || { echo "error: baseline binary missing at $dest (baseline build failed?)" >&2; return 1; }
   echo "$dest"
 }
 

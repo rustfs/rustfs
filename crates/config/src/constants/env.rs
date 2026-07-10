@@ -41,6 +41,24 @@ pub const ENV_ILM_PROCESS_TIME_DEPRECATED: &str = "_RUSTFS_ILM_PROCESS_TIME";
 /// Default ILM process boundary in seconds (24h).
 pub const DEFAULT_ILM_PROCESS_TIME_SECS: i32 = 86400;
 
+/// **TEST/DEBUG ONLY** — lifecycle "day" length override, in seconds.
+///
+/// Modeled on Ceph RGW's `rgw_lc_debug_interval`. When set to a positive
+/// integer `N`, lifecycle rule evaluation treats one Days-based "day" as `N`
+/// seconds instead of [`DEFAULT_ILM_DAY_SECS`] (86400), so `Days`-based
+/// expiration/transition/noncurrent rules become exercisable in seconds under
+/// test. When unset (or set to `0`/an invalid value), behavior is byte-for-byte
+/// identical to production.
+///
+/// This accelerates data deletion and MUST NEVER be set in a production
+/// deployment. Enabling it emits a `WARN` log. It only rescales relative
+/// `Days` deadlines; absolute `Date`-based rules are unaffected.
+pub const ENV_ILM_DEBUG_DAY_SECS: &str = "RUSTFS_ILM_DEBUG_DAY_SECS";
+
+/// Number of seconds in one lifecycle "day" (86400) used as the default when
+/// [`ENV_ILM_DEBUG_DAY_SECS`] is unset.
+pub const DEFAULT_ILM_DAY_SECS: u32 = 86400;
+
 /// Medium-drawn lines separator
 /// This is used to separate words in environment variable names.
 pub const ENV_WORD_DELIMITER_DASH: &str = "-";

@@ -78,7 +78,6 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 const REDACTED_CREDENTIAL: &str = "<redacted>";
 
@@ -335,7 +334,9 @@ impl BucketTargetSys {
     }
 
     pub async fn heartbeat(&self) {
-        let mut interval = tokio::time::interval(DEFAULT_HEALTH_CHECK_DURATION);
+        // Probe interval: `RUSTFS_REPL_HEALTH_CHECK_INTERVAL_MS` (default 5000ms,
+        // clamped to >=10ms), read once when the heartbeat task starts.
+        let mut interval = tokio::time::interval(crate::bucket::replication::replication_timing::health_check_interval());
         loop {
             interval.tick().await;
 
