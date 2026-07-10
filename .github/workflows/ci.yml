@@ -161,10 +161,15 @@ jobs:
       # Explicit gate for migration-critical suites. These tests already ran in
       # the full nextest pass above; a single filtered nextest invocation keeps
       # the named gate without rebuilding or re-running them one package at a time.
+      #
+      # The gate selects tests by name substring (data_movement / rebalance /
+      # decommission / source_cleanup / delete_marker), so renames can silently
+      # thin it. The script owns the filter expression and first verifies the
+      # selected-test count against the committed floor in
+      # .config/migration-gate-floor.txt before running the gate; renames or
+      # removals must update that file consciously (see the script header).
       - name: Run rebalance/decommission migration proofs
-        run: |
-          cargo nextest run -p rustfs-ecstore --lib \
-            -E 'test(data_movement) or test(rebalance) or test(decommission) or test(source_cleanup) or test(delete_marker)'
+        run: ./scripts/check_migration_gate_count.sh
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
