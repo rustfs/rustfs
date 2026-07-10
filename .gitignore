@@ -59,6 +59,8 @@ docs/*
 !docs/testing/**
 !docs/superpowers/
 !docs/superpowers/**
+!docs/testing/
+!docs/testing/**
 docs/heal-scanner-logging-governance.md
 docs/benchmark/rustfs-target-bench/
 docs/benchmark/*.md

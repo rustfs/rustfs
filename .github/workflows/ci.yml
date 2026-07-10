@@ -314,7 +314,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      # Full setup with dependency caching: the migration-proof step below
+      # Full setup with dependency caching: the smoke-suite step below
       # compiles the e2e_test crate, which pulls in most of the workspace.
       # Without a restored cache this was a cold multi-GB build on every run.
       - name: Setup Rust environment
@@ -336,8 +336,13 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
-      - name: Run delete-marker migration proof
-        run: cargo test -p e2e_test delete_marker_migration_semantics -- --nocapture --test-threads=1
+      # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
+      # profile.e2e-smoke default-filter in .config/nextest.toml is the single
+      # wiring mechanism for e2e tests in CI — extend that filter instead of
+      # adding new e2e jobs here. Each test spawns its own rustfs server on a
+      # random port and reuses the downloaded debug binary above.
+      - name: Run e2e smoke suite
+        run: cargo nextest run --profile e2e-smoke -p e2e_test
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
