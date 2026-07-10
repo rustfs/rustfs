@@ -63,6 +63,42 @@ pub(crate) async fn invalidate_object_data_cache_after_complete_multipart_succes
         .await
 }
 
+/// Invalidates every cached body under a prefix before a force-prefix delete
+/// begins (ODC-27). The exact-key `..._before_mutation` helper only covers the
+/// prefix string itself, leaving every object beneath it cached.
+pub(crate) async fn invalidate_object_data_cache_prefix_before_mutation(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    prefix: &str,
+) -> ObjectDataCacheInvalidationResult {
+    adapter
+        .invalidate_prefix(bucket, prefix, ObjectDataCacheInvalidationReason::BeforeMutation)
+        .await
+}
+
+/// Invalidates every cached body under a prefix after a successful force-prefix
+/// delete (ODC-27).
+pub(crate) async fn invalidate_object_data_cache_prefix_after_delete(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    prefix: &str,
+) -> ObjectDataCacheInvalidationResult {
+    adapter
+        .invalidate_prefix(bucket, prefix, ObjectDataCacheInvalidationReason::AfterPrefixDelete)
+        .await
+}
+
+/// Invalidates every cached body in a bucket after the bucket is deleted
+/// (ODC-28).
+pub(crate) async fn invalidate_object_data_cache_bucket_after_delete(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+) -> ObjectDataCacheInvalidationResult {
+    adapter
+        .invalidate_bucket(bucket, ObjectDataCacheInvalidationReason::AfterBucketDelete)
+        .await
+}
+
 /// Invalidates a single object identity through the app-layer cache adapter.
 pub(crate) async fn invalidate_object_data_cache_object(
     adapter: &ObjectDataCacheAdapter,

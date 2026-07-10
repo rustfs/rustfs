@@ -63,9 +63,10 @@ use super::storage_api::bucket_usecase::{
 use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
+use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
-    current_notify_interface_for_context, current_object_store_handle_for_context,
+    current_notify_interface_for_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
@@ -1192,6 +1193,13 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+
+        // Drop every cached object body for the now-deleted bucket so dead
+        // bytes do not sit resident until TTL. Covers both the normal and the
+        // force-delete path, which share this single delete_bucket call
+        // (ODC-28, backlog#1133).
+        let cache_adapter = current_object_data_cache_for_context(self.context.as_deref());
+        let _ = invalidate_object_data_cache_bucket_after_delete(&cache_adapter, &input.bucket).await;
 
         // Invalidate bucket validation cache
         crate::storage::invalidate_bucket_validation_cache(&input.bucket);

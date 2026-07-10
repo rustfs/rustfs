@@ -36,6 +36,7 @@ pub mod kms_management;
 pub mod metrics;
 pub mod module_switch;
 mod notify_runtime_access;
+pub mod object_data_cache;
 pub mod object_zip_download;
 pub mod oidc;
 pub mod plugins_catalog;

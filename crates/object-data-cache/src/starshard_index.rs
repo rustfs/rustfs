@@ -98,6 +98,42 @@ impl StarshardIdentityIndex {
             .map_or_else(Vec::new, |set| set.cloned())
     }
 
+    /// Removes every tracked identity whose key matches `predicate`, returning
+    /// all keys that were dropped so the caller can evict them from the cache.
+    ///
+    /// This performs a **full shard scan** (`keys()` snapshots every identity,
+    /// then each match is removed under its shard write lock). It is therefore
+    /// restricted to the rare prefix-delete, bucket-delete, and admin
+    /// `clear()`/flush paths — it must never run on the GET or fill hot path.
+    /// A `true`-returning predicate clears the whole index (used by `clear()`).
+    ///
+    /// The snapshot/remove split leaves a small window: an identity inserted
+    /// after the snapshot but before removal is not visited, and a key added to
+    /// a matched identity between snapshot and its `remove` is still dropped
+    /// from the index (via `remove`) but returned for cache eviction, so no
+    /// tracked body is stranded. This is acceptable hygiene slack on these rare
+    /// paths (backlog#1132/#1133/#1143).
+    pub async fn remove_matching<F>(&self, predicate: F) -> Vec<ObjectDataCacheKey>
+    where
+        F: Fn(&ObjectDataCacheIdentity) -> bool,
+    {
+        let identities: Vec<ObjectDataCacheIdentity> = self
+            .by_object
+            .keys()
+            .await
+            .into_iter()
+            .filter(|identity| predicate(identity))
+            .collect();
+
+        let mut removed = Vec::new();
+        for identity in identities {
+            if let Some(key_set) = self.by_object.remove(&identity).await {
+                removed.extend(key_set.cloned());
+            }
+        }
+        removed
+    }
+
     /// Removes a single evicted key tracked under an identity, but only when the
     /// evicted entry's generation token still matches the tracked one.
     ///
@@ -257,6 +293,53 @@ mod tests {
         // A later invalidate_object still finds and removes the key.
         let invalidated = index.remove_identity(&identity).await;
         assert_eq!(invalidated, vec![key_a]);
+    }
+
+    fn bucketed_key(bucket: &str, object: &str) -> ObjectDataCacheKey {
+        ObjectDataCacheKey::new(bucket, object, Some("v1"), "etag", 1, ObjectDataCacheBodyVariant::FullObjectPlainV1)
+    }
+
+    #[tokio::test]
+    async fn remove_matching_returns_only_predicate_matches() {
+        let index = StarshardIdentityIndex::new(4);
+        let id_photos = ObjectDataCacheIdentity::new("bucket", "photos/a.jpg");
+        let id_photos2 = ObjectDataCacheIdentity::new("bucket", "photos/b.jpg");
+        let id_videos = ObjectDataCacheIdentity::new("bucket", "videos/c.mp4");
+
+        let _ = index
+            .insert(id_photos.clone(), bucketed_key("bucket", "photos/a.jpg"), 1)
+            .await;
+        let _ = index
+            .insert(id_photos2.clone(), bucketed_key("bucket", "photos/b.jpg"), 2)
+            .await;
+        let _ = index
+            .insert(id_videos.clone(), bucketed_key("bucket", "videos/c.mp4"), 3)
+            .await;
+
+        let removed = index
+            .remove_matching(|identity| identity.bucket.as_ref() == "bucket" && identity.object.starts_with("photos/"))
+            .await;
+
+        assert_eq!(removed.len(), 2, "only the two photos/ identities match the prefix");
+        // The unmatched identity is still tracked; the matched ones are gone.
+        assert!(index.remove_identity(&id_videos).await.len() == 1);
+        assert!(index.remove_identity(&id_photos).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_matching_true_predicate_clears_index() {
+        let index = StarshardIdentityIndex::new(4);
+        let _ = index
+            .insert(ObjectDataCacheIdentity::new("b1", "o1"), bucketed_key("b1", "o1"), 1)
+            .await;
+        let _ = index
+            .insert(ObjectDataCacheIdentity::new("b2", "o2"), bucketed_key("b2", "o2"), 2)
+            .await;
+
+        let removed = index.remove_matching(|_| true).await;
+
+        assert_eq!(removed.len(), 2);
+        assert_eq!(index.identity_count().await, 0, "a true predicate clears every identity");
     }
 
     #[tokio::test]

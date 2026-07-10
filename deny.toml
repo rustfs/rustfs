@@ -40,9 +40,6 @@ allow-git = [
     # Pinned to a specific commit in workspace Cargo.toml.
     # "https://github.com/rustfs/s3s",
     "https://github.com/apache/datafusion.git",
-    # Runtime-probed io_uring read backend (backlog#1104), Linux-only.
-    # Pinned to a specific commit in crates/ecstore/Cargo.toml.
-    "https://github.com/rustfs/uring",
 ]
 
 [bans]

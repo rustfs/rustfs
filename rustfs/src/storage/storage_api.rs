@@ -441,7 +441,9 @@ pub(crate) mod ecstore_rpc {
 }
 
 pub(crate) mod ecstore_object {
-    pub(crate) use rustfs_ecstore::api::object::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
+    pub(crate) use rustfs_ecstore::api::object::{
+        GetObjectBodyCacheHook, ObjectMutationHook, register_get_object_body_cache_hook, register_object_mutation_hook,
+    };
 }
 
 pub(crate) mod ecstore_set_disk {

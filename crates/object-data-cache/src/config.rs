@@ -54,6 +54,11 @@ pub enum ObjectDataCacheMode {
 }
 
 impl ObjectDataCacheMode {
+    /// Stable lowercase identifier for this mode, for admin status reporting.
+    pub const fn as_str(self) -> &'static str {
+        self.as_metric_label()
+    }
+
     pub(crate) const fn as_metric_label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
