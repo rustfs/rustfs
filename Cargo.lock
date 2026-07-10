@@ -10030,7 +10030,7 @@ dependencies = [
 [[package]]
 name = "rustfs-uring"
 version = "0.1.0"
-source = "git+https://github.com/rustfs/uring?rev=39018c09cde98b380658f1a1511349a3574daddf#39018c09cde98b380658f1a1511349a3574daddf"
+source = "git+https://github.com/rustfs/uring?rev=f577ba0bfd6c3d74f9bdc54b573b8fcb45d6bc22#f577ba0bfd6c3d74f9bdc54b573b8fcb45d6bc22"
 dependencies = [
  "io-uring",
  "libc",

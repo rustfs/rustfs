@@ -813,6 +813,7 @@ impl LocalDiskWrapper {
                     immediate: false,
                     undo_write: false,
                     old_data_dir: None,
+                    ..Default::default()
                 },
             )
             .await?;

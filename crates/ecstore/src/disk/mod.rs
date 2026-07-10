@@ -31,6 +31,14 @@ pub const MIGRATING_META_BUCKET: &str = ".minio.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
+/// Staging area for the delete quorum-rollback (backlog#864). Sibling of
+/// `.trash` under `tmp`, deliberately kept separate from the overwrite backup
+/// (`xl.meta.bkp`) so the two rollback mechanisms never share paths. A failed
+/// delete stages the pre-delete `xl.meta` (and its data-dirs) here so an
+/// `undo_delete` fan-out can restore the object; a committed delete drains the
+/// staged content to `.trash`. Like `.trash`, this prefix must be excluded from
+/// data-usage/list/heal traversal.
+pub const RUSTFS_META_TMP_ROLLBACK_BUCKET: &str = ".rustfs.sys/tmp/.rollback";
 pub const BUCKET_META_PREFIX: &str = "buckets";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
@@ -882,8 +890,30 @@ pub struct RenameDataResp {
 pub struct DeleteOptions {
     pub recursive: bool,
     pub immediate: bool,
+    /// Overwrite-rollback flag (issue #4107). Reserved for `rename_data` undo;
+    /// never reuse it for the delete rollback below — use `undo_delete` instead.
     pub undo_write: bool,
     pub old_data_dir: Option<Uuid>,
+    // --- delete quorum-rollback (backlog#864) ---
+    // All new fields default to the legacy behavior and carry `#[serde(default)]`
+    // so a peer that predates them (rolling upgrade) still decodes the option.
+    /// prepare: back up the pre-delete `xl.meta` (and stage its data-dirs) into
+    /// the rollback token dir before applying the destructive delete.
+    #[serde(default)]
+    pub stage_rollback: bool,
+    /// prepare token for the single-object delete path.
+    #[serde(default)]
+    pub rollback_token: Option<Uuid>,
+    /// prepare tokens for the batch delete path, aligned by position with the
+    /// `versions` array (one unique token per (op, object)).
+    #[serde(default)]
+    pub rollback_tokens: Vec<Uuid>,
+    /// undo: self-describing restore/removal keyed by the staged token dir.
+    #[serde(default)]
+    pub undo_delete: Option<Uuid>,
+    /// commit: drain the staged token dir to trash once quorum is reached.
+    #[serde(default)]
+    pub commit_delete: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1123,12 +1153,19 @@ mod tests {
             immediate: false,
             undo_write: true,
             old_data_dir: Some(Uuid::new_v4()),
+            ..Default::default()
         };
 
         assert!(opts.recursive);
         assert!(!opts.immediate);
         assert!(opts.undo_write);
         assert!(opts.old_data_dir.is_some());
+        // #864 additions default to the legacy (no-op) behavior.
+        assert!(!opts.stage_rollback);
+        assert!(opts.rollback_token.is_none());
+        assert!(opts.rollback_tokens.is_empty());
+        assert!(opts.undo_delete.is_none());
+        assert!(opts.commit_delete.is_none());
     }
 
     /// Test ReadOptions structure

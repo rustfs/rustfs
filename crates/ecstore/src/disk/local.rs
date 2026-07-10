@@ -19,8 +19,9 @@ use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
     FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
-    RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE,
-    STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    RUSTFS_META_TMP_DELETED_BUCKET, RUSTFS_META_TMP_ROLLBACK_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -3371,6 +3372,95 @@ impl LocalDisk {
     //     })
     // }
 
+    // --- delete quorum-rollback staging helpers (backlog#864) ---
+
+    /// Absolute path of a rollback staging token directory on this disk.
+    fn rollback_token_dir_path(&self, token: Uuid) -> Result<PathBuf> {
+        self.get_object_path(RUSTFS_META_TMP_ROLLBACK_BUCKET, token.to_string().as_str())
+    }
+
+    /// prepare: record the create-from-absent sentinel (no xl.meta backup).
+    async fn stage_created_from_absent(&self, token: Uuid) -> Result<()> {
+        let tdir = self.rollback_token_dir_path(token)?;
+        fs::create_dir_all(&tdir).await.map_err(to_volume_error)?;
+        fs::write(tdir.join(".created_from_absent"), b"")
+            .await
+            .map_err(to_file_error)?;
+        Ok(())
+    }
+
+    /// prepare: back up the pre-delete `xl.meta` into the token dir and return it.
+    async fn stage_backup_meta(&self, token: Uuid, buf: &[u8]) -> Result<PathBuf> {
+        let tdir = self.rollback_token_dir_path(token)?;
+        fs::create_dir_all(&tdir).await.map_err(to_volume_error)?;
+        fs::write(tdir.join(STORAGE_FORMAT_FILE), buf).await.map_err(to_file_error)?;
+        Ok(tdir)
+    }
+
+    /// undo: self-describing rollback keyed by the staged token dir. A missing
+    /// token dir is a benign idempotent no-op (this disk never staged anything).
+    async fn undo_staged_delete(&self, volume: &str, path: &str, token: Uuid) -> Result<()> {
+        let tdir = self.rollback_token_dir_path(token)?;
+        if !os::file_exists(&tdir) {
+            warn!(disk = %self.endpoint, %token, "undo_delete: no staged token dir, treating as no-op");
+            return Ok(());
+        }
+
+        let volume_dir = self.get_bucket_path(volume)?;
+        let file_path = self.get_object_path(volume, path)?;
+        let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
+
+        if os::file_exists(tdir.join(".created_from_absent")) {
+            // absent leg: remove the phantom marker created from nothing.
+            if let Err(err) = self.delete_file(&volume_dir, &xl_path, false, false).await
+                && err != DiskError::FileNotFound
+                && err != DiskError::VolumeNotFound
+            {
+                warn!(disk = %self.endpoint, %token, ?err, "undo_delete: failed to remove phantom marker");
+            }
+        } else if os::file_exists(tdir.join(STORAGE_FORMAT_FILE)) {
+            // restore leg: rename the backup xl.meta back, then each staged data-dir.
+            // base_dir is the bucket dir (not the object dir): a branch-B delete may
+            // have removed the object dir, and the rename must recreate it.
+            let backup_meta = tdir.join(STORAGE_FORMAT_FILE);
+            rename_all(&backup_meta, &xl_path, &volume_dir).await?;
+
+            let mut rd = fs::read_dir(&tdir).await.map_err(to_volume_error)?;
+            while let Some(entry) = rd.next_entry().await.map_err(to_volume_error)? {
+                let name = entry.file_name();
+                if name == ".created_from_absent" {
+                    continue;
+                }
+                let dst = path_join(&[file_path.as_path(), Path::new(&name)]);
+                if let Err(err) = rename_all(entry.path(), &dst, &volume_dir).await {
+                    warn!(disk = %self.endpoint, %token, ?err, "undo_delete: failed to restore staged data-dir");
+                }
+            }
+        }
+
+        // best-effort cleanup: leftover staging is reclaimed by the orphan sweeper.
+        if let Err(err) = fs::remove_dir_all(&tdir).await
+            && err.kind() != ErrorKind::NotFound
+        {
+            warn!(disk = %self.endpoint, %token, ?err, "undo_delete: failed to clean token dir");
+        }
+        Ok(())
+    }
+
+    /// commit: drain the staged token dir to trash once quorum is reached. A
+    /// missing token dir is a benign no-op.
+    async fn commit_staged_delete(&self, token: Uuid) -> Result<()> {
+        let tdir = self.rollback_token_dir_path(token)?;
+        if os::file_exists(&tdir)
+            && let Err(err) = self.move_to_trash(&tdir, true, false).await
+            && err != DiskError::FileNotFound
+            && err != DiskError::VolumeNotFound
+        {
+            warn!(disk = %self.endpoint, %token, ?err, "commit_delete: failed to drain staged token dir to trash");
+        }
+        Ok(())
+    }
+
     async fn move_to_trash(&self, delete_path: &PathBuf, recursive: bool, immediate_purge: bool) -> Result<()> {
         // if recursive {
         //     remove_all_std(delete_path).map_err(to_volume_error)?;
@@ -3699,7 +3789,21 @@ impl LocalDisk {
         Ok((bytes, modtime))
     }
 
-    async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &[FileInfo]) -> Result<()> {
+    async fn delete_versions_internal(
+        &self,
+        volume: &str,
+        path: &str,
+        fis: &[FileInfo],
+        stage_rollback: bool,
+        token: Option<Uuid>,
+    ) -> Result<()> {
+        // test-only fault injection (design §7.1): fail before staging so the
+        // object on this disk is provably untouched. Compiled out in production.
+        #[cfg(test)]
+        if stage_rollback && delete_fault::should_fail_early(volume, self.endpoint.disk_idx as usize) {
+            return Err(DiskError::FaultyDisk);
+        }
+
         let volume_dir = self.get_bucket_path(volume)?;
         let xlpath = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
 
@@ -3712,6 +3816,20 @@ impl LocalDisk {
         let mut fm = FileMeta::default();
 
         fm.unmarshal_msg(&data)?;
+
+        // #864 prepare: an object exists on this disk, so back up its pre-delete
+        // xl.meta once before any destructive change. Absent disks returned above
+        // (FileNotFound / empty data) never create a token dir, so their undo is a
+        // benign no-op (design §2.3). All this object's data-dirs share one token.
+        let staged_dir = if stage_rollback {
+            if let Some(token) = token {
+                Some(self.stage_backup_meta(token, &data).await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         for fi in fis.iter() {
             let data_dir = match fm.delete_version(fi) {
@@ -3731,7 +3849,10 @@ impl LocalDisk {
                 let _ = fm.data.remove(vec![vid, dir]);
 
                 let dir_path = self.get_object_path(volume, format!("{path}/{dir}").as_str())?;
-                if let Err(err) = self.move_to_trash(&dir_path, true, false).await
+                if let Some(tdir) = staged_dir.as_ref() {
+                    let staged_data = path_join(&[tdir.as_path(), Path::new(dir.to_string().as_str())]);
+                    rename_all_ignore_missing_source(&dir_path, &staged_data, tdir.as_path()).await?;
+                } else if let Err(err) = self.move_to_trash(&dir_path, true, false).await
                     && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
                 {
                     return Err(err);
@@ -3742,15 +3863,22 @@ impl LocalDisk {
         // Remove xl.meta when no versions remain
         if fm.versions.is_empty() {
             self.delete_file(&volume_dir, &xlpath, true, false).await?;
-            return Ok(());
+        } else {
+            // Update xl.meta atomically: a concurrent reader or crash mid-write must
+            // never observe a truncated xl.meta for versions that were not deleted.
+            let buf = fm.marshal_msg()?;
+
+            self.write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
+                .await?;
         }
 
-        // Update xl.meta atomically: a concurrent reader or crash mid-write must
-        // never observe a truncated xl.meta for versions that were not deleted.
-        let buf = fm.marshal_msg()?;
-
-        self.write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
-            .await?;
+        // test-only fault injection (design §7.1): model an errored-but-staged disk
+        // that applied the delete then reports failure; the set-layer undo fan-out
+        // must still restore it. Compiled out in production.
+        #[cfg(test)]
+        if stage_rollback && delete_fault::should_fail_after_stage(volume, self.endpoint.disk_idx as usize) {
+            return Err(DiskError::FaultyDisk);
+        }
 
         Ok(())
     }
@@ -6310,6 +6438,31 @@ impl DiskAPI for LocalDisk {
                 .await;
         }
 
+        // #864 rollback-token interception, placed AFTER the slash delegation so a
+        // token can never target a directory/slash path (delete_prefix is excluded,
+        // see design §5). Directory objects reach delete_version already encoded (no
+        // leading slash), so the assert pins the invariant for tests.
+        if opts.undo_delete.is_some() || opts.commit_delete.is_some() {
+            debug_assert!(
+                !path.starts_with(SLASH_SEPARATOR),
+                "rollback token must never target a slash/directory path"
+            );
+        }
+        if let Some(token) = opts.undo_delete {
+            return self.undo_staged_delete(volume, path, token).await;
+        }
+        if let Some(token) = opts.commit_delete {
+            return self.commit_staged_delete(token).await;
+        }
+
+        // test-only fault injection (design §7.1): force a delete failure on
+        // selected disks BEFORE any staging so the object is provably untouched.
+        // Compiled out of production builds (`#[cfg(test)]`), so zero prod impact.
+        #[cfg(test)]
+        if opts.stage_rollback && delete_fault::should_fail_early(volume, self.endpoint.disk_idx as usize) {
+            return Err(DiskError::FaultyDisk);
+        }
+
         let volume_dir = self.get_bucket_path(volume)?;
 
         let file_path = self.get_object_path(volume, path)?;
@@ -6325,6 +6478,15 @@ impl DiskAPI for LocalDisk {
                 }
 
                 if fi.deleted && force_del_marker {
+                    // create-from-absent leg: a fresh delete-marker is written where
+                    // no object existed. Record an absent sentinel (no xl.meta backup)
+                    // so an undo removes the phantom marker instead of restoring a
+                    // non-existent backup (design §2.2 / §3).
+                    if opts.stage_rollback
+                        && let Some(token) = opts.rollback_token
+                    {
+                        self.stage_created_from_absent(token).await?;
+                    }
                     return self.write_metadata("", volume, path, fi).await;
                 }
 
@@ -6337,6 +6499,20 @@ impl DiskAPI for LocalDisk {
         };
 
         let mut meta = FileMeta::load(&buf)?;
+
+        // #864 prepare: back up the pre-delete xl.meta verbatim before any
+        // destructive change. Not fsynced (design §4): in-process undo relies on
+        // same-disk rename, and crash recovery is delegated to heal.
+        let staged_dir = if opts.stage_rollback {
+            if let Some(token) = opts.rollback_token {
+                Some(self.stage_backup_meta(token, &buf).await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let old_dir = meta.delete_version(&fi)?;
 
         if let Some(uuid) = old_dir {
@@ -6346,7 +6522,12 @@ impl DiskAPI for LocalDisk {
             let old_path = path_join(&[file_path.as_path(), Path::new(uuid.to_string().as_str())]);
             check_path_length(old_path.to_string_lossy().as_ref())?;
 
-            if let Err(err) = self.move_to_trash(&old_path, true, false).await
+            if let Some(tdir) = staged_dir.as_ref() {
+                // stage (same-disk rename) the data-dir into the token dir rather
+                // than trashing it, so an undo can rename it back.
+                let staged_data = path_join(&[tdir.as_path(), Path::new(uuid.to_string().as_str())]);
+                rename_all_ignore_missing_source(&old_path, &staged_data, tdir.as_path()).await?;
+            } else if let Err(err) = self.move_to_trash(&old_path, true, false).await
                 && err != DiskError::FileNotFound
                 && err != DiskError::VolumeNotFound
             {
@@ -6367,22 +6548,42 @@ impl DiskAPI for LocalDisk {
 
         if !meta.versions.is_empty() {
             let buf = meta.marshal_msg()?;
-            return self
-                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
-                .await;
+            self.write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
+                .await?;
+        } else {
+            self.delete_file(&volume_dir, &xl_path, true, false).await?;
         }
 
-        self.delete_file(&volume_dir, &xl_path, true, false).await
+        // test-only fault injection (design §7.1): the delete has been applied and
+        // the rollback content is staged; model an "errored-but-staged" disk that
+        // reports failure so the set-layer undo fan-out must still restore it.
+        #[cfg(test)]
+        if opts.stage_rollback && delete_fault::should_fail_after_stage(volume, self.endpoint.disk_idx as usize) {
+            return Err(DiskError::FaultyDisk);
+        }
+
+        Ok(())
     }
+
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, _opts: DeleteOptions) -> Vec<Option<Error>> {
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         let mut errs = Vec::with_capacity(versions.len());
         for _ in 0..versions.len() {
             errs.push(None);
         }
 
         for (i, ver) in versions.iter().enumerate() {
-            if let Err(e) = self.delete_versions_internal(volume, ver.name.as_str(), &ver.versions).await {
+            // #864 batch prepare: each (op, object) carries a unique token, aligned
+            // by position with the `versions` array (never derived from name).
+            let token = if opts.stage_rollback {
+                opts.rollback_tokens.get(i).copied()
+            } else {
+                None
+            };
+            if let Err(e) = self
+                .delete_versions_internal(volume, ver.name.as_str(), &ver.versions, opts.stage_rollback, token)
+                .await
+            {
                 errs[i] = Some(e);
             } else {
                 errs[i] = None;
@@ -6560,6 +6761,65 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
     };
 
     Ok((disk_info, root_drive))
+}
+
+/// Test-only fault-injection knob for the delete rollback path (backlog#864,
+/// design §7.1). The delete path has no natural injection point, so set-layer
+/// tests use this to force selected disks (by `disk_idx`) to fail either before
+/// staging (`FAIL_EARLY`) or after apply+stage (`FAIL_AFTER_STAGE`). Gated on
+/// `#[cfg(test)]`, so it is compiled out of production entirely — the seam never
+/// leaks into a release build and does not alter the `Disk` enum's behavior.
+#[cfg(test)]
+pub(crate) mod delete_fault {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    type BucketDiskSet = HashMap<String, HashSet<usize>>;
+
+    fn fail_early() -> &'static Mutex<BucketDiskSet> {
+        static M: OnceLock<Mutex<BucketDiskSet>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    fn fail_after_stage() -> &'static Mutex<BucketDiskSet> {
+        static M: OnceLock<Mutex<BucketDiskSet>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm/disarm are keyed by bucket so an armed fault can only ever hit the
+    /// erasure set under test — unrelated buckets (including other tests running
+    /// in parallel, since delete rollback is on by default) never match. This
+    /// keeps the seam hermetic without serializing the whole delete test surface.
+    pub(crate) fn arm_fail_early(bucket: &str, disk_idxs: &[usize]) {
+        fail_early()
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), disk_idxs.iter().copied().collect());
+    }
+    pub(crate) fn arm_fail_after_stage(bucket: &str, disk_idxs: &[usize]) {
+        fail_after_stage()
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), disk_idxs.iter().copied().collect());
+    }
+    pub(crate) fn disarm(bucket: &str) {
+        fail_early().lock().unwrap().remove(bucket);
+        fail_after_stage().lock().unwrap().remove(bucket);
+    }
+    pub(crate) fn should_fail_early(bucket: &str, disk_idx: usize) -> bool {
+        fail_early()
+            .lock()
+            .unwrap()
+            .get(bucket)
+            .is_some_and(|s| s.contains(&disk_idx))
+    }
+    pub(crate) fn should_fail_after_stage(bucket: &str, disk_idx: usize) -> bool {
+        fail_after_stage()
+            .lock()
+            .unwrap()
+            .get(bucket)
+            .is_some_and(|s| s.contains(&disk_idx))
+    }
 }
 
 #[cfg(test)]
@@ -8783,7 +9043,7 @@ mod test {
             .await
             .expect("existing metadata should be written");
 
-        disk.delete_versions_internal(bucket, object, &[missing_fi, existing_fi])
+        disk.delete_versions_internal(bucket, object, &[missing_fi, existing_fi], false, None)
             .await
             .expect("missing non-deleted version should not abort deletion");
 
@@ -10578,6 +10838,7 @@ mod test {
             immediate: true,
             undo_write: false,
             old_data_dir: None,
+            ..Default::default()
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)
             .await
@@ -12109,5 +12370,450 @@ mod test {
             mean,
             (reads * shard_mib) as f64 / wall,
         );
+    }
+
+    // backlog#864: disk-layer contract for the delete quorum-rollback.
+    mod delete_rollback_864 {
+        use super::*;
+        use tempfile::tempdir;
+
+        fn rollback_token_dir(root: &std::path::Path, token: Uuid) -> std::path::PathBuf {
+            root.join(RUSTFS_META_TMP_ROLLBACK_BUCKET).join(token.to_string())
+        }
+
+        /// Single-disk scaffold: one single-version object with a real data-dir.
+        async fn seed_single_version(
+            root: &std::path::Path,
+            disk: &LocalDisk,
+            bucket: &str,
+            object: &str,
+        ) -> (Uuid, Uuid, Vec<u8>) {
+            ensure_test_volume(disk, bucket).await;
+            let vid = Uuid::new_v4();
+            let data_dir = Uuid::new_v4();
+            let object_dir = root.join(bucket).join(object);
+            fs::create_dir_all(object_dir.join(data_dir.to_string()))
+                .await
+                .expect("data dir should be created");
+            fs::write(object_dir.join(data_dir.to_string()).join("part.1"), b"payload-864")
+                .await
+                .expect("part should be written");
+            let fi = test_file_info(object, vid, Some(data_dir), None);
+            let original = test_meta(fi);
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &original)
+                .await
+                .expect("xl.meta should be written");
+            (vid, data_dir, original)
+        }
+
+        // #1 prepare backs up the original xl.meta + stages the data-dir; the
+        // object enters its deleted state (branch B: last version -> xl.meta gone).
+        #[tokio::test]
+        async fn stage_rollback_backs_up_original_then_applies_delete_branch_b() {
+            let dir = tempdir().unwrap();
+            let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+            let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+            let (bucket, object) = ("bucket", "dir/obj");
+            let (vid, data_dir, original) = seed_single_version(dir.path(), &disk, bucket, object).await;
+
+            let token = Uuid::new_v4();
+            disk.delete_version(
+                bucket,
+                object,
+                test_file_info(object, vid, Some(data_dir), None),
+                false,
+                DeleteOptions {
+                    stage_rollback: true,
+                    rollback_token: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("staged delete should succeed");
+
+            let object_dir = dir.path().join(bucket).join(object);
+            assert!(
+                !object_dir.join(STORAGE_FORMAT_FILE).exists(),
+                "xl.meta must be removed after last-version delete"
+            );
+            assert!(
+                !object_dir.join(data_dir.to_string()).exists(),
+                "data-dir must be moved out of object dir"
+            );
+            let tdir = rollback_token_dir(dir.path(), token);
+            assert_eq!(
+                fs::read(tdir.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("backup xl.meta must exist"),
+                original,
+                "rollback backup must be the pre-delete xl.meta verbatim"
+            );
+            assert_eq!(
+                fs::read(tdir.join(data_dir.to_string()).join("part.1"))
+                    .await
+                    .expect("staged data-dir must exist"),
+                b"payload-864",
+                "data-dir must be staged (renamed) into the token dir, not sent to trash"
+            );
+        }
+
+        // #2 undo restores the object byte-for-byte (branch B); token dir cleaned.
+        #[tokio::test]
+        async fn undo_delete_restores_object_byte_for_byte_branch_b() {
+            let dir = tempdir().unwrap();
+            let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+            let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+            let (bucket, object) = ("bucket", "dir/obj");
+            let (vid, data_dir, original) = seed_single_version(dir.path(), &disk, bucket, object).await;
+
+            let token = Uuid::new_v4();
+            let fi = test_file_info(object, vid, Some(data_dir), None);
+            disk.delete_version(
+                bucket,
+                object,
+                fi.clone(),
+                false,
+                DeleteOptions {
+                    stage_rollback: true,
+                    rollback_token: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            disk.delete_version(
+                bucket,
+                object,
+                fi,
+                false,
+                DeleteOptions {
+                    undo_delete: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("undo should succeed");
+
+            let object_dir = dir.path().join(bucket).join(object);
+            assert_eq!(
+                fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("xl.meta restored"),
+                original,
+                "undo must restore the original xl.meta byte-for-byte"
+            );
+            assert_eq!(
+                fs::read(object_dir.join(data_dir.to_string()).join("part.1"))
+                    .await
+                    .expect("data-dir restored"),
+                b"payload-864",
+                "undo must restore the data-dir"
+            );
+            assert!(!rollback_token_dir(dir.path(), token).exists(), "token dir must be cleaned after undo");
+        }
+
+        // #3 undo branch A: other versions remain -> restore the full original xl.meta.
+        #[tokio::test]
+        async fn undo_delete_restores_when_other_versions_remain_branch_a() {
+            let dir = tempdir().unwrap();
+            let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+            let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+            let (bucket, object) = ("bucket", "dir/obj");
+            ensure_test_volume(&disk, bucket).await;
+
+            let vid_del = Uuid::new_v4();
+            let vid_keep = Uuid::new_v4();
+            let dd_del = Uuid::new_v4();
+            let dd_keep = Uuid::new_v4();
+            let object_dir = dir.path().join(bucket).join(object);
+            fs::create_dir_all(object_dir.join(dd_del.to_string())).await.unwrap();
+            fs::create_dir_all(object_dir.join(dd_keep.to_string())).await.unwrap();
+
+            let mut meta = FileMeta::default();
+            meta.add_version(test_file_info(object, vid_del, Some(dd_del), None)).unwrap();
+            meta.add_version(test_file_info(object, vid_keep, Some(dd_keep), None))
+                .unwrap();
+            let original = meta.marshal_msg().unwrap();
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &original).await.unwrap();
+
+            let token = Uuid::new_v4();
+            let fi_del = test_file_info(object, vid_del, Some(dd_del), None);
+            disk.delete_version(
+                bucket,
+                object,
+                fi_del.clone(),
+                false,
+                DeleteOptions {
+                    stage_rollback: true,
+                    rollback_token: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(object_dir.join(STORAGE_FORMAT_FILE).exists());
+
+            disk.delete_version(
+                bucket,
+                object,
+                fi_del,
+                false,
+                DeleteOptions {
+                    undo_delete: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                fs::read(object_dir.join(STORAGE_FORMAT_FILE)).await.unwrap(),
+                original,
+                "undo must restore the full original xl.meta (both versions), not the rewritten subset"
+            );
+        }
+
+        // #4 commit moves the staged content to trash; object stays deleted.
+        #[tokio::test]
+        async fn commit_delete_moves_staged_to_trash() {
+            let dir = tempdir().unwrap();
+            let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+            let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+            let (bucket, object) = ("bucket", "dir/obj");
+            let (vid, data_dir, _original) = seed_single_version(dir.path(), &disk, bucket, object).await;
+
+            let token = Uuid::new_v4();
+            let fi = test_file_info(object, vid, Some(data_dir), None);
+            disk.delete_version(
+                bucket,
+                object,
+                fi.clone(),
+                false,
+                DeleteOptions {
+                    stage_rollback: true,
+                    rollback_token: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            disk.delete_version(
+                bucket,
+                object,
+                fi,
+                false,
+                DeleteOptions {
+                    commit_delete: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                !rollback_token_dir(dir.path(), token).exists(),
+                "committed token dir must be drained to trash"
+            );
+            assert!(
+                !dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
+                "object stays deleted after commit"
+            );
+            let trash = dir.path().join(RUSTFS_META_TMP_DELETED_BUCKET);
+            let mut rd = fs::read_dir(&trash).await.expect("trash dir should exist");
+            assert!(rd.next_entry().await.unwrap().is_some(), "staged content must land in trash on commit");
+        }
+
+        // #5 create-from-absent leg: staging records a sentinel; undo removes the
+        // phantom marker instead of restoring a non-existent backup.
+        #[tokio::test]
+        async fn stage_rollback_create_from_absent_undo_removes_phantom_marker() {
+            let dir = tempdir().unwrap();
+            let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+            let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+            let (bucket, object) = ("bucket", "dir/ghost");
+            ensure_test_volume(&disk, bucket).await;
+
+            let vid = Uuid::new_v4();
+            let fi = FileInfo {
+                name: object.to_string(),
+                version_id: Some(vid),
+                deleted: true,
+                mark_deleted: true,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            let token = Uuid::new_v4();
+            disk.delete_version(
+                bucket,
+                object,
+                fi.clone(),
+                true,
+                DeleteOptions {
+                    stage_rollback: true,
+                    rollback_token: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let object_dir = dir.path().join(bucket).join(object);
+            assert!(
+                object_dir.join(STORAGE_FORMAT_FILE).exists(),
+                "a fresh delete-marker xl.meta must have been created"
+            );
+            let tdir = rollback_token_dir(dir.path(), token);
+            assert!(
+                tdir.join(".created_from_absent").exists(),
+                "absent sentinel must be recorded (no backup to restore)"
+            );
+            assert!(!tdir.join(STORAGE_FORMAT_FILE).exists(), "create-from-absent leg has no xl.meta backup");
+
+            disk.delete_version(
+                bucket,
+                object,
+                fi,
+                true,
+                DeleteOptions {
+                    undo_delete: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                !object_dir.join(STORAGE_FORMAT_FILE).exists(),
+                "undo of a create-from-absent delete must remove the phantom marker, not no-op"
+            );
+            assert!(!tdir.exists(), "token dir cleaned");
+        }
+
+        // #6 undo is idempotent: unknown token dir -> Ok, object untouched.
+        #[tokio::test]
+        async fn undo_delete_is_noop_when_token_dir_absent() {
+            let dir = tempdir().unwrap();
+            let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+            let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+            let (bucket, object) = ("bucket", "dir/obj");
+            let (vid, data_dir, original) = seed_single_version(dir.path(), &disk, bucket, object).await;
+
+            disk.delete_version(
+                bucket,
+                object,
+                test_file_info(object, vid, Some(data_dir), None),
+                false,
+                DeleteOptions {
+                    undo_delete: Some(Uuid::new_v4()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("undo with unknown token must be a benign no-op, not an error");
+
+            assert_eq!(
+                fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                    .await
+                    .unwrap(),
+                original,
+                "no-op undo must leave the object untouched"
+            );
+        }
+
+        // #7 batch: multiple versions, single token -> all restored on undo.
+        #[tokio::test]
+        async fn delete_versions_internal_multi_version_single_token_undo_restores_all() {
+            let dir = tempdir().unwrap();
+            let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+            let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+            let (bucket, object) = ("bucket", "dir/multi");
+            ensure_test_volume(&disk, bucket).await;
+
+            let v1 = Uuid::new_v4();
+            let v2 = Uuid::new_v4();
+            let d1 = Uuid::new_v4();
+            let d2 = Uuid::new_v4();
+            let object_dir = dir.path().join(bucket).join(object);
+            fs::create_dir_all(object_dir.join(d1.to_string())).await.unwrap();
+            fs::create_dir_all(object_dir.join(d2.to_string())).await.unwrap();
+            let mut meta = FileMeta::default();
+            meta.add_version(test_file_info(object, v1, Some(d1), None)).unwrap();
+            meta.add_version(test_file_info(object, v2, Some(d2), None)).unwrap();
+            let original = meta.marshal_msg().unwrap();
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &original).await.unwrap();
+
+            let token = Uuid::new_v4();
+            let vers = vec![FileInfoVersions {
+                name: object.to_string(),
+                versions: vec![
+                    test_file_info(object, v1, Some(d1), None),
+                    test_file_info(object, v2, Some(d2), None),
+                ],
+                ..Default::default()
+            }];
+            let errs = disk
+                .delete_versions(
+                    bucket,
+                    vers,
+                    DeleteOptions {
+                        stage_rollback: true,
+                        rollback_tokens: vec![token],
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(errs.iter().all(Option::is_none), "staged batch delete should succeed: {errs:?}");
+            let tdir = rollback_token_dir(dir.path(), token);
+            assert!(tdir.join(d1.to_string()).exists() && tdir.join(d2.to_string()).exists());
+
+            disk.delete_version(
+                bucket,
+                object,
+                test_file_info(object, v1, Some(d1), None),
+                false,
+                DeleteOptions {
+                    undo_delete: Some(token),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                fs::read(object_dir.join(STORAGE_FORMAT_FILE)).await.unwrap(),
+                original,
+                "undo must restore the full two-version xl.meta"
+            );
+            assert!(
+                object_dir.join(d1.to_string()).exists() && object_dir.join(d2.to_string()).exists(),
+                "both data-dirs must be restored"
+            );
+        }
+
+        // #8 gate: stage_rollback=false takes the legacy path (no staging dir).
+        #[tokio::test]
+        async fn stage_rollback_false_matches_legacy_delete_and_creates_no_rollback_dir() {
+            let dir = tempdir().unwrap();
+            let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+            let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+            let (bucket, object) = ("bucket", "dir/obj");
+            let (vid, data_dir, _original) = seed_single_version(dir.path(), &disk, bucket, object).await;
+
+            disk.delete_version(
+                bucket,
+                object,
+                test_file_info(object, vid, Some(data_dir), None),
+                false,
+                DeleteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+            assert!(!dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists());
+            assert!(
+                !dir.path().join(RUSTFS_META_TMP_ROLLBACK_BUCKET).exists(),
+                "legacy path must never create the rollback staging area"
+            );
+        }
     }
 }

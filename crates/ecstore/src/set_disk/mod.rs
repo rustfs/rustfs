@@ -222,6 +222,17 @@ pub const MAX_PARTS_COUNT: usize = 10000;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
 const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
+/// Gate for the delete quorum-rollback (backlog#864). Default on: a delete that
+/// fails to reach write quorum stages then undoes its local changes so the
+/// object survives. Set `RUSTFS_DELETE_ROLLBACK_ENABLE=false` to fall back to
+/// the legacy fail-forward behavior (matches MinIO: leave the partial delete for
+/// heal to converge).
+pub(crate) const ENV_DELETE_ROLLBACK_ENABLE: &str = "RUSTFS_DELETE_ROLLBACK_ENABLE";
+pub(crate) const DEFAULT_DELETE_ROLLBACK_ENABLE: bool = true;
+
+pub(crate) fn delete_rollback_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_DELETE_ROLLBACK_ENABLE, DEFAULT_DELETE_ROLLBACK_ENABLE)
+}
 
 struct ObjectLockDiagGuard {
     guard: NamespaceLockGuard,

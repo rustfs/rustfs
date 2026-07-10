@@ -1313,38 +1313,123 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let disks = self.disk_inventory().await;
         let write_quorum = disks.len() / 2 + 1;
 
-        let mut futures = Vec::with_capacity(disks.len());
-        let mut errs = Vec::with_capacity(disks.len());
+        // Legacy fail-forward path (RUSTFS_DELETE_ROLLBACK_ENABLE=off): no staging,
+        // no undo — a quorum-failed delete leaves the partial state for heal.
+        if !delete_rollback_enabled() {
+            let mut futures = Vec::with_capacity(disks.len());
+            for disk in disks.iter() {
+                futures.push(async move {
+                    if let Some(disk) = disk {
+                        disk.delete_version(bucket, object, fi.clone(), force_del_marker, DeleteOptions::default())
+                            .await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    }
+                });
+            }
+            let errs: Vec<Option<DiskError>> = join_all(futures).await.into_iter().map(|r| r.err()).collect();
+            return resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+        }
 
+        // Phase 1 (prepare + apply): each disk stages its pre-delete state under a
+        // shared token before applying the destructive change. force_del_marker is
+        // threaded so the create-from-absent leg also records its sentinel.
+        let token = Uuid::new_v4();
+        let mut futures = Vec::with_capacity(disks.len());
         for disk in disks.iter() {
+            let opts = DeleteOptions {
+                stage_rollback: true,
+                rollback_token: Some(token),
+                ..Default::default()
+            };
             futures.push(async move {
                 if let Some(disk) = disk {
-                    match disk
-                        .delete_version(bucket, object, fi.clone(), force_del_marker, DeleteOptions::default())
-                        .await
-                    {
-                        Ok(r) => Ok(r),
-                        Err(e) => Err(e),
-                    }
+                    disk.delete_version(bucket, object, fi.clone(), force_del_marker, opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
                 }
             });
         }
+        let errs: Vec<Option<DiskError>> = join_all(futures).await.into_iter().map(|r| r.err()).collect();
 
-        let results = join_all(futures).await;
-        for result in results {
-            match result {
-                Ok(_) => {
-                    errs.push(None);
+        let result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+
+        // Phase 2 (undo | commit). Both fan out unconditionally to every Some disk
+        // (never filtered by `err.is_none()`): each disk self-describes via its
+        // token dir, so unstaged disks no-op and errored-but-staged disks are still
+        // restored. This is the core correctness fix (design §2.4).
+        match &result {
+            Err(_) => {
+                // Undo synchronously, before returning (and, for the locked single
+                // delete, before the write lock is released): the object must not
+                // vanish on a quorum-failed delete.
+                let mut undo_futs = Vec::with_capacity(disks.len());
+                for disk in disks.iter() {
+                    if let Some(disk) = disk.as_ref() {
+                        let disk = disk.clone();
+                        let bucket = bucket.to_string();
+                        let object = object.to_string();
+                        let fi = fi.clone();
+                        undo_futs.push(async move {
+                            disk.delete_version(
+                                &bucket,
+                                &object,
+                                fi,
+                                false,
+                                DeleteOptions {
+                                    undo_delete: Some(token),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        });
+                    }
                 }
-                Err(e) => {
-                    errs.push(Some(e));
+                let undo_error_count = join_all(undo_futs).await.iter().filter(|r| r.is_err()).count();
+                if undo_error_count > 0 {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        bucket = %bucket,
+                        object = %object,
+                        undo_error_count,
+                        "delete quorum rollback reported errors (residue left for heal)"
+                    );
                 }
+            }
+            Ok(()) => {
+                // Commit synchronously: drain each disk's staging to trash before
+                // returning. The design left detached-vs-synchronous open; we take
+                // synchronous so no `.rollback` residue outlives a successful delete
+                // (deterministic for callers and avoids capacity/GC races). A failed
+                // commit only leaks staging to the orphan sweeper — it can never
+                // resurrect a deleted object (design §6, #898).
+                let mut commit_futs = Vec::with_capacity(disks.len());
+                for disk in disks.iter() {
+                    if let Some(disk) = disk.as_ref() {
+                        let disk = disk.clone();
+                        let bucket = bucket.to_string();
+                        let object = object.to_string();
+                        let fi = fi.clone();
+                        commit_futs.push(async move {
+                            disk.delete_version(
+                                &bucket,
+                                &object,
+                                fi,
+                                false,
+                                DeleteOptions {
+                                    commit_delete: Some(token),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        });
+                    }
+                }
+                let _ = join_all(commit_futs).await;
             }
         }
 
-        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+        result
     }
 
     #[tracing::instrument(skip(self))]
@@ -1542,6 +1627,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             vers.push(fi_vers);
         }
 
+        // #864 rollback: one unique token per (op, object), aligned by position
+        // with `vers`. All versions of an object share a single token (its whole
+        // xl.meta is backed up once). Empty when rollback is disabled.
+        let rollback_enabled = delete_rollback_enabled();
+        let rollback_tokens: Vec<Uuid> = if rollback_enabled {
+            (0..vers.len()).map(|_| Uuid::new_v4()).collect()
+        } else {
+            Vec::new()
+        };
+
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
@@ -1552,9 +1647,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         for disk in disks.iter() {
             let vers = vers.clone();
+            let opts = DeleteOptions {
+                stage_rollback: rollback_enabled,
+                rollback_tokens: rollback_tokens.clone(),
+                ..Default::default()
+            };
             futures.push(async move {
                 if let Some(disk) = disk {
-                    disk.delete_versions(bucket, vers, DeleteOptions::default()).await
+                    disk.delete_versions(bucket, vers, opts).await
                 } else {
                     let mut errs = Vec::with_capacity(vers.len());
                     for _ in 0..vers.len() {
@@ -1612,6 +1712,92 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     ));
                 } else {
                     del_errs[obj_idx] = Some(to_object_err(err.into(), vec![bucket, &objects[obj_idx].object_name.clone()]));
+                }
+            }
+        }
+
+        // #864 Phase 2 (undo | commit), per object. Reuse the single-object token
+        // primitives, fanning out unconditionally to every Some disk: each disk
+        // self-describes via its token dir, so unstaged disks (FileNotFound
+        // `continue`, DiskNotFound) no-op while errored-but-staged disks restore.
+        // The per-object quorum verdict mirrors the reporting loop above but skips
+        // the S3 object-not-found suppression, keying strictly on the disk outcome.
+        if rollback_enabled {
+            let write_quorum = disks.len() / 2 + 1;
+            for (j, ver) in vers.iter().enumerate() {
+                let Some(token) = rollback_tokens.get(j).copied() else {
+                    continue;
+                };
+                let Some(rep_idx) = ver.versions.first().map(|fi| fi.idx) else {
+                    continue;
+                };
+
+                let mut disk_err = vec![None; disks.len()];
+                for (disk_idx, entry) in disk_err.iter_mut().enumerate() {
+                    *entry = del_obj_errs[disk_idx][rep_idx].clone();
+                }
+                let quorum_failed = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, write_quorum).is_some();
+
+                if quorum_failed {
+                    // Undo synchronously so a quorum-failed key survives on all disks.
+                    let mut undo_futs = Vec::with_capacity(disks.len());
+                    for disk in disks.iter() {
+                        if let Some(disk) = disk.as_ref() {
+                            let disk = disk.clone();
+                            let bucket = bucket.to_string();
+                            let object = ver.name.clone();
+                            let fi = ver.versions[0].clone();
+                            undo_futs.push(async move {
+                                disk.delete_version(
+                                    &bucket,
+                                    &object,
+                                    fi,
+                                    false,
+                                    DeleteOptions {
+                                        undo_delete: Some(token),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            });
+                        }
+                    }
+                    let undo_error_count = join_all(undo_futs).await.iter().filter(|r| r.is_err()).count();
+                    if undo_error_count > 0 {
+                        warn!(
+                            target: "rustfs_ecstore::set_disk",
+                            bucket = %bucket,
+                            object = %ver.name,
+                            undo_error_count,
+                            "batch delete quorum rollback reported errors (residue left for heal)"
+                        );
+                    }
+                } else {
+                    // Commit synchronously (see delete_object_version rationale):
+                    // drain staging to trash before returning so no residue leaks.
+                    let mut commit_futs = Vec::with_capacity(disks.len());
+                    for disk in disks.iter() {
+                        if let Some(disk) = disk.as_ref() {
+                            let disk = disk.clone();
+                            let bucket = bucket.to_string();
+                            let object = ver.name.clone();
+                            let fi = ver.versions[0].clone();
+                            commit_futs.push(async move {
+                                disk.delete_version(
+                                    &bucket,
+                                    &object,
+                                    fi,
+                                    false,
+                                    DeleteOptions {
+                                        commit_delete: Some(token),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                            });
+                        }
+                    }
+                    let _ = join_all(commit_futs).await;
                 }
             }
         }
@@ -2773,5 +2959,181 @@ mod delete_objects_lock_gating_tests {
 
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
+    }
+}
+
+#[cfg(test)]
+mod delete_rollback_864_set_layer {
+    //! backlog#864: set-layer invariants for the delete quorum-rollback. These
+    //! directly cover the blind spot the audit named: existing delete_objects_*
+    //! tests never inject partial-disk failure and never assert that a committed
+    //! object survives a quorum-failed delete. The fault knob is armed per bucket
+    //! (unique per test) so parallel deletes in other tests are never affected.
+
+    use super::hermetic_set_disks_support::hermetic_set_disks;
+    use super::*;
+    use crate::disk::DiskAPI as _;
+    use crate::disk::RUSTFS_META_TMP_ROLLBACK_BUCKET;
+    use crate::disk::local::delete_fault;
+
+    async fn put_plain_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) {
+        let mut reader = PutObjReader::from_vec(vec![9u8; 4096]);
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("object should be written");
+    }
+
+    fn object_meta_exists(temp: &std::path::Path, bucket: &str, object: &str) -> bool {
+        temp.join(bucket).join(object).join("xl.meta").exists()
+    }
+
+    async fn rollback_residue(temp: &std::path::Path) -> bool {
+        let p = temp.join(RUSTFS_META_TMP_ROLLBACK_BUCKET);
+        match tokio::fs::read_dir(&p).await {
+            Ok(mut rd) => rd.next_entry().await.unwrap().is_some(),
+            Err(_) => false,
+        }
+    }
+
+    // #8 core invariant: a quorum-failed single delete leaves the object on every
+    // disk (no half-delete).
+    #[tokio::test]
+    async fn single_delete_quorum_failure_leaves_object_on_all_disks() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "rb864-survive";
+        for d in &disk_stores {
+            d.make_volume(bucket).await.unwrap();
+        }
+        put_plain_object(&set_disks, bucket, "obj").await;
+
+        // 2 of 4 disks fail before staging -> only 2 succeed < write_quorum(3).
+        delete_fault::arm_fail_early(bucket, &[2, 3]);
+        let res = set_disks.delete_object(bucket, "obj", ObjectOptions::default()).await;
+        delete_fault::disarm(bucket);
+
+        assert!(res.is_err(), "delete below write quorum must return an error, not silently succeed");
+
+        set_disks
+            .get_object_info(bucket, "obj", &ObjectOptions::default())
+            .await
+            .expect("object must survive a quorum-failed delete");
+        for (i, t) in temp_dirs.iter().enumerate() {
+            assert!(
+                object_meta_exists(t.path(), bucket, "obj"),
+                "disk {i}: xl.meta must be intact after rollback (no half-delete)"
+            );
+        }
+        assert!(
+            !rollback_residue(temp_dirs[0].path()).await,
+            "quorum-fail undo must drain rollback staging"
+        );
+    }
+
+    // #9 no phantom marker: a quorum-failed force-delete-marker create leaves no
+    // delete marker on any disk.
+    #[tokio::test]
+    async fn force_delete_marker_quorum_failure_leaves_no_phantom_marker() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "rb864-ghost";
+        for d in &disk_stores {
+            d.make_volume(bucket).await.unwrap();
+        }
+        // object absent on every disk -> create-from-absent leg.
+
+        let opts = ObjectOptions {
+            versioned: true,
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        delete_fault::arm_fail_early(bucket, &[2, 3]);
+        let res = set_disks.delete_object(bucket, "ghost", opts).await;
+        delete_fault::disarm(bucket);
+
+        assert!(res.is_err(), "force-marker create below quorum must fail");
+        for (i, t) in temp_dirs.iter().enumerate() {
+            assert!(
+                !object_meta_exists(t.path(), bucket, "ghost"),
+                "disk {i}: a quorum-failed delete-marker create must not leave a phantom marker"
+            );
+        }
+    }
+
+    // #10 batch: every key below quorum is undone and survives on all disks.
+    #[tokio::test]
+    async fn batch_delete_quorum_failure_restores_every_key() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "rb864-batch";
+        for d in &disk_stores {
+            d.make_volume(bucket).await.unwrap();
+        }
+        put_plain_object(&set_disks, bucket, "keep").await;
+        put_plain_object(&set_disks, bucket, "gone").await;
+
+        // 3 of 4 disks apply then report failure -> quorum(3) not reached for
+        // either key; both must be restored on all disks by the per-key undo.
+        delete_fault::arm_fail_after_stage(bucket, &[1, 2, 3]);
+        let objects = vec![
+            ObjectToDelete {
+                object_name: "keep".into(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: "gone".into(),
+                ..Default::default()
+            },
+        ];
+        let (_deleted, errs) = set_disks.delete_objects(bucket, objects, ObjectOptions::default()).await;
+        delete_fault::disarm(bucket);
+
+        assert!(
+            errs[0].is_some() && errs[1].is_some(),
+            "both keys below quorum must report errors: {errs:?}"
+        );
+        for key in ["keep", "gone"] {
+            set_disks
+                .get_object_info(bucket, key, &ObjectOptions::default())
+                .await
+                .unwrap_or_else(|e| panic!("{key} must survive quorum-failed batch delete: {e:?}"));
+            for (i, t) in temp_dirs.iter().enumerate() {
+                assert!(
+                    object_meta_exists(t.path(), bucket, key),
+                    "disk {i} key {key}: xl.meta must be intact after per-key undo"
+                );
+            }
+        }
+        assert!(
+            !rollback_residue(temp_dirs[0].path()).await,
+            "batch undo must drain rollback staging on all keys"
+        );
+    }
+
+    // #11 healthy delete: object gone, no .rollback residue on any disk.
+    #[tokio::test]
+    async fn quorum_success_delete_leaves_no_rollback_residue() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "rb864-ok";
+        for d in &disk_stores {
+            d.make_volume(bucket).await.unwrap();
+        }
+        put_plain_object(&set_disks, bucket, "obj").await;
+
+        set_disks
+            .delete_object(bucket, "obj", ObjectOptions::default())
+            .await
+            .expect("healthy delete should succeed");
+
+        set_disks
+            .get_object_info(bucket, "obj", &ObjectOptions::default())
+            .await
+            .expect_err("object must be gone after a quorum-success delete");
+        for (i, t) in temp_dirs.iter().enumerate() {
+            assert!(!object_meta_exists(t.path(), bucket, "obj"), "disk {i}: object deleted");
+            assert!(
+                !rollback_residue(t.path()).await,
+                "disk {i}: commit must drain rollback staging (no leak)"
+            );
+        }
     }
 }
