@@ -153,8 +153,8 @@ pub const DEFAULT_UNSAFE_BYPASS_DISK_CHECK: bool = false;
 /// - `bounded`: wait for a finite window (see
 ///   `ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT`) then fail with an actionable error.
 /// - `fail-fast`: fail on the first non-transient resolution error (CI/local).
-/// - `auto`: Kubernetes -> orchestrated, distributed URL endpoints -> bounded,
-///   local path endpoints -> fail-fast.
+/// - `auto`: distributed URL endpoints use orchestrated on Kubernetes and
+///   bounded otherwise; local path endpoints use fail-fast (no DNS to await).
 pub const ENV_STARTUP_TOPOLOGY_WAIT_MODE: &str = "RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE";
 
 /// Environment variable bounding how long startup waits for topology/DNS
