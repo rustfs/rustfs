@@ -886,6 +886,25 @@ mod tests {
         assert_eq!(versions[1].version_id, Some(last_version));
     }
 
+    #[test]
+    fn versions_after_marker_preserves_stale_marker_compatibility() {
+        let existing_version =
+            Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("existing version UUID should parse");
+        let deleted_marker = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("delete marker UUID should parse");
+        let file_infos = rustfs_filemeta::FileInfoVersions {
+            versions: vec![FileInfo {
+                version_id: Some(existing_version),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let versions = versions_after_marker(&file_infos, VersionMarker::Version(deleted_marker));
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, Some(existing_version));
+    }
+
     #[tokio::test]
     async fn versions_listing_applies_version_marker_only_to_first_entry() {
         let metadata = rustfs_filemeta::test_data::create_real_xlmeta().expect("test metadata should be valid");

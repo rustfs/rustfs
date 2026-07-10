@@ -188,6 +188,9 @@ pub(crate) mod rpc_consumer {
 
     pub(crate) mod http_service {
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
+        #[cfg(test)]
+        pub(crate) use super::super::storage_contracts::WALK_DIR_BODY_SHA256_QUERY;
+        pub(crate) use super::super::storage_contracts::WALK_DIR_STREAM_COMPLETION_V1;
         pub(crate) use super::super::{StorageDiskRpcExt, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature};
     }
 
@@ -361,8 +364,8 @@ pub(crate) mod ecstore_data_usage {
         apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_data_usage_from_backend,
         record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
         record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
-        refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
-        remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
+        refresh_bucket_usage_from_object_layer, remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info,
+        store_compression_total_in_backend,
     };
 }
 

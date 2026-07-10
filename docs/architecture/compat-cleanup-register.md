@@ -12,6 +12,8 @@ for later deletion.
 
 ## Open Items
 
+- `#4648` walk-dir stream completion capability: old clients can append fallback output to an already-used metacache writer after a terminal body error, so servers emit terminal walk errors only to clients that sign the `walk_dir_stream_completion=error-v1` query capability and its request-body digest. Remove the legacy clean-EOF path after the minimum supported RustFS peer version always advertises this capability.
+
 ## Review Checklist
 
 Before completing a PR that adds wrappers, re-exports, fallbacks, legacy action

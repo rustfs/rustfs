@@ -70,14 +70,6 @@ pub(crate) mod data_usage {
         .await
     }
 
-    pub(crate) async fn refresh_versioned_bucket_usage_from_object_layer(
-        store: Arc<crate::storage::storage_api::ECStore>,
-        data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
-    ) {
-        crate::storage::storage_api::ecstore_data_usage::refresh_versioned_bucket_usage_from_object_layer(store, data_usage_info)
-            .await;
-    }
-
     pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
         crate::storage::storage_api::ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
     }

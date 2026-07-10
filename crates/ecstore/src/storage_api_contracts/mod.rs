@@ -21,6 +21,12 @@ pub(crate) mod heal {
     pub(crate) use rustfs_storage_api::HealOperations;
 }
 
+pub(crate) mod internode {
+    pub(crate) use rustfs_storage_api::{
+        WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
+    };
+}
+
 pub(crate) mod lifecycle {
     pub use rustfs_storage_api::{ExpirationOptions, TransitionedObject};
 }
