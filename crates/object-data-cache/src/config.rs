@@ -85,7 +85,9 @@ pub struct ObjectDataCacheConfig {
     /// See [`ttl`](Self::ttl): expiration uses `min(ttl, time_to_idle)`, so
     /// setting `time_to_idle` above `ttl` is inert.
     pub time_to_idle: Duration,
-    /// Minimum free memory percent before fill is paused.
+    /// Minimum free memory percent before fill is paused. Zero disables the
+    /// memory gate entirely, which makes fill admission independent of the
+    /// host's or container's live memory reading.
     pub min_free_memory_percent: u8,
     /// Fill concurrency multiplier applied to CPU count.
     pub fill_concurrency_per_cpu: u16,
@@ -210,7 +212,8 @@ impl ObjectDataCacheConfig {
             );
         }
 
-        if self.min_free_memory_percent == 0 || self.min_free_memory_percent > 100 {
+        // Zero is a deliberate opt-out of the memory gate, not an invalid value.
+        if self.min_free_memory_percent > 100 {
             return Err(ObjectDataCacheConfigError::InvalidMinFreeMemoryPercent);
         }
 
@@ -344,6 +347,30 @@ mod tests {
             .expect_err("max fill concurrency must not be smaller than per-cpu factor");
 
         assert_eq!(err, ObjectDataCacheConfigError::FillConcurrencyMaxTooSmall);
+    }
+
+    #[test]
+    fn validate_accepts_zero_min_free_memory_percent_as_gate_opt_out() {
+        let config = ObjectDataCacheConfig {
+            min_free_memory_percent: 0,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_min_free_memory_percent_above_100() {
+        let config = ObjectDataCacheConfig {
+            min_free_memory_percent: 101,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("a free-memory floor above 100% is unsatisfiable");
+
+        assert_eq!(err, ObjectDataCacheConfigError::InvalidMinFreeMemoryPercent);
     }
 
     #[test]

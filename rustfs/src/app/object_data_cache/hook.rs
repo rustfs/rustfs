@@ -86,6 +86,8 @@ mod tests {
             ObjectDataCacheAdapter::new(ObjectDataCacheConfig {
                 mode: ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 4 * 1024 * 1024,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..ObjectDataCacheConfig::default()
             })
             .expect("adapter"),

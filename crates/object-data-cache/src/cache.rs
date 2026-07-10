@@ -348,6 +348,9 @@ mod tests {
         let config = ObjectDataCacheConfig {
             mode: ObjectDataCacheMode::FillBufferedOnly,
             max_bytes: 8_388_608,
+            // Fill must not depend on the live memory reading, which differs
+            // between a developer host and a CI container.
+            min_free_memory_percent: 0,
             ..ObjectDataCacheConfig::default()
         };
         ObjectDataCache::new(config).expect("fill-enabled cache config should initialize")

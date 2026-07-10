@@ -188,6 +188,12 @@ impl ObjectDataCacheMemoryGate {
 
     /// Returns true when the fill path may proceed under current memory pressure.
     pub fn allows_fill(&self, required_bytes: u64) -> bool {
+        // A zero floor opts out of the gate, so fill admission never depends on
+        // a live memory reading — which differs between a host and a container.
+        if self.min_free_memory_percent == 0 {
+            return true;
+        }
+
         self.refresh_if_stale();
         let snapshot = self.snapshot();
         if snapshot.total_bytes == 0 {
@@ -290,6 +296,27 @@ mod tests {
         }));
 
         assert!(gate.allows_fill(100));
+    }
+
+    #[test]
+    fn zero_min_free_percent_disables_the_gate() {
+        // A pod-sized snapshot far below any floor: the gate is opted out, so
+        // fill admission stays independent of the live memory reading.
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let gate = ObjectDataCacheMemoryGate::new(
+            &ObjectDataCacheConfig {
+                min_free_memory_percent: 0,
+                ..ObjectDataCacheConfig::default()
+            },
+            Arc::clone(&stats),
+        );
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000,
+            available_bytes: 1,
+        }));
+
+        assert!(gate.allows_fill(512));
+        assert_eq!(stats.snapshot().memory_pressure_events, 0);
     }
 
     #[test]

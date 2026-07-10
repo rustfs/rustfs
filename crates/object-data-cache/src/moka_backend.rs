@@ -186,6 +186,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// Fills here must succeed regardless of the live memory reading, which
+    /// differs between a developer host and a CI container, so the gate is
+    /// opted out of. Tests that exercise the gate re-enable it explicitly.
     fn enabled_config() -> ObjectDataCacheConfig {
         ObjectDataCacheConfig {
             mode: ObjectDataCacheMode::FillMaterializeEnabled,
@@ -194,10 +197,17 @@ mod tests {
             max_entry_bytes: 1_048_576,
             ttl: Duration::from_millis(100),
             time_to_idle: Duration::from_millis(100),
-            min_free_memory_percent: 20,
+            min_free_memory_percent: 0,
             fill_concurrency_per_cpu: 1,
             fill_concurrency_max: 32,
             identity_keys_max: 16,
+        }
+    }
+
+    fn memory_gated_config() -> ObjectDataCacheConfig {
+        ObjectDataCacheConfig {
+            min_free_memory_percent: 20,
+            ..enabled_config()
         }
     }
 
@@ -299,7 +309,8 @@ mod tests {
     #[tokio::test]
     async fn moka_backend_skips_fill_under_memory_pressure() {
         let stats = Arc::new(ObjectDataCacheStats::default());
-        let backend = MokaBackend::new(&enabled_config(), Arc::clone(&stats)).expect("moka backend should build");
+        // The gate must be enabled here, otherwise allows_fill short-circuits.
+        let backend = MokaBackend::new(&memory_gated_config(), Arc::clone(&stats)).expect("moka backend should build");
         backend
             .memory_gate
             .set_test_snapshot(Some(crate::memory::ObjectDataCacheMemorySnapshot {
