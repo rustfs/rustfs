@@ -40,7 +40,11 @@ pub trait ShardSource: AsyncRead + Send + Sync + Unpin {
     }
 }
 
+/// Borrowed and owned byte slices are ordinary streaming sources: they carry no
+/// `Bytes` to hand out, so they take the default and keep the old copy path.
 impl ShardSource for std::io::Cursor<Vec<u8>> {}
+
+impl ShardSource for std::io::Cursor<&[u8]> {}
 
 impl ShardSource for Box<dyn AsyncRead + Send + Sync + Unpin> {}
 
