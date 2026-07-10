@@ -98,92 +98,110 @@ where
         self.last_verify_duration
     }
 
-    /// Read a single (hash+data) block, verify hash, and return the number of bytes read into `out`.
-    /// Returns an error if hash verification fails or data exceeds shard_size.
+    /// Read a single (hash+data) block, verify hash, and copy `out.len()` bytes
+    /// into `out`. Returns an error if the shard is short, the hash mismatches,
+    /// or `out` is larger than one shard. On error `out`'s contents are
+    /// unspecified but never contain bytes that failed the hash check — the copy
+    /// happens only after verification.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        self.last_verify_duration = Duration::ZERO;
-        if out.len() > self.shard_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("data size {} exceeds shard size {}", out.len(), self.shard_size),
-            ));
-        }
-
-        let hash_size = self.hash_algo.size();
+        let want = out.len();
+        self.begin_read(want)?;
 
         // No-hash path: pull the shard straight into the caller's buffer with no
         // intermediate copy. There is no leading hash to co-locate, so a combined
         // buffer would only add a memcpy.
-        if hash_size == 0 {
+        if self.hash_algo.size() == 0 {
             let data_len = fill(&mut self.inner, out).await?;
-            return self.finish_len(data_len, out.len());
+            return self.finish_len(data_len, want);
         }
 
-        // Hashed path: the on-disk block is a contiguous `[hash][data]` run, so
-        // read both in a single pass into the scratch buffer instead of one
-        // dispatch for the 32-byte hash and another for the shard. On the
-        // streaming disk reader (a raw tokio File whose every `read` is a
-        // spawn_blocking round-trip) this halves the per-block dispatch count;
-        // on an in-memory Cursor (inline/mmap) it is a plain slice copy. The
-        // trailing `out.copy_from_slice` is the only added cost versus the old
-        // two-read path.
-        let need = hash_size + out.len();
+        let need = self.hash_algo.size() + want;
+        self.read_scratch_block(need, want).await?;
+        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need], &self.id)?;
+        out.copy_from_slice(data);
+        self.last_verify_duration = verify;
+        Ok(want)
+    }
+
+    /// Shared preamble for [`Self::read`]/[`Self::read_appending`]: reset the
+    /// verify timer and reject a request larger than one shard.
+    fn begin_read(&mut self, want: usize) -> std::io::Result<()> {
+        self.last_verify_duration = Duration::ZERO;
+        if want > self.shard_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("data size {want} exceeds shard size {}", self.shard_size),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read a full `[hash][data]` block of `need` bytes into the scratch buffer
+    /// in a single pass, returning it as a slice. On the streaming disk reader
+    /// (a raw tokio File whose every `read` is a spawn_blocking round-trip) the
+    /// single pass halves the per-block dispatch count; on an in-memory source
+    /// it is a plain fill.
+    ///
+    /// A short read (EOF before the whole block is in hand) is a truncated shard,
+    /// returned as `UnexpectedEof` so the caller drops this reader and parity
+    /// reconstruction engages, rather than silently shifting every downstream
+    /// byte (backlog#799 B2). This fires independent of the hash check, so it
+    /// also catches truncation under `skip_verify`.
+    ///
+    /// On `Ok` the block is `self.buf[..need]`; the caller re-borrows it so the
+    /// verification can also borrow `self` immutably.
+    async fn read_scratch_block(&mut self, need: usize, want: usize) -> std::io::Result<()> {
         if self.buf.len() < need {
             self.buf.resize(need, 0);
         }
         let filled = fill(&mut self.inner, &mut self.buf[..need]).await?;
-
-        // A short read (EOF before the full `[hash][data]` block is in hand)
-        // means a truncated/incomplete shard — whether the hash itself or the
-        // data was cut. Return an error so the caller drops this reader from the
-        // stripe and reconstruction from parity engages, instead of silently
-        // returning fewer bytes and shifting every downstream byte (backlog#799
-        // B2). This fires BEFORE and independent of the bitrot hash check so it
-        // also catches truncation under skip_verify, where the hash comparison
-        // is skipped. The caller sizes `out` to exactly the expected shard
-        // length for the current stripe, so "block complete" == "shard complete".
         if filled < need {
-            let got_data = filled.saturating_sub(hash_size);
-            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, got_data, out.len());
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("short shard read: got {got_data} of {} bytes", out.len()),
-            ));
+            return Err(short_shard_read(&self.id, filled.saturating_sub(self.hash_algo.size()), want));
         }
-
-        let (hash, data) = self.buf[..need].split_at(hash_size);
-        out.copy_from_slice(data);
-
-        if !self.skip_verify {
-            let verify_start = std::time::Instant::now();
-            let actual_hash = self.hash_algo.hash_encode(data);
-            self.last_verify_duration = verify_start.elapsed();
-            if actual_hash.as_ref() != hash {
-                error!(
-                    "bitrot reader hash mismatch, id={} data_len={}, out_len={}",
-                    self.id,
-                    data.len(),
-                    out.len()
-                );
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
-            }
-        }
-        Ok(out.len())
+        Ok(())
     }
 
     /// Map a completed no-hash read to the shared short-shard contract: a full
     /// buffer returns its length, a short read is UnexpectedEof (backlog#799 B2).
     fn finish_len(&self, data_len: usize, want: usize) -> std::io::Result<usize> {
         if data_len < want {
-            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, data_len, want);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("short shard read: got {data_len} of {want} bytes"),
-            ));
+            return Err(short_shard_read(&self.id, data_len, want));
         }
         Ok(data_len)
     }
+}
+
+/// A truncated shard is `UnexpectedEof`, not a short success (backlog#799 B2).
+fn short_shard_read(id: &Uuid, got: usize, want: usize) -> std::io::Error {
+    error!("bitrot reader short shard read: id={id} got {got} of {want} bytes");
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("short shard read: got {got} of {want} bytes"))
+}
+
+/// Split a `[hash][data]` block, verify the hash (unless `skip_verify`), and
+/// return the data slice plus the time spent hashing. The caller writes `data`
+/// into its sink **only after** this returns `Ok`, so a shard that fails the
+/// hash never reaches the caller's buffer. The verify duration is returned
+/// rather than stored so this stays a free function usable while `self` is
+/// borrowed for the block.
+fn split_and_verify<'a>(
+    hash_algo: &HashAlgorithm,
+    skip_verify: bool,
+    block: &'a [u8],
+    id: &Uuid,
+) -> std::io::Result<(&'a [u8], Duration)> {
+    let (hash, data) = block.split_at(hash_algo.size());
+    if skip_verify {
+        return Ok((data, Duration::ZERO));
+    }
+    let verify_start = std::time::Instant::now();
+    let actual_hash = hash_algo.hash_encode(data);
+    let verify = verify_start.elapsed();
+    if actual_hash.as_ref() != hash {
+        error!("bitrot reader hash mismatch, id={id} data_len={}", data.len());
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+    }
+    Ok((data, verify))
 }
 
 impl<R> BitrotReader<R>
@@ -205,13 +223,7 @@ where
         use bytes::BufMut as _;
         use tokio::io::AsyncReadExt as _;
 
-        self.last_verify_duration = Duration::ZERO;
-        if want > self.shard_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("data size {want} exceeds shard size {}", self.shard_size),
-            ));
-        }
+        self.begin_read(want)?;
         out.reserve(want);
         let hash_size = self.hash_algo.size();
 
@@ -226,9 +238,7 @@ where
                     .inner
                     .read_buf(&mut (&mut *out).limit(remaining))
                     .await
-                    .inspect_err(|e| {
-                        error!("bitrot reader read error: {}", e);
-                    })?;
+                    .inspect_err(|e| error!("bitrot reader read error: {e}"))?;
                 if n == 0 {
                     break;
                 }
@@ -238,54 +248,25 @@ where
 
         let need = hash_size + want;
 
-        // In-memory fast path: the block is already resident, so slice it instead of
-        // copying it into the scratch buffer first (rustfs/backlog#1159). One copy
-        // (`extend_from_slice`) instead of two. A source that cannot serve `need`
-        // bytes returns `None` and falls through, keeping the short-read contract.
+        // In-memory fast path: the block is already resident, so slice it instead
+        // of copying it into the scratch buffer first (rustfs/backlog#1159). One
+        // copy (`extend_from_slice`) instead of two. A source that cannot serve
+        // `need` bytes returns `None` and falls through to the scratch path,
+        // keeping the short-read contract.
         if let Some(block) = self.inner.try_take_block(need) {
-            let (hash, data) = block.split_at(hash_size);
-            if !self.skip_verify {
-                let verify_start = std::time::Instant::now();
-                let actual_hash = self.hash_algo.hash_encode(data);
-                self.last_verify_duration = verify_start.elapsed();
-                if actual_hash.as_ref() != hash {
-                    error!("bitrot reader hash mismatch, id={} data_len={}, out_len={}", self.id, data.len(), want);
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
-                }
-            }
-            // Only after verification: a corrupt shard must not reach the caller.
+            let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &block, &self.id)?;
             out.extend_from_slice(data);
+            self.last_verify_duration = verify;
             return Ok(want);
         }
 
-        // Streaming path: identical to `read` — one pass pulls `[hash][data]` into
-        // the scratch buffer — except the shard lands in `out` by `extend_from_slice`
-        // rather than `copy_from_slice` into a pre-zeroed buffer. Same single copy.
-        if self.buf.len() < need {
-            self.buf.resize(need, 0);
-        }
-        let filled = fill(&mut self.inner, &mut self.buf[..need]).await?;
-        if filled < need {
-            let got_data = filled.saturating_sub(hash_size);
-            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, got_data, want);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("short shard read: got {got_data} of {want} bytes"),
-            ));
-        }
-
-        let (hash, data) = self.buf[..need].split_at(hash_size);
-        if !self.skip_verify {
-            let verify_start = std::time::Instant::now();
-            let actual_hash = self.hash_algo.hash_encode(data);
-            self.last_verify_duration = verify_start.elapsed();
-            if actual_hash.as_ref() != hash {
-                error!("bitrot reader hash mismatch, id={} data_len={}, out_len={}", self.id, data.len(), want);
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
-            }
-        }
-        // Only after verification: a corrupt shard must not reach the caller.
+        // Streaming path: same single pass and same verification as `read`; only
+        // the sink differs (`extend_from_slice` into `out` instead of
+        // `copy_from_slice` into a pre-zeroed buffer).
+        self.read_scratch_block(need, want).await?;
+        let (data, verify) = split_and_verify(&self.hash_algo, self.skip_verify, &self.buf[..need], &self.id)?;
         out.extend_from_slice(data);
+        self.last_verify_duration = verify;
         Ok(want)
     }
 }
