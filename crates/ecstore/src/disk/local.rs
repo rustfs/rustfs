@@ -1725,6 +1725,20 @@ pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
 
     /// Open a writer (mirrors `create_file`/`append_file` per [`WriteMode`]).
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter>;
+
+    /// Drop any descriptor this backend caches for exactly `volume`'s `path`
+    /// (backlog#1145). Preferred wherever the caller knows the affected paths.
+    ///
+    /// MUST be called by every path that replaces a file a reader may have opened
+    /// — `rename_data` (heal reuses a version's `data_dir` and lands a rebuilt
+    /// shard on the same part path) and `rename_file`.
+    async fn invalidate_cached_fd(&self, _volume: &str, _path: &str) {}
+
+    /// Drop every descriptor for `volume`'s `path` and anything beneath it.
+    /// For callers that cannot enumerate the affected paths (`delete`).
+    ///
+    /// Backends that hold no descriptors ignore both methods.
+    fn invalidate_cached_fds_under(&self, _volume: &str, _path: &str) {}
 }
 
 /// Default [`LocalIoBackend`]: tokio blocking-pool file I/O plus the
@@ -2339,6 +2353,137 @@ impl LocalIoBackend for StdBackend {
 /// Runtime-probed io_uring read backend (backlog#1104).
 ///
 /// Wraps a [`StdBackend`] for everything except positioned reads, which go
+/// Enable the per-disk descriptor cache for io_uring reads (backlog#1145).
+#[cfg(target_os = "linux")]
+const ENV_RUSTFS_IO_URING_FD_CACHE: &str = "RUSTFS_IO_URING_FD_CACHE";
+#[cfg(target_os = "linux")]
+const DEFAULT_RUSTFS_IO_URING_FD_CACHE: bool = true;
+
+/// Open descriptors kept per disk. Each entry holds an fd, so this bounds the
+/// cache's share of `RLIMIT_NOFILE`. moka evicts asynchronously, so the count may
+/// briefly exceed this.
+#[cfg(target_os = "linux")]
+const FD_CACHE_CAPACITY: u64 = 512;
+
+/// Backstop on how long a cached descriptor may serve reads. Explicit
+/// invalidation (below) is the correctness mechanism; this only bounds the
+/// blast radius if a future mutation path forgets to call it.
+#[cfg(target_os = "linux")]
+const FD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(target_os = "linux")]
+fn is_io_uring_fd_cache_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_IO_URING_FD_CACHE, DEFAULT_RUSTFS_IO_URING_FD_CACHE)
+}
+
+/// A cached descriptor is keyed by the open flags too: the O_DIRECT and buffered
+/// read paths must never hand each other a descriptor opened the other way.
+/// Only the buffered path caches today, so `direct` is always `false`; keeping it
+/// in the key stops a future O_DIRECT cache from colliding with this one.
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct FdKey {
+    volume: String,
+    path: String,
+    direct: bool,
+}
+
+/// Per-disk cache of open descriptors for io_uring reads (backlog#1145).
+///
+/// Why this exists: `pread_uring` opened the file on the blocking pool for every
+/// read, so each read paid a `spawn_blocking` round trip — the very thread hop
+/// io_uring exists to avoid. Measured on a 16-core host with a 4-shard driver,
+/// removing it is worth +36% to +180% IOPS and 3-5x better p999.
+///
+/// Why it is safe to cache a *part file* descriptor:
+/// - only `<object>/<data_dir>/part.N` reaches this backend's `pread_bytes`;
+///   `xl.meta` (the one path replaced in place) is read through `read_all` /
+///   `read_metadata` and never gets here;
+/// - part files are never rewritten in place — a replacement is always
+///   write-new-tmp then `rename`, which swaps the inode, so a cached descriptor
+///   can never observe a torn shard.
+///
+/// Why invalidation is nevertheless REQUIRED: heal reuses the existing version's
+/// `data_dir` and renames a reconstructed shard onto the *same* part path. A
+/// cached descriptor would keep serving the pre-heal (corrupt) inode, defeating
+/// the heal and eroding read quorum. `delete` likewise unlinks the part while a
+/// cached descriptor would keep the inode readable.
+///
+/// Backed by `moka`, already a dependency: its `get` is sharded rather than
+/// behind one mutex (this cache is touched on every read, at >300k IOPS), and it
+/// evicts by TinyLFU instead of arbitrarily. `time_to_live` supplies the backstop
+/// TTL should a future mutation path forget to invalidate; `max_capacity` bounds
+/// this cache's share of `RLIMIT_NOFILE`. Eviction drops the `Arc<File>`, closing
+/// the descriptor once no in-flight read still holds it.
+#[cfg(target_os = "linux")]
+struct FdCache {
+    cache: moka::future::Cache<FdKey, Arc<std::fs::File>>,
+}
+
+#[cfg(target_os = "linux")]
+impl FdCache {
+    fn new() -> Self {
+        Self {
+            cache: moka::future::Cache::builder()
+                .max_capacity(FD_CACHE_CAPACITY)
+                .time_to_live(FD_CACHE_TTL)
+                // Required for `invalidate_entries_if`; without it that call
+                // fails at runtime instead of dropping stale descriptors.
+                .support_invalidation_closures()
+                .build(),
+        }
+    }
+
+    async fn get(&self, key: &FdKey) -> Option<Arc<std::fs::File>> {
+        self.cache.get(key).await
+    }
+
+    async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
+        self.cache.insert(key, file).await;
+    }
+
+    /// Drop the descriptor for exactly this path. Preferred wherever the caller
+    /// knows the keys: unlike a predicate it costs nothing on later reads.
+    async fn invalidate_exact(&self, volume: &str, path: &str) {
+        self.cache
+            .invalidate(&FdKey {
+                volume: volume.to_owned(),
+                path: path.to_owned(),
+                direct: false,
+            })
+            .await;
+    }
+
+    /// Drop every descriptor for `volume` whose path is `prefix` or lies under it.
+    /// A component-boundary check keeps `a/b` from invalidating `a/bc`.
+    ///
+    /// moka applies the predicate to entries inserted at or before this call and
+    /// guarantees a later `get` never returns one of them, so the invalidation is
+    /// effective immediately even though the removal itself is deferred. Reserved
+    /// for paths whose exact keys are unknown (`delete`); every predicate is
+    /// re-evaluated by subsequent `get`s, so registering one per write would tax
+    /// the read path.
+    fn invalidate_under(&self, volume: &str, prefix: &str) {
+        let volume = volume.to_owned();
+        let prefix = prefix.trim_end_matches('/').to_owned();
+        let matches = move |k: &FdKey, _: &Arc<std::fs::File>| {
+            k.volume == volume && (k.path == prefix || k.path.strip_prefix(&prefix).is_some_and(|r| r.starts_with('/')))
+        };
+        if self.cache.invalidate_entries_if(matches).is_err() {
+            // Closure support is enabled at construction, so this is unreachable.
+            // If it ever changes, over-invalidate rather than serve a stale
+            // descriptor: correctness first, the cache refills on the next read.
+            self.cache.invalidate_all();
+        }
+    }
+
+    #[cfg(test)]
+    async fn entry_count(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
+        self.cache.entry_count()
+    }
+}
+
 /// through rustfs-uring's cancel-safe `UringDriver`. Constructed only when
 /// `RUSTFS_IO_URING_READ_ENABLE` is set AND the per-disk probe succeeds; on any
 /// per-read driver error a read falls back to the inner `StdBackend`, so
@@ -2365,6 +2510,9 @@ pub(crate) struct UringBackend {
     /// `active` gates io_uring as a whole, this gates only the native O_DIRECT
     /// read shape.
     direct_uring: DirectIoReadState,
+    /// Per-disk descriptor cache (backlog#1145). `None` when
+    /// `RUSTFS_IO_URING_FD_CACHE` is off, which restores the open-per-read path.
+    fd_cache: Option<FdCache>,
 }
 
 /// Disks whose io_uring probe failed, so `UringBackend::try_new` can skip
@@ -2430,6 +2578,7 @@ impl UringBackend {
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
+                    fd_cache: is_io_uring_fd_cache_enabled().then(FdCache::new),
                 })
             }
             Err(err) => {
@@ -2466,34 +2615,67 @@ impl UringBackend {
         let Some(end_offset) = offset.checked_add(length) else {
             return Err(DiskError::FileCorrupt);
         };
-        let root = self.root.clone();
-        let volume_owned = volume.to_owned();
-        let path_owned = path.to_owned();
+        let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
 
-        let (file, offset_u64) = tokio::task::spawn_blocking(move || -> Result<(std::fs::File, u64)> {
-            let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
-            if !skip_access_checks(&volume_owned) {
-                access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+        // Descriptor-cache hit: no `open`, no `spawn_blocking`, so the read path
+        // never leaves the runtime worker — which is the whole point of io_uring
+        // (backlog#1145). The two preamble checks the miss path runs are not
+        // silently lost:
+        //   * bounds — a file shorter than `end_offset` short-reads, and the
+        //     driver only short-reads at EOF (it resubmits otherwise), so the
+        //     `bytes.len() != length` check below is exactly the old
+        //     `meta.len() < end_offset` check and yields the same `FileCorrupt`;
+        //   * volume access — skipped while an entry is live. A disk that became
+        //     unreachable keeps serving its already-open descriptors for at most
+        //     `FD_CACHE_TTL`, after which the re-open re-runs the check. Disk
+        //     health is tracked independently of this per-read probe.
+        let key = self.fd_cache.as_ref().map(|_| FdKey {
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            direct: false,
+        });
+        let cached = match (self.fd_cache.as_ref(), key.as_ref()) {
+            (Some(cache), Some(key)) => cache.get(key).await,
+            _ => None,
+        };
+
+        let file = match cached {
+            Some(file) => file,
+            None => {
+                let root = self.root.clone();
+                let volume_owned = volume.to_owned();
+                let path_owned = path.to_owned();
+                let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+                    let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
+                    if !skip_access_checks(&volume_owned) {
+                        access_std(&volume_dir)
+                            .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+                    }
+                    let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
+                    check_path_length(file_path.to_string_lossy().as_ref())?;
+                    let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
+                    let meta = file.metadata().map_err(DiskError::from)?;
+                    let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
+                    if meta.len() < end_offset_u64 {
+                        return Err(DiskError::FileCorrupt);
+                    }
+                    Ok(file)
+                })
+                .await
+                .map_err(|e| DiskError::other(format!("uring pread join error: {e}")))??;
+                let file = Arc::new(file);
+                if let (Some(cache), Some(key)) = (self.fd_cache.as_ref(), key) {
+                    cache.insert(key, Arc::clone(&file)).await;
+                }
+                file
             }
-            let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
-            check_path_length(file_path.to_string_lossy().as_ref())?;
-            let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
-            let meta = file.metadata().map_err(DiskError::from)?;
-            let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
-            if meta.len() < end_offset_u64 {
-                return Err(DiskError::FileCorrupt);
-            }
-            let offset_u64 = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
-            Ok((file, offset_u64))
-        })
-        .await
-        .map_err(|e| DiskError::other(format!("uring pread join error: {e}")))??;
+        };
 
         if length == 0 {
             return Ok(Bytes::new());
         }
 
-        let bytes = match self.driver.read_at(Arc::new(file), offset_u64, length).await {
+        let bytes = match self.driver.read_at(file, offset_u64, length).await {
             Ok(bytes) => bytes,
             Err(io_err) => {
                 // Latch io_uring off for this disk if the errno says the
@@ -2506,7 +2688,11 @@ impl UringBackend {
             }
         };
         if bytes.len() != length {
-            return Err(DiskError::other("io_uring returned a short read"));
+            // The driver resubmits short reads, so a short result means EOF: the
+            // file is shorter than `offset + length`. That is precisely what the
+            // miss path's `meta.len() < end_offset` check rejects, so report the
+            // same error whether or not the descriptor came from the cache.
+            return Err(DiskError::FileCorrupt);
         }
         Ok(Bytes::from(bytes))
     }
@@ -2698,6 +2884,18 @@ impl LocalIoBackend for UringBackend {
 
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
         self.inner.open_write(volume, path, mode).await
+    }
+
+    async fn invalidate_cached_fd(&self, volume: &str, path: &str) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.invalidate_exact(volume, path).await;
+        }
+    }
+
+    fn invalidate_cached_fds_under(&self, volume: &str, path: &str) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.invalidate_under(volume, path);
+        }
     }
 }
 
@@ -4937,6 +5135,12 @@ impl DiskAPI for LocalDisk {
         self.delete_file(&volume_dir, &file_path, opt.recursive, opt.immediate)
             .await?;
 
+        // The inode is unlinked, but a cached descriptor would keep it readable —
+        // a deleted shard must not keep answering reads (backlog#1145). The part
+        // numbers under `path` are not known here, so this is the one caller that
+        // needs the predicate form.
+        self.io_backend.invalidate_cached_fds_under(volume, path);
+
         Ok(())
     }
 
@@ -5348,6 +5552,11 @@ impl DiskAPI for LocalDisk {
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
 
+        // Both ends changed identity: the source path no longer exists and the
+        // destination now resolves to a different inode (backlog#1145).
+        self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
+        self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
+
         if let Some(parent) = src_file_path.parent() {
             let _ = self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await;
         }
@@ -5552,6 +5761,17 @@ impl DiskAPI for LocalDisk {
         dst_path: &str,
     ) -> Result<RenameDataResp> {
         crate::hp_guard!("LocalDisk::rename_data");
+        // Snapshot the destination part paths before `fi` is consumed below. These
+        // are the descriptors a reader may hold for the version this call is about
+        // to replace (backlog#1145); readers build the identical string in
+        // `io_primitives`. An inline-data version has no parts and yields none.
+        let invalidate_part_paths: Vec<String> = {
+            let data_dir = fi.data_dir.unwrap_or_default();
+            fi.parts
+                .iter()
+                .map(|part| format!("{dst_path}/{data_dir}/part.{}", part.number))
+                .collect()
+        };
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         if !skip_access_checks(src_volume)
             && let Err(e) = super::fs::access_std(&src_volume_dir)
@@ -5870,6 +6090,21 @@ impl DiskAPI for LocalDisk {
                 }
             }
 
+            // Heal reuses a version's `data_dir` and lands the rebuilt shard on
+            // the SAME `<object>/<data_dir>/part.N` path. Without this, a cached
+            // descriptor would keep serving the pre-heal inode, defeating the heal
+            // and eroding read quorum (backlog#1145).
+            //
+            // The exact keys are derivable here, and this runs on every write, so
+            // use them rather than registering a predicate the read path would then
+            // have to evaluate. Readers build the same string
+            // (`{object}/{data_dir}/part.{n}`), and `fi.parts` enumerates every
+            // part of the version now at `dst_path` — any part path absent from it
+            // no longer exists for readers to ask for.
+            for part_path in &invalidate_part_paths {
+                self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+            }
+
             Ok(RenameDataResp {
                 old_data_dir: has_old_data_dir,
                 sign: version_signature,
@@ -6026,6 +6261,21 @@ impl DiskAPI for LocalDisk {
                 let _ = self.delete_file(&dst_volume_dir, cleanup, true, false).await;
             } else if let Some(parent) = src_file_path.parent() {
                 let _ = remove_std(parent);
+            }
+
+            // Heal reuses a version's `data_dir` and lands the rebuilt shard on
+            // the SAME `<object>/<data_dir>/part.N` path. Without this, a cached
+            // descriptor would keep serving the pre-heal inode, defeating the heal
+            // and eroding read quorum (backlog#1145).
+            //
+            // The exact keys are derivable here, and this runs on every write, so
+            // use them rather than registering a predicate the read path would then
+            // have to evaluate. Readers build the same string
+            // (`{object}/{data_dir}/part.{n}`), and `fi.parts` enumerates every
+            // part of the version now at `dst_path` — any part path absent from it
+            // no longer exists for readers to ask for.
+            for part_path in &invalidate_part_paths {
+                self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
             }
 
             Ok(RenameDataResp {
@@ -11812,6 +12062,176 @@ mod test {
             let got = get_io_uring_shards();
             assert!((1..=4).contains(&got), "an unparseable override must fall back to the default, got {got}");
         });
+    }
+
+    /// Prefix invalidation must respect component boundaries: dropping the
+    /// descriptors for object `a/b` must not also drop those for `a/bc`.
+    /// moka applies the predicate lazily, so this also pins the guarantee we rely
+    /// on — a `get` after `invalidate_under` never returns a matched entry.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fd_cache_prefix_invalidation_respects_component_boundary() {
+        use std::fs::File;
+        let dir = tempfile::tempdir().expect("operation should succeed");
+        let make = || Arc::new(File::create(dir.path().join("f")).expect("operation should succeed"));
+        let cache = FdCache::new();
+        let key = |path: &str| FdKey {
+            volume: "v".into(),
+            path: path.into(),
+            direct: false,
+        };
+        for path in ["a/b", "a/b/dir/part.1", "a/bc", "a/bc/dir/part.1"] {
+            cache.insert(key(path), make()).await;
+        }
+        assert_eq!(cache.entry_count().await, 4);
+
+        cache.invalidate_under("v", "a/b");
+        // `a/b` itself and everything under it go; the sibling `a/bc` stays.
+        assert!(cache.get(&key("a/b")).await.is_none(), "the prefix itself must be dropped");
+        assert!(cache.get(&key("a/b/dir/part.1")).await.is_none(), "children must be dropped");
+        assert!(cache.get(&key("a/bc")).await.is_some(), "a/bc is not under a/b");
+        assert!(cache.get(&key("a/bc/dir/part.1")).await.is_some(), "a/bc/... is not under a/b");
+
+        // A different volume with the same path must be untouched.
+        cache.insert(key("a/b"), make()).await;
+        cache.invalidate_under("other", "a/b");
+        assert!(cache.get(&key("a/b")).await.is_some(), "invalidation must be scoped to its volume");
+
+        // Exact invalidation drops only its own key.
+        cache.invalidate_exact("v", "a/bc").await;
+        assert!(cache.get(&key("a/bc")).await.is_none(), "exact key must be dropped");
+        assert!(
+            cache.get(&key("a/bc/dir/part.1")).await.is_some(),
+            "exact invalidation must not touch children"
+        );
+    }
+
+    /// The descriptor cache (backlog#1145) must not let a healed shard be masked
+    /// by a stale descriptor.
+    ///
+    /// Heal reuses the version's `data_dir` and renames a rebuilt shard onto the
+    /// SAME `<object>/<data_dir>/part.N` path. This test reproduces exactly that:
+    /// read the part (which caches its descriptor), swap the file for new content
+    /// by rename, and assert that a read still returns the OLD bytes — proving the
+    /// hazard is real and the cache is actually in play — then invalidate and
+    /// assert the healed bytes become visible.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_fd_cache_hides_a_healed_shard_until_invalidated() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+        let Some(backend) = temp_env::with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            || UringBackend::try_new(root.clone()),
+        ) else {
+            // Restricted environment (CI seccomp): io_uring is unavailable, so
+            // there is no descriptor cache to exercise. Do not vacuously pass.
+            eprintln!("SKIP uring_fd_cache_hides_a_healed_shard_until_invalidated: io_uring unavailable");
+            return;
+        };
+        assert!(backend.fd_cache.is_some(), "the cache must be on for this test to mean anything");
+
+        let volume = "bucket";
+        let object = "obj/0d1e2f/part.1";
+        let dir = root.join(volume).join("obj/0d1e2f");
+        std::fs::create_dir_all(&dir).expect("operation should succeed");
+        let part = root.join(volume).join(object);
+        std::fs::write(&part, b"corrupt-shard").expect("operation should succeed");
+
+        let before = backend
+            .pread_bytes(volume, object, 0, b"corrupt-shard".len(), None)
+            .await
+            .expect("operation should succeed");
+        assert_eq!(before, Bytes::from_static(b"corrupt-shard"));
+
+        // Heal: write the rebuilt shard beside the old one and rename it into
+        // place, exactly as rename_data does. The path is unchanged; the inode is not.
+        let rebuilt = dir.join("part.1.rebuilt");
+        std::fs::write(&rebuilt, b"healed--shard").expect("operation should succeed");
+        std::fs::rename(&rebuilt, &part).expect("operation should succeed");
+
+        let stale = backend
+            .pread_bytes(volume, object, 0, b"healed--shard".len(), None)
+            .await
+            .expect("operation should succeed");
+        assert_eq!(
+            stale,
+            Bytes::from_static(b"corrupt-shard"),
+            "a cached descriptor is expected to still see the pre-heal inode — this is the hazard \
+             invalidate_cached_fds exists to close, and the assertion proves the cache is live"
+        );
+
+        backend.invalidate_cached_fds_under(volume, "obj/0d1e2f");
+        let healed = backend
+            .pread_bytes(volume, object, 0, b"healed--shard".len(), None)
+            .await
+            .expect("operation should succeed");
+        assert_eq!(
+            healed,
+            Bytes::from_static(b"healed--shard"),
+            "after invalidation the healed shard must be visible"
+        );
+    }
+
+    /// The mutation paths on `LocalDisk` must actually call
+    /// `invalidate_cached_fds`, not merely have it available (backlog#1145).
+    /// `rename_file` replaces the inode at a path a reader has already cached;
+    /// `delete` unlinks it while a cached descriptor would keep it readable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_fd_cache_is_invalidated_by_rename_file_and_delete() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            async {
+                let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+                disk.make_volume("bucket").await.expect("operation should succeed");
+
+                disk.write_all("bucket", "obj/part.1", Bytes::from_static(b"v1"))
+                    .await
+                    .expect("operation should succeed");
+                let got = disk
+                    .read_file_mmap_copy("bucket", "obj/part.1", 0, 2)
+                    .await
+                    .expect("operation should succeed");
+                assert_eq!(got, Bytes::from_static(b"v1"), "first read seeds the descriptor cache");
+
+                // rename_file over the same destination path: the inode changes.
+                disk.write_all("bucket", "staging/part.1", Bytes::from_static(b"v2"))
+                    .await
+                    .expect("operation should succeed");
+                disk.rename_file("bucket", "staging/part.1", "bucket", "obj/part.1")
+                    .await
+                    .expect("operation should succeed");
+                let got = disk
+                    .read_file_mmap_copy("bucket", "obj/part.1", 0, 2)
+                    .await
+                    .expect("operation should succeed");
+                assert_eq!(got, Bytes::from_static(b"v2"), "rename_file must invalidate the cached descriptor");
+
+                // delete must stop the path from answering reads at all.
+                disk.delete("bucket", "obj/part.1", DeleteOptions::default())
+                    .await
+                    .expect("operation should succeed");
+                let err = disk.read_file_mmap_copy("bucket", "obj/part.1", 0, 2).await;
+                assert!(
+                    err.is_err(),
+                    "a deleted part must not keep answering reads from a cached descriptor, got {err:?}"
+                );
+            },
+        )
+        .await;
     }
 
     /// O_DIRECT interop (backlog#1102): with BOTH io_uring and O_DIRECT enabled,
