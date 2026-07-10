@@ -28,6 +28,22 @@
 # truth, also used locally and by the PR gate). This workflow only provisions
 # the server topology: a single node, or a real 4-node distributed cluster
 # (erasure-coded across nodes) behind an HAProxy round-robin load balancer.
+#
+# Runner infrastructure (ci-1, backlog#1149): this sweep needs BOTH a working
+# Docker daemon (to build the source image and run the single/multi topologies)
+# AND a Python toolchain with pip (for awscurl/tox and the pytest harness).
+# It previously ran on the self-hosted `sm-standard-4` label, which is served
+# by heterogeneous runners: some scheduled runs landed on minimal pods that
+# had neither `pip` (bare python3, `No module named pip`) nor `docker.sock`,
+# so "Install Python tools" died before any test executed (all 15 recorded
+# runs failed). Two changes make the infra assumptions explicit instead of
+# trusting drifting runner state:
+#   1. Pin to GitHub-hosted `ubuntu-latest`, which reliably ships Docker,
+#      docker compose, python3 and pip (no self-hosted fleet drift).
+#   2. Set up Python explicitly (actions/setup-python) before any pip usage,
+#      so the workflow stays correct even if the runner image changes.
+# The PR gate (ci.yml s3-implemented-tests) is unaffected: it avoids Docker
+# via DEPLOY_MODE=binary and defers all pip setup to run.sh's self-bootstrap.
 
 name: e2e-s3tests
 
@@ -99,7 +115,11 @@ defaults:
 
 jobs:
   s3tests:
-    runs-on: sm-standard-4
+    # GitHub-hosted: reliably provides Docker + docker compose + python3/pip.
+    # See the header note (ci-1) for why the self-hosted sm-standard-4 label
+    # was abandoned. TODO(ci-8): scheduled-failure alerting (auto-open issue)
+    # is added by the ci-8 composite action; do not implement it here.
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -110,6 +130,14 @@ jobs:
       TEST_MODE: ${{ matrix.test-mode }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      # Provision Python explicitly rather than trusting the runner image to
+      # ship a working pip (ci-1: a bare python3 without pip is what broke the
+      # scheduled sweep). Keeps the workflow correct across runner drift.
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
 
       - name: Cache pip downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -130,9 +158,9 @@ jobs:
       - name: Build RustFS image (source, cached)
         run: |
           DOCKER_BUILDKIT=1 docker buildx build --load \
-            --platform ${PLATFORM} \
-            --cache-from type=gha,scope=${BUILDX_CACHE_SCOPE} \
-            --cache-to type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE} \
+            --platform "${PLATFORM}" \
+            --cache-from "type=gha,scope=${BUILDX_CACHE_SCOPE}" \
+            --cache-to "type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE}" \
             -t rustfs-ci \
             -f Dockerfile.source .
 
@@ -143,10 +171,10 @@ jobs:
           docker rm -f rustfs-single >/dev/null 2>&1 || true
           docker run -d --name rustfs-single \
             --network rustfs-net \
-            -p ${S3_PORT}:9000 \
+            -p "${S3_PORT}:9000" \
             -e RUSTFS_ADDRESS=0.0.0.0:9000 \
-            -e RUSTFS_ACCESS_KEY=${S3_ACCESS_KEY} \
-            -e RUSTFS_SECRET_KEY=${S3_SECRET_KEY} \
+            -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
+            -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
             -e RUSTFS_VOLUMES="/data/rustfs{0...3}" \
             -v /tmp/rustfs-single:/data \
             rustfs-ci
@@ -226,7 +254,7 @@ jobs:
 
       - name: Wait for RustFS ready
         run: |
-          for i in {1..120}; do
+          for _ in {1..120}; do
             if curl -sf "http://${S3_HOST}:${S3_PORT}/health" >/dev/null 2>&1; then
               echo "RustFS is ready"
               exit 0
