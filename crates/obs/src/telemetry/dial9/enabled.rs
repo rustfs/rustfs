@@ -51,11 +51,6 @@ impl Dial9SessionGuard {
     pub fn is_active(&self) -> bool {
         self.guard.is_enabled()
     }
-
-    /// The configuration this session was built from.
-    pub fn config(&self) -> &Dial9Config {
-        &self.config
-    }
 }
 
 impl std::fmt::Debug for Dial9SessionGuard {
