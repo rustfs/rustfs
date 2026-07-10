@@ -27,8 +27,28 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 
 [features]
 default = []
+# Tokio runtime-level telemetry. Requires a `--cfg tokio_unstable` build; the
+# build script fails the compile when that flag is missing. Off by default so
+# ordinary builds neither pay for nor depend on Tokio's unstable API.
+dial9 = ["dep:dial9-tokio-telemetry"]
+# Capture async backtraces of stalled tasks. Enables `tokio/taskdump`, which
+# hard-errors at compile time on anything other than linux/{aarch64,x86,x86_64},
+# and additionally needs `--cfg tokio_taskdump` to record anything. Linux-only,
+# and not a silent no-op elsewhere: enabling it on macOS fails the build.
+dial9-taskdump = ["dial9", "dial9-tokio-telemetry/taskdump"]
+#
+# NOTE: there is deliberately no `dial9-s3` feature. dial9's `worker-s3` feature
+# pulls aws-sdk-s3-transfer-manager 0.1.3 (its latest), which pins
+# aws-smithy-http-client onto hyper-rustls 0.24 / rustls-webpki 0.101.7. That
+# webpki carries RUSTSEC-2026-0098, -0099 and -0104, and `cargo deny` rejects it.
+# Feature unification cannot drop a transitive dependency, so this can only be
+# fixed upstream. Tracked in rustfs/backlog#1157 (D9-14).
 gpu = ["dep:nvml-wrapper"]
 pyroscope = ["dep:pyroscope"]
+
+[[example]]
+name = "dial9_smoke"
+required-features = ["dial9"]
 
 [lints]
 workspace = true
@@ -76,7 +96,7 @@ tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "std", "fmt", "env-filter", "tracing-log", "time", "local-time", "json"] }
 tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "rt", "time", "macros"] }
 tokio-util = { workspace = true }
-dial9-tokio-telemetry = { workspace = true }
+dial9-tokio-telemetry = { workspace = true, optional = true }
 thiserror = { workspace = true }
 zstd = { workspace = true, features = ["zstdmt"] }
 sysinfo = { workspace = true }

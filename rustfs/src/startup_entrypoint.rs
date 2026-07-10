@@ -32,8 +32,14 @@ const OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED: &str = "observability initializ
 
 pub fn run_process() {
     // Building the process runtime is a startup fatal boundary.
-    let runtime = crate::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
+    let (runtime, dial9_guard) = crate::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
+
+    // Flush and seal the trace segment before any exit path. `process::exit`
+    // below does not run destructors, and neither does returning from `main`
+    // for a guard held in a `static`.
+    drop(dial9_guard);
+
     if let Err(ref e) = result {
         if e.to_string() != OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED {
             // Tracing may not be initialized when startup fails this early.

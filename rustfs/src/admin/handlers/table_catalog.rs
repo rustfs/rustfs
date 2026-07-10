@@ -3015,7 +3015,7 @@ where
             namespace,
             table,
             entry,
-            &manifest_location,
+            &manifest_location.manifest_path,
             crate::table_catalog::TableMetadataMaintenanceObjectKind::ManifestFile,
         )?;
         let manifest_object = metadata_backend
@@ -3025,12 +3025,28 @@ where
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest object is missing"))?;
         let file_references =
             crate::table_catalog::data_file_references_from_manifest_avro(&manifest_object.data).map_err(catalog_store_error)?;
-        for reference in file_references {
+        for mut reference in file_references {
+            if reference.snapshot_id.is_none() {
+                reference.snapshot_id = manifest_location.added_snapshot_id;
+            }
+            if reference.sequence_number.is_none() {
+                reference.sequence_number = manifest_location.sequence_number;
+            }
+            if reference.file_sequence_number.is_none() {
+                reference.file_sequence_number = manifest_location.sequence_number;
+            }
             validate_manifest_data_file_reference(metadata_backend, bucket, namespace, table, entry, &reference).await?;
             references.push(reference);
         }
     }
     Ok(references)
+}
+
+#[derive(Debug)]
+struct SnapshotManifestLocation {
+    manifest_path: String,
+    sequence_number: Option<i64>,
+    added_snapshot_id: Option<i64>,
 }
 
 async fn snapshot_manifest_locations<B>(
@@ -3040,7 +3056,7 @@ async fn snapshot_manifest_locations<B>(
     table: &crate::table_catalog::IdentifierSegment,
     entry: &crate::table_catalog::TableEntry,
     snapshot: &serde_json::Value,
-) -> S3Result<Vec<String>>
+) -> S3Result<Vec<SnapshotManifestLocation>>
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
@@ -3063,7 +3079,14 @@ where
         if references.is_empty() {
             return Err(s3_error!(InvalidRequest, "snapshot manifest-list must reference at least one manifest"));
         }
-        return Ok(references.into_iter().map(|reference| reference.manifest_path).collect());
+        return Ok(references
+            .into_iter()
+            .map(|reference| SnapshotManifestLocation {
+                manifest_path: reference.manifest_path,
+                sequence_number: reference.sequence_number,
+                added_snapshot_id: reference.added_snapshot_id,
+            })
+            .collect());
     }
 
     let Some(manifests) = snapshot.get("manifests").and_then(serde_json::Value::as_array) else {
@@ -3078,7 +3101,11 @@ where
             manifest
                 .as_str()
                 .filter(|manifest| !manifest.is_empty())
-                .map(str::to_string)
+                .map(|manifest| SnapshotManifestLocation {
+                    manifest_path: manifest.to_string(),
+                    sequence_number: None,
+                    added_snapshot_id: None,
+                })
                 .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest location must be a string"))
         })
         .collect()
@@ -8125,6 +8152,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_level_conflict_inherits_manifest_list_sequence_numbers() {
+        let store = TestTableCatalogStore::default();
+        let metadata_backend = TestTableCatalogObjectBackend::default();
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let created = create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let table_location = created.metadata["location"]
+            .as_str()
+            .expect("created metadata should have table location");
+        let manifest_list = format!("{table_location}/metadata/snap-10.avro");
+        let manifest = format!("{table_location}/metadata/manifest-10.avro");
+        let data_file = format!("{table_location}/data/part-10.parquet");
+        seed_test_manifest_list(&metadata_backend, "warehouse", &manifest_list, &[&manifest], 1, 10).await;
+        seed_test_manifest_with_nullable_sequences(&metadata_backend, "warehouse", &manifest, &[(&data_file, 0, 1, 10, None)])
+            .await;
+        let append_request: RestCommitTableRequest = serde_json::from_value(serde_json::json!({
+            "updates": [
+                {
+                    "action": "add-snapshot",
+                    "snapshot": {
+                        "snapshot-id": 10,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1234,
+                        "manifest-list": manifest_list,
+                        "summary": {
+                            "operation": "append"
+                        }
+                    }
+                },
+                {
+                    "action": "set-snapshot-ref",
+                    "ref-name": "main",
+                    "snapshot-id": 10,
+                    "type": "branch"
+                }
+            ]
+        }))
+        .expect("append request should parse");
+
+        let commit = commit_table_response(&store, &metadata_backend, "warehouse", &namespace, "events", append_request)
+            .await
+            .expect("manifest entry should inherit sequence numbers from manifest list");
+
+        assert_eq!(commit.metadata["current-snapshot-id"], 10);
+        assert_eq!(commit.metadata["last-sequence-number"], 1);
+    }
+
+    #[tokio::test]
     async fn row_level_conflict_allows_add_only_overwrite_snapshot() {
         let store = TestTableCatalogStore::default();
         let metadata_backend = TestTableCatalogObjectBackend::default();
@@ -9498,6 +9572,83 @@ mod tests {
         writer.into_inner().expect("manifest avro bytes should flush")
     }
 
+    fn test_nullable_long(value: Option<i64>) -> apache_avro::types::Value {
+        match value {
+            Some(value) => apache_avro::types::Value::Union(1, Box::new(apache_avro::types::Value::Long(value))),
+            None => apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+        }
+    }
+
+    fn test_manifest_avro_bytes_with_nullable_sequences(files: &[(&str, i32, i32, i64, Option<i64>)]) -> Vec<u8> {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "manifest_entry",
+              "fields": [
+                {"name": "status", "type": "int"},
+                {"name": "snapshot_id", "type": "long"},
+                {"name": "sequence_number", "type": ["null", "long"], "default": null},
+                {"name": "file_sequence_number", "type": ["null", "long"], "default": null},
+                {
+                  "name": "data_file",
+                  "type": {
+                    "type": "record",
+                    "name": "data_file",
+                    "fields": [
+                      {"name": "content", "type": "int"},
+                      {"name": "file_path", "type": "string"},
+                      {"name": "record_count", "type": "long"},
+                      {"name": "file_size_in_bytes", "type": "long"}
+                    ]
+                  }
+                }
+              ]
+            }
+            "#,
+        )
+        .expect("manifest avro schema should parse");
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for (file_path, content, status, snapshot_id, sequence_number) in files {
+            writer
+                .append(apache_avro::types::Value::Record(vec![
+                    ("status".to_string(), apache_avro::types::Value::Int(*status)),
+                    ("snapshot_id".to_string(), apache_avro::types::Value::Long(*snapshot_id)),
+                    ("sequence_number".to_string(), test_nullable_long(*sequence_number)),
+                    ("file_sequence_number".to_string(), test_nullable_long(*sequence_number)),
+                    (
+                        "data_file".to_string(),
+                        apache_avro::types::Value::Record(vec![
+                            ("content".to_string(), apache_avro::types::Value::Int(*content)),
+                            ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                            ("record_count".to_string(), apache_avro::types::Value::Long(1)),
+                            ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
+                        ]),
+                    ),
+                ]))
+                .expect("manifest record should append");
+        }
+        writer.into_inner().expect("manifest avro bytes should flush")
+    }
+
+    async fn seed_test_manifest_list(
+        backend: &TestTableCatalogObjectBackend,
+        bucket: &str,
+        manifest_list_location: &str,
+        manifest_locations: &[&str],
+        sequence_number: i64,
+        snapshot_id: i64,
+    ) {
+        let manifest_list_key = test_snapshot_object_key(bucket, manifest_list_location);
+        backend
+            .put_bytes(
+                bucket,
+                &manifest_list_key,
+                test_manifest_list_avro_bytes(manifest_locations, sequence_number, snapshot_id),
+            )
+            .await;
+    }
+
     async fn seed_test_snapshot_manifest(
         backend: &TestTableCatalogObjectBackend,
         bucket: &str,
@@ -9523,6 +9674,25 @@ mod tests {
             .put_bytes(bucket, &manifest_key, test_manifest_avro_bytes(files))
             .await;
         seed_test_manifest_data_files(backend, bucket, files).await;
+    }
+
+    async fn seed_test_manifest_with_nullable_sequences(
+        backend: &TestTableCatalogObjectBackend,
+        bucket: &str,
+        manifest_location: &str,
+        files: &[(&str, i32, i32, i64, Option<i64>)],
+    ) {
+        let manifest_key = test_snapshot_object_key(bucket, manifest_location);
+        backend
+            .put_bytes(bucket, &manifest_key, test_manifest_avro_bytes_with_nullable_sequences(files))
+            .await;
+        let data_files = files
+            .iter()
+            .map(|(file_path, content, status, snapshot_id, sequence_number)| {
+                (*file_path, *content, *status, *snapshot_id, sequence_number.unwrap_or_default())
+            })
+            .collect::<Vec<_>>();
+        seed_test_manifest_data_files(backend, bucket, &data_files).await;
     }
 
     async fn seed_test_manifest(
