@@ -193,12 +193,16 @@ impl Dial9Config {
     }
 }
 
-/// S3 upload needs the `dial9-s3` feature, which pulls in the AWS SDK. Warn
-/// loudly rather than silently discarding a configured bucket.
+/// S3 upload of sealed segments is not available in any build.
+///
+/// dial9's `worker-s3` feature depends on aws-sdk-s3-transfer-manager 0.1.3,
+/// which pins hyper-rustls 0.24 / rustls-webpki 0.101.7 — a webpki carrying
+/// RUSTSEC-2026-0098, -0099 and -0104. Cargo cannot drop a transitive
+/// dependency, so this needs an upstream fix (rustfs/backlog#1157, D9-14).
+///
+/// Warn loudly rather than silently discarding a configured bucket: an operator
+/// who set these expects their traces to be uploaded somewhere.
 fn warn_unusable_s3_upload(s3_bucket: Option<&str>, s3_prefix: Option<&str>) {
-    if cfg!(feature = "dial9-s3") {
-        return;
-    }
     if s3_bucket.is_none() && s3_prefix.is_none() {
         return;
     }
@@ -207,10 +211,11 @@ fn warn_unusable_s3_upload(s3_bucket: Option<&str>, s3_prefix: Option<&str>) {
         event = EVENT_DIAL9_STATE,
         component = LOG_COMPONENT_OBS,
         subsystem = LOG_SUBSYSTEM_DIAL9,
-        result = "s3_upload_not_compiled_in",
+        result = "s3_upload_unsupported",
         s3_bucket = s3_bucket.unwrap_or(""),
         s3_prefix = s3_prefix.unwrap_or(""),
-        remedy = "rebuild with --features dial9-s3",
+        reason = "dial9 worker-s3 depends on a vulnerable rustls-webpki (RUSTSEC-2026-0098/0099/0104)",
+        remedy = "collect trace segments from the output directory instead",
         "dial9 state changed"
     );
 }

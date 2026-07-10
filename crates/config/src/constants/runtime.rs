@@ -33,9 +33,10 @@ pub const ENV_RUNTIME_DIAL9_OUTPUT_DIR: &str = "RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR"
 pub const ENV_RUNTIME_DIAL9_FILE_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_FILE_PREFIX";
 pub const ENV_RUNTIME_DIAL9_MAX_FILE_SIZE: &str = "RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE";
 pub const ENV_RUNTIME_DIAL9_ROTATION_COUNT: &str = "RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT";
-/// Requires the `dial9-s3` build feature; ignored with a warning otherwise.
+/// Accepted but not honoured: dial9's S3 uploader depends on a vulnerable
+/// rustls-webpki. Setting this logs a warning. See rustfs/backlog#1157.
 pub const ENV_RUNTIME_DIAL9_S3_BUCKET: &str = "RUSTFS_RUNTIME_DIAL9_S3_BUCKET";
-/// Requires the `dial9-s3` build feature; ignored with a warning otherwise.
+/// Accepted but not honoured; see [`ENV_RUNTIME_DIAL9_S3_BUCKET`].
 pub const ENV_RUNTIME_DIAL9_S3_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_S3_PREFIX";
 /// Capture async backtraces for tasks that stall on a worker.
 pub const ENV_RUNTIME_DIAL9_TASK_DUMP_ENABLED: &str = "RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED";

@@ -38,13 +38,12 @@ make build-profiling
 ```
 
 That is `cargo build --release --bin rustfs --features dial9` with
-`RUSTFLAGS="--cfg tokio_unstable"`. Two optional features layer on top:
+`RUSTFLAGS="--cfg tokio_unstable"`. One optional feature layers on top:
 
 ```bash
-# Upload sealed segments to S3 (pulls in the AWS SDK)
-DIAL9_FEATURES="dial9-s3" make build-profiling
-
-# Async backtraces of stalled tasks (Linux x86_64/aarch64)
+# Async backtraces of stalled tasks. Linux aarch64/x86/x86_64 only —
+# `tokio/taskdump` hard-errors at compile time on other targets, so this
+# will not build on macOS.
 DIAL9_RUSTFLAGS="--cfg tokio_unstable --cfg tokio_taskdump" \
   DIAL9_FEATURES="dial9-taskdump" make build-profiling
 ```
@@ -83,13 +82,26 @@ Turn `RUSTFS_RUNTIME_DIAL9_ENABLED` back off when you are done.
 | `RUSTFS_RUNTIME_DIAL9_FILE_PREFIX` | `rustfs-tokio` | |
 | `RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE` | `104857600` | Bytes per segment |
 | `RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT` | `10` | Total budget = size × count |
-| `RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED` | `false` | Needs `dial9-taskdump` |
+| `RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED` | `false` | Needs `dial9-taskdump` (Linux only) |
 | `RUSTFS_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS` | `10` | Mean idle for Poisson sampling |
-| `RUSTFS_RUNTIME_DIAL9_S3_BUCKET` | unset | Needs `dial9-s3` |
-| `RUSTFS_RUNTIME_DIAL9_S3_PREFIX` | unset | Needs `dial9-s3` |
+| `RUSTFS_RUNTIME_DIAL9_S3_BUCKET` | unset | **Not honoured**, see below |
+| `RUSTFS_RUNTIME_DIAL9_S3_PREFIX` | unset | **Not honoured**, see below |
 
 Variables whose build feature is absent are ignored, with a warning naming the
 feature to rebuild with.
+
+### S3 upload is unavailable
+
+dial9's `worker-s3` feature depends on `aws-sdk-s3-transfer-manager` 0.1.3 (its
+latest release), which pins `aws-smithy-http-client` onto `hyper-rustls` 0.24 and
+`rustls-webpki` 0.101.7. That webpki carries RUSTSEC-2026-0098, -0099 and -0104,
+and the repository's `cargo deny` gate rejects it.
+
+Cargo's feature unification can add features but cannot drop a transitive
+dependency, so this cannot be worked around downstream — it needs an upstream
+release. RustFS therefore builds no S3 uploader at all. Setting the two variables
+above logs a warning and changes nothing; retrieve trace segments from
+`OUTPUT_DIR` directly. Tracked as D9-14 in rustfs/backlog#1157.
 
 ## Metrics
 

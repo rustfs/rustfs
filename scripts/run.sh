@@ -149,13 +149,14 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 #export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=10
 
 # Capture async backtraces of tasks that stall (default: false).
-# Needs a binary built with the `dial9-taskdump` feature.
+# Needs a binary built with the `dial9-taskdump` feature (Linux only).
 #export RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED=true
 # Mean idle duration for task-dump Poisson sampling, in ms (default: 10)
 #export RUSTFS_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS=10
 
-# Upload sealed segments to S3. Needs a binary built with the `dial9-s3`
-# feature; otherwise these are ignored with a warning.
+# S3 upload is NOT available: dial9's uploader depends on a rustls-webpki with
+# known CVEs, so the feature is not built. These are parsed and warned about,
+# never honoured. Collect segments from OUTPUT_DIR instead.
 #export RUSTFS_RUNTIME_DIAL9_S3_BUCKET=my-trace-bucket
 #export RUSTFS_RUNTIME_DIAL9_S3_PREFIX=telemetry/
 

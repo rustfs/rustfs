@@ -43,9 +43,9 @@ build-gnu-arm64: ## Build aarch64 GNU version
 # Setting RUSTFLAGS here replaces (never appends to) the config-file value, and
 # crates/obs/build.rs fails the build if the feature and the flag disagree.
 #
-# DIAL9_FEATURES can add `dial9-s3` (upload sealed segments) or
-# `dial9-taskdump` (async backtraces of stalled tasks; Linux x86_64/aarch64,
-# and also needs --cfg tokio_taskdump).
+# DIAL9_FEATURES can add `dial9-taskdump` (async backtraces of stalled tasks;
+# Linux x86_64/aarch64, and also needs --cfg tokio_taskdump). There is no S3
+# upload feature — see the note in crates/obs/Cargo.toml.
 DIAL9_FEATURES ?= dial9
 DIAL9_RUSTFLAGS ?= --cfg tokio_unstable
 

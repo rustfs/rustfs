@@ -108,8 +108,7 @@ pub fn build_traced_runtime(
     })?;
 
     // `with_trace_path` transitions the builder into the state that spawns the
-    // background worker, which drives the segment pipeline (and S3 upload when
-    // configured).
+    // background worker, which drives the segment pipeline.
     let traced = TracedRuntime::builder()
         .with_trace_path(&config.output_dir)
         .with_task_tracking(true)
@@ -126,14 +125,11 @@ pub fn build_traced_runtime(
         traced
     };
 
-    // `build_and_start` rather than `build`: `build` leaves the guard disabled
-    // and records nothing at all.
-    #[cfg(feature = "dial9-s3")]
-    if let Some(s3_config) = build_s3_config(&config) {
-        let started = traced.with_s3_uploader(s3_config).build_and_start(builder, writer);
-        return finish_traced_runtime(started, config);
-    }
-
+    // `build_and_start` rather than `build`: `build` returns a live guard that
+    // never records, writing segments that contain only a header.
+    //
+    // No `with_s3_uploader` here: dial9's `worker-s3` feature carries a
+    // vulnerable TLS stack. See the note in `crates/obs/Cargo.toml`.
     finish_traced_runtime(traced.build_and_start(builder, writer), config)
 }
 
@@ -206,21 +202,6 @@ async fn refresh_disk_usage_loop() {
             ),
         }
     }
-}
-
-/// Translate the RustFS-facing S3 knobs into dial9's uploader config.
-#[cfg(feature = "dial9-s3")]
-fn build_s3_config(config: &Dial9Config) -> Option<dial9_tokio_telemetry::background_task::s3::S3Config> {
-    use dial9_tokio_telemetry::background_task::s3::S3Config;
-
-    let bucket = config.s3_bucket.clone()?;
-    Some(
-        S3Config::builder()
-            .bucket(bucket)
-            .service_name(RUNTIME_NAME.to_string())
-            .maybe_prefix(config.s3_prefix.clone())
-            .build(),
-    )
 }
 
 #[cfg(test)]
