@@ -16,22 +16,24 @@ use crate::cache::ObjectDataCacheFillResult;
 use crate::key::ObjectDataCacheKey;
 use crate::metrics::{record_singleflight_join, set_inflight_fills};
 use crate::stats::ObjectDataCacheStats;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use tokio::sync::watch;
 
-type FillMap = Mutex<HashMap<ObjectDataCacheKey, watch::Sender<Option<ObjectDataCacheFillResult>>>>;
+type FillSet = Mutex<HashSet<ObjectDataCacheKey>>;
 
-fn lock_fills(
-    fills: &FillMap,
-) -> std::sync::MutexGuard<'_, HashMap<ObjectDataCacheKey, watch::Sender<Option<ObjectDataCacheFillResult>>>> {
+fn lock_fills(fills: &FillSet) -> std::sync::MutexGuard<'_, HashSet<ObjectDataCacheKey>> {
     fills.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Shared singleflight controller for cache fill operations.
+/// Shared singleflight controller that dedups concurrent cache fills per key.
+///
+/// The fill path already holds the fully materialized body, so a non-leader
+/// gains nothing by waiting for the leader's result — a duplicate fill is
+/// simply skipped. The controller therefore only elects a leader per key and
+/// reports [`Busy`](ObjectDataCacheSingleflightAcquire::Busy) to everyone else.
 #[derive(Debug)]
 pub struct ObjectDataCacheSingleflight {
-    fills: FillMap,
+    fills: FillSet,
     stats: Arc<ObjectDataCacheStats>,
 }
 
@@ -39,31 +41,46 @@ impl ObjectDataCacheSingleflight {
     /// Creates a new singleflight controller.
     pub fn new(stats: Arc<ObjectDataCacheStats>) -> Self {
         Self {
-            fills: Mutex::new(HashMap::new()),
+            fills: Mutex::new(HashSet::new()),
             stats,
         }
     }
 
-    /// Acquires a leader-or-waiter role for the supplied cache key.
-    pub async fn acquire(&self, key: ObjectDataCacheKey) -> ObjectDataCacheSingleflightAcquire<'_> {
-        let mut fills = lock_fills(&self.fills);
-        if let Some(sender) = fills.get(&key) {
-            record_singleflight_join(&self.stats);
-            return ObjectDataCacheSingleflightAcquire::Waiter(ObjectDataCacheSingleflightWaiter { rx: sender.subscribe() });
+    /// Tries to become the leader for the supplied cache key without blocking.
+    ///
+    /// Returns [`Leader`](ObjectDataCacheSingleflightAcquire::Leader) when no
+    /// fill for the key is in flight, otherwise
+    /// [`Busy`](ObjectDataCacheSingleflightAcquire::Busy). The caller already
+    /// owns the body, so a `Busy` outcome skips the redundant fill rather than
+    /// waiting for another request's leader to finish.
+    pub fn try_acquire(&self, key: ObjectDataCacheKey) -> ObjectDataCacheSingleflightAcquire<'_> {
+        // Keep the critical section to the map mutation only; emit metrics after
+        // dropping the guard so the recorder round-trip never serializes fills.
+        let inflight_len = {
+            let mut fills = lock_fills(&self.fills);
+            if fills.contains(&key) {
+                None
+            } else {
+                fills.insert(key.clone());
+                Some(fills.len())
+            }
+        };
+
+        match inflight_len {
+            None => {
+                record_singleflight_join(&self.stats);
+                ObjectDataCacheSingleflightAcquire::Busy
+            }
+            Some(len) => {
+                set_inflight_fills(&self.stats, "moka", len);
+                ObjectDataCacheSingleflightAcquire::Leader(ObjectDataCacheSingleflightLeader {
+                    key,
+                    fills: &self.fills,
+                    stats: Arc::clone(&self.stats),
+                    finished: false,
+                })
+            }
         }
-
-        let (tx, _rx) = watch::channel(None);
-        fills.insert(key.clone(), tx.clone());
-        set_inflight_fills(&self.stats, "moka", fills.len());
-        drop(fills);
-
-        ObjectDataCacheSingleflightAcquire::Leader(ObjectDataCacheSingleflightLeader {
-            key,
-            tx,
-            fills: &self.fills,
-            stats: Arc::clone(&self.stats),
-            finished: false,
-        })
     }
 
     /// Returns whether a leader fill is currently in flight for the key.
@@ -72,72 +89,54 @@ impl ObjectDataCacheSingleflight {
     /// (a different key under the same identity that has registered in the index
     /// but not yet published its cache entry) from being pruned as stale.
     pub fn has_inflight(&self, key: &ObjectDataCacheKey) -> bool {
-        lock_fills(&self.fills).contains_key(key)
+        lock_fills(&self.fills).contains(key)
     }
 }
 
-/// Leader or waiter result from the singleflight map.
+/// Leader-or-busy result from the singleflight controller.
 pub enum ObjectDataCacheSingleflightAcquire<'a> {
     /// Caller is responsible for performing the fill operation.
     Leader(ObjectDataCacheSingleflightLeader<'a>),
-    /// Caller must wait for the leader's result.
-    Waiter(ObjectDataCacheSingleflightWaiter),
+    /// A fill for the same key is already in flight; the caller skips its own.
+    Busy,
 }
 
 /// Leader handle for a singleflight fill operation.
 pub struct ObjectDataCacheSingleflightLeader<'a> {
     key: ObjectDataCacheKey,
-    tx: watch::Sender<Option<ObjectDataCacheFillResult>>,
-    fills: &'a FillMap,
+    fills: &'a FillSet,
     stats: Arc<ObjectDataCacheStats>,
     finished: bool,
 }
 
 impl<'a> ObjectDataCacheSingleflightLeader<'a> {
-    /// Completes the leader operation and publishes the shared result.
-    pub async fn finish(mut self, result: ObjectDataCacheFillResult) -> ObjectDataCacheFillResult {
+    /// Completes the leader operation and releases the key.
+    pub fn finish(mut self, result: ObjectDataCacheFillResult) -> ObjectDataCacheFillResult {
         self.remove_entry();
         self.finished = true;
-        let _ = self.tx.send(Some(result.clone()));
         result
     }
 
     fn remove_entry(&self) {
-        let mut fills = lock_fills(self.fills);
-        fills.remove(&self.key);
-        set_inflight_fills(&self.stats, "moka", fills.len());
+        // Capture the length under the guard, then emit the gauge after dropping
+        // it so the recorder round-trip stays out of the critical section.
+        let len = {
+            let mut fills = lock_fills(self.fills);
+            fills.remove(&self.key);
+            fills.len()
+        };
+        set_inflight_fills(&self.stats, "moka", len);
     }
 }
 
 impl<'a> Drop for ObjectDataCacheSingleflightLeader<'a> {
     fn drop(&mut self) {
         // A leader dropped without finish() was cancelled mid-fill (e.g. the
-        // GET request future was aborted). Remove the map entry so its sender
-        // clone is released and waiters observe the closed channel instead of
-        // blocking forever, and so a later fill can become the new leader.
+        // fill task was aborted). Release the key so a later fill can become the
+        // new leader instead of seeing a phantom in-flight entry forever.
         if !self.finished {
             self.remove_entry();
         }
-    }
-}
-
-/// Waiter handle for a singleflight fill operation.
-pub struct ObjectDataCacheSingleflightWaiter {
-    rx: watch::Receiver<Option<ObjectDataCacheFillResult>>,
-}
-
-impl ObjectDataCacheSingleflightWaiter {
-    /// Waits for the shared fill result.
-    pub async fn wait(mut self) -> ObjectDataCacheFillResult {
-        if self.rx.wait_for(|value| value.is_some()).await.is_err() {
-            return ObjectDataCacheFillResult::SkippedSingleflightClosed;
-        }
-
-        self.rx
-            .borrow()
-            .as_ref()
-            .cloned()
-            .unwrap_or(ObjectDataCacheFillResult::SkippedSingleflightClosed)
     }
 }
 
@@ -153,55 +152,72 @@ mod tests {
         ObjectDataCacheKey::new("bucket", "object", None, "etag", 1, ObjectDataCacheBodyVariant::FullObjectPlainV1)
     }
 
-    #[tokio::test]
-    async fn singleflight_returns_waiter_for_second_caller() {
+    #[test]
+    fn first_caller_leads_and_second_caller_is_busy() {
         let stats = Arc::new(ObjectDataCacheStats::default());
         let singleflight = ObjectDataCacheSingleflight::new(Arc::clone(&stats));
 
-        let first = singleflight.acquire(key()).await;
-        let second = singleflight.acquire(key()).await;
-
-        let leader = match first {
-            ObjectDataCacheSingleflightAcquire::Leader(leader) => leader,
-            ObjectDataCacheSingleflightAcquire::Waiter(_) => panic!("first caller must become leader"),
-        };
-        let waiter = match second {
-            ObjectDataCacheSingleflightAcquire::Leader(_) => panic!("second caller must become waiter"),
-            ObjectDataCacheSingleflightAcquire::Waiter(waiter) => waiter,
-        };
-
-        let waiter_task = tokio::spawn(async move { waiter.wait().await });
-        let leader_result = leader.finish(ObjectDataCacheFillResult::Inserted).await;
-        let waiter_result = waiter_task.await.expect("waiter task should complete");
-
-        assert_eq!(leader_result, ObjectDataCacheFillResult::Inserted);
-        assert_eq!(waiter_result, ObjectDataCacheFillResult::Inserted);
-        assert_eq!(stats.snapshot().singleflight_joins, 1);
-    }
-
-    #[tokio::test]
-    async fn cancelled_leader_releases_key_and_unblocks_waiters() {
-        let stats = Arc::new(ObjectDataCacheStats::default());
-        let singleflight = ObjectDataCacheSingleflight::new(Arc::clone(&stats));
-
-        let leader = match singleflight.acquire(key()).await {
-            ObjectDataCacheSingleflightAcquire::Leader(leader) => leader,
-            ObjectDataCacheSingleflightAcquire::Waiter(_) => panic!("first caller must become leader"),
-        };
-        let waiter = match singleflight.acquire(key()).await {
-            ObjectDataCacheSingleflightAcquire::Leader(_) => panic!("second caller must become waiter"),
-            ObjectDataCacheSingleflightAcquire::Waiter(waiter) => waiter,
-        };
-
-        // Dropping without finish() simulates the leader future being cancelled.
-        drop(leader);
-
-        let waiter_result = waiter.wait().await;
-        assert_eq!(waiter_result, ObjectDataCacheFillResult::SkippedSingleflightClosed);
+        let first = singleflight.try_acquire(key());
+        let second = singleflight.try_acquire(key());
 
         assert!(
-            matches!(singleflight.acquire(key()).await, ObjectDataCacheSingleflightAcquire::Leader(_)),
+            matches!(first, ObjectDataCacheSingleflightAcquire::Leader(_)),
+            "first caller must become leader"
+        );
+        assert!(
+            matches!(second, ObjectDataCacheSingleflightAcquire::Busy),
+            "second caller must not wait; it is busy and skips"
+        );
+        assert_eq!(stats.snapshot().singleflight_joins, 1);
+
+        // Completing the leader releases the key for a subsequent fill.
+        let ObjectDataCacheSingleflightAcquire::Leader(leader) = first else {
+            unreachable!("first caller must be the leader");
+        };
+        let result = leader.finish(ObjectDataCacheFillResult::Inserted);
+        assert_eq!(result, ObjectDataCacheFillResult::Inserted);
+
+        assert!(
+            matches!(singleflight.try_acquire(key()), ObjectDataCacheSingleflightAcquire::Leader(_)),
+            "key must be released after the leader finishes"
+        );
+    }
+
+    #[test]
+    fn cancelled_leader_releases_key() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let singleflight = ObjectDataCacheSingleflight::new(Arc::clone(&stats));
+
+        let leader = match singleflight.try_acquire(key()) {
+            ObjectDataCacheSingleflightAcquire::Leader(leader) => leader,
+            ObjectDataCacheSingleflightAcquire::Busy => panic!("first caller must become leader"),
+        };
+        assert!(singleflight.has_inflight(&key()), "leader must register the key as in-flight");
+
+        // Dropping without finish() simulates the fill task being cancelled.
+        drop(leader);
+
+        assert!(!singleflight.has_inflight(&key()), "a cancelled leader must release the key");
+        assert!(
+            matches!(singleflight.try_acquire(key()), ObjectDataCacheSingleflightAcquire::Leader(_)),
             "key must be released after a cancelled leader"
         );
+    }
+
+    #[test]
+    fn distinct_keys_lead_independently() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let singleflight = ObjectDataCacheSingleflight::new(Arc::clone(&stats));
+        let other = ObjectDataCacheKey::new("bucket", "other", None, "etag", 1, ObjectDataCacheBodyVariant::FullObjectPlainV1);
+
+        let first = singleflight.try_acquire(key());
+        let second = singleflight.try_acquire(other);
+
+        assert!(matches!(first, ObjectDataCacheSingleflightAcquire::Leader(_)));
+        assert!(
+            matches!(second, ObjectDataCacheSingleflightAcquire::Leader(_)),
+            "a distinct key must not be deduped against another in-flight fill"
+        );
+        assert_eq!(stats.snapshot().singleflight_joins, 0);
     }
 }

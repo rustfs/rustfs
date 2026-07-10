@@ -282,6 +282,10 @@ pub enum ObjectDataCacheFillResult {
     SkippedInvalidationRace,
     /// The cache entry was inserted successfully.
     Inserted,
+    /// Fill was skipped because the fill-concurrency limiter was saturated.
+    SkippedFillConcurrency,
+    /// Fill was skipped because another fill for the same key was already in flight.
+    SkippedSingleflightBusy,
 }
 
 impl ObjectDataCacheFillResult {
@@ -296,6 +300,8 @@ impl ObjectDataCacheFillResult {
             Self::SkippedSingleflightClosed => "skipped_singleflight_closed",
             Self::SkippedInvalidationRace => "skipped_invalidation_race",
             Self::Inserted => "inserted",
+            Self::SkippedFillConcurrency => "skipped_fill_concurrency",
+            Self::SkippedSingleflightBusy => "skipped_singleflight_busy",
         }
     }
 }

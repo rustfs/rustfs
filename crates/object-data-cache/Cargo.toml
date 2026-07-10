@@ -34,7 +34,7 @@ moka = { workspace = true, features = ["future"] }
 starshard.workspace = true
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
