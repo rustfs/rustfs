@@ -6372,7 +6372,7 @@ impl SetDisks {
                 filter_prefix: opts.filter_prefix.clone(),
                 forward_to: opts.marker.clone(),
                 per_disk_limit: limit,
-                skip_total_timeout: false,
+                skip_total_timeout: true,
                 walkdir_timeout: opts.walkdir_timeout,
                 walkdir_stall_timeout: opts.walkdir_stall_timeout,
             },
@@ -6395,6 +6395,10 @@ impl SetDisks {
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
                 per_disk_limit: limit,
+                // A foreground listing is bounded by lack of drive progress (the walk
+                // stall timeout) and by the page limit, never by how long a healthy
+                // walk takes — a large prefix on slow media is not a fault (#4644).
+                skip_walkdir_total_timeout: true,
                 walkdir_timeout: opts.walkdir_timeout,
                 walkdir_stall_timeout: opts.walkdir_stall_timeout,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {

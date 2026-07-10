@@ -14,7 +14,7 @@
 
 use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
-use crate::disk::disk_store::get_object_disk_read_timeout;
+use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
@@ -1413,6 +1413,29 @@ where
     W: AsyncWrite + Unpin,
 {
     out.write_obj(obj).await.map_err(metacache_write_error)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Bound one drive read issued by a walk with the stall timeout.
+///
+/// A walk is not failed for taking a long time — a large directory tree is not a
+/// fault. It is failed only when the drive stops answering, so the timeout wraps
+/// each individual read rather than the walk as a whole. Time spent blocked
+/// writing to a slow consumer is deliberately outside this budget.
+async fn with_walk_stall_timeout<T, F>(stall: Option<Duration>, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match stall {
+        Some(stall) if !stall.is_zero() => match timeout(stall, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(DiskError::Timeout),
+        },
+        _ => fut.await,
+    }
 }
 
 impl FileCacheReclaimReader {
@@ -3818,7 +3841,9 @@ impl LocalDisk {
 
         // TODO: add lock
 
-        let mut entries = match self.list_dir("", &opts.bucket, &current, -1).await {
+        let stall = opts.stall_timeout_duration();
+
+        let mut entries = match with_walk_stall_timeout(stall, self.list_dir("", &opts.bucket, &current, -1)).await {
             Ok(res) => res,
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
@@ -3899,9 +3924,9 @@ impl LocalDisk {
                     continue;
                 }
 
-                let metadata = self
-                    .read_metadata(bucket, format!("{}/{}", &current, &entry).as_str())
-                    .await?;
+                let metadata =
+                    with_walk_stall_timeout(stall, self.read_metadata(bucket, format!("{}/{}", &current, &entry).as_str()))
+                        .await?;
 
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
@@ -4019,7 +4044,7 @@ impl LocalDisk {
 
             let fname = format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE);
 
-            match self.read_metadata(&opts.bucket, fname.as_str()).await {
+            match with_walk_stall_timeout(stall, self.read_metadata(&opts.bucket, fname.as_str())).await {
                 Ok(res) => {
                     if is_dir_obj {
                         meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
@@ -4062,7 +4087,7 @@ impl LocalDisk {
                         );
                     } else if !is_dir_obj
                         && self
-                            .object_dir_has_listable_child(&opts.bucket, &meta.name, &dir_to_skip, opts.incl_deleted)
+                            .object_dir_has_listable_child(&opts.bucket, &meta.name, &dir_to_skip, opts.incl_deleted, stall)
                             .await?
                     {
                         // A plain object `a` shares its backing directory with any
@@ -4085,7 +4110,7 @@ impl LocalDisk {
                             if opts.recursive
                                 || opts.incl_deleted
                                 || self
-                                    .directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted)
+                                    .directory_has_listing_entry(&opts.bucket, &meta.name, opts.incl_deleted, stall)
                                     .await?
                             {
                                 schedule_dir(&mut dir_stack, meta.name, false, None);
@@ -4159,6 +4184,7 @@ impl LocalDisk {
         object_name: &str,
         data_dirs: &HashSet<String>,
         incl_deleted: bool,
+        stall: Option<Duration>,
     ) -> Result<bool> {
         // The backing dir usually holds only the xl.meta plus the version data
         // dirs, so a read bounded just past that count decides the common case
@@ -4169,7 +4195,7 @@ impl LocalDisk {
         let mut probed = HashSet::new();
 
         for count in [bounded, -1] {
-            let entries = match self.list_dir("", bucket, object_name, count).await {
+            let entries = match with_walk_stall_timeout(stall, self.list_dir("", bucket, object_name, count)).await {
                 Ok(entries) => entries,
                 Err(err) => {
                     if err == DiskError::VolumeNotFound || err == Error::FileNotFound {
@@ -4193,7 +4219,10 @@ impl LocalDisk {
                 }
 
                 let child_path = path_join_buf(&[object_name, child]);
-                if self.directory_has_listing_entry(bucket, &child_path, incl_deleted).await? {
+                if self
+                    .directory_has_listing_entry(bucket, &child_path, incl_deleted, stall)
+                    .await?
+                {
                     return Ok(true);
                 }
             }
@@ -4210,7 +4239,13 @@ impl LocalDisk {
     /// `incl_deleted`, any `xl.meta` counts (versioned listings surface
     /// delete-marker-only objects too); otherwise the metadata must hold a
     /// visible version.
-    async fn directory_has_listing_entry(&self, bucket: &str, dir_name: &str, incl_deleted: bool) -> Result<bool> {
+    async fn directory_has_listing_entry(
+        &self,
+        bucket: &str,
+        dir_name: &str,
+        incl_deleted: bool,
+        stall: Option<Duration>,
+    ) -> Result<bool> {
         let mut stack = vec![dir_name.trim_matches('/').to_owned()];
 
         while let Some(current) = stack.pop() {
@@ -4218,7 +4253,7 @@ impl LocalDisk {
                 continue;
             }
 
-            let entries = match self.list_dir("", bucket, &current, -1).await {
+            let entries = match with_walk_stall_timeout(stall, self.list_dir("", bucket, &current, -1)).await {
                 Ok(entries) => entries,
                 Err(err) => {
                     if err == DiskError::VolumeNotFound || err == Error::FileNotFound {
@@ -4239,7 +4274,7 @@ impl LocalDisk {
                     }
 
                     let metadata_path = path_join_buf(&[current.as_str(), STORAGE_FORMAT_FILE]);
-                    match self.read_metadata(bucket, metadata_path.as_str()).await {
+                    match with_walk_stall_timeout(stall, self.read_metadata(bucket, metadata_path.as_str())).await {
                         Ok(metadata) => {
                             let file_meta = match FileMeta::load(&metadata) {
                                 Ok(file_meta) => file_meta,
@@ -5229,6 +5264,15 @@ impl DiskAPI for LocalDisk {
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         self.wait_for_startup_cleanup().await;
 
+        // Callers that do not pin a stall budget inherit the configured default, so
+        // every local walk keeps a liveness bound even when the wrapper-level total
+        // timeout is skipped.
+        let mut opts = opts;
+        if opts.stall_timeout_ms.is_none() {
+            opts.stall_timeout_ms = Some(duration_millis(get_drive_walkdir_stall_timeout()));
+        }
+        let stall = opts.stall_timeout_duration();
+
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket)
@@ -5248,16 +5292,18 @@ impl DiskAPI for LocalDisk {
         let mut skip_current_dir_object = false;
         let mut multipart_dir_to_skip: HashSet<String> = HashSet::new();
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
-            if let Ok(data) = self
-                .read_metadata(
+            if let Ok(data) = with_walk_stall_timeout(
+                stall,
+                self.read_metadata(
                     &opts.bucket,
                     path_join_buf(&[
                         format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX).as_str(),
                         STORAGE_FORMAT_FILE,
                     ])
                     .as_str(),
-                )
-                .await
+                ),
+            )
+            .await
             {
                 let meta = MetaCacheEntry {
                     name: opts.base_dir.clone(),
@@ -7119,6 +7165,128 @@ mod test {
                 .is_err(),
             "blocking scan writer shutdown should stay pending"
         );
+    }
+
+    /// A writer that stalls on every write, standing in for a slow listing
+    /// consumer (quorum merge, a lagging peer drive).
+    struct SlowWriter {
+        delay: Duration,
+        sleep: Option<std::pin::Pin<Box<Sleep>>>,
+    }
+
+    impl AsyncWrite for SlowWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.sleep.is_none() {
+                let delay = self.delay;
+                self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
+            }
+
+            let sleep = self.sleep.as_mut().expect("sleep was just installed");
+            match sleep.as_mut().poll(cx) {
+                std::task::Poll::Ready(()) => {
+                    self.sleep = None;
+                    std::task::Poll::Ready(Ok(buf.len()))
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    // #4644: the stall budget bounds a single drive read, never the walk as a
+    // whole. A walk that keeps making progress must survive even when the total
+    // time spent blocked on a slow consumer dwarfs the stall timeout.
+    #[tokio::test]
+    async fn walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let bucket = "test-bucket";
+        for idx in 0..4 {
+            let object_dir = dir.path().join(bucket).join(format!("prefix/object-{idx}"));
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                .await
+                .expect("object metadata should be written");
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let stall = Duration::from_millis(300);
+        let write_delay = Duration::from_millis(150);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "prefix/".to_string(),
+            recursive: true,
+            stall_timeout_ms: Some(duration_millis(stall)),
+            ..Default::default()
+        };
+
+        let mut writer = SlowWriter {
+            delay: write_delay,
+            sleep: None,
+        };
+
+        let started = std::time::Instant::now();
+        let result = disk.walk_dir(opts, &mut writer).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "a walk making steady progress must not time out, got {result:?}");
+        assert!(
+            elapsed > stall,
+            "test is only meaningful if the walk outlives the stall budget, elapsed {elapsed:?} vs stall {stall:?}"
+        );
+    }
+
+    // #4644: the stall timeout is what catches a drive that stops answering.
+    #[tokio::test(start_paused = true)]
+    async fn with_walk_stall_timeout_fails_only_when_a_read_stops_answering() {
+        let stall = Duration::from_millis(100);
+
+        let hung = with_walk_stall_timeout(Some(stall), async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        })
+        .await;
+        assert!(
+            matches!(hung, Err(DiskError::Timeout)),
+            "a read that stops answering must trip the stall budget, got {hung:?}"
+        );
+
+        let prompt = with_walk_stall_timeout(Some(stall), async { Ok(7_u32) })
+            .await
+            .expect("a prompt read must pass through");
+        assert_eq!(prompt, 7);
+
+        // No budget configured: the read is unbounded on purpose.
+        let unbounded = with_walk_stall_timeout(None, async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        })
+        .await;
+        assert!(unbounded.is_ok(), "an unset stall budget must not bound the read");
+
+        let disabled = with_walk_stall_timeout(Some(Duration::ZERO), async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        })
+        .await;
+        assert!(disabled.is_ok(), "a zero stall budget must disable the bound");
     }
 
     #[tokio::test]
