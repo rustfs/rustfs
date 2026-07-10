@@ -152,7 +152,18 @@ mod tests {
         let lookup = adapter.lookup_body(&plan).await;
 
         assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
-        assert_eq!(invalidation, ObjectDataCacheInvalidationResult::Success);
+        // The behavioral guarantee is that the cached body is gone (Miss below).
+        // The exact result variant is transitional: today `MokaBackend` returns
+        // `Success`; once it is widened to report the removal count (backlog#1141)
+        // this second (post-delete) invalidation of an already-empty identity
+        // becomes `NoOp`. Accept any successful variant so this file (owned by a
+        // different branch than moka_backend.rs) does not break at merge.
+        assert!(matches!(
+            invalidation,
+            ObjectDataCacheInvalidationResult::Success
+                | ObjectDataCacheInvalidationResult::NoOp
+                | ObjectDataCacheInvalidationResult::Removed { .. }
+        ));
         assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
     }
 

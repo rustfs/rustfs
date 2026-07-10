@@ -17,15 +17,27 @@ use crate::config::ObjectDataCacheConfig;
 use crate::error::ObjectDataCacheConfigError;
 use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheIdentity, ObjectDataCacheKey};
 use crate::metrics::{
-    describe_metrics_once, publish_cache_state, record_fill_result, record_hit_bytes, record_invalidation,
-    record_request_decision,
+    describe_metrics_once, publish_cache_state, record_fill_result, record_hit_bytes, record_invalidation, record_lookup_result,
+    record_plan_decision,
 };
 use crate::moka_backend::MokaBackend;
 use crate::noop::NoopBackend;
 use crate::stats::{ObjectDataCacheStats, ObjectDataCacheStatsSnapshot};
 use bytes::Bytes;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+/// Minimum spacing between cache-state gauge publishes. Moka's `entry_count`
+/// and `weighted_size` are cross-segment approximations that only settle after
+/// pending tasks run, so republishing on every fill/invalidate lands the same
+/// stale value thousands of times between scrapes (backlog#1134).
+const ENTRY_COUNT_PUBLISH_DEBOUNCE_MS: u64 = 1000;
+
+/// Invalidation outcome label: keys were dropped from the cache.
+const INVALIDATION_OUTCOME_REMOVED: &str = "removed";
+/// Invalidation outcome label: the identity was not cached, nothing removed.
+const INVALIDATION_OUTCOME_NOOP: &str = "noop";
 
 /// Protocol-neutral cache facade for object body reuse.
 #[derive(Debug)]
@@ -33,6 +45,11 @@ pub struct ObjectDataCache {
     backend: ObjectDataCacheBackendKind,
     config: Arc<ObjectDataCacheConfig>,
     stats: Arc<ObjectDataCacheStats>,
+    /// Monotonic origin for the cache-state publish debounce.
+    created_at: Instant,
+    /// Millis since `created_at` of the last cache-state gauge publish, or `0`
+    /// when it has never published.
+    last_entry_publish_ms: AtomicU64,
 }
 
 impl ObjectDataCache {
@@ -45,6 +62,8 @@ impl ObjectDataCache {
             backend: ObjectDataCacheBackendKind::Noop(NoopBackend),
             config,
             stats,
+            created_at: Instant::now(),
+            last_entry_publish_ms: AtomicU64::new(0),
         }
     }
 
@@ -63,13 +82,15 @@ impl ObjectDataCache {
             backend,
             config: Arc::new(config),
             stats,
+            created_at: Instant::now(),
+            last_entry_publish_ms: AtomicU64::new(0),
         })
     }
 
     /// Produces a lightweight GET plan from request metadata.
     pub fn plan_get(&self, request: ObjectDataCacheGetRequest<'_>) -> ObjectDataCacheGetPlan {
         if self.config.is_disabled() {
-            record_request_decision(
+            record_plan_decision(
                 self.backend.as_metric_label(),
                 self.config.mode,
                 "disabled",
@@ -80,11 +101,11 @@ impl ObjectDataCache {
         }
 
         if request.size > self.config.max_entry_bytes {
-            record_request_decision(self.backend.as_metric_label(), self.config.mode, "skip", "too_large", request.size);
+            record_plan_decision(self.backend.as_metric_label(), self.config.mode, "skip", "too_large", request.size);
             return ObjectDataCacheGetPlan::SkipTooLarge;
         }
 
-        record_request_decision(self.backend.as_metric_label(), self.config.mode, "cacheable", "eligible", request.size);
+        record_plan_decision(self.backend.as_metric_label(), self.config.mode, "cacheable", "eligible", request.size);
 
         ObjectDataCacheGetPlan::Cacheable {
             key: ObjectDataCacheKey::new(
@@ -106,11 +127,13 @@ impl ObjectDataCache {
         };
 
         self.stats.record_lookup(matches!(lookup, ObjectDataCacheLookup::Hit(_)));
-        self.refresh_entry_count();
+        // Do not refresh the cache-state gauge on the lookup hot path: moka's
+        // approximations do not change on a read, so it would only republish the
+        // same stale value on every GET (backlog#1134).
         match &lookup {
             ObjectDataCacheLookup::Hit(bytes) => {
                 let size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                record_request_decision(self.backend.as_metric_label(), self.config.mode, "hit", "cache_hit", size_bytes);
+                record_lookup_result(self.backend.as_metric_label(), self.config.mode, "hit", size_bytes);
                 record_hit_bytes(self.backend.as_metric_label(), self.config.mode, size_bytes);
             }
             ObjectDataCacheLookup::Miss => {
@@ -118,13 +141,13 @@ impl ObjectDataCache {
                     ObjectDataCacheGetPlan::Cacheable { key } => key.size,
                     _ => 0,
                 };
-                record_request_decision(self.backend.as_metric_label(), self.config.mode, "miss", "cache_miss", size_bytes);
+                record_lookup_result(self.backend.as_metric_label(), self.config.mode, "miss", size_bytes);
             }
             ObjectDataCacheLookup::SkipDisabled => {
-                record_request_decision(self.backend.as_metric_label(), self.config.mode, "skip", "lookup_disabled", 0);
+                record_lookup_result(self.backend.as_metric_label(), self.config.mode, "skip_disabled", 0);
             }
             ObjectDataCacheLookup::SkipNotCacheable => {
-                record_request_decision(self.backend.as_metric_label(), self.config.mode, "skip", "lookup_not_cacheable", 0);
+                record_lookup_result(self.backend.as_metric_label(), self.config.mode, "skip_not_cacheable", 0);
             }
         }
 
@@ -135,21 +158,19 @@ impl ObjectDataCache {
     pub async fn fill_body(&self, plan: &ObjectDataCacheGetPlan, bytes: Bytes) -> ObjectDataCacheFillResult {
         let fill_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if !self.config.fill_enabled() {
-            record_fill_result(self.backend.as_metric_label(), self.config.mode, "skipped_by_mode", fill_bytes, 0.0);
-            return ObjectDataCacheFillResult::SkippedByMode;
+            // Never reached the backend: count the outcome, but record no bytes
+            // (nothing was submitted) and no duration (there was no fill work).
+            let result = ObjectDataCacheFillResult::SkippedByMode;
+            record_fill_result(self.backend.as_metric_label(), self.config.mode, result.as_metric_label(), 0, None);
+            return result;
         }
 
         if let ObjectDataCacheGetPlan::Cacheable { key } = plan
             && fill_bytes != key.size
         {
+            // Never reached the backend either: count only.
             let result = ObjectDataCacheFillResult::SkippedSizeMismatch;
-            record_fill_result(
-                self.backend.as_metric_label(),
-                self.config.mode,
-                result.as_metric_label(),
-                fill_bytes,
-                0.0,
-            );
+            record_fill_result(self.backend.as_metric_label(), self.config.mode, result.as_metric_label(), 0, None);
             return result;
         }
 
@@ -159,16 +180,26 @@ impl ObjectDataCache {
             ObjectDataCacheBackendKind::Moka(backend) => backend.fill_body(plan, bytes).await,
         };
 
-        if matches!(result, ObjectDataCacheFillResult::Inserted) {
-            self.stats.record_fill();
-        }
-        self.refresh_entry_count();
+        // Only the true leader path that actually inserted counts as a fill and
+        // moves the entry count; a `JoinedInflightFill` merely observed another
+        // fill's outcome (already counted by singleflight_joins) so it records
+        // neither fill bytes nor a duration (which would be wait time, not fill
+        // work). See backlog#1123.
+        let (recorded_bytes, duration) = match &result {
+            ObjectDataCacheFillResult::Inserted => {
+                self.stats.record_fill();
+                self.refresh_entry_count();
+                (fill_bytes, Some(fill_start.elapsed().as_secs_f64()))
+            }
+            ObjectDataCacheFillResult::JoinedInflightFill => (0, None),
+            _ => (fill_bytes, Some(fill_start.elapsed().as_secs_f64())),
+        };
         record_fill_result(
             self.backend.as_metric_label(),
             self.config.mode,
             result.as_metric_label(),
-            fill_bytes,
-            fill_start.elapsed().as_secs_f64(),
+            recorded_bytes,
+            duration,
         );
 
         result
@@ -186,8 +217,15 @@ impl ObjectDataCache {
         };
 
         self.stats.record_invalidation();
-        self.refresh_entry_count();
-        record_invalidation(self.backend.as_metric_label(), _reason.as_metric_label());
+        let outcome = invalidation_outcome(&result);
+        // A mutating op invalidates twice by design (before + after); the vast
+        // majority of those touch identities that were never cached. Only refresh
+        // the cache-state gauge when something was actually removed so the
+        // no-op path stays cheap (backlog#1141).
+        if outcome != INVALIDATION_OUTCOME_NOOP {
+            self.refresh_entry_count();
+        }
+        record_invalidation(self.backend.as_metric_label(), _reason.as_metric_label(), outcome);
 
         result
     }
@@ -207,13 +245,41 @@ impl ObjectDataCache {
         matches!(self.config.mode, crate::config::ObjectDataCacheMode::FillMaterializeEnabled)
     }
 
+    /// Publishes the cache-state gauge (and mirrors it into stats), debounced so
+    /// it fires at most once per [`ENTRY_COUNT_PUBLISH_DEBOUNCE_MS`]. Moka's
+    /// `entry_count`/`weighted_size` are approximations that only settle after
+    /// pending tasks run, so publishing on every fill/invalidate would restore
+    /// the same stale value thousands of times between scrapes (backlog#1134).
     fn refresh_entry_count(&self) {
+        let now_ms = u64::try_from(self.created_at.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            // Reserve 0 as the "never published" sentinel.
+            .max(1);
+        let last = self.last_entry_publish_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < ENTRY_COUNT_PUBLISH_DEBOUNCE_MS {
+            return;
+        }
+        self.last_entry_publish_ms.store(now_ms, Ordering::Relaxed);
+
         let (entries, weighted_bytes) = match &self.backend {
             ObjectDataCacheBackendKind::Noop(_) => (0, 0),
             ObjectDataCacheBackendKind::Moka(backend) => (backend.entry_count(), backend.weighted_size()),
         };
         self.stats.set_entries(entries);
         publish_cache_state(self.backend.as_metric_label(), entries, weighted_bytes);
+    }
+}
+
+/// Maps an invalidation result to its metric outcome label.
+const fn invalidation_outcome(result: &ObjectDataCacheInvalidationResult) -> &'static str {
+    match result {
+        ObjectDataCacheInvalidationResult::Removed { keys } if *keys > 0 => INVALIDATION_OUTCOME_REMOVED,
+        ObjectDataCacheInvalidationResult::Removed { .. } | ObjectDataCacheInvalidationResult::NoOp => INVALIDATION_OUTCOME_NOOP,
+        // Transitional: a backend that has not yet been widened to report the
+        // removal count (`MokaBackend`) still returns `Success`. Treat it as a
+        // removal so the gauge keeps refreshing until the backend reports
+        // `Removed`/`NoOp` (see report / backlog#1141).
+        ObjectDataCacheInvalidationResult::Success => INVALIDATION_OUTCOME_REMOVED,
     }
 }
 
@@ -280,6 +346,11 @@ pub enum ObjectDataCacheFillResult {
     SkippedSingleflightClosed,
     /// Fill was undone because an invalidation raced with the insert.
     SkippedInvalidationRace,
+    /// The caller joined an in-flight leader fill instead of performing one, so
+    /// it did no fill work of its own (the join is counted by
+    /// `singleflight_joins`). Distinguishes waiters from true inserts so N
+    /// concurrent GETs of one cold key do not record N inserts (backlog#1123).
+    JoinedInflightFill,
     /// The cache entry was inserted successfully.
     Inserted,
     /// Fill was skipped because the fill-concurrency limiter was saturated.
@@ -299,6 +370,7 @@ impl ObjectDataCacheFillResult {
             Self::SkippedSizeMismatch => "skipped_size_mismatch",
             Self::SkippedSingleflightClosed => "skipped_singleflight_closed",
             Self::SkippedInvalidationRace => "skipped_invalidation_race",
+            Self::JoinedInflightFill => "joined_inflight",
             Self::Inserted => "inserted",
             Self::SkippedFillConcurrency => "skipped_fill_concurrency",
             Self::SkippedSingleflightBusy => "skipped_singleflight_busy",
@@ -339,16 +411,30 @@ impl ObjectDataCacheInvalidationReason {
 /// Result of an invalidation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectDataCacheInvalidationResult {
-    /// Invalidation completed successfully.
+    /// Invalidation completed successfully, but the backend did not report the
+    /// removal outcome. Transitional: prefer `Removed`/`NoOp`. `MokaBackend`
+    /// still returns this until it is widened to report the removed key count.
     Success,
+    /// Cache keys were removed for the identity.
+    Removed {
+        /// Number of cache keys dropped.
+        keys: usize,
+    },
+    /// The identity was not cached, so nothing was removed.
+    NoOp,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectDataCache, ObjectDataCacheFillResult, ObjectDataCacheGetRequest, ObjectDataCacheLookup};
+    use super::{
+        ObjectDataCache, ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheGetRequest,
+        ObjectDataCacheInvalidationReason, ObjectDataCacheLookup,
+    };
     use crate::config::{ObjectDataCacheConfig, ObjectDataCacheMode};
-    use crate::key::ObjectDataCacheBodyVariant;
+    use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheIdentity};
     use bytes::Bytes;
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     fn fill_enabled_cache() -> ObjectDataCache {
         let config = ObjectDataCacheConfig {
@@ -360,6 +446,192 @@ mod tests {
             ..ObjectDataCacheConfig::default()
         };
         ObjectDataCache::new(config).expect("fill-enabled cache config should initialize")
+    }
+
+    fn hit_only_cache() -> ObjectDataCache {
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::HitOnly,
+            max_bytes: 8_388_608,
+            ..ObjectDataCacheConfig::default()
+        };
+        ObjectDataCache::new(config).expect("hit-only cache config should initialize")
+    }
+
+    fn plain_request<'a>(bucket: &'a str, object: &'a str, etag: &'a str, size: u64) -> ObjectDataCacheGetRequest<'a> {
+        ObjectDataCacheGetRequest {
+            bucket,
+            object,
+            version_id: None,
+            etag,
+            size,
+            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        }
+    }
+
+    struct CapturedMetric {
+        kind: MetricKind,
+        name: String,
+        labels: Vec<(String, String)>,
+        value: DebugValue,
+    }
+
+    /// Runs `f` under a thread-local debugging recorder and a current-thread
+    /// runtime, so every metric the async body emits is captured without
+    /// touching the process-global registry. A current-thread runtime keeps the
+    /// spawned fill tasks on the recorder's thread.
+    fn capture_metrics<F, Fut>(f: F) -> Vec<CapturedMetric>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        metrics::with_local_recorder(&recorder, || runtime.block_on(f()));
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _unit, _desc, value)| {
+                let labels = composite
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
+                CapturedMetric {
+                    kind: composite.kind(),
+                    name: composite.key().name().to_string(),
+                    labels,
+                    value,
+                }
+            })
+            .collect()
+    }
+
+    fn counter_total(metrics: &[CapturedMetric], name: &str) -> Option<u64> {
+        let mut found = false;
+        let mut sum = 0u64;
+        for metric in metrics {
+            if metric.kind == MetricKind::Counter && metric.name == name {
+                found = true;
+                if let DebugValue::Counter(v) = metric.value {
+                    sum += v;
+                }
+            }
+        }
+        found.then_some(sum)
+    }
+
+    fn has_gauge(metrics: &[CapturedMetric], name: &str) -> bool {
+        metrics.iter().any(|m| m.kind == MetricKind::Gauge && m.name == name)
+    }
+
+    fn has_counter_with_label(metrics: &[CapturedMetric], name: &str, label: (&str, &str)) -> bool {
+        metrics.iter().any(|m| {
+            m.kind == MetricKind::Counter && m.name == name && m.labels.iter().any(|(k, v)| k == label.0 && v == label.1)
+        })
+    }
+
+    #[test]
+    fn single_get_records_one_plan_and_one_lookup_increment() {
+        // ODC-17: one GET must produce exactly one plan increment and one lookup
+        // increment, no longer conflated on a single requests_total counter.
+        let cache = hit_only_cache();
+        let metrics = capture_metrics(|| async {
+            let plan = cache.plan_get(plain_request("bucket", "object", "etag", 1024));
+            let _ = cache.lookup_body(&plan).await;
+        });
+
+        assert_eq!(
+            counter_total(&metrics, "rustfs_object_data_cache_plan_total"),
+            Some(1),
+            "exactly one plan decision per GET"
+        );
+        assert_eq!(
+            counter_total(&metrics, "rustfs_object_data_cache_lookup_total"),
+            Some(1),
+            "exactly one lookup outcome per GET"
+        );
+    }
+
+    #[test]
+    fn lookup_does_not_publish_entry_count_gauge() {
+        // ODC-29: the lookup hot path must not republish the cache-state gauge.
+        let cache = hit_only_cache();
+        let metrics = capture_metrics(|| async {
+            let plan = cache.plan_get(plain_request("bucket", "object", "etag", 1024));
+            let _ = cache.lookup_body(&plan).await;
+        });
+
+        assert!(
+            !has_gauge(&metrics, "rustfs_object_data_cache_entries"),
+            "lookup must not publish the entries gauge"
+        );
+    }
+
+    #[test]
+    fn joined_inflight_result_maps_to_metric_label() {
+        // ODC-18: the waiter outcome has its own, distinct metric label.
+        assert_eq!(ObjectDataCacheFillResult::JoinedInflightFill.as_metric_label(), "joined_inflight");
+        assert_ne!(
+            ObjectDataCacheFillResult::JoinedInflightFill.as_metric_label(),
+            ObjectDataCacheFillResult::Inserted.as_metric_label()
+        );
+    }
+
+    #[test]
+    fn disabled_cache_invalidation_labels_noop_and_skips_gauge() {
+        // ODC-36: invalidating an identity that was never cached is a no-op; it
+        // is labeled outcome=noop and must not refresh the cache-state gauge.
+        let cache = ObjectDataCache::disabled();
+        let metrics = capture_metrics(|| async {
+            let _ = cache
+                .invalidate_object(
+                    ObjectDataCacheIdentity::new("bucket", "object"),
+                    ObjectDataCacheInvalidationReason::BeforeMutation,
+                )
+                .await;
+        });
+
+        assert!(
+            has_counter_with_label(&metrics, "rustfs_object_data_cache_invalidations_total", ("outcome", "noop")),
+            "a no-op invalidation must be labeled outcome=noop"
+        );
+        assert!(
+            !has_gauge(&metrics, "rustfs_object_data_cache_entries"),
+            "a no-op invalidation must not refresh the entries gauge"
+        );
+    }
+
+    #[test]
+    fn invalidation_of_cached_identity_labels_removed() {
+        // ODC-36: invalidating an identity that held cached keys is labeled
+        // outcome=removed.
+        let cache = fill_enabled_cache();
+        let metrics = capture_metrics(|| async {
+            let plan = cache.plan_get(plain_request("bucket", "object", "etag", 5));
+            let ObjectDataCacheGetPlan::Cacheable { .. } = &plan else {
+                panic!("plan should be cacheable");
+            };
+            assert_eq!(
+                cache.fill_body(&plan, Bytes::from_static(b"hello")).await,
+                ObjectDataCacheFillResult::Inserted
+            );
+            let _ = cache
+                .invalidate_object(
+                    ObjectDataCacheIdentity::new("bucket", "object"),
+                    ObjectDataCacheInvalidationReason::AfterDeleteSuccess,
+                )
+                .await;
+        });
+
+        assert!(
+            has_counter_with_label(&metrics, "rustfs_object_data_cache_invalidations_total", ("outcome", "removed")),
+            "invalidating a cached identity must be labeled outcome=removed"
+        );
     }
 
     #[tokio::test]
