@@ -95,7 +95,6 @@ inventory. Generic function-local names such as `CACHE`, `LOCK`, `INIT`, and
 | `LICENSE_STATE`, `LICENSE_VERIFIER` | `rustfs/src/license.rs` | Process-global owner-local state | License state and verifier selection stay private to the license owner; callers use license helper functions. |
 | `CPU_CONT_GUARD`, `PROFILING_CANCEL_TOKEN` | `rustfs/src/profiling.rs` | Process-global owner-local guard | CPU profiling guard and cancellation state stay private to the profiling owner. |
 | `MEMORY_SYSTEM` | `rustfs/src/memory_observability.rs` | Process-global owner-local cache | Memory sampling keeps the `sysinfo::System` cache private to the memory observability owner. |
-| `DIAL9_TELEMETRY_GUARD` | `rustfs/src/server/runtime.rs` | Process-global owner-local guard | Dial9 telemetry lifetime state stays private to runtime setup. |
 | `DISPLAY_CONFIG_SNAPSHOT`, `GLOBAL_CONFIG_SNAPSHOT` | `rustfs/src/config/snapshot.rs` | Process-global owner-local state | Config snapshots stay private to the config snapshot owner. |
 | `BUFFER_CONFIG_SINGLETON`, `BUFFER_PROFILE_ENABLED` | `rustfs/src/config/workload_profiles.rs` | Process-global owner-local state | Workload buffer profile configuration stays private to workload profile helpers. |
 | `LEGACY_CREDENTIAL_WARNED_KEYS` | `rustfs/src/config/config_struct.rs` | Process-global owner-local cache | Legacy credential warning de-duplication stays private to config parsing. |
