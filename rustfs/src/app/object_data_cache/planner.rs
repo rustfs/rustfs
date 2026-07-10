@@ -81,9 +81,14 @@ pub(crate) fn build_get_object_body_cache_plan(
         .version_id
         .filter(|version_id| !version_id.is_nil())
         .map(|version_id| version_id.to_string());
-    // ODC-06 (backlog#1111): carry the resolved version's modification time into
-    // the key so an unversioned overwrite (which advances mod_time) cannot be
-    // served the stale body under an MD5 collision. Absent mod_time maps to 0.
+    // ODC-06 (backlog#1111): make the key write-unique. `data_dir` is the xl.meta
+    // directory UUID that ecstore regenerates on every body write, so it is
+    // distinct across overwrites regardless of content (MD5 collision) or
+    // timestamp; it is the primary anchor. `mod_time` is a second anchor for the
+    // rare read where `data_dir` is unresolved. Both derive here — the one place
+    // the ecstore hook and the usecase layer share — so both sites produce an
+    // identical key by construction.
+    let data_dir_u128 = request.info.data_dir.map(|data_dir| data_dir.as_u128());
     let mod_time_unix_nanos = request
         .info
         .mod_time
@@ -95,6 +100,7 @@ pub(crate) fn build_get_object_body_cache_plan(
         version_id,
         etag,
         size,
+        data_dir_u128,
         mod_time_unix_nanos,
         body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
     };
@@ -332,6 +338,46 @@ mod tests {
         let new_key = cacheable_key(&make_request(&info));
 
         assert_ne!(old_key, new_key, "keys differing only by mod_time must not collide");
+    }
+
+    #[test]
+    fn planner_key_changes_with_data_dir() {
+        // ODC-06 (backlog#1111): data_dir is regenerated on every body write, so
+        // an overwrite yields a different key even when etag + size AND mod_time
+        // are identical — the case mod_time alone cannot cover. Also confirms
+        // data_dir actually reaches the key (data_dir_u128 == the UUID's u128).
+        let adapter = enabled_adapter();
+        let dir_a = uuid::Uuid::from_u128(0xA);
+        let dir_b = uuid::Uuid::from_u128(0xB);
+        let mut info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            actual_size: 4,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp_nanos(1_000).unwrap()),
+            data_dir: Some(dir_a),
+            ..Default::default()
+        };
+        let make_request = |info: &crate::storage::storage_api::StorageObjectInfo| {
+            build_get_object_body_cache_plan(
+                &adapter,
+                GetObjectBodyCacheRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    info,
+                    response_content_length: 4,
+                    has_range: false,
+                    part_number: None,
+                    encryption_applied: false,
+                },
+            )
+        };
+        let key_a = cacheable_key(&make_request(&info));
+        assert_eq!(key_a.data_dir_u128, Some(dir_a.as_u128()), "data_dir must reach the key");
+
+        // Same etag/size/mod_time, only data_dir differs → different key.
+        info.data_dir = Some(dir_b);
+        let key_b = cacheable_key(&make_request(&info));
+        assert_ne!(key_a, key_b, "keys differing only by data_dir must not collide");
     }
 
     #[test]

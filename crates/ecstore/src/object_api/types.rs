@@ -172,6 +172,10 @@ pub struct ObjectInfo {
     pub parity_blocks: usize,
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
+    /// xl.meta directory UUID for this version, regenerated on every body write.
+    /// A write-unique token: the object data cache keys on it so an overwrite
+    /// cannot be served the previous body under an MD5 collision (backlog#1111).
+    pub data_dir: Option<Uuid>,
     pub delete_marker: bool,
     pub transitioned_object: TransitionedObject,
     pub restore_ongoing: bool,
@@ -211,6 +215,7 @@ impl Clone for ObjectInfo {
             parity_blocks: self.parity_blocks,
             data_blocks: self.data_blocks,
             version_id: self.version_id,
+            data_dir: self.data_dir,
             delete_marker: self.delete_marker,
             transitioned_object: self.transitioned_object.clone(),
             restore_ongoing: self.restore_ongoing,
@@ -515,6 +520,7 @@ impl ObjectInfo {
             parity_blocks: fi.erasure.parity_blocks,
             data_blocks: fi.erasure.data_blocks,
             version_id,
+            data_dir: fi.data_dir,
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
             size: fi.size,

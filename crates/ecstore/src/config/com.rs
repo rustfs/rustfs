@@ -1759,6 +1759,7 @@ mod tests {
                 parity_blocks: 0,
                 data_blocks: 0,
                 version_id: None,
+                data_dir: None,
                 delete_marker: false,
                 transitioned_object: Default::default(),
                 restore_ongoing: false,

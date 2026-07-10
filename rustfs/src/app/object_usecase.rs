@@ -7166,6 +7166,7 @@ mod tests {
             version_id: None,
             etag,
             size,
+            data_dir_u128: None,
             mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
@@ -7577,6 +7578,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
             mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
@@ -7638,6 +7640,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
             mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
@@ -7786,6 +7789,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
             mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
@@ -7852,6 +7856,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
             mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
