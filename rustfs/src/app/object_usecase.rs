@@ -3130,7 +3130,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body_with_cache<R>(
         cache_adapter: &ObjectDataCacheAdapter,
-        mut final_stream: R,
+        final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
