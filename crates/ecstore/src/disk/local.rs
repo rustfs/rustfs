@@ -1416,6 +1416,10 @@ fn should_fail_before_old_metadata_backup(_dst_path: &str) -> bool {
 /// build, but the arming static and [`should_crash_rename_data_at`] are
 /// `#[cfg(test)]`; in production the guard is a const-`false` no-op, so the
 /// injection points compile away to nothing.
+// The `After<step>` naming is deliberate: every crash point names the
+// commit-sequence step it fires immediately after, so the shared prefix is the
+// point, not noise.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenameDataCrashPoint {
     /// After the data dir has been renamed into its destination but before the
@@ -1426,6 +1430,14 @@ pub(crate) enum RenameDataCrashPoint {
     /// commit rename that makes the new version visible. Still pre-commit, so a
     /// crash here must also leave the object readable as the old version.
     AfterBackupBeforeMetaCommit,
+    /// After the xl.meta commit rename has made the new version visible, in the
+    /// same window the graceful [`should_fail_after_metadata_commit`] failpoint
+    /// covers — but as a hard power loss with **no** rollback. The commit rename
+    /// already landed on disk, so a crash here must leave the object readable as
+    /// the *new* version. This is the post-commit counterpart to the two
+    /// pre-commit points above, closing the "old or new, never mixed" invariant
+    /// (rustfs/backlog#878) from the new-version side.
+    AfterMetaCommit,
 }
 
 #[cfg(test)]
@@ -6438,6 +6450,15 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::Unexpected);
             }
 
+            // Crash-consistency injection: hard power loss immediately after the
+            // xl.meta commit rename but before the durability fsync. Unlike the
+            // graceful failpoint above, no rollback runs — the commit rename is
+            // already on disk, so the harness asserts the object reads back as
+            // the new version.
+            if should_crash_rename_data_at(RenameDataCrashPoint::AfterMetaCommit, dst_path) {
+                return Err(DiskError::Unexpected);
+            }
+
             // Persist the directory entries for both the data dir and xl.meta renames;
             // without this the commit itself can vanish on power loss. Relaxed tiers
             // accept that window (documented in docs/operations/durability-modes.md).
@@ -7657,6 +7678,24 @@ mod test {
                 .await;
 
             match crash {
+                Some(RenameDataCrashPoint::AfterMetaCommit) => {
+                    // Hard power loss right after the xl.meta commit rename: the
+                    // commit landed and no rollback ran, so the object must read
+                    // back as the new version — whether or not an old version
+                    // preceded it. This is the new-version half of the "old or
+                    // new, never mixed" invariant (rustfs/backlog#878).
+                    assert!(result.is_err(), "{mode:?}/AfterMetaCommit: an armed crash must surface as an error");
+                    let fi = read.expect("new version must be readable after a post-commit crash");
+                    assert_eq!(
+                        fi.data_dir,
+                        Some(new_data_dir),
+                        "{mode:?}/AfterMetaCommit: read must resolve to the committed new data dir, never roll back to the old one"
+                    );
+                    assert!(
+                        object_dir.join(new_data_dir.to_string()).exists(),
+                        "{mode:?}/AfterMetaCommit: new data dir must remain on disk after the commit rename"
+                    );
+                }
                 Some(point) => {
                     assert!(result.is_err(), "{mode:?}/{point:?}: an armed crash must surface as an error");
                     match &old_meta {
@@ -7745,6 +7784,32 @@ mod test {
             run_scenario(DurabilityMode::Strict, None, true).await;
             run_scenario(DurabilityMode::Relaxed, None, true).await;
             run_scenario(DurabilityMode::Strict, None, false).await;
+        }
+
+        // Post-commit hard-crash points: the counterpart to the pre-commit
+        // cases above. A crash right after the xl.meta commit rename (no
+        // rollback) must leave the *new* version readable, closing the "old or
+        // new, never mixed" invariant from the new-version side. Relaxed is
+        // exercised alongside Strict so the durability relaxations are held to
+        // the same invariant.
+        #[tokio::test]
+        async fn overwrite_post_commit_crash_keeps_new_version_strict() {
+            run_scenario(DurabilityMode::Strict, Some(RenameDataCrashPoint::AfterMetaCommit), true).await;
+        }
+
+        #[tokio::test]
+        async fn overwrite_post_commit_crash_keeps_new_version_relaxed() {
+            run_scenario(DurabilityMode::Relaxed, Some(RenameDataCrashPoint::AfterMetaCommit), true).await;
+        }
+
+        #[tokio::test]
+        async fn fresh_post_commit_crash_keeps_new_version_strict() {
+            run_scenario(DurabilityMode::Strict, Some(RenameDataCrashPoint::AfterMetaCommit), false).await;
+        }
+
+        #[tokio::test]
+        async fn fresh_post_commit_crash_keeps_new_version_relaxed() {
+            run_scenario(DurabilityMode::Relaxed, Some(RenameDataCrashPoint::AfterMetaCommit), false).await;
         }
     }
 
