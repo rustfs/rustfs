@@ -84,12 +84,6 @@ pub struct Dial9Config {
 
     /// Number of rotated files to keep
     pub rotation_count: usize,
-
-    /// Optional S3 bucket for uploading sealed trace segments
-    pub s3_bucket: Option<String>,
-
-    /// Optional key prefix for uploaded segments
-    pub s3_prefix: Option<String>,
 }
 
 impl Default for Dial9Config {
@@ -100,27 +94,28 @@ impl Default for Dial9Config {
             file_prefix: DEFAULT_RUNTIME_DIAL9_FILE_PREFIX.to_string(),
             max_file_size: DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE,
             rotation_count: DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT,
-            s3_bucket: None,
-            s3_prefix: None,
         }
     }
 }
 
 impl Dial9Config {
-    /// Create configuration from environment variables.
+    /// Create configuration from environment variables, recording the resulting
+    /// trace location so metrics can report it even on a disabled binary.
     pub fn from_env() -> Self {
-        let enabled = is_enabled();
+        let config = if is_enabled() {
+            Self::from_env_enabled()
+        } else {
+            Self::default()
+        };
+        dial9_runtime_state().record_config(&config);
+        config
+    }
 
-        if !enabled {
-            let config = Self::default();
-            dial9_runtime_state().record_config(&config);
-            return config;
-        }
-
+    /// Build the enabled configuration from the environment, warning about any
+    /// knob that is set but cannot be honoured.
+    fn from_env_enabled() -> Self {
         let raw_max_file_size = get_env_opt_u64(ENV_RUNTIME_DIAL9_MAX_FILE_SIZE);
         let raw_rotation_count = get_env_opt_usize(ENV_RUNTIME_DIAL9_ROTATION_COUNT);
-        let max_file_size = sanitize_max_file_size(raw_max_file_size.unwrap_or(DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE));
-        let rotation_count = sanitize_rotation_count(raw_rotation_count.unwrap_or(DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT));
 
         if raw_max_file_size == Some(0) {
             warn!(
@@ -143,22 +138,24 @@ impl Dial9Config {
             );
         }
 
-        let s3_bucket = get_env_opt_str(ENV_RUNTIME_DIAL9_S3_BUCKET).filter(|s| !s.is_empty());
-        let s3_prefix = get_env_opt_str(ENV_RUNTIME_DIAL9_S3_PREFIX).filter(|s| !s.is_empty());
-        warn_unusable_s3_upload(s3_bucket.as_deref(), s3_prefix.as_deref());
+        // S3 upload is not built (see `warn_unusable_s3_upload`); read the knobs
+        // only to warn, and drop them rather than carrying dead configuration.
+        warn_unusable_s3_upload(
+            get_env_opt_str(ENV_RUNTIME_DIAL9_S3_BUCKET)
+                .filter(|s| !s.is_empty())
+                .as_deref(),
+            get_env_opt_str(ENV_RUNTIME_DIAL9_S3_PREFIX)
+                .filter(|s| !s.is_empty())
+                .as_deref(),
+        );
 
-        let config = Self {
-            enabled,
+        Self {
+            enabled: true,
             output_dir: get_env_str(ENV_RUNTIME_DIAL9_OUTPUT_DIR, DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR),
             file_prefix: get_env_str(ENV_RUNTIME_DIAL9_FILE_PREFIX, DEFAULT_RUNTIME_DIAL9_FILE_PREFIX),
-            max_file_size,
-            rotation_count,
-            s3_bucket,
-            s3_prefix,
-        };
-
-        dial9_runtime_state().record_config(&config);
-        config
+            max_file_size: sanitize_max_file_size(raw_max_file_size.unwrap_or(DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE)),
+            rotation_count: sanitize_rotation_count(raw_rotation_count.unwrap_or(DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT)),
+        }
     }
 
     /// Get the base path for trace files.
@@ -169,11 +166,6 @@ impl Dial9Config {
     /// Total on-disk byte budget across all retained segments.
     pub fn total_disk_budget(&self) -> u64 {
         total_rotation_size(self.max_file_size, self.rotation_count)
-    }
-
-    /// Whether S3 upload of sealed segments is both requested and usable.
-    pub fn s3_upload_requested(&self) -> bool {
-        self.s3_bucket.is_some()
     }
 }
 
