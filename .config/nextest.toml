@@ -78,6 +78,13 @@ filter = 'package(rustfs-ecstore) & test(/^store::bucket::tests::bucket_delete_(
 test-group = 'ecstore-serial-flaky'
 retries = 2
 
+# QUARANTINE: OPEN rustfs#4690 — walk_dir stall-budget accounting test depends
+# on producer/consumer timing windows that stretch past the budget on loaded
+# CI runners (regression test for rustfs#4644; failed on a zero-Rust-diff PR).
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
+retries = 2
+
 # ---------------------------------------------------------------------------
 # e2e-smoke profile — PR smoke subset of the e2e_test crate (backlog#1149 ci-4)
 # ---------------------------------------------------------------------------
