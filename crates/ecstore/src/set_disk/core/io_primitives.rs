@@ -48,6 +48,7 @@ use crate::diagnostics::get::{
 };
 use crate::disk::OldCurrentSize;
 use crate::erasure::coding::BitrotReader;
+use crate::io_support::bitrot::ShardReader;
 use crate::io_support::bitrot::{
     BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics,
     create_deferred_bitrot_reader_with_stripe_handle, object_mmap_read_enabled,
@@ -916,7 +917,7 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
     });
 }
 
-pub(in crate::set_disk) type ObjectBitrotReader = BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>;
+pub(in crate::set_disk) type ObjectBitrotReader = BitrotReader<ShardReader>;
 pub(in crate::set_disk) type BitrotReaderTask<'a> =
     Pin<Box<dyn Future<Output = (usize, std::result::Result<Option<ObjectBitrotReader>, DiskError>)> + Send + 'a>>;
 
@@ -3954,7 +3955,7 @@ mod tests {
 
     fn test_object_bitrot_reader() -> ObjectBitrotReader {
         BitrotReader::new(
-            Box::new(Cursor::new(vec![1u8, 2, 3, 4])) as Box<dyn AsyncRead + Send + Sync + Unpin>,
+            ShardReader::Stream(Box::new(Cursor::new(vec![1u8, 2, 3, 4]))),
             4,
             HashAlgorithm::None,
             false,

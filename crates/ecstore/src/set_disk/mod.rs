@@ -192,7 +192,7 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
-type InlineBitrotReader = coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>;
+type InlineBitrotReader = coding::BitrotReader<crate::io_support::bitrot::ShardReader>;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
