@@ -62,7 +62,9 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
+#[cfg(not(unix))]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
