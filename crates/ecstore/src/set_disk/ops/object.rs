@@ -23,26 +23,47 @@ use super::super::*;
 
 use crate::disk::OldCurrentSize;
 
-/// Gates the app-layer body-cache hook probe in `get_object_reader`.
+/// Length of the full plaintext body when — and only when — this read's output
+/// is exactly the object's complete plaintext, so the app-layer body cache may
+/// serve it in place of the erasure read.
 ///
-/// A hook hit serves the cached full-object plaintext directly, bypassing
-/// `ReadPlan`/`ReadTransform`. That is only sound when the normal read path
-/// would return that same plaintext byte-for-byte, so the probe is refused for:
-/// - ranged / part-number reads (the cache only holds whole objects);
-/// - data-movement reads — `raw_data_movement_read` makes `ReadPlan::build`
-///   return the STORED representation (e.g. compressed bytes), while the cache
-///   holds the post-decompression body (backlog#1108);
-/// - compressed objects — `ReadTransform::Compressed` rewrites `object_info.size`
-///   to the decompressed length, so a hook hit would pair a compressed-size
-///   `object_info` with a decompressed stream (backlog#1109).
+/// A hook hit bypasses `ReadPlan`/`ReadTransform` entirely, so it is sound only
+/// where the normal read path would produce that same plaintext byte-for-byte
+/// AND expose the same `object_info.size`. This is a fail-closed allow-list, not
+/// a deny-list: every read whose `ReadPlan` applies some other transform returns
+/// `None`, so a newly added `ReadPlan` branch bypasses the cache by default
+/// instead of silently serving bytes in the wrong representation.
 ///
-/// These mirror the gates `get_small_object_direct_memory_decision` applies.
-fn should_probe_body_cache_hook(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions, object_info: &ObjectInfo) -> bool {
-    range.is_none()
-        && opts.part_number.is_none()
-        && !opts.raw_data_movement_read
-        && !opts.data_movement
-        && !object_info.is_compressed()
+/// Refused reads, each mapping to a `ReadPlan::build` branch:
+/// - ranged / part-number reads — the cache only holds whole objects;
+/// - `raw_data_movement_read` / `data_movement` — yields the STORED
+///   representation, e.g. compressed bytes (backlog#1108);
+/// - restore reads — `restore_request_active` forces the `Plain` branch, so a
+///   compressed object yields STORED bytes under its compressed `size`;
+/// - encrypted objects — `ReadTransform::Encrypted` rewrites size and the cache
+///   must never hold their plaintext;
+/// - remote (transitioned) objects — served from the warm tier.
+///
+/// Compressed objects ARE eligible: `ReadTransform::Compressed` returns the full
+/// plaintext and rewrites `object_info.size` to the decompressed length, which
+/// the caller must replicate with the returned length (backlog#1109).
+fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions, object_info: &ObjectInfo) -> Option<i64> {
+    if range.is_some()
+        || opts.part_number.is_some()
+        || opts.raw_data_movement_read
+        || opts.data_movement
+        || crate::object_api::restore_request_active(opts)
+        || object_info.is_encrypted()
+        || object_info.is_remote()
+    {
+        return None;
+    }
+
+    if object_info.is_compressed() {
+        return object_info.get_actual_size().ok();
+    }
+
+    Some(object_info.size)
 }
 
 #[async_trait::async_trait]
@@ -362,11 +383,20 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // but no data shards have been read yet, so a hit skips the erasure
         // read, bitrot verify and decode entirely. The hook validates object
         // identity and rejects anything it cannot serve byte-identically.
-        if should_probe_body_cache_hook(&range, opts, &object_info)
+        //
+        // `plaintext_len` carries the size the normal `ReadPlan` would have
+        // published, which the reader below must reproduce: for a compressed
+        // object `ReadTransform::Compressed` sets `object_info.size` to the
+        // decompressed length, and consumers such as UploadPartCopy read the
+        // copy length straight off that field (backlog#1109).
+        if let Some(plaintext_len) = full_object_plaintext_len(&range, opts, &object_info)
             && let Some(hook) = get_object_body_cache_hook()
             && let Some(body) = hook.lookup(bucket, object, &object_info).await
+            && i64::try_from(body.len()).is_ok_and(|len| len == plaintext_len)
         {
             record_get_object_reader_path_observation(GET_OBJECT_PATH_BODY_CACHE, object_class, size_bucket);
+            let mut object_info = object_info;
+            object_info.size = plaintext_len;
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(body.clone())),
                 object_info,
@@ -2804,14 +2834,17 @@ mod body_cache_hook_gate_tests {
     //! cached full-object plaintext directly, bypassing `ReadPlan`. It must not
     //! be probed when the normal read path would return a different byte stream.
 
-    use super::should_probe_body_cache_hook;
+    use super::full_object_plaintext_len;
     use crate::object_api::{ObjectInfo, ObjectOptions};
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    const STORED_SIZE: i64 = 1024;
+    const PLAINTEXT_SIZE: i64 = 4096;
+
     fn plain_object_info() -> ObjectInfo {
         ObjectInfo {
-            size: 1024,
+            size: STORED_SIZE,
             ..Default::default()
         }
     }
@@ -2820,20 +2853,47 @@ mod body_cache_hook_gate_tests {
         let mut user_defined = HashMap::new();
         // is_compressed() checks for the internal compression suffix key.
         user_defined.insert("x-rustfs-internal-compression".to_string(), "klauspost/compress/s2".to_string());
+        user_defined.insert("x-rustfs-internal-actual-size".to_string(), PLAINTEXT_SIZE.to_string());
         ObjectInfo {
-            size: 1024,
+            size: STORED_SIZE,
             user_defined: Arc::new(user_defined),
             ..Default::default()
         }
     }
 
-    #[test]
-    fn plain_full_object_read_is_probed() {
-        assert!(should_probe_body_cache_hook(&None, &ObjectOptions::default(), &plain_object_info()));
+    fn encrypted_object_info() -> ObjectInfo {
+        let mut user_defined = HashMap::new();
+        user_defined.insert("x-minio-encryption-key".to_string(), "opaque".to_string());
+        ObjectInfo {
+            size: STORED_SIZE,
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        }
+    }
+
+    fn restore_opts() -> ObjectOptions {
+        let mut opts = ObjectOptions::default();
+        opts.transition.restore_request.days = Some(1);
+        opts
     }
 
     #[test]
-    fn raw_data_movement_read_skips_probe() {
+    fn plain_full_object_read_yields_its_stored_size() {
+        let len = full_object_plaintext_len(&None, &ObjectOptions::default(), &plain_object_info());
+        assert_eq!(len, Some(STORED_SIZE));
+    }
+
+    #[test]
+    fn compressed_object_yields_decompressed_size() {
+        // ReadTransform::Compressed publishes the decompressed length as
+        // object_info.size; the hit site must reproduce exactly this value or
+        // UploadPartCopy truncates the copy (backlog#1109).
+        let len = full_object_plaintext_len(&None, &ObjectOptions::default(), &compressed_object_info());
+        assert_eq!(len, Some(PLAINTEXT_SIZE));
+    }
+
+    #[test]
+    fn raw_data_movement_read_is_refused() {
         // Decommission reads set raw_data_movement_read: ReadPlan returns the
         // STORED bytes, so the cached decompressed body must not be served
         // (backlog#1108 — silent data corruption on the destination pool).
@@ -2841,23 +2901,49 @@ mod body_cache_hook_gate_tests {
             raw_data_movement_read: true,
             ..Default::default()
         };
-        assert!(!should_probe_body_cache_hook(&None, &opts, &plain_object_info()));
+        assert_eq!(full_object_plaintext_len(&None, &opts, &plain_object_info()), None);
     }
 
     #[test]
-    fn data_movement_read_skips_probe() {
+    fn data_movement_read_is_refused() {
         let opts = ObjectOptions {
             data_movement: true,
             ..Default::default()
         };
-        assert!(!should_probe_body_cache_hook(&None, &opts, &plain_object_info()));
+        assert_eq!(full_object_plaintext_len(&None, &opts, &plain_object_info()), None);
     }
 
     #[test]
-    fn compressed_object_skips_probe() {
-        // ReadTransform::Compressed rewrites object_info.size to the
-        // decompressed length; a hook hit would pair a compressed-size
-        // object_info with a decompressed stream (backlog#1109).
-        assert!(!should_probe_body_cache_hook(&None, &ObjectOptions::default(), &compressed_object_info()));
+    fn restore_read_of_compressed_object_is_refused() {
+        // restore_request_active forces ReadPlan down the Plain branch, so the
+        // read yields STORED (compressed) bytes under the compressed size.
+        assert_eq!(full_object_plaintext_len(&None, &restore_opts(), &compressed_object_info()), None);
+    }
+
+    #[test]
+    fn restore_read_of_plain_object_is_refused() {
+        assert_eq!(full_object_plaintext_len(&None, &restore_opts(), &plain_object_info()), None);
+    }
+
+    #[test]
+    fn encrypted_object_is_refused() {
+        assert_eq!(
+            full_object_plaintext_len(&None, &ObjectOptions::default(), &encrypted_object_info()),
+            None
+        );
+    }
+
+    #[test]
+    fn compressed_object_without_actual_size_is_refused() {
+        // A compressed object whose actual size cannot be resolved must not be
+        // served from cache: there is no length to publish as object_info.size.
+        let mut user_defined = HashMap::new();
+        user_defined.insert("x-rustfs-internal-compression".to_string(), "klauspost/compress/s2".to_string());
+        let info = ObjectInfo {
+            size: STORED_SIZE,
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+        assert_eq!(full_object_plaintext_len(&None, &ObjectOptions::default(), &info), None);
     }
 }
