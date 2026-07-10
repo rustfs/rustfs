@@ -66,6 +66,9 @@ make pre-commit
 make pre-pr
 ```
 
+> `make test` requires [cargo-nextest](https://nexte.st) (CI runs it and only nextest honours `.config/nextest.toml` test-groups). Install it with `cargo install cargo-nextest --locked` or a prebuilt binary (see https://nexte.st/docs/installation/). To run the plain `cargo test` fallback anyway (results not authoritative — serialization semantics differ from CI), set `RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1`.
+
+### 🔒 Automated Pre-commit Hooks
 #### What `make pre-commit` and `make pre-pr` actually run
 
 `make pre-commit` is the **fast** gate. It runs, in order
