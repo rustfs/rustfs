@@ -144,6 +144,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.fill_body(&plan, Bytes::from_static(b"hello")).await;
@@ -170,6 +171,7 @@ mod tests {
             version_id: None,
             etag: "etag-a",
             size: 5,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let plan_b = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
@@ -178,6 +180,7 @@ mod tests {
             version_id: None,
             etag: "etag-b",
             size: 5,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let _ = adapter.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;

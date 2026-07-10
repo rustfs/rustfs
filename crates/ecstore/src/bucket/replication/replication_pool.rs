@@ -1614,6 +1614,7 @@ mod tests {
                     ..Default::default()
                 },
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 

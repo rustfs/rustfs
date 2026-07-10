@@ -26,6 +26,16 @@ pub enum ObjectDataCacheBodyVariant {
 }
 
 /// Stable cache key for a reusable object body.
+///
+/// The key is *write-unique*, not merely *content-unique* (backlog#1111 /
+/// ODC-06). `etag + size` alone identify content: for an unversioned overwrite
+/// two same-length payloads that collide on MD5 would derive the identical key,
+/// so a GET on a node that never observed the overwrite could serve the old
+/// bytes for up to the TTL, and the same collision turns the
+/// fill-after-invalidation race (backlog#1118) into a serving bug. Including
+/// the resolved version's modification time distinguishes two writes even under
+/// an MD5 collision, because an overwrite advances `mod_time`. `etag + size`
+/// stay in the key as belt-and-braces.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectDataCacheKey {
     /// Bucket name.
@@ -38,6 +48,11 @@ pub struct ObjectDataCacheKey {
     pub etag: Arc<str>,
     /// Object size in bytes.
     pub size: u64,
+    /// Resolved version's modification time as Unix nanoseconds
+    /// (`OffsetDateTime::unix_timestamp_nanos`), or `0` when absent. This is the
+    /// write-unique component: an overwrite advances `mod_time`, so the key
+    /// changes even when `etag + size` are unchanged (an MD5 collision).
+    pub mod_time_unix_nanos: i128,
     /// Cached body semantics.
     pub body_variant: ObjectDataCacheBodyVariant,
 }
@@ -52,13 +67,17 @@ pub struct ObjectDataCacheIdentity {
 }
 
 impl ObjectDataCacheKey {
-    /// Creates a new stable object data cache key.
-    pub fn new(
+    /// Creates a stable object data cache key with an explicit modification
+    /// time. This is the full constructor; the production GET planner uses it so
+    /// the key is write-unique (backlog#1111 / ODC-06).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_mod_time(
         bucket: impl Into<Arc<str>>,
         object: impl Into<Arc<str>>,
         version_id: Option<&str>,
         etag: impl Into<Arc<str>>,
         size: u64,
+        mod_time_unix_nanos: i128,
         body_variant: ObjectDataCacheBodyVariant,
     ) -> Self {
         Self {
@@ -67,8 +86,23 @@ impl ObjectDataCacheKey {
             version_id: version_id.map_or_else(|| Arc::<str>::from(NULL_VERSION_ID), Arc::<str>::from),
             etag: etag.into(),
             size,
+            mod_time_unix_nanos,
             body_variant,
         }
+    }
+
+    /// Creates a stable object data cache key with no modification time
+    /// (`mod_time_unix_nanos == 0`). Retained for callers that key purely by
+    /// content identity (index/backend tests).
+    pub fn new(
+        bucket: impl Into<Arc<str>>,
+        object: impl Into<Arc<str>>,
+        version_id: Option<&str>,
+        etag: impl Into<Arc<str>>,
+        size: u64,
+        body_variant: ObjectDataCacheBodyVariant,
+    ) -> Self {
+        Self::with_mod_time(bucket, object, version_id, etag, size, 0, body_variant)
     }
 
     /// Returns true when this key targets the canonical unversioned body variant.
@@ -110,6 +144,51 @@ mod tests {
             ObjectDataCacheKey::new("bucket", "object", Some("3d2"), "etag", 42, ObjectDataCacheBodyVariant::FullObjectPlainV1);
 
         assert_ne!(latest, versioned);
+    }
+
+    #[test]
+    fn key_distinguishes_writes_by_mod_time() {
+        // ODC-06 (backlog#1111): two writes with identical etag + size (an MD5
+        // collision on an unversioned overwrite) must derive different keys once
+        // the modification time differs, so a stale node cannot serve old bytes.
+        let old = ObjectDataCacheKey::with_mod_time(
+            "bucket",
+            "object",
+            None,
+            "etag",
+            42,
+            1_000,
+            ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        );
+        let new = ObjectDataCacheKey::with_mod_time(
+            "bucket",
+            "object",
+            None,
+            "etag",
+            42,
+            2_000,
+            ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        );
+
+        assert_ne!(old, new, "keys differing only by mod_time must not collide");
+        // Same mod_time still collapses to one key (a true re-read of one write).
+        let new_again = ObjectDataCacheKey::with_mod_time(
+            "bucket",
+            "object",
+            None,
+            "etag",
+            42,
+            2_000,
+            ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        );
+        assert_eq!(new, new_again);
+    }
+
+    #[test]
+    fn key_new_defaults_mod_time_to_zero() {
+        let key = ObjectDataCacheKey::new("bucket", "object", None, "etag", 42, ObjectDataCacheBodyVariant::FullObjectPlainV1);
+
+        assert_eq!(key.mod_time_unix_nanos, 0);
     }
 
     #[test]

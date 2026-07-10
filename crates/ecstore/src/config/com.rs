@@ -1824,6 +1824,7 @@ mod tests {
                 }),
                 object_info: self.object_info(bucket, object),
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 
@@ -3042,6 +3043,7 @@ mod tests {
                 stream: Box::new(Cursor::new(data)),
                 object_info,
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 

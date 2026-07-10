@@ -81,12 +81,21 @@ pub(crate) fn build_get_object_body_cache_plan(
         .version_id
         .filter(|version_id| !version_id.is_nil())
         .map(|version_id| version_id.to_string());
+    // ODC-06 (backlog#1111): carry the resolved version's modification time into
+    // the key so an unversioned overwrite (which advances mod_time) cannot be
+    // served the stale body under an MD5 collision. Absent mod_time maps to 0.
+    let mod_time_unix_nanos = request
+        .info
+        .mod_time
+        .map(|mod_time| mod_time.unix_timestamp_nanos())
+        .unwrap_or(0);
     let engine_request = ObjectDataCacheGetRequest {
         bucket: request.bucket,
         object: request.key,
         version_id,
         etag,
         size,
+        mod_time_unix_nanos,
         body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
     };
 
@@ -240,6 +249,89 @@ mod tests {
         );
 
         assert!(matches!(plan, GetObjectBodyCachePlan::Skip));
+    }
+
+    fn cacheable_key(plan: &GetObjectBodyCachePlan) -> rustfs_object_data_cache::ObjectDataCacheKey {
+        match plan {
+            GetObjectBodyCachePlan::Cacheable(rustfs_object_data_cache::ObjectDataCacheGetPlan::Cacheable { key }) => key.clone(),
+            other => panic!("expected a cacheable plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_and_planner_derive_identical_keys() {
+        // ODC-16 correctness guard: the ecstore hook and the usecase planner both
+        // route through build_get_object_body_cache_plan, so for the same object
+        // they must derive byte-identical keys — otherwise every GET misses. The
+        // hook builds its request with response_content_length = get_actual_size;
+        // the usecase builds the same for a plain, non-range GET.
+        let adapter = enabled_adapter();
+        let info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            actual_size: 4,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp_nanos(1_234_567_890).unwrap()),
+            ..Default::default()
+        };
+
+        let hook_request = GetObjectBodyCacheRequest {
+            bucket: "bucket",
+            key: "object",
+            info: &info,
+            response_content_length: info.get_actual_size().expect("actual size"),
+            has_range: false,
+            part_number: None,
+            encryption_applied: false,
+        };
+        let usecase_request = GetObjectBodyCacheRequest {
+            bucket: "bucket",
+            key: "object",
+            info: &info,
+            response_content_length: 4,
+            has_range: false,
+            part_number: None,
+            encryption_applied: false,
+        };
+
+        let hook_key = cacheable_key(&build_get_object_body_cache_plan(&adapter, hook_request));
+        let usecase_key = cacheable_key(&build_get_object_body_cache_plan(&adapter, usecase_request));
+
+        assert_eq!(hook_key, usecase_key, "hook and planner must derive the same key");
+        // ODC-06: the modification time flows into the key.
+        assert_eq!(hook_key.mod_time_unix_nanos, 1_234_567_890);
+    }
+
+    #[test]
+    fn planner_key_changes_with_mod_time() {
+        // ODC-06 (backlog#1111): an unversioned overwrite advances mod_time, so
+        // the same etag + size must derive a different key.
+        let adapter = enabled_adapter();
+        let mut info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            actual_size: 4,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp_nanos(1_000).unwrap()),
+            ..Default::default()
+        };
+        let make_request = |info: &crate::storage::storage_api::StorageObjectInfo| {
+            build_get_object_body_cache_plan(
+                &adapter,
+                GetObjectBodyCacheRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    info,
+                    response_content_length: 4,
+                    has_range: false,
+                    part_number: None,
+                    encryption_applied: false,
+                },
+            )
+        };
+        let old_key = cacheable_key(&make_request(&info));
+        info.mod_time = Some(time::OffsetDateTime::from_unix_timestamp_nanos(2_000).unwrap());
+        let new_key = cacheable_key(&make_request(&info));
+
+        assert_ne!(old_key, new_key, "keys differing only by mod_time must not collide");
     }
 
     #[test]
