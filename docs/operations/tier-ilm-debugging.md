@@ -73,16 +73,17 @@ If both `x-rustfs-internal-transitioned-versionID` and
 `x-minio-internal-transitioned-versionID` are the **empty string**, the object
 was transitioned to a non-versioned tier bucket and no versionId must be sent.
 
-## Known open issue: expire/GET race
-
-`expire_transitioned_object` deletes the remote tier version **before**
-deleting local metadata. A concurrent GET between those two steps reads a
-valid stored version_id whose remote version is already gone →
-`NoSuchVersion`. The proper fix is to delete local metadata first (making the
-object unreachable), then the remote tier version.
-
 ## Historical fixes (for context, already merged)
 
+- Expire/GET race (`NoSuchVersion` during expiry of a tiered object):
+  `expire_transitioned_object` used to delete the remote tier version
+  **before** local metadata, so a concurrent GET between the two steps read a
+  stored version_id whose remote version was already gone. Fixed in `#3491`:
+  local metadata is deleted **first** (making the object unreachable), and
+  remote-tier cleanup is driven by persisted free-version recovery
+  (`crates/ecstore/src/bucket/lifecycle/tier_free_version_recovery.rs`).
+  **Invariant — keep local-first ordering**: never remove a remote tier
+  version while live local metadata still points at it.
 - Nil-UUID versionId sent to tier (`NoSuchVersion`): reading code used
   `Uuid::from_slice(..).unwrap_or_default()`, converting an empty metadata
   value into `Uuid::nil()`. Fixed by the `and_then`/`filter` pattern above.
