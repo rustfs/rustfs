@@ -7463,6 +7463,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("fill-enabled cache adapter should initialize");
@@ -7519,6 +7521,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("fill-enabled cache adapter should initialize");
@@ -7583,6 +7587,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("fill-enabled cache adapter should initialize");
@@ -7652,6 +7658,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("fill-enabled cache adapter should initialize");
@@ -7715,6 +7723,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("materialize-fill cache adapter should initialize");
@@ -7786,6 +7796,8 @@ mod tests {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
                 max_bytes: 8_388_608,
                 max_entry_bytes: 4,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("materialize-fill cache adapter should initialize");
