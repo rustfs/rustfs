@@ -37,7 +37,9 @@ pub fn run_process() {
 
     // Flush and seal the trace segment before any exit path. `process::exit`
     // below does not run destructors, and neither does returning from `main`
-    // for a guard held in a `static`.
+    // for a guard held in a `static`. Under feature sets where the dial9 guard
+    // carries no Drop impl (e.g. `--features sftp`), this is an intentional no-op.
+    #[allow(clippy::drop_non_drop)]
     drop(dial9_guard);
 
     if let Err(ref e) = result {
