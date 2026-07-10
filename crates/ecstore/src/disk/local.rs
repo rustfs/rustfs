@@ -2295,6 +2295,14 @@ pub(crate) struct UringBackend {
     /// [`DirectIoReadState::supported`].
     active: std::sync::atomic::AtomicBool,
     fallback_logged: std::sync::atomic::AtomicBool,
+    /// Per-disk O_DIRECT+io_uring state (backlog#1102). `supported` starts
+    /// `true`; it latches `false` the first time the filesystem refuses
+    /// O_DIRECT, after which O_DIRECT-eligible reads use `StdBackend`'s aligned
+    /// path instead of retrying. `align` caches the probed device alignment so
+    /// the `statx` probe runs at most once per disk. Independent of `active`:
+    /// `active` gates io_uring as a whole, this gates only the native O_DIRECT
+    /// read shape.
+    direct_uring: DirectIoReadState,
 }
 
 /// Disks whose io_uring probe failed, so `UringBackend::try_new` can skip
@@ -2357,6 +2365,7 @@ impl UringBackend {
                     driver: Arc::new(driver),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
+                    direct_uring: DirectIoReadState::new(),
                 })
             }
             Err(err) => {
@@ -2437,6 +2446,113 @@ impl UringBackend {
         }
         Ok(Bytes::from(bytes))
     }
+
+    /// Native O_DIRECT positioned read through io_uring (backlog#1102): open the
+    /// file with `O_DIRECT`, then let the driver read the block-aligned superset
+    /// range into a block-aligned buffer and hand back exactly the requested
+    /// logical range. This keeps BOTH io_uring's async submission AND O_DIRECT's
+    /// page-cache bypass, instead of trading one for the other.
+    ///
+    /// Latching (so a failure is never re-attempted per-read):
+    /// - the filesystem refusing O_DIRECT (`EINVAL`/`EOPNOTSUPP` on open) latches
+    ///   [`Self::direct_uring`]`.supported` off — the caller then uses
+    ///   `StdBackend`'s aligned path;
+    /// - a restriction-class errno from the read latches [`Self::active`] off,
+    ///   the whole-io_uring degradation from backlog#1101.
+    ///
+    /// Any other error is returned so the caller can fall back for this read
+    /// without masking a genuine data problem as a permanent downgrade.
+    async fn pread_uring_direct(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        let Some(end_offset) = offset.checked_add(length) else {
+            return Err(DiskError::FileCorrupt);
+        };
+        let root = self.root.clone();
+        let volume_owned = volume.to_owned();
+        let path_owned = path.to_owned();
+        // Probe the device alignment at most once per disk: pass the cached
+        // value in so the blocking closure can skip `statx` when it is known.
+        let cached_align = self.direct_uring.align.get().copied();
+
+        let opened = tokio::task::spawn_blocking(move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let volume_dir = local_disk_bucket_path(&root, &volume_owned).map_err(DirectOpenError::Disk)?;
+            if !skip_access_checks(&volume_owned) {
+                access_std(&volume_dir)
+                    .map_err(|e| DirectOpenError::Disk(DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied))))?;
+            }
+            let file_path = local_disk_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
+            check_path_length(file_path.to_string_lossy().as_ref()).map_err(DirectOpenError::Disk)?;
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
+                .open(&file_path)
+            {
+                Ok(file) => file,
+                // Filesystem refuses O_DIRECT: signal a latch, not a hard error.
+                Err(e) if is_direct_io_unsupported(&e) => return Err(DirectOpenError::ODirectRefused),
+                Err(e) => return Err(DirectOpenError::Disk(DiskError::from(e))),
+            };
+            let meta = file.metadata().map_err(|e| DirectOpenError::Disk(DiskError::from(e)))?;
+            let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DirectOpenError::Disk(DiskError::FileCorrupt))?;
+            if meta.len() < end_offset_u64 {
+                return Err(DirectOpenError::Disk(DiskError::FileCorrupt));
+            }
+            let offset_u64 = u64::try_from(offset).map_err(|_| DirectOpenError::Disk(DiskError::FileCorrupt))?;
+            let align = cached_align.unwrap_or_else(|| probe_direct_io_align(&file));
+            Ok((file, offset_u64, align))
+        })
+        .await
+        .map_err(|e| DiskError::other(format!("uring O_DIRECT pread join error: {e}")))?;
+
+        let (file, offset_u64, probed_align) = match opened {
+            Ok(t) => t,
+            Err(DirectOpenError::ODirectRefused) => {
+                // Latch the native O_DIRECT path off for this disk; the caller
+                // falls back to StdBackend's aligned path for this and every
+                // future eligible read.
+                self.direct_uring.supported.store(false, Ordering::Relaxed);
+                if !self.direct_uring.fallback_logged.swap(true, Ordering::Relaxed) {
+                    debug!(
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        "filesystem refused O_DIRECT under io_uring; using StdBackend aligned path (logged once per disk)"
+                    );
+                }
+                return Err(DiskError::other("filesystem refused O_DIRECT"));
+            }
+            Err(DirectOpenError::Disk(e)) => return Err(e),
+        };
+        // Cache the alignment so the next read skips the statx probe.
+        let align = *self.direct_uring.align.get_or_init(|| probed_align);
+
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let bytes = match self.driver.read_at_direct(Arc::new(file), offset_u64, length, align).await {
+            Ok(bytes) => bytes,
+            Err(io_err) => {
+                if is_io_uring_unsupported(&io_err) {
+                    self.active.store(false, Ordering::Relaxed);
+                }
+                return Err(DiskError::from(io_err));
+            }
+        };
+        if bytes.len() != length {
+            return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
+        }
+        Ok(Bytes::from(bytes))
+    }
+}
+
+/// Outcome of opening a file with `O_DIRECT` on the blocking pool for
+/// [`UringBackend::pread_uring_direct`]. `ODirectRefused` is split out from a
+/// generic disk error so the async side can latch the native direct path off
+/// (rather than treating an unsupported filesystem as a hard read failure).
+#[cfg(target_os = "linux")]
+enum DirectOpenError {
+    ODirectRefused,
+    Disk(DiskError),
 }
 
 #[cfg(target_os = "linux")]
@@ -2455,16 +2571,41 @@ impl LocalIoBackend for UringBackend {
         if !self.active.load(Ordering::Relaxed) {
             return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
         }
-        // O_DIRECT interop (backlog#1102): `pread_uring` opens the file
-        // buffered, so routing an O_DIRECT-eligible read through io_uring would
-        // silently drop O_DIRECT and pollute the page cache — a behavior change
-        // the moment io_uring is enabled on a disk that uses it. Until the
-        // driver grows a native aligned O_DIRECT read, such reads keep going
-        // through StdBackend's aligned path (which itself falls back to
-        // buffered when the filesystem rejects O_DIRECT).
-        if is_direct_io_read_enabled() && length > 0 && length >= get_direct_io_read_threshold() {
+
+        // O_DIRECT interop (backlog#1102): pick the read shape by eligibility
+        // and per-disk capability, preferring the path that keeps io_uring's
+        // async submission — never a blanket downgrade.
+        let direct_eligible = is_direct_io_read_enabled() && length > 0 && length >= get_direct_io_read_threshold();
+        if direct_eligible {
+            if self.direct_uring.supported.load(Ordering::Relaxed) {
+                // Best path: io_uring + native O_DIRECT (async submission AND no
+                // page-cache pollution). On any error fall back to StdBackend
+                // for this read; the latching errnos already flipped the
+                // relevant per-disk latch inside `pread_uring_direct`.
+                match self.pread_uring_direct(volume, path, offset, length).await {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(err) => {
+                        if !self.fallback_logged.swap(true, Ordering::Relaxed) {
+                            debug!(
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                error = ?err,
+                                "io_uring O_DIRECT read fell back to StdBackend (logged once per disk)"
+                            );
+                        }
+                        return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+                    }
+                }
+            }
+            // O_DIRECT proved unusable on this disk earlier: use StdBackend's
+            // aligned path, which itself degrades to buffered if the filesystem
+            // rejects O_DIRECT. Not an io_uring downgrade — io_uring cannot
+            // serve an O_DIRECT read here without polluting the page cache.
             return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
         }
+
+        // Non-O_DIRECT read: buffered io_uring, falling back to StdBackend on any
+        // per-read error.
         match self.pread_uring(volume, path, offset, length).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
@@ -11400,10 +11541,12 @@ mod test {
     }
 
     /// O_DIRECT interop (backlog#1102): with BOTH io_uring and O_DIRECT enabled,
-    /// an O_DIRECT-eligible read keeps O_DIRECT semantics — it is routed to
-    /// StdBackend's aligned path instead of the buffered io_uring path — and
-    /// still returns exactly the requested bytes for unaligned ranges. Without
-    /// the guard, enabling io_uring would silently drop O_DIRECT.
+    /// an O_DIRECT-eligible read keeps O_DIRECT semantics via the native
+    /// `read_at_direct` path (or, if that disk can't do io_uring+O_DIRECT, the
+    /// StdBackend aligned fallback) and still returns exactly the requested
+    /// bytes for unaligned ranges. This asserts byte-correctness regardless of
+    /// which tier serves the read — the native path is exercised directly by
+    /// rustfs-uring's own O_DIRECT test under real io_uring.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn uring_preserves_o_direct_for_eligible_reads() {
@@ -11429,8 +11572,8 @@ mod test {
         ];
 
         // Threshold 1 makes every non-empty read O_DIRECT-eligible, so each read
-        // below exercises the guard. The env must be set before LocalDisk::new
-        // so the io_uring backend is the one selected.
+        // below exercises the O_DIRECT tier. The env must be set before
+        // LocalDisk::new so the io_uring backend is the one selected.
         let root_dir = tempdir().expect("operation should succeed");
         let got_ranges = temp_env::async_with_vars(
             [
