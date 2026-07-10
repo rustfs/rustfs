@@ -23,6 +23,28 @@ use super::super::*;
 
 use crate::disk::OldCurrentSize;
 
+/// Gates the app-layer body-cache hook probe in `get_object_reader`.
+///
+/// A hook hit serves the cached full-object plaintext directly, bypassing
+/// `ReadPlan`/`ReadTransform`. That is only sound when the normal read path
+/// would return that same plaintext byte-for-byte, so the probe is refused for:
+/// - ranged / part-number reads (the cache only holds whole objects);
+/// - data-movement reads — `raw_data_movement_read` makes `ReadPlan::build`
+///   return the STORED representation (e.g. compressed bytes), while the cache
+///   holds the post-decompression body (backlog#1108);
+/// - compressed objects — `ReadTransform::Compressed` rewrites `object_info.size`
+///   to the decompressed length, so a hook hit would pair a compressed-size
+///   `object_info` with a decompressed stream (backlog#1109).
+///
+/// These mirror the gates `get_small_object_direct_memory_decision` applies.
+fn should_probe_body_cache_hook(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions, object_info: &ObjectInfo) -> bool {
+    range.is_none()
+        && opts.part_number.is_none()
+        && !opts.raw_data_movement_read
+        && !opts.data_movement
+        && !object_info.is_compressed()
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type Error = Error;
@@ -340,8 +362,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // but no data shards have been read yet, so a hit skips the erasure
         // read, bitrot verify and decode entirely. The hook validates object
         // identity and rejects anything it cannot serve byte-identically.
-        if range.is_none()
-            && opts.part_number.is_none()
+        if should_probe_body_cache_hook(&range, opts, &object_info)
             && let Some(hook) = get_object_body_cache_hook()
             && let Some(body) = hook.lookup(bucket, object, &object_info).await
         {
@@ -2773,5 +2794,70 @@ mod delete_objects_lock_gating_tests {
 
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
+    }
+}
+
+#[cfg(test)]
+mod body_cache_hook_gate_tests {
+    //! Regression coverage for backlog#1108 (raw data-movement reads) and
+    //! backlog#1109 (compressed objects): the app-layer body-cache hook serves
+    //! cached full-object plaintext directly, bypassing `ReadPlan`. It must not
+    //! be probed when the normal read path would return a different byte stream.
+
+    use super::should_probe_body_cache_hook;
+    use crate::object_api::{ObjectInfo, ObjectOptions};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn plain_object_info() -> ObjectInfo {
+        ObjectInfo {
+            size: 1024,
+            ..Default::default()
+        }
+    }
+
+    fn compressed_object_info() -> ObjectInfo {
+        let mut user_defined = HashMap::new();
+        // is_compressed() checks for the internal compression suffix key.
+        user_defined.insert("x-rustfs-internal-compression".to_string(), "klauspost/compress/s2".to_string());
+        ObjectInfo {
+            size: 1024,
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plain_full_object_read_is_probed() {
+        assert!(should_probe_body_cache_hook(&None, &ObjectOptions::default(), &plain_object_info()));
+    }
+
+    #[test]
+    fn raw_data_movement_read_skips_probe() {
+        // Decommission reads set raw_data_movement_read: ReadPlan returns the
+        // STORED bytes, so the cached decompressed body must not be served
+        // (backlog#1108 — silent data corruption on the destination pool).
+        let opts = ObjectOptions {
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+        assert!(!should_probe_body_cache_hook(&None, &opts, &plain_object_info()));
+    }
+
+    #[test]
+    fn data_movement_read_skips_probe() {
+        let opts = ObjectOptions {
+            data_movement: true,
+            ..Default::default()
+        };
+        assert!(!should_probe_body_cache_hook(&None, &opts, &plain_object_info()));
+    }
+
+    #[test]
+    fn compressed_object_skips_probe() {
+        // ReadTransform::Compressed rewrites object_info.size to the
+        // decompressed length; a hook hit would pair a compressed-size
+        // object_info with a decompressed stream (backlog#1109).
+        assert!(!should_probe_body_cache_hook(&None, &ObjectOptions::default(), &compressed_object_info()));
     }
 }
