@@ -15,50 +15,40 @@
 use bytes::Bytes;
 use std::cmp;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::key::ObjectDataCacheKey;
 
 const ENTRY_OVERHEAD_BYTES: usize = 64;
 
 /// Cached object body entry.
+///
+/// The content length and etag are already part of the moka key's `Hash`/`Eq`
+/// identity (see [`ObjectDataCacheKey`]), so a cached hit is only returned for a
+/// key that already matched them. Storing per-entry copies (`content_length`,
+/// `etag`, `inserted_at`) added memory not captured by `ENTRY_OVERHEAD_BYTES`
+/// with no reader, so the entry is now a thin `Bytes` wrapper (backlog#1141).
 #[derive(Debug, Clone)]
 pub struct ObjectDataCacheEntry {
     bytes: Bytes,
-    content_length: u64,
-    etag: Arc<str>,
-    inserted_at: Instant,
 }
 
 impl ObjectDataCacheEntry {
     /// Creates a new cached entry.
+    ///
+    /// `content_length` and `etag` are accepted but intentionally ignored: they
+    /// are redundant with the moka key identity. The arity is retained so the
+    /// only external constructor caller (`MokaBackend::fill_body`, owned by a
+    /// concurrent branch) keeps compiling; the follow-up dropping the two unused
+    /// arguments belongs with that file.
     pub fn new(bytes: Bytes, content_length: u64, etag: Arc<str>) -> Self {
-        Self {
-            bytes,
-            content_length,
-            etag,
-            inserted_at: Instant::now(),
-        }
+        let _ = content_length;
+        let _ = etag;
+        Self { bytes }
     }
 
     /// Returns a clone of the cached body bytes.
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()
-    }
-
-    /// Returns the recorded content length.
-    pub const fn content_length(&self) -> u64 {
-        self.content_length
-    }
-
-    /// Returns the cached etag reference.
-    pub fn etag(&self) -> &Arc<str> {
-        &self.etag
-    }
-
-    /// Returns the insertion timestamp.
-    pub const fn inserted_at(&self) -> Instant {
-        self.inserted_at
     }
 
     /// Returns the estimated weighted size for capacity accounting.

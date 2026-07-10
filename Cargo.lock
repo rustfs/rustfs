@@ -9570,6 +9570,7 @@ version = "1.0.0-beta.8"
 dependencies = [
  "bytes",
  "metrics",
+ "metrics-util",
  "moka",
  "starshard",
  "sysinfo",
@@ -10031,7 +10032,7 @@ dependencies = [
 [[package]]
 name = "rustfs-uring"
 version = "0.1.0"
-source = "git+https://github.com/rustfs/uring?rev=f577ba0bfd6c3d74f9bdc54b573b8fcb45d6bc22#f577ba0bfd6c3d74f9bdc54b573b8fcb45d6bc22"
+source = "git+https://github.com/rustfs/uring?rev=719b245f9bb24e838de8639c19858df2690f3ae1#719b245f9bb24e838de8639c19858df2690f3ae1"
 dependencies = [
  "io-uring",
  "libc",

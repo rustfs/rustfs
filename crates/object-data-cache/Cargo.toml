@@ -38,6 +38,7 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
+metrics-util = { version = "0.20", features = ["debugging"] }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [lints]
