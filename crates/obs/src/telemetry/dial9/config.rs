@@ -22,14 +22,12 @@
 use super::state::dial9_runtime_state;
 use rustfs_config::{
     DEFAULT_RUNTIME_DIAL9_ENABLED, DEFAULT_RUNTIME_DIAL9_FILE_PREFIX, DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE,
-    DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR, DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT, DEFAULT_RUNTIME_DIAL9_TASK_DUMP_ENABLED,
-    DEFAULT_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS, ENV_RUNTIME_DIAL9_ENABLED, ENV_RUNTIME_DIAL9_FILE_PREFIX,
-    ENV_RUNTIME_DIAL9_MAX_FILE_SIZE, ENV_RUNTIME_DIAL9_OUTPUT_DIR, ENV_RUNTIME_DIAL9_ROTATION_COUNT, ENV_RUNTIME_DIAL9_S3_BUCKET,
-    ENV_RUNTIME_DIAL9_S3_PREFIX, ENV_RUNTIME_DIAL9_TASK_DUMP_ENABLED, ENV_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS,
+    DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR, DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT, ENV_RUNTIME_DIAL9_ENABLED,
+    ENV_RUNTIME_DIAL9_FILE_PREFIX, ENV_RUNTIME_DIAL9_MAX_FILE_SIZE, ENV_RUNTIME_DIAL9_OUTPUT_DIR,
+    ENV_RUNTIME_DIAL9_ROTATION_COUNT, ENV_RUNTIME_DIAL9_S3_BUCKET, ENV_RUNTIME_DIAL9_S3_PREFIX,
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_opt_u64, get_env_opt_usize, get_env_str};
 use std::path::PathBuf;
-use std::time::Duration;
 use tracing::warn;
 
 use super::{EVENT_DIAL9_STATE, LOG_COMPONENT_OBS, LOG_SUBSYSTEM_DIAL9};
@@ -92,12 +90,6 @@ pub struct Dial9Config {
 
     /// Optional key prefix for uploaded segments
     pub s3_prefix: Option<String>,
-
-    /// Whether to capture async backtraces for tasks that stall
-    pub task_dump_enabled: bool,
-
-    /// Mean idle duration for task-dump Poisson sampling
-    pub task_dump_idle_threshold: Duration,
 }
 
 impl Default for Dial9Config {
@@ -110,8 +102,6 @@ impl Default for Dial9Config {
             rotation_count: DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT,
             s3_bucket: None,
             s3_prefix: None,
-            task_dump_enabled: DEFAULT_RUNTIME_DIAL9_TASK_DUMP_ENABLED,
-            task_dump_idle_threshold: Duration::from_millis(DEFAULT_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS),
         }
     }
 }
@@ -165,12 +155,6 @@ impl Dial9Config {
             rotation_count,
             s3_bucket,
             s3_prefix,
-            task_dump_enabled: get_env_bool(ENV_RUNTIME_DIAL9_TASK_DUMP_ENABLED, DEFAULT_RUNTIME_DIAL9_TASK_DUMP_ENABLED),
-            task_dump_idle_threshold: Duration::from_millis(
-                get_env_opt_u64(ENV_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS)
-                    .filter(|ms| *ms > 0)
-                    .unwrap_or(DEFAULT_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS),
-            ),
         };
 
         dial9_runtime_state().record_config(&config);

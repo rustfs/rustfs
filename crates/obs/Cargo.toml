@@ -31,11 +31,15 @@ default = []
 # build script fails the compile when that flag is missing. Off by default so
 # ordinary builds neither pay for nor depend on Tokio's unstable API.
 dial9 = ["dep:dial9-tokio-telemetry"]
-# Capture async backtraces of stalled tasks. Enables `tokio/taskdump`, which
-# hard-errors at compile time on anything other than linux/{aarch64,x86,x86_64},
-# and additionally needs `--cfg tokio_taskdump` to record anything. Linux-only,
-# and not a silent no-op elsewhere: enabling it on macOS fails the build.
-dial9-taskdump = ["dial9", "dial9-tokio-telemetry/taskdump"]
+#
+# NOTE: there is deliberately no `dial9-taskdump` feature. dial9 only captures a
+# task dump for futures it wrapped itself, i.e. those spawned via
+# `dial9_tokio_telemetry::spawn`. RustFS spawns with `tokio::spawn` throughout,
+# so enabling `tokio/taskdump` would cost a Linux-only build constraint and
+# record nothing. Measured on an identical workload: 0 dumps via `tokio::spawn`,
+# 14709 via `dial9::spawn`. Re-adding this feature only makes sense together
+# with migrating the paths under investigation to dial9's spawner.
+# See rustfs/backlog#1157 (D9-16) and dial9-rs/dial9#477.
 #
 # NOTE: there is deliberately no `dial9-s3` feature. dial9's `worker-s3` feature
 # pulls aws-sdk-s3-transfer-manager 0.1.3 (its latest), which pins
