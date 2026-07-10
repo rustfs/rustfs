@@ -275,13 +275,15 @@ where
     let role = shard_role(index, data_shards);
     if let Some(reader) = reader {
         Box::pin(async move {
-            let mut buf = recycled_buf.unwrap_or_else(|| vec![0; shard_size]);
-            debug_assert_eq!(buf.len(), shard_size);
+            // Capacity, not length: `read_appending` writes every byte it returns, so
+            // the buffer never needs zeroing first (rustfs/backlog#1159).
+            let mut buf = recycled_buf.unwrap_or_else(|| Vec::with_capacity(shard_size));
+            buf.clear();
             let read_start = metrics_path.map(|_| Instant::now());
             let read_result = if read_timeout.is_zero() {
-                reader.read(&mut buf).await
+                reader.read_appending(&mut buf, shard_size).await
             } else {
-                match tokio::time::timeout(read_timeout, reader.read(&mut buf)).await {
+                match tokio::time::timeout(read_timeout, reader.read_appending(&mut buf, shard_size)).await {
                     Ok(result) => result,
                     Err(_) => {
                         let timeout_error = io::Error::new(ErrorKind::TimedOut, "shard read timed out");
@@ -306,7 +308,7 @@ where
 
             match read_result {
                 Ok(n) => {
-                    buf.truncate(n);
+                    debug_assert_eq!(buf.len(), n, "read_appending must grow the buffer by exactly n");
                     if let Some(path) = metrics_path {
                         rustfs_io_metrics::record_get_object_shard_read_observation(
                             path,

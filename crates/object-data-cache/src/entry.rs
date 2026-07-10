@@ -14,51 +14,32 @@
 
 use bytes::Bytes;
 use std::cmp;
-use std::sync::Arc;
-use std::time::Instant;
 
 use crate::key::ObjectDataCacheKey;
 
 const ENTRY_OVERHEAD_BYTES: usize = 64;
 
 /// Cached object body entry.
+///
+/// The content length and etag are already part of the moka key's `Hash`/`Eq`
+/// identity (see [`ObjectDataCacheKey`]), so a cached hit is only returned for a
+/// key that already matched them. Storing per-entry copies (`content_length`,
+/// `etag`, `inserted_at`) added memory not captured by `ENTRY_OVERHEAD_BYTES`
+/// with no reader, so the entry is now a thin `Bytes` wrapper (backlog#1141).
 #[derive(Debug, Clone)]
 pub struct ObjectDataCacheEntry {
     bytes: Bytes,
-    content_length: u64,
-    etag: Arc<str>,
-    inserted_at: Instant,
 }
 
 impl ObjectDataCacheEntry {
     /// Creates a new cached entry.
-    pub fn new(bytes: Bytes, content_length: u64, etag: Arc<str>) -> Self {
-        Self {
-            bytes,
-            content_length,
-            etag,
-            inserted_at: Instant::now(),
-        }
+    pub fn new(bytes: Bytes) -> Self {
+        Self { bytes }
     }
 
     /// Returns a clone of the cached body bytes.
     pub fn bytes(&self) -> Bytes {
         self.bytes.clone()
-    }
-
-    /// Returns the recorded content length.
-    pub const fn content_length(&self) -> u64 {
-        self.content_length
-    }
-
-    /// Returns the cached etag reference.
-    pub fn etag(&self) -> &Arc<str> {
-        &self.etag
-    }
-
-    /// Returns the insertion timestamp.
-    pub const fn inserted_at(&self) -> Instant {
-        self.inserted_at
     }
 
     /// Returns the estimated weighted size for capacity accounting.
@@ -77,13 +58,12 @@ mod tests {
     use super::ObjectDataCacheEntry;
     use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheKey};
     use bytes::Bytes;
-    use std::sync::Arc;
 
     #[test]
     fn estimated_weight_includes_body_and_key_bytes() {
         let key =
             ObjectDataCacheKey::new("bucket", "object", Some("vid"), "etag", 5, ObjectDataCacheBodyVariant::FullObjectPlainV1);
-        let entry = ObjectDataCacheEntry::new(Bytes::from_static(b"hello"), 5, Arc::<str>::from("etag"));
+        let entry = ObjectDataCacheEntry::new(Bytes::from_static(b"hello"));
 
         let weight = entry.estimated_weight(&key);
 
@@ -104,7 +84,7 @@ mod tests {
             ObjectDataCacheBodyVariant::FullObjectPlainV1,
         );
         let huge = vec![0u8; (u32::MAX as usize).saturating_add(1024)];
-        let entry = ObjectDataCacheEntry::new(Bytes::from(huge), 1, Arc::<str>::from("etag"));
+        let entry = ObjectDataCacheEntry::new(Bytes::from(huge));
 
         let weight = entry.estimated_weight(&key);
 

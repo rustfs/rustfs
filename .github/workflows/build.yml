@@ -224,11 +224,11 @@ jobs:
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      # Always enable Tokio unstable features (required by dial9-tokio-telemetry).
-      # The RUSTFLAGS env var takes precedence over .cargo/config.toml [build] rustflags,
-      # so we must include --cfg tokio_unstable here explicitly; otherwise an empty
-      # RUSTFLAGS value would shadow the config-file flag and silently break tracing.
-      RUSTFLAGS: "--cfg tokio_unstable ${{ matrix.rustflags }}"
+      # Release binaries ship without dial9 telemetry and therefore do not need
+      # --cfg tokio_unstable. Telemetry builds opt in explicitly (see
+      # `make build-profiling`); crates/obs/build.rs fails the compile if the
+      # `dial9` feature is enabled without the flag.
+      RUSTFLAGS: "${{ matrix.rustflags }}"
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}

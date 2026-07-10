@@ -23,6 +23,29 @@ Metric directions: `reqps` (put obj/s) and `throughput` (get MiB/s) are
 higher-is-better; `latency` / p99 (mixed) is lower-is-better. warp is assumed
 pre-installed, as elsewhere in `scripts/`.
 
+## Workload matrix
+
+Six workloads × the drive-sync on/off matrix × baseline/candidate = 24 cells:
+
+| Workload | mode | size | why |
+| --- | --- | --- | --- |
+| `put-4kib` / `get-4kib` | put / get | 4KiB | the #4221 fsync regression size (~-10% @4KiB) — previously invisible |
+| `put-4mib` / `get-4mib` | put / get | 4MiB | bulk obj/s and MiB/s |
+| `get-10mib` | get | 10MiB | the historical large-GET EOF size |
+| `mixed-256k` | mixed | 256KiB | p99 latency |
+
+Sizes are passed to the load driver via `--sizes` (one size per cell); the
+driver's `DEFAULT_SIZES` covers 1KiB..10MiB, so any of those can be added by
+editing `WORKLOADS` in `scripts/run_hotpath_warp_ab.sh`. A 1KiB cell is left
+out for now to keep the nightly matrix under the 90-minute job budget (the
+baseline+candidate double build dominates until perf-3 caches it); re-enable it
+once that lands.
+
+CI runs a **short** warp matrix (`--duration`/`--rounds`/`--cooldown` tuned in
+`.github/workflows/performance-ab.yml`) so all 24 cells fit the budget without
+dropping cells. These params are deliberately noisy-but-fast for the Phase-0
+"keep the pipeline alive" goal; perf-6 recalibrates them.
+
 ## Local mode (quick / CI smoke)
 
 Builds both binaries and runs a throwaway single-node server on local disks.
@@ -93,6 +116,22 @@ Some regressions are the correct trade — #4221 deliberately paid a large write
 cost to restore power-loss durability. For those, run with
 `--allow-regression` (or add the `perf-deliberate-tradeoff` label in CI): the
 FAIL is recorded and rendered as an exempted WARN, and the gate exits 0.
+
+## Diagnosing a failed run
+
+Each phase's server log and its startup environment are written under the run's
+output dir (`target/hotpath-ab/<ts>/server-logs/<phase>-sync-<sync>.{log,env}`)
+and uploaded in the `hotpath-warp-ab-<run>` artifact, so a failure is
+diagnosable after the fact. On a health-check failure the rig also dumps the
+last 50 log lines into the job log and the CI job writes the failing phase (or
+the gate table) into the GitHub step summary.
+
+Readiness polling waits up to `--health-timeout` seconds (default **180**),
+which must outlast the server's own startup-readiness budget
+(`RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS`, default 120s) — a shorter poll on a
+slow shared runner mis-reports a slow cold start as a failure. In local mode the
+rig also fails fast if the server process exits before becoming healthy instead
+of polling out the full budget.
 
 ## Scope note
 

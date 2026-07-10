@@ -15,9 +15,11 @@
 use crate::config::ObjectDataCacheConfig;
 use crate::metrics::record_memory_pressure;
 use crate::stats::ObjectDataCacheStats;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use sysinfo::System;
 
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -110,16 +112,60 @@ impl ObjectDataCacheMemorySnapshot {
     }
 }
 
-/// Memory gate that keeps a cheap snapshot for fill-path checks.
+/// Lock-free memory snapshot shared between the gate and its refresher task.
+#[derive(Debug)]
+struct MemorySnapshotCell {
+    total_bytes: AtomicU64,
+    available_bytes: AtomicU64,
+}
+
+impl MemorySnapshotCell {
+    fn new(snapshot: ObjectDataCacheMemorySnapshot) -> Self {
+        Self {
+            total_bytes: AtomicU64::new(snapshot.total_bytes),
+            available_bytes: AtomicU64::new(snapshot.available_bytes),
+        }
+    }
+
+    fn store(&self, snapshot: ObjectDataCacheMemorySnapshot) {
+        self.total_bytes.store(snapshot.total_bytes, Ordering::Relaxed);
+        self.available_bytes.store(snapshot.available_bytes, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> ObjectDataCacheMemorySnapshot {
+        ObjectDataCacheMemorySnapshot {
+            total_bytes: self.total_bytes.load(Ordering::Relaxed),
+            available_bytes: self.available_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Aborts the periodic refresher when the gate (and thus the cache) is dropped.
+#[derive(Debug)]
+struct RefresherGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for RefresherGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Memory gate that keeps a cheap, lock-free snapshot for fill-path checks.
+///
+/// The snapshot is sampled off the fill path by a dedicated periodic refresher
+/// (see [`spawn_refresher`](ObjectDataCacheMemoryGate::spawn_refresher)) that
+/// runs the blocking `sysinfo` read on a `spawn_blocking` thread. `allows_fill`
+/// only reads atomics, so it never blocks a tokio worker and concurrent fills
+/// never serialize on a refresh.
 #[derive(Debug)]
 pub struct ObjectDataCacheMemoryGate {
-    system: Mutex<System>,
-    last_refresh: Mutex<Instant>,
-    snapshot_total_bytes: AtomicU64,
-    snapshot_available_bytes: AtomicU64,
+    snapshot: Arc<MemorySnapshotCell>,
     min_free_memory_percent: u8,
-    refresh_interval: Duration,
     stats: Arc<ObjectDataCacheStats>,
+    /// Kept alive so the refresher runs for the gate's lifetime; `None` when the
+    /// gate is opted out (`min_free_memory_percent == 0`) or no tokio runtime is
+    /// available at construction (e.g. synchronous unit tests).
+    _refresher: Option<RefresherGuard>,
     #[cfg(test)]
     test_override: Mutex<Option<ObjectDataCacheMemorySnapshot>>,
 }
@@ -127,25 +173,57 @@ pub struct ObjectDataCacheMemoryGate {
 impl ObjectDataCacheMemoryGate {
     /// Creates a new memory gate.
     pub fn new(config: &ObjectDataCacheConfig, stats: Arc<ObjectDataCacheStats>) -> Self {
-        let mut system = System::new();
-        system.refresh_memory();
-        let effective = effective_memory_from_system(&system);
-        let snapshot = ObjectDataCacheMemorySnapshot {
+        // Seed the snapshot once at construction. This is the only blocking
+        // sysinfo read on any caller's stack; all later refreshes run off-path.
+        let effective = resolve_effective_memory();
+        let snapshot = Arc::new(MemorySnapshotCell::new(ObjectDataCacheMemorySnapshot {
             total_bytes: effective.total_bytes,
             available_bytes: effective.available_bytes,
+        }));
+
+        let min_free_memory_percent = config.min_free_memory_percent;
+        // A zero floor opts out of the gate entirely, so there is nothing to
+        // refresh; skip the background task in that case.
+        let refresher = if min_free_memory_percent == 0 {
+            None
+        } else {
+            Self::spawn_refresher(Arc::clone(&snapshot), DEFAULT_REFRESH_INTERVAL)
         };
 
         Self {
-            system: Mutex::new(system),
-            last_refresh: Mutex::new(Instant::now()),
-            snapshot_total_bytes: AtomicU64::new(snapshot.total_bytes),
-            snapshot_available_bytes: AtomicU64::new(snapshot.available_bytes),
-            min_free_memory_percent: config.min_free_memory_percent,
-            refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            snapshot,
+            min_free_memory_percent,
             stats,
+            _refresher: refresher,
             #[cfg(test)]
             test_override: Mutex::new(None),
         }
+    }
+
+    /// Spawns the periodic refresher, returning `None` when no tokio runtime is
+    /// available (the gate then keeps its construction-time seed snapshot).
+    fn spawn_refresher(snapshot: Arc<MemorySnapshotCell>, interval: Duration) -> Option<RefresherGuard> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let task = handle.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately; the seed snapshot is already in
+            // place, so refresh from the second tick onward.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                // Run the blocking /proc/meminfo read off the async worker. A
+                // join error only happens if the runtime is shutting down; keep
+                // the last snapshot rather than clobbering it in that case.
+                if let Ok(effective) = tokio::task::spawn_blocking(resolve_effective_memory).await {
+                    snapshot.store(ObjectDataCacheMemorySnapshot {
+                        total_bytes: effective.total_bytes,
+                        available_bytes: effective.available_bytes,
+                    });
+                }
+            }
+        });
+        Some(RefresherGuard(task))
     }
 
     /// Returns the current atomic memory snapshot.
@@ -157,44 +235,21 @@ impl ObjectDataCacheMemoryGate {
             }
         }
 
-        ObjectDataCacheMemorySnapshot {
-            total_bytes: self.snapshot_total_bytes.load(Ordering::Relaxed),
-            available_bytes: self.snapshot_available_bytes.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Refreshes the snapshot if it is stale.
-    pub fn refresh_if_stale(&self) {
-        {
-            let last_refresh = lock_or_recover(&self.last_refresh);
-            if last_refresh.elapsed() < self.refresh_interval {
-                return;
-            }
-        }
-
-        let mut system = lock_or_recover(&self.system);
-        system.refresh_memory();
-        let effective = effective_memory_from_system(&system);
-        let snapshot = ObjectDataCacheMemorySnapshot {
-            total_bytes: effective.total_bytes,
-            available_bytes: effective.available_bytes,
-        };
-
-        self.snapshot_total_bytes.store(snapshot.total_bytes, Ordering::Relaxed);
-        self.snapshot_available_bytes
-            .store(snapshot.available_bytes, Ordering::Relaxed);
-        *lock_or_recover(&self.last_refresh) = Instant::now();
+        self.snapshot.load()
     }
 
     /// Returns true when the fill path may proceed under current memory pressure.
+    ///
+    /// This is lock-free and does no blocking sysinfo read: it only reads the
+    /// atomic snapshot maintained by the periodic refresher.
     pub fn allows_fill(&self, required_bytes: u64) -> bool {
         // A zero floor opts out of the gate, so fill admission never depends on
         // a live memory reading — which differs between a host and a container.
+        // This must short-circuit before any snapshot read (see 51a97a81c).
         if self.min_free_memory_percent == 0 {
             return true;
         }
 
-        self.refresh_if_stale();
         let snapshot = self.snapshot();
         if snapshot.total_bytes == 0 {
             return true;
@@ -216,8 +271,22 @@ impl ObjectDataCacheMemoryGate {
     pub fn set_test_snapshot(&self, snapshot: Option<ObjectDataCacheMemorySnapshot>) {
         *lock_or_recover(&self.test_override) = snapshot;
     }
+
+    /// Writes the atomic snapshot directly, bypassing the `test_override` read
+    /// path so a test can observe whether `allows_fill` mutates the snapshot.
+    #[cfg(test)]
+    fn store_raw_snapshot_for_test(&self, snapshot: ObjectDataCacheMemorySnapshot) {
+        self.snapshot.store(snapshot);
+    }
+
+    /// Reads the atomic snapshot directly, bypassing `test_override`.
+    #[cfg(test)]
+    fn raw_snapshot_for_test(&self) -> ObjectDataCacheMemorySnapshot {
+        self.snapshot.load()
+    }
 }
 
+#[cfg(test)]
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -231,6 +300,7 @@ mod tests {
     use crate::config::ObjectDataCacheConfig;
     use crate::stats::ObjectDataCacheStats;
     use std::sync::Arc;
+    use std::time::Duration;
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -330,5 +400,58 @@ mod tests {
 
         assert!(!gate.allows_fill(128));
         assert_eq!(stats.snapshot().memory_pressure_events, 1);
+    }
+
+    // ODC-14: `allows_fill` must read the atomic snapshot without performing an
+    // inline (blocking) refresh. A synchronous test has no tokio runtime, so no
+    // refresher task exists; if `allows_fill` refreshed inline it would clobber
+    // the seeded atomic snapshot with the real host reading. Comparing exact
+    // byte values makes the assertion independent of the host's actual memory.
+    #[test]
+    fn allows_fill_reads_snapshot_without_refreshing_inline() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::clone(&stats));
+
+        let sentinel = ObjectDataCacheMemorySnapshot {
+            total_bytes: 4_242,
+            available_bytes: 2_121,
+        };
+        gate.store_raw_snapshot_for_test(sentinel);
+
+        // Exercise the gate on the atomic path (no test_override installed).
+        let _ = gate.allows_fill(1);
+
+        let after = gate.raw_snapshot_for_test();
+        assert_eq!(
+            after, sentinel,
+            "allows_fill must not mutate the snapshot; an inline refresh would overwrite it"
+        );
+    }
+
+    // ODC-14: the periodic refresher samples memory off the fill path and
+    // updates the atomic snapshot, so a stale seed is replaced without any
+    // fill ever blocking on a refresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_refresher_updates_snapshot_off_path() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let snapshot = Arc::new(super::MemorySnapshotCell::new(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1,
+            available_bytes: 1,
+        }));
+        let _guard = ObjectDataCacheMemoryGate::spawn_refresher(Arc::clone(&snapshot), Duration::from_millis(20))
+            .expect("a tokio runtime is available in an async test");
+
+        // The seed is a bogus 1/1; wait for the refresher to overwrite it with a
+        // real host reading (total memory is always far above 1 byte).
+        let mut refreshed = false;
+        for _ in 0..200 {
+            if snapshot.load().total_bytes > 1 {
+                refreshed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(refreshed, "the periodic refresher must replace the seed snapshot off the fill path");
+        let _ = stats;
     }
 }

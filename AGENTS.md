@@ -108,6 +108,11 @@ list, suppress a lint with `#[allow]`, mark a failing test `#[ignore]`, or
 delete or relax a failing assertion to get green. If a check itself is wrong,
 change it deliberately and state the rationale in the PR.
 
+For flaky tests, do not paper over them with retries. Follow the flake policy
+in [docs/testing/README.md](docs/testing/README.md) (open an issue within 24h,
+quarantine with an issue link, fix or delete within 30 days); the local
+`default` nextest profile never retries.
+
 ## Adversarial Validation (Default On)
 
 Every non-exempt output (see Risk tiers) — code change, bug fix, or
