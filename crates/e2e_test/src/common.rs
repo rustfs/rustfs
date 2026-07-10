@@ -514,6 +514,29 @@ impl Drop for RustFSTestEnvironment {
     }
 }
 
+/// Short-interval replication timing overrides for fast e2e runs
+/// (backlog#1147 repl-4).
+///
+/// Returns the full set of replication background-loop env vars with
+/// millisecond values so failure-recovery scenarios converge in seconds
+/// instead of the production defaults (health check 5s, MRF flush 10s,
+/// resync retry poll up to 60s). Pass to
+/// [`RustFSTestEnvironment::start_rustfs_server_with_env`] as
+/// `&replication_fast_env()`. The server reads each value once at background
+/// task startup, so the vars must be set before the process starts. Values
+/// below 10ms are clamped server-side to avoid busy-spin.
+pub fn replication_fast_env() -> Vec<(&'static str, &'static str)> {
+    // Env var names mirror `crates/ecstore/src/bucket/replication/replication_timing.rs`
+    // (this is a process-boundary contract: the vars are passed to the spawned
+    // server, not consumed in-process). The names are pinned by the
+    // `env_var_names_are_a_cross_process_contract` test in that module.
+    vec![
+        ("RUSTFS_REPL_HEALTH_CHECK_INTERVAL_MS", "200"),
+        ("RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS", "100"),
+        ("RUSTFS_REPL_RESYNC_POLL_MAX_MS", "250"),
+    ]
+}
+
 async fn execute_awscurl_with_service(
     url: &str,
     method: &str,
