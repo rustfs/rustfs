@@ -1425,17 +1425,26 @@ fn duration_millis(duration: Duration) -> u64 {
 /// fault. It is failed only when the drive stops answering, so the timeout wraps
 /// each individual read rather than the walk as a whole. Time spent blocked
 /// writing to a slow consumer is deliberately outside this budget.
+///
+/// Every filesystem call a walk makes must go through this, because the listing
+/// path skips the wrapper-level total timeout: an unbounded read would leave the
+/// walk with no liveness bound of its own.
+async fn with_walk_stall_deadline<T, F>(stall: Option<Duration>, fut: F) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match stall {
+        Some(stall) if !stall.is_zero() => timeout(stall, fut).await.map_err(|_| DiskError::Timeout),
+        _ => Ok(fut.await),
+    }
+}
+
+/// [`with_walk_stall_deadline`] for reads that already yield a [`Result`].
 async fn with_walk_stall_timeout<T, F>(stall: Option<Duration>, fut: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
-    match stall {
-        Some(stall) if !stall.is_zero() => match timeout(stall, fut).await {
-            Ok(res) => res,
-            Err(_) => Err(DiskError::Timeout),
-        },
-        _ => fut.await,
-    }
+    with_walk_stall_deadline(stall, fut).await?
 }
 
 impl FileCacheReclaimReader {
@@ -4246,7 +4255,10 @@ impl LocalDisk {
                     if err == Error::FileNotFound || err == Error::IsNotRegular {
                         // NOT an object, append to stack (with slash)
                         // If dirObject, but no metadata (which is unexpected) we skip it.
-                        if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
+                        if !is_dir_obj
+                            && !with_walk_stall_deadline(stall, is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?))
+                                .await?
+                        {
                             meta.name.push_str(SLASH_SEPARATOR);
                             if opts.recursive
                                 || opts.incl_deleted
@@ -5417,7 +5429,7 @@ impl DiskAPI for LocalDisk {
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket)
-            && let Err(e) = access(&volume_dir).await
+            && let Err(e) = with_walk_stall_deadline(stall, access(&volume_dir)).await?
         {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
@@ -5457,16 +5469,18 @@ impl DiskAPI for LocalDisk {
                 let fpath =
                     self.get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
 
-                if let Ok(meta) = tokio::fs::metadata(&fpath).await
+                if let Ok(meta) = with_walk_stall_deadline(stall, tokio::fs::metadata(&fpath)).await?
                     && meta.is_file()
                 {
                     skip_current_dir_object = true;
-                    if let Ok(meta_bytes) = self
-                        .read_metadata(
+                    if let Ok(meta_bytes) = with_walk_stall_deadline(
+                        stall,
+                        self.read_metadata(
                             opts.bucket.as_str(),
                             path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
-                        )
-                        .await
+                        ),
+                    )
+                    .await?
                         && let Ok(file_meta) = FileMeta::load(&meta_bytes)
                         && let Ok(data_dirs) = file_meta.get_data_dirs()
                     {
@@ -7395,6 +7409,13 @@ mod test {
     }
 
     // #4644: the stall timeout is what catches a drive that stops answering.
+    //
+    // This exercises the bound directly rather than through `walk_dir`. A drive
+    // read only outlives the budget when the drive itself hangs, and a local disk
+    // offers no seam to make a real read hang: `access`/`read_dir`/`read_metadata`
+    // dispatch to tokio's blocking pool, so on a healthy filesystem they always
+    // complete first. Racing them against a paused clock would only buy a flaky
+    // test.
     #[tokio::test(start_paused = true)]
     async fn with_walk_stall_timeout_fails_only_when_a_read_stops_answering() {
         let stall = Duration::from_millis(100);
@@ -7428,6 +7449,29 @@ mod test {
         })
         .await;
         assert!(disabled.is_ok(), "a zero stall budget must disable the bound");
+    }
+
+    // #4644: reads that do not yield a Result (`access`, `is_empty_dir`,
+    // `fs::metadata`) are bounded by the same budget — the listing path has no
+    // total timeout left to fall back on.
+    #[tokio::test(start_paused = true)]
+    async fn with_walk_stall_deadline_bounds_reads_that_do_not_yield_a_result() {
+        let stall = Duration::from_millis(100);
+
+        let hung = with_walk_stall_deadline(Some(stall), async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            true
+        })
+        .await;
+        assert!(
+            matches!(hung, Err(DiskError::Timeout)),
+            "a hung infallible read must trip the stall budget, got {hung:?}"
+        );
+
+        let prompt = with_walk_stall_deadline(Some(stall), async { true })
+            .await
+            .expect("a prompt read must pass through");
+        assert!(prompt);
     }
 
     #[tokio::test]
