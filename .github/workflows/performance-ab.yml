@@ -147,3 +147,22 @@ jobs:
             exit "$status"
           fi
           echo "warp A/B budget gate passed."
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [warp-ab]
+    # `always()` is required: without it this job is skipped when a needed
+    # job fails. Alerts only for scheduled (nightly) runs (backlog#1149
+    # ci-8); PR and manual dispatch failures are already watched by a human.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
