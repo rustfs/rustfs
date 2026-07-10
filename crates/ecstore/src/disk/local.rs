@@ -286,10 +286,40 @@ const ENV_RUSTFS_IO_URING_READ_ENABLE: &str = "RUSTFS_IO_URING_READ_ENABLE";
 const DEFAULT_RUSTFS_IO_URING_READ_ENABLE: bool = false;
 
 /// io_uring submission-queue depth used when probing a disk (backlog#1104).
-/// Backpressure caps in-flight at this value, below CQ capacity (2×), so CQ
-/// overflow is structurally unreachable.
+/// Backpressure caps in-flight at this value **per shard**, below that ring's CQ
+/// capacity (2×), so CQ overflow is structurally unreachable.
 #[cfg(target_os = "linux")]
 const URING_QUEUE_DEPTH: u32 = 128;
+
+/// Number of independent io_uring rings (each with its own driver thread) to run
+/// per disk (backlog#1145).
+///
+/// A buffered read that hits the page cache completes inline inside
+/// `io_uring_enter`, so the thread driving a ring performs that read's memcpy;
+/// one ring per disk therefore caps cache-hit reads at a single core's memory
+/// bandwidth. Sharding lifts that ceiling roughly linearly. Measured on a
+/// 16-core host: 1 MiB reads went from 4911 MB/s (1 shard) to 47361 MB/s (8),
+/// and 64 KiB reads at concurrency 32 from 124k to 345k IOPS — while keeping
+/// io_uring's tail-latency advantage.
+///
+/// Cost is `disks × shards` driver threads, each normally blocked in `poll(2)`.
+/// The default stays modest for that reason; raise it on cache-heavy workloads.
+#[cfg(target_os = "linux")]
+const ENV_RUSTFS_IO_URING_SHARDS: &str = "RUSTFS_IO_URING_SHARDS";
+#[cfg(target_os = "linux")]
+const MAX_URING_SHARDS: usize = 16;
+
+/// Shards per disk: `RUSTFS_IO_URING_SHARDS` when set, else a quarter of the
+/// available parallelism clamped to `1..=4`. Clamped to `1..=MAX_URING_SHARDS`
+/// so a mistyped env var cannot spawn an unbounded number of driver threads per
+/// disk.
+#[cfg(target_os = "linux")]
+fn get_io_uring_shards() -> usize {
+    let default = std::thread::available_parallelism()
+        .map(|n| (n.get() / 4).clamp(1, 4))
+        .unwrap_or(1);
+    rustfs_utils::get_env_usize(ENV_RUSTFS_IO_URING_SHARDS, default).clamp(1, MAX_URING_SHARDS)
+}
 
 /// Check if the runtime-probed io_uring read backend is enabled.
 #[cfg(target_os = "linux")]
@@ -2383,12 +2413,14 @@ impl UringBackend {
         {
             return None;
         }
-        match rustfs_uring::UringDriver::probe_and_start(URING_QUEUE_DEPTH) {
+        let shards = get_io_uring_shards();
+        match rustfs_uring::UringDriver::probe_and_start_sharded(URING_QUEUE_DEPTH, shards) {
             Ok(driver) => {
                 info!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
                     root = %root.display(),
+                    shards,
                     "io_uring read backend enabled"
                 );
                 Some(Self {
@@ -11750,6 +11782,36 @@ mod test {
             .expect("uring probe cache mutex poisoned")
             .remove(&cached);
         assert!(skipped, "a cached-unsupported disk must skip the probe and return None");
+    }
+
+    /// Shard count (backlog#1145): `disks × shards` driver threads is the cost, so
+    /// a mistyped env var must not spawn an unbounded number per disk. The default
+    /// scales with cores but stays inside `1..=4`; any override is clamped to
+    /// `1..=MAX_URING_SHARDS`, and an unparseable value falls back to the default.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_uring_shard_count_defaults_by_cores_and_clamps_overrides() {
+        temp_env::with_var_unset(ENV_RUSTFS_IO_URING_SHARDS, || {
+            let default = get_io_uring_shards();
+            assert!((1..=4).contains(&default), "default shards must stay in 1..=4, got {default}");
+        });
+        temp_env::with_var(ENV_RUSTFS_IO_URING_SHARDS, Some("8"), || {
+            assert_eq!(get_io_uring_shards(), 8, "an in-range override must be honored");
+        });
+        temp_env::with_var(ENV_RUSTFS_IO_URING_SHARDS, Some("0"), || {
+            assert_eq!(get_io_uring_shards(), 1, "zero shards would start no driver at all");
+        });
+        temp_env::with_var(ENV_RUSTFS_IO_URING_SHARDS, Some("100000"), || {
+            assert_eq!(
+                get_io_uring_shards(),
+                MAX_URING_SHARDS,
+                "a huge override must be capped, not spawn a thread per unit"
+            );
+        });
+        temp_env::with_var(ENV_RUSTFS_IO_URING_SHARDS, Some("not-a-number"), || {
+            let got = get_io_uring_shards();
+            assert!((1..=4).contains(&got), "an unparseable override must fall back to the default, got {got}");
+        });
     }
 
     /// O_DIRECT interop (backlog#1102): with BOTH io_uring and O_DIRECT enabled,
