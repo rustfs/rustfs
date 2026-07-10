@@ -56,7 +56,6 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
-dial9-taskdump = ["dial9", "rustfs-obs/dial9-taskdump"]
 hotpath = [
     "dep:hotpath",
     "hotpath/hotpath",

@@ -38,10 +38,11 @@ pub const ENV_RUNTIME_DIAL9_ROTATION_COUNT: &str = "RUSTFS_RUNTIME_DIAL9_ROTATIO
 pub const ENV_RUNTIME_DIAL9_S3_BUCKET: &str = "RUSTFS_RUNTIME_DIAL9_S3_BUCKET";
 /// Accepted but not honoured; see [`ENV_RUNTIME_DIAL9_S3_BUCKET`].
 pub const ENV_RUNTIME_DIAL9_S3_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_S3_PREFIX";
-/// Capture async backtraces for tasks that stall on a worker.
-pub const ENV_RUNTIME_DIAL9_TASK_DUMP_ENABLED: &str = "RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED";
-/// Mean idle duration for task-dump Poisson sampling, in milliseconds.
-pub const ENV_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS: &str = "RUSTFS_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS";
+// Note: there are deliberately no task-dump knobs. dial9 only captures task
+// dumps for futures spawned through `dial9_tokio_telemetry::spawn`, and RustFS
+// spawns with `tokio::spawn` throughout, so the switch could never do anything.
+// Measured: 0 dumps via tokio::spawn vs 14709 via dial9::spawn on an identical
+// workload. See rustfs/backlog#1157 (D9-16).
 
 // Default values for Tokio runtime
 pub const DEFAULT_WORKER_THREADS: usize = 16;
@@ -62,9 +63,6 @@ pub const DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR: &str = "/var/log/rustfs/telemetry";
 pub const DEFAULT_RUNTIME_DIAL9_FILE_PREFIX: &str = "rustfs-tokio";
 pub const DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 pub const DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT: usize = 10;
-pub const DEFAULT_RUNTIME_DIAL9_TASK_DUMP_ENABLED: bool = false;
-/// Matches dial9's own default mean idle duration for task-dump sampling.
-pub const DEFAULT_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS: u64 = 10;
 // Note: S3 bucket/prefix have no default; absence means upload is disabled (modeled as Option<String>)
 
 /// Maximum transition workers used as a local fallback when runtime env is unset.

@@ -6,12 +6,29 @@ stalled tasks — into binary trace segments.
 
 It answers questions that Prometheus metrics and `tracing` spans cannot:
 
-- A request took 200 ms. Was a worker thread blocked, or was it waiting on I/O?
 - Which task held a worker for 40 ms without yielding?
 - Are workers parking because there is no work, or because the queue is starved?
 
-These are the failure modes behind drive stalls, `io_uring`/`O_DIRECT` regressions,
-and object-data-cache fill contention. They are invisible to the rest of the obs stack.
+On a plain warp workload with no injected fault it recorded single polls of
+418–625 ms: real worker stalls that nothing else in the obs stack would surface.
+
+## What it does not see
+
+**A drive stall is invisible to dial9.** RustFS performs disk I/O on the blocking
+pool (`spawn_blocking`) and through io_uring, never on an async worker, so a slow
+drive does not lengthen any poll. Injecting 200 ms of latency on one of four
+drives cut throughput by 64% and left the poll-duration distribution unchanged
+(polls ≥ 5 ms: 49 → 56; p999: 2.67 ms → 2.75 ms). Enabling dial9's CPU and sched
+profilers does not help either: sched events are captured per-worker only, and
+the CPU profiler samples on-CPU, while a stalled drive is an off-CPU wait.
+
+For drive stalls use the `rustfs_io_*` metrics and the drive-stall budget. dial9
+answers a different question: which task held a worker, and for how long.
+
+**It cannot tell you where a task was stuck.** That would need a task dump, and
+dial9 only captures those for futures spawned through `dial9_tokio_telemetry::spawn`.
+RustFS spawns with `tokio::spawn` throughout, so no task dump is ever recorded and
+no configuration exposes one. Tracked as D9-16 in rustfs/backlog#1157.
 
 ## This is a profiler, not telemetry
 
@@ -23,10 +40,11 @@ depend on Tokio's non-semver surface nor pay its cost. Setting
 `RUSTFS_RUNTIME_DIAL9_ENABLED=true` on a stock binary logs a warning and records nothing.
 
 **Traces are written continuously and evicted.** The retained budget is
-`MAX_FILE_SIZE × ROTATION_COUNT` (1 GB by default). Once exceeded, the *oldest*
-segments are deleted. Under a high poll rate that budget can wrap in minutes,
-which means the incident you are chasing may already have been overwritten.
-Size the budget against the window you need, and prefer short, targeted runs.
+`MAX_FILE_SIZE × ROTATION_COUNT` (1 GiB by default). Once exceeded, the *oldest*
+segments are deleted. Measured on a single-node 4-drive cluster under warp mixed
+(66 MiB/s, 110 obj/s, 32 concurrent): **13023 events/s, 0.16 MiB/s**, so the
+default budget wraps after roughly **108 minutes**. Scale that by your own event
+rate — it tracks poll rate, not object throughput — and prefer short, targeted runs.
 
 **There is no runtime toggle.** Telemetry is installed when the Tokio runtime is
 constructed, so enabling or disabling it requires a process restart.
@@ -38,15 +56,8 @@ make build-profiling
 ```
 
 That is `cargo build --release --bin rustfs --features dial9` with
-`RUSTFLAGS="--cfg tokio_unstable"`. One optional feature layers on top:
-
-```bash
-# Async backtraces of stalled tasks. Linux aarch64/x86/x86_64 only —
-# `tokio/taskdump` hard-errors at compile time on other targets, so this
-# will not build on macOS.
-DIAL9_RUSTFLAGS="--cfg tokio_unstable --cfg tokio_taskdump" \
-  DIAL9_FEATURES="dial9-taskdump" make build-profiling
-```
+`RUSTFLAGS="--cfg tokio_unstable"`. There are no other telemetry features: task
+dumps and S3 upload are both unavailable, for the reasons given above and below.
 
 `crates/obs/build.rs` fails the build if the `dial9` feature is enabled without
 `--cfg tokio_unstable`. This is deliberate: an environment `RUSTFLAGS` *replaces*
@@ -60,8 +71,7 @@ For CPU profiling with usable stacks, add `-C force-frame-pointers=yes`.
 ```bash
 export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR=/tmp/rustfs-telemetry-investigation
-export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=3      # 300 MB total, ~short window
-export RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED=true # if built with dial9-taskdump
+export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=3      # 300 MiB total, ~short window
 ```
 
 Reproduce the fault, then stop the process **gracefully**. The final buffered
@@ -82,8 +92,6 @@ Turn `RUSTFS_RUNTIME_DIAL9_ENABLED` back off when you are done.
 | `RUSTFS_RUNTIME_DIAL9_FILE_PREFIX` | `rustfs-tokio` | |
 | `RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE` | `104857600` | Bytes per segment |
 | `RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT` | `10` | Total budget = size × count |
-| `RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED` | `false` | Needs `dial9-taskdump` (Linux only) |
-| `RUSTFS_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS` | `10` | Mean idle for Poisson sampling |
 | `RUSTFS_RUNTIME_DIAL9_S3_BUCKET` | unset | **Not honoured**, see below |
 | `RUSTFS_RUNTIME_DIAL9_S3_PREFIX` | unset | **Not honoured**, see below |
 
@@ -101,7 +109,8 @@ Cargo's feature unification can add features but cannot drop a transitive
 dependency, so this cannot be worked around downstream — it needs an upstream
 release. RustFS therefore builds no S3 uploader at all. Setting the two variables
 above logs a warning and changes nothing; retrieve trace segments from
-`OUTPUT_DIR` directly. Tracked as D9-14 in rustfs/backlog#1157.
+`OUTPUT_DIR` directly. Tracked as D9-14 in rustfs/backlog#1157 and reported
+upstream as [dial9-rs/dial9#659](https://github.com/dial9-rs/dial9/issues/659).
 
 ## Metrics
 
@@ -136,3 +145,5 @@ There is therefore no `writer_healthy` gauge, because it could only ever be
 hard-coded to `1`. Instead, watch `rustfs_dial9_disk_usage_bytes`: a session with
 `active_sessions=1` whose disk usage has stopped growing has most likely hit this
 state, and needs a restart.
+
+Reported upstream as [dial9-rs/dial9#658](https://github.com/dial9-rs/dial9/issues/658).
