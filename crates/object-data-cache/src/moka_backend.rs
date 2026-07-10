@@ -293,6 +293,48 @@ impl MokaBackend {
             self.cache.remove(&key).await;
         }
 
+        Self::invalidation_result(removed)
+    }
+
+    /// Invalidates every cached key of an identity in `bucket` whose object key
+    /// starts with `prefix`. Full index scan; rare force-delete/admin path only.
+    pub async fn invalidate_prefix(&self, bucket: &str, prefix: &str) -> ObjectDataCacheInvalidationResult {
+        let keys_to_remove = self
+            .index
+            .remove_matching(|identity| identity.bucket.as_ref() == bucket && identity.object.starts_with(prefix))
+            .await;
+        let removed = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.cache.remove(&key).await;
+        }
+        Self::invalidation_result(removed)
+    }
+
+    /// Invalidates every cached key of every identity in `bucket`. Full index
+    /// scan; rare bucket-delete/admin path only.
+    pub async fn invalidate_bucket(&self, bucket: &str) -> ObjectDataCacheInvalidationResult {
+        let keys_to_remove = self
+            .index
+            .remove_matching(|identity| identity.bucket.as_ref() == bucket)
+            .await;
+        let removed = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.cache.remove(&key).await;
+        }
+        Self::invalidation_result(removed)
+    }
+
+    /// Drops every cached body and resets the identity index. The index scan
+    /// yields the tracked key count for the outcome label; `invalidate_all`
+    /// then clears moka in one call (also dropping any entry not tracked in the
+    /// index). Rare admin `clear()` path only.
+    pub async fn clear(&self) -> ObjectDataCacheInvalidationResult {
+        let removed = self.index.remove_matching(|_| true).await.len();
+        self.cache.invalidate_all();
+        Self::invalidation_result(removed)
+    }
+
+    const fn invalidation_result(removed: usize) -> ObjectDataCacheInvalidationResult {
         if removed > 0 {
             ObjectDataCacheInvalidationResult::Removed { keys: removed }
         } else {
@@ -400,6 +442,109 @@ mod tests {
             .await;
 
         assert_eq!(result, ObjectDataCacheInvalidationResult::NoOp);
+    }
+
+    fn bucketed_plan(bucket: &str, object: &str, etag: &str) -> ObjectDataCacheGetPlan {
+        ObjectDataCacheGetPlan::Cacheable {
+            key: ObjectDataCacheKey::new(bucket, object, None, etag, 5, ObjectDataCacheBodyVariant::FullObjectPlainV1),
+        }
+    }
+
+    // ODC-27: prefix invalidation drops only the identities under the prefix and
+    // leaves every other cached body intact.
+    #[tokio::test]
+    async fn moka_backend_invalidate_prefix_removes_only_matching_prefix() {
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let plan_a = cacheable_plan("photos/a.jpg", "etag-a");
+        let plan_b = cacheable_plan("photos/b.jpg", "etag-b");
+        let plan_c = cacheable_plan("videos/c.mp4", "etag-c");
+
+        let _ = backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
+        let _ = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
+        let _ = backend.fill_body(&plan_c, Bytes::from_static(b"ccccc")).await;
+
+        let result = backend.invalidate_prefix("bucket", "photos/").await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 2 });
+        assert!(matches!(backend.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
+        assert!(matches!(backend.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));
+        assert!(
+            matches!(backend.lookup_body(&plan_c).await, ObjectDataCacheLookup::Hit(_)),
+            "an object outside the prefix must survive"
+        );
+    }
+
+    // ODC-27: a prefix that matches nothing cached is a no-op.
+    #[tokio::test]
+    async fn moka_backend_invalidate_prefix_uncached_is_noop() {
+        let backend =
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let _ = backend
+            .fill_body(&cacheable_plan("photos/a.jpg", "e"), Bytes::from_static(b"aaaaa"))
+            .await;
+
+        let result = backend.invalidate_prefix("bucket", "videos/").await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::NoOp);
+    }
+
+    // ODC-28: bucket invalidation drops every identity in the bucket and leaves
+    // other buckets untouched.
+    #[tokio::test]
+    async fn moka_backend_invalidate_bucket_removes_only_that_bucket() {
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let plan_a = bucketed_plan("bucket-a", "o1", "etag-a");
+        let plan_b = bucketed_plan("bucket-a", "o2", "etag-b");
+        let plan_other = bucketed_plan("bucket-b", "o3", "etag-c");
+
+        let _ = backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
+        let _ = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
+        let _ = backend.fill_body(&plan_other, Bytes::from_static(b"ccccc")).await;
+
+        let result = backend.invalidate_bucket("bucket-a").await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 2 });
+        assert!(matches!(backend.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
+        assert!(matches!(backend.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));
+        assert!(
+            matches!(backend.lookup_body(&plan_other).await, ObjectDataCacheLookup::Hit(_)),
+            "an object in another bucket must survive a bucket flush"
+        );
+    }
+
+    // ODC-C2: clear drops every cached body and empties the identity index.
+    #[tokio::test]
+    async fn moka_backend_clear_removes_everything() {
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let plan_a = bucketed_plan("bucket-a", "o1", "etag-a");
+        let plan_b = bucketed_plan("bucket-b", "o2", "etag-b");
+
+        let _ = backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
+        let _ = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
+
+        let result = backend.clear().await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 2 });
+        assert!(matches!(backend.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
+        assert!(matches!(backend.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));
+        assert_eq!(backend.index.identity_count().await, 0, "clear must empty the identity index");
+    }
+
+    #[tokio::test]
+    async fn moka_backend_clear_empty_cache_is_noop() {
+        let backend =
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+
+        assert_eq!(backend.clear().await, ObjectDataCacheInvalidationResult::NoOp);
     }
 
     #[tokio::test]

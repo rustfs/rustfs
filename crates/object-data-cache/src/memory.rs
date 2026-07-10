@@ -153,7 +153,7 @@ impl Drop for RefresherGuard {
 /// Memory gate that keeps a cheap, lock-free snapshot for fill-path checks.
 ///
 /// The snapshot is sampled off the fill path by a dedicated periodic refresher
-/// (see [`spawn_refresher`](ObjectDataCacheMemoryGate::spawn_refresher)) that
+/// (the private `spawn_refresher` task) that
 /// runs the blocking `sysinfo` read on a `spawn_blocking` thread. `allows_fill`
 /// only reads atomics, so it never blocks a tokio worker and concurrent fills
 /// never serialize on a refresh.

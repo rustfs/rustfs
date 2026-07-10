@@ -221,31 +221,91 @@ impl ObjectDataCache {
     /// Invalidates all cache entries associated with the object identity.
     pub async fn invalidate_object(
         &self,
-        _identity: ObjectDataCacheIdentity,
-        _reason: ObjectDataCacheInvalidationReason,
+        identity: ObjectDataCacheIdentity,
+        reason: ObjectDataCacheInvalidationReason,
     ) -> ObjectDataCacheInvalidationResult {
         let result = match &self.backend {
             ObjectDataCacheBackendKind::Noop(backend) => backend.invalidate_object().await,
-            ObjectDataCacheBackendKind::Moka(backend) => backend.invalidate_object(&_identity).await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.invalidate_object(&identity).await,
         };
+        self.finish_invalidation(result, reason)
+    }
 
+    /// Invalidates every cached body under `bucket`/`prefix`.
+    ///
+    /// Drops the cached bodies of every identity in `bucket` whose object key
+    /// starts with `prefix`. Backed by a full identity-index scan, so it must
+    /// stay on the rare force-delete and admin paths and never touch the GET or
+    /// fill hot path (ODC-27, backlog#1132).
+    pub async fn invalidate_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
+        let result = match &self.backend {
+            ObjectDataCacheBackendKind::Noop(backend) => backend.invalidate_prefix().await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.invalidate_prefix(bucket, prefix).await,
+        };
+        self.finish_invalidation(result, reason)
+    }
+
+    /// Invalidates every cached body in `bucket`.
+    ///
+    /// Backed by a full identity-index scan; keep it on the rare bucket-delete
+    /// and admin paths only (ODC-28, backlog#1133).
+    pub async fn invalidate_bucket(
+        &self,
+        bucket: &str,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
+        let result = match &self.backend {
+            ObjectDataCacheBackendKind::Noop(backend) => backend.invalidate_bucket().await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.invalidate_bucket(bucket).await,
+        };
+        self.finish_invalidation(result, reason)
+    }
+
+    /// Drops every cached body and resets the identity index.
+    ///
+    /// The only production remediation for a poisoned or stale entry short of a
+    /// node restart (ODC-C2, backlog#1143). Rare admin path only.
+    pub async fn clear(&self, reason: ObjectDataCacheInvalidationReason) -> ObjectDataCacheInvalidationResult {
+        let result = match &self.backend {
+            ObjectDataCacheBackendKind::Noop(backend) => backend.clear().await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.clear().await,
+        };
+        self.finish_invalidation(result, reason)
+    }
+
+    /// Shared post-processing for every invalidation primitive: bump the
+    /// invalidation counter, refresh the cache-state gauge only when something
+    /// was removed, and emit the outcome-labelled metric. A mutating op
+    /// invalidates twice by design (before + after) and the vast majority of
+    /// those touch identities that were never cached, so the no-op path skips
+    /// the gauge refresh (backlog#1141).
+    fn finish_invalidation(
+        &self,
+        result: ObjectDataCacheInvalidationResult,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
         self.stats.record_invalidation();
         let outcome = invalidation_outcome(&result);
-        // A mutating op invalidates twice by design (before + after); the vast
-        // majority of those touch identities that were never cached. Only refresh
-        // the cache-state gauge when something was actually removed so the
-        // no-op path stays cheap (backlog#1141).
         if outcome != INVALIDATION_OUTCOME_NOOP {
             self.refresh_entry_count();
         }
-        record_invalidation(self.backend.as_metric_label(), _reason.as_metric_label(), outcome);
-
+        record_invalidation(self.backend.as_metric_label(), reason.as_metric_label(), outcome);
         result
     }
 
     /// Returns the current stats snapshot.
     pub fn stats(&self) -> ObjectDataCacheStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Returns the configured runtime mode, for admin status reporting.
+    pub fn mode(&self) -> crate::config::ObjectDataCacheMode {
+        self.config.mode
     }
 
     /// Returns true when the cache facade is fully disabled.
@@ -397,6 +457,15 @@ pub enum ObjectDataCacheInvalidationReason {
     AfterCopySuccess,
     /// Invalidation after a successful complete multipart upload.
     AfterCompleteMultipartSuccess,
+    /// Invalidation after an ecstore-internal lifecycle/scanner expiry deleted
+    /// the object body (ODC-26).
+    AfterLifecycleExpiry,
+    /// Invalidation after a forced prefix delete removed every object under a
+    /// prefix (ODC-27).
+    AfterPrefixDelete,
+    /// Invalidation after a bucket delete removed every object in the bucket
+    /// (ODC-28).
+    AfterBucketDelete,
     /// Manual invalidation requested by the caller.
     Manual,
 }
@@ -409,6 +478,9 @@ impl ObjectDataCacheInvalidationReason {
             Self::AfterDeleteSuccess => "after_delete_success",
             Self::AfterCopySuccess => "after_copy_success",
             Self::AfterCompleteMultipartSuccess => "after_complete_multipart_success",
+            Self::AfterLifecycleExpiry => "after_lifecycle_expiry",
+            Self::AfterPrefixDelete => "after_prefix_delete",
+            Self::AfterBucketDelete => "after_bucket_delete",
             Self::Manual => "manual",
         }
     }
@@ -430,7 +502,7 @@ pub enum ObjectDataCacheInvalidationResult {
 mod tests {
     use super::{
         ObjectDataCache, ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheGetRequest,
-        ObjectDataCacheInvalidationReason, ObjectDataCacheLookup,
+        ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup,
     };
     use crate::config::{ObjectDataCacheConfig, ObjectDataCacheMode};
     use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheIdentity};
@@ -634,6 +706,96 @@ mod tests {
             has_counter_with_label(&metrics, "rustfs_object_data_cache_invalidations_total", ("outcome", "removed")),
             "invalidating a cached identity must be labeled outcome=removed"
         );
+    }
+
+    #[test]
+    fn new_invalidation_reasons_map_to_distinct_labels() {
+        assert_eq!(
+            ObjectDataCacheInvalidationReason::AfterLifecycleExpiry.as_metric_label(),
+            "after_lifecycle_expiry"
+        );
+        assert_eq!(
+            ObjectDataCacheInvalidationReason::AfterPrefixDelete.as_metric_label(),
+            "after_prefix_delete"
+        );
+        assert_eq!(
+            ObjectDataCacheInvalidationReason::AfterBucketDelete.as_metric_label(),
+            "after_bucket_delete"
+        );
+    }
+
+    #[test]
+    fn prefix_invalidation_of_cached_identity_labels_reason_and_removed() {
+        // ODC-27: a prefix flush that drops a cached body is labelled with its
+        // own reason and outcome=removed so dashboards attribute the churn.
+        let cache = fill_enabled_cache();
+        let metrics = capture_metrics(|| async {
+            let plan = cache.plan_get(plain_request("bucket", "photos/a", "etag", 5));
+            assert_eq!(
+                cache.fill_body(&plan, Bytes::from_static(b"hello")).await,
+                ObjectDataCacheFillResult::Inserted
+            );
+            let result = cache
+                .invalidate_prefix("bucket", "photos/", ObjectDataCacheInvalidationReason::AfterPrefixDelete)
+                .await;
+            assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
+        });
+
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_invalidations_total",
+            ("reason", "after_prefix_delete")
+        ));
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_invalidations_total",
+            ("outcome", "removed")
+        ));
+    }
+
+    #[test]
+    fn bucket_invalidation_of_uncached_bucket_labels_noop() {
+        // ODC-28: a bucket flush that matched nothing is a no-op and must not
+        // refresh the entries gauge.
+        let cache = fill_enabled_cache();
+        let metrics = capture_metrics(|| async {
+            let result = cache
+                .invalidate_bucket("empty-bucket", ObjectDataCacheInvalidationReason::AfterBucketDelete)
+                .await;
+            assert_eq!(result, ObjectDataCacheInvalidationResult::NoOp);
+        });
+
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_invalidations_total",
+            ("outcome", "noop")
+        ));
+        assert!(
+            !has_gauge(&metrics, "rustfs_object_data_cache_entries"),
+            "a no-op bucket flush must not refresh the entries gauge"
+        );
+    }
+
+    #[test]
+    fn clear_of_cached_cache_labels_manual_and_removed() {
+        // ODC-C2: an admin clear reuses the Manual reason and reports removed.
+        let cache = fill_enabled_cache();
+        let metrics = capture_metrics(|| async {
+            let plan = cache.plan_get(plain_request("bucket", "object", "etag", 5));
+            assert_eq!(
+                cache.fill_body(&plan, Bytes::from_static(b"hello")).await,
+                ObjectDataCacheFillResult::Inserted
+            );
+            let result = cache.clear(ObjectDataCacheInvalidationReason::Manual).await;
+            assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
+            assert!(matches!(cache.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+        });
+
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_invalidations_total",
+            ("reason", "manual")
+        ));
     }
 
     #[tokio::test]

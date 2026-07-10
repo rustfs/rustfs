@@ -351,8 +351,8 @@ pub mod notification {
 
 pub mod object {
     pub use crate::object_api::{
-        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader,
-        RangedDecompressReader, StreamConsumer, register_get_object_body_cache_hook,
+        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectReader, ObjectInfo, ObjectMutationHook, ObjectOptions,
+        PutObjReader, RangedDecompressReader, StreamConsumer, register_get_object_body_cache_hook, register_object_mutation_hook,
     };
 }
 

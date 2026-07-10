@@ -2261,6 +2261,9 @@ pub async fn expire_transitioned_object(
         opts.transition.expire_restored = true;
         return match api.delete_object(&oi.bucket, &oi.name, opts).await {
             Ok(dobj) => {
+                // Drop any cached restored-copy body so it does not sit resident
+                // until TTL after the copy is expired (ODC-26).
+                crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
                 //audit_log_lifecycle(*oi, ILMExpiry, tags, traceFn);
                 Ok(dobj)
             }
@@ -2292,6 +2295,10 @@ pub async fn expire_transitioned_object(
     };
 
     schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
+
+    // The transitioned version is gone; evict any cached body for this object
+    // so it does not linger until TTL (ODC-26).
+    crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
 
     //audit_log_lifecycle(oi, ILMExpiry, tags);
 
@@ -2802,6 +2809,13 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         }
     };
     schedule_lifecycle_replication_delete_if_needed(oi, &dobj).await;
+
+    // The object (or all its versions, for delete_all) was expired; evict any
+    // cached body so dead bytes do not sit resident until TTL (ODC-26). The
+    // cache identity is the decoded object name used by GET, not the
+    // encode_dir_object form passed to delete_object.
+    crate::object_api::notify_object_mutation(&oi.bucket, &oi.name).await;
+
     //debug!("dobj: {:?}", dobj);
     if dobj.name.is_empty() {
         dobj = oi.clone();

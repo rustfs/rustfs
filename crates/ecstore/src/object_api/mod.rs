@@ -53,6 +53,7 @@ pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 
 mod body_cache_hook;
+mod object_mutation_hook;
 mod readers;
 mod types;
 
@@ -60,5 +61,7 @@ mod types;
 pub(crate) use body_cache_hook::clear_get_object_body_cache_hook;
 pub(crate) use body_cache_hook::get_object_body_cache_hook;
 pub use body_cache_hook::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
+pub(crate) use object_mutation_hook::notify_object_mutation;
+pub use object_mutation_hook::{ObjectMutationHook, register_object_mutation_hook};
 pub use readers::*;
 pub use types::*;
