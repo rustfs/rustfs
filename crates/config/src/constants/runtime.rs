@@ -118,6 +118,25 @@ pub const ENV_OBJECT_SEEK_SUPPORT_THRESHOLD: &str = "RUSTFS_OBJECT_SEEK_SUPPORT_
 pub const DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD: usize = 10 * 1024 * 1024;
 
 // Object data cache configuration
+
+/// Enables the in-memory object body cache, which serves whole-object GET
+/// responses without an erasure read.
+///
+/// # Timing side channel
+///
+/// A cache hit skips the erasure read, bitrot verification and decode, so it is
+/// reliably faster than a miss. Any principal authorized to read an object can
+/// therefore infer, by timing a single GET, whether *someone* read that object
+/// within the entry's lifetime (see `RUSTFS_OBJECT_DATA_CACHE_TTL_SECS` and
+/// `..._TIME_TO_IDLE_SECS`).
+///
+/// This never crosses an authorization boundary — the probe requires read
+/// access to the exact bucket and object, checked before the cache is consulted
+/// — but it does disclose co-tenants' recent access patterns on objects the
+/// observer may already read. Leave the cache disabled where access-pattern
+/// confidentiality matters, such as a bucket shared read-only between competing
+/// tenants. Timing noise is not a viable mitigation: it would cost exactly the
+/// latency the cache exists to save.
 pub const ENV_OBJECT_DATA_CACHE_ENABLE: &str = "RUSTFS_OBJECT_DATA_CACHE_ENABLE";
 pub const ENV_OBJECT_DATA_CACHE_MODE: &str = "RUSTFS_OBJECT_DATA_CACHE_MODE";
 pub const ENV_OBJECT_DATA_CACHE_MAX_BYTES: &str = "RUSTFS_OBJECT_DATA_CACHE_MAX_BYTES";
