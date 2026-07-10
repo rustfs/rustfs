@@ -124,6 +124,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"hello")).await;

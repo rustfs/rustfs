@@ -22,6 +22,7 @@
 use super::super::*;
 
 use crate::disk::OldCurrentSize;
+use crate::object_api::GetObjectBodySource;
 
 /// Length of the full plaintext body when — and only when — this read's output
 /// is exactly the object's complete plaintext, so the app-layer body cache may
@@ -170,6 +171,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 stream: Box::new(Cursor::new(Vec::new())),
                 object_info,
                 buffered_body: Some(Bytes::new()),
+                body_source: GetObjectBodySource::Unprobed,
             };
             return Ok(reader);
         }
@@ -256,6 +258,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         stream: Box::new(Cursor::new(body.clone())),
                         object_info,
                         buffered_body: Some(body),
+                        body_source: GetObjectBodySource::Unprobed,
                     };
                     return Ok(reader);
                 }
@@ -338,6 +341,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     stream: Box::new(Cursor::new(body.clone())),
                     object_info,
                     buffered_body: Some(body),
+                    body_source: GetObjectBodySource::Unprobed,
                 };
                 return Ok(reader);
             }
@@ -389,23 +393,39 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // object `ReadTransform::Compressed` sets `object_info.size` to the
         // decompressed length, and consumers such as UploadPartCopy read the
         // copy length straight off that field (backlog#1109).
+        // Records whether the app-layer cache probe ran for this read, so the
+        // app layer does not repeat the lookup it already performed after fresh
+        // metadata resolution (backlog#1121 / ODC-16). It stays `Unprobed` when
+        // the read is ineligible under the allow-list or the hook is not
+        // registered; the direct-memory and streaming readers built below carry
+        // it forward.
+        let mut body_source = GetObjectBodySource::Unprobed;
         if let Some(plaintext_len) = full_object_plaintext_len(&range, opts, &object_info)
             && let Some(hook) = get_object_body_cache_hook()
-            && let Some(body) = hook.lookup(bucket, object, &object_info).await
-            && i64::try_from(body.len()).is_ok_and(|len| len == plaintext_len)
         {
-            record_get_object_reader_path_observation(GET_OBJECT_PATH_BODY_CACHE, object_class, size_bucket);
-            let mut object_info = object_info;
-            object_info.size = plaintext_len;
-            let reader = GetObjectReader {
-                stream: Box::new(Cursor::new(body.clone())),
-                object_info,
-                buffered_body: Some(body),
-            };
-            if lock_optimization_enabled {
-                release_materialized_read_lock(bucket, object, read_lock_guard.take());
+            match hook.lookup(bucket, object, &object_info).await {
+                Some(body) if i64::try_from(body.len()).is_ok_and(|len| len == plaintext_len) => {
+                    record_get_object_reader_path_observation(GET_OBJECT_PATH_BODY_CACHE, object_class, size_bucket);
+                    let mut object_info = object_info;
+                    object_info.size = plaintext_len;
+                    let reader = GetObjectReader {
+                        stream: Box::new(Cursor::new(body.clone())),
+                        object_info,
+                        buffered_body: Some(body),
+                        body_source: GetObjectBodySource::HookServed,
+                    };
+                    if lock_optimization_enabled {
+                        release_materialized_read_lock(bucket, object, read_lock_guard.take());
+                    }
+                    return Ok(reader);
+                }
+                // Probed after fresh metadata resolution but no usable body: a
+                // genuine miss, or a length-defensive rejection. The miss is
+                // authoritative, so the app layer must not look up again.
+                _ => {
+                    body_source = GetObjectBodySource::HookMissed;
+                }
             }
-            return Ok(reader);
         }
 
         let direct_memory_decision = get_small_object_direct_memory_decision(&range, &object_info, &fi, opts);
@@ -435,6 +455,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     stream: Box::new(Cursor::new(body.clone())),
                     object_info,
                     buffered_body: Some(body),
+                    body_source,
                 };
                 if lock_optimization_enabled {
                     release_materialized_read_lock(bucket, object, read_lock_guard.take());
@@ -476,6 +497,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 stream: Box::new(Cursor::new(body.clone())),
                 object_info,
                 buffered_body: Some(body),
+                body_source,
             };
             if lock_optimization_enabled {
                 release_materialized_read_lock(bucket, object, read_lock_guard.take());
@@ -508,7 +530,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                             size_bucket,
                         );
                         record_get_object_reader_path_observation(GET_OBJECT_PATH_CODEC_STREAMING, object_class, size_bucket);
-                        let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
+                        let (mut reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
+                        // Carry the hook probe result so the app layer skips its
+                        // now-redundant lookup on the streaming miss path (ODC-16).
+                        reader.body_source = body_source;
                         return Ok(finish_set_disk_read_lock(
                             reader,
                             read_lock_guard.take(),
@@ -543,7 +568,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
-        let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h).await?;
+        let (mut reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h).await?;
+        // Carry the hook probe result so the app layer skips its now-redundant
+        // lookup on the streaming miss path (ODC-16).
+        reader.body_source = body_source;
 
         // let disks = disks.clone();
         let bucket = bucket.to_owned();
@@ -2232,6 +2260,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             stream: Box::new(pr),
             object_info: oi,
             buffered_body: None,
+            body_source: GetObjectBodySource::Unprobed,
         });
 
         let cloned_bucket = bucket.to_string();
@@ -3145,7 +3174,7 @@ mod body_cache_hook_e2e_tests {
     use crate::ecstore_validation_blackbox::make_local_set_disks;
     use crate::io_support::rio::{HashReader, compression_metadata_value, compression_reader};
     use crate::object_api::{
-        GetObjectBodyCacheHook, ObjectInfo, ObjectOptions, PutObjReader, clear_get_object_body_cache_hook,
+        GetObjectBodyCacheHook, GetObjectBodySource, ObjectInfo, ObjectOptions, PutObjReader, clear_get_object_body_cache_hook,
         register_get_object_body_cache_hook,
     };
     use crate::set_disk::SetDisks;
@@ -3255,6 +3284,90 @@ mod body_cache_hook_e2e_tests {
     /// to keep the object off the inline / direct-memory fast paths.
     fn compressible_plaintext() -> Vec<u8> {
         b"rustfs-body-cache-e2e-regression-".repeat(20_000)
+    }
+
+    /// Writes a plain (uncompressed, unencrypted) object of `data`, large enough
+    /// to keep it off the inline fast path so the cache hook is actually probed.
+    async fn put_plain_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, data: &[u8]) {
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let stream = HashReader::from_stream(Cursor::new(data.to_vec()), data.len() as i64, data.len() as i64, None, None, false)
+            .expect("hash reader over plain bytes");
+        let mut reader = PutObjReader::new(stream);
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        set_disks
+            .put_object(bucket, object, &mut reader, &opts)
+            .await
+            .expect("plain object should be written");
+    }
+
+    /// ODC-16: a cache-hook hit must mark the reader `HookServed` so the app
+    /// layer serves the buffered body without a second lookup. A large plain
+    /// object stays off the inline fast path, so the hook is genuinely probed.
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn plain_cache_hit_marks_reader_hook_served() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "e2e-body-cache-hook-served";
+        let object = "plain.bin";
+        let payload = b"rustfs-hook-served-payload-".repeat(40_000);
+        put_plain_object(&set_disks, bucket, object, &payload).await;
+
+        let _guard = HookGuard::install(bucket, object, Bytes::from(payload.clone()));
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("object reader should open");
+
+        assert_eq!(
+            reader.body_source,
+            GetObjectBodySource::HookServed,
+            "a hook hit must mark the reader HookServed"
+        );
+        assert!(reader.buffered_body.is_some(), "a hook-served reader carries the cache body");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("object should stream");
+        assert_eq!(body, payload, "the hook-served body must be the primed plaintext");
+    }
+
+    /// ODC-16: when the hook is registered but misses this object, the reader
+    /// must be marked `HookMissed` so the app layer skips its now-redundant
+    /// lookup (the hook's miss ran after fresh metadata resolution).
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn plain_cache_miss_marks_reader_hook_missed() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "e2e-body-cache-hook-missed";
+        let object = "plain.bin";
+        let payload = b"rustfs-hook-missed-payload-".repeat(40_000);
+        put_plain_object(&set_disks, bucket, object, &payload).await;
+
+        // Register a hook primed for a DIFFERENT object, so this read is probed
+        // (hook registered + eligible) but the probe misses.
+        let _guard = HookGuard::install(bucket, "other-object", Bytes::from_static(b"unrelated"));
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+            .await
+            .expect("object reader should open");
+
+        assert_eq!(
+            reader.body_source,
+            GetObjectBodySource::HookMissed,
+            "a probed miss must mark the reader HookMissed"
+        );
     }
 
     /// backlog#1108: a raw data-movement read (decommission/rebalance copy) must

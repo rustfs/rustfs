@@ -45,6 +45,16 @@ pub struct ObjectDataCache {
     backend: ObjectDataCacheBackendKind,
     config: Arc<ObjectDataCacheConfig>,
     stats: Arc<ObjectDataCacheStats>,
+    /// Effective fill ceiling in bytes: a body larger than this is planned
+    /// `SkipTooLarge` even when it fits `max_entry_bytes`. The app layer sets it
+    /// to `min(max_entry_bytes, seek-support threshold, 64 MiB buffer cap)` so a
+    /// `max_entry_bytes` above the in-memory GET fill limits is not reported as
+    /// eligible while fill could never materialize it (backlog#1129 / ODC-24).
+    /// `0` means "no additional clamp" — eligibility rests on `max_entry_bytes`
+    /// alone (the default, used by engine-level tests). The concurrency-driven
+    /// shrink of the fill threshold is dynamic and cannot be captured at plan
+    /// time; this static ceiling is the conservative floor.
+    fill_ceiling_bytes: u64,
     /// Monotonic origin for the cache-state publish debounce.
     created_at: Instant,
     /// Millis since `created_at` of the last cache-state gauge publish, or `0`
@@ -62,6 +72,7 @@ impl ObjectDataCache {
             backend: ObjectDataCacheBackendKind::Noop(NoopBackend),
             config,
             stats,
+            fill_ceiling_bytes: 0,
             created_at: Instant::now(),
             last_entry_publish_ms: AtomicU64::new(0),
         }
@@ -82,9 +93,30 @@ impl ObjectDataCache {
             backend,
             config: Arc::new(config),
             stats,
+            fill_ceiling_bytes: 0,
             created_at: Instant::now(),
             last_entry_publish_ms: AtomicU64::new(0),
         })
+    }
+
+    /// Sets the effective fill ceiling (backlog#1129 / ODC-24). The app layer
+    /// applies this at startup so a body above the in-memory GET fill limits is
+    /// planned `SkipTooLarge` instead of being reported eligible. `0` disables
+    /// the extra clamp.
+    #[must_use]
+    pub fn with_fill_ceiling_bytes(mut self, fill_ceiling_bytes: u64) -> Self {
+        self.fill_ceiling_bytes = fill_ceiling_bytes;
+        self
+    }
+
+    /// Effective size above which a body is planned `SkipTooLarge`:
+    /// `max_entry_bytes` clamped by the fill ceiling when one is set.
+    fn effective_size_ceiling(&self) -> u64 {
+        if self.fill_ceiling_bytes == 0 {
+            self.config.max_entry_bytes
+        } else {
+            self.config.max_entry_bytes.min(self.fill_ceiling_bytes)
+        }
     }
 
     /// Produces a lightweight GET plan from request metadata.
@@ -100,7 +132,11 @@ impl ObjectDataCache {
             return ObjectDataCacheGetPlan::Disabled;
         }
 
-        if request.size > self.config.max_entry_bytes {
+        // ODC-24: clamp eligibility to the effective fill ceiling, not just
+        // `max_entry_bytes`. A body in the gap between `max_entry_bytes` and the
+        // in-memory GET fill limits could never fill, so admitting it here would
+        // report it "eligible" while it kept a permanent 0% hit rate.
+        if request.size > self.effective_size_ceiling() {
             record_plan_decision(self.backend.as_metric_label(), self.config.mode, "skip", "too_large", request.size);
             return ObjectDataCacheGetPlan::SkipTooLarge;
         }
@@ -108,12 +144,13 @@ impl ObjectDataCache {
         record_plan_decision(self.backend.as_metric_label(), self.config.mode, "cacheable", "eligible", request.size);
 
         ObjectDataCacheGetPlan::Cacheable {
-            key: ObjectDataCacheKey::new(
+            key: ObjectDataCacheKey::with_mod_time(
                 request.bucket,
                 request.object,
                 request.version_id.as_deref(),
                 request.etag,
                 request.size,
+                request.mod_time_unix_nanos,
                 request.body_variant,
             ),
         }
@@ -308,6 +345,10 @@ pub struct ObjectDataCacheGetRequest<'a> {
     pub etag: &'a str,
     /// Object size in bytes.
     pub size: u64,
+    /// Resolved version's modification time as Unix nanoseconds, or `0` when
+    /// absent. Carried into the key so it is write-unique (backlog#1111 /
+    /// ODC-06).
+    pub mod_time_unix_nanos: i128,
     /// Supported response body variant.
     pub body_variant: ObjectDataCacheBodyVariant,
 }
@@ -466,6 +507,7 @@ mod tests {
             version_id: None,
             etag,
             size,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         }
     }
@@ -645,6 +687,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
 
@@ -653,5 +696,57 @@ mod tests {
 
         assert_eq!(fill, ObjectDataCacheFillResult::SkippedSizeMismatch);
         assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
+    }
+
+    #[test]
+    fn plan_clamps_size_eligibility_to_fill_ceiling() {
+        // ODC-24 (backlog#1129): a body in the gap between `max_entry_bytes` and
+        // the effective fill ceiling must plan `SkipTooLarge`, not `Cacheable`,
+        // so it stops being reported as eligible while it can never fill.
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::HitOnly,
+            max_bytes: 32 * 1024 * 1024,
+            max_memory_percent: 0,
+            max_entry_bytes: 16 * 1024 * 1024,
+            ..ObjectDataCacheConfig::default()
+        };
+        let cache = ObjectDataCache::new(config)
+            .expect("clamped cache config should initialize")
+            .with_fill_ceiling_bytes(4 * 1024 * 1024);
+
+        // Within the ceiling: eligible.
+        assert!(matches!(
+            cache.plan_get(plain_request("bucket", "object", "etag", 4 * 1024 * 1024)),
+            ObjectDataCacheGetPlan::Cacheable { .. }
+        ));
+        // In the gap (ceiling < size <= max_entry_bytes): skipped as too large.
+        assert_eq!(
+            cache.plan_get(plain_request("bucket", "object", "etag", 4 * 1024 * 1024 + 1)),
+            ObjectDataCacheGetPlan::SkipTooLarge
+        );
+        assert_eq!(
+            cache.plan_get(plain_request("bucket", "object", "etag", 16 * 1024 * 1024)),
+            ObjectDataCacheGetPlan::SkipTooLarge
+        );
+    }
+
+    #[test]
+    fn plan_carries_mod_time_into_key() {
+        // ODC-06: the resolved modification time must reach the key so two
+        // writes with identical etag + size derive different keys.
+        let cache = hit_only_cache();
+        let request = ObjectDataCacheGetRequest {
+            bucket: "bucket",
+            object: "object",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            mod_time_unix_nanos: 42,
+            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        };
+        let ObjectDataCacheGetPlan::Cacheable { key } = cache.plan_get(request) else {
+            panic!("plan should be cacheable");
+        };
+        assert_eq!(key.mod_time_unix_nanos, 42);
     }
 }
