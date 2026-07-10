@@ -155,16 +155,72 @@ jobs:
 
       - name: Run tests
         run: |
-          cargo nextest run --all --exclude e2e_test
+          cargo nextest run --profile ci --all --exclude e2e_test
           cargo test --all --doc
+
+      - name: Upload test junit report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: junit-test-and-lint-${{ github.run_number }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 3
+          if-no-files-found: ignore
 
       # Explicit gate for migration-critical suites. These tests already ran in
       # the full nextest pass above; a single filtered nextest invocation keeps
       # the named gate without rebuilding or re-running them one package at a time.
+      #
+      # The gate selects tests by name substring (data_movement / rebalance /
+      # decommission / source_cleanup / delete_marker), so renames can silently
+      # thin it. The script owns the filter expression and first verifies the
+      # selected-test count against the committed floor in
+      # .config/migration-gate-floor.txt before running the gate; renames or
+      # removals must update that file consciously (see the script header).
+      # Kept on the default profile (no --profile ci): a second --profile ci run
+      # would clobber target/nextest/ci/junit.xml, and none of these tests are
+      # quarantined so they gain nothing from the ci profile's retry overrides.
       - name: Run rebalance/decommission migration proofs
+        run: ./scripts/check_migration_gate_count.sh
+
+  # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
+  # drive the object layer through process-global singletons (the GLOBAL_ENV
+  # ECStore, the global tier-config manager, background-expiry workers) and bind
+  # fixed ports (9002 for the scanner suite, 9003 for the app suite), so they are
+  # marked #[ignore] to keep them out of the default parallel `cargo nextest run
+  # --all` pass. Run them here explicitly with `--run-ignored ignored-only` and
+  # `-j1` so no two of them share global state or race for a port at once.
+  # serial_test's #[serial] does NOT serialize across nextest's process-per-test
+  # boundary (see .config/nextest.toml); `-j1` is what actually serializes them.
+  # See rustfs/backlog#1148 (ilm-1) and #1155.
+  test-ilm-integration-serial:
+    name: ILM Integration (serial)
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: sm-standard-4
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-ilm-serial
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Three scanner tests fail on main independently of this lane (restore of
+      # a transitioned multipart object, noncurrent transition/expiry after an
+      # immediate compensation transition); they keep #[ignore] with a backlog
+      # reference and are excluded here by name until fixed (rustfs/backlog#1148).
+      - name: Run ignored ILM integration tests serially
         run: |
-          cargo nextest run -p rustfs-ecstore --lib \
-            -E 'test(data_movement) or test(rebalance) or test(decommission) or test(source_cleanup) or test(delete_marker)'
+          cargo nextest run -j1 --run-ignored ignored-only \
+            -p rustfs-scanner -p rustfs \
+            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_transition_and_restore_flows) or test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition))'
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)

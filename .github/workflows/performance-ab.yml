@@ -30,9 +30,9 @@ on:
   workflow_dispatch:
     inputs:
       duration:
-        description: "warp duration per round"
+        description: "warp duration per round (short by default to fit the double-build budget)"
         required: false
-        default: "30s"
+        default: "12s"
         type: string
       allow_regression:
         description: "Pass the gate despite a FAIL (deliberate tradeoff)"
@@ -69,7 +69,12 @@ jobs:
       (contains(github.event.pull_request.labels.*.name, 'perf-ab') &&
        (github.event.action != 'labeled' || github.event.label.name == 'perf-ab'))
     runs-on: sm-standard-2
-    timeout-minutes: 90
+    # Phase-0 stopgap: the baseline+candidate release double-build alone is
+    # ~65min on this runner, so 90min left no room for a real full-matrix
+    # measurement (the earlier nightly runs only ever failed *before*
+    # measuring). 120min gives the 24-cell short matrix headroom until perf-3
+    # caches the baseline binary and restores a tighter budget.
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -109,7 +114,17 @@ jobs:
         id: ab
         run: |
           set -euo pipefail
-          args=(--baseline-ref origin/main --duration "${{ github.event.inputs.duration || '30s' }}")
+          # Budget note: the baseline+candidate release double-build (~65 min,
+          # cached away later by perf-3) dominates the 90-min job, so the
+          # measurement runs a short warp matrix — duration/rounds/cooldown are
+          # kept small to fit all 24 cells (6 workloads x 2 phases x 2 drive-sync)
+          # under budget rather than dropping cells. --health-timeout 180 outlasts
+          # the server's own 120s startup-readiness budget, which is what the
+          # rig's previous 60s health poll undershot (the first two nightly
+          # failures). perf-6 will recalibrate these once the pipeline is green.
+          duration="${{ github.event.inputs.duration || '12s' }}"
+          args=(--baseline-ref origin/main
+            --duration "$duration" --rounds 2 --cooldown 5 --health-timeout 180)
           if [[ "${{ steps.exempt.outputs.allow_regression }}" == "true" ]]; then
             args+=(--allow-regression --exemption-reason "labeled perf-deliberate-tradeoff / dispatch override")
           fi
@@ -119,7 +134,14 @@ jobs:
           bash scripts/run_hotpath_warp_ab.sh "${args[@]}"
           echo "status=$?" >> "$GITHUB_OUTPUT"
           set -e
-          # Locate the newest gate.md for the comment/artifact steps.
+          # Locate the newest run dir + gate.md for the summary/comment/artifact
+          # steps. On a startup failure there is no gate.md, but the run dir still
+          # holds server-logs/ for diagnosis.
+          # Run dirs are UTC-timestamp names (no special chars); ls is safe here.
+          # shellcheck disable=SC2012
+          run_dir="$(ls -td target/hotpath-ab/*/ 2>/dev/null | head -n1 || true)"
+          echo "run_dir=${run_dir%/}" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2012
           gate_md="$(ls -t target/hotpath-ab/*/gate.md 2>/dev/null | head -n1 || true)"
           echo "gate_md=$gate_md" >> "$GITHUB_OUTPUT"
 
@@ -128,8 +150,49 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: hotpath-warp-ab-${{ github.run_number }}
+          # Includes per-cell median_summary.csv / baseline_compare.csv, gate.md,
+          # and server-logs/ (rustfs.log + startup env per phase) so a failed run
+          # is diagnosable. Short retention: this is churny nightly debug data.
           path: target/hotpath-ab/
           if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write gate summary
+        if: always()
+        run: |
+          set -euo pipefail
+          status="${{ steps.ab.outputs.status }}"
+          gate_md="${{ steps.ab.outputs.gate_md }}"
+          run_dir="${{ steps.ab.outputs.run_dir }}"
+          {
+            echo "## Hotpath warp A/B — run ${{ github.run_number }}"
+            echo
+            if [[ "$status" == "0" ]]; then
+              echo "Rig/gate exit: \`0\` (pass or warn)."
+            else
+              echo "Rig/gate exit: \`${status:-unknown}\` — **FAILED**."
+            fi
+            echo
+            if [[ -n "$gate_md" && -f "$gate_md" ]]; then
+              cat "$gate_md"
+            else
+              echo "No \`gate.md\` produced — the rig failed **before** the gate"
+              echo "(most likely server startup / health). Failing phase(s) below;"
+              echo "full logs in the \`hotpath-warp-ab-${{ github.run_number }}\` artifact."
+              if [[ -n "$run_dir" && -d "$run_dir/server-logs" ]]; then
+                for f in "$run_dir"/server-logs/*.log; do
+                  [[ -f "$f" ]] || continue
+                  echo
+                  echo "<details><summary>$(basename "$f")</summary>"
+                  echo
+                  echo '```'
+                  tail -n 30 "$f"
+                  echo '```'
+                  echo "</details>"
+                done
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment gate result on PR
         if: always() && github.event_name == 'pull_request' && steps.ab.outputs.gate_md != ''
@@ -138,12 +201,38 @@ jobs:
         run: |
           gh pr comment "${{ github.event.pull_request.number }}" --body-file "${{ steps.ab.outputs.gate_md }}"
 
+      # TODO(ci-8/perf-2): scheduled/dispatch failures are currently silent. Once
+      # ci-8 lands the .github/actions/schedule-failure-issue composite action,
+      # perf-2 adds a step here guarded by
+      #   if: failure() && github.event_name != 'pull_request'
+      # that calls it (label perf-nightly-failure, append to an existing open
+      # issue) instead of hand-rolling gh CLI dedup. Do not implement it here.
+
       - name: Enforce gate
         if: always()
         run: |
           status="${{ steps.ab.outputs.status }}"
           if [[ "$status" != "0" ]]; then
-            echo "::error::warp A/B budget gate failed (exit $status). See the PR comment / gate.md artifact." >&2
+            echo "::error::warp A/B budget gate failed (exit $status). See the step summary / PR comment / gate.md artifact." >&2
             exit "$status"
           fi
           echo "warp A/B budget gate passed."
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [warp-ab]
+    # `always()` is required: without it this job is skipped when a needed
+    # job fails. Alerts only for scheduled (nightly) runs (backlog#1149
+    # ci-8); PR and manual dispatch failures are already watched by a human.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,10 @@
+# Committed floor for the number of tests selected by the migration-critical
+# CI gate (see scripts/check_migration_gate_count.sh, backlog#1153 infra-12).
+#
+# The floor equals the exact count of rustfs-ecstore --lib tests matching the
+# gate filter (name substrings: data_movement, rebalance, decommission,
+# source_cleanup, delete_marker) at the time this file was last updated.
+# CI fails if the selected count drops below this number, so renames or
+# removals that thin the gate must update this file in the same PR.
+# Adding tests does not require a bump, but bumping keeps the guard tight.
+571

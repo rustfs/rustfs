@@ -8,9 +8,9 @@ This guide covers the local development environment and the checks expected befo
 
 **MANDATORY**: All code must be properly formatted before committing. This project enforces strict formatting standards to maintain code consistency and readability.
 
-#### Pre-commit Requirements
+#### Verification Requirements
 
-Before every commit, you **MUST**:
+Before submitting your changes for review, you **MUST**:
 
 1. **Format your code**:
 
@@ -47,33 +47,56 @@ make fmt
 # Check if code is properly formatted
 make fmt-check
 
-# Run clippy checks
-make clippy
+# Run clippy checks (all targets, all features, -D warnings)
+make clippy-check
 
-# Run compilation check
-make check
+# Fast workspace compilation check (excludes e2e_test)
+make quick-check
 
-# Run tests
+# Full compilation check (cargo check --all-targets)
+make compilation-check
+
+# Run tests (shell script tests + workspace tests + doc tests)
 make test
 
-# Run all pre-commit checks (format + clippy + check + test)
+# Fast pre-commit gate — see below for exactly what it runs
 make pre-commit
 
-# Setup git hooks (one-time setup)
-make setup-hooks
+# Full pre-PR gate (pre-commit gates + clippy + tests)
+make pre-pr
 ```
 
+> `make test` requires [cargo-nextest](https://nexte.st) (CI runs it and only nextest honours `.config/nextest.toml` test-groups). Install it with `cargo install cargo-nextest --locked` or a prebuilt binary (see https://nexte.st/docs/installation/). To run the plain `cargo test` fallback anyway (results not authoritative — serialization semantics differ from CI), set `RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1`.
+
 ### 🔒 Automated Pre-commit Hooks
+#### What `make pre-commit` and `make pre-pr` actually run
 
-This project includes a pre-commit hook that automatically runs before each commit to ensure:
+`make pre-commit` is the **fast** gate. It runs, in order
+(see `.config/make/pre-commit.mak`):
 
-- ✅ Code is properly formatted (`cargo fmt --all --check`)
-- ✅ No clippy warnings (`cargo clippy --all-targets --all-features -- -D warnings`)
-- ✅ Code compiles successfully (`cargo check --all-targets`)
+1. `fmt-check` — `cargo fmt --all --check`
+2. `unsafe-code-check` — `./scripts/check_unsafe_code_allowances.sh`
+3. `architecture-migration-check` — `./scripts/check_architecture_migration_rules.sh`
+4. `logging-guardrails-check` — `./scripts/check_logging_guardrails.sh`
+5. `tokio-io-uring-check` — `./scripts/check_no_tokio_io_uring.sh`
+6. `doc-paths-check` — `./scripts/check_doc_paths.sh`
+7. `quick-check` — `cargo check --workspace --exclude e2e_test`
 
-#### Setting Up Pre-commit Hooks
+**`make pre-commit` does NOT run clippy and does NOT run any tests.**
+A green `make pre-commit` is not enough to open a pull request.
 
-Run this command once after cloning the repository:
+`make pre-pr` is the **full** gate: it runs all of the guard checks above,
+then `clippy-check` (`cargo clippy --all-targets --all-features -- -D warnings`)
+and `test` (shell script tests, workspace tests excluding `e2e_test`, and doc
+tests). Run `make pre-pr` before opening or updating a pull request — this is
+what CI enforces.
+
+### 🔒 Git Pre-commit Hooks (optional)
+
+Git hooks are **not** versioned in this repository, so a fresh clone has no
+active pre-commit hook. If you add your own `.git/hooks/pre-commit` (a good
+choice is a one-liner that runs `make pre-commit`), you can mark it executable
+with:
 
 ```bash
 make setup-hooks
@@ -84,6 +107,9 @@ Or manually:
 ```bash
 chmod +x .git/hooks/pre-commit
 ```
+
+With or without a hook, the expectation is the same: run `make pre-commit`
+before committing and `make pre-pr` before opening a pull request.
 
 ### 📝 Formatting Configuration
 
@@ -97,7 +123,7 @@ single_line_let_else_max_width = 100
 
 ### 🚫 Commit Prevention
 
-If your code doesn't meet the formatting requirements, the pre-commit hook will:
+If you set up a pre-commit hook and your code doesn't meet the formatting requirements, the hook will:
 
 1. **Block the commit** and show clear error messages
 2. **Provide exact commands** to fix the issues
@@ -119,9 +145,10 @@ Example output when formatting fails:
 
 1. **Make your changes**
 2. **Format your code**: `make fmt` or `cargo fmt --all`
-3. **Run pre-commit checks**: `make pre-commit`
+3. **Run the fast gate**: `make pre-commit` (no clippy, no tests)
 4. **Commit your changes**: `git commit -m "your message"`
-5. **Push to your branch**: `git push`
+5. **Run the full gate before opening/updating a PR**: `make pre-pr` (clippy + tests)
+6. **Push to your branch**: `git push`
 
 ### 🛠️ IDE Integration
 

@@ -14,13 +14,20 @@
 
 # RustFS Cargo configuration
 
-# Enable tokio_unstable cfg for dial9-tokio-telemetry support
-# This allows dial9 to hook into Tokio's internal runtime events
-[build]
-# Enable Tokio unstable features required by dial9-tokio-telemetry for runtime tracing.
-# See: https://docs.rs/tokio/latest/tokio/#unstable-features
-rustflags = ["--cfg", "tokio_unstable"]
-
-# Enable frame pointers for CPU profiling (Linux only, optional but recommended)
-# Uncomment the following line for better CPU profiling data
-# rustflags = ["--cfg", "tokio_unstable", "-C", "force-frame-pointers=yes"]
+# NOTE: `--cfg tokio_unstable` is deliberately NOT set here.
+#
+# It used to be a global `[build] rustflags` entry so that the (default-off)
+# `dial9` telemetry feature could compile. That made every build depend on
+# Tokio's unstable, non-semver API, and it broke silently whenever a caller
+# exported their own RUSTFLAGS — an environment RUSTFLAGS replaces the value
+# from this file rather than appending to it.
+#
+# The flag is now scoped to telemetry builds, which opt in explicitly:
+#
+#     make build-profiling
+#     RUSTFLAGS="--cfg tokio_unstable" cargo build --features dial9
+#
+# `crates/obs/build.rs` fails the compile if the `dial9` feature is on without
+# the flag, so the two can no longer drift apart unnoticed.
+#
+# For CPU profiling, add `-C force-frame-pointers=yes` to that RUSTFLAGS value.
