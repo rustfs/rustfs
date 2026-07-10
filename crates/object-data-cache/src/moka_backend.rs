@@ -188,8 +188,12 @@ impl MokaBackend {
 
         // The caller already owns the body, so a non-leader gains nothing by
         // waiting for another request's leader — it just skips its own fill.
+        // Report it as JoinedInflightFill (ODC-18): it did no fill work, so it
+        // must not be counted as an insert or record fill bytes. It also does
+        // NOT wait for the leader — waiting only matters when the joiner needs
+        // the result value, which the GET path never does (ODC-15).
         let ObjectDataCacheSingleflightAcquire::Leader(leader) = self.singleflight.try_acquire(key.clone()) else {
-            return ObjectDataCacheFillResult::SkippedSingleflightBusy;
+            return ObjectDataCacheFillResult::JoinedInflightFill;
         };
 
         // Bound distinct-key fill concurrency after winning leadership and
@@ -280,11 +284,20 @@ impl MokaBackend {
     /// needed when the index has no entry for the identity.
     pub async fn invalidate_object(&self, identity: &ObjectDataCacheIdentity) -> ObjectDataCacheInvalidationResult {
         let keys_to_remove = self.index.remove_identity(identity).await;
+        // ODC-36: report the removal count so the facade can label the
+        // invalidation outcome (removed vs noop) and skip the gauge refresh on
+        // the no-op path. The vast majority of invalidations touch identities
+        // that were never cached.
+        let removed = keys_to_remove.len();
         for key in keys_to_remove {
             self.cache.remove(&key).await;
         }
 
-        ObjectDataCacheInvalidationResult::Success
+        if removed > 0 {
+            ObjectDataCacheInvalidationResult::Removed { keys: removed }
+        } else {
+            ObjectDataCacheInvalidationResult::NoOp
+        }
     }
 }
 
@@ -363,15 +376,30 @@ mod tests {
         let _ = backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
         let _ = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
 
+        // object-a has exactly one cached key, so invalidation reports Removed { keys: 1 }.
         let result = backend
             .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "object-a"))
             .await;
         let lookup_a = backend.lookup_body(&plan_a).await;
         let lookup_b = backend.lookup_body(&plan_b).await;
 
-        assert!(matches!(result, ObjectDataCacheInvalidationResult::Success));
+        assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
         assert!(matches!(lookup_a, ObjectDataCacheLookup::Miss));
         assert!(matches!(lookup_b, ObjectDataCacheLookup::Hit(_)));
+    }
+
+    // ODC-36: invalidating an identity that was never cached reports NoOp so the
+    // facade can skip the cache-state gauge refresh on the common no-op path.
+    #[tokio::test]
+    async fn moka_backend_invalidate_uncached_identity_is_noop() {
+        let backend =
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+
+        let result = backend
+            .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "never-cached"))
+            .await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::NoOp);
     }
 
     #[tokio::test]
@@ -450,11 +478,12 @@ mod tests {
         assert_eq!(stats.snapshot().memory_pressure_events, 1);
     }
 
-    // ODC-15: a concurrent duplicate fill for the same key must NOT wait for the
-    // in-flight leader. The second caller already owns the body, so it skips as
-    // busy and returns immediately instead of stalling on the leader.
+    // ODC-15 + ODC-18: a concurrent duplicate fill for the same key must NOT
+    // wait for the in-flight leader (it already owns the body), and it must be
+    // reported as JoinedInflightFill — not Inserted — so it records no fill
+    // work and cannot inflate the inserted count/bytes for one real insert.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn moka_backend_duplicate_fill_same_key_skips_without_waiting() {
+    async fn moka_backend_duplicate_fill_same_key_joins_without_waiting() {
         let backend = Arc::new(
             MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build"),
         );
@@ -468,13 +497,13 @@ mod tests {
         };
 
         // A has registered its singleflight key and parked before the cache
-        // insert. A second fill for the same key must skip as busy right away.
+        // insert. A second fill for the same key must join (skip) right away.
         barrier.wait_until_reached().await;
         let fill_b = backend.fill_body(&plan, Bytes::from_static(b"hello")).await;
         assert_eq!(
             fill_b,
-            ObjectDataCacheFillResult::SkippedSingleflightBusy,
-            "a duplicate fill must skip rather than wait for the in-flight leader"
+            ObjectDataCacheFillResult::JoinedInflightFill,
+            "a duplicate fill must join the in-flight leader (not insert), and not wait for it"
         );
 
         barrier.release();
