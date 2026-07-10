@@ -3130,7 +3130,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body_with_cache<R>(
         cache_adapter: &ObjectDataCacheAdapter,
-        mut final_stream: R,
+        final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
@@ -3171,7 +3171,21 @@ impl DefaultObjectUsecase {
         }
 
         if let Some(buffered_body) = buffered_body {
-            let _fill_result = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
+            // ODC-15: the body is already fully in hand, so keep the fill off the
+            // response's critical path. For a cacheable plan, run the fill in a
+            // detached task (Bytes is a cheap clone) and return immediately. For
+            // a non-cacheable plan the fill is a pure metric-only skip with no
+            // I/O, so record it inline to preserve observability.
+            if matches!(cache_plan, GetObjectBodyCachePlan::Cacheable(_)) {
+                let cache_adapter = cache_adapter.clone();
+                let cache_plan = cache_plan.clone();
+                let fill_bytes = buffered_body.clone();
+                tokio::spawn(async move {
+                    let _ = fill_get_object_body_cache_from_buffered_body(&cache_adapter, &cache_plan, &fill_bytes).await;
+                });
+            } else {
+                let _ = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
+            }
 
             return Ok(Self::build_memory_bytes_blob(
                 buffered_body,
@@ -3215,23 +3229,43 @@ impl DefaultObjectUsecase {
                 .await;
             };
             let mut buf = Vec::with_capacity(materialized_capacity);
+            // ODC-07: bound the read so a stream yielding more than the declared
+            // length cannot grow `buf` past the in-memory GET threshold. Reading
+            // one byte past the capacity is enough to detect an over-long stream.
+            let mut bounded_stream = tokio::io::AsyncReadExt::take(final_stream, materialized_capacity as u64 + 1);
             let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
+            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut bounded_stream, &mut buf).await;
             record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ, buffer_read_start);
 
             match read_result {
                 Ok(_) => {
+                    // ODC-07: treat a length mismatch as a hard error, matching
+                    // the direct-memory GET path. Serving a body whose decoded
+                    // length disagrees with the declared content length would
+                    // ship a truncated or over-long response.
                     if buf.len() != materialized_capacity {
-                        warn!(
+                        lifecycle.finish_err();
+                        error!(
                             expected = response_content_length,
                             actual = buf.len(),
-                            "Object size mismatch during materialize-fill read"
+                            "materialize-fill GET decoded length mismatch"
                         );
+                        return Err(ApiError::from(StorageError::other(format!(
+                            "materialize-fill GET decoded length mismatch: expected {response_content_length}, got {}",
+                            buf.len()
+                        )))
+                        .into());
                     }
 
                     let bytes = Bytes::from(buf);
-                    let _fill_result =
-                        fill_get_object_body_cache_from_materialized_body(cache_adapter, &cache_plan, &bytes).await;
+                    // ODC-15: fill off the response's critical path (see the
+                    // buffered-body branch above).
+                    let cache_adapter = cache_adapter.clone();
+                    let cache_plan = cache_plan.clone();
+                    let fill_bytes = bytes.clone();
+                    tokio::spawn(async move {
+                        let _ = fill_get_object_body_cache_from_materialized_body(&cache_adapter, &cache_plan, &fill_bytes).await;
+                    });
 
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,
@@ -7075,6 +7109,32 @@ mod tests {
         ));
     }
 
+    /// Polls the cache until the detached fill (ODC-15) populates the entry, so
+    /// a follow-up GET is a deterministic hit rather than racing the fill task.
+    async fn wait_for_cache_hit(
+        adapter: &crate::app::object_data_cache::ObjectDataCacheAdapter,
+        bucket: &str,
+        object: &str,
+        etag: &str,
+        size: u64,
+    ) {
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket,
+            object,
+            version_id: None,
+            etag,
+            size,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        for _ in 0..400 {
+            if matches!(adapter.lookup_body(&plan).await, rustfs_object_data_cache::ObjectDataCacheLookup::Hit(_)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("detached fill did not populate the cache within the timeout");
+    }
+
     struct ReadProbeReader {
         reads: Arc<AtomicUsize>,
     }
@@ -7612,6 +7672,10 @@ mod tests {
         .await
         .expect("buffered-body handoff should succeed");
 
+        // ODC-15: the fill is detached from the response path, so wait for it to
+        // populate the cache before the follow-up GET to keep the hit deterministic.
+        wait_for_cache_hit(&adapter, "test-bucket", "cached-object", "etag", 5).await;
+
         let _second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             second_reader,
@@ -7748,6 +7812,10 @@ mod tests {
         .await
         .expect("materialize-fill handoff should succeed");
 
+        // ODC-15: the fill is detached from the response path, so wait for it to
+        // populate the cache before the follow-up GET to keep the hit deterministic.
+        wait_for_cache_hit(&adapter, "test-bucket", "materialized-object", "etag", 5).await;
+
         let _second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
             second_reader,
@@ -7776,6 +7844,56 @@ mod tests {
             second_reads.load(AtomicOrdering::Relaxed),
             0,
             "cache hit after materialize-fill must not read from the fallback reader"
+        );
+    }
+
+    // ODC-07: a materialize read that yields more than the declared content
+    // length must be a hard error, not a warn-and-serve, matching the
+    // direct-memory GET path. The bounded `take` reads one byte past capacity so
+    // the over-long stream is detected without buffering it unbounded.
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_materialize_rejects_length_mismatch() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        // Declared content length is 5, but the stream yields 6 bytes.
+        let reader = DataProbeReader {
+            reads: Arc::clone(&reads),
+            data: std::io::Cursor::new(b"hello!".to_vec()),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let result = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "mismatch-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an over-long materialize read must be a hard error, not a truncated served body"
         );
     }
 
