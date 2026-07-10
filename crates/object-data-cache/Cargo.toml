@@ -35,6 +35,7 @@ starshard.workspace = true
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }

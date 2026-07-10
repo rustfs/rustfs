@@ -52,8 +52,21 @@ impl ObjectDataCacheAdapter {
 
     /// Creates an adapter from runtime environment variables, falling back to
     /// no-op on invalid input so startup behavior stays conservative.
+    ///
+    /// A malformed value on any single key (bad mode string, failed validation,
+    /// or an unparseable numeric override) disables the whole cache rather than
+    /// silently starting with defaults the operator never chose.
     pub(crate) fn from_env_or_disabled() -> Arc<Self> {
-        Self::from_config_or_disabled(object_data_cache_config_from_env(), "env")
+        match object_data_cache_config_from_env() {
+            Ok(config) => Self::from_config_or_disabled(config, "env"),
+            Err(invalid_keys) => {
+                warn!(
+                    invalid_keys = %invalid_keys.join(","),
+                    "object data cache disabled because one or more environment variables are malformed"
+                );
+                Self::disabled_arc()
+            }
+        }
     }
 
     /// Creates a disabled no-op adapter.
@@ -131,20 +144,51 @@ impl Default for ObjectDataCacheAdapter {
     }
 }
 
-fn object_data_cache_config_from_env() -> ObjectDataCacheConfig {
-    object_data_cache_config_from_values(ObjectDataCacheEnvValues {
+/// Reads a numeric env override with three-valued semantics: absent keeps the
+/// default (`None`), a valid value is applied, and a malformed value records the
+/// key in `invalid_keys` so the caller can invalidate the whole config.
+fn take_numeric_env<T>(key: &'static str, invalid_keys: &mut Vec<&'static str>) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    match rustfs_utils::get_env_parse_outcome::<T>(key) {
+        rustfs_utils::EnvParseOutcome::Parsed(value) => Some(value),
+        rustfs_utils::EnvParseOutcome::Absent => None,
+        rustfs_utils::EnvParseOutcome::Invalid => {
+            invalid_keys.push(key);
+            None
+        }
+    }
+}
+
+fn object_data_cache_config_from_env() -> Result<ObjectDataCacheConfig, Vec<&'static str>> {
+    let mut invalid_keys: Vec<&'static str> = Vec::new();
+
+    let values = ObjectDataCacheEnvValues {
         enabled: rustfs_utils::get_env_opt_bool(rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE),
         mode: rustfs_utils::get_env_opt_str(rustfs_config::ENV_OBJECT_DATA_CACHE_MODE),
-        max_bytes: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_BYTES),
-        max_memory_percent: rustfs_utils::get_env_opt_u8(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_MEMORY_PERCENT),
-        max_entry_bytes: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES),
-        ttl_secs: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_TTL_SECS),
-        time_to_idle_secs: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_TIME_TO_IDLE_SECS),
-        min_free_memory_percent: rustfs_utils::get_env_opt_u8(rustfs_config::ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT),
-        fill_concurrency_per_cpu: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU),
-        fill_concurrency_max: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX),
-        identity_keys_max: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX),
-    })
+        max_bytes: take_numeric_env(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_BYTES, &mut invalid_keys),
+        max_memory_percent: take_numeric_env(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_MEMORY_PERCENT, &mut invalid_keys),
+        max_entry_bytes: take_numeric_env(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES, &mut invalid_keys),
+        ttl_secs: take_numeric_env(rustfs_config::ENV_OBJECT_DATA_CACHE_TTL_SECS, &mut invalid_keys),
+        time_to_idle_secs: take_numeric_env(rustfs_config::ENV_OBJECT_DATA_CACHE_TIME_TO_IDLE_SECS, &mut invalid_keys),
+        min_free_memory_percent: take_numeric_env(
+            rustfs_config::ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT,
+            &mut invalid_keys,
+        ),
+        fill_concurrency_per_cpu: take_numeric_env(
+            rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU,
+            &mut invalid_keys,
+        ),
+        fill_concurrency_max: take_numeric_env(rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX, &mut invalid_keys),
+        identity_keys_max: take_numeric_env(rustfs_config::ENV_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX, &mut invalid_keys),
+    };
+
+    if !invalid_keys.is_empty() {
+        return Err(invalid_keys);
+    }
+
+    Ok(object_data_cache_config_from_values(values))
 }
 
 fn object_data_cache_config_from_values(values: ObjectDataCacheEnvValues) -> ObjectDataCacheConfig {
@@ -217,10 +261,40 @@ fn parse_object_data_cache_mode(value: &str) -> Option<ObjectDataCacheMode> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ObjectDataCacheAdapter, ObjectDataCacheEnvValues, object_data_cache_config_from_values, parse_object_data_cache_mode,
+        ObjectDataCacheAdapter, ObjectDataCacheEnvValues, object_data_cache_config_from_env,
+        object_data_cache_config_from_values, parse_object_data_cache_mode,
     };
     use rustfs_object_data_cache::{ObjectDataCacheConfig, ObjectDataCacheMode};
     use std::time::Duration;
+
+    /// All object-data-cache env keys, unset by default. Tests override the
+    /// entries they care about so the surrounding process environment cannot
+    /// influence the outcome.
+    fn all_env_unset() -> Vec<(&'static str, Option<&'static str>)> {
+        vec![
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_MODE, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_BYTES, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_MEMORY_PERCENT, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_TTL_SECS, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_TIME_TO_IDLE_SECS, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX, None),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX, None),
+        ]
+    }
+
+    fn with_env_overrides(overrides: &[(&'static str, &'static str)]) -> Vec<(&'static str, Option<&'static str>)> {
+        let mut vars = all_env_unset();
+        for (key, value) in overrides {
+            if let Some(entry) = vars.iter_mut().find(|(name, _)| name == key) {
+                entry.1 = Some(value);
+            }
+        }
+        vars
+    }
 
     #[test]
     fn disabled_adapter_exposes_disabled_engine() {
@@ -341,5 +415,71 @@ mod tests {
         );
 
         assert!(adapter.is_disabled());
+    }
+
+    #[test]
+    fn overlong_ttl_builds_disabled_adapter_without_panic() {
+        // moka's builder asserts on durations beyond ~1000 years; validate()
+        // must reject an out-of-range ttl so the adapter degrades to disabled
+        // rather than panicking AppContext::new at boot.
+        let adapter = ObjectDataCacheAdapter::from_config_or_disabled(
+            ObjectDataCacheConfig {
+                mode: ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8 * 1024 * 1024,
+                ttl: Duration::from_secs(u64::MAX),
+                ..ObjectDataCacheConfig::default()
+            },
+            "test",
+        );
+
+        assert!(adapter.is_disabled());
+    }
+
+    #[test]
+    fn object_data_cache_env_absent_uses_defaults() {
+        temp_env::with_vars(all_env_unset(), || {
+            let config = object_data_cache_config_from_env().expect("absent env should build the default config");
+
+            assert_eq!(config, ObjectDataCacheConfig::default());
+        });
+    }
+
+    #[test]
+    fn object_data_cache_env_valid_numeric_value_is_applied() {
+        let vars = with_env_overrides(&[
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, "true"),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES, "2097152"),
+        ]);
+        temp_env::with_vars(vars, || {
+            let config = object_data_cache_config_from_env().expect("valid numeric env should be applied");
+
+            assert_eq!(config.mode, ObjectDataCacheMode::HitOnly);
+            assert_eq!(config.max_entry_bytes, 2_097_152);
+        });
+    }
+
+    #[test]
+    fn object_data_cache_env_malformed_numeric_invalidates_config() {
+        let key = rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES;
+        let vars = with_env_overrides(&[(rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, "true"), (key, "not-a-number")]);
+        temp_env::with_vars(vars, || {
+            let invalid_keys =
+                object_data_cache_config_from_env().expect_err("a malformed numeric key must invalidate the config");
+
+            assert!(invalid_keys.contains(&key));
+        });
+    }
+
+    #[test]
+    fn object_data_cache_env_malformed_numeric_builds_disabled_adapter() {
+        let vars = with_env_overrides(&[
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, "true"),
+            (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES, "not-a-number"),
+        ]);
+        temp_env::with_vars(vars, || {
+            let adapter = ObjectDataCacheAdapter::from_env_or_disabled();
+
+            assert!(adapter.is_disabled());
+        });
     }
 }
