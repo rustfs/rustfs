@@ -145,7 +145,7 @@ metrics = { workspace = true }
 # scripts/check_no_tokio_io_uring.sh allows an explicit io-uring integration;
 # only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = { git = "https://github.com/rustfs/uring", rev = "39018c09cde98b380658f1a1511349a3574daddf" }
+rustfs-uring = { git = "https://github.com/rustfs/uring", rev = "f577ba0bfd6c3d74f9bdc54b573b8fcb45d6bc22" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
