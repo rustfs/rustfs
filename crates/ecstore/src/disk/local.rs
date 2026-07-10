@@ -2773,6 +2773,25 @@ fn is_io_uring_unsupported(err: &std::io::Error) -> bool {
     )
 }
 
+/// Resolve `volume`/`path` to the on-disk object path, running the same volume
+/// access and path-length checks `StdBackend::pread_bytes` does before opening
+/// (backlog#1102/#1145).
+///
+/// Blocking (`access_std` stats the volume dir), so it is called inside the
+/// `spawn_blocking` closures of both io_uring read paths. It is the one piece
+/// they genuinely share; each caller opens the returned path its own way
+/// (buffered vs `O_DIRECT`) and maps the error into its own type.
+#[cfg(target_os = "linux")]
+fn resolve_uring_object_path(root: &Path, volume: &str, path: &str) -> Result<PathBuf> {
+    let volume_dir = local_disk_bucket_path(root, volume)?;
+    if !skip_access_checks(volume) {
+        access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+    }
+    let file_path = local_disk_object_path(root, volume, path)?;
+    check_path_length(file_path.to_string_lossy().as_ref())?;
+    Ok(file_path)
+}
+
 #[cfg(target_os = "linux")]
 impl std::fmt::Debug for UringBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2882,13 +2901,7 @@ impl UringBackend {
                 let volume_owned = volume.to_owned();
                 let path_owned = path.to_owned();
                 let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-                    let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
-                    if !skip_access_checks(&volume_owned) {
-                        access_std(&volume_dir)
-                            .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
-                    }
-                    let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
-                    check_path_length(file_path.to_string_lossy().as_ref())?;
+                    let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned)?;
                     let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
                     let meta = file.metadata().map_err(DiskError::from)?;
                     let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
@@ -2968,13 +2981,7 @@ impl UringBackend {
 
         let opened = tokio::task::spawn_blocking(move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
             use std::os::unix::fs::OpenOptionsExt;
-            let volume_dir = local_disk_bucket_path(&root, &volume_owned).map_err(DirectOpenError::Disk)?;
-            if !skip_access_checks(&volume_owned) {
-                access_std(&volume_dir)
-                    .map_err(|e| DirectOpenError::Disk(DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied))))?;
-            }
-            let file_path = local_disk_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
-            check_path_length(file_path.to_string_lossy().as_ref()).map_err(DirectOpenError::Disk)?;
+            let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
             let file = match std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
