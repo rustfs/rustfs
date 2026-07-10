@@ -883,6 +883,8 @@ pub struct DeleteOptions {
     pub recursive: bool,
     pub immediate: bool,
     pub undo_write: bool,
+    #[serde(default)]
+    pub undo_delete: bool,
     pub old_data_dir: Option<Uuid>,
 }
 
@@ -1122,12 +1124,14 @@ mod tests {
             recursive: true,
             immediate: false,
             undo_write: true,
+            undo_delete: false,
             old_data_dir: Some(Uuid::new_v4()),
         };
 
         assert!(opts.recursive);
         assert!(!opts.immediate);
         assert!(opts.undo_write);
+        assert!(!opts.undo_delete);
         assert!(opts.old_data_dir.is_some());
     }
 

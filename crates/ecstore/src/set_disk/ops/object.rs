@@ -23,6 +23,49 @@ use super::super::*;
 
 use crate::disk::OldCurrentSize;
 
+/// Length of the full plaintext body when — and only when — this read's output
+/// is exactly the object's complete plaintext, so the app-layer body cache may
+/// serve it in place of the erasure read.
+///
+/// A hook hit bypasses `ReadPlan`/`ReadTransform` entirely, so it is sound only
+/// where the normal read path would produce that same plaintext byte-for-byte
+/// AND expose the same `object_info.size`. This is a fail-closed allow-list, not
+/// a deny-list: every read whose `ReadPlan` applies some other transform returns
+/// `None`, so a newly added `ReadPlan` branch bypasses the cache by default
+/// instead of silently serving bytes in the wrong representation.
+///
+/// Refused reads, each mapping to a `ReadPlan::build` branch:
+/// - ranged / part-number reads — the cache only holds whole objects;
+/// - `raw_data_movement_read` / `data_movement` — yields the STORED
+///   representation, e.g. compressed bytes (backlog#1108);
+/// - restore reads — `restore_request_active` forces the `Plain` branch, so a
+///   compressed object yields STORED bytes under its compressed `size`;
+/// - encrypted objects — `ReadTransform::Encrypted` rewrites size and the cache
+///   must never hold their plaintext;
+/// - remote (transitioned) objects — served from the warm tier.
+///
+/// Compressed objects ARE eligible: `ReadTransform::Compressed` returns the full
+/// plaintext and rewrites `object_info.size` to the decompressed length, which
+/// the caller must replicate with the returned length (backlog#1109).
+fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions, object_info: &ObjectInfo) -> Option<i64> {
+    if range.is_some()
+        || opts.part_number.is_some()
+        || opts.raw_data_movement_read
+        || opts.data_movement
+        || crate::object_api::restore_request_active(opts)
+        || object_info.is_encrypted()
+        || object_info.is_remote()
+    {
+        return None;
+    }
+
+    if object_info.is_compressed() {
+        return object_info.get_actual_size().ok();
+    }
+
+    Some(object_info.size)
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type Error = Error;
@@ -78,7 +121,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
 
         let metadata_stage_start = Instant::now();
-        let (fi, files, disks) = match self.get_object_fileinfo(bucket, object, opts, true).await {
+        let (fi, files, disks) = match self.get_object_fileinfo(bucket, object, opts, true, true).await {
             Ok(result) => result,
             Err(err) => {
                 rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
@@ -340,12 +383,20 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // but no data shards have been read yet, so a hit skips the erasure
         // read, bitrot verify and decode entirely. The hook validates object
         // identity and rejects anything it cannot serve byte-identically.
-        if range.is_none()
-            && opts.part_number.is_none()
+        //
+        // `plaintext_len` carries the size the normal `ReadPlan` would have
+        // published, which the reader below must reproduce: for a compressed
+        // object `ReadTransform::Compressed` sets `object_info.size` to the
+        // decompressed length, and consumers such as UploadPartCopy read the
+        // copy length straight off that field (backlog#1109).
+        if let Some(plaintext_len) = full_object_plaintext_len(&range, opts, &object_info)
             && let Some(hook) = get_object_body_cache_hook()
             && let Some(body) = hook.lookup(bucket, object, &object_info).await
+            && i64::try_from(body.len()).is_ok_and(|len| len == plaintext_len)
         {
             record_get_object_reader_path_observation(GET_OBJECT_PATH_BODY_CACHE, object_class, size_bucket);
+            let mut object_info = object_info;
+            object_info.size = plaintext_len;
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(body.clone())),
                 object_info,
@@ -1312,6 +1363,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
         let disks = self.disk_inventory().await;
         let write_quorum = disks.len() / 2 + 1;
+        let rollback_dir = Uuid::new_v4();
 
         let mut futures = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
@@ -1320,7 +1372,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             futures.push(async move {
                 if let Some(disk) = disk {
                     match disk
-                        .delete_version(bucket, object, fi.clone(), force_del_marker, DeleteOptions::default())
+                        .delete_version(
+                            bucket,
+                            object,
+                            fi.clone(),
+                            force_del_marker,
+                            DeleteOptions {
+                                old_data_dir: Some(rollback_dir),
+                                ..Default::default()
+                            },
+                        )
                         .await
                     {
                         Ok(r) => Ok(r),
@@ -1344,7 +1405,77 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
-        resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object)
+        let quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+        let should_rollback = quorum_result.is_err();
+        let mut rollback_futures = Vec::new();
+        for (index, err) in errs.iter().enumerate() {
+            if err.is_some() {
+                continue;
+            }
+
+            let Some(disk) = disks[index].as_ref() else {
+                continue;
+            };
+
+            let disk = disk.clone();
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            let fi = fi.clone();
+            rollback_futures.push(async move {
+                if should_rollback {
+                    if let Err(err) = disk
+                        .delete_version(
+                            &bucket,
+                            &object,
+                            fi,
+                            force_del_marker,
+                            DeleteOptions {
+                                undo_write: true,
+                                undo_delete: true,
+                                old_data_dir: Some(rollback_dir),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %object,
+                            rollback_dir = %rollback_dir,
+                            error = ?err,
+                            "failed to roll back delete after write quorum failure"
+                        );
+                    }
+                } else {
+                    let rollback_path = format!("{object}/{rollback_dir}");
+                    if let Err(err) = disk
+                        .delete(
+                            &bucket,
+                            &rollback_path,
+                            DeleteOptions {
+                                recursive: true,
+                                immediate: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        && err != DiskError::FileNotFound
+                        && err != DiskError::VolumeNotFound
+                    {
+                        warn!(
+                            bucket = %bucket,
+                            object = %object,
+                            rollback_dir = %rollback_dir,
+                            error = ?err,
+                            "failed to clean delete rollback state after quorum success"
+                        );
+                    }
+                }
+            });
+        }
+
+        join_all(rollback_futures).await;
+        quorum_result
     }
 
     #[tracing::instrument(skip(self))]
@@ -1542,6 +1673,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             vers.push(fi_vers);
         }
 
+        let rollback_dir = Uuid::new_v4();
+
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
@@ -1554,7 +1687,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let vers = vers.clone();
             futures.push(async move {
                 if let Some(disk) = disk {
-                    disk.delete_versions(bucket, vers, DeleteOptions::default()).await
+                    disk.delete_versions(
+                        bucket,
+                        vers,
+                        DeleteOptions {
+                            old_data_dir: Some(rollback_dir),
+                            ..Default::default()
+                        },
+                    )
+                    .await
                 } else {
                     let mut errs = Vec::with_capacity(vers.len());
                     for _ in 0..vers.len() {
@@ -1617,6 +1758,77 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
+
+        let mut rollback_futures = Vec::new();
+        for fi_vers in &vers {
+            // delete_versions commits one xl.meta per object group, so rollback must use the same boundary.
+            let should_rollback = fi_vers.versions.iter().any(|fi| del_errs[fi.idx].is_some());
+            for (disk_idx, disk) in disks.iter().enumerate() {
+                if fi_vers.versions.iter().any(|fi| del_obj_errs[disk_idx][fi.idx].is_some()) {
+                    continue;
+                }
+
+                let Some(disk) = disk.as_ref() else {
+                    continue;
+                };
+
+                let disk = disk.clone();
+                let bucket = bucket.to_string();
+                let object = fi_vers.name.clone();
+                let versions = fi_vers.clone();
+                rollback_futures.push(async move {
+                    if should_rollback {
+                        let errs = disk
+                            .delete_versions(
+                                &bucket,
+                                vec![versions],
+                                DeleteOptions {
+                                    undo_write: true,
+                                    undo_delete: true,
+                                    old_data_dir: Some(rollback_dir),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        if let Some(err) = errs.into_iter().flatten().next() {
+                            warn!(
+                                bucket = %bucket,
+                                object = %object,
+                                rollback_dir = %rollback_dir,
+                                error = ?err,
+                                "failed to roll back batch delete after write quorum failure"
+                            );
+                        }
+                    } else {
+                        let rollback_path = format!("{object}/{rollback_dir}");
+                        if let Err(err) = disk
+                            .delete(
+                                &bucket,
+                                &rollback_path,
+                                DeleteOptions {
+                                    recursive: true,
+                                    immediate: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            && err != DiskError::FileNotFound
+                            && err != DiskError::VolumeNotFound
+                        {
+                            warn!(
+                                bucket = %bucket,
+                                object = %object,
+                                rollback_dir = %rollback_dir,
+                                error = ?err,
+                                "failed to clean batch delete rollback state after quorum success"
+                            );
+                        }
+                    }
+                });
+            }
+        }
+
+        join_all(rollback_futures).await;
 
         // TODO: add_partial
 
@@ -1789,7 +2001,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // This avoids HEAD/GetObject metadata visibility skew immediately after
         // PutObject/CompleteMultipartUpload.
         let (fi, _, _) = self
-            .get_object_fileinfo(bucket, object, opts, true)
+            .get_object_fileinfo(bucket, object, opts, true, false)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
@@ -1935,7 +2147,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         //     _lock_guard = guard_opt;
         // }
 
-        let (mut fi, meta_arr, online_disks) = self.get_object_fileinfo(bucket, object, opts, true).await?;
+        let (mut fi, meta_arr, online_disks) = self.get_object_fileinfo(bucket, object, opts, true, false).await?;
         /*if err != nil {
             return Err(to_object_err(err, vec![bucket, object]));
         }*/
@@ -1969,7 +2181,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if let Err(err) = self.heal_object(bucket, object, "", &HealOpts {no_lock: true, ..Default::default()}) {
                 return err.expect("err");
             }
-            (fi, meta_arr, online_disks) = self.get_object_fileinfo(&bucket, &object, &opts, true);
+            (fi, meta_arr, online_disks) = self.get_object_fileinfo(&bucket, &object, &opts, true, false);
             if err != nil {
                 return to_object_err(err, vec![bucket, object]);
             }
@@ -2116,7 +2328,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Err(rerr.unwrap())
         };
         let mut oi = ObjectInfo::default();
-        let fi = self_.clone().get_object_fileinfo(bucket, object, opts, true).await;
+        let fi = self_.clone().get_object_fileinfo(bucket, object, opts, true, false).await;
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
@@ -2773,5 +2985,126 @@ mod delete_objects_lock_gating_tests {
 
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
+    }
+}
+
+#[cfg(test)]
+mod body_cache_hook_gate_tests {
+    //! Regression coverage for backlog#1108 (raw data-movement reads) and
+    //! backlog#1109 (compressed objects): the app-layer body-cache hook serves
+    //! cached full-object plaintext directly, bypassing `ReadPlan`. It must not
+    //! be probed when the normal read path would return a different byte stream.
+
+    use super::full_object_plaintext_len;
+    use crate::object_api::{ObjectInfo, ObjectOptions};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const STORED_SIZE: i64 = 1024;
+    const PLAINTEXT_SIZE: i64 = 4096;
+
+    fn plain_object_info() -> ObjectInfo {
+        ObjectInfo {
+            size: STORED_SIZE,
+            ..Default::default()
+        }
+    }
+
+    fn compressed_object_info() -> ObjectInfo {
+        let mut user_defined = HashMap::new();
+        // is_compressed() checks for the internal compression suffix key.
+        user_defined.insert("x-rustfs-internal-compression".to_string(), "klauspost/compress/s2".to_string());
+        user_defined.insert("x-rustfs-internal-actual-size".to_string(), PLAINTEXT_SIZE.to_string());
+        ObjectInfo {
+            size: STORED_SIZE,
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        }
+    }
+
+    fn encrypted_object_info() -> ObjectInfo {
+        let mut user_defined = HashMap::new();
+        user_defined.insert("x-minio-encryption-key".to_string(), "opaque".to_string());
+        ObjectInfo {
+            size: STORED_SIZE,
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        }
+    }
+
+    fn restore_opts() -> ObjectOptions {
+        let mut opts = ObjectOptions::default();
+        opts.transition.restore_request.days = Some(1);
+        opts
+    }
+
+    #[test]
+    fn plain_full_object_read_yields_its_stored_size() {
+        let len = full_object_plaintext_len(&None, &ObjectOptions::default(), &plain_object_info());
+        assert_eq!(len, Some(STORED_SIZE));
+    }
+
+    #[test]
+    fn compressed_object_yields_decompressed_size() {
+        // ReadTransform::Compressed publishes the decompressed length as
+        // object_info.size; the hit site must reproduce exactly this value or
+        // UploadPartCopy truncates the copy (backlog#1109).
+        let len = full_object_plaintext_len(&None, &ObjectOptions::default(), &compressed_object_info());
+        assert_eq!(len, Some(PLAINTEXT_SIZE));
+    }
+
+    #[test]
+    fn raw_data_movement_read_is_refused() {
+        // Decommission reads set raw_data_movement_read: ReadPlan returns the
+        // STORED bytes, so the cached decompressed body must not be served
+        // (backlog#1108 — silent data corruption on the destination pool).
+        let opts = ObjectOptions {
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+        assert_eq!(full_object_plaintext_len(&None, &opts, &plain_object_info()), None);
+    }
+
+    #[test]
+    fn data_movement_read_is_refused() {
+        let opts = ObjectOptions {
+            data_movement: true,
+            ..Default::default()
+        };
+        assert_eq!(full_object_plaintext_len(&None, &opts, &plain_object_info()), None);
+    }
+
+    #[test]
+    fn restore_read_of_compressed_object_is_refused() {
+        // restore_request_active forces ReadPlan down the Plain branch, so the
+        // read yields STORED (compressed) bytes under the compressed size.
+        assert_eq!(full_object_plaintext_len(&None, &restore_opts(), &compressed_object_info()), None);
+    }
+
+    #[test]
+    fn restore_read_of_plain_object_is_refused() {
+        assert_eq!(full_object_plaintext_len(&None, &restore_opts(), &plain_object_info()), None);
+    }
+
+    #[test]
+    fn encrypted_object_is_refused() {
+        assert_eq!(
+            full_object_plaintext_len(&None, &ObjectOptions::default(), &encrypted_object_info()),
+            None
+        );
+    }
+
+    #[test]
+    fn compressed_object_without_actual_size_is_refused() {
+        // A compressed object whose actual size cannot be resolved must not be
+        // served from cache: there is no length to publish as object_info.size.
+        let mut user_defined = HashMap::new();
+        user_defined.insert("x-rustfs-internal-compression".to_string(), "klauspost/compress/s2".to_string());
+        let info = ObjectInfo {
+            size: STORED_SIZE,
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+        assert_eq!(full_object_plaintext_len(&None, &ObjectOptions::default(), &info), None);
     }
 }

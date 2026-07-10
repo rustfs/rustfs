@@ -130,7 +130,9 @@ fn http_range_spec_from_object_info(oi: &ObjectInfo, part_number: usize) -> Opti
     HTTPRangeSpec::from_part_sizes(oi.size, part_number, oi.parts.iter().map(part_plaintext_size))
 }
 
-fn restore_request_active(opts: &ObjectOptions) -> bool {
+/// A restore read forces `ReadPlan::build` down the `Plain` branch, so it
+/// yields the STORED representation even for compressed or encrypted objects.
+pub(crate) fn restore_request_active(opts: &ObjectOptions) -> bool {
     let restore = &opts.transition.restore_request;
     restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
 }

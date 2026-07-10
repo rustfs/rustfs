@@ -3903,6 +3903,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_rename_data_inline_quorum_failure_rolls_back_destination_object() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let disk_root = dir.path().join("disk0");
+        fs::create_dir_all(&disk_root).await.expect("disk root should be created");
+        let endpoint = Endpoint::try_from(disk_root.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let bucket = "bucket";
+        let object = "inline-object";
+        let tmp_object = "tmp-inline-object";
+        let version_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("version id should parse");
+
+        match disk.make_volume(bucket).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("bucket should be available: {err:?}"),
+        }
+        match disk.make_volume(RUSTFS_META_TMP_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("tmp bucket should be available: {err:?}"),
+        }
+
+        let object_dir = disk_root.join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        let mut old_fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 1);
+        old_fi.name = object.to_string();
+        old_fi.version_id = Some(version_id);
+        old_fi.data = Some(Bytes::from_static(b"old-inline"));
+        old_fi.size = 10;
+        old_fi.mod_time = Some(OffsetDateTime::now_utc());
+        let mut old_meta = FileMeta::default();
+        old_meta.add_version(old_fi).expect("old metadata should accept file info");
+        let old_meta_buf = old_meta.marshal_msg().expect("old metadata should encode");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), old_meta_buf.clone())
+            .await
+            .expect("old metadata should be written");
+
+        let mut new_fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 1);
+        new_fi.name = object.to_string();
+        new_fi.version_id = Some(version_id);
+        new_fi.data = Some(Bytes::from_static(b"new-inline"));
+        new_fi.size = 10;
+        new_fi.mod_time = Some(OffsetDateTime::now_utc());
+
+        let disks = vec![Some(disk), None];
+        let file_infos = vec![new_fi.clone(), new_fi];
+        let result = SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, tmp_object, &file_infos, bucket, object, 2).await;
+
+        assert!(result.is_err());
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("destination metadata should remain readable");
+        assert_eq!(restored_meta, old_meta_buf);
+    }
+
     #[test]
     fn disk_health_entry_returns_cached_value_within_ttl() {
         let entry = DiskHealthEntry {

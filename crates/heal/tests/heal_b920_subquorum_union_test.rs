@@ -565,4 +565,43 @@ mod serial_tests {
             "version must remain byte-identical after heal"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn deep_heal_keeps_present_ec2_plus_2_shards_healthy() {
+        disable_dangling_grace();
+        let (disk_paths, ecstore, heal_storage) = setup_test_env_n(4).await;
+        let bucket = "b1044-deep-verify";
+        let object = "obj.bin";
+        create_versioned_bucket(&ecstore, bucket).await;
+
+        let data_v1 = versioned_test_data(12);
+        let v1 = put_versioned(&ecstore, bucket, object, &data_v1).await;
+
+        std::fs::remove_dir_all(object_dir(&disk_paths[3], bucket, object)).expect("wipe object on disk3");
+        for disk in &disk_paths[..3] {
+            assert_eq!(count_part_files(&object_dir(disk, bucket, object)), 1, "intact shard must remain present");
+        }
+
+        let (_result, error) = heal_storage
+            .heal_object(bucket, object, Some(&v1), &deep_heal_opts())
+            .await
+            .expect("deep heal_object call must not itself error");
+        assert!(error.is_none(), "Deep heal must retain the three intact EC2+2 shards: {error:?}");
+
+        assert!(
+            xl_meta_path(&object_dir(&disk_paths[3], bucket, object)).exists(),
+            "Deep heal must restore xl.meta on the missing disk"
+        );
+        assert_eq!(
+            count_part_files(&object_dir(&disk_paths[3], bucket, object)),
+            1,
+            "Deep heal must restore the missing shard"
+        );
+        assert_eq!(
+            read_version(&ecstore, bucket, object, &v1).await,
+            data_v1,
+            "Deep-healed EC2+2 object must remain byte-identical"
+        );
+    }
 }
