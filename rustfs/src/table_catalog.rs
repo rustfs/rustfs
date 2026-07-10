@@ -1090,6 +1090,13 @@ struct TableMaintenanceHeartbeatRef<'a> {
     worker_id: &'a str,
 }
 
+struct TableMaintenancePreflightContext<'a> {
+    table_bucket: &'a str,
+    namespace: &'a Namespace,
+    table: &'a IdentifierSegment,
+    entry: &'a TableEntry,
+}
+
 struct TableMaintenanceWorkerControlReport<'a> {
     table_bucket: &'a str,
     namespace: &'a Namespace,
@@ -4084,7 +4091,7 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceEffectiveConfig> {
         let table_config_path = self
             .paths
-            .table_maintenance_config_path(table_bucket, &namespace, &table, &entry.table_id);
+            .table_maintenance_config_path(table_bucket, namespace, table, &entry.table_id);
         if let Some((config, _)) = self
             .read_entry_unlocked::<TableMaintenanceConfig>(self.catalog_bucket(), &table_config_path)
             .await?
@@ -4368,10 +4375,12 @@ where
                 .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
                 .await?;
             self.table_metadata_maintenance_scheduler_preflight(
-                table_bucket,
-                &namespace,
-                &table,
-                &entry,
+                TableMaintenancePreflightContext {
+                    table_bucket,
+                    namespace: &namespace,
+                    table: &table,
+                    entry: &entry,
+                },
                 &scheduler_id,
                 now,
                 effective,
@@ -4413,10 +4422,12 @@ where
                 .await?;
             match self
                 .table_metadata_maintenance_scheduler_preflight(
-                    table_bucket,
-                    &namespace,
-                    &table,
-                    &entry,
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
                     &scheduler_id,
                     now,
                     effective,
@@ -4628,10 +4639,7 @@ where
 
     async fn table_metadata_maintenance_scheduler_preflight(
         &self,
-        table_bucket: &str,
-        namespace: &Namespace,
-        table: &IdentifierSegment,
-        entry: &TableEntry,
+        context: TableMaintenancePreflightContext<'_>,
         scheduler_id: &str,
         now: OffsetDateTime,
         effective: TableMaintenanceEffectiveConfig,
@@ -4639,10 +4647,10 @@ where
         if !effective.config.background_enabled {
             let report = self
                 .put_table_metadata_maintenance_scheduler_control_report(TableMaintenanceSchedulerControlReport {
-                    table_bucket,
-                    namespace,
-                    table,
-                    entry,
+                    table_bucket: context.table_bucket,
+                    namespace: context.namespace,
+                    table: context.table,
+                    entry: context.entry,
                     scheduler_id: scheduler_id.to_string(),
                     effective: &effective,
                     status: TableMetadataMaintenanceJobStatus::Disabled,
@@ -4655,10 +4663,10 @@ where
         if effective.config.worker_paused {
             let report = self
                 .put_table_metadata_maintenance_scheduler_control_report(TableMaintenanceSchedulerControlReport {
-                    table_bucket,
-                    namespace,
-                    table,
-                    entry,
+                    table_bucket: context.table_bucket,
+                    namespace: context.namespace,
+                    table: context.table,
+                    entry: context.entry,
                     scheduler_id: scheduler_id.to_string(),
                     effective: &effective,
                     status: TableMetadataMaintenanceJobStatus::Paused,
@@ -4671,10 +4679,10 @@ where
 
         if let Some(current) = self
             .get_table_metadata_maintenance_report_for_entry_unlocked(
-                table_bucket,
-                namespace,
-                table,
-                &entry.table_id,
+                context.table_bucket,
+                context.namespace,
+                context.table,
+                &context.entry.table_id,
                 MAINTENANCE_JOB_ALIAS_CURRENT,
             )
             .await?
@@ -4746,7 +4754,17 @@ where
                 .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
                 .await?;
             match self
-                .table_metadata_maintenance_worker_preflight(table_bucket, &namespace, &table, &entry, &worker_id, now, effective)
+                .table_metadata_maintenance_worker_preflight(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &worker_id,
+                    now,
+                    effective,
+                )
                 .await?
             {
                 TableMaintenanceWorkerPreflight::Ready { effective, queued } => (effective, queued),
@@ -4778,7 +4796,17 @@ where
                 .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
                 .await?;
             let (effective, queued) = match self
-                .table_metadata_maintenance_worker_preflight(table_bucket, &namespace, &table, &entry, &worker_id, now, effective)
+                .table_metadata_maintenance_worker_preflight(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &worker_id,
+                    now,
+                    effective,
+                )
                 .await?
             {
                 TableMaintenanceWorkerPreflight::Ready { effective, queued } => (effective, queued),
@@ -4850,10 +4878,7 @@ where
 
     async fn table_metadata_maintenance_worker_preflight(
         &self,
-        table_bucket: &str,
-        namespace: &Namespace,
-        table: &IdentifierSegment,
-        entry: &TableEntry,
+        context: TableMaintenancePreflightContext<'_>,
         worker_id: &str,
         now: OffsetDateTime,
         effective: TableMaintenanceEffectiveConfig,
@@ -4861,10 +4886,10 @@ where
         if !effective.config.background_enabled {
             let report = self
                 .put_table_metadata_maintenance_worker_control_report(TableMaintenanceWorkerControlReport {
-                    table_bucket,
-                    namespace,
-                    table,
-                    entry,
+                    table_bucket: context.table_bucket,
+                    namespace: context.namespace,
+                    table: context.table,
+                    entry: context.entry,
                     worker_id: worker_id.to_string(),
                     effective: &effective,
                     status: TableMetadataMaintenanceJobStatus::Disabled,
@@ -4877,10 +4902,10 @@ where
         if effective.config.worker_paused {
             let report = self
                 .put_table_metadata_maintenance_worker_control_report(TableMaintenanceWorkerControlReport {
-                    table_bucket,
-                    namespace,
-                    table,
-                    entry,
+                    table_bucket: context.table_bucket,
+                    namespace: context.namespace,
+                    table: context.table,
+                    entry: context.entry,
                     worker_id: worker_id.to_string(),
                     effective: &effective,
                     status: TableMetadataMaintenanceJobStatus::Paused,
@@ -4893,10 +4918,10 @@ where
 
         if let Some(current) = self
             .get_table_metadata_maintenance_report_for_entry_unlocked(
-                table_bucket,
-                namespace,
-                table,
-                &entry.table_id,
+                context.table_bucket,
+                context.namespace,
+                context.table,
+                &context.entry.table_id,
                 MAINTENANCE_JOB_ALIAS_CURRENT,
             )
             .await?
