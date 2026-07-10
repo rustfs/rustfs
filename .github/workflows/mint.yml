@@ -26,7 +26,24 @@
 # the run red. The job fails only when mint produces no results at all
 # (infrastructure error). Once a suite passes reliably, tightening this into a
 # baseline gate (like implemented_tests.txt for s3-tests) is the natural next
-# step.
+# step. Tightening this into a per-suite baseline gate is tracked as ci-3
+# (backlog#1149) and is intentionally NOT done here.
+#
+# Runner infrastructure (ci-2, backlog#1149): this job needs a working Docker
+# daemon to (a) build the RustFS source image with buildx and (b) run both the
+# RustFS server and the mint image. It previously ran on the self-hosted
+# `sm-standard-4` label, which is served by heterogeneous runners; its single
+# recorded run (28730530597, 2026-07-05) landed on a minimal pod with no
+# `/var/run/docker.sock`, so "Enable buildx" died at `docker buildx create`
+# ("failed to connect to the docker API at unix:///var/run/docker.sock") before
+# any test executed -- the same root cause ci-1 fixed for the weekly s3-tests
+# sweep. The fix is to pin to GitHub-hosted `ubuntu-latest`, which reliably
+# ships a running Docker daemon + buildx + python3, instead of trusting the
+# drifting self-hosted fleet. Tradeoff: the source Rust build is heavier on a
+# GitHub-hosted 4-vCPU runner than on a warm self-hosted host, but it stays
+# well inside the 120-minute budget and buys deterministic infra. The
+# docker-capable self-hosted `dind-sm-standard-2` label was the alternative but
+# has fewer cores and reintroduces fleet-state risk for no reliability gain.
 
 name: mint
 
@@ -65,9 +82,17 @@ env:
 
   MINT_SUITES: ${{ github.event.inputs.suites || '' }}
   MINT_MODE: ${{ github.event.inputs.mode || 'core' }}
-  # NOTE: minio/mint:edge is a rolling tag. If sweeps get noisy from upstream
-  # mint changes, pin this to a digest known to work.
-  MINT_IMAGE: ${{ github.event.inputs.mint-image || 'minio/mint:edge' }}
+  # minio/mint:edge is a rolling tag, so an unpinned run is not reproducible and
+  # can go red purely from an upstream mint change (ci-2, backlog#1149). Pin the
+  # default to the linux/amd64 digest resolved on 2026-07-10. workflow_dispatch
+  # can still override via the `mint-image` input (e.g. to test a newer edge).
+  # Refresh: docker manifest inspect minio/mint:edge --verbose | grep digest
+  #   (or, without a docker daemon:)
+  #   TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:minio/mint:pull" | jq -r .token)
+  #   curl -sI -H "Authorization: Bearer $TOKEN" \
+  #     -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+  #     https://registry-1.docker.io/v2/minio/mint/manifests/edge | grep -i docker-content-digest
+  MINT_IMAGE: ${{ github.event.inputs.mint-image || 'minio/mint:edge@sha256:08a05e68893c68be2a83b6f79556853ed6aa3c6c9e64c823a00853e4e55d2200' }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -79,7 +104,12 @@ defaults:
 
 jobs:
   mint:
-    runs-on: sm-standard-4
+    # GitHub-hosted: reliably provides a running Docker daemon + buildx +
+    # python3. See the header note (ci-2) for why the self-hosted sm-standard-4
+    # label was abandoned (no docker.sock on the pod its only run landed on).
+    # TODO(ci-8): scheduled-failure alerting (auto-open issue on a red weekly
+    # run) is added by the ci-8 composite action; do not implement it here.
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -90,9 +120,9 @@ jobs:
       - name: Build RustFS image (source, cached)
         run: |
           DOCKER_BUILDKIT=1 docker buildx build --load \
-            --platform ${PLATFORM} \
-            --cache-from type=gha,scope=${BUILDX_CACHE_SCOPE} \
-            --cache-to type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE} \
+            --platform "${PLATFORM}" \
+            --cache-from "type=gha,scope=${BUILDX_CACHE_SCOPE}" \
+            --cache-to "type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE}" \
             -t rustfs-ci \
             -f Dockerfile.source .
 
@@ -104,15 +134,15 @@ jobs:
             --network rustfs-net \
             -p 9000:9000 \
             -e RUSTFS_ADDRESS=0.0.0.0:9000 \
-            -e RUSTFS_ACCESS_KEY=${S3_ACCESS_KEY} \
-            -e RUSTFS_SECRET_KEY=${S3_SECRET_KEY} \
+            -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
+            -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
             -e RUSTFS_VOLUMES="/data/rustfs{0...3}" \
             -v /tmp/rustfs-mint:/data \
             rustfs-ci
 
       - name: Wait for RustFS ready
         run: |
-          for i in {1..60}; do
+          for _ in {1..60}; do
             if curl -sf http://127.0.0.1:9000/health >/dev/null 2>&1; then
               echo "RustFS is ready"
               exit 0
