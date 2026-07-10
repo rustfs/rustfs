@@ -32,7 +32,7 @@ use crate::disk::{
     os,
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
-use crate::erasure::coding::bitrot_verify;
+use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
@@ -5285,6 +5285,12 @@ impl DiskAPI for LocalDisk {
         };
 
         let erasure = &fi.erasure;
+        let codec_erasure = coding::Erasure::new_with_options(
+            erasure.data_blocks,
+            erasure.parity_blocks,
+            erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let checksum_algo =
@@ -5305,9 +5311,9 @@ impl DiskAPI for LocalDisk {
             let err = self
                 .bitrot_verify(
                     &part_path,
-                    erasure.shard_file_size(part.size as i64) as usize,
+                    codec_erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
-                    erasure.shard_size(),
+                    codec_erasure.shard_size(),
                 )
                 .await
                 .err();
@@ -12350,6 +12356,69 @@ mod test {
             .expect("verify_file should return per-part status");
 
         assert_eq!(result.results, vec![CHECK_PART_FILE_CORRUPT]);
+    }
+
+    #[tokio::test]
+    async fn local_disk_verify_file_matches_legacy_and_nonlegacy_shard_geometry() {
+        use crate::erasure::coding::{BitrotWriter, Erasure};
+        use rustfs_filemeta::ChecksumInfo;
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let volume = "verify-volume";
+        ensure_test_volume(&disk, volume).await;
+
+        for (object, payload, uses_legacy_checksum) in [
+            ("nonlegacy.bin", Bytes::from_static(b"sharddata"), false),
+            ("legacy.bin", Bytes::from_static(b"legacydata"), true),
+        ] {
+            let data_dir = Uuid::new_v4();
+            let part_number = 1;
+            let codec_erasure = Erasure::new_with_options(2, 2, 16, uses_legacy_checksum);
+            let mut file_info = FileInfo::new(object, 2, 2);
+            file_info.volume = volume.to_string();
+            file_info.name = object.to_string();
+            file_info.size = 17;
+            file_info.data_dir = Some(data_dir);
+            file_info.uses_legacy_checksum = uses_legacy_checksum;
+            file_info.erasure.block_size = 16;
+            file_info.erasure.index = 1;
+            file_info.erasure.checksums = vec![ChecksumInfo {
+                part_number,
+                algorithm: HashAlgorithm::HighwayHash256S,
+                hash: Bytes::new(),
+            }];
+            file_info.parts = vec![ObjectPartInfo {
+                number: part_number,
+                size: 17,
+                actual_size: 17,
+                ..Default::default()
+            }];
+
+            let checksum_algo = if uses_legacy_checksum {
+                HashAlgorithm::HighwayHash256SLegacy
+            } else {
+                HashAlgorithm::HighwayHash256S
+            };
+            let mut writer = BitrotWriter::new(std::io::Cursor::new(Vec::new()), codec_erasure.shard_size(), checksum_algo);
+            writer.write(&payload[..8]).await.expect("first shard block should encode");
+            writer.write(&payload[8..]).await.expect("final shard block should encode");
+            writer.shutdown().await.expect("bitrot writer should flush test payload");
+
+            let part_path = path_join_buf(&[object, &data_dir.to_string(), &format!("part.{part_number}")]);
+            disk.write_all(volume, &part_path, Bytes::from(writer.into_inner().into_inner()))
+                .await
+                .expect("encoded part should be written");
+
+            let result = disk
+                .verify_file(volume, object, &file_info)
+                .await
+                .expect("verify_file should return per-part status");
+
+            assert_eq!(result.results, vec![CHECK_PART_SUCCESS]);
+        }
     }
 
     // ----- HP-6: O_DIRECT shard write -----
