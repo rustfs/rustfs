@@ -147,23 +147,17 @@ mod tests {
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.fill_body(&plan, Bytes::from_static(b"hello")).await;
-        let _ = invalidate_object_data_cache_before_mutation(&adapter, "bucket", "object").await;
-        let invalidation = invalidate_object_data_cache_after_delete_success(&adapter, "bucket", "object").await;
+        let before_mutation = invalidate_object_data_cache_before_mutation(&adapter, "bucket", "object").await;
+        let after_delete = invalidate_object_data_cache_after_delete_success(&adapter, "bucket", "object").await;
         let lookup = adapter.lookup_body(&plan).await;
 
         assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
-        // The behavioral guarantee is that the cached body is gone (Miss below).
-        // The exact result variant is transitional: today `MokaBackend` returns
-        // `Success`; once it is widened to report the removal count (backlog#1141)
-        // this second (post-delete) invalidation of an already-empty identity
-        // becomes `NoOp`. Accept any successful variant so this file (owned by a
-        // different branch than moka_backend.rs) does not break at merge.
-        assert!(matches!(
-            invalidation,
-            ObjectDataCacheInvalidationResult::Success
-                | ObjectDataCacheInvalidationResult::NoOp
-                | ObjectDataCacheInvalidationResult::Removed { .. }
-        ));
+        // The two-phase invalidation is deliberate hygiene, and the outcomes must
+        // distinguish real churn from its no-op half: the first call evicts the
+        // cached body, the second finds the identity already empty. Dashboards
+        // read that split (backlog#1141).
+        assert_eq!(before_mutation, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
+        assert_eq!(after_delete, ObjectDataCacheInvalidationResult::NoOp);
         assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
     }
 

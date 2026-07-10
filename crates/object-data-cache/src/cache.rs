@@ -180,19 +180,32 @@ impl ObjectDataCache {
             ObjectDataCacheBackendKind::Moka(backend) => backend.fill_body(plan, bytes).await,
         };
 
-        // Only the true leader path that actually inserted counts as a fill and
-        // moves the entry count; a `JoinedInflightFill` merely observed another
-        // fill's outcome (already counted by singleflight_joins) so it records
-        // neither fill bytes nor a duration (which would be wait time, not fill
-        // work). See backlog#1123.
+        // Fill bytes and duration describe work the backend actually performed,
+        // so each outcome is listed explicitly rather than caught by a wildcard:
+        // a rejected fill wrote nothing and must not inflate fill_bytes_total.
+        // See backlog#1123.
         let (recorded_bytes, duration) = match &result {
+            // Inserted the body: the only outcome that moves the entry count.
             ObjectDataCacheFillResult::Inserted => {
                 self.stats.record_fill();
                 self.refresh_entry_count();
                 (fill_bytes, Some(fill_start.elapsed().as_secs_f64()))
             }
-            ObjectDataCacheFillResult::JoinedInflightFill => (0, None),
-            _ => (fill_bytes, Some(fill_start.elapsed().as_secs_f64())),
+            // Reached the backend and wrote the body, then undid it. The bytes
+            // were written, so both are real.
+            ObjectDataCacheFillResult::SkippedInvalidationRace | ObjectDataCacheFillResult::SkippedIdentityOverflow => {
+                (fill_bytes, Some(fill_start.elapsed().as_secs_f64()))
+            }
+            // Rejected before writing anything: count the outcome, nothing else.
+            // A `JoinedInflightFill` is already counted by singleflight_joins,
+            // and its elapsed time would be wait time, not fill work.
+            ObjectDataCacheFillResult::JoinedInflightFill
+            | ObjectDataCacheFillResult::SkippedFillConcurrency
+            | ObjectDataCacheFillResult::SkippedMemoryPressure
+            | ObjectDataCacheFillResult::SkippedDisabled
+            | ObjectDataCacheFillResult::SkippedByMode
+            | ObjectDataCacheFillResult::SkippedNotCacheable
+            | ObjectDataCacheFillResult::SkippedSizeMismatch => (0, None),
         };
         record_fill_result(
             self.backend.as_metric_label(),
@@ -279,7 +292,6 @@ const fn invalidation_outcome(result: &ObjectDataCacheInvalidationResult) -> &'s
         // removal count (`MokaBackend`) still returns `Success`. Treat it as a
         // removal so the gauge keeps refreshing until the backend reports
         // `Removed`/`NoOp` (see report / backlog#1141).
-        ObjectDataCacheInvalidationResult::Success => INVALIDATION_OUTCOME_REMOVED,
     }
 }
 
@@ -342,8 +354,6 @@ pub enum ObjectDataCacheFillResult {
     SkippedIdentityOverflow,
     /// Fill was skipped because the provided body length did not match the cache key identity.
     SkippedSizeMismatch,
-    /// Fill waiters were released without a published leader result.
-    SkippedSingleflightClosed,
     /// Fill was undone because an invalidation raced with the insert.
     SkippedInvalidationRace,
     /// The caller joined an in-flight leader fill instead of performing one, so
@@ -366,7 +376,6 @@ impl ObjectDataCacheFillResult {
             Self::SkippedMemoryPressure => "skipped_memory_pressure",
             Self::SkippedIdentityOverflow => "skipped_identity_overflow",
             Self::SkippedSizeMismatch => "skipped_size_mismatch",
-            Self::SkippedSingleflightClosed => "skipped_singleflight_closed",
             Self::SkippedInvalidationRace => "skipped_invalidation_race",
             Self::JoinedInflightFill => "joined_inflight",
             Self::Inserted => "inserted",
@@ -408,10 +417,6 @@ impl ObjectDataCacheInvalidationReason {
 /// Result of an invalidation request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectDataCacheInvalidationResult {
-    /// Invalidation completed successfully, but the backend did not report the
-    /// removal outcome. Transitional: prefer `Removed`/`NoOp`. `MokaBackend`
-    /// still returns this until it is widened to report the removed key count.
-    Success,
     /// Cache keys were removed for the identity.
     Removed {
         /// Number of cache keys dropped.

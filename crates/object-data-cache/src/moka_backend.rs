@@ -220,7 +220,7 @@ impl MokaBackend {
 
         // Build the entry up front so its Arc pointer can serve as the
         // generation token registered in the index alongside the key.
-        let entry = Arc::new(ObjectDataCacheEntry::new(bytes, key.size, Arc::clone(&key.etag)));
+        let entry = Arc::new(ObjectDataCacheEntry::new(bytes));
         let token = Arc::as_ptr(&entry) as ObjectDataCacheKeyToken;
 
         // Run the register/insert/recheck/undo sequence in a spawned task and
