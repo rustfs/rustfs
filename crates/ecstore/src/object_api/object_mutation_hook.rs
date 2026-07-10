@@ -26,7 +26,8 @@
 //! This hook lets the app-layer cache adapter drop those bodies from its index
 //! the moment ecstore removes the object (ODC-26, backlog#1131).
 
-use std::sync::{Arc, RwLock};
+use crate::object_api::hook_slot::HookSlot;
+use std::sync::Arc;
 
 /// Invalidates cached object bodies after an ecstore-internal mutation removed
 /// them. Keyed on `(bucket, object)`; the implementation invalidates every
@@ -36,35 +37,28 @@ pub trait ObjectMutationHook: Send + Sync + 'static {
     async fn after_object_mutation(&self, bucket: &str, object: &str);
 }
 
-// `RwLock<Option<Arc<dyn ...>>>` for the same reason as the GET hook slot:
-// arc-swap cannot hold an unsized `Arc<dyn ObjectMutationHook>`. Registration is
-// a startup event and each delete-path invocation only clones an `Arc` under the
-// read guard, negligible next to the delete it accompanies.
-static OBJECT_MUTATION_HOOK: RwLock<Option<Arc<dyn ObjectMutationHook>>> = RwLock::new(None);
+// A `HookSlot`, for the same reason as the GET hook slot: arc-swap cannot hold
+// an unsized `Arc<dyn ObjectMutationHook>`. Registration is a startup event and
+// each delete-path invocation only clones an `Arc` under the read guard,
+// negligible next to the delete it accompanies.
+static OBJECT_MUTATION_HOOK: HookSlot<dyn ObjectMutationHook> = HookSlot::new();
 
 /// Register (or re-register) the process-wide object mutation hook.
 ///
 /// Re-registration atomically swaps to `hook`, mirroring the GET body hook so a
 /// rebuilt `AppContext` leaves ecstore's delete paths pointed at the newest
-/// adapter. Replacing a *different* instance is logged at WARN: in production
-/// the hook is installed once per process, so a swap to a distinct instance
-/// signals an unexpected re-init and orphans the previous adapter's cache.
+/// adapter.
 pub fn register_object_mutation_hook(hook: Arc<dyn ObjectMutationHook>) {
-    let mut slot = OBJECT_MUTATION_HOOK.write().unwrap_or_else(|e| e.into_inner());
-    if let Some(previous) = slot.as_ref()
-        && !Arc::ptr_eq(previous, &hook)
-    {
-        tracing::warn!(
-            "object mutation cache hook re-registered with a different instance; \
-             the previous adapter's cache is now unreachable by ecstore's delete paths"
-        );
-    }
-    *slot = Some(hook);
+    OBJECT_MUTATION_HOOK.register(
+        hook,
+        "object mutation cache hook re-registered with a different instance; \
+         the previous adapter's cache is now unreachable by ecstore's delete paths",
+    );
 }
 
 /// The registered hook, if any.
 fn object_mutation_hook() -> Option<Arc<dyn ObjectMutationHook>> {
-    OBJECT_MUTATION_HOOK.read().unwrap_or_else(|e| e.into_inner()).clone()
+    OBJECT_MUTATION_HOOK.get()
 }
 
 /// Invoke the registered hook for `(bucket, object)`, if one is installed.
@@ -81,7 +75,7 @@ pub(crate) async fn notify_object_mutation(bucket: &str, object: &str) {
 /// deterministically without leaking a hook into unrelated tests.
 #[cfg(test)]
 pub(crate) fn clear_object_mutation_hook() {
-    *OBJECT_MUTATION_HOOK.write().unwrap_or_else(|e| e.into_inner()) = None;
+    OBJECT_MUTATION_HOOK.clear();
 }
 
 #[cfg(test)]

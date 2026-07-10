@@ -53,6 +53,7 @@ pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 
 mod body_cache_hook;
+mod hook_slot;
 mod object_mutation_hook;
 mod readers;
 mod types;
