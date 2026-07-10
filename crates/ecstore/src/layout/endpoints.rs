@@ -768,13 +768,16 @@ impl StartupTopologyPolicy {
             Some("bounded") => StartupTopologyWaitMode::Bounded,
             Some("fail-fast") | Some("failfast") | Some("strict") => StartupTopologyWaitMode::FailFast,
             // "auto", unset, or unrecognized: derive from the environment.
+            // Only URL-style (distributed) endpoints resolve hostnames and need
+            // to wait for DNS/topology convergence; local path endpoints never
+            // do, so they fail fast regardless of the platform.
             _ => {
-                if kubernetes {
-                    StartupTopologyWaitMode::Orchestrated
-                } else if distributed {
-                    StartupTopologyWaitMode::Bounded
-                } else {
+                if !distributed {
                     StartupTopologyWaitMode::FailFast
+                } else if kubernetes {
+                    StartupTopologyWaitMode::Orchestrated
+                } else {
+                    StartupTopologyWaitMode::Bounded
                 }
             }
         };
@@ -1351,6 +1354,12 @@ mod test {
         let local = StartupTopologyPolicy::resolve_from(None, false, false, None, None);
         assert_eq!(local.mode, StartupTopologyWaitMode::FailFast);
         assert_eq!(local.wait_timeout, Duration::ZERO);
+
+        // Local path endpoints stay fail-fast even under Kubernetes: they have
+        // no hostnames to resolve, so there is nothing to wait for.
+        let k8s_local = StartupTopologyPolicy::resolve_from(None, true, false, None, None);
+        assert_eq!(k8s_local.mode, StartupTopologyWaitMode::FailFast);
+        assert_eq!(k8s_local.wait_timeout, Duration::ZERO);
     }
 
     #[test]
