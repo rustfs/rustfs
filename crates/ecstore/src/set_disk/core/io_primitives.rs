@@ -357,7 +357,7 @@ impl MetadataQuorumAccumulator {
         if !self.allow_early_stop {
             return None;
         }
-        if self.delete_marker_votes >= self.missing_response_quorum() {
+        if self.delete_marker_votes >= self.default_write_quorum() {
             return Some(MetadataEarlyStopDecision {
                 reason: GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
             });
@@ -373,8 +373,8 @@ impl MetadataQuorumAccumulator {
         if self
             .candidate
             .as_ref()
-            .and_then(|candidate| self.candidate_read_quorum(candidate))
-            .is_some_and(|read_quorum| self.candidate_votes >= read_quorum)
+            .and_then(|candidate| self.candidate_latest_quorum(candidate))
+            .is_some_and(|latest_quorum| self.candidate_votes >= latest_quorum)
         {
             return Some(MetadataEarlyStopDecision {
                 reason: GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
@@ -441,14 +441,26 @@ impl MetadataQuorumAccumulator {
         GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM
     }
 
-    pub(in crate::set_disk) fn candidate_read_quorum(&self, candidate: &FileInfo) -> Option<usize> {
+    pub(in crate::set_disk) fn candidate_latest_quorum(&self, candidate: &FileInfo) -> Option<usize> {
         if self.default_parity_count == 0 {
             return Some(self.total_disks);
         }
         if candidate.deleted || candidate.size == 0 || candidate.erasure.parity_blocks >= self.total_disks {
             return None;
         }
-        Some(self.total_disks.saturating_sub(candidate.erasure.parity_blocks))
+        Some(candidate.write_quorum(self.default_write_quorum()))
+    }
+
+    pub(in crate::set_disk) fn default_write_quorum(&self) -> usize {
+        if self.default_parity_count == 0 {
+            return self.total_disks;
+        }
+        let data_blocks = self.total_disks.saturating_sub(self.default_parity_count);
+        if data_blocks == self.default_parity_count {
+            data_blocks.saturating_add(1)
+        } else {
+            data_blocks
+        }
     }
 
     pub(in crate::set_disk) fn missing_response_quorum(&self) -> usize {
@@ -1772,7 +1784,7 @@ pub(in crate::set_disk) fn should_allow_metadata_early_stop(
     }
 
     (is_get_metadata_early_stop_enabled() && version_id.is_empty() && !healing && !incl_free_versions)
-        || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing)
+        || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing && !incl_free_versions)
 }
 
 /// Final gate for the metadata early-stop fast path.
@@ -1885,7 +1897,7 @@ impl SetDisks {
         read_data: bool,
         healing: bool,
         incl_free_versions: bool,
-        allow_early_stop: bool,
+        caller_allows_early_stop: bool,
         default_parity_count: usize,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
         Self::read_all_fileinfo_inner(
@@ -1898,7 +1910,7 @@ impl SetDisks {
             healing,
             incl_free_versions,
             true,
-            allow_early_stop,
+            caller_allows_early_stop,
             default_parity_count,
         )
         .await
@@ -4064,24 +4076,24 @@ mod tests {
     }
 
     #[test]
-    fn metadata_quorum_accumulator_candidate_quorum_handles_zero_parity_and_invalid_candidates() {
+    fn metadata_quorum_accumulator_candidate_latest_quorum_handles_zero_parity_and_invalid_candidates() {
         let accumulator = MetadataQuorumAccumulator::new(4, 0, true);
         let candidate = metadata_test_fileinfo("object");
-        assert_eq!(accumulator.candidate_read_quorum(&candidate), Some(4));
+        assert_eq!(accumulator.candidate_latest_quorum(&candidate), Some(4));
         assert_eq!(accumulator.missing_response_quorum(), 4);
 
         let accumulator = MetadataQuorumAccumulator::new(4, 2, true);
         let mut deleted = candidate.clone();
         deleted.deleted = true;
-        assert_eq!(accumulator.candidate_read_quorum(&deleted), None);
+        assert_eq!(accumulator.candidate_latest_quorum(&deleted), None);
 
         let mut empty = candidate.clone();
         empty.size = 0;
-        assert_eq!(accumulator.candidate_read_quorum(&empty), None);
+        assert_eq!(accumulator.candidate_latest_quorum(&empty), None);
 
         let mut impossible_parity = candidate;
         impossible_parity.erasure.parity_blocks = 4;
-        assert_eq!(accumulator.candidate_read_quorum(&impossible_parity), None);
+        assert_eq!(accumulator.candidate_latest_quorum(&impossible_parity), None);
     }
 
     #[test]
