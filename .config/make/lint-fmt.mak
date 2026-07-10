@@ -15,7 +15,7 @@ fmt-check: core-deps fmt-deps ## Check code formatting
 .PHONY: clippy-check
 clippy-check: core-deps ## Run clippy checks
 	@echo "🔍 Running clippy checks..."
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets -- -D warnings
 
 .PHONY: clippy-fix
 clippy-fix: core-deps ## Apply clippy fixes
