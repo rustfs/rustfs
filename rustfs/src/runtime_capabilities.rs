@@ -24,6 +24,7 @@ const EBPF_LINUX_ONLY: &str = "eBPF support is only available on linux targets";
 const STORAGE_MEDIA_NOT_REPORTED: &str = "storage media not reported by endpoints";
 const FAILURE_DOMAIN_NOT_REPORTED: &str = "failure domain labels not reported by endpoints";
 const NUMA_NOT_WIRED: &str = "NUMA topology not wired into runtime";
+const RUNTIME_TELEMETRY_NOT_COMPILED_IN: &str = "dial9 telemetry not compiled into this binary";
 const NUMA_LINUX_ONLY: &str = "NUMA topology reporting currently targets linux runtimes";
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -99,7 +100,10 @@ pub fn topology_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPool
 }
 
 fn runtime_telemetry_status() -> CapabilityStatus {
-    if rustfs_obs::dial9::is_enabled() {
+    if !rustfs_obs::dial9::is_supported() {
+        return CapabilityStatus::unsupported().with_reason(RUNTIME_TELEMETRY_NOT_COMPILED_IN);
+    }
+    if rustfs_obs::dial9::is_configured() {
         CapabilityStatus::supported()
     } else {
         CapabilityStatus::disabled()
