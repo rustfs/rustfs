@@ -56,6 +56,8 @@ mod body_cache_hook;
 mod readers;
 mod types;
 
+#[cfg(test)]
+pub(crate) use body_cache_hook::clear_get_object_body_cache_hook;
 pub(crate) use body_cache_hook::get_object_body_cache_hook;
 pub use body_cache_hook::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
 pub use readers::*;

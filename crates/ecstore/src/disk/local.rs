@@ -9956,6 +9956,66 @@ mod test {
         assert!(!object_dir.join(rollback_dir.to_string()).exists());
     }
 
+    // backlog#1158 safety premise: the set layer fans the undo out to every online
+    // disk on a quorum-failed delete, including disks that never staged a rollback
+    // (e.g. a disk that errored before staging). A delete-undo on such a disk must be
+    // a safe no-op that leaves the committed object untouched.
+    #[tokio::test]
+    async fn test_delete_version_undo_is_noop_when_nothing_staged() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("aaaaaaaa-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("bbbbbbbb-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("cccccccc-1111-2222-3333-444444444444").expect("rollback dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        // A committed object exists on this disk, but no rollback state was staged.
+        let object_dir = dir.path().join(bucket).join("dir/object");
+        let data_path = object_dir.join(data_dir.to_string());
+        fs::create_dir_all(&data_path).await.expect("data dir should be created");
+        fs::write(data_path.join("part.1"), b"live-data")
+            .await
+            .expect("part data should be written");
+        let fi = test_file_info(object, version_id, Some(data_dir), None);
+        let meta = test_meta(fi.clone());
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), meta.clone())
+            .await
+            .expect("metadata should be written");
+
+        // Undo targeting a rollback dir that was never created must be an Ok no-op.
+        disk.delete_version(
+            bucket,
+            object,
+            fi.clone(),
+            false,
+            DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("undo with no staged rollback state must be a no-op");
+
+        // The committed object is untouched.
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("metadata should remain"),
+            meta
+        );
+        assert_eq!(fs::read(data_path.join("part.1")).await.expect("data should remain"), b"live-data");
+        assert!(!object_dir.join(rollback_dir.to_string()).exists());
+    }
+
     #[tokio::test]
     async fn test_delete_marker_rollback_removes_new_metadata_without_backup() {
         use tempfile::tempdir;

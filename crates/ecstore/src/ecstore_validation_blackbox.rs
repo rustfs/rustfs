@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 
 /// Returns the backing [`tempfile::TempDir`]s alongside the set so callers keep
 /// them alive for the test's duration and the directories are removed on drop.
-async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
+pub(crate) async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
     let format = FormatV3::new(1, drive_count);
     let mut dirs = Vec::with_capacity(drive_count);
     let mut endpoints = Vec::with_capacity(drive_count);

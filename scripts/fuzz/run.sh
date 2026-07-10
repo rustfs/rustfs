@@ -47,7 +47,10 @@ PREBUILT_BINARY_DIR=${PREBUILT_BINARY_DIR:-}
 cd "$FUZZ_DIR"
 mkdir -p "$ARTIFACT_ROOT"
 
-targets="path_containment bucket_validation local_metadata"
+# All buildable fuzz bins registered in fuzz/Cargo.toml. Keep in sync with the
+# smoke/nightly matrices in .github/workflows/fuzz.yml. The *_storage_api.rs
+# files are `mod` submodules of their parent targets, not standalone bins.
+targets="archive_extract bucket_validation local_metadata path_containment policy_ingress"
 if [ -n "$FUZZ_TARGET" ]; then
     targets="$FUZZ_TARGET"
 fi

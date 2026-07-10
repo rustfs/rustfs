@@ -87,7 +87,7 @@ mod rio_tests {
 }
 
 #[cfg(test)]
-mod ecstore_validation_blackbox;
+pub(crate) mod ecstore_validation_blackbox;
 
 #[cfg(test)]
 pub(crate) mod test_metrics;

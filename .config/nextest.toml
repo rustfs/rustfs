@@ -17,9 +17,63 @@
 # nextest executes each test in its own process, where the in-process
 # serial_test mutex has no effect. A nextest test-group with max-threads = 1 is
 # the mechanism that actually serializes across nextest's process boundary.
+#
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+# The `default` profile is what local `cargo nextest run` uses. It NEVER
+# retries: a red test locally means a real failure to investigate, not noise to
+# paper over. The `ci` profile (below) is the strict CI gate: global
+# retries = 0 so a new race's first occurrence is never masked, plus a
+# narrowly-scoped quarantine list (retries = 2) for tests with a tracked OPEN
+# flake issue. Flake policy lives in docs/testing/README.md.
+
 [test-groups]
 ecstore-serial-flaky = { max-threads = 1 }
 
+# --- default profile (local): serialize the flaky groups, never retry --------
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
+
+# ---------------------------------------------------------------------------
+# ci profile — the strict CI gate (ci.yml `cargo nextest run --profile ci`)
+# ---------------------------------------------------------------------------
+[profile.ci]
+# Strict: a new race must fail on its first occurrence, never be retried away.
+retries = 0
+# Report every failure in one run instead of bailing on the first.
+fail-fast = false
+
+[profile.ci.junit]
+# Emitted to target/nextest/ci/junit.xml; uploaded as a CI artifact.
+# Tests that pass only after a quarantine retry are marked `flaky` here — that
+# marker is the observable signal the flake policy is built around.
+path = "junit.xml"
+
+# ===========================================================================
+# QUARANTINE — flaky tests granted retries = 2 under the ci profile ONLY.
+#
+# RULES (enforced by review, see docs/testing/README.md):
+#   * Every entry MUST link exactly one OPEN issue tracking the flake.
+#   * An entry stays until the issue is fixed (test made robust) or the test is
+#     deleted — 30-day policy. No entry may exist without a live issue link.
+#
+# Each entry also re-declares the `ecstore-serial-flaky` test-group so the
+# serialization holds under the ci profile (nextest evaluates a named
+# profile's own overrides list, not the default profile's).
+# ===========================================================================
+
+# QUARANTINE: OPEN backlog#937 — concurrent_resend lock-acquire deadline flakes
+# under saturated disk I/O in the full parallel suite.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(concurrent_resend_same_part_commits_one_generation)'
+test-group = 'ecstore-serial-flaky'
+retries = 2
+
+# QUARANTINE: OPEN backlog#937 — store::bucket::tests::bucket_delete_* race
+# make_bucket into InsufficientWriteQuorum via shared global state under load.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/)'
+test-group = 'ecstore-serial-flaky'
+retries = 2

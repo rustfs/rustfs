@@ -72,6 +72,10 @@ impl ObjectDataCacheKey {
     }
 
     /// Returns true when this key targets the canonical unversioned body variant.
+    ///
+    /// Only exercised by tests; gated so it is not compiled into the shipping
+    /// binary as dead code (backlog#1141).
+    #[cfg(test)]
     pub fn is_null_version(&self) -> bool {
         self.version_id.as_ref() == NULL_VERSION_ID
     }
