@@ -11354,6 +11354,41 @@ mod test {
         assert!(!is_io_uring_unsupported(&Error::other("driver gone")));
     }
 
+    /// Per-disk probe cache (backlog#1101): a disk already recorded as
+    /// unsupported is skipped by `try_new` without a fresh probe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uring_probe_cache_skips_known_unsupported_disk() {
+        use tempfile::tempdir;
+
+        // Precondition: io_uring must be usable on this host. Otherwise a `None`
+        // result below is ambiguous — it could be a probe failure rather than
+        // the cache fast-path — so the test would pass vacuously in a restricted
+        // CI environment. Probe an uncached root; skip if io_uring is
+        // unavailable. (The returned backend, if any, is dropped immediately,
+        // shutting its driver down.)
+        let probe_dir = tempdir().expect("tempdir");
+        if UringBackend::try_new(probe_dir.path().to_path_buf()).is_none() {
+            return;
+        }
+
+        // Now a `None` for a cached-unsupported root can ONLY be the cache
+        // fast-path (io_uring works here, so a fresh probe would have succeeded).
+        let cached = std::path::PathBuf::from("/nonexistent/uring-probe-cache-test-root");
+        URING_UNSUPPORTED_DISKS
+            .lock()
+            .expect("uring probe cache mutex poisoned")
+            .insert(cached.clone());
+        let skipped = UringBackend::try_new(cached.clone()).is_none();
+        // Clean up the process-wide cache entry so no shared state leaks to
+        // other tests.
+        URING_UNSUPPORTED_DISKS
+            .lock()
+            .expect("uring probe cache mutex poisoned")
+            .remove(&cached);
+        assert!(skipped, "a cached-unsupported disk must skip the probe and return None");
+    }
+
     /// Once io_uring is latched off (backlog#1101), reads still return correct
     /// bytes via StdBackend. Lay out the disk with LocalDisk, then read the same
     /// root through a UringBackend with the latch tripped.
