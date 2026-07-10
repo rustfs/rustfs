@@ -81,6 +81,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         }
     }
