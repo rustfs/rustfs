@@ -105,19 +105,13 @@ async fn two_embedded_servers_start_and_shutdown_independently() {
     server_a.shutdown().await;
 }
 
-// backlog#1052 auth acceptance: two embedded servers with *different*
-// credentials each authenticate against their own root identity. Server B
-// accepts its own access key and rejects server A's. This exercises the
-// per-server auth path (each request resolves its own AppContext for
-// credential validation).
-//
-// NOTE: full bucket-namespace isolation is a separate, deeper follow-up: the
-// ecstore data plane still resolves some lower-level reads (peer/disk/bucket
-// metadata) through the process-global object handle, so the two servers do
-// not yet present independent bucket listings even though each holds its own
-// store object. That isolation is the remaining work on #1052.
+// backlog#1052 full acceptance: two embedded servers with *different*
+// credentials are isolated end to end — auth (each accepts its own key and
+// rejects the other's) AND data plane (each server's buckets/objects are
+// invisible to the other; each lists/creates/deletes only on its own disks
+// and bucket-metadata system).
 #[tokio::test]
-async fn two_embedded_servers_authenticate_with_their_own_credentials() {
+async fn two_embedded_servers_isolate_auth_and_data_planes() {
     let port_a = match find_available_port() {
         Ok(port) => port,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -175,6 +169,79 @@ async fn two_embedded_servers_authenticate_with_their_own_credentials() {
         .send()
         .await
         .expect("server A must authenticate with its own credentials");
+
+    // ---- Data-plane isolation (backlog#1052 S7) ----
+
+    // Server A owns a bucket + object.
+    client_a
+        .create_bucket()
+        .bucket("only-on-a")
+        .send()
+        .await
+        .expect("server A creates its bucket");
+    client_a
+        .put_object()
+        .bucket("only-on-a")
+        .key("marker.txt")
+        .body(ByteStream::from_static(b"belongs to A"))
+        .send()
+        .await
+        .expect("server A writes its object");
+
+    // Server B's listing does not contain server A's bucket.
+    let b_buckets: Vec<_> = client_b
+        .list_buckets()
+        .send()
+        .await
+        .expect("server B lists buckets")
+        .buckets()
+        .iter()
+        .flat_map(|bucket| bucket.name.clone())
+        .collect();
+    assert!(
+        !b_buckets.contains(&"only-on-a".to_string()),
+        "server B must not see server A's bucket; saw {b_buckets:?}"
+    );
+
+    // Server B cannot resolve server A's object either.
+    let cross_head = client_b.head_object().bucket("only-on-a").key("marker.txt").send().await;
+    assert!(cross_head.is_err(), "server B must not resolve server A's object; got {cross_head:?}");
+
+    // Server B's own bucket is invisible to server A.
+    client_b
+        .create_bucket()
+        .bucket("only-on-b")
+        .send()
+        .await
+        .expect("server B creates its bucket");
+    let a_buckets: Vec<_> = client_a
+        .list_buckets()
+        .send()
+        .await
+        .expect("server A lists buckets")
+        .buckets()
+        .iter()
+        .flat_map(|bucket| bucket.name.clone())
+        .collect();
+    assert!(
+        a_buckets.contains(&"only-on-a".to_string()),
+        "server A must keep seeing its own bucket; saw {a_buckets:?}"
+    );
+    assert!(
+        !a_buckets.contains(&"only-on-b".to_string()),
+        "server A must not see server B's bucket; saw {a_buckets:?}"
+    );
+
+    // Server A's data plane is intact.
+    let a_get = client_a
+        .get_object()
+        .bucket("only-on-a")
+        .key("marker.txt")
+        .send()
+        .await
+        .expect("server A serves its own object");
+    let a_data = a_get.body.collect().await.expect("read A body").into_bytes();
+    assert_eq!(a_data.as_ref(), b"belongs to A");
 
     server_a.shutdown().await;
     server_b.shutdown().await;

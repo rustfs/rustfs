@@ -40,8 +40,8 @@ fn validate_table_bucket_delete_allowed(
     Ok(())
 }
 
-async fn table_catalog_metadata_exists(bucket: &str) -> bool {
-    let local_disks = all_local_disk().await;
+async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> bool {
+    let local_disks = runtime_sources::local_disks_in(ctx).await;
     for disk in local_disks.iter() {
         let catalog_path = disk.path().join(bucket).join(BUCKET_TABLE_RESERVED_PREFIX);
         if has_xlmeta_files(&catalog_path).await {
@@ -52,12 +52,12 @@ async fn table_catalog_metadata_exists(bucket: &str) -> bool {
     false
 }
 
-async fn validate_table_bucket_delete_guard(bucket: &str) -> Result<()> {
-    let table_bucket_enabled = metadata_sys::get(bucket)
+async fn validate_table_bucket_delete_guard(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<()> {
+    let table_bucket_enabled = metadata_sys::get_in(ctx, bucket)
         .await
         .is_ok_and(|metadata| metadata.table_bucket_enabled());
     if table_bucket_enabled {
-        validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(bucket).await)?;
+        validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(ctx, bucket).await)?;
     }
 
     Ok(())
@@ -106,7 +106,7 @@ impl ECStore {
             self.delete_all(RUSTFS_META_BUCKET, marker_prefix.as_str()).await?;
         }
 
-        metadata_sys::remove_bucket_metadata(bucket).await?;
+        metadata_sys::remove_bucket_metadata_in(&self.ctx, bucket).await?;
         runtime_sources::delete_bucket_monitor_entry(bucket);
         Ok(())
     }
@@ -186,9 +186,7 @@ impl ECStore {
             meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&enableVersioningConfig)?;
         }
 
-        meta.save().await?;
-
-        set_bucket_metadata(bucket.to_string(), meta).await?;
+        metadata_sys::set_bucket_metadata_in(&self.ctx, meta).await?;
 
         Ok(())
     }
@@ -197,7 +195,7 @@ impl ECStore {
     pub(super) async fn handle_get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
         let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
 
-        if let Ok(sys) = metadata_sys::get(bucket).await {
+        if let Ok(sys) = metadata_sys::get_in(&self.ctx, bucket).await {
             if should_override_created_from_metadata(sys.created) {
                 info.created = Some(sys.created);
             }
@@ -216,7 +214,7 @@ impl ECStore {
 
         if !opts.no_metadata {
             for bucket in buckets.iter_mut() {
-                if let Ok(created) = metadata_sys::created_at(&bucket.name).await
+                if let Ok(created) = metadata_sys::created_at_in(&self.ctx, &bucket.name).await
                     && should_override_created_from_metadata(created)
                 {
                     bucket.created = Some(created);
@@ -270,7 +268,7 @@ impl ECStore {
             return Err(to_object_err(storage_err, vec![bucket]));
         }
 
-        validate_table_bucket_delete_guard(bucket).await?;
+        validate_table_bucket_delete_guard(&self.ctx, bucket).await?;
 
         let sr_mark_delete = opts.srdelete_op == SRBucketDeleteOp::MarkDelete;
         let sr_purge = opts.srdelete_op == SRBucketDeleteOp::Purge;
@@ -280,7 +278,7 @@ impl ECStore {
         // is not set, return BucketNotEmpty error.
         // Note: Empty directories (left after object deletion) should NOT count as objects.
         if !opts.force && !sr_mark_delete {
-            let local_disks = all_local_disk().await;
+            let local_disks = runtime_sources::local_disks_in(&self.ctx).await;
             for disk in local_disks.iter() {
                 // Check if bucket directory contains any xl.meta files (actual objects)
                 // We recursively scan for xl.meta files to determine if bucket has objects

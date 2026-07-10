@@ -181,6 +181,44 @@ pub async fn get(bucket: &str) -> Result<Arc<BucketMetadata>> {
     lock.get(bucket).await
 }
 
+// ---- Instance-scoped variants (backlog#1052 S7) ----
+//
+// A store's own bucket operations resolve the metadata system of *their*
+// instance context so two servers in one process stay isolated; when the
+// instance cell is not initialized yet (early startup) they fall back to the
+// ambient default — the single-instance legacy behavior.
+
+fn bucket_metadata_sys_of(ctx: &crate::runtime::instance::InstanceContext) -> Result<Arc<RwLock<BucketMetadataSys>>> {
+    if let Some(sys) = ctx.bucket_metadata_sys() {
+        return Ok(sys);
+    }
+    get_bucket_metadata_sys()
+}
+
+pub(crate) async fn get_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<Arc<BucketMetadata>> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let lock = sys.read().await;
+    lock.get(bucket).await
+}
+
+pub(crate) async fn created_at_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<OffsetDateTime> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let lock = sys.read().await;
+    lock.created_at(bucket).await
+}
+
+pub(crate) async fn set_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bm: BucketMetadata) -> Result<()> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let lock = sys.read().await;
+    lock.persist_and_set(bm).await
+}
+
+pub(crate) async fn remove_bucket_metadata_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let lock = sys.read().await;
+    Ok(lock.remove(bucket).await)
+}
+
 pub async fn update(bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let mut bucket_meta_sys = bucket_meta_sys_lock.write().await;
@@ -531,9 +569,16 @@ impl BucketMetadataSys {
             return Err(Error::other("errInvalidArgument"));
         }
 
+        self.persist_and_set(bm).await
+    }
+
+    /// Persist metadata through this system's own store and cache it here
+    /// (backlog#1052 S7). The store-scoped bucket path uses this so a second
+    /// server's metadata never leaks into the ambient (first) instance.
+    pub(crate) async fn persist_and_set(&self, bm: BucketMetadata) -> Result<()> {
         let mut bm = bm;
 
-        bm.save().await?;
+        bm.save_with_store(self.api.clone()).await?;
 
         self.set(bm.name.clone(), Arc::new(bm)).await;
 

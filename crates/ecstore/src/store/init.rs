@@ -339,7 +339,7 @@ impl ECStore {
             runtime_sources::record_local_disks(&instance_ctx, local_disks).await;
         }
 
-        let peer_sys = S3PeerSys::new(&endpoint_pools);
+        let peer_sys = S3PeerSys::new_with_instance_ctx(&endpoint_pools, instance_ctx.clone());
         let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
         pool_meta.dont_save = true;
 

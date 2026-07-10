@@ -40,15 +40,13 @@
 //! }
 //! ```
 //!
-//! # Multi-instance status
+//! # Multi-instance support
 //!
-//! Multiple `RustFSServer`s may now coexist in one process on different ports
-//! and volumes (backlog#1052). Each server's storage layer, request-path
-//! dispatch, and app subsystem instances stay isolated. IAM and root-credential
-//! validation still share a process-wide domain, so a second server whose
-//! credentials differ from the first cannot authenticate S3 clients today;
-//! wiring authentication per-server is tracked as a follow-up on the same
-//! issue.
+//! Multiple `RustFSServer`s may coexist in one process on different ports and
+//! volumes (backlog#1052). Each server is fully isolated: its own storage
+//! layer, request-path dispatch, root credentials, IAM domain, and bucket
+//! namespace. Two servers with different credentials each authenticate their
+//! own clients, and neither can see the other's buckets or objects.
 
 use crate::server::ShutdownHandle;
 use crate::startup_embedded::{EmbeddedStartedServer, EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};

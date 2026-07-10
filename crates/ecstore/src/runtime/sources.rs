@@ -475,6 +475,17 @@ pub(crate) async fn local_disk_paths() -> Vec<String> {
     local_disk_map_handle().read().await.keys().cloned().collect()
 }
 
+/// Local disks registered on an explicit instance context (backlog#1052 S7).
+pub(crate) async fn local_disks_in(instance_ctx: &InstanceContext) -> Vec<DiskStore> {
+    instance_ctx
+        .local_disk_map()
+        .read()
+        .await
+        .values()
+        .filter_map(|v| v.as_ref().cloned())
+        .collect()
+}
+
 pub(crate) async fn local_disks() -> Vec<DiskStore> {
     local_disk_map_handle()
         .read()
