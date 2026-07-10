@@ -57,8 +57,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use rustfs_object_data_cache::{
-        ObjectDataCacheBodyVariant, ObjectDataCacheConfig, ObjectDataCacheFillResult, ObjectDataCacheGetRequest,
-        ObjectDataCacheLookup, ObjectDataCacheMode,
+        ObjectDataCacheConfig, ObjectDataCacheFillResult, ObjectDataCacheGetRequest, ObjectDataCacheLookup, ObjectDataCacheMode,
     };
 
     fn fill_enabled_adapter() -> Arc<ObjectDataCacheAdapter> {
@@ -78,10 +77,9 @@ mod tests {
         ObjectDataCacheGetRequest {
             bucket,
             object,
-            version_id: None,
             etag: "etag",
             size: 5,
-            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+            ..Default::default()
         }
     }
 
