@@ -20,6 +20,42 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::error;
 use uuid::Uuid;
 
+/// A shard source that may already hold its bytes in memory.
+///
+/// The GET path reads a shard out of the page cache into a `Bytes` and then, in
+/// the old code, copied it twice more: once out of the `Cursor` wrapping it into
+/// the reader's scratch buffer, and once from there into the caller's buffer.
+/// `try_take_block` lets an in-memory source hand over the `[hash][data]` block
+/// as a slice instead, collapsing that to a single copy (rustfs/backlog#1159:
+/// `Cursor::poll_read` was 8.23% of GET CPU).
+///
+/// The default says "not in memory", so a streaming source keeps the old path and
+/// its short-read/EOF semantics unchanged.
+pub trait ShardSource: AsyncRead + Send + Sync + Unpin {
+    /// The next `n` bytes, consumed from the source, or `None` when the source is
+    /// not in memory or holds fewer than `n` bytes left. Advancing must match what
+    /// an `AsyncRead` of `n` bytes would have done, so the two can be mixed.
+    fn try_take_block(&mut self, _n: usize) -> Option<bytes::Bytes> {
+        None
+    }
+}
+
+impl ShardSource for std::io::Cursor<Vec<u8>> {}
+
+impl ShardSource for Box<dyn AsyncRead + Send + Sync + Unpin> {}
+
+impl ShardSource for std::io::Cursor<bytes::Bytes> {
+    fn try_take_block(&mut self, n: usize) -> Option<bytes::Bytes> {
+        let pos = usize::try_from(self.position()).ok()?;
+        let end = pos.checked_add(n)?;
+        if end > self.get_ref().len() {
+            return None;
+        }
+        self.set_position(end as u64);
+        Some(self.get_ref().slice(pos..end))
+    }
+}
+
 pin_project! {
     /// BitrotReader reads (hash+data) blocks from an async reader and verifies hash integrity.
     pub struct BitrotReader<R> {
@@ -132,6 +168,24 @@ where
         Ok(out.len())
     }
 
+    /// Map a completed no-hash read to the shared short-shard contract: a full
+    /// buffer returns its length, a short read is UnexpectedEof (backlog#799 B2).
+    fn finish_len(&self, data_len: usize, want: usize) -> std::io::Result<usize> {
+        if data_len < want {
+            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, data_len, want);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("short shard read: got {data_len} of {want} bytes"),
+            ));
+        }
+        Ok(data_len)
+    }
+}
+
+impl<R> BitrotReader<R>
+where
+    R: ShardSource,
+{
     /// Same contract as [`Self::read`], but **appends** `want` bytes into `out`'s
     /// spare capacity instead of demanding an initialized `&mut [u8]`
     /// (rustfs/backlog#1159).
@@ -178,10 +232,31 @@ where
             return self.finish_len(out.len() - start, want);
         }
 
-        // Hashed path: identical to `read` — one pass pulls `[hash][data]` into
+        let need = hash_size + want;
+
+        // In-memory fast path: the block is already resident, so slice it instead of
+        // copying it into the scratch buffer first (rustfs/backlog#1159). One copy
+        // (`extend_from_slice`) instead of two. A source that cannot serve `need`
+        // bytes returns `None` and falls through, keeping the short-read contract.
+        if let Some(block) = self.inner.try_take_block(need) {
+            let (hash, data) = block.split_at(hash_size);
+            if !self.skip_verify {
+                let verify_start = std::time::Instant::now();
+                let actual_hash = self.hash_algo.hash_encode(data);
+                self.last_verify_duration = verify_start.elapsed();
+                if actual_hash.as_ref() != hash {
+                    error!("bitrot reader hash mismatch, id={} data_len={}, out_len={}", self.id, data.len(), want);
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
+                }
+            }
+            // Only after verification: a corrupt shard must not reach the caller.
+            out.extend_from_slice(data);
+            return Ok(want);
+        }
+
+        // Streaming path: identical to `read` — one pass pulls `[hash][data]` into
         // the scratch buffer — except the shard lands in `out` by `extend_from_slice`
         // rather than `copy_from_slice` into a pre-zeroed buffer. Same single copy.
-        let need = hash_size + want;
         if self.buf.len() < need {
             self.buf.resize(need, 0);
         }
@@ -208,19 +283,6 @@ where
         // Only after verification: a corrupt shard must not reach the caller.
         out.extend_from_slice(data);
         Ok(want)
-    }
-
-    /// Map a completed no-hash read to the shared short-shard contract: a full
-    /// buffer returns its length, a short read is UnexpectedEof (backlog#799 B2).
-    fn finish_len(&self, data_len: usize, want: usize) -> std::io::Result<usize> {
-        if data_len < want {
-            error!("bitrot reader short shard read: id={} got {} of {} bytes", self.id, data_len, want);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("short shard read: got {data_len} of {want} bytes"),
-            ));
-        }
-        Ok(data_len)
     }
 }
 
@@ -611,6 +673,7 @@ impl BitrotWriterWrapper {
 
 #[cfg(test)]
 mod tests {
+    use super::ShardSource;
     use super::{
         BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, bitrot_shard_file_size, bitrot_verify, write_all_vectored,
     };
@@ -1321,5 +1384,86 @@ mod tests {
             .await
             .expect_err("want > shard_size must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The in-memory fast path (rustfs/backlog#1159) must be *equivalent* to the
+    /// streaming path, not merely present. `Cursor<Bytes>` slices the
+    /// `[hash][data]` block instead of copying it into the scratch buffer; if that
+    /// ever diverged, GET would return different bytes.
+    ///
+    /// The first assertion is the non-vacuity gate: it proves `try_take_block`
+    /// actually fires for `Cursor<Bytes>` (and does not for `Cursor<Vec<u8>>`), so
+    /// the equivalence below is really comparing two different code paths.
+    #[tokio::test]
+    async fn in_memory_fast_path_fires_and_matches_the_streaming_path() {
+        use bytes::Bytes;
+        use std::io::Cursor;
+
+        const SHARD: usize = 4096;
+        let algo = HashAlgorithm::HighwayHash256;
+        let data: Vec<u8> = (0..SHARD).map(|i| (i * 17 + 3) as u8).collect();
+        let mut encoded = Vec::new();
+        BitrotWriter::new(&mut encoded, SHARD, algo.clone())
+            .write(&data)
+            .await
+            .expect("write shard");
+
+        // Non-vacuity: the fast path exists for Bytes and not for Vec.
+        let mut mem = Cursor::new(Bytes::from(encoded.clone()));
+        assert!(
+            ShardSource::try_take_block(&mut mem, 8).is_some(),
+            "Cursor<Bytes> must be able to hand out a block, otherwise the fast path is dead code"
+        );
+        assert_eq!(mem.position(), 8, "taking a block must advance like a read of the same length");
+        let mut streamed = Cursor::new(encoded.clone());
+        assert!(
+            ShardSource::try_take_block(&mut streamed, 8).is_none(),
+            "a non-Bytes source must stay on the streaming path"
+        );
+        // A block larger than what is left must decline rather than truncate.
+        let mut short = Cursor::new(Bytes::from_static(b"1234"));
+        assert!(ShardSource::try_take_block(&mut short, 5).is_none());
+
+        // Equivalence: same bytes out of both paths.
+        let mut via_mem: Vec<u8> = Vec::with_capacity(SHARD);
+        BitrotReader::new(Cursor::new(Bytes::from(encoded.clone())), SHARD, algo.clone(), false)
+            .read_appending(&mut via_mem, SHARD)
+            .await
+            .expect("in-memory read");
+
+        let mut via_stream: Vec<u8> = Vec::with_capacity(SHARD);
+        BitrotReader::new(Cursor::new(encoded), SHARD, algo, false)
+            .read_appending(&mut via_stream, SHARD)
+            .await
+            .expect("streaming read");
+
+        assert_eq!(via_mem, via_stream, "the two paths must return identical bytes");
+        assert_eq!(via_mem, data);
+    }
+
+    /// A corrupt shard must fail on the fast path too — the slice is verified
+    /// before anything is appended, exactly as on the streaming path.
+    #[tokio::test]
+    async fn in_memory_fast_path_rejects_a_corrupt_shard_without_appending() {
+        use bytes::Bytes;
+        use std::io::Cursor;
+
+        const SHARD: usize = 4096;
+        let algo = HashAlgorithm::HighwayHash256;
+        let mut encoded = Vec::new();
+        BitrotWriter::new(&mut encoded, SHARD, algo.clone())
+            .write(&vec![5u8; SHARD])
+            .await
+            .expect("write shard");
+        let last = encoded.len() - 1;
+        encoded[last] ^= 0xff;
+
+        let mut out: Vec<u8> = Vec::with_capacity(SHARD);
+        let err = BitrotReader::new(Cursor::new(Bytes::from(encoded)), SHARD, algo, false)
+            .read_appending(&mut out, SHARD)
+            .await
+            .expect_err("a corrupt shard must not verify on the fast path either");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(out.is_empty(), "corrupt bytes must never reach the caller's buffer");
     }
 }

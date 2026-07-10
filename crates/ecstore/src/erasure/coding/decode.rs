@@ -34,7 +34,6 @@ use std::io;
 use std::io::ErrorKind;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::{error, warn};
@@ -270,7 +269,7 @@ fn read_shard<'a, R>(
     metrics_path: Option<&'static str>,
 ) -> ShardReadFuture<'a>
 where
-    R: AsyncRead + Unpin + Send + Sync + 'a,
+    R: crate::erasure::coding::ShardSource + 'a,
 {
     let role = shard_role(index, data_shards);
     if let Some(reader) = reader {
@@ -395,7 +394,7 @@ pub(crate) struct ParallelReader<R> {
 
 impl<R> ParallelReader<R>
 where
-    R: AsyncRead + Unpin + Send + Sync,
+    R: crate::erasure::coding::ShardSource,
 {
     // Readers should handle disk errors before being passed in, ensuring each reader reaches the available number of BitrotReaders
     pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
@@ -686,7 +685,7 @@ fn record_scheduled_read_cost(
 
 impl<R> ParallelReader<R>
 where
-    R: AsyncRead + Unpin + Send + Sync,
+    R: crate::erasure::coding::ShardSource,
 {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn read(&mut self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
@@ -1247,7 +1246,7 @@ where
 #[async_trait::async_trait]
 impl<R> ShardStripeSource for ParallelReader<R>
 where
-    R: AsyncRead + Unpin + Send + Sync,
+    R: crate::erasure::coding::ShardSource,
 {
     async fn read_next_stripe(&mut self) -> StripeReadState {
         let read_quorum = self.data_shards;
@@ -1275,7 +1274,7 @@ async fn read_stripe_timed<R>(
     stage_metrics_enabled: bool,
 ) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>)
 where
-    R: AsyncRead + Unpin + Send + Sync,
+    R: crate::erasure::coding::ShardSource,
 {
     let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     let out = reader.read().await;
@@ -1422,7 +1421,7 @@ impl Erasure {
     ) -> (usize, Option<std::io::Error>)
     where
         W: AsyncWrite + Send + Sync + Unpin,
-        R: AsyncRead + Unpin + Send + Sync,
+        R: crate::erasure::coding::ShardSource,
     {
         self.decode_inner(writer, readers, offset, length, total_length, None, Vec::new())
             .await
@@ -1439,7 +1438,7 @@ impl Erasure {
     ) -> (usize, Option<std::io::Error>)
     where
         W: AsyncWrite + Send + Sync + Unpin,
-        R: AsyncRead + Unpin + Send + Sync,
+        R: crate::erasure::coding::ShardSource,
     {
         self.decode_inner(writer, readers, offset, length, total_length, Some(read_costs), Vec::new())
             .await
@@ -1461,7 +1460,7 @@ impl Erasure {
     ) -> (usize, Option<std::io::Error>)
     where
         W: AsyncWrite + Send + Sync + Unpin,
-        R: AsyncRead + Unpin + Send + Sync,
+        R: crate::erasure::coding::ShardSource,
     {
         self.decode_inner(writer, readers, offset, length, total_length, read_costs, deferred_handles)
             .await
@@ -1582,7 +1581,7 @@ impl Erasure {
     ) -> (usize, Option<std::io::Error>)
     where
         W: AsyncWrite + Send + Sync + Unpin,
-        R: AsyncRead + Unpin + Send + Sync,
+        R: crate::erasure::coding::ShardSource,
     {
         if readers.len() != self.data_shards + self.parity_shards {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
@@ -1806,10 +1805,11 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::task::{Context, Poll};
+    use tokio::io::AsyncRead;
     use tokio::io::ReadBuf;
     use tokio::time::{Instant as TokioInstant, Sleep};
 
-    type BoxedShardReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
+    type BoxedShardReader = crate::io_support::bitrot::ShardReader;
 
     /// Counts the raw bytes pulled from a shard stream, to prove which shards
     /// a decode path actually touches (backlog#923 call-count evidence).
@@ -1817,6 +1817,10 @@ mod tests {
         inner: Cursor<Vec<u8>>,
         bytes_read: Arc<AtomicUsize>,
     }
+
+    /// Streaming test source: no in-memory block, so it exercises the same path a
+    /// real disk stream takes.
+    impl crate::erasure::coding::ShardSource for CountingShardReader {}
 
     impl AsyncRead for CountingShardReader {
         fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
@@ -1853,7 +1857,7 @@ mod tests {
                     .map(|(_, len)| buf[..*len].to_vec())
                     .unwrap_or_else(|| buf.clone());
                 readers.push(Some(BitrotReader::new(
-                    Box::new(Cursor::new(bytes)) as BoxedShardReader,
+                    crate::io_support::bitrot::ShardReader::Stream(Box::new(Cursor::new(bytes))),
                     shard_size,
                     hash_algo.clone(),
                     false,
@@ -1892,6 +1896,8 @@ mod tests {
         },
         TimedOut,
     }
+
+    impl crate::erasure::coding::ShardSource for TestShardReader {}
 
     impl AsyncRead for TestShardReader {
         fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {

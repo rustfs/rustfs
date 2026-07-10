@@ -33,7 +33,36 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::debug;
 
-type BoxedObjectReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
+/// A shard source for the bitrot reader.
+///
+/// `InMemory` keeps the `Bytes` concrete instead of erasing it behind
+/// `dyn AsyncRead`, so `BitrotReader` can slice the `[hash][data]` block straight
+/// out of the page-cache copy rather than copying it into a scratch buffer first
+/// (rustfs/backlog#1159). Everything else is a stream and keeps the old path.
+pub enum ShardReader {
+    InMemory(Cursor<Bytes>),
+    Stream(Box<dyn AsyncRead + Send + Sync + Unpin>),
+}
+
+impl AsyncRead for ShardReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::InMemory(cursor) => Pin::new(cursor).poll_read(cx, buf),
+            Self::Stream(reader) => Pin::new(reader).poll_read(cx, buf),
+        }
+    }
+}
+
+impl crate::erasure::coding::ShardSource for ShardReader {
+    fn try_take_block(&mut self, n: usize) -> Option<Bytes> {
+        match self {
+            Self::InMemory(cursor) => cursor.try_take_block(n),
+            Self::Stream(_) => None,
+        }
+    }
+}
+
+type BoxedObjectReader = ShardReader;
 type OpenObjectReaderFuture = Pin<Box<dyn Future<Output = disk::error::Result<Option<BoxedObjectReader>>> + Send>>;
 
 #[derive(Clone, Copy)]
@@ -70,7 +99,7 @@ impl BitrotReaderSource {
             let mut rd = Cursor::new(data);
             let offset = u64::try_from(self.offset).map_err(|_| DiskError::FileCorrupt)?;
             rd.set_position(offset);
-            Ok(Some(Box::new(rd)))
+            Ok(Some(ShardReader::InMemory(rd)))
         } else if let Some(disk) = self.disk {
             open_disk_reader(
                 &disk,
@@ -272,7 +301,7 @@ async fn open_disk_reader(
     length: usize,
     use_mmap_read: bool,
     metrics_path: Option<&'static str>,
-) -> disk::error::Result<FileReader> {
+) -> disk::error::Result<ShardReader> {
     let metrics_path = metrics_path.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
     let stage_metrics_enabled = metrics_path.is_some();
 
@@ -309,7 +338,7 @@ async fn open_disk_reader(
                     "zero_copy_read_success"
                 );
 
-                return Ok(Box::new(Cursor::new(bytes)));
+                return Ok(ShardReader::InMemory(Cursor::new(bytes)));
             }
             Err(err) => {
                 if let Some(metrics_path) = metrics_path {
@@ -345,14 +374,18 @@ async fn open_disk_reader(
     Ok(wrap_first_read_metrics(reader, metrics_path))
 }
 
-fn wrap_first_read_metrics(reader: FileReader, metrics_path: Option<&'static str>) -> FileReader {
+fn wrap_first_read_metrics(reader: FileReader, metrics_path: Option<&'static str>) -> ShardReader {
     if let Some(metrics_path) = metrics_path
         && rustfs_io_metrics::get_stage_metrics_enabled()
     {
-        return Box::new(FirstReadMetricsReader::new(reader, metrics_path, GET_STAGE_READER_STREAM_FIRST_READ));
+        return ShardReader::Stream(Box::new(FirstReadMetricsReader::new(
+            reader,
+            metrics_path,
+            GET_STAGE_READER_STREAM_FIRST_READ,
+        )));
     }
 
-    reader
+    ShardReader::Stream(reader)
 }
 
 fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksum_algo: HashAlgorithm) -> (usize, usize) {
@@ -387,7 +420,7 @@ pub async fn create_bitrot_reader(
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
     use_mmap_read: bool,
-) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
+) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
     create_bitrot_reader_with_stage_metrics(
         inline_data,
         disk,
@@ -417,7 +450,7 @@ pub(crate) async fn create_bitrot_reader_with_stage_metrics(
     skip_verify: bool,
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
-) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
+) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
     create_bitrot_reader_from_bytes_with_stage_metrics(
         inline_data.map(Bytes::copy_from_slice),
         disk,
@@ -450,7 +483,7 @@ pub async fn create_bitrot_reader_from_bytes(
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
     use_mmap_read: bool,
-) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
+) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
     create_bitrot_reader_from_bytes_with_stage_metrics(
         inline_data,
         disk,
@@ -480,7 +513,7 @@ async fn create_bitrot_reader_from_bytes_with_stage_metrics(
     skip_verify: bool,
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
-) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
+) -> disk::error::Result<Option<BitrotReader<ShardReader>>> {
     let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
     let stage_metrics_enabled = stage_metrics.is_some();
 
@@ -527,7 +560,7 @@ pub fn create_deferred_bitrot_reader(
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
     use_mmap_read: bool,
-) -> BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>> {
+) -> BitrotReader<ShardReader> {
     create_deferred_bitrot_reader_with_stripe_handle(
         inline_data,
         disk,
@@ -558,7 +591,7 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
     use_mmap_read: bool,
-) -> (BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>, DeferredReaderStripeHandle) {
+) -> (BitrotReader<ShardReader>, DeferredReaderStripeHandle) {
     let stripe_stride = shard_size + checksum_algo.size();
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
     let source = BitrotReaderSource {
@@ -574,12 +607,10 @@ pub(crate) fn create_deferred_bitrot_reader_with_stripe_handle(
 
     let deferred = DeferredObjectReader::new(source);
     let handle = deferred.stripe_handle(stripe_stride);
-    let reader = BitrotReader::new(
-        Box::new(deferred) as Box<dyn AsyncRead + Send + Sync + Unpin>,
-        shard_size,
-        checksum_algo,
-        skip_verify,
-    );
+    // The deferred parity reader opens its source lazily, so it cannot hand out an
+    // in-memory block up front; it stays on the streaming path. Parity shards are
+    // only read when a data shard fails, so the fast path is not needed here.
+    let reader = BitrotReader::new(ShardReader::Stream(Box::new(deferred)), shard_size, checksum_algo, skip_verify);
     (reader, handle)
 }
 
