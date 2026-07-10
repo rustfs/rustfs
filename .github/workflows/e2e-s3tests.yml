@@ -109,6 +109,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs['test-mode'] || 'single' }}
   cancel-in-progress: true
 
+# Only alert-on-failure needs more than read access; it declares its own
+# job-level `issues: write`.
+permissions:
+  contents: read
+
 defaults:
   run:
     shell: bash
@@ -325,3 +330,22 @@ jobs:
         with:
           name: s3tests-${{ env.TEST_MODE }}
           path: artifacts/**
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [s3tests]
+    # `always()` is required: without it this job is skipped when a needed
+    # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
+    # dispatch failures are already watched by a human.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

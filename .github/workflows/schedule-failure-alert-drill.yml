@@ -1,0 +1,62 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Manual drill for the scheduled-failure alerting path (backlog#1149 ci-8).
+#
+# Forces a job failure and then runs .github/actions/schedule-failure-issue
+# through the exact `needs` + `always() && contains(needs.*.result,
+# 'failure')` wiring used by the real consumers (e2e-s3tests, mint, fuzz,
+# performance-ab). Dispatch it twice to verify both the issue-creation and
+# the dedupe-comment paths, then close the resulting
+# "[scheduled-failure] Schedule Failure Alert Drill" issue.
+#
+# The run itself is expected to end red (the forced failure); only the
+# alert-on-failure job result matters.
+
+name: Schedule Failure Alert Drill
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  forced-failure:
+    name: Forced failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail on purpose
+        run: |
+          echo "Deliberate failure so alert-on-failure exercises the real consumer wiring."
+          exit 1
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [forced-failure]
+    # Mirrors the consumer wiring, minus the schedule-event guard (this
+    # workflow is dispatch-only by design).
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
