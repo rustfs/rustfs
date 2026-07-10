@@ -92,6 +92,8 @@ mod tests {
         let config = ObjectDataCacheConfig {
             mode: ObjectDataCacheMode::FillBufferedOnly,
             max_bytes: 8_388_608,
+            // Fill must not depend on the live memory reading (host vs container).
+            min_free_memory_percent: 0,
             ..ObjectDataCacheConfig::default()
         };
         ObjectDataCacheAdapter::new(config).expect("fill-enabled config should build adapter")

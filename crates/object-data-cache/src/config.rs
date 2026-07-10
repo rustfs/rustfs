@@ -13,11 +13,31 @@
 // limitations under the License.
 
 use crate::error::ObjectDataCacheConfigError;
+use crate::memory::{MemoryBasis, resolve_effective_memory};
+use std::sync::Once;
 use std::time::Duration;
-use sysinfo::System;
 
 const DEFAULT_DERIVED_MAX_MEMORY_PERCENT_CAP: u64 = 10;
 const DEFAULT_DERIVED_MAX_BYTES_CAP: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Upper bound (seconds) for `ttl` / `time_to_idle`. Kept far below moka's
+/// ~1000-year builder assertion while remaining a sane operational cap so a
+/// bad env var degrades to the disabled adapter instead of panicking at boot.
+const MAX_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Overhead reserved on top of a cached body when validating an explicit
+/// `max_bytes`. moka's weigher charges key bytes + a small per-entry overhead
+/// on top of the body, so `max_bytes` must clear `max_entry_bytes` by at least
+/// this margin for the entry to ever be retained.
+const ENTRY_WEIGHT_OVERHEAD_BYTES: u64 = 4096;
+
+/// Upper bound for `max_entry_bytes`. moka weighers return `u32`, so an entry
+/// above ~4 GiB would be under-weighted and bypass capacity accounting; stay
+/// below `u32::MAX` with room for the weigher overhead.
+const MAX_ENTRY_BYTES_LIMIT: u64 = u32::MAX as u64 - ENTRY_WEIGHT_OVERHEAD_BYTES;
+
+/// Guards the one-shot startup log of the resolved cache capacity.
+static RESOLVED_CAPACITY_LOGGED: Once = Once::new();
 
 /// Runtime mode for the object data cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,16 +76,25 @@ pub struct ObjectDataCacheConfig {
     /// Maximum cacheable entry size in bytes.
     pub max_entry_bytes: u64,
     /// Time-to-live for a cache entry.
+    ///
+    /// moka expires an entry at `min(ttl, time_to_idle-since-last-access)`, so
+    /// a `time_to_idle` larger than `ttl` never takes effect.
     pub ttl: Duration,
     /// Time-to-idle for a cache entry.
+    ///
+    /// See [`ttl`](Self::ttl): expiration uses `min(ttl, time_to_idle)`, so
+    /// setting `time_to_idle` above `ttl` is inert.
     pub time_to_idle: Duration,
-    /// Minimum free memory percent before fill is paused.
+    /// Minimum free memory percent before fill is paused. Zero disables the
+    /// memory gate entirely, which makes fill admission independent of the
+    /// host's or container's live memory reading.
     pub min_free_memory_percent: u8,
     /// Fill concurrency multiplier applied to CPU count.
     pub fill_concurrency_per_cpu: u16,
     /// Absolute fill concurrency cap.
     pub fill_concurrency_max: u16,
-    /// Conservative cap for keys attached to one object identity.
+    /// Conservative cap for keys attached to one object identity. Must be at
+    /// least 2: the index admits a new key by evicting the oldest one.
     pub identity_keys_max: u16,
 }
 
@@ -111,15 +140,26 @@ impl ObjectDataCacheConfig {
             return Ok(self.max_bytes);
         }
 
-        let mut system = System::new();
-        system.refresh_memory();
-        let total_memory = system.total_memory();
+        // Resolve capacity from the effective (container-aware) total memory so
+        // a pod with a cgroup limit far below the node RAM does not size the
+        // cache to the node.
+        let effective = resolve_effective_memory();
+        let total_memory = effective.total_bytes;
         let derived = total_memory.saturating_mul(u64::from(self.max_memory_percent)) / 100;
-        let resolved = clamp_derived_max_bytes(derived, total_memory, self.max_entry_bytes);
+        let resolved = clamp_derived_max_bytes(derived, total_memory);
 
         if resolved == 0 {
             return Err(ObjectDataCacheConfigError::ZeroResolvedMaxBytes);
         }
+
+        // The derived capacity is no longer floored by `max_entry_bytes` (that
+        // used to silently inflate the cache above the safety clamp). If a
+        // single entry cannot fit, reject rather than inflate.
+        if self.max_entry_bytes > resolved {
+            return Err(ObjectDataCacheConfigError::MaxEntryBytesExceedsCapacity);
+        }
+
+        log_resolved_capacity_once(resolved, total_memory, effective.basis);
 
         Ok(resolved)
     }
@@ -134,15 +174,46 @@ impl ObjectDataCacheConfig {
             return Err(ObjectDataCacheConfigError::ZeroMaxEntryBytes);
         }
 
+        if self.max_entry_bytes > MAX_ENTRY_BYTES_LIMIT {
+            return Err(ObjectDataCacheConfigError::MaxEntryBytesTooLarge);
+        }
+
+        // An explicit capacity must leave room for a full entry plus the
+        // weigher overhead, otherwise moka can never retain the entry while
+        // fills still report success.
+        if self.max_bytes > 0 && self.max_bytes < self.max_entry_bytes.saturating_add(ENTRY_WEIGHT_OVERHEAD_BYTES) {
+            return Err(ObjectDataCacheConfigError::MaxEntryBytesExceedsMaxBytes);
+        }
+
         if self.ttl.is_zero() {
             return Err(ObjectDataCacheConfigError::ZeroTimeToLiveSecs);
+        }
+
+        if self.ttl.as_secs() > MAX_DURATION_SECS {
+            return Err(ObjectDataCacheConfigError::TimeToLiveTooLarge);
         }
 
         if self.time_to_idle.is_zero() {
             return Err(ObjectDataCacheConfigError::ZeroTimeToIdleSecs);
         }
 
-        if self.min_free_memory_percent == 0 || self.min_free_memory_percent > 100 {
+        if self.time_to_idle.as_secs() > MAX_DURATION_SECS {
+            return Err(ObjectDataCacheConfigError::TimeToIdleTooLarge);
+        }
+
+        // moka expires at min(ttl, time_to_idle); a larger time_to_idle is
+        // inert. Warn instead of rejecting so a benign misconfiguration still
+        // starts the cache.
+        if self.time_to_idle > self.ttl {
+            tracing::warn!(
+                time_to_idle_secs = self.time_to_idle.as_secs(),
+                ttl_secs = self.ttl.as_secs(),
+                "object data cache time_to_idle exceeds ttl; moka expires at min(ttl, time_to_idle) so the larger time_to_idle has no effect"
+            );
+        }
+
+        // Zero is a deliberate opt-out of the memory gate, not an invalid value.
+        if self.min_free_memory_percent > 100 {
             return Err(ObjectDataCacheConfigError::InvalidMinFreeMemoryPercent);
         }
 
@@ -162,15 +233,33 @@ impl ObjectDataCacheConfig {
             return Err(ObjectDataCacheConfigError::ZeroIdentityKeysMax);
         }
 
+        // The identity index evicts the oldest key to admit a new one, so a
+        // budget of 1 evicts the previous key on every fill and can never hold
+        // two live keys of one object at once.
+        if self.identity_keys_max < 2 {
+            return Err(ObjectDataCacheConfigError::IdentityKeysMaxTooSmall);
+        }
+
         Ok(())
     }
 }
 
-fn clamp_derived_max_bytes(derived: u64, total_memory: u64, max_entry_bytes: u64) -> u64 {
+fn clamp_derived_max_bytes(derived: u64, total_memory: u64) -> u64 {
     let percent_cap = total_memory.saturating_mul(DEFAULT_DERIVED_MAX_MEMORY_PERCENT_CAP) / 100;
-    let safe_cap = percent_cap.min(DEFAULT_DERIVED_MAX_BYTES_CAP).max(max_entry_bytes);
+    let safe_cap = percent_cap.min(DEFAULT_DERIVED_MAX_BYTES_CAP);
 
-    derived.min(safe_cap).max(max_entry_bytes)
+    derived.min(safe_cap)
+}
+
+fn log_resolved_capacity_once(resolved_max_bytes: u64, effective_total_bytes: u64, basis: MemoryBasis) {
+    RESOLVED_CAPACITY_LOGGED.call_once(|| {
+        tracing::info!(
+            resolved_max_bytes,
+            effective_total_bytes,
+            basis = basis.as_str(),
+            "object data cache resolved capacity"
+        );
+    });
 }
 
 #[cfg(test)]
@@ -261,6 +350,54 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_zero_min_free_memory_percent_as_gate_opt_out() {
+        let config = ObjectDataCacheConfig {
+            min_free_memory_percent: 0,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_min_free_memory_percent_above_100() {
+        let config = ObjectDataCacheConfig {
+            min_free_memory_percent: 101,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("a free-memory floor above 100% is unsatisfiable");
+
+        assert_eq!(err, ObjectDataCacheConfigError::InvalidMinFreeMemoryPercent);
+    }
+
+    #[test]
+    fn validate_rejects_single_key_identity_budget() {
+        let config = ObjectDataCacheConfig {
+            identity_keys_max: 1,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("a one-key identity budget evicts the previous key on every fill");
+
+        assert_eq!(err, ObjectDataCacheConfigError::IdentityKeysMaxTooSmall);
+    }
+
+    #[test]
+    fn validate_accepts_two_key_identity_budget() {
+        let config = ObjectDataCacheConfig {
+            identity_keys_max: 2,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn validate_accepts_explicit_byte_cap() {
         let config = ObjectDataCacheConfig {
             mode: ObjectDataCacheMode::HitOnly,
@@ -287,25 +424,129 @@ mod tests {
     }
 
     #[test]
-    fn resolved_max_bytes_is_at_least_max_entry_bytes() {
+    fn derived_capacity_is_not_inflated_by_max_entry_bytes() {
+        // 512 MiB effective memory with a tiny percent yields a small derived
+        // capacity. A large max_entry_bytes must NOT raise the total capacity
+        // (the old `.max(max_entry_bytes)` floor did exactly that).
+        let host = 512_u64 * 1024 * 1024;
+        let derived = host / 100;
+        let resolved = clamp_derived_max_bytes(derived, host);
+
+        assert_eq!(resolved, derived);
+        assert!(resolved < 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resolved_max_bytes_rejects_entry_larger_than_capacity() {
+        // Derived capacity is clamped to at most 64 GiB, so a 128 GiB entry cap
+        // can never fit regardless of the test host's memory.
         let config = ObjectDataCacheConfig {
             max_bytes: 0,
-            max_memory_percent: 1,
-            max_entry_bytes: 8_388_608,
+            max_memory_percent: 100,
+            max_entry_bytes: 128 * 1024 * 1024 * 1024,
             ..ObjectDataCacheConfig::default()
         };
 
-        let resolved = config.resolved_max_bytes().expect("derived capacity should stay positive");
+        let err = config
+            .resolved_max_bytes()
+            .expect_err("entry cap above the derived capacity must be rejected");
 
-        assert!(resolved >= config.max_entry_bytes);
+        assert_eq!(err, ObjectDataCacheConfigError::MaxEntryBytesExceedsCapacity);
     }
 
     #[test]
     fn derived_max_bytes_clamps_to_v3_safe_cap() {
         let one_tib = 1024_u64 * 1024 * 1024 * 1024;
         let derived = one_tib / 2;
-        let resolved = clamp_derived_max_bytes(derived, one_tib, 1_048_576);
+        let resolved = clamp_derived_max_bytes(derived, one_tib);
 
         assert_eq!(resolved, DEFAULT_DERIVED_MAX_BYTES_CAP);
+    }
+
+    #[test]
+    fn validate_rejects_ttl_above_upper_bound() {
+        let config = ObjectDataCacheConfig {
+            ttl: Duration::from_secs(u64::MAX),
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config.validate().expect_err("ttl above the operational cap must be rejected");
+
+        assert_eq!(err, ObjectDataCacheConfigError::TimeToLiveTooLarge);
+    }
+
+    #[test]
+    fn validate_rejects_time_to_idle_above_upper_bound() {
+        let config = ObjectDataCacheConfig {
+            time_to_idle: Duration::from_secs(u64::MAX),
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("time-to-idle above the operational cap must be rejected");
+
+        assert_eq!(err, ObjectDataCacheConfigError::TimeToIdleTooLarge);
+    }
+
+    #[test]
+    fn validate_rejects_entry_above_weigher_limit() {
+        let config = ObjectDataCacheConfig {
+            max_entry_bytes: u32::MAX as u64,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("entry size at the u32 weigher boundary must be rejected");
+
+        assert_eq!(err, ObjectDataCacheConfigError::MaxEntryBytesTooLarge);
+    }
+
+    #[test]
+    fn validate_rejects_entry_larger_than_explicit_max_bytes() {
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::HitOnly,
+            max_bytes: 2 * 1024 * 1024,
+            max_memory_percent: 0,
+            max_entry_bytes: 8 * 1024 * 1024,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("an entry larger than max_bytes can never be retained");
+
+        assert_eq!(err, ObjectDataCacheConfigError::MaxEntryBytesExceedsMaxBytes);
+    }
+
+    #[test]
+    fn validate_rejects_entry_equal_to_explicit_max_bytes() {
+        // Equal fails because the weigher adds key bytes + per-entry overhead.
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::HitOnly,
+            max_bytes: 4 * 1024 * 1024,
+            max_memory_percent: 0,
+            max_entry_bytes: 4 * 1024 * 1024,
+            ..ObjectDataCacheConfig::default()
+        };
+
+        let err = config
+            .validate()
+            .expect_err("max_entry_bytes must clear max_bytes by the weigher overhead");
+
+        assert_eq!(err, ObjectDataCacheConfigError::MaxEntryBytesExceedsMaxBytes);
+    }
+
+    #[test]
+    fn validate_accepts_time_to_idle_greater_than_ttl() {
+        // A time_to_idle above ttl is inert (warned, not rejected).
+        let config = ObjectDataCacheConfig {
+            ttl: Duration::from_secs(30),
+            time_to_idle: Duration::from_secs(60),
+            ..ObjectDataCacheConfig::default()
+        };
+
+        assert!(config.validate().is_ok());
     }
 }
