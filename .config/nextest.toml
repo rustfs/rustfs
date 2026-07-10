@@ -77,3 +77,19 @@ retries = 2
 filter = 'package(rustfs-ecstore) & test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/)'
 test-group = 'ecstore-serial-flaky'
 retries = 2
+
+# ---------------------------------------------------------------------------
+# e2e-smoke profile — PR smoke subset of the e2e_test crate (backlog#1149 ci-4)
+# ---------------------------------------------------------------------------
+# PR smoke subset of the e2e_test crate (backlog#1149 ci-4). This profile is
+# the single wiring mechanism for e2e tests in CI: other suites join by
+# extending this filter (or a sibling profile), never by adding ad-hoc e2e
+# jobs to ci.yml. Admission criteria (see crates/e2e_test/README.md): fast,
+# single-node topology, no external dependencies (no awscurl / Vault / fixed
+# ports / pre-started server), no #[ignore].
+#
+# Each e2e test spawns its own rustfs server on a random port with an isolated
+# temp dir (crates/e2e_test/src/common.rs), so the subset is parallel-safe.
+[profile.e2e-smoke]
+default-filter = 'package(e2e_test) & test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check)_test::/)'
+fail-fast = false
