@@ -39,6 +39,10 @@ dial9-taskdump = ["dial9", "dial9-tokio-telemetry/taskdump"]
 gpu = ["dep:nvml-wrapper"]
 pyroscope = ["dep:pyroscope"]
 
+[[example]]
+name = "dial9_smoke"
+required-features = ["dial9"]
+
 [lints]
 workspace = true
 

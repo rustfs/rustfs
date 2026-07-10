@@ -148,15 +148,14 @@ fn finish_traced_runtime(
         TelemetryError::Io(format!("Failed to build dial9 TracedRuntime: {e}"))
     })?;
 
+    // `is_enabled` distinguishes a live guard from the inert one a lenient
+    // config produces after a build failure. It does NOT mean recording has
+    // started — a guard from `build` (rather than `build_and_start`) reports
+    // `true` while writing segments that contain only a header. Recording is
+    // guaranteed by the `build_and_start` call above, not by this check.
     if !guard.is_enabled() {
-        // A lenient config can downgrade to a disabled guard after a build
-        // failure. Recording silently off is precisely the failure mode this
-        // integration used to have, so surface it instead of reporting a
-        // healthy session.
         dial9_runtime_state().record_runtime_error(&config);
-        return Err(TelemetryError::Io(
-            "dial9 TracedRuntime built but telemetry recording is disabled".to_string(),
-        ));
+        return Err(TelemetryError::Io("dial9 TracedRuntime built with telemetry disabled".to_string()));
     }
 
     dial9_runtime_state().record_runtime_started(&config);
