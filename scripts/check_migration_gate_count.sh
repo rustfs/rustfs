@@ -54,12 +54,18 @@ if [[ "$mode" == "all" || "$mode" == "check" ]]; then
         exit 1
     fi
 
-    # Human-format list: binary headers start at column 0, one test per
-    # 4-space-indented line. A nextest failure aborts via set -e with its
-    # stderr visible; an output-format change collapses the count to 0 and
-    # fails loudly rather than silently passing.
-    list_output="$(cargo nextest list -p rustfs-ecstore --lib -E "$MIGRATION_GATE_FILTER")"
-    count="$(printf '%s\n' "$list_output" | grep -c '^    ' || true)"
+    # Count via the structured JSON listing, not the human format: the
+    # human format's indentation varies across nextest versions (CI's newer
+    # nextest emitted a layout where no line matched '^    ', collapsing the
+    # count to 0 and failing every PR). A nextest failure aborts via set -e
+    # with its stderr visible; a JSON schema change makes jq fail loudly
+    # rather than silently passing.
+    count="$(cargo nextest list -p rustfs-ecstore --lib -E "$MIGRATION_GATE_FILTER" --message-format json \
+        | jq '[."rust-suites"[].testcases[] | select(."filter-match".status == "matches")] | length')"
+    if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+        echo "error: could not parse nextest JSON listing (got count: '$count')" >&2
+        exit 1
+    fi
 
     if ((count < floor)); then
         echo "error: migration gate selects $count tests, below the committed floor of $floor." >&2
