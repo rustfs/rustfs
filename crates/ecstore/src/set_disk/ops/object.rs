@@ -1409,7 +1409,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let should_rollback = quorum_result.is_err();
         let mut rollback_futures = Vec::new();
         for (index, err) in errs.iter().enumerate() {
-            if err.is_some() {
+            // backlog#1158: when rolling back, fan the idempotent undo out to every
+            // online disk (each self-decides from its staged backup: restore if the
+            // rollback dir is present, no-op otherwise). This covers a disk that
+            // staged + applied the delete and *then* errored, which the plain
+            // `err.is_some()` skip would leave deleted while its peers were restored.
+            // On success only the successful disks' backup dirs need cleaning; errored
+            // disks' residue is reclaimed by heal/scanner.
+            if !should_rollback && err.is_some() {
                 continue;
             }
 
@@ -1764,7 +1771,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // delete_versions commits one xl.meta per object group, so rollback must use the same boundary.
             let should_rollback = fi_vers.versions.iter().any(|fi| del_errs[fi.idx].is_some());
             for (disk_idx, disk) in disks.iter().enumerate() {
-                if fi_vers.versions.iter().any(|fi| del_obj_errs[disk_idx][fi.idx].is_some()) {
+                // backlog#1158: on rollback, include every online disk so a disk that
+                // staged + applied the delete and then errored is still restored (the
+                // disk-side undo is idempotent, no-op when nothing was staged). On
+                // success, skip the errored disks and only clean up successful ones.
+                if !should_rollback && fi_vers.versions.iter().any(|fi| del_obj_errs[disk_idx][fi.idx].is_some()) {
                     continue;
                 }
 
