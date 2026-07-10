@@ -200,7 +200,8 @@ use crate::app::object_data_cache::{
     fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
     invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
-    invalidate_object_data_cache_objects_before_mutation, lookup_get_object_body_cache_hit,
+    invalidate_object_data_cache_objects_before_mutation, invalidate_object_data_cache_prefix_after_delete,
+    invalidate_object_data_cache_prefix_before_mutation, lookup_get_object_body_cache_hit,
 };
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -5543,7 +5544,14 @@ impl DefaultObjectUsecase {
         };
 
         let cache_adapter = self.object_data_cache();
-        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        // A force (delete_prefix) delete removes every object under `key` as a
+        // prefix, so invalidating only the exact key would strand every cached
+        // body beneath it. Use the prefix primitive in that branch (ODC-27).
+        if force_delete {
+            let _ = invalidate_object_data_cache_prefix_before_mutation(&cache_adapter, &bucket, &key).await;
+        } else {
+            let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        }
 
         let obj_info = {
             match store.delete_object(&bucket, &key, opts.clone()).await {
@@ -5574,7 +5582,11 @@ impl DefaultObjectUsecase {
                 "failed to persist transitioned object cleanup journal"
             );
         }
-        let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
+        if force_delete {
+            let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;
+        } else {
+            let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
+        }
 
         // Fast in-memory update for immediate quota and admin usage consistency
         if delete_creates_delete_marker(&opts) {

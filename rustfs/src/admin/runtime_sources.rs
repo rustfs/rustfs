@@ -18,14 +18,16 @@ use crate::admin::storage_api::runtime_sources::{
 pub(crate) use crate::app::admin_usecase::{
     AdminPoolStatus, DefaultAdminUsecase, QueryPoolStatusRequest, QueryServerInfoRequest,
 };
+use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::runtime_sources as root_runtime_sources;
 pub(crate) use crate::runtime_sources::{
     AppContext, ServerContextSlot, current_action_credentials, current_boot_time, current_bucket_metadata_handle,
     current_bucket_monitor_handle, current_deployment_id, current_endpoints_handle, current_iam_handle,
-    current_kms_runtime_service_manager, current_notification_system_for_context, current_object_store_handle_for_context,
-    current_oidc_handle, current_ready_iam_handle, current_region, current_replication_pool_handle,
-    current_replication_stats_handle, current_server_config_for_context, current_token_signing_key,
+    current_kms_runtime_service_manager, current_notification_system_for_context, current_object_data_cache_handle_for_context,
+    current_object_store_handle_for_context, current_oidc_handle, current_ready_iam_handle, current_region,
+    current_replication_pool_handle, current_replication_stats_handle, current_server_config_for_context,
+    current_token_signing_key,
 };
 use rustfs_config::server_config::Config;
 use rustfs_kms::KmsServiceManager;
@@ -50,6 +52,14 @@ pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
 pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
     let context = current_app_context();
     current_object_store_handle_for_context(context.as_deref())
+}
+
+/// Resolve the object data cache adapter for an admin request through the
+/// process AppContext. `None` when no context is initialised (the admin
+/// stats/flush handlers then report the cache as unavailable).
+pub(crate) fn current_object_data_cache() -> Option<Arc<ObjectDataCacheAdapter>> {
+    let context = current_app_context();
+    current_object_data_cache_handle_for_context(context.as_deref())
 }
 
 /// Resolve the object store for an admin request through the server's context

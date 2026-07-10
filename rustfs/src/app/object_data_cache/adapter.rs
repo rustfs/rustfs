@@ -16,7 +16,7 @@ use bytes::Bytes;
 use rustfs_object_data_cache::{
     ObjectDataCache, ObjectDataCacheConfig, ObjectDataCacheConfigError, ObjectDataCacheFillResult, ObjectDataCacheGetPlan,
     ObjectDataCacheGetRequest, ObjectDataCacheIdentity, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult,
-    ObjectDataCacheLookup, ObjectDataCacheMode,
+    ObjectDataCacheLookup, ObjectDataCacheMode, ObjectDataCacheStatsSnapshot,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
@@ -124,6 +124,40 @@ impl ObjectDataCacheAdapter {
         reason: ObjectDataCacheInvalidationReason,
     ) -> ObjectDataCacheInvalidationResult {
         self.cache.invalidate_object(identity, reason).await
+    }
+
+    /// Executes an engine-level prefix invalidation (ODC-27).
+    pub(crate) async fn invalidate_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
+        self.cache.invalidate_prefix(bucket, prefix, reason).await
+    }
+
+    /// Executes an engine-level bucket invalidation (ODC-28).
+    pub(crate) async fn invalidate_bucket(
+        &self,
+        bucket: &str,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
+        self.cache.invalidate_bucket(bucket, reason).await
+    }
+
+    /// Drops every cached body and resets the identity index (ODC-C2 flush).
+    pub(crate) async fn clear(&self, reason: ObjectDataCacheInvalidationReason) -> ObjectDataCacheInvalidationResult {
+        self.cache.clear(reason).await
+    }
+
+    /// Current cache statistics snapshot (ODC-C2 admin stats).
+    pub(crate) fn stats(&self) -> ObjectDataCacheStatsSnapshot {
+        self.cache.stats()
+    }
+
+    /// Configured runtime mode (ODC-C2 admin stats).
+    pub(crate) fn mode(&self) -> ObjectDataCacheMode {
+        self.cache.mode()
     }
 }
 

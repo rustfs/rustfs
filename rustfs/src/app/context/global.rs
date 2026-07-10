@@ -82,6 +82,11 @@ impl AppContext {
         // Let ecstore probe this cache inside get_object_reader, after
         // metadata resolution but before the erasure data read (backlog#802).
         crate::app::object_data_cache::register_object_data_cache_body_hook(Arc::clone(&object_data_cache));
+        // Let ecstore's internal delete paths (lifecycle/scanner expiry,
+        // noncurrent-version cleanup, restored-copy expiry) drop the removed
+        // object's cached body instead of leaving it resident until TTL
+        // (ODC-26, backlog#1131).
+        crate::app::object_data_cache::register_object_data_cache_mutation_hook(Arc::clone(&object_data_cache));
 
         Self {
             object_store,
