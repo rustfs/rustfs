@@ -2455,6 +2455,16 @@ impl LocalIoBackend for UringBackend {
         if !self.active.load(Ordering::Relaxed) {
             return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
         }
+        // O_DIRECT interop (backlog#1102): `pread_uring` opens the file
+        // buffered, so routing an O_DIRECT-eligible read through io_uring would
+        // silently drop O_DIRECT and pollute the page cache — a behavior change
+        // the moment io_uring is enabled on a disk that uses it. Until the
+        // driver grows a native aligned O_DIRECT read, such reads keep going
+        // through StdBackend's aligned path (which itself falls back to
+        // buffered when the filesystem rejects O_DIRECT).
+        if is_direct_io_read_enabled() && length > 0 && length >= get_direct_io_read_threshold() {
+            return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
+        }
         match self.pread_uring(volume, path, offset, length).await {
             Ok(bytes) => Ok(bytes),
             Err(err) => {
@@ -11387,6 +11397,74 @@ mod test {
             .expect("uring probe cache mutex poisoned")
             .remove(&cached);
         assert!(skipped, "a cached-unsupported disk must skip the probe and return None");
+    }
+
+    /// O_DIRECT interop (backlog#1102): with BOTH io_uring and O_DIRECT enabled,
+    /// an O_DIRECT-eligible read keeps O_DIRECT semantics — it is routed to
+    /// StdBackend's aligned path instead of the buffered io_uring path — and
+    /// still returns exactly the requested bytes for unaligned ranges. Without
+    /// the guard, enabling io_uring would silently drop O_DIRECT.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_preserves_o_direct_for_eligible_reads() {
+        use tempfile::tempdir;
+
+        // Unaligned on purpose: 3 blocks + 7 bytes.
+        const FILE_LEN: usize = 4096 * 3 + 7;
+        let mut state = 0x2545f4914f6cdd1du64;
+        let content: Vec<u8> = (0..FILE_LEN)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        let content = Bytes::from(content);
+
+        let ranges = [
+            (0usize, FILE_LEN),
+            (0, 4096),
+            (4095, 4098),
+            (4096 * 2, 4096 + 7),
+            (FILE_LEN - 7, 7),
+        ];
+
+        // Threshold 1 makes every non-empty read O_DIRECT-eligible, so each read
+        // below exercises the guard. The env must be set before LocalDisk::new
+        // so the io_uring backend is the one selected.
+        let root_dir = tempdir().expect("operation should succeed");
+        let got_ranges = temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("1")),
+            ],
+            async {
+                let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+                disk.make_volume("test-volume").await.expect("operation should succeed");
+                disk.write_all("test-volume", "shard.bin", content.clone())
+                    .await
+                    .expect("operation should succeed");
+                let mut out = Vec::new();
+                for (offset, length) in ranges {
+                    out.push(
+                        disk.read_file_mmap_copy("test-volume", "shard.bin", offset, length)
+                            .await
+                            .expect("O_DIRECT-eligible read must succeed under io_uring (direct or fallback)"),
+                    );
+                }
+                out
+            },
+        )
+        .await;
+
+        for ((offset, length), got) in ranges.into_iter().zip(got_ranges) {
+            assert_eq!(
+                got,
+                content.slice(offset..offset + length),
+                "O_DIRECT read mismatch at offset={offset} length={length}"
+            );
+        }
     }
 
     /// Once io_uring is latched off (backlog#1101), reads still return correct
