@@ -321,11 +321,6 @@ async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64)
 }
 
 #[allow(dead_code)]
-async fn set_bucket_lifecycle_transition(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    set_bucket_lifecycle_transition_with_tier(bucket_name, "COLDTIER44").await
-}
-
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_transition_with_tier(
     bucket_name: &str,
     storage_class: &str,
@@ -364,67 +359,6 @@ async fn set_bucket_lifecycle_transition_with_tier(
     Ok(())
 }
 
-/// Test helper: Create a test tier
-#[allow(dead_code)]
-async fn create_test_tier(server: u32) {
-    let args = TierConfig {
-        version: "v1".to_string(),
-        tier_type: TierType::MinIO,
-        name: "COLDTIER44".to_string(),
-        s3: None,
-        aliyun: None,
-        tencent: None,
-        huaweicloud: None,
-        azure: None,
-        gcs: None,
-        r2: None,
-        rustfs: None,
-        minio: if server == 1 {
-            Some(TierMinIO {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-                bucket: "hello".to_string(),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
-                region: "".to_string(),
-                ..Default::default()
-            })
-        } else if server == 2 {
-            let test_compatible_server = std::env::var("TEST_MINIO_SERVER").unwrap_or_else(|_| "localhost:9000".to_string());
-            Some(TierMinIO {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-                bucket: "mblock2".to_string(),
-                endpoint: format!("http://{}", test_compatible_server),
-                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
-                region: "".to_string(),
-                ..Default::default()
-            })
-        } else {
-            Some(TierMinIO {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-                bucket: "mblock2".to_string(),
-                endpoint: "http://127.0.0.1:9020".to_string(),
-                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
-                region: "".to_string(),
-                ..Default::default()
-            })
-        },
-    };
-    let tier_config_mgr_handle = get_global_tier_config_mgr();
-    let mut tier_config_mgr = tier_config_mgr_handle.write().await;
-    if let Err(err) = tier_config_mgr.add(args, false).await {
-        println!("tier_config_mgr add failed, e: {err:?}");
-        panic!("tier add failed. {err}");
-    }
-    if let Err(e) = tier_config_mgr.save().await {
-        println!("tier_config_mgr save failed, e: {e:?}");
-        panic!("tier save failed");
-    }
-    println!("Created test tier: COLDTIER44");
-}
-
 /// Test helper: Check if object exists
 async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     match (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
@@ -442,18 +376,6 @@ async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &
     } else {
         println!("object_is_delete_marker is error");
         panic!("object_is_delete_marker is error");
-    }
-}
-
-/// Test helper: Check if object exists
-#[allow(dead_code)]
-async fn object_is_transitioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
-    if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        println!("oi: {oi:?}");
-        !oi.transitioned_object.status.is_empty()
-    } else {
-        println!("object_is_transitioned is error");
-        panic!("object_is_transitioned is error");
     }
 }
 
@@ -515,6 +437,24 @@ async fn free_version_count(disk_path: &Path, bucket: &str, object: &str) -> usi
         .expect("failed to decode file info versions")
         .free_versions
         .len()
+}
+
+/// The free-version metadata removal lands asynchronously after the remote
+/// object disappears, so poll instead of asserting a single read.
+async fn wait_for_free_version_absence(disk_path: &Path, bucket: &str, object: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if free_version_count(disk_path, bucket, object).await == 0 {
+            return true;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn object_version_count(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> usize {
@@ -829,98 +769,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore]
-    async fn test_lifecycle_transition_basic() {
-        let (_disk_paths, ecstore) = setup_test_env().await;
-
-        create_test_tier(2).await;
-
-        // Create test bucket and object
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let bucket_name = format!("test-lc-transition-{}", &suffix[..8]);
-        let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
-        let test_data = b"Hello, this is test data for lifecycle expiry!";
-
-        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
-        upload_test_object(
-            &ecstore,
-            bucket_name.as_str(),
-            object_name,
-            b"Hello, this is test data for lifecycle expiry 1111-11111111-1111 !",
-        )
-        .await;
-        //create_test_bucket(&ecstore, bucket_name.as_str()).await;
-        upload_test_object(&ecstore, bucket_name.as_str(), object_name, test_data).await;
-
-        // Verify object exists initially
-        assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
-        println!("✅ Object exists before lifecycle processing");
-
-        // Set lifecycle configuration with very short expiry (0 days = immediate expiry)
-        set_bucket_lifecycle_transition(bucket_name.as_str())
-            .await
-            .expect("Failed to set lifecycle configuration");
-        println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
-
-        // Verify lifecycle configuration was set
-        match get_bucket_metadata(bucket_name.as_str()).await {
-            Ok(bucket_meta) => {
-                assert!(bucket_meta.lifecycle_config.is_some());
-                println!("✅ Bucket metadata retrieved successfully");
-            }
-            Err(e) => {
-                println!("❌ Error retrieving bucket metadata: {e:?}");
-            }
-        }
-
-        let ctx = CancellationToken::new();
-
-        // Start scanner
-        init_data_scanner(ctx.clone(), ecstore.clone()).await;
-        println!("✅ Scanner started");
-
-        // Wait for scanner to process lifecycle rules
-        tokio::time::sleep(Duration::from_secs(1200)).await;
-
-        // Check if object has been expired (deleted)
-        let check_result = object_is_transitioned(&ecstore, &bucket_name, object_name).await;
-        println!("Object exists after lifecycle processing: {check_result}");
-
-        if check_result {
-            println!("✅ Object was transitioned by lifecycle processing");
-            // Let's try to get object info to see its details
-            match ecstore
-                .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
-                .await
-            {
-                Ok(obj_info) => {
-                    println!(
-                        "Object info: name={}, size={}, mod_time={:?}",
-                        obj_info.name, obj_info.size, obj_info.mod_time
-                    );
-                    println!("Object info: transitioned_object={:?}", obj_info.transitioned_object);
-                }
-                Err(e) => {
-                    println!("Error getting object info: {e:?}");
-                }
-            }
-        } else {
-            println!("❌ Object was not transitioned by lifecycle processing");
-        }
-
-        assert!(check_result);
-        println!("✅ Object successfully transitioned");
-
-        // Stop scanner
-        ctx.cancel();
-        println!("✅ Scanner stopped");
-
-        println!("Lifecycle transition basic test completed");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
     async fn test_transition_and_restore_flows() {
         let (_disk_paths, ecstore) = setup_test_env().await;
 
@@ -1229,7 +1078,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_enqueues_free_version_cleanup_for_stale_transitioned_object() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1276,9 +1125,8 @@ mod serial_tests {
             wait_for_remote_absence(&backend, &stale_remote_object, TRANSITION_WAIT_TIMEOUT).await,
             "scanner should enqueue stale free-version cleanup for the transitioned remote object"
         );
-        assert_eq!(
-            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await,
-            0,
+        assert!(
+            wait_for_free_version_absence(&disk_paths[0], bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT).await,
             "free-version metadata should be removed after scanner-triggered cleanup"
         );
         assert!(
@@ -1289,7 +1137,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_cleanup_still_works_after_immediate_compensation_transition() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1337,16 +1185,15 @@ mod serial_tests {
             wait_for_remote_absence(&backend, &stale_remote_object, TRANSITION_WAIT_TIMEOUT).await,
             "scanner should clean stale remote object even after immediate compensation transitioned it"
         );
-        assert_eq!(
-            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await,
-            0,
+        assert!(
+            wait_for_free_version_absence(&disk_paths[0], bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT).await,
             "free-version metadata should be removed after scanner cleanup"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_existing_object_backfill_is_idempotent_after_immediate_compensation_transition() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1389,7 +1236,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
     async fn test_noncurrent_expiry_still_works_after_immediate_compensation_transition() {
         let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1473,7 +1320,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
     async fn test_noncurrent_transition_still_works_after_immediate_compensation_transition() {
         let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1556,7 +1403,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_modeled_versioned_delete_creates_delete_marker_after_immediate_compensation_transition() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1604,7 +1451,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_modeled_delete_marker_cleanup_after_immediate_compensation_transition() {
         let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1681,7 +1528,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_expires_zero_day_current_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1708,7 +1555,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_put_object_immediately_enqueues_zero_day_current_expiry() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1746,7 +1593,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_expires_zero_day_noncurrent_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1813,7 +1660,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_put_object_immediately_enqueues_zero_day_noncurrent_expiry() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1898,7 +1745,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_background_scanner_expires_zero_day_current_version_for_exact_key_prefix() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
