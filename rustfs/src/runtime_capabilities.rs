@@ -194,10 +194,16 @@ mod tests {
         assert_eq!(snapshot.platform.os.as_deref(), Some(std::env::consts::OS));
         assert_eq!(snapshot.platform.arch.as_deref(), Some(std::env::consts::ARCH));
         assert_eq!(snapshot.platform.target_triple.as_deref(), Some(compiled_target_triple().as_str()));
+        // A binary built without the `dial9` feature reports `Unsupported`
+        // rather than `Disabled`: telemetry cannot be turned on by configuration
+        // alone, and reporting it as merely disabled would imply that it can.
         assert!(matches!(
             snapshot.runtime_telemetry.state,
-            CapabilityState::Supported | CapabilityState::Disabled
+            CapabilityState::Supported | CapabilityState::Disabled | CapabilityState::Unsupported
         ));
+        if !rustfs_obs::dial9::is_supported() {
+            assert!(matches!(snapshot.runtime_telemetry.state, CapabilityState::Unsupported));
+        }
         assert!(
             snapshot
                 .platform
