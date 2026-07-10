@@ -38,6 +38,13 @@ impl Dial9SessionGuard {
     }
 }
 
+/// Mirrors the `Drop` the enabled guard uses to flush and seal the trace
+/// segment, so a caller can drop the guard before `process::exit` under either
+/// feature without `clippy::drop_non_drop` firing on this variant.
+impl Drop for Dial9SessionGuard {
+    fn drop(&mut self) {}
+}
+
 /// Always fails: telemetry support is not compiled in.
 ///
 /// # Errors
