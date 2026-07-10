@@ -129,7 +129,7 @@ the gate table) into the GitHub step summary.
 Readiness polling waits up to `--health-timeout` seconds (default **180**),
 which must outlast the server's own startup-readiness budget
 (`RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS`, default 120s) — a shorter poll on a
-slow shared runner mis-reports a slow cold start as a failure. In local mode the
+slow shared runner misreports a slow cold start as a failure. In local mode the
 rig also fails fast if the server process exits before becoming healthy instead
 of polling out the full budget.
 
