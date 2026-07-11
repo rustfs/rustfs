@@ -13,8 +13,9 @@
 // limitations under the License.
 
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::{
-    bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, init_background_expiry},
-    lifecycle::TransitionOptions,
+    bucket_lifecycle_audit::LcEventSrc,
+    bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, expire_transitioned_object, init_background_expiry},
+    lifecycle::{Event as LcEvent, IlmAction, TransitionOptions},
 };
 pub(crate) use rustfs_ecstore::api::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
@@ -24,6 +25,7 @@ pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
 pub(crate) use rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path;
 pub(crate) use rustfs_ecstore::api::client::transition_api::{ReadCloser, ReaderImpl};
 pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
+pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreError, is_err_object_not_found, is_err_version_not_found};
 pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
 pub(crate) use rustfs_ecstore::api::runtime::global_tier_config_mgr as get_global_tier_config_mgr;
 pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
@@ -40,10 +42,11 @@ pub(crate) mod lifecycle {
     };
 
     pub(crate) use super::{
-        BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskAPI, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
-        PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, ScannerWarmBackend, TierConfig, TierMinIO, TierType,
-        TransitionOptions, WarmBackendGetOpts, build_transition_put_options, enqueue_transition_for_existing_objects,
-        get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks,
+        BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskAPI, DiskOption, ECStore, EcstoreError, Endpoint, EndpointServerPools,
+        Endpoints, IlmAction, LcEvent, LcEventSrc, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE,
+        ScannerWarmBackend, TierConfig, TierMinIO, TierType, TransitionOptions, WarmBackendGetOpts, build_transition_put_options,
+        enqueue_transition_for_existing_objects, expire_transitioned_object, get_bucket_metadata, get_global_tier_config_mgr,
+        init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found, is_err_version_not_found,
         new_disk, path2_bucket_object_with_base_path, update_bucket_metadata,
     };
 }
