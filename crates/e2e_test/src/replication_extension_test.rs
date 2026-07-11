@@ -49,6 +49,13 @@ use uuid::Uuid;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
+/// A replication source server validates the remote target endpoint, and the e2e
+/// target runs on loopback (127.0.0.1), which RustFS's SSRF egress guard rejects by
+/// default. This suite opts its source servers into the loopback allowance explicitly
+/// so the shared harness (`RustFSTestEnvironment` / the cluster harness) stays
+/// fail-closed and every other e2e scenario keeps exercising the production SSRF policy.
+const LOOPBACK_REPLICATION_TARGET_ENV: &[(&str, &str)] = &[("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true")];
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
     #[serde(rename = "Targets", default)]
@@ -1325,7 +1332,9 @@ async fn build_replication_pair(
     enable_target_versioning: bool,
 ) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment, String), Box<dyn Error + Send + Sync>> {
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1370,7 +1379,9 @@ async fn test_replication_check_rejects_target_without_object_lock() -> Result<(
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1412,7 +1423,9 @@ async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<()
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1449,7 +1462,8 @@ async fn test_replication_check_rejects_unversioned_source_bucket() -> Result<()
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-check-source-unversioned";
     let client = env.create_s3_client();
@@ -1472,7 +1486,8 @@ async fn test_replication_check_rejects_missing_replication_config() -> Result<(
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-check-missing-config";
     let client = env.create_s3_client();
@@ -1495,7 +1510,8 @@ async fn test_replication_check_rejects_invalid_bucket() -> Result<(), Box<dyn E
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let response = run_replication_check(&env, "replication-check-no-such-bucket").await?;
     let status = response.status();
@@ -1513,7 +1529,8 @@ async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Resu
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-check-same-target";
     let client = env.create_s3_client();
@@ -1556,7 +1573,9 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1585,7 +1604,9 @@ async fn test_set_remote_target_update_requires_arn() -> Result<(), Box<dyn Erro
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1635,7 +1656,9 @@ async fn test_set_remote_target_update_rejects_missing_target() -> Result<(), Bo
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1686,7 +1709,9 @@ async fn test_set_remote_target_rejects_invalid_target_url() -> Result<(), Box<d
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-invalid-target-url-src";
     let source_client = source_env.create_s3_client();
@@ -1730,7 +1755,7 @@ async fn test_set_remote_target_rejects_self_signed_https_target_without_skip_tl
         .await
         .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
     source_env
-        .start_rustfs_server(vec![])
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
         .await
         .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
 
@@ -1815,7 +1840,7 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
         .await
         .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
     source_env
-        .start_rustfs_server(vec![])
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
         .await
         .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
 
@@ -1907,7 +1932,7 @@ async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_
         .await
         .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
     source_env
-        .start_rustfs_server(vec![])
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
         .await
         .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
 
@@ -1991,7 +2016,7 @@ async fn test_set_remote_target_allows_private_ca_https_target_with_ca_cert_pem(
         .await
         .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
     source_env
-        .start_rustfs_server(vec![])
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
         .await
         .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
 
@@ -2079,7 +2104,8 @@ async fn test_list_remote_targets_rejects_empty_bucket() -> Result<(), Box<dyn E
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let response = list_replication_targets_request(&env, Some("")).await?;
     let status = response.status();
@@ -2098,7 +2124,8 @@ async fn test_list_remote_targets_rejects_invalid_bucket() -> Result<(), Box<dyn
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let response = list_replication_targets_request(&env, Some("missing-replication-target-bucket")).await?;
     let status = response.status();
@@ -2116,7 +2143,9 @@ async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dy
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2155,7 +2184,8 @@ async fn test_remove_remote_target_rejects_missing_arn() -> Result<(), Box<dyn E
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-remove-missing-arn";
     let client = env.create_s3_client();
@@ -2179,7 +2209,8 @@ async fn test_remove_remote_target_rejects_invalid_bucket() -> Result<(), Box<dy
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let response = remove_replication_target_request(
         &env,
@@ -2242,7 +2273,9 @@ async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Bo
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2290,7 +2323,9 @@ async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<()
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2330,7 +2365,9 @@ async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env_a = RustFSTestEnvironment::new().await?;
     target_env_a.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2379,7 +2416,9 @@ async fn test_sequential_bucket_replication_succeeds_for_multiple_buckets() -> R
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2421,7 +2460,9 @@ async fn test_replication_recovers_after_runtime_target_cache_is_cleared() -> Re
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2463,7 +2504,9 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2588,7 +2631,9 @@ async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Re
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2708,7 +2753,9 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2767,7 +2814,9 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2870,7 +2919,9 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2942,7 +2993,9 @@ async fn test_site_replication_replicates_policy_backed_user_access_real_dual_no
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -3025,7 +3078,9 @@ async fn test_site_replication_replicates_group_policy_backed_access_real_dual_n
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -3109,7 +3164,8 @@ async fn test_service_account_policy_from_accountinfo_round_trips_real_single_no
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let account_info = get_account_info(&env, &env.access_key, &env.secret_key).await?;
     let policy_str = account_info
@@ -3160,7 +3216,9 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -3260,7 +3318,9 @@ async fn test_site_replication_replicates_service_accounts_created_from_sts_sess
     }
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
