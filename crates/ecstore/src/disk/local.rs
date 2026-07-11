@@ -67,7 +67,7 @@ use tokio::fs::{self, File};
 #[cfg(not(unix))]
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -3639,6 +3639,7 @@ pub struct LocalDisk {
     startup_cleanup_notify: Arc<Notify>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
     io_backend: Arc<dyn LocalIoBackend>,
+    file_sync_permits: Arc<Semaphore>,
 }
 
 impl Drop for LocalDisk {
@@ -3876,6 +3877,7 @@ impl LocalDisk {
             startup_cleanup_notify,
             exit_signal: None,
             io_backend: build_local_io_backend(root.clone()),
+            file_sync_permits: os::disk_file_sync_limiter(&root),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
             log_startup_disk_error("get_disk_info", &root, err);
@@ -6780,7 +6782,7 @@ impl DiskAPI for LocalDisk {
             let shard_sync = async {
                 if durability.syncs_data_shards()
                     && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
-                    && let Err(err) = os::sync_dir_files(src_data_path).await
+                    && let Err(err) = os::sync_dir_files_with_limiter(src_data_path, self.file_sync_permits.clone()).await
                     && err.kind() != ErrorKind::NotFound
                 {
                     return Err::<(), DiskError>(to_file_error(err).into());
@@ -9003,6 +9005,89 @@ mod test {
                 .join(STORAGE_FORMAT_FILE)
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(file_sync_probe)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_shares_file_sync_limit_across_one_disk() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "shared-sync-limit-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let first_data_dir = Uuid::from_u128(1);
+        let second_data_dir = Uuid::from_u128(2);
+        for (tmp_object, data_dir) in [("tmp-first", first_data_dir), ("tmp-second", second_data_dir)] {
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join(tmp_object)
+                .join(data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("staged data dir should be created");
+            for part in 1..=os::MAX_PARALLEL_FILE_SYNCS {
+                fs::write(tmp_data_dir.join(format!("part.{part}")), b"shard")
+                    .await
+                    .expect("staged shard should be written");
+            }
+        }
+
+        let _probe = os::file_sync_probe::set_blocking(dir.path());
+        let first = {
+            let disk = disk.clone();
+            tokio::spawn(async move {
+                let fi = test_file_info("first-object", Uuid::from_u128(11), Some(first_data_dir), None);
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, "tmp-first", fi, bucket, "first-object")
+                    .await
+            })
+        };
+        let second = {
+            let disk = disk.clone();
+            tokio::spawn(async move {
+                let fi = test_file_info("second-object", Uuid::from_u128(12), Some(second_data_dir), None);
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, "tmp-second", fi, bucket, "second-object")
+                    .await
+            })
+        };
+        os::file_sync_probe::wait_for_active(os::MAX_PARALLEL_FILE_SYNCS).await;
+
+        assert_eq!(
+            disk.file_sync_permits.available_permits(),
+            0,
+            "concurrent rename_data calls must share the LocalDisk sync limit"
+        );
+        assert_eq!(
+            os::file_sync_probe::peak(),
+            os::MAX_PARALLEL_FILE_SYNCS,
+            "one disk must not exceed its shared file-sync capacity"
+        );
+        let reconnected = LocalDisk::new(&endpoint, false).await.expect("local disk should reconnect");
+        assert!(
+            Arc::ptr_eq(&disk.file_sync_permits, &reconnected.file_sync_permits),
+            "reconnecting the same disk must preserve its file-sync limiter"
+        );
+        assert_eq!(
+            reconnected.file_sync_permits.available_permits(),
+            0,
+            "reconnected disk must inherit the outstanding sync budget"
+        );
+
+        os::file_sync_probe::release();
+        first
+            .await
+            .expect("first rename_data task should join")
+            .expect("first rename_data should commit");
+        second
+            .await
+            .expect("second rename_data task should join")
+            .expect("second rename_data should commit");
     }
 
     #[tokio::test]
