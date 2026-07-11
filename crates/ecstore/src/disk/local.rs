@@ -3060,6 +3060,19 @@ impl UringBackend {
         }
     }
 
+    /// Classify an O_DIRECT read-side error and latch the right path off, matching
+    /// StdBackend (rustfs/backlog#1171). An O_DIRECT-shape error (EINVAL/EOPNOTSUPP)
+    /// latches only the native direct path; a genuine subsystem error latches
+    /// io_uring as a whole. Shared by the single-op and chunked read paths so the
+    /// classification lives in one place (rustfs/backlog#1174).
+    fn classify_direct_read_error(&self, io_err: &std::io::Error) {
+        if is_direct_io_unsupported(io_err) {
+            self.direct_uring.supported.store(false, Ordering::Relaxed);
+        } else if is_io_uring_unsupported(io_err) {
+            self.latch_active_off(io_err);
+        }
+    }
+
     /// Positioned read via io_uring. Mirrors `StdBackend::pread_bytes`'s
     /// resolution/access/bounds preamble, then reads the range with the driver
     /// (whole-range: the driver resubmits short reads for positioned reads).
@@ -3275,23 +3288,40 @@ impl UringBackend {
 
         let file = Arc::new(file);
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = match self.driver.read_at_direct(file, offset_u64, length, align).await {
-            Ok(bytes) => bytes,
-            Err(io_err) => {
-                // Classify a read-side failure the same way StdBackend does
-                // (rustfs/backlog#1171): an O_DIRECT-shape error (EINVAL/EOPNOTSUPP
-                // — the fs accepted the O_DIRECT open but rejects the read shape,
-                // e.g. a wrong alignment guess) latches only the native O_DIRECT
-                // path off, so subsequent eligible reads take StdBackend's aligned
-                // path instead of repaying the open+failed-submit every time. Only
-                // a genuine subsystem error latches io_uring as a whole.
-                if is_direct_io_unsupported(&io_err) {
-                    self.direct_uring.supported.store(false, Ordering::Relaxed);
-                } else if is_io_uring_unsupported(&io_err) {
-                    self.latch_active_off(&io_err);
+        let bytes = if length <= URING_MAX_OP_LEN {
+            // Fast path: one op. The driver's Vec becomes the result with no copy.
+            match self.driver.read_at_direct(Arc::clone(&file), offset_u64, length, align).await {
+                Ok(bytes) => bytes,
+                Err(io_err) => {
+                    self.classify_direct_read_error(&io_err);
+                    return Err(DiskError::from(io_err));
                 }
-                return Err(DiskError::from(io_err));
             }
+        } else {
+            // Split a very large O_DIRECT read into sequential chunks so a single
+            // op cannot pin ~length bytes of driver buffer, bounding worst-case
+            // in-flight memory (rustfs/backlog#1174). read_at_direct aligns each
+            // chunk's sub-range internally; chunk sizes are a multiple of
+            // URING_MAX_OP_LEN, so boundary re-reads are at most one block.
+            let mut assembled = Vec::with_capacity(length);
+            let mut done = 0usize;
+            while done < length {
+                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk_off = offset_u64 + done as u64;
+                let part = match self.driver.read_at_direct(Arc::clone(&file), chunk_off, chunk, align).await {
+                    Ok(part) => part,
+                    Err(io_err) => {
+                        self.classify_direct_read_error(&io_err);
+                        return Err(DiskError::from(io_err));
+                    }
+                };
+                if part.len() != chunk {
+                    return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
+                }
+                assembled.extend_from_slice(&part);
+                done += chunk;
+            }
+            assembled
         };
         if bytes.len() != length {
             return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
