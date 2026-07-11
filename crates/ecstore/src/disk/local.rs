@@ -2743,10 +2743,17 @@ struct FdCache {
 #[cfg(target_os = "linux")]
 impl FdCache {
     fn new() -> Self {
+        Self::with_ttl(FD_CACHE_TTL)
+    }
+
+    /// Build a cache with an explicit TTL backstop. Production goes through
+    /// `new` (`FD_CACHE_TTL`); tests inject a short TTL to exercise the backstop
+    /// eviction (rustfs/backlog#1180) without a multi-second wait.
+    fn with_ttl(ttl: std::time::Duration) -> Self {
         Self {
             cache: moka::future::Cache::builder()
                 .max_capacity(FD_CACHE_CAPACITY)
-                .time_to_live(FD_CACHE_TTL)
+                .time_to_live(ttl)
                 // Required for `invalidate_entries_if`; without it that call
                 // fails at runtime instead of dropping stale descriptors.
                 .support_invalidation_closures()
@@ -13851,6 +13858,228 @@ mod test {
             },
         )
         .await;
+    }
+
+    /// The real `rename_data` commit path — heal's write-then-commit, and the
+    /// two production copies at `LocalDisk::rename_data` — must invalidate the
+    /// destination part descriptors, not merely `rename_file`/`delete`
+    /// (backlog#1180 item 1). Heal reuses a version's `data_dir` and lands the
+    /// rebuilt shard on the SAME `<object>/<data_dir>/part.N` path, so a
+    /// descriptor cached before the commit would keep serving the pre-heal inode.
+    ///
+    /// Faithfulness: it drives `disk.rename_data(...)` for real (non-inline part,
+    /// so `invalidate_part_paths` is non-empty), not a raw `fs::rename` + manual
+    /// invalidate. Non-vacuity: after seeding the cache it removes the on-disk
+    /// data dir out of band — the cached fd keeps the old inode alive — and
+    /// asserts a read still returns the OLD bytes, which fails outright if the
+    /// cache is off, so the test cannot pass without a live cache. Removing the
+    /// dir also clears the path for the directory rename `rename_data` performs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_fd_cache_is_invalidated_by_rename_data() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            async {
+                let root = root_dir.path().to_path_buf();
+                // The invalidation only means anything when a descriptor is
+                // actually cached: io_uring must be available AND the fd cache on
+                // (RLIMIT_NOFILE headroom, backlog#1178). Probe the (existing)
+                // root to decide; otherwise there is nothing to exercise.
+                let cache_on = UringBackend::try_new(root.clone())
+                    .map(|b| b.fd_cache.is_some())
+                    .unwrap_or(false);
+                if !cache_on {
+                    uring_test_skip("uring_fd_cache_is_invalidated_by_rename_data");
+                    return;
+                }
+
+                let data_dir = Uuid::new_v4();
+                let version_id = Uuid::new_v4();
+                let part_rel = format!("object/{data_dir}/part.1");
+
+                let endpoint = Endpoint::try_from(root.to_string_lossy().as_ref()).expect("operation should succeed");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+                // `LocalDisk::new` already creates the system buckets, so the tmp
+                // bucket exists; `ensure_test_volume` tolerates that.
+                ensure_test_volume(&disk, "bucket").await;
+                ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+                // 1. Seed the descriptor cache: write the destination part and read
+                //    it, caching an open fd to that (pre-heal) inode.
+                disk.write_all("bucket", &part_rel, Bytes::from_static(b"oldshard"))
+                    .await
+                    .expect("operation should succeed");
+                let got = disk.read_file_mmap_copy("bucket", &part_rel, 0, 8).await.expect("seed read");
+                assert_eq!(got, Bytes::from_static(b"oldshard"), "first read seeds the descriptor cache");
+
+                // 2. Remove the destination data dir out of band. The cached fd
+                //    keeps the old inode alive and readable, and clears the path so
+                //    the real rename_data below can move a fresh data dir onto it (a
+                //    directory rename cannot land on a non-empty dir). No LocalDisk
+                //    mutation runs here, so nothing invalidates the cache.
+                std::fs::remove_dir_all(root.join("bucket").join(format!("object/{data_dir}")))
+                    .expect("remove destination data dir out of band");
+
+                // Liveness gate (non-vacuity): the cache must still serve the
+                // removed inode. With the cache off this read would fail, so this
+                // assertion is what proves the descriptor is genuinely cached.
+                let stale = disk
+                    .read_file_mmap_copy("bucket", &part_rel, 0, 8)
+                    .await
+                    .expect("a cached descriptor must still read the removed inode");
+                assert_eq!(
+                    stale,
+                    Bytes::from_static(b"oldshard"),
+                    "a cached descriptor is expected to still see the pre-commit inode — proves the cache is live"
+                );
+
+                // 3. Stage the rebuilt shard in the tmp bucket under the SAME
+                //    data_dir (exactly as heal does) and commit it with the real
+                //    rename_data (non-inline: data=None, size>0, one part).
+                let src_object = "heal-src";
+                disk.write_all(
+                    RUSTFS_META_TMP_BUCKET,
+                    &format!("{src_object}/{data_dir}/part.1"),
+                    Bytes::from_static(b"newshard"),
+                )
+                .await
+                .expect("stage rebuilt shard");
+
+                let mut fi = test_file_info("object", version_id, Some(data_dir), None);
+                fi.size = 8;
+                fi.add_object_part(1, "etag".to_string(), 8, Some(OffsetDateTime::now_utc()), 8, None, None);
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, src_object, fi, "bucket", "object")
+                    .await
+                    .expect("real rename_data must commit the rebuilt shard");
+
+                // 4. The read must now see the committed shard: rename_data
+                //    invalidated the cached descriptor for `{dst}/{data_dir}/part.N`.
+                let healed = disk
+                    .read_file_mmap_copy("bucket", &part_rel, 0, 8)
+                    .await
+                    .expect("post-commit read");
+                assert_eq!(
+                    healed,
+                    Bytes::from_static(b"newshard"),
+                    "rename_data must invalidate the cached descriptor so the committed shard is visible"
+                );
+            },
+        )
+        .await;
+    }
+
+    /// The TTL backstop (backlog#1178/#1180): `FdCache` must stop serving a
+    /// descriptor once `time_to_live` elapses even when no mutation path ever
+    /// calls an explicit `invalidate_*`. This is the safety net for a future
+    /// write path that forgets to invalidate — the stale descriptor self-evicts
+    /// rather than masking a replaced inode indefinitely. An injected short TTL
+    /// exercises the backstop without the production 5s wait; a static check
+    /// pins the production value so a change to it is a conscious edit.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fd_cache_ttl_evicts_without_explicit_invalidation() {
+        use std::fs::File;
+
+        assert_eq!(
+            FD_CACHE_TTL,
+            std::time::Duration::from_secs(5),
+            "the production TTL backstop value is pinned; update this assertion deliberately if it changes"
+        );
+
+        let dir = tempfile::tempdir().expect("operation should succeed");
+        let ttl = std::time::Duration::from_millis(200);
+        let cache = FdCache::with_ttl(ttl);
+        let key = FdKey {
+            volume: "v".into(),
+            path: "object/dd/part.1".into(),
+            direct: false,
+        };
+        let file = Arc::new(File::create(dir.path().join("f")).expect("operation should succeed"));
+        cache.insert(key.clone(), file).await;
+        assert!(cache.get(&key).await.is_some(), "a freshly inserted descriptor must be served");
+
+        // Well past the TTL (10x margin against scheduler jitter): the backstop
+        // must drop the descriptor with no explicit invalidation in between.
+        tokio::time::sleep(ttl * 10).await;
+        assert!(
+            cache.get(&key).await.is_none(),
+            "the TTL backstop must stop serving a descriptor once time_to_live elapses"
+        );
+        assert_eq!(cache.entry_count().await, 0, "the expired entry must be evicted, not merely hidden");
+    }
+
+    /// Zero-length read bounds parity on the cache-HIT path (backlog#1173/#1180).
+    /// A `length == 0` read past EOF must be rejected identically whether the
+    /// descriptor is freshly opened (miss path) or served from the cache: the
+    /// cache-hit branch fstats the descriptor to reproduce the miss path's
+    /// `offset > len` check instead of returning empty unconditionally. Seeds
+    /// the cache with a normal read so the zero-length reads are hits, then pins
+    /// that UringBackend and StdBackend agree on every case.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_zero_length_read_bounds_match_std_on_cache_hit() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+        let Some(backend) = temp_env::with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            || UringBackend::try_new(root.clone()),
+        ) else {
+            uring_test_skip("uring_zero_length_read_bounds_match_std_on_cache_hit");
+            return;
+        };
+        assert!(
+            backend.fd_cache.is_some(),
+            "the cache-hit branch is the point of this test; the cache must be on"
+        );
+
+        let volume = "bucket";
+        let object = "obj/dd/part.1";
+        std::fs::create_dir_all(root.join(volume).join("obj/dd")).expect("operation should succeed");
+        let content: &[u8] = b"exactly-fifteen"; // 15 bytes
+        std::fs::write(root.join(volume).join(object), content).expect("operation should succeed");
+        let len = content.len();
+
+        // A normal read seeds the descriptor cache, so the zero-length reads
+        // below take the cache-hit branch (3206) rather than the miss path.
+        let seed = backend.pread_bytes(volume, object, 0, len, None).await.expect("seed read");
+        assert_eq!(seed, Bytes::copy_from_slice(content));
+
+        // StdBackend over the same file is the parity oracle.
+        let std_backend = StdBackend::new(root.clone());
+        for offset in [0usize, len, len + 1] {
+            let uring = backend.pread_bytes(volume, object, offset, 0, None).await;
+            let std = std_backend.pread_bytes(volume, object, offset, 0, None).await;
+            if offset > len {
+                assert!(
+                    matches!(uring, Err(DiskError::FileCorrupt)),
+                    "zero-length read past EOF must be rejected on the cache-hit path (offset={offset}), got {uring:?}"
+                );
+                assert!(
+                    matches!(std, Err(DiskError::FileCorrupt)),
+                    "StdBackend oracle must reject the same zero-length read past EOF (offset={offset}), got {std:?}"
+                );
+            } else {
+                let u = uring.unwrap_or_else(|e| panic!("zero-length read at/inside EOF must succeed (offset={offset}): {e:?}"));
+                let s = std.unwrap_or_else(|e| {
+                    panic!("StdBackend zero-length read at/inside EOF must succeed (offset={offset}): {e:?}")
+                });
+                assert!(
+                    u.is_empty() && s.is_empty(),
+                    "zero-length read at/inside EOF must be empty (offset={offset})"
+                );
+            }
+        }
     }
 
     /// Pages of `path` still resident in the page cache, via `mincore(2)`.
