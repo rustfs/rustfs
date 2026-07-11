@@ -160,12 +160,16 @@ async fn test_bucket_lifecycle_configuration() -> Result<(), Box<dyn std::error:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_bucket_lifecycle_accepts_zero_days() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_bucket_lifecycle_rejects_zero_days() -> Result<(), Box<dyn std::error::Error>> {
     use aws_sdk_s3::types::{BucketLifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter};
 
     let client = create_aws_s3_client().await?;
     setup_test_bucket(&client).await?;
 
+    // S3 compatibility: Expiration.Days must be a positive integer (>= 1). AWS and the
+    // ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with an
+    // InvalidArgument (HTTP 400). See crates/lifecycle validate() + the
+    // PutBucketLifecycleConfiguration handler which maps it to s3_error!(InvalidArgument).
     let expiration = LifecycleExpiration::builder().days(0).build();
     let filter = LifecycleRuleFilter::builder().prefix("zero-days/").build();
     let rule = LifecycleRule::builder()
@@ -176,12 +180,20 @@ async fn test_bucket_lifecycle_accepts_zero_days() -> Result<(), Box<dyn std::er
         .build()?;
     let lifecycle = BucketLifecycleConfiguration::builder().rules(rule).build()?;
 
-    client
+    let err = client
         .put_bucket_lifecycle_configuration()
         .bucket(BUCKET)
         .lifecycle_configuration(lifecycle)
         .send()
-        .await?;
+        .await
+        .expect_err("zero-day expiration lifecycle rule should be rejected");
+
+    let service_error = err.as_service_error().expect("expected an S3 service error");
+    assert_eq!(
+        service_error.meta().code(),
+        Some("InvalidArgument"),
+        "expected InvalidArgument for zero-day expiration, got: {err:?}"
+    );
 
     Ok(())
 }
