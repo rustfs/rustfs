@@ -1,3 +1,7 @@
+> **Archived migration snapshot** — moved from `docs/architecture/` (2026-07)
+> when the architecture-review ledger it fed closed out. Kept for history; not
+> maintained.
+
 # KMS Development Defaults Inventory
 
 This inventory tracks `KMSD-001` for

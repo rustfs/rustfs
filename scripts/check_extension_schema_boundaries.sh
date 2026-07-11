@@ -12,6 +12,10 @@ fail() {
 }
 
 [[ -f "$CARGO_TOML" ]] || fail "crates/extension-schema/Cargo.toml is missing"
+# Without this, a moved/removed src/ makes the rg probe below exit 2, which the
+# `if` treats as "no matches" — the check would silently pass while guarding
+# nothing.
+[[ -d "${CRATE_DIR}/src" ]] || fail "crates/extension-schema/src is missing"
 
 grep -qxF '    "crates/extension-schema", # Extension schema contracts' "${ROOT_DIR}/Cargo.toml" ||
   fail "workspace members must include crates/extension-schema"
