@@ -13696,6 +13696,45 @@ mod test {
         .await;
     }
 
+    /// `delete_paths` is one of the primary object-delete entry points that
+    /// removes data without going through `LocalDisk::delete`; it must invalidate
+    /// the fd cache too, or a cached descriptor keeps a removed part readable
+    /// (backlog#1175/#1180).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_fd_cache_is_invalidated_by_delete_paths() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            async {
+                let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+                disk.make_volume("bucket").await.expect("operation should succeed");
+
+                disk.write_all("bucket", "obj/part.1", Bytes::from_static(b"v1"))
+                    .await
+                    .expect("operation should succeed");
+                let got = disk
+                    .read_file_mmap_copy("bucket", "obj/part.1", 0, 2)
+                    .await
+                    .expect("operation should succeed");
+                assert_eq!(got, Bytes::from_static(b"v1"), "first read seeds the descriptor cache");
+
+                disk.delete_paths("bucket", &["obj/part.1".to_string()])
+                    .await
+                    .expect("operation should succeed");
+                let err = disk.read_file_mmap_copy("bucket", "obj/part.1", 0, 2).await;
+                assert!(err.is_err(), "delete_paths must invalidate the cached descriptor, got {err:?}");
+            },
+        )
+        .await;
+    }
+
     /// Pages of `path` still resident in the page cache, via `mincore(2)`.
     /// `mincore` reports residency without faulting anything in, so measuring
     /// cannot perturb what it measures.
