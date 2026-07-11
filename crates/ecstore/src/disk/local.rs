@@ -35,7 +35,9 @@ use crate::disk::{
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
-use metrics::{counter, gauge};
+use metrics::counter;
+#[cfg(target_os = "linux")]
+use metrics::gauge;
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,

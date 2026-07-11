@@ -3771,7 +3771,10 @@ mod tests {
 
         temp_env::async_with_vars(
             [
-                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, data_blocks_first.then_some("true")),
+                (
+                    ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+                    Some(if data_blocks_first { "true" } else { "false" }),
+                ),
                 (
                     ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP,
                     codec_data_blocks_first.then_some("true"),
