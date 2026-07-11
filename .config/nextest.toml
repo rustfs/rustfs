@@ -101,6 +101,12 @@ retries = 2
 filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
 retries = 2
 
+# QUARANTINE: OPEN rustfs#4740 — the embedded S3 test intermittently observes
+# BucketNotEmpty immediately after an acknowledged unversioned object delete.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & binary(embedded_test) & test(test_embedded_server_basic_s3_operations)'
+retries = 2
+
 # Serialize the 4-disk reliability / degraded-read e2e tests under the ci
 # profile too (see the e2e-reliability test-group note near the top). Not a
 # quarantine: no retries, just single-threaded so several 4-disk servers never
