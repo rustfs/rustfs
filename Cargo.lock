@@ -9569,6 +9569,7 @@ name = "rustfs-object-data-cache"
 version = "1.0.0-beta.8"
 dependencies = [
  "bytes",
+ "criterion",
  "metrics",
  "metrics-util",
  "moka",
