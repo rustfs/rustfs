@@ -28,7 +28,7 @@ use reqwest::Client as HttpClient;
 use std::ffi::OsStr;
 use std::fs as stdfs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Once;
 use std::time::Duration;
 use tokio::fs;
@@ -293,6 +293,10 @@ pub struct RustFSTestEnvironment {
     pub access_key: String,
     pub secret_key: String,
     pub process: Option<Child>,
+    /// When set, the spawned server's stdout+stderr are redirected (append) to
+    /// this file instead of being inherited by the test process. Lets a test
+    /// grep the child's logs (e.g. to confirm which GET reader path ran).
+    pub capture_log_path: Option<String>,
 }
 
 impl RustFSTestEnvironment {
@@ -313,6 +317,7 @@ impl RustFSTestEnvironment {
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
+            capture_log_path: None,
         })
     }
 
@@ -330,6 +335,7 @@ impl RustFSTestEnvironment {
             access_key: DEFAULT_ACCESS_KEY.to_string(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
+            capture_log_path: None,
         })
     }
 
@@ -397,6 +403,13 @@ impl RustFSTestEnvironment {
         command.env("RUSTFS_CONSOLE_ENABLE", "false");
         for (key, value) in extra_env {
             command.env(key, value);
+        }
+        // Optionally capture the child's stdout+stderr to a file so the test can
+        // grep server logs (e.g. to confirm which GET reader path was taken).
+        if let Some(log_path) = &self.capture_log_path {
+            let file = stdfs::OpenOptions::new().create(true).append(true).open(log_path)?;
+            let stderr_file = file.try_clone()?;
+            command.stdout(Stdio::from(file)).stderr(Stdio::from(stderr_file));
         }
         let process = command.args(&args).spawn()?;
 
