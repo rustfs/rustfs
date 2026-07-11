@@ -1,0 +1,121 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nightly full replication e2e lane (backlog#1147 repl-1, deps: ci-4).
+#
+# The per-PR gate (ci.yml `e2e-tests` job, `--profile e2e-smoke`) runs the 20
+# FAST bucket-replication tests. This scheduled lane runs the remaining 16
+# heavier replication e2e tests that are unfit for a per-PR gate:
+#
+#   * 6 slow bucket-replication data-plane tests (PUT + poll for convergence at
+#     production background-loop intervals; two replicate over HTTPS).
+#   * 9 `_real_dual_node` site-replication tests (each spawns TWO rustfs
+#     servers and drives the cross-process site-replication control plane).
+#   * 1 `_real_single_node` service-account round-trip test.
+#
+# The selection is the [profile.e2e-repl-nightly] default-filter in
+# .config/nextest.toml — the single wiring mechanism (repl-1 / ci-4). Do NOT
+# add ad-hoc cargo-test steps here; change the filterset instead.
+#
+# Explicit division of labor: these 16 tests run ONLY here, never double-run
+# in ci-5's future e2e-full merge gate. TODO(ci-7): once the ci domain's
+# consolidated scheduled e2e workflow exists, fold this interim repl-owned lane
+# into it rather than growing a second scheduled entrypoint.
+
+name: e2e-replication-nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 04:00 UTC nightly — staggered clear of fuzz/e2e-s3tests (02:00),
+    # stale (01:30) and performance-ab (06:00).
+    - cron: "0 4 * * *"
+
+# Only alert-on-failure needs more than read access; it declares its own
+# job-level `issues: write`.
+permissions:
+  contents: read
+
+jobs:
+  repl-nightly:
+    name: Replication e2e (nightly)
+    # dual-node tests spawn two full rustfs servers each; the extra headroom
+    # over the per-PR sm-standard-2 e2e job keeps the parallel process fan-out
+    # from starving the runner. Mirrors the ILM serial lane's runner class.
+    runs-on: sm-standard-4
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-e2e-repl
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # awscurl lets the STS dual-node test actually exercise its path. Without
+      # it the test skips gracefully with a visible log line
+      # (`awscurl_available()` in crates/e2e_test/src/common.rs), so the lane
+      # still passes — installing it just upgrades that one test from skip to
+      # real coverage.
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install awscurl
+        run: python3 -m pip install --user --upgrade pip awscurl
+
+      # Build the rustfs binary once up front. The e2e tests spawn it as a
+      # child process (crates/e2e_test/src/common.rs) and will build it on
+      # demand otherwise, but a single explicit build avoids several parallel
+      # nextest test processes racing to build it at once.
+      - name: Build rustfs binary
+        run: cargo build -p rustfs --bins
+
+      - name: Run replication e2e nightly suite
+        run: cargo nextest run --profile e2e-repl-nightly -p e2e_test
+
+      - name: Upload nextest junit report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: e2e-replication-nightly-junit-${{ github.run_number }}
+          path: target/nextest/e2e-repl-nightly/junit.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [repl-nightly]
+    # Only scheduled runs open/append the tracking issue (backlog#1149 ci-8);
+    # manual workflow_dispatch runs stay quiet so a debugging run never files a
+    # spurious alert.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
