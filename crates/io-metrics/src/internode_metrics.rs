@@ -15,7 +15,7 @@
 use metrics::{counter, gauge};
 use std::collections::HashMap;
 use std::sync::{
-    Arc, LazyLock, Mutex,
+    Arc, LazyLock, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -460,7 +460,11 @@ impl Default for PeerHealthState {
     }
 }
 
-static CLUSTER_PEER_HEALTH: LazyLock<Mutex<HashMap<String, PeerHealthState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Read-mostly: the hot `cluster_peer_should_bypass` check per internode RPC only
+/// reads the map for the common (unknown/online) peer; a `RwLock` lets those run
+/// concurrently instead of serializing every internode RPC on one mutex. Writes
+/// (dial reachable/unreachable, and recording an offline peer's re-probe) are rare.
+static CLUSTER_PEER_HEALTH: LazyLock<RwLock<HashMap<String, PeerHealthState>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
 fn publish_offline_gauge(peers: &HashMap<String, PeerHealthState>) {
     let offline = peers.values().filter(|peer| !peer.online).count();
@@ -483,7 +487,7 @@ fn normalize_peer_key(addr: &str) -> &str {
 /// counter. Called on a successful dial to `addr`.
 pub fn record_peer_reachable(addr: &str) {
     // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
-    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut peers = CLUSTER_PEER_HEALTH.write().unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = peers.entry(normalize_peer_key(addr).to_string()).or_default();
     entry.online = true;
     entry.consecutive_failures = 0;
@@ -495,7 +499,7 @@ pub fn record_peer_reachable(addr: &str) {
 /// `failure_threshold` (>= 1) consecutive failures the peer flips offline.
 pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
     // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
-    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut peers = CLUSTER_PEER_HEALTH.write().unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = peers.entry(normalize_peer_key(addr).to_string()).or_default();
     entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     if entry.consecutive_failures >= failure_threshold.max(1) {
@@ -506,7 +510,7 @@ pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
 
 /// Whether a cluster peer is currently considered offline (known and marked offline).
 pub fn cluster_peer_is_offline(addr: &str) -> bool {
-    let peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     peers.get(normalize_peer_key(addr)).map(|peer| !peer.online).unwrap_or(false)
 }
 
@@ -518,8 +522,26 @@ pub fn cluster_peer_is_offline(addr: &str) -> bool {
 /// can recover via a normal dial even if no background monitor is running. Online peers are never
 /// bypassed.
 pub fn cluster_peer_should_bypass(addr: &str, reprobe_interval: Duration) -> bool {
-    let mut peers = CLUSTER_PEER_HEALTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(entry) = peers.get_mut(normalize_peer_key(addr)) else {
+    let key = normalize_peer_key(addr);
+
+    // Fast path: the overwhelmingly common cases — an unknown peer or an online
+    // one — are read-only, so take a shared read lock and let concurrent internode
+    // RPCs check peer health without serializing on a single lock.
+    {
+        let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match peers.get(key) {
+            None => return false,
+            Some(entry) if entry.online => return false,
+            Some(_) => {} // offline: fall through to the write path below
+        }
+    }
+
+    // Slow path: the peer is offline, which may require recording a re-probe, so
+    // take the write lock. Re-fetch and re-check because the state can change
+    // between releasing the read lock and acquiring the write lock (e.g. a
+    // successful dial flipped it back online).
+    let mut peers = CLUSTER_PEER_HEALTH.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = peers.get_mut(key) else {
         return false;
     };
     if entry.online {
@@ -542,7 +564,7 @@ pub fn cluster_peer_should_bypass(addr: &str, reprobe_interval: Duration) -> boo
 #[cfg(test)]
 fn cluster_peer_online(addr: &str) -> Option<bool> {
     CLUSTER_PEER_HEALTH
-        .lock()
+        .read()
         .ok()?
         .get(normalize_peer_key(addr))
         .map(|peer| peer.online)
@@ -551,7 +573,7 @@ fn cluster_peer_online(addr: &str) -> Option<bool> {
 #[cfg(test)]
 fn cluster_peer_health_keys() -> Vec<String> {
     CLUSTER_PEER_HEALTH
-        .lock()
+        .read()
         .map(|peers| peers.keys().cloned().collect())
         .unwrap_or_default()
 }
