@@ -429,4 +429,13 @@ pub mod tier {
             WarmBackend, WarmBackendGetOpts, WarmBackendImpl, build_transition_put_options, check_warm_backend, new_warm_backend,
         };
     }
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::services::tier::test_util::{
+            FaultConfig, MockStoredObject, MockWarmBackend, MockWarmOp, TransitionMeta, assert_transition_meta_consistent,
+            free_version_count, read_transition_meta, register_mock_tier, register_mock_tier_backend,
+            wait_for_free_version_absence,
+        };
+    }
 }

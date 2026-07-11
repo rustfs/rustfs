@@ -145,14 +145,11 @@ pub(crate) mod runtime {
     pub(crate) type TierConfigMgr = crate::storage::storage_api::TierConfigMgr;
     pub(crate) type TransitionState = crate::storage::storage_api::TransitionState;
 
+    // Shared MockWarmBackend + register_mock_tier helper (rustfs/backlog#1148 ilm-6).
+    // The mock (and the tier types it used to need) now live in ecstore behind
+    // the `test-util` feature.
     #[cfg(test)]
-    pub(crate) type TierConfig = crate::storage::storage_api::ecstore_tier::tier_config::TierConfig;
-    #[cfg(test)]
-    pub(crate) type TierType = crate::storage::storage_api::ecstore_tier::tier_config::TierType;
-    #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_tier::warm_backend::WarmBackend as AppWarmBackend;
-    #[cfg(test)]
-    pub(crate) type WarmBackendGetOpts = crate::storage::storage_api::ecstore_tier::warm_backend::WarmBackendGetOpts;
+    pub(crate) use crate::storage::storage_api::ecstore_tier::test_util::{MockWarmBackend, register_mock_tier};
 
     pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
         crate::storage::storage_api::ecstore_config::set_global_storage_class(cfg);

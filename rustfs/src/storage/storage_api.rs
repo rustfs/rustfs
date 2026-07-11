@@ -464,9 +464,11 @@ pub(crate) mod ecstore_storage {
 
 pub(crate) mod ecstore_tier {
     pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::tier::warm_backend;
     pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers};
+    // Shared lifecycle/tier test utilities behind ecstore's `test-util` feature
+    // (rustfs/backlog#1148 ilm-6). Only linked into test builds.
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::tier::test_util;
 }
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
