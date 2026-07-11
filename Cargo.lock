@@ -9569,6 +9569,7 @@ name = "rustfs-object-data-cache"
 version = "1.0.0-beta.8"
 dependencies = [
  "bytes",
+ "criterion",
  "metrics",
  "metrics-util",
  "moka",
@@ -10031,13 +10032,14 @@ dependencies = [
 
 [[package]]
 name = "rustfs-uring"
-version = "0.1.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f93a938838b26259162f23283de9d02922dc7b66d3a3c48a4db6036a44e9cf29"
+checksum = "0486e62d0efe25db95c00aeacb2da84368adcba299216cda99fcb11328061c84"
 dependencies = [
  "io-uring",
  "libc",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

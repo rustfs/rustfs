@@ -1,3 +1,7 @@
+> **Archived migration snapshot** — moved from `docs/architecture/` (2026-07)
+> when the architecture-review ledger it fed closed out. Kept for history; not
+> maintained.
+
 # Profiling And NUMA Capability Inventory
 
 This inventory covers `G-013` for `rustfs/backlog#667`. It records the current

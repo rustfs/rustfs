@@ -40,10 +40,11 @@ const _ERR_XML_NOT_WELL_FORMED: &str =
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket";
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
-const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "Lifecycle expiration days must not be negative";
-const ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS: &str = "Lifecycle noncurrent expiration days must not be negative";
+const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "'Days' for Expiration action must be a positive integer";
+const ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS: &str =
+    "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer";
 const ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS: &str =
-    "DaysAfterInitiation must be 0 or greater when used with AbortIncompleteMultipartUpload";
+    "'DaysAfterInitiation' for AbortIncompleteMultipartUpload action must be a positive integer";
 const ERR_LIFECYCLE_INVALID_EXPIRATION_DATE_NOT_MIDNIGHT: &str = "Expiration.Date must be at midnight UTC";
 const ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_DELETE_MARKER: &str =
     "ExpiredObjectDeleteMarker cannot be specified with Days or Date";
@@ -325,21 +326,29 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRATION_DATE_NOT_MIDNIGHT));
                     }
                 }
+                // S3 requires Expiration.Days to be a positive integer (>= 1). AWS and the
+                // ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with
+                // InvalidArgument; only Date-based rules may omit Days entirely.
                 if let Some(days) = expiration.days
-                    && days < 0
+                    && days < 1
                 {
                     return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS));
                 }
             }
+            // S3 requires NoncurrentVersionExpiration.NoncurrentDays to be a positive
+            // integer (>= 1); AWS rejects 0 with InvalidArgument.
             if let Some(noncurrent_version_expiration) = &r.noncurrent_version_expiration
                 && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
-                && noncurrent_days < 0
+                && noncurrent_days < 1
             {
                 return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS));
             }
+            // S3 requires AbortIncompleteMultipartUpload.DaysAfterInitiation to be present
+            // and a positive integer (>= 1); AWS rejects 0 (and a missing value) with
+            // InvalidArgument.
             if let Some(abort_incomplete_multipart_upload) = &r.abort_incomplete_multipart_upload {
                 match abort_incomplete_multipart_upload.days_after_initiation {
-                    Some(days) if days >= 0 => {}
+                    Some(days) if days >= 1 => {}
                     _ => return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS)),
                 }
             }
@@ -1066,7 +1075,11 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn validate_accepts_zero_expiration_days() {
+    async fn validate_rejects_zero_expiration_days() {
+        // S3 compatibility: Expiration.Days must be a positive integer (>= 1). AWS and
+        // the ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with
+        // InvalidArgument. The PutBucketLifecycleConfiguration path maps this io::Error
+        // to s3_error!(InvalidArgument) (see execute_put_bucket_lifecycle_configuration).
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -1086,9 +1099,12 @@ mod tests {
             }],
         };
 
-        lc.validate(&ObjectLockConfiguration::default())
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
             .await
-            .expect("zero-day expiration should be accepted");
+            .expect_err("zero-day expiration should be rejected");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS);
     }
 
     #[tokio::test]
@@ -1150,6 +1166,41 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn validate_accepts_one_day_boundary_values() {
+        // Pin the exact >= 1 boundary: a value of 1 is the smallest legal positive
+        // integer and must be accepted for every day-count field tightened for S3
+        // compatibility. This catches an off-by-one that would reject Days == 1.
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(1),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("one-day-boundary".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: Some("boundary/".to_string()),
+                transitions: None,
+            }],
+        };
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("one-day boundary values should be accepted");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn has_active_rules_accepts_zero_day_expiration() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1175,7 +1226,9 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn validate_accepts_zero_noncurrent_expiration_days() {
+    async fn validate_rejects_zero_noncurrent_expiration_days() {
+        // S3 compatibility: NoncurrentVersionExpiration.NoncurrentDays must be a positive
+        // integer (>= 1); AWS rejects 0 with InvalidArgument.
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -1195,9 +1248,12 @@ mod tests {
             }],
         };
 
-        lc.validate(&ObjectLockConfiguration::default())
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
             .await
-            .expect("zero-day noncurrent expiration should be accepted");
+            .expect_err("zero-day noncurrent expiration should be rejected");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS);
     }
 
     #[tokio::test]
@@ -1258,7 +1314,9 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn validate_accepts_zero_abort_incomplete_multipart_upload_days() {
+    async fn validate_rejects_zero_abort_incomplete_multipart_upload_days() {
+        // S3 compatibility: AbortIncompleteMultipartUpload.DaysAfterInitiation must be a
+        // positive integer (>= 1); AWS rejects 0 with InvalidArgument.
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -1277,9 +1335,12 @@ mod tests {
             }],
         };
 
-        lc.validate(&ObjectLockConfiguration::default())
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
             .await
-            .expect("zero-day abort incomplete multipart upload should be accepted");
+            .expect_err("zero-day abort incomplete multipart upload should be rejected");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS);
     }
 
     #[tokio::test]

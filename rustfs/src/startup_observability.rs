@@ -29,6 +29,7 @@ pub(crate) async fn init_observability_runtime(store: Arc<ECStore>, ctx: Cancell
         init_compression_total_memory_from_backend(store).await;
         startup_runtime_sources::set_put_stage_metrics_enabled(true);
         startup_runtime_sources::set_get_stage_metrics_enabled(true);
+        startup_runtime_sources::set_metrics_enabled(true);
         startup_runtime_sources::init_metrics_runtime(ctx.clone());
         crate::memory_observability::init_memory_observability(ctx.clone());
         init_auto_tuner(ctx).await;

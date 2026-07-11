@@ -101,6 +101,12 @@ retries = 2
 filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
 retries = 2
 
+# QUARANTINE: OPEN rustfs#4740 — the embedded S3 test intermittently observes
+# BucketNotEmpty immediately after an acknowledged unversioned object delete.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & binary(embedded_test) & test(test_embedded_server_basic_s3_operations)'
+retries = 2
+
 # Serialize the 4-disk reliability / degraded-read e2e tests under the ci
 # profile too (see the e2e-reliability test-group note near the top). Not a
 # quarantine: no retries, just single-threaded so several 4-disk servers never
@@ -138,10 +144,16 @@ test-group = 'e2e-reliability'
 # silently unrun) until it is explicitly blessed as fast here. Keep the two
 # regexes byte-identical. Count invariant: 20 here + 16 nightly = 36 total
 # (authority: `cargo nextest list`; docs/testing/e2e-suite-inventory.md).
+# HISTORY (2026-07-11): the 20 fast tests were briefly pulled out of this lane
+# (#4724) because they set a loopback (127.0.0.1) replication target that the
+# SSRF egress guard rejected on every PR after repl-1 (#4712). That is fixed —
+# the guard now honours an off-by-default opt-in and this suite's source servers
+# set it (RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET) — so the allowlist below is
+# restored.
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
-        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check)_test::/)
+        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check|presigned_negative)_test::/)
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
     )

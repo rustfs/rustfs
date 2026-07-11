@@ -75,8 +75,8 @@ pub use metrics::schema::*;
 pub use metrics::{
     MetricsRuntimeCancellationSource, MetricsRuntimeController, MetricsRuntimeControllerSnapshot, MetricsRuntimeDesiredSnapshot,
     MetricsRuntimeDesiredState, MetricsRuntimeIntervalsSnapshot, MetricsRuntimeReconcilePlan, MetricsRuntimeServiceState,
-    MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_collectors,
-    init_metrics_runtime, metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
+    MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_runtime,
+    metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
 };
 pub use telemetry::{OtelGuard, Recorder};
 

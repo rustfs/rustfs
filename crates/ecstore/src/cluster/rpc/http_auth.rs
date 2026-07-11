@@ -12,6 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Internode RPC HMAC authentication.
+//!
+//! # Security regression coverage
+//!
+//! GHSA-r5qv-rc46-hv8q (internode RPC authentication must fail closed, fixed in
+//! rustfs/rustfs#4402) is anchored by the `ghsa_r5qv_*` tests in the module
+//! below, plus the broader negative-signature suite. The advisory class is: a
+//! node must never accept an RPC whose auth is missing, malformed, replayed, or
+//! signed with the default/empty shared secret. See
+//! `docs/testing/security-regressions.md` for the full advisory -> test map.
+//!
+//! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-r5qv-rc46-hv8q>
+
 use crate::cluster::rpc::context_propagation::{inject_request_id_into_http_headers, inject_trace_context_into_http_headers};
 use base64::Engine as _;
 use base64::engine::general_purpose;
@@ -227,13 +240,70 @@ mod tests {
         runtime_sources::ensure_test_rpc_secret();
     }
 
+    /// Security regression for GHSA-r5qv-rc46-hv8q (internode RPC fail-closed,
+    /// fixed in rustfs/rustfs#4402): secret resolution must never silently fall
+    /// back to a default/empty shared secret. Missing and default secrets both
+    /// resolve to an error, so a misconfigured node cannot come up with a
+    /// predictable, attacker-known RPC key.
     #[test]
-    fn test_resolve_shared_secret_rejects_default_fallback() {
+    fn ghsa_r5qv_resolve_shared_secret_rejects_default_fallback() {
         let err = resolve_shared_secret(None, None).expect_err("default fallback must be rejected");
         assert_eq!(err.to_string(), RPC_SECRET_REQUIRED_MESSAGE);
 
         let err = resolve_shared_secret(None, Some(DEFAULT_SECRET_KEY)).expect_err("default global secret must be rejected");
         assert_eq!(err.to_string(), RPC_SECRET_REQUIRED_MESSAGE);
+
+        let err = resolve_shared_secret(Some(DEFAULT_SECRET_KEY), None).expect_err("default env secret must be rejected");
+        assert_eq!(err.to_string(), RPC_SECRET_REQUIRED_MESSAGE);
+
+        let err = resolve_shared_secret(Some("   "), Some("   ")).expect_err("blank secrets must be rejected");
+        assert_eq!(err.to_string(), RPC_SECRET_REQUIRED_MESSAGE);
+    }
+
+    /// Security regression for GHSA-r5qv-rc46-hv8q: `verify_rpc_signature` must
+    /// fail closed for every shape of missing or malformed authentication.
+    /// Consolidates the advisory's exact scenario (no valid signature/timestamp
+    /// pair => rejected, never silently allowed) into one named test so the
+    /// advisory maps to a discoverable regression.
+    #[test]
+    fn ghsa_r5qv_verify_rpc_signature_fails_closed_on_missing_or_invalid_auth() {
+        ensure_test_rpc_secret();
+        let url = "http://example.com/api/test";
+        let method = Method::GET;
+
+        // No auth headers at all.
+        let empty = HeaderMap::new();
+        assert!(
+            verify_rpc_signature(url, &method, &empty).is_err(),
+            "request with no auth headers must be rejected"
+        );
+
+        // Signature header present but garbage; timestamp is current.
+        let mut forged = HeaderMap::new();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        forged.insert(SIGNATURE_HEADER, HeaderValue::from_static("not-a-real-signature"));
+        forged.insert(TIMESTAMP_HEADER, HeaderValue::from_str(&now.to_string()).unwrap());
+        assert!(
+            verify_rpc_signature(url, &method, &forged).is_err(),
+            "request with a forged signature must be rejected"
+        );
+
+        // A validly signed request for a *different* URL must not authorize this one.
+        let mut cross = HeaderMap::new();
+        build_auth_headers("http://example.com/api/other", &method, &mut cross).expect("auth headers should build");
+        assert!(
+            verify_rpc_signature(url, &method, &cross).is_err(),
+            "a signature bound to a different URL must not authorize this request"
+        );
+
+        // Control: a correctly signed request for this URL still succeeds, so the
+        // gate is fail-closed rather than fail-everything.
+        let mut valid = HeaderMap::new();
+        build_auth_headers(url, &method, &mut valid).expect("auth headers should build");
+        assert!(
+            verify_rpc_signature(url, &method, &valid).is_ok(),
+            "a correctly signed request must be accepted"
+        );
     }
 
     #[test]

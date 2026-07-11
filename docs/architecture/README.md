@@ -51,12 +51,12 @@ Two rules keep this directory healthy:
 - [obs-ecstore-dependency-inventory.md](obs-ecstore-dependency-inventory.md)
 - [background-services-inventory.md](background-services-inventory.md)
 - [admin-route-action-snapshot.md](admin-route-action-snapshot.md)
-- [startup-timeline.md](startup-timeline.md)
-- [scheduler-baseline.md](scheduler-baseline.md)
-- [profiling-numa-capability-inventory.md](profiling-numa-capability-inventory.md)
-- [kms-development-defaults-inventory.md](kms-development-defaults-inventory.md)
 - [compat-cleanup-register.md](compat-cleanup-register.md)
 
 Historical plans and trackers (rebalance/decommission phases,
 migration-progress ledger) were moved to
-[`docs/superpowers/plans/`](../superpowers/plans/) in 2026-07.
+[`docs/superpowers/plans/`](../superpowers/plans/) in 2026-07. One-shot
+migration snapshots whose only consumer was that ledger (startup timeline,
+scheduler baseline, profiling/NUMA capability inventory, KMS development
+defaults inventory) followed once the architecture-review ledger they fed
+closed out (backlog#660/#665).

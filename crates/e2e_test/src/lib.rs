@@ -62,6 +62,10 @@ mod bucket_policy_check_test;
 #[cfg(test)]
 mod security_boundary_test;
 
+// Admin authorization gate: non-admin denial + root-credential lifecycle (backlog#1151 sec-4)
+#[cfg(test)]
+mod admin_auth_test;
+
 /// IAM / bucket / STS session policy with `s3:ExistingObjectTag` conditions (E2E).
 #[cfg(test)]
 mod existing_object_tag_policy_test;
@@ -164,6 +168,11 @@ mod bucket_logging_test;
 // Multipart control API auth regression tests
 #[cfg(test)]
 mod multipart_auth_test;
+
+// Negative presigned-URL (query-string SigV4) regression suite (backlog#1151
+// sec-2): expired, tampered signature, wrong secret, tampered target.
+#[cfg(test)]
+mod presigned_negative_test;
 
 // Negative header-SigV4 regression suite (backlog#1151 sec-1): tampered
 // signature, wrong secret, skewed date, malformed Authorization.

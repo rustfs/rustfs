@@ -128,6 +128,9 @@ jobs:
       - name: Check tokio io-uring feature guard
         run: ./scripts/check_no_tokio_io_uring.sh
 
+      - name: Check extension schema boundaries
+        run: ./scripts/check_extension_schema_boundaries.sh
+
   test-and-lint:
     name: Test and Lint
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
@@ -344,6 +347,39 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  uring-integration:
+    name: io_uring Integration (real)
+    # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
+    # a container, applies no seccomp filter that would block io_uring_setup — so
+    # the probe succeeds and the tests exercise the real UringBackend/FdCache/
+    # latch paths instead of the StdBackend fallback (rustfs/backlog#1179). The
+    # self-hosted sm-standard runners cannot guarantee this.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-uring
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # RUSTFS_URING_TESTS_MUST_RUN=1 makes the io_uring tests fail instead of
+      # silently skipping if io_uring is unavailable, so this leg can never pass
+      # vacuously. RUSTFS_IO_URING_READ_ENABLE=true selects the UringBackend.
+      - name: Run ecstore io_uring integration tests on real io_uring
+        env:
+          RUSTFS_IO_URING_READ_ENABLE: "true"
+          RUSTFS_URING_TESTS_MUST_RUN: "1"
+        run: cargo test -p rustfs-ecstore uring_ -- --test-threads=1 --nocapture
+
   e2e-tests:
     name: End-to-End Tests
     needs: [ build-rustfs-debug-binary ]
@@ -492,6 +528,64 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: s3tests-implemented-${{ github.run_number }}
+          path: artifacts/s3tests-single/**
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # Dedicated lifecycle behavior lane (backlog#1148 ilm-10, master plan #1155).
+  #
+  # These ceph/s3-tests cases assert that objects/versions/uploads are actually
+  # removed by the background scanner and the stale-multipart cleanup loop, so
+  # they need a debug-accelerated day plus an enabled scanner. That configuration
+  # cannot be applied to the s3-implemented-tests lane above because a global
+  # RUSTFS_ILM_DEBUG_DAY_SECS also shrinks the x-amz-expiration header those tests
+  # assert on (test_lifecycle_expiration_header_*). Hence a separate server here.
+  s3-lifecycle-behavior-tests:
+    name: S3 Lifecycle Behavior Tests
+    needs: [ build-rustfs-debug-binary ]
+    runs-on: sm-standard-4
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Download debug binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: rustfs-debug-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      - name: Run lifecycle behavior s3-tests
+        run: |
+          RUN_ROOT="${RUNNER_TEMP}/rustfs-s3tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          mkdir -p "${RUN_ROOT}"
+          S3_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+          # Serial (XDIST=0) for timing determinism: the cases sleep on multiples
+          # of the debug day and assert scanner-driven deletion.
+          DEPLOY_MODE=binary \
+          RUSTFS_BINARY=./target/debug/rustfs \
+          TEST_MODE=single \
+          MAXFAIL=0 \
+          XDIST=0 \
+          IMPLEMENTED_TESTS_FILE=scripts/s3-tests/lifecycle_behavior_tests.txt \
+          RUSTFS_ILM_DEBUG_DAY_SECS=10 \
+          RUSTFS_SCANNER_ENABLED=true \
+          RUSTFS_SCANNER_CYCLE=2 \
+          RUSTFS_SCANNER_START_DELAY_SECS=0 \
+          RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL=2s \
+          S3_PORT="${S3_PORT}" \
+          DATA_ROOT="${RUN_ROOT}" \
+          S3TESTS_CONF=artifacts/s3tests-single/s3tests.conf \
+          ./scripts/s3-tests/run.sh
+
+      - name: Upload s3 test artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: s3tests-lifecycle-behavior-${{ github.run_number }}
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3

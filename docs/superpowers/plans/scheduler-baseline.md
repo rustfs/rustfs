@@ -1,3 +1,7 @@
+> **Archived migration snapshot** — moved from `docs/architecture/` (2026-07)
+> when the architecture-review ledger it fed closed out. Kept for history; not
+> maintained.
+
 # Scheduler Baseline Inventory
 
 This inventory covers `G-011` for `rustfs/backlog#675`. It is a docs-only
