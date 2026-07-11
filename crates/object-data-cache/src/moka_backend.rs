@@ -331,6 +331,7 @@ impl MokaBackend {
     pub async fn clear(&self) -> ObjectDataCacheInvalidationResult {
         let removed = self.index.remove_matching(|_| true).await.len();
         self.cache.invalidate_all();
+        self.cache.run_pending_tasks().await;
         Self::invalidation_result(removed)
     }
 
@@ -536,6 +537,7 @@ mod tests {
         assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 2 });
         assert!(matches!(backend.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
         assert!(matches!(backend.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));
+        assert_eq!(backend.entry_count(), 0, "clear must drain cached entries before returning");
         assert_eq!(backend.index.identity_count().await, 0, "clear must empty the identity index");
     }
 
@@ -954,9 +956,7 @@ mod tests {
             "invalidation must still win after a concurrency storm"
         );
 
-        // clear() plus a moka drain empties both the cache and the identity index.
         let _ = backend.clear().await;
-        backend.cache.run_pending_tasks().await;
         assert_eq!(backend.entry_count(), 0, "clear() must drop every entry");
     }
 
