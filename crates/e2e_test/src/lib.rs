@@ -27,6 +27,11 @@ pub mod chaos;
 #[cfg(test)]
 mod reliability_disk_fault_test;
 
+// dist-13 (backlog#1150/#1155): e2e regression net proving a large-object
+// degraded EC read never returns a silently truncated body (rustfs#4594/#4560/#4585).
+#[cfg(test)]
+mod degraded_read_eof_regression_test;
+
 #[cfg(test)]
 mod version_id_regression_test;
 
@@ -164,6 +169,11 @@ mod multipart_auth_test;
 // sec-2): expired, tampered signature, wrong secret, tampered target.
 #[cfg(test)]
 mod presigned_negative_test;
+
+// Negative header-SigV4 regression suite (backlog#1151 sec-1): tampered
+// signature, wrong secret, skewed date, malformed Authorization.
+#[cfg(test)]
+mod negative_sigv4_test;
 
 #[cfg(test)]
 mod stale_multipart_cleanup_cluster_test;
