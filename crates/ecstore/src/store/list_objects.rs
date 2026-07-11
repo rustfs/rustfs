@@ -6600,13 +6600,14 @@ mod test {
         VersionMarker, current_list_objects_mutation_sequence, encode_persistent_list_metadata_object,
         enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
         latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
-        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
-        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
-        list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
-        list_objects_index_provider_from_env, list_objects_index_provider_state_from_env, list_objects_key_only_provider_health,
-        list_objects_metadata_fast_guardrails_from_env, list_objects_paginate, list_objects_quorum_from_env,
-        list_quorum_from_env, load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one,
-        merge_entry_channels, namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
+        latest_listing_required_object_quorum, list_marker_key, list_metadata_resolution_params,
+        list_objects_from_metadata_snapshot_candidates, list_objects_from_verified_index_candidates,
+        list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
+        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
+        list_objects_key_only_provider_health, list_objects_metadata_fast_guardrails_from_env, list_objects_paginate,
+        list_objects_quorum_from_env, list_quorum_from_env, load_namespace_mutation_journal_state,
+        load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels,
+        namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
         namespace_mutation_journal_chaos_enabled_from_env, namespace_mutation_journal_chaos_sequence_from_env,
         namespace_mutation_journal_chaos_status_from_env, normalize_list_quorum, observe_list_objects_mutations_with_store,
         parse_namespace_mutation_journal_state, parse_persistent_key_only_index, parse_persistent_list_metadata_object,
@@ -9047,6 +9048,22 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
+    }
+
+    #[test]
+    fn list_marker_key_strips_only_trailing_cache_tag() {
+        assert_eq!(
+            list_marker_key("photos/2026/image.jpg[rustfs_cache:v2,id:list-cache-id,src:walker,gen:live]"),
+            "photos/2026/image.jpg"
+        );
+        assert_eq!(
+            list_marker_key("photos/[rustfs_cache:v2]/image.jpg"),
+            "photos/[rustfs_cache:v2]/image.jpg"
+        );
+        assert_eq!(
+            list_marker_key("photos/image.jpg[rustfs_cache:v2,id:list-cache-id"),
+            "photos/image.jpg[rustfs_cache:v2,id:list-cache-id"
+        );
     }
 
     #[test]
