@@ -6855,7 +6855,7 @@ impl DiskAPI for LocalDisk {
             };
 
             let dst_path_for_failpoint = dst_path.to_string();
-            let (old_data_dir, version_signature, old_current_size) = tokio::task::spawn_blocking(move || {
+            let inline_commit = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -7007,7 +7007,24 @@ impl DiskAPI for LocalDisk {
                 ))
             })
             .await
-            .map_err(DiskError::from)??;
+            .map_err(DiskError::from)?;
+
+            // A post-commit rollback inside the closure (a commit-metadata fsync
+            // failure under strict durability) restores the old data dir; drop any
+            // fds cached during the committed window before propagating the error
+            // (rustfs/backlog#1177). The sync closure cannot call the async
+            // invalidate itself, so it is done here. Inline objects carry their
+            // data in xl.meta rather than separate part inodes, so this is mostly
+            // defensive, but it keeps the inline and streaming branches consistent.
+            let (old_data_dir, version_signature, old_current_size) = match inline_commit {
+                Ok(committed) => committed,
+                Err(err) => {
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Err(DiskError::from(err));
+                }
+            };
 
             // Cleanup
             if let Some(ref cleanup) = cleanup_path {
