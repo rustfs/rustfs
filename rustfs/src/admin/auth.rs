@@ -16,7 +16,7 @@ use crate::auth::get_condition_values;
 use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::Credentials;
-use rustfs_iam::store::object::ObjectStore;
+use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::policy::{Args, action::Action};
 use s3s::{S3Result, s3_error};
@@ -67,8 +67,22 @@ pub async fn validate_admin_request(
         remote_addr,
     };
 
-    for action in &actions {
-        if check_admin_request_auth(iam_store.clone(), &ctx, *action, "", "")
+    evaluate_admin_actions(iam_store, &ctx, &actions, "", "").await
+}
+
+/// Return `Ok(())` as soon as any of the candidate `actions` is allowed for the
+/// request context, otherwise `AccessDenied`. This is the single decision core
+/// shared by every admin-gate entry point; unit tests exercise it directly so
+/// the allow/deny contract does not silently drift.
+async fn evaluate_admin_actions<S: Store>(
+    iam_store: Arc<IamSys<S>>,
+    ctx: &AuthContext<'_>,
+    actions: &[Action],
+    bucket: &str,
+    object: &str,
+) -> S3Result<()> {
+    for action in actions {
+        if check_admin_request_auth(iam_store.clone(), ctx, *action, bucket, object)
             .await
             .is_ok()
         {
@@ -78,8 +92,8 @@ pub async fn validate_admin_request(
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
-async fn check_admin_request_auth(
-    iam_store: Arc<IamSys<ObjectStore>>,
+async fn check_admin_request_auth<S: Store>(
+    iam_store: Arc<IamSys<S>>,
     ctx: &AuthContext<'_>,
     action: Action,
     bucket: &str,
@@ -157,15 +171,7 @@ pub async fn validate_admin_request_with_bucket_object(
         remote_addr,
     };
 
-    for action in &actions {
-        if check_admin_request_auth(iam_store.clone(), &ctx, *action, resource.bucket, resource.object)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    Err(s3_error!(AccessDenied, "Access Denied"))
+    evaluate_admin_actions(iam_store, &ctx, &actions, resource.bucket, resource.object).await
 }
 
 /// Unified authentication request handler for both UI and CLI
@@ -223,4 +229,276 @@ pub async fn authenticate_request(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the central admin authorization gate (rustfs/backlog#1151 sec-4).
+    //!
+    //! These tests pin the allow/deny contract of the gate decision core without a
+    //! running cluster. The gate delegates the actual policy evaluation to
+    //! `IamSys::is_allowed`; the behavior owned *here* is: owner/root short-circuits
+    //! to allow, any other principal with no matching policy is denied with
+    //! `AccessDenied`, and `evaluate_admin_actions` grants access as soon as any one
+    //! candidate action is permitted. We drive that with an `IamSys` backed by an
+    //! empty in-memory cache so `is_owner=true` returns allow (owner short-circuit)
+    //! and every non-owner principal resolves to deny.
+    use super::*;
+    use rustfs_iam::cache::Cache;
+    use rustfs_iam::manager::IamCache;
+    use rustfs_iam::store::{GroupInfo, MappedPolicy, UserType};
+    use rustfs_policy::auth::UserIdentity;
+    use rustfs_policy::policy::PolicyDoc;
+    use rustfs_policy::policy::action::AdminAction;
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
+
+    /// A `Store` whose methods are never invoked by these tests: the gate only
+    /// reaches the persistence layer for non-owner principals, and the
+    /// `IamCache` we build starts with an empty in-memory snapshot, so
+    /// `get_user` resolves to `None` (unknown user) before any `api` call.
+    #[derive(Clone)]
+    struct EmptyStore;
+
+    #[async_trait::async_trait]
+    impl Store for EmptyStore {
+        fn has_watcher(&self) -> bool {
+            false
+        }
+        async fn save_iam_config<Item: Serialize + Send>(
+            &self,
+            _item: Item,
+            _path: impl AsRef<str> + Send,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_iam_config<Item: DeserializeOwned>(
+            &self,
+            _path: impl AsRef<str> + Send,
+        ) -> rustfs_iam::error::Result<Item> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_iam_config(&self, _path: impl AsRef<str> + Send) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn save_user_identity(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _item: UserIdentity,
+            _ttl: Option<usize>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_user_identity(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<UserIdentity> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_user(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _m: &mut HashMap<String, UserIdentity>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_users(
+            &self,
+            _user_type: UserType,
+            _m: &mut HashMap<String, UserIdentity>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_secret_key(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<String> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_group_info(&self, _name: &str) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_group(&self, _name: &str, _m: &mut HashMap<String, GroupInfo>) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_groups(&self, _m: &mut HashMap<String, GroupInfo>) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn save_policy_doc(&self, _name: &str, _item: PolicyDoc) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_policy_doc(&self, _name: &str) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_policy(&self, _name: &str) -> rustfs_iam::error::Result<PolicyDoc> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, PolicyDoc>) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_policy_docs(&self, _m: &mut HashMap<String, PolicyDoc>) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn save_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _item: MappedPolicy,
+            _ttl: Option<usize>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_mapped_policies(
+            &self,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_all(&self, _cache: &Cache) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+    }
+
+    /// Build an `IamSys` backed by an empty in-memory cache. The cache is
+    /// constructed directly (all fields are public, mirroring the iam crate's
+    /// own `build_test_iam_cache`) so no cluster-backed `ObjectStore` or disk
+    /// load is required. Readiness state is irrelevant: the gate calls
+    /// `is_allowed` directly, which does not gate on `is_ready`.
+    fn iam_sys_with_empty_store() -> Arc<IamSys<EmptyStore>> {
+        let (send_chan, _rx) = tokio::sync::mpsc::channel::<i64>(1);
+        let cache = IamCache {
+            cache: Cache::default(),
+            api: EmptyStore,
+            state: Arc::new(AtomicU8::new(0)),
+            loading: Arc::new(AtomicBool::new(false)),
+            roles: HashMap::new(),
+            send_chan,
+            last_timestamp: AtomicI64::new(0),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
+        };
+        Arc::new(IamSys::new(Arc::new(cache)))
+    }
+
+    fn ctx_for<'a>(headers: &'a HeaderMap, cred: &'a Credentials, is_owner: bool) -> AuthContext<'a> {
+        AuthContext {
+            headers,
+            cred,
+            is_owner,
+            deny_only: false,
+            remote_addr: None,
+        }
+    }
+
+    fn admin_action() -> Action {
+        Action::AdminAction(AdminAction::ServerInfoAdminAction)
+    }
+
+    fn assert_access_denied(res: S3Result<()>) {
+        let err = res.expect_err("gate should reject the request");
+        assert_eq!(
+            err.code(),
+            &s3s::S3ErrorCode::AccessDenied,
+            "admin gate rejection must map to the AccessDenied S3 error code"
+        );
+    }
+
+    /// Owner (root/admin) credential is authorized for an admin action.
+    #[tokio::test]
+    async fn admin_owner_credential_is_allowed() {
+        let iam = iam_sys_with_empty_store();
+        let headers = HeaderMap::new();
+        let cred = Credentials {
+            access_key: "rustfsadmin".to_string(),
+            ..Default::default()
+        };
+        let ctx = ctx_for(&headers, &cred, true);
+
+        let res = check_admin_request_auth(iam, &ctx, admin_action(), "", "").await;
+        assert!(res.is_ok(), "owner credential must pass the admin auth gate");
+    }
+
+    /// A known-shaped but non-owner principal with no matching policy is denied.
+    #[tokio::test]
+    async fn non_admin_credential_is_denied() {
+        let iam = iam_sys_with_empty_store();
+        let headers = HeaderMap::new();
+        let cred = Credentials {
+            access_key: "limiteduser".to_string(),
+            secret_key: "limitedsecret".to_string(),
+            ..Default::default()
+        };
+        let ctx = ctx_for(&headers, &cred, false);
+
+        let res = check_admin_request_auth(iam, &ctx, admin_action(), "", "").await;
+        assert_access_denied(res);
+    }
+
+    /// A request carrying an empty (missing) access key is denied.
+    #[tokio::test]
+    async fn missing_credential_is_denied() {
+        let iam = iam_sys_with_empty_store();
+        let headers = HeaderMap::new();
+        let cred = Credentials::default();
+        let ctx = ctx_for(&headers, &cred, false);
+
+        let res = check_admin_request_auth(iam, &ctx, admin_action(), "", "").await;
+        assert_access_denied(res);
+    }
+
+    /// The multi-action loop authorizes as soon as one candidate action passes
+    /// (owner short-circuits every action), and denies when none pass.
+    #[tokio::test]
+    async fn evaluate_admin_actions_grants_when_any_action_allowed() {
+        let headers = HeaderMap::new();
+        let actions = vec![
+            Action::AdminAction(AdminAction::ServerInfoAdminAction),
+            Action::AdminAction(AdminAction::ConfigUpdateAdminAction),
+        ];
+
+        // Owner: allowed on the first candidate action.
+        let owner_cred = Credentials {
+            access_key: "rustfsadmin".to_string(),
+            ..Default::default()
+        };
+        let owner_ctx = ctx_for(&headers, &owner_cred, true);
+        let iam = iam_sys_with_empty_store();
+        let res = evaluate_admin_actions(iam, &owner_ctx, &actions, "", "").await;
+        assert!(res.is_ok(), "owner must be granted when at least one action is permitted");
+
+        // Non-owner with no policy: none of the candidate actions pass.
+        let user_cred = Credentials {
+            access_key: "limiteduser".to_string(),
+            ..Default::default()
+        };
+        let user_ctx = ctx_for(&headers, &user_cred, false);
+        let iam = iam_sys_with_empty_store();
+        let res = evaluate_admin_actions(iam, &user_ctx, &actions, "", "").await;
+        assert_access_denied(res);
+    }
 }
