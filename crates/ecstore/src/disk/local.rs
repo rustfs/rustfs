@@ -1963,6 +1963,16 @@ pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
     ///
     /// Backends that hold no descriptors ignore both methods.
     fn invalidate_cached_fds_under(&self, _volume: &str, _path: &str) {}
+
+    /// Drop every descriptor for `volume` — used when the whole bucket tree is
+    /// removed (`delete_volume`), where the exact object paths are unknown
+    /// (rustfs/backlog#1177).
+    fn invalidate_cached_fds_for_volume(&self, _volume: &str) {}
+
+    /// Drop ALL cached descriptors. Called when this disk instance is retired
+    /// (`close`) so a replacement instance's invalidations are never defeated by
+    /// this one continuing to serve stale fds (rustfs/backlog#1177).
+    async fn clear_cached_fds(&self) {}
 }
 
 /// Default [`LocalIoBackend`]: tokio blocking-pool file I/O plus the
@@ -2754,6 +2764,24 @@ impl FdCache {
         }
     }
 
+    /// Drop every descriptor for `volume` — the whole bucket is gone
+    /// (rustfs/backlog#1177).
+    fn invalidate_volume(&self, volume: &str) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        let volume = volume.to_owned();
+        let matches = move |k: &FdKey, _: &Arc<std::fs::File>| k.volume == volume;
+        if self.cache.invalidate_entries_if(matches).is_err() {
+            self.cache.invalidate_all();
+        }
+    }
+
+    /// Drop ALL descriptors — this disk instance is being retired
+    /// (rustfs/backlog#1177).
+    fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.cache.invalidate_all();
+    }
+
     /// Unconditional insert. Production reads go through `insert_if_fresh` (the
     /// generation guard, rustfs/backlog#1176); this bare primitive is only for
     /// tests that drive the cache directly.
@@ -3206,6 +3234,18 @@ impl LocalIoBackend for UringBackend {
     fn invalidate_cached_fds_under(&self, volume: &str, path: &str) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_under(volume, path);
+        }
+    }
+
+    fn invalidate_cached_fds_for_volume(&self, volume: &str) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.invalidate_volume(volume);
+        }
+    }
+
+    async fn clear_cached_fds(&self) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.clear();
         }
     }
 }
@@ -5419,6 +5459,12 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn close(&self) -> Result<()> {
+        // This disk instance is being retired (e.g. replaced by renew_disk on
+        // reconnect). Drop its cached descriptors so a replacement instance's
+        // invalidations are never defeated by this one continuing to serve stale
+        // fds through operations still holding a snapshot of it
+        // (rustfs/backlog#1177).
+        self.io_backend.clear_cached_fds().await;
         Ok(())
     }
 
@@ -6522,6 +6568,12 @@ impl DiskAPI for LocalDisk {
             {
                 rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
                     .map_err(to_file_error)?;
+                // The commit rename changed the dst part inodes before this fsync
+                // failed and rolled them back; drop any fd cached during that
+                // window so readers re-open the restored inode (rustfs/backlog#1177).
+                for part_path in &invalidate_part_paths {
+                    self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                }
                 return Err(to_file_error(err).into());
             }
 
@@ -6544,6 +6596,12 @@ impl DiskAPI for LocalDisk {
                     if let Err(err) = os::fsync_dir(dir).await {
                         rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
                             .map_err(to_file_error)?;
+                        // Same post-commit rollback window as above — drop cached
+                        // dst part fds so readers re-open the restored inode
+                        // (rustfs/backlog#1177).
+                        for part_path in &invalidate_part_paths {
+                            self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                        }
                         return Err(to_file_error(err).into());
                     }
                     if dir == dst_volume_dir.as_path() {
@@ -7405,6 +7463,12 @@ impl DiskAPI for LocalDisk {
                 return Err(e);
             }
         }
+
+        // The whole bucket tree is gone; drop every cached io_uring descriptor
+        // for it so a cache hit cannot keep serving a removed object (the read
+        // hit path skips the volume-access check, so nothing else would notice)
+        // (rustfs/backlog#1177).
+        self.io_backend.invalidate_cached_fds_for_volume(volume);
 
         Ok(())
     }
