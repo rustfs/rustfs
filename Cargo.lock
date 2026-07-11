@@ -10032,13 +10032,14 @@ dependencies = [
 
 [[package]]
 name = "rustfs-uring"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "358fe7987fc6b4a98dd65d4f6a7785f4f1af41daf027d14ae4b5a94eadba6348"
+checksum = "0486e62d0efe25db95c00aeacb2da84368adcba299216cda99fcb11328061c84"
 dependencies = [
  "io-uring",
  "libc",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
