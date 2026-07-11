@@ -170,7 +170,8 @@ join CI through the nextest profile system only (never as ad-hoc jobs):
 | ILM / lifecycle (ignored) | `test-ilm-integration-serial` lane, `-j1` | **Active** (backlog#1148 ilm-1) |
 | KMS suite | — | Not in CI yet (backlog#1149 ci-5) |
 | Protocols (FTPS/WebDAV/SFTP) | — | Not in CI yet (backlog#1149 ci-7) |
-| Cluster / replication e2e | — | Not in CI yet (backlog#1147 repl-1) |
+| Replication (fast subset) | `e2e-smoke` profile, `e2e-tests` job, every PR | **Active** (backlog#1147 repl-1) |
+| Replication (slow + dual-node) | `e2e-repl-nightly` profile, scheduled workflow | **Active** (backlog#1147 repl-1) |
 | `reliant/*` (pre-started server) | — | Manual only |
 
 Links: [`ci.yml`](../../.github/workflows/ci.yml) `e2e-tests` (line 347),
@@ -185,8 +186,11 @@ and may add lanes; keep the table above easy to extend.
 **Reproduce a CI failure locally** — run the exact profile/lane:
 
 ```bash
-# Smoke (e2e-tests job)
+# Smoke (e2e-tests job) — includes the 20 fast replication tests
 cargo nextest run --profile e2e-smoke -p e2e_test
+# Replication nightly lane (16 slow + dual-node tests; install awscurl for the
+# STS dual-node test, else it skips gracefully)
+cargo nextest run --profile e2e-repl-nightly -p e2e_test
 # ILM serial lane
 cargo nextest run -j1 --run-ignored ignored-only -p rustfs-scanner -p rustfs \
   -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'
