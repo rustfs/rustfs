@@ -165,6 +165,11 @@ mod bucket_logging_test;
 #[cfg(test)]
 mod multipart_auth_test;
 
+// Negative header-SigV4 regression suite (backlog#1151 sec-1): tampered
+// signature, wrong secret, skewed date, malformed Authorization.
+#[cfg(test)]
+mod negative_sigv4_test;
+
 #[cfg(test)]
 mod stale_multipart_cleanup_cluster_test;
 
