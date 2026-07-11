@@ -521,6 +521,7 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 32 * 1024 * 1024,
+            data_dir_u128: None,
             mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });

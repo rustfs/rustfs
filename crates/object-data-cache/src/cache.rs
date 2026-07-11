@@ -144,12 +144,13 @@ impl ObjectDataCache {
         record_plan_decision(self.backend.as_metric_label(), self.config.mode, "cacheable", "eligible", request.size);
 
         ObjectDataCacheGetPlan::Cacheable {
-            key: ObjectDataCacheKey::with_mod_time(
+            key: ObjectDataCacheKey::with_write_anchors(
                 request.bucket,
                 request.object,
                 request.version_id.as_deref(),
                 request.etag,
                 request.size,
+                request.data_dir_u128,
                 request.mod_time_unix_nanos,
                 request.body_variant,
             ),
@@ -393,7 +394,11 @@ const fn invalidation_outcome(result: &ObjectDataCacheInvalidationResult) -> &'s
 }
 
 /// Protocol-neutral GET request metadata for cache planning.
-#[derive(Debug, Clone)]
+///
+/// Derives `Default` so tests construct it with `..Default::default()`; a new
+/// field then does not have to be added to every literal (which is how the
+/// `mod_time` seam bug arose during backlog#1111).
+#[derive(Debug, Clone, Default)]
 pub struct ObjectDataCacheGetRequest<'a> {
     /// Bucket name.
     pub bucket: &'a str,
@@ -405,9 +410,11 @@ pub struct ObjectDataCacheGetRequest<'a> {
     pub etag: &'a str,
     /// Object size in bytes.
     pub size: u64,
+    /// Resolved version's `data_dir` UUID as a `u128`, or `None`. Primary
+    /// write-unique key component (backlog#1111 / ODC-06).
+    pub data_dir_u128: Option<u128>,
     /// Resolved version's modification time as Unix nanoseconds, or `0` when
-    /// absent. Carried into the key so it is write-unique (backlog#1111 /
-    /// ODC-06).
+    /// absent. Second write-unique anchor.
     pub mod_time_unix_nanos: i128,
     /// Supported response body variant.
     pub body_variant: ObjectDataCacheBodyVariant,
@@ -546,7 +553,7 @@ mod tests {
         ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup,
     };
     use crate::config::{ObjectDataCacheConfig, ObjectDataCacheMode};
-    use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheIdentity};
+    use crate::key::ObjectDataCacheIdentity;
     use bytes::Bytes;
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -576,11 +583,9 @@ mod tests {
         ObjectDataCacheGetRequest {
             bucket,
             object,
-            version_id: None,
             etag,
             size,
-            mod_time_unix_nanos: 0,
-            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+            ..Default::default()
         }
     }
 
@@ -846,11 +851,9 @@ mod tests {
         let plan = cache.plan_get(ObjectDataCacheGetRequest {
             bucket: "bucket",
             object: "object",
-            version_id: None,
             etag: "etag",
             size: 5,
-            mod_time_unix_nanos: 0,
-            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+            ..Default::default()
         });
 
         let fill = cache.fill_body(&plan, Bytes::from_static(b"oops")).await;
@@ -900,11 +903,10 @@ mod tests {
         let request = ObjectDataCacheGetRequest {
             bucket: "bucket",
             object: "object",
-            version_id: None,
             etag: "etag",
             size: 5,
             mod_time_unix_nanos: 42,
-            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+            ..Default::default()
         };
         let ObjectDataCacheGetPlan::Cacheable { key } = cache.plan_get(request) else {
             panic!("plan should be cacheable");
