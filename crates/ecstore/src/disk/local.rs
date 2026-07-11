@@ -2630,10 +2630,25 @@ fn reclaim_read_range(file: &std::fs::File, offset: u64, length: usize) -> Resul
     use rustix::fs::{Advice, fadvise};
 
     let length = u64::try_from(length).map_err(|_| DiskError::other("read reclaim length overflow"))?;
-    let Some(length) = NonZeroU64::new(length) else {
+    if length == 0 {
+        return Ok(());
+    }
+    // Page-align the reclaim window down to the containing page, matching
+    // StdBackend's mmap reclaim `[aligned_offset, offset + length)`
+    // (rustfs/backlog#1173). fadvise(DONTNEED) only drops fully-covered pages, so
+    // reclaiming the raw unaligned range would leave the head partial page
+    // resident that the mmap path drops — divergent residency for the same read
+    // (bitrot shards' 32-byte block headers keep offsets off page boundaries, so
+    // this is the common case, not a corner case).
+    let page = mmap_page_size()?;
+    let aligned_offset = offset - (offset % page);
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| DiskError::other("read reclaim range overflow"))?;
+    let Some(aligned_len) = NonZeroU64::new(end - aligned_offset) else {
         return Ok(());
     };
-    fadvise(file, offset, Some(length), Advice::DontNeed)
+    fadvise(file, aligned_offset, Some(aligned_len), Advice::DontNeed)
         .map_err(std::io::Error::from)
         .map_err(DiskError::from)
 }
@@ -3064,6 +3079,17 @@ impl UringBackend {
         };
 
         if length == 0 {
+            // Parity with StdBackend and the miss path (rustfs/backlog#1173): a
+            // zero-length read still rejects an offset past EOF. The miss path
+            // validated `meta.len() < end_offset` (end_offset == offset here), but
+            // a cache hit skipped it — so fstat the descriptor and match. This is
+            // a rare path (callers do not issue zero-length reads), so the one
+            // extra fstat is negligible.
+            match file.metadata() {
+                Ok(meta) if offset_u64 > meta.len() => return Err(DiskError::FileCorrupt),
+                Ok(_) => {}
+                Err(e) => return Err(DiskError::from(e)),
+            }
             return Ok(Bytes::new());
         }
 
