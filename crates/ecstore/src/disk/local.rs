@@ -2613,9 +2613,6 @@ impl LocalIoBackend for StdBackend {
     }
 }
 
-/// Runtime-probed io_uring read backend (backlog#1104).
-///
-/// Wraps a [`StdBackend`] for everything except positioned reads, which go
 /// Enable the per-disk descriptor cache for io_uring reads (backlog#1145).
 #[cfg(target_os = "linux")]
 const ENV_RUSTFS_IO_URING_FD_CACHE: &str = "RUSTFS_IO_URING_FD_CACHE";
@@ -2857,6 +2854,9 @@ impl FdCache {
     }
 }
 
+/// Runtime-probed io_uring read backend (backlog#1104).
+///
+/// Wraps a [`StdBackend`] for everything except positioned reads, which go
 /// through rustfs-uring's cancel-safe `UringDriver`. Constructed only when
 /// `RUSTFS_IO_URING_READ_ENABLE` is set AND the per-disk probe succeeds; on any
 /// per-read driver error a read falls back to the inner `StdBackend`, so
@@ -3157,14 +3157,19 @@ impl UringBackend {
         //     unreachable keeps serving its already-open descriptors for at most
         //     `FD_CACHE_TTL`, after which the re-open re-runs the check. Disk
         //     health is tracked independently of this per-read probe.
-        let key = self.fd_cache.as_ref().map(|_| FdKey {
-            volume: volume.to_owned(),
-            path: path.to_owned(),
-            direct: false,
+        // The cache handle and its lookup key travel together: `Some` exactly when
+        // the fd cache is enabled, so neither use site below re-checks presence.
+        let cache_entry = self.fd_cache.as_ref().map(|cache| {
+            let key = FdKey {
+                volume: volume.to_owned(),
+                path: path.to_owned(),
+                direct: false,
+            };
+            (cache, key)
         });
-        let cached = match (self.fd_cache.as_ref(), key.as_ref()) {
-            (Some(cache), Some(key)) => cache.get(key).await,
-            _ => None,
+        let cached = match &cache_entry {
+            Some((cache, key)) => cache.get(key).await,
+            None => None,
         };
 
         let file = match cached {
@@ -3174,7 +3179,7 @@ impl UringBackend {
                 // if a heal/delete invalidation runs while this open is in flight,
                 // the generation moves and insert_if_fresh refuses to cache the
                 // now-stale descriptor.
-                let gen_at_open = self.fd_cache.as_ref().map(|c| c.generation());
+                let gen_at_open = cache_entry.as_ref().map(|(cache, _)| cache.generation());
                 let root = self.root.clone();
                 let volume_owned = volume.to_owned();
                 let path_owned = path.to_owned();
@@ -3191,7 +3196,7 @@ impl UringBackend {
                 .await
                 .map_err(|e| DiskError::other(format!("uring pread join error: {e}")))??;
                 let file = Arc::new(file);
-                if let (Some(cache), Some(key), Some(gen_at_open)) = (self.fd_cache.as_ref(), key, gen_at_open) {
+                if let (Some((cache, key)), Some(gen_at_open)) = (cache_entry, gen_at_open) {
                     cache.insert_if_fresh(key, Arc::clone(&file), gen_at_open).await;
                 }
                 file
