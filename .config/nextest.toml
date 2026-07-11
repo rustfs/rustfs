@@ -97,6 +97,13 @@ retries = 2
 #
 # Each e2e test spawns its own rustfs server on a random port with an isolated
 # temp dir (crates/e2e_test/src/common.rs), so the subset is parallel-safe.
+#
+# The `reliant::lifecycle::` tests (backlog#1148 ilm-3) are self-managed
+# expiry e2e tests. They qualify for the smoke subset: each spawns its own
+# server on a random port with an isolated temp dir, drives expiry to completion
+# in seconds via `mod_time` back-dating / `RUSTFS_ILM_DEBUG_DAY_SECS` plus a
+# 1-second scanner cycle (all set as child-process env, so no cross-test global
+# state), and is not `#[ignore]`. They are added as their own filterset clause.
 [profile.e2e-smoke]
-default-filter = 'package(e2e_test) & test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check)_test::/)'
+default-filter = 'package(e2e_test) & (test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check)_test::/) | test(/^reliant::lifecycle::/))'
 fail-fast = false
