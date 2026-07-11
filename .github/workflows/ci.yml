@@ -131,6 +131,9 @@ jobs:
       - name: Check extension schema boundaries
         run: ./scripts/check_extension_schema_boundaries.sh
 
+      - name: Check body-cache whitelist guard
+        run: ./scripts/check_body_cache_whitelist.sh
+
   test-and-lint:
     name: Test and Lint
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
