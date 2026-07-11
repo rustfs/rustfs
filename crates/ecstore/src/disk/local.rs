@@ -1696,15 +1696,23 @@ impl<R: AsyncRead + Unpin> AsyncRead for StallTimeoutReader<R> {
 }
 
 fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
+    // Runs per read-stream page-cache reclaim window; skip the whole emission
+    // (three metric-key constructions) when general metrics are disabled.
+    if !rustfs_io_metrics::metrics_enabled() {
+        return;
+    }
     // `kind`, "ok" and "err" are all `&'static str`; the `metrics` macros take
     // static label values directly, so pass them as-is instead of allocating a
-    // `String` per reclaim (this runs per read-stream page-cache reclaim window).
+    // `String` per reclaim.
     counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind, "result" => "ok").increment(1);
     counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => kind).increment(reclaim_len as u64);
     metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => kind).record(started.elapsed().as_secs_f64());
 }
 
 fn record_file_cache_reclaim_error(kind: &'static str) {
+    if !rustfs_io_metrics::metrics_enabled() {
+        return;
+    }
     counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind, "result" => "err").increment(1);
 }
 
@@ -12921,7 +12929,9 @@ mod test {
 
         let recorder = crate::test_metrics::CapturingRecorder::default();
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        let previous_metrics_gate = rustfs_io_metrics::metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        rustfs_io_metrics::set_metrics_enabled(true);
         metrics::with_local_recorder(&recorder, || {
             record_mmap_copy_stage(metrics(), "mmap_copy", None);
             record_mmap_copy_stage(metrics(), "mmap_copy", Some(std::time::Instant::now()));
@@ -12937,6 +12947,7 @@ mod test {
             }
         });
         rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+        rustfs_io_metrics::set_metrics_enabled(previous_metrics_gate);
 
         assert_eq!(
             recorder.histogram_sample_count("rustfs_io_get_object_stage_duration_seconds"),
