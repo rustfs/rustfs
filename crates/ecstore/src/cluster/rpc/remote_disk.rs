@@ -827,14 +827,13 @@ impl RemoteDisk {
             .expect("operation should succeed")
             .as_nanos() as i64;
         self.health.last_started.store(now, std::sync::atomic::Ordering::Relaxed);
-        self.health.increment_waiting();
+        let _waiting_guard = self.health.waiting_guard();
 
         if timeout_duration == Duration::ZERO {
             let operation_result = operation().await;
             if operation_result.is_ok() {
                 self.health.log_success();
             }
-            self.health.decrement_waiting();
             self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                 .await;
             return operation_result;
@@ -845,18 +844,16 @@ impl RemoteDisk {
 
         match result {
             Ok(operation_result) => {
-                // Log success and decrement waiting counter
+                // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
                     self.health.log_success();
                 }
-                self.health.decrement_waiting();
                 self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                     .await;
                 operation_result
             }
             Err(_) => {
                 // Timeout occurred, mark disk as potentially faulty
-                self.health.decrement_waiting();
                 counter!(
                     "rustfs_drive_op_timeout_total",
                     "endpoint" => self.endpoint.to_string(),
@@ -3312,6 +3309,33 @@ mod tests {
         RemoteDisk::new(&endpoint, &disk_option, data_transport)
             .await
             .expect("operation should succeed")
+    }
+
+    #[tokio::test]
+    async fn remote_disk_health_wrapper_balances_task_cancellation() {
+        let disk = Arc::new(new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await);
+        let task_disk = Arc::clone(&disk);
+        let task = tokio::spawn(async move {
+            task_disk
+                .execute_with_timeout_for_op(
+                    "cancellation-test",
+                    || async { std::future::pending::<Result<()>>().await },
+                    Duration::ZERO,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while disk.health.waiting_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation should enter remote disk health tracking");
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(disk.health.waiting_count(), 0);
     }
 
     #[derive(Debug)]

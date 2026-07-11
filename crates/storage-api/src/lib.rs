@@ -14,6 +14,10 @@
 
 //! Storage API contracts for RustFS.
 
+pub const WALK_DIR_STREAM_COMPLETION_QUERY: &str = "walk_dir_stream_completion";
+pub const WALK_DIR_STREAM_COMPLETION_V1: &str = "error-v1";
+pub const WALK_DIR_BODY_SHA256_QUERY: &str = "walk_dir_body_sha256";
+
 pub mod admin;
 pub mod bucket;
 pub mod capability;

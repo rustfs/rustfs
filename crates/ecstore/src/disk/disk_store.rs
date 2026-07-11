@@ -283,6 +283,16 @@ pub struct DiskHealthTracker {
     pub last_capacity_probe_unix_secs: AtomicI64,
 }
 
+pub(crate) struct DiskHealthWaitingGuard<'a> {
+    health: &'a DiskHealthTracker,
+}
+
+impl Drop for DiskHealthWaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.health.decrement_waiting();
+    }
+}
+
 impl DiskHealthTracker {
     /// Create a new disk health tracker
     pub fn new() -> Self {
@@ -535,6 +545,11 @@ impl DiskHealthTracker {
     /// Increment waiting operations counter
     pub fn increment_waiting(&self) {
         self.waiting.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn waiting_guard(&self) -> DiskHealthWaitingGuard<'_> {
+        self.increment_waiting();
+        DiskHealthWaitingGuard { health: self }
     }
 
     /// Decrement waiting operations counter
@@ -1038,11 +1053,10 @@ impl LocalDiskWrapper {
             .unwrap()
             .as_nanos() as i64;
         self.health.last_started.store(now, Ordering::Relaxed);
-        self.health.increment_waiting();
+        let _waiting_guard = self.health.waiting_guard();
 
         if timeout_duration == Duration::ZERO {
             let result = operation().await;
-            self.health.decrement_waiting();
             if result.is_ok() {
                 self.health.record_operation_success(&self.endpoint(), "operation_success");
             }
@@ -1053,16 +1067,14 @@ impl LocalDiskWrapper {
 
         match result {
             Ok(operation_result) => {
-                // Log success and decrement waiting counter
+                // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
                     self.health.record_operation_success(&self.endpoint(), "operation_success");
                 }
-                self.health.decrement_waiting();
                 operation_result
             }
             Err(_) => {
-                // Timeout occurred, mark disk as potentially faulty and decrement waiting counter
-                self.health.decrement_waiting();
+                // Timeout occurred, mark disk as potentially faulty.
                 if timeout_health_action == TimeoutHealthAction::MarkFailure
                     && self.health.mark_failure(&self.endpoint(), "operation_timeout")
                 {
@@ -1467,6 +1479,43 @@ mod tests {
     use tokio::io::AsyncWrite;
 
     struct PendingWriter;
+
+    #[test]
+    fn disk_health_waiting_guard_balances_cancellation() {
+        let health = DiskHealthTracker::new();
+        {
+            let _guard = health.waiting_guard();
+            assert_eq!(health.waiting_count(), 1);
+        }
+        assert_eq!(health.waiting_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_disk_health_wrapper_balances_task_cancellation() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("temp dir should be valid UTF-8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let wrapper = Arc::new(LocalDiskWrapper::new(disk, false));
+        let task_wrapper = Arc::clone(&wrapper);
+        let task = tokio::spawn(async move {
+            task_wrapper
+                .track_disk_health(|| async { std::future::pending::<Result<()>>().await }, Duration::ZERO)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while wrapper.health.waiting_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation should enter disk health tracking");
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(wrapper.health.waiting_count(), 0);
+    }
 
     impl AsyncWrite for PendingWriter {
         fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
