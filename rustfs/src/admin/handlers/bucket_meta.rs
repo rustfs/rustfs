@@ -27,6 +27,7 @@ use crate::admin::storage_api::bucket::{
 };
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use crate::admin::storage_api::error::StorageError;
+use crate::storage::storage_api::lock_bucket_targets_metadata;
 use crate::{
     admin::{
         auth::validate_admin_request,
@@ -836,6 +837,11 @@ impl Operation for ImportBucketMetadata {
         for (bucket_name, metadata) in &bucket_metadatas {
             for (config_file, data) in imported_configs_to_persist(metadata) {
                 let site_replication_item = imported_config_to_site_replication_item(bucket_name, metadata, config_file, &data)?;
+                let targets_guard = if matches!(config_file, BUCKET_REPLICATION_CONFIG | BUCKET_TARGETS_FILE) {
+                    Some(lock_bucket_targets_metadata(bucket_name).await)
+                } else {
+                    None
+                };
                 if let Err(e) = metadata_sys::update(bucket_name, config_file, data).await {
                     warn!(
                         event = EVENT_ADMIN_BUCKET_META_STATE,
@@ -853,6 +859,7 @@ impl Operation for ImportBucketMetadata {
                         "failed to persist imported bucket metadata for {bucket_name}/{config_file}: {e}"
                     ));
                 }
+                drop(targets_guard);
                 if let Some(item) = site_replication_item
                     && let Err(err) = site_replication_bucket_meta_hook(item).await
                 {
