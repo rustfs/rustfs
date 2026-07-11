@@ -2666,6 +2666,11 @@ struct FdKey {
 #[cfg(target_os = "linux")]
 struct FdCache {
     cache: moka::future::Cache<FdKey, Arc<std::fs::File>>,
+    /// Bumped by every invalidation. A miss-path open snapshots this before it
+    /// opens and refuses to insert if it moved, so an fd opened before a
+    /// heal/delete commit can never be resurrected into the cache after the
+    /// commit's invalidation ran (open-then-insert race, rustfs/backlog#1176).
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(target_os = "linux")]
@@ -2679,6 +2684,7 @@ impl FdCache {
                 // fails at runtime instead of dropping stale descriptors.
                 .support_invalidation_closures()
                 .build(),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2686,13 +2692,33 @@ impl FdCache {
         self.cache.get(key).await
     }
 
-    async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
-        self.cache.insert(key, file).await;
+    /// Current invalidation generation, snapshotted by the miss path before it
+    /// opens a descriptor (rustfs/backlog#1176).
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Insert a freshly-opened descriptor only if no invalidation happened since
+    /// it was opened (rustfs/backlog#1176). An invalidate that ran during the
+    /// open bumped the generation, so a stale pre-heal/pre-delete inode is never
+    /// cached. The post-insert re-check closes the tiny window where an
+    /// invalidate races the insert itself, by removing the entry we just added.
+    async fn insert_if_fresh(&self, key: FdKey, file: Arc<std::fs::File>, gen_at_open: u64) {
+        if self.generation.load(Ordering::Acquire) != gen_at_open {
+            return;
+        }
+        self.cache.insert(key.clone(), file).await;
+        if self.generation.load(Ordering::Acquire) != gen_at_open {
+            self.cache.invalidate(&key).await;
+        }
     }
 
     /// Drop the descriptor for exactly this path. Preferred wherever the caller
     /// knows the keys: unlike a predicate it costs nothing on later reads.
     async fn invalidate_exact(&self, volume: &str, path: &str) {
+        // Bump BEFORE the moka invalidation so a concurrent miss-path insert
+        // that snapshotted the old generation is refused (rustfs/backlog#1176).
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.cache
             .invalidate(&FdKey {
                 volume: volume.to_owned(),
@@ -2712,6 +2738,9 @@ impl FdCache {
     /// re-evaluated by subsequent `get`s, so registering one per write would tax
     /// the read path.
     fn invalidate_under(&self, volume: &str, prefix: &str) {
+        // Bump before registering the predicate so a concurrent miss-path insert
+        // that snapshotted the old generation is refused (rustfs/backlog#1176).
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let volume = volume.to_owned();
         let prefix = prefix.trim_end_matches('/').to_owned();
         let matches = move |k: &FdKey, _: &Arc<std::fs::File>| {
@@ -2723,6 +2752,14 @@ impl FdCache {
             // descriptor: correctness first, the cache refills on the next read.
             self.cache.invalidate_all();
         }
+    }
+
+    /// Unconditional insert. Production reads go through `insert_if_fresh` (the
+    /// generation guard, rustfs/backlog#1176); this bare primitive is only for
+    /// tests that drive the cache directly.
+    #[cfg(test)]
+    async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
+        self.cache.insert(key, file).await;
     }
 
     #[cfg(test)]
@@ -2909,6 +2946,11 @@ impl UringBackend {
         let file = match cached {
             Some(file) => file,
             None => {
+                // Snapshot the cache generation BEFORE opening (rustfs/backlog#1176):
+                // if a heal/delete invalidation runs while this open is in flight,
+                // the generation moves and insert_if_fresh refuses to cache the
+                // now-stale descriptor.
+                let gen_at_open = self.fd_cache.as_ref().map(|c| c.generation());
                 let root = self.root.clone();
                 let volume_owned = volume.to_owned();
                 let path_owned = path.to_owned();
@@ -2925,8 +2967,8 @@ impl UringBackend {
                 .await
                 .map_err(|e| DiskError::other(format!("uring pread join error: {e}")))??;
                 let file = Arc::new(file);
-                if let (Some(cache), Some(key)) = (self.fd_cache.as_ref(), key) {
-                    cache.insert(key, Arc::clone(&file)).await;
+                if let (Some(cache), Some(key), Some(gen_at_open)) = (self.fd_cache.as_ref(), key, gen_at_open) {
+                    cache.insert_if_fresh(key, Arc::clone(&file), gen_at_open).await;
                 }
                 file
             }
