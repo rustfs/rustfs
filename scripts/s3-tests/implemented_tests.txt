@@ -225,6 +225,8 @@ test_delete_bucket_encryption_kms
 test_delete_bucket_encryption_s3
 # Lifecycle tests
 test_lifecycle_delete
+# Negative validation: Expiration{Days:0} must return InvalidArgument (backlog#1148 ilm-10).
+test_lifecycle_expiration_days0
 test_lifecycle_get
 test_lifecycle_get_no_id
 test_lifecycle_id_too_long

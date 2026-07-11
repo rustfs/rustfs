@@ -495,3 +495,61 @@ jobs:
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3
+
+  # Dedicated lifecycle behavior lane (backlog#1148 ilm-10, master plan #1155).
+  #
+  # These ceph/s3-tests cases assert that objects/versions/uploads are actually
+  # removed by the background scanner and the stale-multipart cleanup loop, so
+  # they need a debug-accelerated day plus an enabled scanner. That configuration
+  # cannot be applied to the s3-implemented-tests lane above because a global
+  # RUSTFS_ILM_DEBUG_DAY_SECS also shrinks the x-amz-expiration header those tests
+  # assert on (test_lifecycle_expiration_header_*). Hence a separate server here.
+  s3-lifecycle-behavior-tests:
+    name: S3 Lifecycle Behavior Tests
+    needs: [ build-rustfs-debug-binary ]
+    runs-on: sm-standard-4
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Download debug binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: rustfs-debug-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      - name: Run lifecycle behavior s3-tests
+        run: |
+          RUN_ROOT="${RUNNER_TEMP}/rustfs-s3tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          mkdir -p "${RUN_ROOT}"
+          S3_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+          # Serial (XDIST=0) for timing determinism: the cases sleep on multiples
+          # of the debug day and assert scanner-driven deletion.
+          DEPLOY_MODE=binary \
+          RUSTFS_BINARY=./target/debug/rustfs \
+          TEST_MODE=single \
+          MAXFAIL=0 \
+          XDIST=0 \
+          IMPLEMENTED_TESTS_FILE=scripts/s3-tests/lifecycle_behavior_tests.txt \
+          RUSTFS_ILM_DEBUG_DAY_SECS=10 \
+          RUSTFS_SCANNER_ENABLED=true \
+          RUSTFS_SCANNER_CYCLE=2 \
+          RUSTFS_SCANNER_START_DELAY_SECS=0 \
+          RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL=2s \
+          S3_PORT="${S3_PORT}" \
+          DATA_ROOT="${RUN_ROOT}" \
+          S3TESTS_CONF=artifacts/s3tests-single/s3tests.conf \
+          ./scripts/s3-tests/run.sh
+
+      - name: Upload s3 test artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: s3tests-lifecycle-behavior-${{ github.run_number }}
+          path: artifacts/s3tests-single/**
+          if-no-files-found: ignore
+          retention-days: 3

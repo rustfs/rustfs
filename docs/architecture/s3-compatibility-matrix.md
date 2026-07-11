@@ -15,11 +15,20 @@ features are covered by the compatibility matrix and test lists.
 
 | List | Purpose | Current count | Source |
 |---|---:|---:|---|
-| Implemented tests | Standard S3 tests expected to pass and used by the default local s3tests run. | 449 | `scripts/s3-tests/implemented_tests.txt` |
+| Implemented tests | Standard S3 tests expected to pass and used by the default local s3tests run. | 452 | `scripts/s3-tests/implemented_tests.txt` |
+| Lifecycle behavior tests | Expiration behavior cases gated by the dedicated `s3-lifecycle-behavior-tests` lane (debug-accelerated day + scanner enabled). | 5 | `scripts/s3-tests/lifecycle_behavior_tests.txt` |
 | Unimplemented tests | Standard S3 features planned but not yet implemented. | 17 | `scripts/s3-tests/unimplemented_tests.txt` |
-| Excluded tests | Vendor-specific or intentionally unsupported behavior excluded from RustFS compatibility gating. | 281 | `scripts/s3-tests/excluded_tests.txt` |
+| Excluded tests | Vendor-specific or intentionally unsupported behavior excluded from RustFS compatibility gating. | 273 | `scripts/s3-tests/excluded_tests.txt` |
 
 Counts ignore blank lines and comments.
+
+The lifecycle behavior lane runs real Days-based expiration cases that need
+`RUSTFS_ILM_DEBUG_DAY_SECS` (Ceph `lc_debug_interval` equivalent) and an enabled
+background scanner; it cannot share the default single-server gate because a
+global debug day would also shrink the `x-amz-expiration` header asserted by the
+`test_lifecycle_expiration_header_*` cases. See `scripts/s3-tests/run.sh`
+(`IMPLEMENTED_TESTS_FILE` override) and the `s3-lifecycle-behavior-tests` job in
+`.github/workflows/ci.yml`.
 
 ## Supported Coverage
 
