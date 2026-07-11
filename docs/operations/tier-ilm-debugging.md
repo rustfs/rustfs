@@ -83,7 +83,11 @@ was transitioned to a non-versioned tier bucket and no versionId must be sent.
   remote-tier cleanup is driven by persisted free-version recovery
   (`crates/ecstore/src/bucket/lifecycle/tier_free_version_recovery.rs`).
   **Invariant — keep local-first ordering**: never remove a remote tier
-  version while live local metadata still points at it.
+  version while live local metadata still points at it. Regression test:
+  `serial_tests::test_expire_transitioned_object_never_races_concurrent_get`
+  in `crates/scanner/tests/lifecycle_integration_test.rs` (runs in the CI
+  ILM Integration serial lane) pins both the local-first ordering and the
+  "concurrent GET never sees `NoSuchVersion`" contract.
 - Nil-UUID versionId sent to tier (`NoSuchVersion`): reading code used
   `Uuid::from_slice(..).unwrap_or_default()`, converting an empty metadata
   value into `Uuid::nil()`. Fixed by the `and_then`/`filter` pattern above.

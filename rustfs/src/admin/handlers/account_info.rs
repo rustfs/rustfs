@@ -20,7 +20,7 @@ use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::data_usage::{
     apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_bucket_usage_from_object_layer,
-    refresh_versioned_bucket_usage_from_object_layer, replace_bucket_usage_memory_from_info,
+    replace_bucket_usage_memory_from_info,
 };
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
@@ -258,7 +258,6 @@ impl Operation for AccountInfoHandler {
         let mut data_usage_info = load_data_usage_from_backend(store.clone())
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-        refresh_versioned_bucket_usage_from_object_layer(store.clone(), &mut data_usage_info).await;
         replace_bucket_usage_memory_from_info(&data_usage_info).await;
         apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
 

@@ -82,6 +82,13 @@ fn signature_payload(url: &str, method: &Method, timestamp: i64) -> String {
     format!("{url}|{method}|{timestamp}")
 }
 
+fn redacted_rpc_path(url: &str) -> String {
+    url.parse::<Uri>()
+        .ok()
+        .map(|uri| uri.path().to_string())
+        .unwrap_or_else(|| "<invalid-rpc-url>".to_string())
+}
+
 /// Generate HMAC-SHA256 signature for the given data
 fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) -> String {
     let data = signature_payload(url, method, timestamp);
@@ -159,12 +166,13 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
     let secret = get_shared_secret()?;
 
     if !verify_signature(&secret, url, method, timestamp, signature) {
+        let rpc_path = redacted_rpc_path(url);
         error!(
-            "verify_rpc_signature: Invalid signature: url {}, method {}, timestamp {}, signature_len {}",
-            url,
-            method,
+            rpc_path = %rpc_path,
+            method = %method,
             timestamp,
-            signature.len()
+            signature_len = signature.len(),
+            "verify_rpc_signature: Invalid signature"
         );
 
         return Err(std::io::Error::other("Invalid signature"));
@@ -457,9 +465,30 @@ mod tests {
     }
 
     #[test]
+    fn walk_dir_capability_is_covered_by_the_signature() {
+        let secret = "test-secret";
+        let signed_url = concat!(
+            "http://node1:9000/rustfs/rpc/walk_dir?disk=disk-a&walk_dir_stream_completion=error-v1",
+            "&walk_dir_body_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let downgraded_url = "http://node1:9000/rustfs/rpc/walk_dir?disk=disk-a";
+        let tampered_body_digest = concat!(
+            "http://node1:9000/rustfs/rpc/walk_dir?disk=disk-a&walk_dir_stream_completion=error-v1",
+            "&walk_dir_body_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let method = Method::GET;
+        let timestamp = 1_640_995_200;
+        let signature = generate_signature(secret, signed_url, &method, timestamp);
+
+        assert!(verify_signature(secret, signed_url, &method, timestamp, &signature));
+        assert!(!verify_signature(secret, downgraded_url, &method, timestamp, &signature));
+        assert!(!verify_signature(secret, tampered_body_digest, &method, timestamp, &signature));
+    }
+
+    #[test]
     fn test_invalid_signature_log_contract_excludes_secrets() {
         ensure_test_rpc_secret();
-        let url = "http://example.com/api/test";
+        let url = "http://example.com/api/test?disk=/sensitive/path&token=private";
         let method = Method::GET;
         let timestamp = OffsetDateTime::now_utc().unix_timestamp();
         let secret = get_shared_secret().expect("test RPC secret should resolve");
@@ -487,6 +516,8 @@ mod tests {
         assert!(!captured.contains(&secret));
         assert!(!captured.contains(&expected_signature));
         assert!(!captured.contains(invalid_signature));
+        assert!(!captured.contains("sensitive"));
+        assert!(!captured.contains("private"));
     }
 
     #[test]

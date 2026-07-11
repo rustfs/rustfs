@@ -14,12 +14,15 @@
 
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
+#[cfg(test)]
+use crate::storage::storage_api::rpc_consumer::http_service::WALK_DIR_BODY_SHA256_QUERY;
 use crate::storage::storage_api::rpc_consumer::http_service::{
-    DEFAULT_READ_BUFFER_SIZE, StorageDiskRpcExt as _, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature,
+    DEFAULT_READ_BUFFER_SIZE, StorageDiskRpcExt as _, WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, find_local_disk_by_ref,
+    verify_rpc_signature,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::{Bytes, BytesMut};
-use futures_util::TryStreamExt;
+use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
@@ -33,11 +36,13 @@ use s3s::Body;
 use s3s::dto::StreamingBlob;
 use serde::de::DeserializeOwned;
 use serde_urlencoded::from_bytes;
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::io::{self, AsyncWriteExt};
+use tokio::sync::oneshot;
 use tokio_util::io::ReaderStream;
 use tower::Service;
 use tracing::{error, warn};
@@ -238,6 +243,32 @@ struct ReadFileQuery {
 #[derive(Debug, Default, serde::Deserialize)]
 struct WalkDirQuery {
     disk: String,
+    walk_dir_stream_completion: Option<String>,
+    walk_dir_body_sha256: Option<String>,
+}
+
+fn supports_walk_dir_stream_completion(query: &WalkDirQuery) -> bool {
+    query.walk_dir_stream_completion.as_deref() == Some(WALK_DIR_STREAM_COMPLETION_V1)
+}
+
+fn verify_walk_dir_body_digest(query: &WalkDirQuery, body: &[u8]) -> bool {
+    if !supports_walk_dir_stream_completion(query) {
+        return true;
+    }
+
+    let Some(expected) = query.walk_dir_body_sha256.as_deref() else {
+        return false;
+    };
+    let actual = hex_simd::encode_to_string(Sha256::digest(body), hex_simd::AsciiCase::Lower);
+    expected == actual
+}
+
+fn validate_walk_dir_completion_request(query: &WalkDirQuery, body: &[u8]) -> Option<bool> {
+    let propagate_completion_errors = supports_walk_dir_stream_completion(query);
+    if !verify_walk_dir_body_digest(query, body) {
+        return None;
+    }
+    Some(propagate_completion_errors)
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -450,7 +481,6 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         Ok(query) => query,
         Err(response) => return *response,
     };
-
     let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
         warn!(
             event = EVENT_RPC_REQUEST_REJECTED,
@@ -483,6 +513,26 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
                 Some(&e)
             );
             return response_with_status(StatusCode::PAYLOAD_TOO_LARGE, message);
+        }
+    };
+    // RUSTFS_COMPAT_TODO(#4648): old clients retry terminal stream failures on an already-used writer.
+    // Remove after every supported peer version advertises walk-dir stream completion v1.
+    let propagate_completion_errors = match validate_walk_dir_completion_request(&query, &body) {
+        Some(propagate_completion_errors) => propagate_completion_errors,
+        None => {
+            warn!(
+                event = EVENT_RPC_REQUEST_REJECTED,
+                component = LOG_COMPONENT_INTERNODE_RPC,
+                subsystem = LOG_SUBSYSTEM_DIRECTORY_WALK,
+                operation = INTERNODE_OPERATION_WALK_DIR,
+                result = "rejected",
+                status_code = StatusCode::FORBIDDEN.as_u16(),
+                rpc_path = WALK_DIR_PATH,
+                method = %Method::GET,
+                reason = "request_body_digest_mismatch",
+                "internode rpc request rejected"
+            );
+            return response_with_status(StatusCode::FORBIDDEN, "invalid request body digest");
         }
     };
 
@@ -518,9 +568,8 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
     let log_limit = args.limit;
     let log_disk_id = args.disk_id.clone();
     let log_skip_total_timeout = args.skip_total_timeout;
-    let (rd, mut wd) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
-    spawn_traced(async move {
-        if let Err(e) = disk.walk_dir(args, &mut wd).await {
+    let body = walk_dir_response_body(propagate_completion_errors, move |mut writer| async move {
+        disk.walk_dir(args, &mut writer).await.map_err(|e| {
             warn!(
                 event = EVENT_RPC_BACKGROUND_TASK_FAILED,
                 component = LOG_COMPONENT_INTERNODE_RPC,
@@ -540,13 +589,38 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
                 error = %e,
                 "internode rpc background task failed"
             );
-        }
+            io::Error::other("remote walk_dir failed")
+        })
     });
 
     runtime_sources::current_internode_metrics()
         .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(body)
+        .expect("failed to build walk dir response")
+}
+
+fn walk_dir_response_body<F, Fut>(propagate_completion_errors: bool, producer: F) -> Body
+where
+    F: FnOnce(tokio::io::DuplexStream) -> Fut + Send + 'static,
+    Fut: Future<Output = io::Result<()>> + Send + 'static,
+{
+    let (reader, writer) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
+    let (mut completion_tx, completion_rx) = oneshot::channel();
+    spawn_traced(async move {
+        tokio::select! {
+            biased;
+            result = producer(writer) => {
+                let _ = completion_tx.send(result);
+            }
+            _ = completion_tx.closed() => {}
+        }
+    });
+
     let metrics = runtime_sources::current_internode_metrics();
-    let stream = ReaderStream::with_capacity(rd, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
+    let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_WALK_DIR,
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
@@ -554,11 +628,32 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         );
         bytes
     });
+    let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from(StreamingBlob::wrap(stream)))
-        .expect("failed to build walk dir response")
+    Body::from(StreamingBlob::wrap(stream))
+}
+
+fn append_walk_dir_completion<S>(
+    stream: S,
+    completion_rx: oneshot::Receiver<io::Result<()>>,
+    propagate_completion_errors: bool,
+) -> impl Stream<Item = io::Result<Bytes>>
+where
+    S: Stream<Item = io::Result<Bytes>>,
+{
+    stream.chain(
+        stream::once(async move {
+            match completion_rx.await {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) if propagate_completion_errors => Some(Err(err)),
+                Err(err) if propagate_completion_errors => {
+                    Some(Err(io::Error::other(format!("remote walk_dir task ended without a result: {err}"))))
+                }
+                Ok(Err(_)) | Err(_) => None,
+            }
+        })
+        .filter_map(std::future::ready),
+    )
 }
 
 async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
@@ -734,19 +829,33 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 mod tests {
     use super::{
         LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER, LOG_SUBSYSTEM_ROUTING, PUT_FILE_STREAM_PATH, PutFileQuery,
-        READ_FILE_STREAM_PATH, WALK_DIR_PATH, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
-        put_body_size_mismatch, put_file_stage_error_message, read_file_body_stream, verify_internode_rpc_signature,
-        write_body_chunks_to_writer,
+        READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
+        internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, put_body_size_mismatch,
+        put_file_stage_error_message, read_file_body_stream, supports_walk_dir_stream_completion,
+        validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_walk_dir_body_digest,
+        walk_dir_response_body, write_body_chunks_to_writer,
     };
     use bytes::Bytes;
     use http::{HeaderMap, Method, StatusCode, Uri};
+    use http_body_util::BodyExt;
     use rustfs_io_metrics::internode_metrics::{
         INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
     };
+    use sha2::Digest as _;
     use tokio::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::StreamExt;
     use tokio_stream::iter;
+
+    struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropNotifier {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
 
     #[test]
     fn internode_rpc_path_matches_rpc_prefix() {
@@ -850,6 +959,130 @@ mod tests {
 
         assert_eq!(copied, 11);
         assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn walk_dir_body_surfaces_background_failure_after_data() {
+        let body = walk_dir_response_body(true, |mut writer| async move {
+            writer.write_all(b"partial walk data").await?;
+            Err(io::Error::other("remote walk_dir failed"))
+        });
+        let err = BodyExt::collect(body)
+            .await
+            .expect_err("failed completion must fail body collection");
+
+        assert!(err.to_string().contains("remote walk_dir failed"));
+    }
+
+    #[tokio::test]
+    async fn walk_dir_body_preserves_data_after_success() {
+        let body = walk_dir_response_body(true, |mut writer| async move {
+            writer.write_all(b"complete walk data").await?;
+            Ok(())
+        });
+        let bytes = BodyExt::collect(body)
+            .await
+            .expect("successful completion should preserve the body")
+            .to_bytes();
+
+        assert_eq!(bytes, Bytes::from_static(b"complete walk data"));
+    }
+
+    #[tokio::test]
+    async fn walk_dir_completion_stream_surfaces_cancelled_producer() {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        drop(completion_tx);
+        let stream = iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"partial walk data"))]);
+        let body = s3s::Body::from(s3s::dto::StreamingBlob::wrap(append_walk_dir_completion(stream, completion_rx, true)));
+
+        let err = BodyExt::collect(body)
+            .await
+            .expect_err("a cancelled producer must fail body collection");
+
+        assert!(err.to_string().contains("ended without a result"));
+    }
+
+    #[tokio::test]
+    async fn dropping_walk_dir_body_cancels_blocked_producer() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let body = walk_dir_response_body(true, move |_writer| async move {
+            let _drop_notifier = DropNotifier(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<io::Result<()>>().await
+        });
+
+        started_rx.await.expect("walk producer should start");
+        drop(body);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("dropping the response body should cancel the walk producer")
+            .expect("drop notifier should send a cancellation signal");
+    }
+
+    #[tokio::test]
+    async fn legacy_walk_dir_client_keeps_clean_eof_compatibility() {
+        let body = walk_dir_response_body(false, |mut writer| async move {
+            writer.write_all(b"legacy partial data").await?;
+            Err(io::Error::other("remote walk_dir failed"))
+        });
+
+        let bytes = BodyExt::collect(body)
+            .await
+            .expect("legacy clients must retain clean EOF until they advertise stream completion support")
+            .to_bytes();
+
+        assert_eq!(bytes, Bytes::from_static(b"legacy partial data"));
+    }
+
+    #[tokio::test]
+    async fn legacy_walk_dir_client_keeps_clean_eof_when_producer_is_cancelled() {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        drop(completion_tx);
+        let stream = iter([Ok::<Bytes, io::Error>(Bytes::from_static(b"legacy partial data"))]);
+        let body = s3s::Body::from(s3s::dto::StreamingBlob::wrap(append_walk_dir_completion(stream, completion_rx, false)));
+
+        let bytes = BodyExt::collect(body)
+            .await
+            .expect("legacy clients must retain clean EOF after producer cancellation")
+            .to_bytes();
+
+        assert_eq!(bytes, Bytes::from_static(b"legacy partial data"));
+    }
+
+    #[test]
+    fn walk_dir_completion_requires_the_exact_signed_query_capability() {
+        let legacy: WalkDirQuery = serde_urlencoded::from_str("disk=disk-a").expect("legacy query should parse");
+        let unknown: WalkDirQuery =
+            serde_urlencoded::from_str("disk=disk-a&walk_dir_stream_completion=error-v2").expect("unknown query should parse");
+        let capable: WalkDirQuery =
+            serde_urlencoded::from_str("disk=disk-a&walk_dir_stream_completion=error-v1").expect("capable query should parse");
+
+        assert!(!supports_walk_dir_stream_completion(&legacy));
+        assert!(!supports_walk_dir_stream_completion(&unknown));
+        assert!(supports_walk_dir_stream_completion(&capable));
+    }
+
+    #[test]
+    fn walk_dir_completion_requires_matching_signed_body_digest() {
+        let body = br#"{"bucket":"bucket-a"}"#;
+        let digest = hex_simd::encode_to_string(sha2::Sha256::digest(body), hex_simd::AsciiCase::Lower);
+        let capable: WalkDirQuery = serde_urlencoded::from_str(&format!(
+            "disk=disk-a&walk_dir_stream_completion=error-v1&{WALK_DIR_BODY_SHA256_QUERY}={digest}"
+        ))
+        .expect("capable query should parse");
+        let missing: WalkDirQuery =
+            serde_urlencoded::from_str("disk=disk-a&walk_dir_stream_completion=error-v1").expect("query should parse");
+        let legacy: WalkDirQuery = serde_urlencoded::from_str("disk=disk-a").expect("legacy query should parse");
+
+        assert!(verify_walk_dir_body_digest(&capable, body));
+        assert!(!verify_walk_dir_body_digest(&capable, b"tampered"));
+        assert!(!verify_walk_dir_body_digest(&missing, body));
+        assert!(verify_walk_dir_body_digest(&legacy, b"legacy body"));
+        assert_eq!(validate_walk_dir_completion_request(&capable, body), Some(true));
+        assert_eq!(validate_walk_dir_completion_request(&legacy, b"legacy body"), Some(false));
+        assert_eq!(validate_walk_dir_completion_request(&capable, b"tampered"), None);
     }
 
     #[tokio::test]
