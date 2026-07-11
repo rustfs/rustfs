@@ -442,14 +442,46 @@ enum LocalReadCopyMethod {
     DirectReadCopy,
 }
 
-/// Check if O_DIRECT reads are enabled.
-fn is_direct_io_read_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE)
+/// Snapshot an env-sourced read-path switch once, then serve it from memory.
+///
+/// The value comes from the process environment, which is fixed at launch, so a
+/// per-read `std::env::var` (a global lock plus a `String` allocation, and for
+/// bools a `to_ascii_lowercase`) is pure hot-path tax at the IOPS these reads run
+/// at. In production the closure runs once via `LazyLock`; under `cfg(test)` it
+/// runs every call so `temp_env` overrides stay observable and tests keep their
+/// isolation. Invalid-value fallback (backlog#1130) lives in the closure, so it
+/// is identical on both paths.
+macro_rules! cached_read_env {
+    ($(#[$meta:meta])* fn $name:ident() -> $ty:ty = $read:expr;) => {
+        $(#[$meta])*
+        #[inline]
+        fn $name() -> $ty {
+            fn read_env() -> $ty {
+                $read
+            }
+            #[cfg(test)]
+            {
+                read_env()
+            }
+            #[cfg(not(test))]
+            {
+                static VALUE: std::sync::LazyLock<$ty> = std::sync::LazyLock::new(read_env as fn() -> $ty);
+                *VALUE
+            }
+        }
+    };
 }
 
-/// Check if O_DIRECT shard/part data writes are enabled.
-fn is_direct_io_write_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE)
+cached_read_env! {
+    /// Check if O_DIRECT reads are enabled.
+    fn is_direct_io_read_enabled() -> bool =
+        rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE);
+}
+
+cached_read_env! {
+    /// Check if O_DIRECT shard/part data writes are enabled.
+    fn is_direct_io_write_enabled() -> bool =
+        rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE);
 }
 
 /// Enable the runtime-probed io_uring read backend (backlog#1104). Default:
@@ -801,21 +833,30 @@ pub(crate) fn effective_durability(volume: &str) -> DurabilityMode {
     bucket_durability::lookup(volume).unwrap_or(global)
 }
 
-/// Get the O_DIRECT read threshold size.
-fn get_direct_io_read_threshold() -> usize {
-    rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD)
+cached_read_env! {
+    /// Get the O_DIRECT read threshold size.
+    fn get_direct_io_read_threshold() -> usize =
+        rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD);
+}
+
+cached_read_env! {
+    /// Whether mmap reads should fault the mapping in with `MAP_POPULATE`.
+    fn mmap_populate_enabled() -> bool =
+        rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE);
 }
 
 fn should_populate_mmap_read(length: usize) -> bool {
-    length > 0 && rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE)
+    length > 0 && mmap_populate_enabled()
 }
 
-fn local_read_copy_method() -> LocalReadCopyMethod {
-    let method = rustfs_utils::get_env_str(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY);
-    match method.as_str() {
-        RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY => LocalReadCopyMethod::DirectReadCopy,
-        _ => LocalReadCopyMethod::MmapCopy,
-    }
+cached_read_env! {
+    fn local_read_copy_method() -> LocalReadCopyMethod = {
+        let method = rustfs_utils::get_env_str(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY);
+        match method.as_str() {
+            RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY => LocalReadCopyMethod::DirectReadCopy,
+            _ => LocalReadCopyMethod::MmapCopy,
+        }
+    };
 }
 
 /// Runtime state for the true O_DIRECT read path (Linux only).
@@ -1663,15 +1704,16 @@ fn record_file_cache_reclaim_error(kind: &'static str) {
     counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "err".to_string()).increment(1);
 }
 
-fn bitrot_size_mismatch_retry_count() -> usize {
-    rustfs_utils::get_env_u64(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT) as usize
+cached_read_env! {
+    fn bitrot_size_mismatch_retry_count() -> usize =
+        rustfs_utils::get_env_u64(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT) as usize;
 }
 
-fn bitrot_size_mismatch_retry_delay() -> Duration {
-    Duration::from_millis(rustfs_utils::get_env_u64(
+cached_read_env! {
+    fn bitrot_size_mismatch_retry_delay() -> Duration = Duration::from_millis(rustfs_utils::get_env_u64(
         ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
         DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
-    ))
+    ));
 }
 
 fn is_bitrot_size_mismatch_error(err: &std::io::Error) -> bool {
@@ -1898,23 +1940,38 @@ impl AsyncWrite for FileCacheReclaimWriter {
     }
 }
 
+cached_read_env! {
+    fn file_cache_reclaim_write_enabled() -> bool = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+    );
+}
+
 fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
     if file_size <= 0 {
         return false;
     }
 
-    if !rustfs_utils::get_env_bool(
-        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
-        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
-    ) {
+    if !file_cache_reclaim_write_enabled() {
         return false;
     }
 
-    let threshold = rustfs_utils::get_env_usize(
+    // Same threshold as the read-side reclaim (backlog#1182): reuse its snapshot.
+    file_size as usize >= file_cache_reclaim_threshold()
+}
+
+cached_read_env! {
+    fn file_cache_reclaim_read_enabled() -> bool = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+    );
+}
+
+cached_read_env! {
+    fn file_cache_reclaim_threshold() -> usize = rustfs_utils::get_env_usize(
         rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
         rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
     );
-    file_size as usize >= threshold
 }
 
 fn should_reclaim_file_cache_after_read(length: usize) -> bool {
@@ -1922,18 +1979,11 @@ fn should_reclaim_file_cache_after_read(length: usize) -> bool {
         return false;
     }
 
-    if !rustfs_utils::get_env_bool(
-        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
-        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
-    ) {
+    if !file_cache_reclaim_read_enabled() {
         return false;
     }
 
-    let threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
-    );
-    length >= threshold
+    length >= file_cache_reclaim_threshold()
 }
 
 /// Write-open semantics for [`LocalIoBackend::open_write`].
