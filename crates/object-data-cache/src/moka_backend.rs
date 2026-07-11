@@ -875,4 +875,125 @@ mod tests {
         }
         assert!(!cached, "a cancelled fill must not leave an orphaned body after a racing invalidation");
     }
+
+    // ---- Concurrency stress (backlog#1107 production-readiness follow-up) ----
+    //
+    // The deterministic race tests above pin specific interleavings with an
+    // injected barrier. These drive sustained, real-parallelism contention on a
+    // small key space to catch leaks and state corruption the pinned tests
+    // cannot: a leaked singleflight leader, a stranded semaphore permit, an
+    // index/cache divergence that only shows up under volume.
+
+    /// Hammer fill / lookup / invalidate concurrently on a few hot identities,
+    /// then assert the shared machinery is neither leaked nor corrupted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn moka_backend_concurrency_storm_leaves_no_leaked_state() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        // Long TTL so entries survive the storm — we want fill-vs-invalidate
+        // races, not just expiry churn.
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = Arc::new(MokaBackend::new(&config, Arc::clone(&stats)).expect("moka backend should build"));
+
+        const TASKS: usize = 48;
+        const ITERS: usize = 400;
+        const KEYS: usize = 6; // small pool → heavy contention on shared identities
+
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let backend = Arc::clone(&backend);
+            handles.push(tokio::spawn(async move {
+                for i in 0..ITERS {
+                    let k = (t + i) % KEYS;
+                    let object = format!("object-{}", k % 3);
+                    let plan = versioned_plan(&object, &format!("v{k}"), &format!("etag-{k}"));
+                    // Deterministic per-(task,iter) mix: mostly fills, plus
+                    // lookups and invalidations racing against them.
+                    match (t + i) % 4 {
+                        0 | 1 => {
+                            let _ = backend.fill_body(&plan, Bytes::from_static(b"hello")).await;
+                        }
+                        2 => {
+                            let _ = backend.lookup_body(&plan).await;
+                        }
+                        _ => {
+                            let identity = ObjectDataCacheIdentity::new("bucket", object.as_str());
+                            let _ = backend.invalidate_object(&identity).await;
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("stress task must not panic or deadlock");
+        }
+
+        // Every fill_body call returned, so no singleflight leader may still be
+        // registered: a non-zero count means a fill leaked its in-flight slot.
+        assert_eq!(
+            stats.snapshot().inflight_fills,
+            0,
+            "the concurrency storm leaked an in-flight fill (singleflight/semaphore not released)"
+        );
+
+        // The shared state is not corrupted: a fresh, uncontended sequence must
+        // still fill, hit, and invalidate correctly.
+        let clean = versioned_plan("fresh-object", "v1", "fresh-etag");
+        assert_eq!(
+            backend.fill_body(&clean, Bytes::from_static(b"hello")).await,
+            ObjectDataCacheFillResult::Inserted,
+            "a clean fill after the storm must still insert"
+        );
+        assert!(matches!(backend.lookup_body(&clean).await, ObjectDataCacheLookup::Hit(_)));
+        let _ = backend
+            .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "fresh-object"))
+            .await;
+        assert!(
+            matches!(backend.lookup_body(&clean).await, ObjectDataCacheLookup::Miss),
+            "invalidation must still win after a concurrency storm"
+        );
+
+        // clear() plus a moka drain empties both the cache and the identity index.
+        let _ = backend.clear().await;
+        backend.cache.run_pending_tasks().await;
+        assert_eq!(backend.entry_count(), 0, "clear() must drop every entry");
+    }
+
+    /// A memory-constrained container (low snapshot) must reject an entire
+    /// concurrent fill burst — admission is bounded, not a check-then-act race
+    /// that lets the burst through. This is the CI-runnable proxy for the
+    /// OOM-under-burst concern; it does not cover the separate 5s-stale-snapshot
+    /// overshoot, which needs byte-based reservation in the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn moka_backend_gate_bounds_admission_under_concurrent_burst() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let backend = Arc::new(MokaBackend::new(&memory_gated_config(), Arc::clone(&stats)).expect("moka backend should build"));
+        // Simulate a pod whose available memory is far below the free floor.
+        backend
+            .memory_gate
+            .set_test_snapshot(Some(crate::memory::ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000,
+                available_bytes: 50,
+            }));
+
+        const TASKS: usize = 32;
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let backend = Arc::clone(&backend);
+            handles.push(tokio::spawn(async move {
+                let plan = versioned_plan(&format!("object-{t}"), "v1", &format!("etag-{t}"));
+                backend.fill_body(&plan, Bytes::from_static(b"hello")).await
+            }));
+        }
+        let mut rejected = 0;
+        for handle in handles {
+            if handle.await.expect("burst task should complete") == ObjectDataCacheFillResult::SkippedMemoryPressure {
+                rejected += 1;
+            }
+        }
+
+        assert_eq!(rejected, TASKS, "the gate must reject every fill in the burst when memory is constrained");
+        assert_eq!(backend.entry_count(), 0, "no body may be admitted under memory pressure");
+    }
 }
