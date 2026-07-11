@@ -117,6 +117,14 @@ impl ObjectDataCacheMemorySnapshot {
 struct MemorySnapshotCell {
     total_bytes: AtomicU64,
     available_bytes: AtomicU64,
+    /// Bytes admitted by the gate since the last snapshot refresh. The snapshot
+    /// is sampled at most every 5 s, so a burst that begins while it still reads
+    /// high could all pass a plain check-then-act gate and over-allocate before
+    /// the next refresh. Subtracting this running total from `available_bytes`
+    /// shrinks the effective budget as the burst proceeds, bounding cumulative
+    /// admission to the real headroom; the refresh resets it because the fresh
+    /// reading already reflects those allocations (backlog#1107).
+    admitted_since_refresh: AtomicU64,
 }
 
 impl MemorySnapshotCell {
@@ -124,12 +132,16 @@ impl MemorySnapshotCell {
         Self {
             total_bytes: AtomicU64::new(snapshot.total_bytes),
             available_bytes: AtomicU64::new(snapshot.available_bytes),
+            admitted_since_refresh: AtomicU64::new(0),
         }
     }
 
+    /// Stores a fresh snapshot and resets the admitted-bytes counter: the new
+    /// reading already accounts for whatever was admitted since the last one.
     fn store(&self, snapshot: ObjectDataCacheMemorySnapshot) {
         self.total_bytes.store(snapshot.total_bytes, Ordering::Relaxed);
         self.available_bytes.store(snapshot.available_bytes, Ordering::Relaxed);
+        self.admitted_since_refresh.store(0, Ordering::Relaxed);
     }
 
     fn load(&self) -> ObjectDataCacheMemorySnapshot {
@@ -137,6 +149,14 @@ impl MemorySnapshotCell {
             total_bytes: self.total_bytes.load(Ordering::Relaxed),
             available_bytes: self.available_bytes.load(Ordering::Relaxed),
         }
+    }
+
+    fn admitted(&self) -> u64 {
+        self.admitted_since_refresh.load(Ordering::Relaxed)
+    }
+
+    fn reserve(&self, bytes: u64) {
+        self.admitted_since_refresh.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -255,12 +275,23 @@ impl ObjectDataCacheMemoryGate {
             return true;
         }
 
+        // Effective budget is the snapshot's available memory minus what the
+        // gate has already admitted since that snapshot was taken. This bounds a
+        // burst that arrives faster than the 5 s refresh: each admission shrinks
+        // the budget the next one sees, so cumulative admission cannot exceed the
+        // real headroom even though every fill reads the same (stale) snapshot.
+        let effective_available = snapshot.available_bytes.saturating_sub(self.snapshot.admitted());
+
         let min_free = u64::from(self.min_free_memory_percent);
-        let has_percent_budget = snapshot.available_bytes.saturating_mul(100) >= snapshot.total_bytes.saturating_mul(min_free);
-        let has_entry_budget = snapshot.available_bytes >= required_bytes;
+        let has_percent_budget = effective_available.saturating_mul(100) >= snapshot.total_bytes.saturating_mul(min_free);
+        let has_entry_budget = effective_available >= required_bytes;
         let allowed = has_percent_budget && has_entry_budget;
 
-        if !allowed {
+        if allowed {
+            // Reserve the admitted bytes so a concurrent fill sees a smaller
+            // budget; the reservation clears on the next snapshot refresh.
+            self.snapshot.reserve(required_bytes);
+        } else {
             record_memory_pressure(&self.stats, "moka");
         }
 
