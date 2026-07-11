@@ -2811,7 +2811,12 @@ impl FdCache {
 pub(crate) struct UringBackend {
     root: PathBuf,
     inner: StdBackend,
-    driver: Arc<rustfs_uring::UringDriver>,
+    /// Wrapped in `ManuallyDrop` so `Drop` can move the (last) `Arc` onto a
+    /// blocking thread: `UringDriver`'s own `Drop` joins its driver threads and
+    /// can block up to the bounded-drain timeout on a hung disk, which must never
+    /// run on a tokio worker during disk reconnect/shutdown (backlog#1170).
+    /// `ManuallyDrop` derefs transparently, so read call sites are unchanged.
+    driver: std::mem::ManuallyDrop<Arc<rustfs_uring::UringDriver>>,
     /// Runtime degradation latch (backlog#1101). Starts `true`; once a read
     /// returns a restriction-class errno (io_uring became unusable on this
     /// disk), it is set `false` and all further reads go straight to
@@ -2888,6 +2893,28 @@ impl std::fmt::Debug for UringBackend {
 }
 
 #[cfg(target_os = "linux")]
+impl Drop for UringBackend {
+    fn drop(&mut self) {
+        // Take the driver Arc out and, if we are on a tokio runtime, drop it on a
+        // blocking thread. `UringDriver::Drop` sends Shutdown and joins each
+        // driver thread; on a hung disk that join can block up to the bounded
+        // drain timeout, which must not stall a runtime worker during disk
+        // reconnect/shutdown (backlog#1170). Off-runtime (tests, plain threads) a
+        // synchronous join is fine.
+        // SAFETY: `ManuallyDrop::take` runs exactly once, here in `Drop`, and the
+        // field is never used again.
+        #[allow(unsafe_code)]
+        let driver = unsafe { std::mem::ManuallyDrop::take(&mut self.driver) };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || drop(driver));
+            }
+            Err(_) => drop(driver),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl UringBackend {
     /// Probe io_uring on `root`; `Some(backend)` if usable, `None` to fall back
     /// to `StdBackend`. A restricted-environment errno degrades quietly; an
@@ -2915,7 +2942,7 @@ impl UringBackend {
                 Some(Self {
                     inner: StdBackend::new(root.clone()),
                     root,
-                    driver: Arc::new(driver),
+                    driver: std::mem::ManuallyDrop::new(Arc::new(driver)),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
