@@ -71,6 +71,7 @@ use crate::app::runtime_sources::{
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
+use crate::storage::storage_api::lock_bucket_targets_metadata;
 use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
@@ -1455,6 +1456,7 @@ impl DefaultBucketUsecase {
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
+        let targets_guard = lock_bucket_targets_metadata(&bucket).await;
         let replication_config = match metadata_sys::get_replication_config(&bucket).await {
             Ok((config, _)) => Some(config),
             Err(StorageError::ConfigNotFound) => None,
@@ -1477,6 +1479,7 @@ impl DefaultBucketUsecase {
             }
             return Err(err);
         }
+        drop(targets_guard);
 
         notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context);
 
@@ -2296,11 +2299,13 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let targets_guard = lock_bucket_targets_metadata(&bucket).await;
         validate_bucket_replication_update(&bucket, &replication_configuration).await?;
         let data = serialize_config(&replication_configuration)?;
         metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+        drop(targets_guard);
 
         notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context);
 

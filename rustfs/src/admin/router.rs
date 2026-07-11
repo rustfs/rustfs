@@ -40,6 +40,7 @@ use crate::license::license_check;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
 };
+use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -2136,6 +2137,7 @@ async fn target_client_object_lock_enabled(bucket: &str, target: &BucketTarget) 
 }
 
 async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartRequest) -> S3Result<ReplicationResetTarget> {
+    let targets_guard = lock_bucket_targets_metadata(bucket).await;
     let (config, _) = metadata_sys::get_replication_config(bucket).await.map_err(ApiError::from)?;
     let resolved_arn = resolve_replication_reset_target_arn(&config, &reset.arn)?;
     let mut resolved_reset = reset.clone();
@@ -2149,6 +2151,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
         .await
         .map_err(ApiError::from)?;
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
+    drop(targets_guard);
 
     let Some(pool) = current_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));

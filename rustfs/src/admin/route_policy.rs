@@ -600,6 +600,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/peer/edit-capabilities",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
         "/rustfs/admin/v3/site-replication/peer/edit",
         SITE_REPLICATION_ADD,
         RouteRiskLevel::High,

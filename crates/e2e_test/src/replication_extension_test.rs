@@ -405,6 +405,14 @@ async fn delete_bucket_replication(
     signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await
 }
 
+async fn get_bucket_replication(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/{bucket}?replication", env.url);
+    signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await
+}
+
 async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = env.create_s3_client();
     client
@@ -1313,6 +1321,29 @@ async fn wait_for_site_replication_disabled(
     env: &RustFSTestEnvironment,
 ) -> Result<SiteReplicationInfo, Box<dyn Error + Send + Sync>> {
     wait_for_site_replication_info(env, |info| !info.enabled && info.sites.is_empty()).await
+}
+
+async fn assert_site_replication_bucket_detached(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let targets_response = list_replication_targets_request(env, Some(bucket)).await?;
+    if targets_response.status() != StatusCode::OK {
+        return Err(format!("list remote targets failed after site removal: {}", targets_response.status()).into());
+    }
+    let targets: Vec<serde_json::Value> = targets_response.json().await?;
+    if !targets.is_empty() {
+        return Err(format!("site removal left remote targets for {bucket}: {targets:?}").into());
+    }
+
+    let replication_response = get_bucket_replication(env, bucket).await?;
+    if replication_response.status() != StatusCode::NOT_FOUND {
+        let status = replication_response.status();
+        let body = replication_response.text().await.unwrap_or_default();
+        return Err(format!("site removal left replication config for {bucket}: {status} {body}").into());
+    }
+
+    Ok(())
 }
 
 async fn wait_for_site_replication_info<F>(
@@ -2632,10 +2663,10 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
 
-    // Site replication rejects initialization unless all but one site is empty, so only
-    // the source is seeded before joining; the target bucket is created afterwards.
-    source_client.create_bucket().bucket(source_bucket).send().await?;
-    enable_bucket_versioning(&source_env, source_bucket).await?;
+    // Seed only the joining site so its synchronous backfill must call the initiating
+    // site before the add handler has persisted its final enabled state.
+    target_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&target_env, source_bucket).await?;
 
     let add_status = site_replication_add(
         &source_env,
@@ -2665,11 +2696,9 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         .find(|peer| peer.endpoint == target_env.url)
         .ok_or("target peer missing from source site replication info")?;
 
-    // Wait for the joined target site to converge: site replication propagates the
-    // source bucket to the target and auto-configures its replication target. Drive the
-    // resync against that auto-created target instead of a redundant manual one (which
-    // now collides — "Remote target already exists").
-    wait_for_bucket_on_target(&target_client, source_bucket).await?;
+    // Wait for the initiating site to accept the join callback and configure the
+    // backfilled bucket before driving resync in the normal source-to-target direction.
+    wait_for_bucket_on_target(&source_client, source_bucket).await?;
     let target_arn = wait_for_remote_target_arn(&source_env, source_bucket).await?;
 
     for idx in 0..32 {
@@ -2739,7 +2768,7 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
 
 #[tokio::test]
 #[serial]
-async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
@@ -2748,7 +2777,25 @@ async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Re
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let mut relay_env = RustFSTestEnvironment::new().await?;
+    relay_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let relay_client = relay_env.create_s3_client();
+    let bucket = "site-repl-edit-endpoint";
+    let baseline_key = "before-edit.txt";
+    let baseline_payload = b"site replication before endpoint edit".to_vec();
+    let moved_key = "after-edit.txt";
+    let moved_payload = b"site replication after endpoint edit".to_vec();
+    let relayed_key = "after-edit-from-relay.txt";
+    let relayed_payload = b"site replication after endpoint edit from relay".to_vec();
 
     let add_status = site_replication_add(
         &source_env,
@@ -2765,57 +2812,132 @@ async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Re
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
             },
+            PeerSite {
+                name: "relay-site".to_string(),
+                endpoint: relay_env.url.clone(),
+                access_key: relay_env.access_key.clone(),
+                secret_key: relay_env.secret_key.clone(),
+            },
         ],
     )
     .await?;
     assert!(add_status.success, "unexpected site add result: {:?}", add_status);
 
-    let source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
-    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+    let source_info = wait_for_site_replication_enabled(&source_env, 3).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 3).await?;
+    let _relay_info = wait_for_site_replication_enabled(&relay_env, 3).await?;
     let mut remote_peer = source_info
         .sites
         .into_iter()
         .find(|peer| peer.endpoint == target_env.url)
         .ok_or("target peer missing from source site replication info")?;
 
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    wait_for_bucket_on_target(&relay_client, bucket).await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(baseline_key)
+        .body(ByteStream::from(baseline_payload.clone()))
+        .send()
+        .await?;
+    let replicated_baseline = wait_for_object_on_target(&target_client, bucket, baseline_key).await?;
+    assert_eq!(replicated_baseline, baseline_payload);
+
+    let old_target_address = target_env.address.clone();
+    let new_target_port = RustFSTestEnvironment::find_available_port().await?;
+    let new_target_address = format!("127.0.0.1:{new_target_port}");
+    let new_target_url = format!("http://{new_target_address}");
     remote_peer.sync_state = SyncStatus::Enable;
+    remote_peer.endpoint = new_target_url.clone();
     let edit_status = site_replication_edit(&source_env, "", &remote_peer).await?;
     assert!(edit_status.success, "unexpected site edit result: {:?}", edit_status);
 
     let source_after_sync = wait_for_site_replication_info(&source_env, |info| {
         info.sites
             .iter()
-            .any(|peer| peer.endpoint == target_env.url && peer.sync_state == SyncStatus::Enable)
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
     })
     .await?;
     let target_after_sync = wait_for_site_replication_info(&target_env, |info| {
         info.sites
             .iter()
-            .any(|peer| peer.endpoint == target_env.url && peer.sync_state == SyncStatus::Enable)
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
+    })
+    .await?;
+    let relay_after_sync = wait_for_site_replication_info(&relay_env, |info| {
+        info.sites
+            .iter()
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
     })
     .await?;
     assert!(
         source_after_sync
             .sites
             .iter()
-            .any(|peer| peer.endpoint == target_env.url && peer.sync_state == SyncStatus::Enable)
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
     );
     assert!(
         target_after_sync
             .sites
             .iter()
-            .any(|peer| peer.endpoint == target_env.url && peer.sync_state == SyncStatus::Enable)
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
     );
+    assert!(
+        relay_after_sync
+            .sites
+            .iter()
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
+    );
+    assert_eq!(relay_after_sync.sites.len(), 3);
+
+    for (env, unchanged_endpoint) in [(&source_env, &relay_env.address), (&relay_env, &source_env.address)] {
+        let mut endpoints_replaced = false;
+        let mut last_targets = Vec::new();
+        for _ in 0..40 {
+            let response = list_replication_targets_request(env, Some(bucket)).await?;
+            if response.status() == StatusCode::OK {
+                let targets: Vec<serde_json::Value> = response.json().await?;
+                let mut endpoints = targets
+                    .iter()
+                    .filter_map(|target| target.get("endpoint").and_then(|endpoint| endpoint.as_str()))
+                    .collect::<Vec<_>>();
+                endpoints.sort_unstable();
+                let mut expected = vec![new_target_address.as_str(), unchanged_endpoint.as_str()];
+                expected.sort_unstable();
+                endpoints_replaced = endpoints == expected;
+                last_targets = targets;
+                if endpoints_replaced {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            endpoints_replaced,
+            "site edit did not replace the bucket target endpoint on {}: {last_targets:?}",
+            env.address
+        );
+    }
+
+    target_env.stop_server();
+    let old_endpoint_listener = tokio::net::TcpListener::bind(&old_target_address).await?;
+    target_env.address = new_target_address;
+    target_env.url = new_target_url.clone();
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    let moved_target_client = target_env.create_s3_client();
 
     let ilm_edit_status = site_replication_edit(&source_env, "enableILMExpiryReplication=true", &PeerInfo::default()).await?;
     assert!(ilm_edit_status.success, "unexpected ilm edit result: {:?}", ilm_edit_status);
 
     let source_after_ilm = wait_for_site_replication_info(&source_env, |info| {
-        info.sites.len() == 2 && info.sites.iter().all(|peer| peer.replicate_ilm_expiry)
+        info.sites.len() == 3 && info.sites.iter().all(|peer| peer.replicate_ilm_expiry)
     })
     .await?;
     let target_after_ilm = wait_for_site_replication_info(&target_env, |info| {
-        info.sites.len() == 2 && info.sites.iter().all(|peer| peer.replicate_ilm_expiry)
+        info.sites.len() == 3 && info.sites.iter().all(|peer| peer.replicate_ilm_expiry)
     })
     .await?;
     assert!(source_after_ilm.sites.iter().all(|peer| peer.replicate_ilm_expiry));
@@ -2823,26 +2945,26 @@ async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Re
 
     let status_query = "peer-state=true";
     let source_status = wait_for_site_replication_status(&source_env, status_query, |status| {
-        status.peer_states.len() == 2
+        status.peer_states.len() == 3
             && status
                 .peer_states
                 .values()
-                .all(|state| state.peers.len() == 2 && state.peers.values().all(|peer| peer.replicate_ilm_expiry))
+                .all(|state| state.peers.len() == 3 && state.peers.values().all(|peer| peer.replicate_ilm_expiry))
     })
     .await?;
     let target_status = wait_for_site_replication_status(&target_env, status_query, |status| {
-        status.peer_states.len() == 2
+        status.peer_states.len() == 3
             && status
                 .peer_states
                 .values()
-                .all(|state| state.peers.len() == 2 && state.peers.values().all(|peer| peer.replicate_ilm_expiry))
+                .all(|state| state.peers.len() == 3 && state.peers.values().all(|peer| peer.replicate_ilm_expiry))
     })
     .await?;
 
-    assert_eq!(source_status.peer_states.len(), 2);
-    assert_eq!(target_status.peer_states.len(), 2);
-    assert!(source_status.peer_states.values().all(|state| state.peers.len() == 2));
-    assert!(target_status.peer_states.values().all(|state| state.peers.len() == 2));
+    assert_eq!(source_status.peer_states.len(), 3);
+    assert_eq!(target_status.peer_states.len(), 3);
+    assert!(source_status.peer_states.values().all(|state| state.peers.len() == 3));
+    assert!(target_status.peer_states.values().all(|state| state.peers.len() == 3));
     assert!(
         source_status
             .peer_states
@@ -2855,6 +2977,35 @@ async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Re
             .values()
             .all(|state| state.peers.values().all(|peer| peer.replicate_ilm_expiry))
     );
+
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(moved_key)
+        .body(ByteStream::from(moved_payload.clone()))
+        .send()
+        .await?;
+    relay_client
+        .put_object()
+        .bucket(bucket)
+        .key(relayed_key)
+        .body(ByteStream::from(relayed_payload.clone()))
+        .send()
+        .await?;
+    let no_old_endpoint_connection = async {
+        match tokio::time::timeout(Duration::from_secs(3), old_endpoint_listener.accept()).await {
+            Err(_) => Ok::<(), Box<dyn Error + Send + Sync>>(()),
+            Ok(Ok((_, peer_address))) => Err(format!("source contacted the old site endpoint from {peer_address}").into()),
+            Ok(Err(err)) => Err(err.into()),
+        }
+    };
+    let (replicated_after_edit, replicated_from_relay, ()) = tokio::try_join!(
+        wait_for_object_on_target(&moved_target_client, bucket, moved_key),
+        wait_for_object_on_target(&moved_target_client, bucket, relayed_key),
+        no_old_endpoint_connection,
+    )?;
+    assert_eq!(replicated_after_edit, moved_payload);
+    assert_eq!(replicated_from_relay, relayed_payload);
 
     Ok(())
 }
@@ -2871,6 +3022,14 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let bucket = "site-repl-remove-all";
+    let baseline_key = "before-remove.txt";
+    let baseline_payload = b"site replication before remove all".to_vec();
+    let post_remove_key = "after-remove.txt";
+    let racing_bucket = "site-repl-remove-racing-create";
 
     let add_status = site_replication_add(
         &source_env,
@@ -2895,14 +3054,28 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
     let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
 
-    let remove_status = site_replication_remove(
-        &source_env,
-        &SRRemoveReq {
-            remove_all: true,
-            ..Default::default()
-        },
-    )
-    .await?;
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(baseline_key)
+        .body(ByteStream::from(baseline_payload.clone()))
+        .send()
+        .await?;
+    let replicated_baseline = wait_for_object_on_target(&target_client, bucket, baseline_key).await?;
+    assert_eq!(replicated_baseline, baseline_payload);
+
+    let create_racing_bucket = source_client.create_bucket().bucket(racing_bucket).send();
+    let remove_req = SRRemoveReq {
+        remove_all: true,
+        ..Default::default()
+    };
+    let remove_all = site_replication_remove(&source_env, &remove_req);
+    let (create_result, remove_status) = tokio::join!(create_racing_bucket, remove_all);
+    create_result?;
+    let remove_status = remove_status?;
     assert!(
         !remove_status.status.is_empty() && remove_status.err_detail.is_empty(),
         "unexpected site remove result: {:?}",
@@ -2916,6 +3089,39 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     assert!(source_after_remove.sites.is_empty());
     assert!(!target_after_remove.enabled);
     assert!(target_after_remove.sites.is_empty());
+
+    source_client.head_bucket().bucket(bucket).send().await?;
+    source_client.head_bucket().bucket(racing_bucket).send().await?;
+    target_client.head_bucket().bucket(bucket).send().await?;
+    assert_site_replication_bucket_detached(&source_env, bucket).await?;
+    assert_site_replication_bucket_detached(&source_env, racing_bucket).await?;
+    match target_client.head_bucket().bucket(racing_bucket).send().await {
+        Ok(_) => assert_site_replication_bucket_detached(&target_env, racing_bucket).await?,
+        Err(err) if matches!(err.code(), Some("NoSuchBucket" | "NotFound")) => {}
+        Err(err) => return Err(err.into()),
+    }
+    assert_site_replication_bucket_detached(&target_env, bucket).await?;
+
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(post_remove_key)
+        .body(ByteStream::from_static(b"site replication must stay stopped"))
+        .send()
+        .await?;
+    let absence_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match target_client.get_object().bucket(bucket).key(post_remove_key).send().await {
+            Ok(_) => return Err("object reached the removed site replication target".into()),
+            Err(err) if matches!(err.code(), Some("NoSuchKey" | "NotFound" | "NoSuchVersion")) => {
+                if tokio::time::Instant::now() >= absence_deadline {
+                    break;
+                }
+                sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 
     Ok(())
 }
@@ -3068,7 +3274,12 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
 
     source_client.create_bucket().bucket(bucket).send().await?;
-    enable_bucket_versioning(&source_env, bucket).await?;
+    let versioning = source_client.get_bucket_versioning().bucket(bucket).send().await?;
+    assert_eq!(
+        versioning.status(),
+        Some(&BucketVersioningStatus::Enabled),
+        "site replication did not enable source bucket versioning"
+    );
     let replication_response = signed_request(
         http::Method::GET,
         &format!("{}/{bucket}?replication", source_env.url),
