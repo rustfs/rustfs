@@ -31,10 +31,26 @@
 [test-groups]
 ecstore-serial-flaky = { max-threads = 1 }
 
+# Reliability / fault-injection e2e tests each spawn a single-node 4-disk RustFS
+# server and manipulate its disk directories at runtime (crates/e2e_test:
+# reliability_disk_fault_test, degraded_read_eof_regression_test / dist-13). They
+# are correct in isolation but resource-heavy; serialize them under nextest's
+# process boundary (serial_test's #[serial] does not cross it) so several 4-disk
+# servers never run at once. ci-7's nightly picks these up via the e2e suite;
+# they are deliberately NOT in the fast PR `e2e-smoke` filter.
+e2e-reliability = { max-threads = 1 }
+
 # --- default profile (local): serialize the flaky groups, never retry --------
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
+
+# Serialize the 4-disk reliability / degraded-read e2e tests (see the
+# e2e-reliability test-group note above). The matching ci-profile override is at
+# the end of the file, after [profile.ci] is declared.
+[[profile.default.overrides]]
+filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
+test-group = 'e2e-reliability'
 
 # ---------------------------------------------------------------------------
 # ci profile — the strict CI gate (ci.yml `cargo nextest run --profile ci`)
@@ -84,6 +100,14 @@ retries = 2
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
 retries = 2
+
+# Serialize the 4-disk reliability / degraded-read e2e tests under the ci
+# profile too (see the e2e-reliability test-group note near the top). Not a
+# quarantine: no retries, just single-threaded so several 4-disk servers never
+# run concurrently when ci-7's nightly runs the full e2e suite.
+[[profile.ci.overrides]]
+filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
+test-group = 'e2e-reliability'
 
 # ---------------------------------------------------------------------------
 # e2e-smoke profile — PR smoke subset of the e2e_test crate (backlog#1149 ci-4)
