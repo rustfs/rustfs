@@ -242,6 +242,10 @@ const EVENT_DISK_LOCAL_RENAME_REJECTED: &str = "disk_local_rename_rejected";
 const EVENT_DISK_LOCAL_READ_VERSION_FALLBACK: &str = "disk_local_read_version_fallback";
 #[cfg(target_os = "linux")]
 const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback";
+/// A disk latched io_uring off at runtime and now reads via StdBackend
+/// (rustfs/backlog#1172). The gray-release signal operators watch for.
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_LATCH_OFF: &str = "disk_local_uring_latch_off";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
@@ -2952,6 +2956,24 @@ impl UringBackend {
         }
     }
 
+    /// Latch io_uring off for this whole disk, logging the transition once at
+    /// warn (rustfs/backlog#1172). Without this the only signal operators ever
+    /// see is the startup "backend enabled" line, which stays true on dashboards
+    /// even after the first read latched the disk back to StdBackend forever.
+    /// `swap` makes the log fire exactly once, on the true -> false edge.
+    fn latch_active_off(&self, io_err: &std::io::Error) {
+        if self.active.swap(false, Ordering::Relaxed) {
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                event = EVENT_DISK_LOCAL_URING_LATCH_OFF,
+                root = %self.root.display(),
+                error = ?io_err,
+                "io_uring latched off for this disk; all reads now use StdBackend"
+            );
+        }
+    }
+
     /// Positioned read via io_uring. Mirrors `StdBackend::pread_bytes`'s
     /// resolution/access/bounds preamble, then reads the range with the driver
     /// (whole-range: the driver resubmits short reads for positioned reads).
@@ -3027,7 +3049,7 @@ impl UringBackend {
                 // subsystem is unusable (backlog#1101); the caller falls back
                 // to StdBackend for this and every future read.
                 if is_io_uring_unsupported(&io_err) {
-                    self.active.store(false, Ordering::Relaxed);
+                    self.latch_active_off(&io_err);
                 }
                 return Err(DiskError::from(io_err));
             }
@@ -3138,7 +3160,7 @@ impl UringBackend {
                 if is_direct_io_unsupported(&io_err) {
                     self.direct_uring.supported.store(false, Ordering::Relaxed);
                 } else if is_io_uring_unsupported(&io_err) {
-                    self.active.store(false, Ordering::Relaxed);
+                    self.latch_active_off(&io_err);
                 }
                 return Err(DiskError::from(io_err));
             }
