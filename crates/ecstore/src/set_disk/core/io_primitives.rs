@@ -775,7 +775,9 @@ pub(in crate::set_disk) async fn release_read_repair_heal_reservation(key: &Read
 }
 
 pub(in crate::set_disk) fn record_read_repair_dedup(reason: &'static str) {
-    counter!("rustfs_heal_read_repair_dedup_total", "reason" => reason.to_string()).increment(1);
+    // `reason` is already `&'static str`; the macro takes it directly, so no
+    // per-call `String` allocation.
+    counter!("rustfs_heal_read_repair_dedup_total", "reason" => reason).increment(1);
 }
 
 pub(in crate::set_disk) enum ReadRepairAdmissionOutcome {

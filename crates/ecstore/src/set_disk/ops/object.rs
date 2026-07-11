@@ -93,7 +93,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         // Acquire a shared read-lock early to protect read consistency
         let mut read_lock_guard = if !opts.no_lock {
-            let acquire_start = Instant::now();
+            let acquire_start = stage_metrics_enabled.then(Instant::now);
             let lock_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
 
             // Record lock wait for deadlock detection
@@ -111,9 +111,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             // Record lock acquisition for deadlock detection
             let _lock_id = record_lock_acquire(bucket, object, "read");
 
-            // Record lock statistics
-            metrics::counter!("rustfs.lock.acquire.total", "type" => "read").increment(1);
-            metrics::histogram!("rustfs.lock.acquire.duration.seconds").record(acquire_start.elapsed().as_secs_f64());
+            // Record lock statistics only when GET stage metrics are enabled,
+            // matching the adjacent stage timer. Avoids a per-GET clock read and
+            // two global-recorder lookups when observability/stage metrics are off.
+            if let Some(acquire_start) = acquire_start {
+                metrics::counter!("rustfs.lock.acquire.total", "type" => "read").increment(1);
+                metrics::histogram!("rustfs.lock.acquire.duration.seconds").record(acquire_start.elapsed().as_secs_f64());
+            }
             record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_LOCK_ACQUIRE, lock_stage_start);
 
             Some(guard)

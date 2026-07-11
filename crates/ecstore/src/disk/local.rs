@@ -1696,14 +1696,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for StallTimeoutReader<R> {
 }
 
 fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
-    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "ok".to_string()).increment(1);
-    counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => kind.to_string()).increment(reclaim_len as u64);
-    metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => kind.to_string())
-        .record(started.elapsed().as_secs_f64());
+    // `kind`, "ok" and "err" are all `&'static str`; the `metrics` macros take
+    // static label values directly, so pass them as-is instead of allocating a
+    // `String` per reclaim (this runs per read-stream page-cache reclaim window).
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind, "result" => "ok").increment(1);
+    counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => kind).increment(reclaim_len as u64);
+    metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => kind).record(started.elapsed().as_secs_f64());
 }
 
 fn record_file_cache_reclaim_error(kind: &'static str) {
-    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "err".to_string()).increment(1);
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind, "result" => "err").increment(1);
 }
 
 cached_read_env! {
