@@ -2935,6 +2935,10 @@ impl FdCache {
 #[cfg(target_os = "linux")]
 pub(crate) struct UringBackend {
     root: PathBuf,
+    /// Caches `root.display().to_string()` for the metric `"root"` label. `root`
+    /// never changes after construction, so formatting the `Path` on every
+    /// fallback emission is pure waste (rustfs/backlog#1185).
+    root_label: String,
     inner: StdBackend,
     /// Wrapped in `ManuallyDrop` so `Drop` can move the (last) `Arc` onto a
     /// blocking thread: `UringDriver`'s own `Drop` joins its driver threads and
@@ -3086,9 +3090,13 @@ impl UringBackend {
                 // Periodically export the driver StatsSnapshot to metrics so a
                 // gray release is not flying blind (rustfs/backlog#1172).
                 Self::spawn_stats_exporter(&driver, root.clone());
+                // Compute the metric label once, before `root` moves into the
+                // struct (rustfs/backlog#1185).
+                let root_label = root.display().to_string();
                 Some(Self {
                     inner: StdBackend::new(root.clone()),
                     root,
+                    root_label,
                     driver: std::mem::ManuallyDrop::new(driver),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
@@ -3153,7 +3161,9 @@ impl UringBackend {
     /// how much traffic is actually on io_uring vs falling back
     /// (rustfs/backlog#1172).
     fn record_uring_fallback(&self) {
-        counter!(METRIC_URING_FALLBACK_TOTAL, "root" => self.root.display().to_string()).increment(1);
+        // Clone the cached label (one alloc of a short string) instead of
+        // re-formatting the `Path` per read (rustfs/backlog#1185).
+        counter!(METRIC_URING_FALLBACK_TOTAL, "root" => self.root_label.clone()).increment(1);
     }
 
     /// Spawn a low-frequency task that exports the per-disk driver StatsSnapshot
