@@ -48,6 +48,11 @@ use crate::object_api::GetObjectBodySource;
 /// Compressed objects ARE eligible: `ReadTransform::Compressed` returns the full
 /// plaintext and rewrites `object_info.size` to the decompressed length, which
 /// the caller must replicate with the returned length (backlog#1109).
+///
+/// The fail-closed shape here is enforced by `scripts/check_body_cache_whitelist.sh`
+/// (backlog#1146): the guard requires every exclusion predicate and a `return
+/// None` to precede the first `Some(..)`, so a refactor to a deny-list fails CI.
+/// If you rename or move this function, update that script.
 fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions, object_info: &ObjectInfo) -> Option<i64> {
     if range.is_some()
         || opts.part_number.is_some()

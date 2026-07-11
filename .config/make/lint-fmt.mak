@@ -55,6 +55,11 @@ extension-schema-check: ## Check extension-schema stays a lightweight contract c
 	@echo "🧩 Checking extension schema boundaries..."
 	./scripts/check_extension_schema_boundaries.sh
 
+.PHONY: body-cache-whitelist-check
+body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fail-closed allow-list
+	@echo "🧱 Checking body-cache whitelist guard..."
+	./scripts/check_body_cache_whitelist.sh
+
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check
 	@echo "🔨 Running compilation check..."
