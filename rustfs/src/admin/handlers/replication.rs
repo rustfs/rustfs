@@ -29,6 +29,7 @@ use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -431,6 +432,7 @@ impl Operation for SetRemoteTargetHandler {
         if remote_target.arn.is_empty() {
             return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "ARN is empty".to_string()));
         }
+        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
 
         if update {
             let Some(mut target) = bucket_target_sys
@@ -577,6 +579,7 @@ impl Operation for RemoveRemoteTargetHandler {
             .map_err(ApiError::from)?;
 
         let sys = BucketTargetSys::get();
+        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
 
         let targets = sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
