@@ -91,10 +91,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
@@ -201,7 +201,71 @@ struct SiteReplicationPeerClientCache {
 }
 
 static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
+// Lock order: lifecycle -> bucket operation -> state -> per-bucket metadata.
 static SITE_REPLICATION_STATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static SITE_REPLICATION_LIFECYCLE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static SITE_REPLICATION_BUCKET_OP_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
+static SITE_REPLICATION_ADD_BOOTSTRAP: LazyLock<StdMutex<Option<SiteReplicationAddBootstrap>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+struct SiteReplicationAddBootstrap {
+    token: Uuid,
+    buckets: HashSet<String>,
+}
+
+struct SiteReplicationAddInProgressGuard {
+    token: Uuid,
+    _lifecycle: SiteReplicationLifecycleGuard,
+}
+
+struct SiteReplicationLifecycleGuard {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl SiteReplicationLifecycleGuard {
+    async fn acquire() -> Self {
+        Self {
+            _guard: SITE_REPLICATION_LIFECYCLE_LOCK.lock().await,
+        }
+    }
+}
+
+impl SiteReplicationAddInProgressGuard {
+    fn start(lifecycle: SiteReplicationLifecycleGuard, buckets: HashSet<String>) -> S3Result<Self> {
+        let token = Uuid::new_v4();
+        let mut pending = SITE_REPLICATION_ADD_BOOTSTRAP.lock().map_err(|_| {
+            S3Error::with_message(S3ErrorCode::InternalError, "site replication bootstrap lock poisoned".to_string())
+        })?;
+        *pending = Some(SiteReplicationAddBootstrap { token, buckets });
+        Ok(Self {
+            token,
+            _lifecycle: lifecycle,
+        })
+    }
+}
+
+impl Drop for SiteReplicationAddInProgressGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = SITE_REPLICATION_ADD_BOOTSTRAP.lock()
+            && pending.as_ref().is_some_and(|bootstrap| bootstrap.token == self.token)
+        {
+            *pending = None;
+        }
+    }
+}
+
+fn bootstrap_peer_bucket_operation_allowed(bucket: &str, operation: &str, bootstrap_token: Option<&str>) -> bool {
+    if !matches!(operation, "make-with-versioning" | "configure-replication") {
+        return false;
+    }
+    let parsed_token = bootstrap_token.and_then(|value| Uuid::parse_str(value).ok());
+    SITE_REPLICATION_ADD_BOOTSTRAP.lock().is_ok_and(|pending| {
+        pending.as_ref().is_some_and(|bootstrap| {
+            parsed_token.is_some_and(|token| token == bootstrap.token)
+                || (bootstrap_token.is_none() && bootstrap.buckets.contains(bucket))
+        })
+    })
+}
 
 fn site_replication_peer_client_cache_hit(
     cache: &Option<SiteReplicationPeerClientCache>,
@@ -314,6 +378,7 @@ struct SiteReplicationAddPreflightInfo {
     deployment_id: String,
     enabled: bool,
     bucket_count: usize,
+    bucket_names: HashSet<String>,
     peer_deployment_ids: BTreeSet<String>,
     idp_settings: serde_json::Value,
 }
@@ -1147,12 +1212,14 @@ fn add_preflight_info_from_sr_info(
     info: SRInfo,
     idp_settings: IDPSettings,
 ) -> S3Result<SiteReplicationAddPreflightInfo> {
+    let bucket_names = info.buckets.keys().cloned().collect();
     Ok(SiteReplicationAddPreflightInfo {
         name: if info.name.is_empty() { site.name.clone() } else { info.name },
         endpoint: site.endpoint.clone(),
         deployment_id: info.deployment_id,
         enabled: info.enabled,
         bucket_count: info.buckets.len(),
+        bucket_names,
         peer_deployment_ids: info.state.peers.keys().cloned().collect(),
         idp_settings: idp_settings_value(&idp_settings)?,
     })
@@ -1275,6 +1342,18 @@ fn bootstrap_bucket_op_path(bucket: &str, operation: &str) -> String {
             .append_pair("operation", operation)
             .finish()
     )
+}
+
+fn with_site_replication_bootstrap_token(path: &str, token: &str) -> String {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("bootstrapToken", token)
+        .finish();
+    format!("{path}{separator}{query}")
+}
+
+fn site_replication_bootstrap_token(uri: &Uri) -> Option<String> {
+    query_pairs(uri).get("bootstrapToken").cloned()
 }
 
 fn bootstrap_bucket_make_op_path(bucket: &SRBucketInfo) -> String {
@@ -2090,11 +2169,38 @@ async fn bootstrap_existing_metadata_after_add(
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
-    ensure_site_replication_bucket_versioning(bucket).await?;
-    if !ensure_site_replication_bucket_setup(bucket).await? {
-        return Ok(());
-    }
+    let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
+    let runtime = {
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let Some(runtime) = runtime_site_replication_targets().await? else {
+            return Ok(());
+        };
 
+        ensure_site_replication_bucket_versioning(bucket).await?;
+        ensure_site_replication_bucket_setup_with_runtime(bucket, &runtime).await?;
+        runtime
+    };
+
+    broadcast_site_replication_make_bucket(bucket, lock_enabled, Some(&runtime), None).await
+}
+
+async fn broadcast_site_replication_json_using_runtime<T: Serialize>(
+    runtime: Option<&SiteReplicationRuntime>,
+    path: &str,
+    body: &T,
+) -> S3Result<()> {
+    match runtime {
+        Some(runtime) => broadcast_site_replication_json_with_runtime(runtime, path, body).await,
+        None => broadcast_site_replication_json(path, body).await,
+    }
+}
+
+async fn broadcast_site_replication_make_bucket(
+    bucket: &str,
+    lock_enabled: bool,
+    runtime: Option<&SiteReplicationRuntime>,
+    bootstrap_token: Option<&str>,
+) -> S3Result<()> {
     let created_at = current_object_store_handle()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?
         .get_bucket_info(bucket, &BucketOptions::default())
@@ -2115,16 +2221,20 @@ pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool)
         }
         format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?{}", query.finish())
     };
-    broadcast_site_replication_json(&path, &serde_json::json!({})).await?;
+    let path = if let Some(token) = bootstrap_token {
+        with_site_replication_bootstrap_token(&path, token)
+    } else {
+        path
+    };
+    broadcast_site_replication_json_using_runtime(runtime, &path, &serde_json::json!({})).await?;
 
-    let configure_path = format!(
-        "/rustfs/admin/v3/site-replication/peer/bucket-ops?{}",
-        form_urlencoded::Serializer::new(String::new())
-            .append_pair("bucket", bucket)
-            .append_pair("operation", "configure-replication")
-            .finish()
-    );
-    broadcast_site_replication_json(&configure_path, &serde_json::json!({})).await
+    let configure_path = bootstrap_bucket_op_path(bucket, "configure-replication");
+    let configure_path = if let Some(token) = bootstrap_token {
+        with_site_replication_bootstrap_token(&configure_path, token)
+    } else {
+        configure_path
+    };
+    broadcast_site_replication_json_using_runtime(runtime, &configure_path, &serde_json::json!({})).await
 }
 
 pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: bool) -> S3Result<()> {
@@ -4275,10 +4385,15 @@ async fn ensure_site_replication_bucket_replication_config_with_runtime(
 }
 
 async fn ensure_site_replication_bucket_setup(bucket: &str) -> S3Result<bool> {
-    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(false);
     };
+    ensure_site_replication_bucket_setup_with_runtime(bucket, &runtime).await?;
+    Ok(true)
+}
+
+async fn ensure_site_replication_bucket_setup_with_runtime(bucket: &str, runtime: &SiteReplicationRuntime) -> S3Result<()> {
+    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
     let config = bucket_replication_config_for_target_refresh(bucket).await?;
     ensure_site_replication_bucket_targets_with_runtime(
         bucket,
@@ -4295,7 +4410,7 @@ async fn ensure_site_replication_bucket_setup(bucket: &str) -> S3Result<bool> {
         &runtime.service_account_secret_key,
     )
     .await?;
-    Ok(true)
+    Ok(())
 }
 
 async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deployment_ids: &HashSet<String>) -> S3Result<usize> {
@@ -4392,7 +4507,7 @@ pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) ->
 /// that already exists locally, wire up versioning + targets + replication config for each, and
 /// kick a resync toward every remote peer so pre-existing objects back-fill. Errors are logged
 /// but never abort the caller — the admin can run a manual resync if needed.
-async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local_peer: &PeerInfo) {
+async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local_peer: &PeerInfo, bootstrap_token: Option<&str>) {
     let Some(store) = current_object_store_handle() else {
         return;
     };
@@ -4457,7 +4572,7 @@ async fn backfill_existing_buckets_after_add(state: &SiteReplicationState, local
                 false
             }
         };
-        if let Err(err) = site_replication_make_bucket_hook(name, lock_enabled).await {
+        if let Err(err) = broadcast_site_replication_make_bucket(name, lock_enabled, None, bootstrap_token).await {
             warn!(
                 event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -5123,6 +5238,7 @@ impl Operation for SiteReplicationAddHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
+        let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let current_state = load_site_replication_state().await?;
         if pending_endpoint_refresh(&current_state).is_some() {
@@ -5142,6 +5258,12 @@ impl Operation for SiteReplicationAddHandler {
         validate_add_preflight_topology(&preflight_infos, &local_peer)?;
         let (service_account_access_key, service_account_secret_key) =
             ensure_site_replicator_service_account(&cred.access_key, false).await?;
+        let bootstrap_buckets = preflight_infos
+            .iter()
+            .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
+            .flat_map(|info| info.bucket_names.iter().cloned())
+            .collect();
+        let add_in_progress_guard = SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets)?;
         let mut state = merge_add_sites(
             current_state,
             local_peer.clone(),
@@ -5157,6 +5279,8 @@ impl Operation for SiteReplicationAddHandler {
             peers: state.peers.clone(),
             updated_at: state.updated_at,
         };
+        let peer_join_path =
+            with_site_replication_bootstrap_token(SITE_REPLICATION_PEER_JOIN_PATH, &add_in_progress_guard.token.to_string());
 
         let mut joined_endpoints = HashSet::new();
         for site in &sites {
@@ -5168,14 +5292,9 @@ impl Operation for SiteReplicationAddHandler {
 
             let mut peer_join_req = join_req.clone();
             peer_join_req.svc_acct_parent = site.access_key.clone();
-            let body = send_peer_admin_request(
-                &site.endpoint,
-                SITE_REPLICATION_PEER_JOIN_PATH,
-                &site.access_key,
-                &site.secret_key,
-                &peer_join_req,
-            )
-            .await?;
+            let body =
+                send_peer_admin_request(&site.endpoint, &peer_join_path, &site.access_key, &site.secret_key, &peer_join_req)
+                    .await?;
 
             let join_response: SRPeerJoinResponse = serde_json::from_slice(&body).map_err(|e| {
                 S3Error::with_message(
@@ -5192,7 +5311,7 @@ impl Operation for SiteReplicationAddHandler {
         // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
         // are not silently left out of replication. Failures are logged but do not abort
         // the overall add operation — the admin can trigger a manual resync if needed.
-        backfill_existing_buckets_after_add(&state, &local_peer).await;
+        backfill_existing_buckets_after_add(&state, &local_peer, None).await;
 
         json_response(&ReplicateAddStatus {
             success: true,
@@ -5211,7 +5330,9 @@ impl Operation for SiteReplicationRemoveHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
         let (pending_remove, local_peer) = {
+            let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
             let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
             let current_state = load_site_replication_state().await?;
             if pending_endpoint_refresh(&current_state).is_some() {
@@ -5293,6 +5414,7 @@ impl Operation for SiteReplicationRemoveHandler {
 
         let finalize_candidate = pending_remove_ready_to_finalize(&pending_remove.id, &local_peer).await?;
         let complete = if let Some(finalized_remove) = finalize_candidate {
+            let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
             let removed_deployment_ids = removed_deployment_ids_for_pending_remove(&finalized_remove, &local_peer);
             match cleanup_removed_site_replication_buckets(&removed_deployment_ids).await {
                 Ok(removed) => {
@@ -5418,6 +5540,7 @@ pub struct SRPeerJoinHandler {}
 impl Operation for SRPeerJoinHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
+        let bootstrap_token = site_replication_bootstrap_token(&req.uri);
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let mut state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
@@ -5499,7 +5622,7 @@ impl Operation for SRPeerJoinHandler {
         persist_site_replication_state(&state).await?;
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
         // buckets it already owns so the reverse direction works from the start.
-        backfill_existing_buckets_after_add(&state, &local_peer).await;
+        backfill_existing_buckets_after_add(&state, &local_peer, bootstrap_token.as_deref()).await;
         json_response(&SRPeerJoinResponse {
             peer: state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
         })
@@ -5512,6 +5635,8 @@ pub struct SRPeerBucketOpsHandler {}
 impl Operation for SRPeerBucketOpsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
+        let state = load_site_replication_state().await?;
         let queries = query_pairs(&req.uri);
         let bucket = queries
             .get("bucket")
@@ -5523,6 +5648,16 @@ impl Operation for SRPeerBucketOpsHandler {
             .filter(|value| !value.is_empty())
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "operation is required"))?;
+        if state.pending_remove.is_some()
+            || (!state.enabled()
+                && !bootstrap_peer_bucket_operation_allowed(
+                    &bucket,
+                    &operation,
+                    queries.get("bootstrapToken").map(String::as_str),
+                ))
+        {
+            return Err(s3_error!(InvalidRequest, "site replication is not enabled"));
+        }
 
         let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -5938,6 +6073,8 @@ impl Operation for SRPeerRemoveHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
+        let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
+        let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let current_state = load_site_replication_state().await?;
         if pending_endpoint_refresh(&current_state).is_some() {
@@ -6580,6 +6717,97 @@ mod tests {
         assert!(!query_flag(&uri, "missing"));
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_add_bootstrap_scope_only_allows_expected_bucket_setup_until_guard_drops() {
+        let token;
+        {
+            let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+            let guard = SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::from(["legacy-bucket".to_string()]))
+                .expect("start site replication add guard");
+            token = guard.token.to_string();
+            assert!(bootstrap_peer_bucket_operation_allowed(
+                "new-bucket",
+                "make-with-versioning",
+                Some(&token)
+            ));
+            assert!(bootstrap_peer_bucket_operation_allowed(
+                "new-bucket",
+                "configure-replication",
+                Some(&token)
+            ));
+            assert!(bootstrap_peer_bucket_operation_allowed("legacy-bucket", "make-with-versioning", None));
+            assert!(!bootstrap_peer_bucket_operation_allowed(
+                "unexpected-bucket",
+                "make-with-versioning",
+                None
+            ));
+            assert!(!bootstrap_peer_bucket_operation_allowed(
+                "legacy-bucket",
+                "force-delete-bucket",
+                Some(&token)
+            ));
+            assert!(!bootstrap_peer_bucket_operation_allowed(
+                "legacy-bucket",
+                "make-with-versioning",
+                Some(&Uuid::new_v4().to_string())
+            ));
+        }
+        assert!(!bootstrap_peer_bucket_operation_allowed(
+            "new-bucket",
+            "make-with-versioning",
+            Some(&token)
+        ));
+    }
+
+    #[test]
+    fn test_add_bootstrap_token_round_trips_from_join_to_bucket_operation() {
+        let token = Uuid::new_v4().to_string();
+        let join_path = with_site_replication_bootstrap_token(SITE_REPLICATION_PEER_JOIN_PATH, &token);
+        let join_uri: Uri = join_path.parse().expect("parse peer join path");
+        let received_token = site_replication_bootstrap_token(&join_uri).expect("peer join bootstrap token");
+        let bucket_path =
+            with_site_replication_bootstrap_token(&bootstrap_bucket_op_path("photos", "configure-replication"), &received_token);
+        let bucket_uri: Uri = bucket_path.parse().expect("parse bucket operation path");
+        let query = query_pairs(&bucket_uri);
+
+        assert_eq!(query.get("bootstrapToken"), Some(&token));
+        assert_eq!(query.get("operation").map(String::as_str), Some("configure-replication"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_add_lifecycle_allows_callback_before_remove_writer() {
+        let lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+        let add_guard =
+            SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::new()).expect("start site replication add guard");
+        let add_state = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let remove = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _lifecycle = SiteReplicationLifecycleGuard::acquire().await;
+            let _bucket_op = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
+            let _state = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let _ = entered_tx.send(());
+        });
+        started_rx.await.expect("remove task started");
+
+        let callback = tokio::time::timeout(Duration::from_millis(500), SITE_REPLICATION_BUCKET_OP_LOCK.read())
+            .await
+            .expect("callback read lock should not wait behind remove");
+        assert!(matches!(entered_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+
+        drop(callback);
+        drop(add_state);
+        drop(add_guard);
+        tokio::time::timeout(Duration::from_millis(500), remove)
+            .await
+            .expect("remove should enter after add finishes")
+            .expect("remove task should finish");
+        entered_rx.await.expect("remove entered lifecycle");
+    }
+
     #[test]
     fn test_merge_add_sites_propagates_replicate_ilm_expiry() {
         let state = merge_add_sites(
@@ -6675,6 +6903,7 @@ mod tests {
             deployment_id: deployment_id.to_string(),
             enabled: false,
             bucket_count,
+            bucket_names: HashSet::new(),
             peer_deployment_ids: BTreeSet::new(),
             idp_settings: serde_json::json!({"provider": "same"}),
         }

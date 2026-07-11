@@ -2663,10 +2663,10 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
 
-    // Site replication rejects initialization unless all but one site is empty, so only
-    // the source is seeded before joining; the target bucket is created afterwards.
-    source_client.create_bucket().bucket(source_bucket).send().await?;
-    enable_bucket_versioning(&source_env, source_bucket).await?;
+    // Seed only the joining site so its synchronous backfill must call the initiating
+    // site before the add handler has persisted its final enabled state.
+    target_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&target_env, source_bucket).await?;
 
     let add_status = site_replication_add(
         &source_env,
@@ -2696,11 +2696,9 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         .find(|peer| peer.endpoint == target_env.url)
         .ok_or("target peer missing from source site replication info")?;
 
-    // Wait for the joined target site to converge: site replication propagates the
-    // source bucket to the target and auto-configures its replication target. Drive the
-    // resync against that auto-created target instead of a redundant manual one (which
-    // now collides — "Remote target already exists").
-    wait_for_bucket_on_target(&target_client, source_bucket).await?;
+    // Wait for the initiating site to accept the join callback and configure the
+    // backfilled bucket before driving resync in the normal source-to-target direction.
+    wait_for_bucket_on_target(&source_client, source_bucket).await?;
     let target_arn = wait_for_remote_target_arn(&source_env, source_bucket).await?;
 
     for idx in 0..32 {
@@ -3031,6 +3029,7 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     let baseline_key = "before-remove.txt";
     let baseline_payload = b"site replication before remove all".to_vec();
     let post_remove_key = "after-remove.txt";
+    let racing_bucket = "site-repl-remove-racing-create";
 
     let add_status = site_replication_add(
         &source_env,
@@ -3068,14 +3067,15 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     let replicated_baseline = wait_for_object_on_target(&target_client, bucket, baseline_key).await?;
     assert_eq!(replicated_baseline, baseline_payload);
 
-    let remove_status = site_replication_remove(
-        &source_env,
-        &SRRemoveReq {
-            remove_all: true,
-            ..Default::default()
-        },
-    )
-    .await?;
+    let create_racing_bucket = source_client.create_bucket().bucket(racing_bucket).send();
+    let remove_req = SRRemoveReq {
+        remove_all: true,
+        ..Default::default()
+    };
+    let remove_all = site_replication_remove(&source_env, &remove_req);
+    let (create_result, remove_status) = tokio::join!(create_racing_bucket, remove_all);
+    create_result?;
+    let remove_status = remove_status?;
     assert!(
         !remove_status.status.is_empty() && remove_status.err_detail.is_empty(),
         "unexpected site remove result: {:?}",
@@ -3091,8 +3091,15 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     assert!(target_after_remove.sites.is_empty());
 
     source_client.head_bucket().bucket(bucket).send().await?;
+    source_client.head_bucket().bucket(racing_bucket).send().await?;
     target_client.head_bucket().bucket(bucket).send().await?;
     assert_site_replication_bucket_detached(&source_env, bucket).await?;
+    assert_site_replication_bucket_detached(&source_env, racing_bucket).await?;
+    match target_client.head_bucket().bucket(racing_bucket).send().await {
+        Ok(_) => assert_site_replication_bucket_detached(&target_env, racing_bucket).await?,
+        Err(err) if matches!(err.code(), Some("NoSuchBucket" | "NotFound")) => {}
+        Err(err) => return Err(err.into()),
+    }
     assert_site_replication_bucket_detached(&target_env, bucket).await?;
 
     source_client
@@ -3267,7 +3274,12 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
 
     source_client.create_bucket().bucket(bucket).send().await?;
-    enable_bucket_versioning(&source_env, bucket).await?;
+    let versioning = source_client.get_bucket_versioning().bucket(bucket).send().await?;
+    assert_eq!(
+        versioning.status(),
+        Some(&BucketVersioningStatus::Enabled),
+        "site replication did not enable source bucket versioning"
+    );
     let replication_response = signed_request(
         http::Method::GET,
         &format!("{}/{bucket}?replication", source_env.url),
