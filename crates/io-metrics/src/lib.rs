@@ -111,6 +111,58 @@ pub fn metrics_enabled() -> bool {
     METRICS_ENABLED.load(Ordering::Relaxed)
 }
 
+// Handle-cached emission for hot, LABEL-LESS metrics. The `metrics` macros
+// re-run the recorder's `register_*` (a `RwLock` read + name-key hash + `Arc`
+// clone) on every call; for a per-IO label-less metric that lookup is pure
+// overhead. In production the handle is resolved once via `LazyLock` and reused.
+//
+// Under `cfg(test)` the handle is re-resolved on every call instead, because the
+// `metrics` crate resolves against a thread-local recorder that
+// `with_local_recorder` swaps per test — a process-global cached handle would
+// bind to whichever recorder happened to be active first and break test capture.
+// These macros must therefore only wrap metrics with a FIXED (label-less) key.
+macro_rules! counter_increment_cached {
+    ($name:literal, $value:expr) => {{
+        #[cfg(not(test))]
+        {
+            static HANDLE: std::sync::LazyLock<metrics::Counter> = std::sync::LazyLock::new(|| metrics::counter!($name));
+            HANDLE.increment($value);
+        }
+        #[cfg(test)]
+        {
+            metrics::counter!($name).increment($value);
+        }
+    }};
+}
+
+macro_rules! gauge_set_cached {
+    ($name:literal, $value:expr) => {{
+        #[cfg(not(test))]
+        {
+            static HANDLE: std::sync::LazyLock<metrics::Gauge> = std::sync::LazyLock::new(|| metrics::gauge!($name));
+            HANDLE.set($value);
+        }
+        #[cfg(test)]
+        {
+            metrics::gauge!($name).set($value);
+        }
+    }};
+}
+
+macro_rules! histogram_record_cached {
+    ($name:literal, $value:expr) => {{
+        #[cfg(not(test))]
+        {
+            static HANDLE: std::sync::LazyLock<metrics::Histogram> = std::sync::LazyLock::new(|| metrics::histogram!($name));
+            HANDLE.record($value);
+        }
+        #[cfg(test)]
+        {
+            metrics::histogram!($name).record($value);
+        }
+    }};
+}
+
 // Public modules
 pub mod adaptive_ttl;
 pub mod autotuner;
@@ -525,7 +577,7 @@ pub fn record_io_queue_congestion() {
     if !metrics_enabled() {
         return;
     }
-    counter!("rustfs_io_queue_congestion_total").increment(1);
+    counter_increment_cached!("rustfs_io_queue_congestion_total", 1);
 }
 
 /// Record I/O priority assignment.
@@ -2009,12 +2061,12 @@ pub fn record_data_transfer(bytes: u64, duration_ms: f64) {
     if !metrics_enabled() {
         return;
     }
-    counter!("rustfs_io_transfer_bytes_total").increment(bytes);
-    histogram!("rustfs_io_transfer_duration_ms").record(duration_ms);
+    counter_increment_cached!("rustfs_io_transfer_bytes_total", bytes);
+    histogram_record_cached!("rustfs_io_transfer_duration_ms", duration_ms);
 
     if duration_ms > 0.0 {
         let bps = (bytes as f64 * 1000.0) / duration_ms;
-        histogram!("rustfs_io_transfer_bandwidth_bps").record(bps);
+        histogram_record_cached!("rustfs_io_transfer_bandwidth_bps", bps);
     }
 }
 
@@ -2282,7 +2334,7 @@ pub fn record_io_latency(latency_ms: f64) {
     if !metrics_enabled() {
         return;
     }
-    histogram!("rustfs_io_latency_ms").record(latency_ms);
+    histogram_record_cached!("rustfs_io_latency_ms", latency_ms);
 }
 
 /// Record I/O latency P95 in milliseconds.
@@ -2295,7 +2347,7 @@ pub fn record_io_latency_p95(latency_ms: f64) {
     if !metrics_enabled() {
         return;
     }
-    gauge!("rustfs_io_latency_p95_ms").set(latency_ms);
+    gauge_set_cached!("rustfs_io_latency_p95_ms", latency_ms);
 }
 
 /// Record I/O latency P99 in milliseconds.
@@ -2308,7 +2360,7 @@ pub fn record_io_latency_p99(latency_ms: f64) {
     if !metrics_enabled() {
         return;
     }
-    gauge!("rustfs_io_latency_p99_ms").set(latency_ms);
+    gauge_set_cached!("rustfs_io_latency_p99_ms", latency_ms);
 }
 
 #[cfg(test)]
