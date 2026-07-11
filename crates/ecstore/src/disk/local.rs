@@ -2837,17 +2837,22 @@ pub(crate) struct UringBackend {
 static URING_UNSUPPORTED_DISKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
-/// True when a runtime io_uring read error means io_uring itself is unusable on
-/// this disk (→ latch off), as opposed to a per-read/file error `StdBackend`
-/// would hit too (backlog#1101). Restriction-class errnos only; data errors
-/// (EIO), missing files, and parameter errors do NOT latch. Mirrors the shape
-/// of [`is_direct_io_unsupported`].
+/// True when a runtime io_uring read error means the io_uring SUBSYSTEM is
+/// unusable on this disk (→ latch off), as opposed to a per-read/file error
+/// `StdBackend` would hit too (backlog#1101, narrowed in #1171). Data errors
+/// (EIO), missing files, and parameter errors do NOT latch.
+///
+/// Deliberately narrower than the probe-time restriction class (C7 in the driver
+/// warns the two must not be conflated): EACCES/EPERM at read time on an
+/// already-open fd are usually per-file (an LSM hooks security_file_permission on
+/// every read), and StdBackend would hit the same denial, so EACCES does NOT
+/// latch the whole disk. EPERM is kept because a seccomp/LSM policy applied after
+/// startup blocks io_uring_enter subsystem-wide. EOPNOTSUPP is classified
+/// per-path by the caller (O_DIRECT shape vs subsystem), so it is not latched
+/// here.
 #[cfg(target_os = "linux")]
 fn is_io_uring_unsupported(err: &std::io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
-    )
+    matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM))
 }
 
 /// Resolve `volume`/`path` to the on-disk object path, running the same volume
@@ -2922,19 +2927,26 @@ impl UringBackend {
                         error = ?err,
                         "io_uring unavailable (restricted environment); using StdBackend"
                     );
+                    // Only a genuine environment restriction is permanently
+                    // negative-cached: it will not change without a restart.
+                    URING_UNSUPPORTED_DISKS
+                        .lock()
+                        .expect("uring probe cache mutex poisoned")
+                        .insert(root);
                 } else {
+                    // An unexpected error may be transient (ENOMEM/EMFILE under
+                    // startup fd/memory pressure, ring/eventfd setup, a partial
+                    // shard start). Do NOT latch the disk off io_uring forever;
+                    // fall back for now and let the next LocalDisk reconstruction
+                    // (disk reconnect) re-probe (rustfs/backlog#1171).
                     warn!(
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
                         root = %root.display(),
                         error = ?err,
-                        "io_uring probe failed unexpectedly; using StdBackend"
+                        "io_uring probe failed unexpectedly; using StdBackend (will re-probe on reconnect)"
                     );
                 }
-                URING_UNSUPPORTED_DISKS
-                    .lock()
-                    .expect("uring probe cache mutex poisoned")
-                    .insert(root);
                 None
             }
         }
@@ -3116,7 +3128,16 @@ impl UringBackend {
         let bytes = match self.driver.read_at_direct(file, offset_u64, length, align).await {
             Ok(bytes) => bytes,
             Err(io_err) => {
-                if is_io_uring_unsupported(&io_err) {
+                // Classify a read-side failure the same way StdBackend does
+                // (rustfs/backlog#1171): an O_DIRECT-shape error (EINVAL/EOPNOTSUPP
+                // — the fs accepted the O_DIRECT open but rejects the read shape,
+                // e.g. a wrong alignment guess) latches only the native O_DIRECT
+                // path off, so subsequent eligible reads take StdBackend's aligned
+                // path instead of repaying the open+failed-submit every time. Only
+                // a genuine subsystem error latches io_uring as a whole.
+                if is_direct_io_unsupported(&io_err) {
+                    self.direct_uring.supported.store(false, Ordering::Relaxed);
+                } else if is_io_uring_unsupported(&io_err) {
                     self.active.store(false, Ordering::Relaxed);
                 }
                 return Err(DiskError::from(io_err));
@@ -13252,17 +13273,25 @@ mod test {
         }
     }
 
-    /// The runtime degradation latch classifier (backlog#1101): only
-    /// restriction-class errnos latch io_uring off; data/parameter/missing-file
-    /// errors do not.
+    /// The runtime degradation latch classifier (backlog#1101, narrowed in
+    /// #1171): only subsystem-level errnos latch io_uring off for the whole disk.
+    /// EACCES/EOPNOTSUPP are per-file or per-path (handled by the caller) and
+    /// data/parameter/missing-file errors never latch.
     #[cfg(target_os = "linux")]
     #[test]
     fn io_uring_unsupported_classifies_restriction_errnos_only() {
         use std::io::Error;
-        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS, libc::EOPNOTSUPP] {
+        for errno in [libc::EPERM, libc::ENOSYS] {
             assert!(is_io_uring_unsupported(&Error::from_raw_os_error(errno)), "errno {errno} should latch");
         }
-        for errno in [libc::EIO, libc::EINVAL, libc::ENOENT, libc::EAGAIN] {
+        for errno in [
+            libc::EACCES,
+            libc::EOPNOTSUPP,
+            libc::EIO,
+            libc::EINVAL,
+            libc::ENOENT,
+            libc::EAGAIN,
+        ] {
             assert!(!is_io_uring_unsupported(&Error::from_raw_os_error(errno)), "errno {errno} must not latch");
         }
         assert!(!is_io_uring_unsupported(&Error::other("driver gone")));
