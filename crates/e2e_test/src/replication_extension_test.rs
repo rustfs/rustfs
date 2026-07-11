@@ -20,7 +20,7 @@ use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
 use aws_sdk_s3::{Client, Config};
 use http::header::{CONTENT_TYPE, HOST};
 use local_ip_address::local_ip;
@@ -37,6 +37,7 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::net::IpAddr;
@@ -794,6 +795,35 @@ async fn wait_for_replicated_object(
                     return Ok(());
                 }
                 return Err(format!("replicated object body mismatch: expected {expected_body}, got {body}").into());
+            }
+            Err(_err) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+async fn wait_for_replicated_sha256(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    expected_sha256: [u8; 32],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    loop {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(output) => {
+                let body = output.body.collect().await?.into_bytes();
+                let actual_sha256: [u8; 32] = Sha256::digest(&body).into();
+                if actual_sha256 == expected_sha256 {
+                    return Ok(());
+                }
+                return Err(
+                    format!("replicated object SHA-256 mismatch: expected {expected_sha256:?}, got {actual_sha256:?}").into(),
+                );
             }
             Err(_err) if tokio::time::Instant::now() < deadline => {
                 sleep(Duration::from_secs(1)).await;
@@ -2383,8 +2413,11 @@ async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<()
 
 #[tokio::test]
 #[serial]
-async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    const PART_COUNT: usize = 3;
 
     let mut source_env = RustFSTestEnvironment::new().await?;
     source_env
@@ -2397,11 +2430,10 @@ async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result
     let mut target_env_b = RustFSTestEnvironment::new().await?;
     target_env_b.start_rustfs_server_without_cleanup(vec![]).await?;
 
-    let source_bucket = "replication-fanout-src";
-    let target_bucket_a = "replication-fanout-dst-a";
-    let target_bucket_b = "replication-fanout-dst-b";
-    let object_key = "fanout.txt";
-    let body = "payload-fanout";
+    let source_bucket = "replication-multipart-fanout-src";
+    let target_bucket_a = "replication-multipart-fanout-dst-a";
+    let target_bucket_b = "replication-multipart-fanout-dst-b";
+    let object_key = "multipart-fanout.bin";
 
     let source_client = source_env.create_s3_client();
     let target_client_a = target_env_a.create_s3_client();
@@ -2418,16 +2450,78 @@ async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result
     let target_arn_b = set_replication_target(&source_env, source_bucket, &target_env_b, target_bucket_b).await?;
     put_bucket_replication_rules(&source_env, source_bucket, &[target_arn_a.as_str(), target_arn_b.as_str()]).await?;
 
-    source_client
-        .put_object()
+    let created = source_client
+        .create_multipart_upload()
         .bucket(source_bucket)
         .key(object_key)
-        .body(ByteStream::from(body.as_bytes().to_vec()))
         .send()
         .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+    let mut completed_parts = Vec::with_capacity(PART_COUNT);
+    let mut payload = Vec::with_capacity(PART_SIZE * PART_COUNT);
 
-    wait_for_replicated_object(&target_client_a, target_bucket_a, object_key, body).await?;
-    wait_for_replicated_object(&target_client_b, target_bucket_b, object_key, body).await?;
+    for part_number in 1..=PART_COUNT {
+        let part = vec![u8::try_from(part_number)?; PART_SIZE];
+        payload.extend_from_slice(&part);
+        let uploaded = source_client
+            .upload_part()
+            .bucket(source_bucket)
+            .key(object_key)
+            .upload_id(&upload_id)
+            .part_number(i32::try_from(part_number)?)
+            .body(ByteStream::from(part))
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(i32::try_from(part_number)?)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+
+    let completed = source_client
+        .complete_multipart_upload()
+        .bucket(source_bucket)
+        .key(object_key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .send()
+        .await?;
+    let source_etag = completed.e_tag().ok_or("completed multipart upload omitted ETag")?;
+    let multipart_suffix = format!("-{PART_COUNT}");
+    assert!(
+        source_etag.trim_matches('"').ends_with(&multipart_suffix),
+        "unexpected source multipart ETag: {source_etag}"
+    );
+
+    let expected_sha256: [u8; 32] = Sha256::digest(&payload).into();
+    tokio::try_join!(
+        wait_for_replicated_sha256(&target_client_a, target_bucket_a, object_key, expected_sha256),
+        wait_for_replicated_sha256(&target_client_b, target_bucket_b, object_key, expected_sha256),
+    )?;
+
+    let target_etag_a = target_client_a
+        .head_object()
+        .bucket(target_bucket_a)
+        .key(object_key)
+        .send()
+        .await?
+        .e_tag()
+        .ok_or("first target omitted ETag")?
+        .to_string();
+    let target_etag_b = target_client_b
+        .head_object()
+        .bucket(target_bucket_b)
+        .key(object_key)
+        .send()
+        .await?
+        .e_tag()
+        .ok_or("second target omitted ETag")?
+        .to_string();
+
+    assert_eq!(target_etag_a, source_etag);
+    assert_eq!(target_etag_b, source_etag);
 
     Ok(())
 }
