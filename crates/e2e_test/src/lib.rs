@@ -32,6 +32,11 @@ mod reliability_disk_fault_test;
 #[cfg(test)]
 mod degraded_read_eof_regression_test;
 
+// backlog#1183: GET codec-streaming fast path must be byte/header identical to
+// the legacy duplex path before its rollout gates can be flipped on by default.
+#[cfg(test)]
+mod get_codec_streaming_compat_test;
+
 #[cfg(test)]
 mod version_id_regression_test;
 
