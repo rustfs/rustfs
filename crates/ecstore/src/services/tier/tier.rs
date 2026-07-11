@@ -1445,4 +1445,557 @@ mod tests {
         assert!(rendered.contains("failed to save tiering config"), "{rendered}");
         assert!(rendered.contains("object layer not initialized"), "{rendered}");
     }
+
+    // ---------------------------------------------------------------------
+    // State-machine coverage (ilm-4): add / edit / remove / verify.
+    //
+    // These tests must not reach a real remote tier. Two techniques keep them
+    // hermetic:
+    //   * error paths that return *before* `new_warm_backend` constructs a
+    //     client (name validation, duplicate detection, unsupported type,
+    //     missing backend payload, missing credentials);
+    //   * a `MockWarmBackend` injected directly into `driver_cache`, so
+    //     `get_driver` returns it from cache without any network I/O, which
+    //     lets us drive `remove`/`verify` through every branch.
+    // ---------------------------------------------------------------------
+
+    use crate::client::transition_api::{ReadCloser, ReaderImpl};
+    use crate::services::tier::warm_backend::{WarmBackend, WarmBackendGetOpts};
+
+    fn empty_mgr() -> TierConfigMgr {
+        TierConfigMgr {
+            driver_cache: HashMap::new(),
+            tiers: HashMap::new(),
+            last_refreshed_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn build_rustfs_tier(name: &str) -> TierConfig {
+        TierConfig {
+            version: "v1".to_string(),
+            tier_type: TierType::RustFS,
+            name: name.to_string(),
+            rustfs: Some(crate::services::tier::tier_config::TierRustFS {
+                name: name.to_string(),
+                endpoint: "https://example-compat.invalid".to_string(),
+                access_key: "ak".to_string(),
+                secret_key: "sk".to_string(),
+                bucket: "bucket-r".to_string(),
+                prefix: "prefix-r".to_string(),
+                region: "us-east-1".to_string(),
+                storage_class: "STANDARD".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A fully offline `WarmBackend` used to exercise the driver-facing
+    /// branches of `remove`/`verify` without touching a remote tier.
+    struct MockWarmBackend {
+        /// `Some(b)` -> `in_use()` returns `Ok(b)`; `None` -> returns `Err`.
+        in_use_value: Option<bool>,
+        /// When false, put/get/remove all fail (drives `verify` error paths).
+        healthy: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl WarmBackend for MockWarmBackend {
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> std::result::Result<String, std::io::Error> {
+            if self.healthy {
+                Ok("mock-version".to_string())
+            } else {
+                Err(std::io::Error::other("mock put failed"))
+            }
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> std::result::Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(
+            &self,
+            _object: &str,
+            _rv: &str,
+            _opts: WarmBackendGetOpts,
+        ) -> std::result::Result<ReadCloser, std::io::Error> {
+            if self.healthy {
+                Ok(BufReader::new(Cursor::new(b"RustFS".to_vec())))
+            } else {
+                Err(std::io::Error::other("mock get failed"))
+            }
+        }
+
+        async fn remove(&self, _object: &str, _rv: &str) -> std::result::Result<(), std::io::Error> {
+            if self.healthy {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("mock remove failed"))
+            }
+        }
+
+        async fn in_use(&self) -> std::result::Result<bool, std::io::Error> {
+            match self.in_use_value {
+                Some(b) => Ok(b),
+                None => Err(std::io::Error::other("mock in_use failed")),
+            }
+        }
+    }
+
+    fn inject_mock(mgr: &mut TierConfigMgr, name: &str, tier: TierConfig, mock: MockWarmBackend) {
+        mgr.tiers.insert(name.to_string(), tier);
+        mgr.driver_cache.insert(name.to_string(), Box::new(mock));
+    }
+
+    // ---- add ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_add_rejects_non_uppercase_name() {
+        let mut mgr = empty_mgr();
+        let err = mgr
+            .add(build_s3_tier("cold-a"), true)
+            .await
+            .expect_err("lowercase tier name must be rejected");
+        assert_eq!(err.code, ERR_TIER_NAME_NOT_UPPERCASE.code);
+        assert!(mgr.tiers.is_empty(), "rejected tier must not be persisted");
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_duplicate_name() {
+        let mut mgr = empty_mgr();
+        mgr.tiers.insert("COLD-A".to_string(), build_s3_tier("COLD-A"));
+
+        let err = mgr
+            .add(build_s3_tier("COLD-A"), true)
+            .await
+            .expect_err("duplicate tier name must be rejected");
+        assert_eq!(err.code, ERR_TIER_ALREADY_EXISTS.code);
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_unsupported_tier_type() {
+        let mut mgr = empty_mgr();
+        // `Unsupported` is rejected by `new_warm_backend` before any network I/O.
+        let tier = TierConfig {
+            version: "v1".to_string(),
+            tier_type: TierType::Unsupported,
+            name: "COLD-U".to_string(),
+            ..Default::default()
+        };
+        let err = mgr.add(tier, true).await.expect_err("unsupported tier type must be rejected");
+        assert_eq!(err.code, ERR_TIER_TYPE_UNSUPPORTED.code);
+        assert!(mgr.tiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_missing_backend_payload() {
+        let mut mgr = empty_mgr();
+        // Declares S3 type but omits the S3 payload; rejected before client build.
+        let tier = TierConfig {
+            version: "v1".to_string(),
+            tier_type: TierType::S3,
+            name: "COLD-A".to_string(),
+            s3: None,
+            ..Default::default()
+        };
+        let err = mgr
+            .add(tier, true)
+            .await
+            .expect_err("missing backend payload must be rejected");
+        assert_eq!(err.code, "XRustFSAdminTierInvalidConfig");
+        assert!(err.message.contains("S3 tier configuration not found"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn test_add_does_not_reserve_standard_name_regression_anchor() {
+        // Regression anchor: RustFS does *not* currently reject the AWS-reserved
+        // tier names (STANDARD / REDUCED_REDUNDANCY). `add` accepts "STANDARD"
+        // (uppercase, not in use) and only fails later at backend construction
+        // because the payload is absent -- proving no reserved-name guard fired.
+        // If a reserved-name check is ever added, this assertion should flip to
+        // `ERR_TIER_RESERVED_NAME` and this comment be removed.
+        let mut mgr = empty_mgr();
+        let tier = TierConfig {
+            version: "v1".to_string(),
+            tier_type: TierType::Unsupported,
+            name: "STANDARD".to_string(),
+            ..Default::default()
+        };
+        let err = mgr
+            .add(tier, true)
+            .await
+            .expect_err("no backend payload => construction error");
+        assert_eq!(
+            err.code, ERR_TIER_TYPE_UNSUPPORTED.code,
+            "STANDARD is not specially rejected; it reaches the type check"
+        );
+    }
+
+    // ---- edit -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_edit_rejects_unknown_tier() {
+        let mut mgr = empty_mgr();
+        let err = mgr
+            .edit("NOPE", TierCreds::default())
+            .await
+            .expect_err("editing an unknown tier must fail");
+        assert_eq!(err.code, ERR_TIER_NOT_FOUND.code);
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_missing_credentials_for_rustfs() {
+        let mut mgr = empty_mgr();
+        mgr.tiers.insert("COLD-R".to_string(), build_rustfs_tier("COLD-R"));
+
+        // Empty access/secret keys => rejected before any driver rebuild.
+        let err = mgr
+            .edit("COLD-R", TierCreds::default())
+            .await
+            .expect_err("empty credentials must be rejected");
+        assert_eq!(err.code, ERR_TIER_MISSING_CREDENTIALS.code);
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_missing_credentials_for_minio() {
+        let mut mgr = empty_mgr();
+        let tier = TierConfig {
+            version: "v1".to_string(),
+            tier_type: TierType::MinIO,
+            name: "COLD-M".to_string(),
+            minio: Some(crate::services::tier::tier_config::TierMinIO {
+                name: "COLD-M".to_string(),
+                endpoint: "https://example-compat.invalid".to_string(),
+                access_key: "ak".to_string(),
+                secret_key: "sk".to_string(),
+                bucket: "bucket-m".to_string(),
+                prefix: String::new(),
+                region: String::new(),
+            }),
+            ..Default::default()
+        };
+        mgr.tiers.insert("COLD-M".to_string(), tier);
+
+        let err = mgr
+            .edit("COLD-M", TierCreds::default())
+            .await
+            .expect_err("empty credentials must be rejected");
+        assert_eq!(err.code, ERR_TIER_MISSING_CREDENTIALS.code);
+    }
+
+    // ---- remove ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_remove_unknown_tier_is_idempotent() {
+        let mut mgr = empty_mgr();
+        // Unknown tier: get_driver returns NotFound, which `remove` swallows.
+        mgr.remove("NOPE", false).await.expect("removing an unknown tier is a no-op");
+    }
+
+    #[tokio::test]
+    async fn test_remove_rejects_backend_in_use() {
+        let mut mgr = empty_mgr();
+        inject_mock(
+            &mut mgr,
+            "COLD-A",
+            build_s3_tier("COLD-A"),
+            MockWarmBackend {
+                in_use_value: Some(true),
+                healthy: true,
+            },
+        );
+
+        let err = mgr
+            .remove("COLD-A", false)
+            .await
+            .expect_err("in-use backend must not be removed");
+        assert_eq!(err.code, ERR_TIER_BACKEND_NOT_EMPTY.code);
+        assert!(mgr.tiers.contains_key("COLD-A"), "tier must survive a rejected remove");
+        assert!(mgr.driver_cache.contains_key("COLD-A"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_succeeds_when_backend_empty() {
+        let mut mgr = empty_mgr();
+        inject_mock(
+            &mut mgr,
+            "COLD-A",
+            build_s3_tier("COLD-A"),
+            MockWarmBackend {
+                in_use_value: Some(false),
+                healthy: true,
+            },
+        );
+
+        mgr.remove("COLD-A", false).await.expect("empty backend can be removed");
+        assert!(!mgr.tiers.contains_key("COLD-A"));
+        assert!(!mgr.driver_cache.contains_key("COLD-A"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_force_skips_in_use_probe() {
+        let mut mgr = empty_mgr();
+        // in_use_value: None would error if probed; force=true must skip it.
+        inject_mock(
+            &mut mgr,
+            "COLD-A",
+            build_s3_tier("COLD-A"),
+            MockWarmBackend {
+                in_use_value: None,
+                healthy: true,
+            },
+        );
+
+        mgr.remove("COLD-A", true).await.expect("force remove must not probe in_use");
+        assert!(!mgr.tiers.contains_key("COLD-A"));
+        assert!(!mgr.driver_cache.contains_key("COLD-A"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_reports_probe_error() {
+        let mut mgr = empty_mgr();
+        inject_mock(
+            &mut mgr,
+            "COLD-A",
+            build_s3_tier("COLD-A"),
+            MockWarmBackend {
+                in_use_value: None,
+                healthy: true,
+            },
+        );
+
+        let err = mgr
+            .remove("COLD-A", false)
+            .await
+            .expect_err("a failed in_use probe must surface as an error");
+        assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+        assert!(mgr.tiers.contains_key("COLD-A"), "tier must survive a failed probe");
+    }
+
+    // ---- verify ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_verify_unknown_tier_errors() {
+        let mut mgr = empty_mgr();
+        let err = mgr.verify("NOPE").await.expect_err("verifying an unknown tier must fail");
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_verify_succeeds_with_healthy_backend() {
+        let mut mgr = empty_mgr();
+        inject_mock(
+            &mut mgr,
+            "COLD-A",
+            build_s3_tier("COLD-A"),
+            MockWarmBackend {
+                in_use_value: Some(false),
+                healthy: true,
+            },
+        );
+
+        mgr.verify("COLD-A").await.expect("healthy backend must verify");
+    }
+
+    #[tokio::test]
+    async fn test_verify_reports_backend_failure() {
+        let mut mgr = empty_mgr();
+        inject_mock(
+            &mut mgr,
+            "COLD-A",
+            build_s3_tier("COLD-A"),
+            MockWarmBackend {
+                in_use_value: Some(false),
+                healthy: false,
+            },
+        );
+
+        mgr.verify("COLD-A")
+            .await
+            .expect_err("an unhealthy backend must fail verification");
+    }
+
+    // ---- pure query helpers --------------------------------------------
+
+    #[test]
+    fn test_query_helpers_reflect_membership() {
+        let mut mgr = empty_mgr();
+        assert!(mgr.empty());
+        assert!(!mgr.is_tier_valid("COLD-A"));
+        assert_eq!(mgr.tier_type("COLD-A"), "internal");
+        assert!(mgr.get("COLD-A").is_none());
+
+        mgr.tiers.insert("COLD-A".to_string(), build_s3_tier("COLD-A"));
+
+        assert!(!mgr.empty());
+        assert!(mgr.is_tier_valid("COLD-A"));
+        let (ty, in_use) = mgr.is_tier_name_in_use("COLD-A");
+        assert!(in_use);
+        assert_eq!(ty.as_lowercase(), "s3");
+        assert_eq!(mgr.tier_type("COLD-A"), "s3");
+        assert_eq!(mgr.list_tiers().len(), 1);
+        assert!(mgr.get("COLD-A").is_some());
+    }
+
+    // ---- persistence: encode/decode and legacy migration ---------------
+
+    #[test]
+    fn test_marshal_unmarshal_json_roundtrip_preserves_tier() {
+        let mut mgr = empty_mgr();
+        mgr.tiers.insert("COLD-A".to_string(), build_s3_tier("COLD-A"));
+
+        let bytes = mgr.marshal().expect("marshal should succeed");
+        let decoded = TierConfigMgr::unmarshal(&bytes).expect("unmarshal should succeed");
+
+        let tier = decoded.tiers.get("COLD-A").expect("tier survives json roundtrip");
+        assert_eq!(tier.tier_type.as_lowercase(), "s3");
+        let s3 = tier.s3.as_ref().expect("s3 payload survives");
+        assert_eq!(s3.bucket, "bucket-a");
+        // secret_key is a serialized field (unlike Clone, marshal does not redact).
+        assert_eq!(s3.secret_key, "sk");
+    }
+
+    #[test]
+    fn test_external_blob_roundtrip_azure_maps_account_fields() {
+        let mut mgr = empty_mgr();
+        mgr.tiers.insert(
+            "COLD-AZ".to_string(),
+            TierConfig {
+                version: "v1".to_string(),
+                tier_type: TierType::Azure,
+                name: "COLD-AZ".to_string(),
+                azure: Some(crate::services::tier::tier_config::TierAzure {
+                    name: "COLD-AZ".to_string(),
+                    endpoint: "https://example-azure.invalid".to_string(),
+                    access_key: "account-name".to_string(),
+                    secret_key: "account-key".to_string(),
+                    bucket: "container".to_string(),
+                    prefix: "p".to_string(),
+                    region: "eastus".to_string(),
+                    storage_class: "HOT".to_string(),
+                    sp_auth: crate::services::tier::tier_config::ServicePrincipalAuth {
+                        tenant_id: "tenant".to_string(),
+                        client_id: "client".to_string(),
+                        client_secret: "secret".to_string(),
+                    },
+                }),
+                ..Default::default()
+            },
+        );
+
+        let bytes = encode_external_tiering_config_blob(&mgr).expect("encode azure tier");
+        let decoded = decode_external_tiering_config_blob(&bytes).expect("decode azure tier");
+        let tier = decoded.tiers.get("COLD-AZ").expect("azure tier survives roundtrip");
+        assert_eq!(tier.tier_type.as_lowercase(), "azure");
+        let az = tier.azure.as_ref().expect("azure payload survives");
+        // AccountName/AccountKey in the on-disk format map back to access/secret.
+        assert_eq!(az.access_key, "account-name");
+        assert_eq!(az.secret_key, "account-key");
+        assert_eq!(az.sp_auth.tenant_id, "tenant");
+        assert_eq!(az.sp_auth.client_secret, "secret");
+    }
+
+    #[test]
+    fn test_external_blob_roundtrip_gcs_preserves_creds() {
+        let mut mgr = empty_mgr();
+        mgr.tiers.insert(
+            "COLD-G".to_string(),
+            TierConfig {
+                version: "v1".to_string(),
+                tier_type: TierType::GCS,
+                name: "COLD-G".to_string(),
+                gcs: Some(crate::services::tier::tier_config::TierGCS {
+                    name: "COLD-G".to_string(),
+                    endpoint: "https://storage.googleapis.com".to_string(),
+                    creds: "service-account-json".to_string(),
+                    bucket: "gbucket".to_string(),
+                    prefix: "gp".to_string(),
+                    region: "us".to_string(),
+                    storage_class: "NEARLINE".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let bytes = encode_external_tiering_config_blob(&mgr).expect("encode gcs tier");
+        let decoded = decode_external_tiering_config_blob(&bytes).expect("decode gcs tier");
+        let tier = decoded.tiers.get("COLD-G").expect("gcs tier survives roundtrip");
+        assert_eq!(tier.tier_type.as_lowercase(), "gcs");
+        assert_eq!(tier.gcs.as_ref().expect("gcs payload survives").creds, "service-account-json");
+    }
+
+    // `TierConfigMgr` intentionally does not derive `Debug` (it holds live
+    // driver handles), so `Result::expect_err` cannot be used on decode
+    // results. Extract the error explicitly instead.
+    fn expect_decode_err(data: &[u8]) -> std::io::Error {
+        match decode_external_tiering_config_blob(data) {
+            Ok(_) => panic!("expected decode to fail"),
+            Err(err) => err,
+        }
+    }
+
+    #[test]
+    fn test_external_blob_rejects_truncated_data() {
+        let err = expect_decode_err(&[0u8; 3]);
+        assert!(err.to_string().contains("no data"), "{err}");
+    }
+
+    #[test]
+    fn test_external_blob_rejects_unknown_format() {
+        // Valid length, but a format word the decoder does not recognise.
+        let mut data = Vec::new();
+        data.extend_from_slice(&99u16.to_le_bytes());
+        data.extend_from_slice(&TIER_CONFIG_VERSION.to_le_bytes());
+        data.extend_from_slice(&[0u8; 8]);
+        let err = expect_decode_err(&data);
+        assert!(err.to_string().contains("unknown format"), "{err}");
+    }
+
+    #[test]
+    fn test_external_blob_rejects_unknown_version() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&TIER_CONFIG_FORMAT.to_le_bytes());
+        data.extend_from_slice(&99u16.to_le_bytes());
+        data.extend_from_slice(&[0u8; 8]);
+        let err = expect_decode_err(&data);
+        assert!(err.to_string().contains("unknown version"), "{err}");
+    }
+
+    #[test]
+    fn test_external_blob_accepts_legacy_v1_version_word() {
+        // The decoder must keep accepting the historical v1 version word, not
+        // just the current TIER_CONFIG_VERSION, so old on-disk configs load.
+        let mut mgr = empty_mgr();
+        mgr.tiers.insert("COLD-A".to_string(), build_s3_tier("COLD-A"));
+        let current = encode_external_tiering_config_blob(&mgr).expect("encode");
+
+        // Rewrite the version word (bytes 2..4) from VERSION to V1.
+        let mut legacy = current.to_vec();
+        legacy[2..4].copy_from_slice(&TIER_CONFIG_V1.to_le_bytes());
+
+        let decoded = decode_external_tiering_config_blob(&legacy).expect("v1 version word must decode");
+        assert!(decoded.tiers.contains_key("COLD-A"));
+    }
+
+    #[test]
+    fn test_encode_external_blob_errors_on_missing_payload() {
+        let mut mgr = empty_mgr();
+        mgr.tiers.insert(
+            "COLD-A".to_string(),
+            TierConfig {
+                version: "v1".to_string(),
+                tier_type: TierType::S3,
+                name: "COLD-A".to_string(),
+                s3: None,
+                ..Default::default()
+            },
+        );
+        let err = encode_external_tiering_config_blob(&mgr).expect_err("missing payload must fail encode");
+        assert!(err.to_string().contains("missing s3 backend payload"), "{err}");
+    }
 }
