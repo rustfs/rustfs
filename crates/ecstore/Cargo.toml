@@ -114,7 +114,9 @@ pin-project-lite.workspace = true
 md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
-rustix = { workspace = true }
+# "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
+# (backlog#1178); "fs" comes from the workspace default.
+rustix = { workspace = true, features = ["process"] }
 rustfs-madmin.workspace = true
 reqwest = { workspace = true }
 aes-gcm.workspace = true

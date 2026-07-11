@@ -2624,6 +2624,22 @@ fn is_io_uring_fd_cache_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_IO_URING_FD_CACHE, DEFAULT_RUSTFS_IO_URING_FD_CACHE)
 }
 
+/// Whether the soft `RLIMIT_NOFILE` has enough headroom to run the fd cache
+/// safely (rustfs/backlog#1178). The cache holds up to `FD_CACHE_CAPACITY` (512)
+/// descriptors PER DISK and `try_new` cannot know the disk count, so a low limit
+/// (the common 1024 default on a bare-metal / non-systemd run) would exhaust fds
+/// with just a couple of disks. Require ample headroom before enabling it;
+/// otherwise fall back to open-per-read. The packaged systemd unit sets
+/// 1,048,576, so tuned deployments are unaffected.
+#[cfg(target_os = "linux")]
+fn rlimit_allows_fd_cache() -> bool {
+    const MIN_SOFT_NOFILE: u64 = 16 << 10;
+    match rustix::process::getrlimit(rustix::process::Resource::Nofile).current {
+        Some(soft) => soft >= MIN_SOFT_NOFILE,
+        None => true, // no soft limit (unlimited)
+    }
+}
+
 /// Drop `offset..offset+length` from the page cache after an io_uring read,
 /// mirroring what `StdBackend::pread_bytes` does for the same range
 /// (backlog#1145).
@@ -2964,6 +2980,24 @@ impl UringBackend {
                     shards,
                     "io_uring read backend enabled"
                 );
+                // Gate the fd cache on RLIMIT_NOFILE headroom (rustfs/backlog#1178):
+                // 512 fds/disk with a low soft limit and several disks would hit
+                // EMFILE. Fall back to open-per-read when the limit is too small.
+                let fd_cache = if is_io_uring_fd_cache_enabled() {
+                    if rlimit_allows_fd_cache() {
+                        Some(FdCache::new())
+                    } else {
+                        warn!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            root = %root.display(),
+                            "io_uring fd cache disabled: RLIMIT_NOFILE soft limit too low for 512 fds/disk; using open-per-read"
+                        );
+                        None
+                    }
+                } else {
+                    None
+                };
                 Some(Self {
                     inner: StdBackend::new(root.clone()),
                     root,
@@ -2971,7 +3005,7 @@ impl UringBackend {
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
-                    fd_cache: is_io_uring_fd_cache_enabled().then(FdCache::new),
+                    fd_cache,
                 })
             }
             Err(err) => {
