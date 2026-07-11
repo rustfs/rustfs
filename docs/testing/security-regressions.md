@@ -1,0 +1,48 @@
+# Security Advisory Regression Tests
+
+Every fixed RustFS GitHub Security Advisory (GHSA) should map to at least one
+named, discoverable regression test. The convention is: name the test (or a
+helper / doc comment on the exact assertion) after the advisory so that
+
+```bash
+rg -i "ghsa|3p3x|r5qv"
+```
+
+finds the guard for any advisory, and a future fix of a still-open advisory is
+forced to update its pinned test (red -> green).
+
+> This is the lightweight inventory. sec-14 (backlog#1151) formalizes the
+> written admission policy in `AGENTS.md`; keep this file as the map.
+
+## Advisory -> test mapping
+
+| Advisory | Class | Fix PR | Named regression tests | Layer |
+| --- | --- | --- | --- | --- |
+| [GHSA-3p3x-734c-h5vx](https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx) | Constant-time secret comparison on WebDAV/FTPS password login | rustfs/rustfs#4403 | `assert_ftps_ghsa_3p3x_wrong_credentials_rejected` (`crates/e2e_test/src/protocols/ftps_core.rs`); `GHSA-3p3x` auth-failure block in `test_webdav_core_operations` (`crates/e2e_test/src/protocols/webdav_core.rs`) | e2e (protocols suite) |
+| [GHSA-r5qv-rc46-hv8q](https://github.com/rustfs/rustfs/security/advisories/GHSA-r5qv-rc46-hv8q) | Internode RPC authentication must fail closed | rustfs/rustfs#4402 | `ghsa_r5qv_resolve_shared_secret_rejects_default_fallback`, `ghsa_r5qv_verify_rpc_signature_fails_closed_on_missing_or_invalid_auth` (`crates/ecstore/src/cluster/rpc/http_auth.rs`) | unit |
+| [GHSA-m77q-r63m-pj89](https://github.com/rustfs/rustfs/security/advisories/GHSA-m77q-r63m-pj89) | STS JWTs signed with shared root secret (intentionally unfixed) | n/a | `test_created_sts_credentials_authorize_with_session_token_claims` (`crates/iam/src/sys.rs`) — pins current behavior; sec-7 adds GHSA naming | unit |
+
+## Where these run
+
+- **Unit tests** (`ghsa_r5qv_*` in `crates/ecstore`) run automatically in the
+  default CI pass via `cargo nextest run` / `cargo test` — no special wiring.
+- **Protocol e2e tests** (WebDAV/FTPS constant-time login rejection) live in the
+  `e2e_test` protocols suite, which binds **fixed ports** and requires
+  `--test-threads=1`. Because of the fixed ports they **cannot** join the
+  `e2e-smoke` nextest profile (parallel, dynamic ports). They run manually today:
+
+  ```bash
+  RUSTFS_BUILD_FEATURES=ftps,webdav cargo test --package e2e_test \
+    test_protocol_core_suite -- --test-threads=1 --nocapture
+  ```
+
+  Wiring the security e2e lane into CI is tracked separately (sec-5, backlog#1151).
+
+## Adding a new advisory guard
+
+1. Reproduce the advisory's bypass form as a focused negative test.
+2. Name the test (or the helper/assertion) `ghsa_<id>_*`, or attach a
+   `GHSA-<id>` doc comment with the advisory URL and fix PR.
+3. Add a row to the table above.
+4. Land the unit-level guard where the default CI pass runs it; land any e2e
+   guard in the protocols suite (and register it with sec-5's filterset seam).
