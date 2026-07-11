@@ -17,7 +17,7 @@ use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::tier::{
     AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
     ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
-    ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType, storageclass,
+    ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierCreds, TierType,
 };
 use crate::{
     admin::runtime_sources::{current_daily_tier_stats, current_notification_system, current_tier_config_handle},
@@ -311,22 +311,6 @@ impl Operation for AddTier {
                 s3_error!(InvalidRequest, "invalid force flag")
             })?;
         }
-        match args.name.as_str() {
-            storageclass::STANDARD | storageclass::RRS => {
-                warn!(
-                    event = EVENT_ADMIN_TIER_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_TIER,
-                    action = "add_tier",
-                    tier_name = %args.name,
-                    result = "reserved_name_rejected",
-                    "admin tier state"
-                );
-                return Err(s3_error!(InvalidRequest, "Cannot use reserved tier name"));
-            }
-            &_ => (),
-        }
-
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
@@ -350,7 +334,18 @@ impl Operation for AddTier {
                 ));
             }
             if let Err(err) = tier_config_mgr.add(args, force).await {
-                return if err.code == ERR_TIER_ALREADY_EXISTS.code {
+                return if err.code == ERR_TIER_RESERVED_NAME.code {
+                    warn!(
+                        event = EVENT_ADMIN_TIER_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_TIER,
+                        action = "add_tier",
+                        tier_name = %tier_name_for_log,
+                        result = "reserved_name_rejected",
+                        "admin tier state"
+                    );
+                    Err(s3_error!(InvalidRequest, "Cannot use reserved tier name"))
+                } else if err.code == ERR_TIER_ALREADY_EXISTS.code {
                     Err(S3Error::with_message(
                         S3ErrorCode::Custom("TierNameAlreadyExist".into()),
                         "tier name already exists",

@@ -41,7 +41,7 @@ use crate::error::{Error, Result, StorageError};
 use crate::services::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType},
-    tier_handlers::{ERR_TIER_ALREADY_EXISTS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND},
+    tier_handlers::{ERR_TIER_ALREADY_EXISTS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME},
     warm_backend::{check_warm_backend, new_warm_backend},
 };
 use crate::storage_api_contracts::{
@@ -761,6 +761,16 @@ impl TierConfigMgr {
         let tier_name = &tier_config.name;
         if tier_name != tier_name.to_uppercase().as_str() {
             return Err(ERR_TIER_NAME_NOT_UPPERCASE.clone());
+        }
+
+        // Reject AWS/MinIO reserved storage-class names as remote-tier names.
+        // MinIO reserves STANDARD and REDUCED_REDUNDANCY (RRS); a tier must not
+        // shadow them. The comparison is case-insensitive to match MinIO parity
+        // and to stay robust regardless of the uppercase gate above.
+        if tier_name.eq_ignore_ascii_case(crate::config::storageclass::STANDARD)
+            || tier_name.eq_ignore_ascii_case(crate::config::storageclass::RRS)
+        {
+            return Err(ERR_TIER_RESERVED_NAME.clone());
         }
 
         let (_, b) = self.is_tier_name_in_use(tier_name);
@@ -1612,28 +1622,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_does_not_reserve_standard_name_regression_anchor() {
-        // Regression anchor: RustFS does *not* currently reject the AWS-reserved
-        // tier names (STANDARD / REDUCED_REDUNDANCY). `add` accepts "STANDARD"
-        // (uppercase, not in use) and only fails later at backend construction
-        // because the payload is absent -- proving no reserved-name guard fired.
-        // If a reserved-name check is ever added, this assertion should flip to
-        // `ERR_TIER_RESERVED_NAME` and this comment be removed.
-        let mut mgr = empty_mgr();
-        let tier = TierConfig {
-            version: "v1".to_string(),
-            tier_type: TierType::Unsupported,
-            name: "STANDARD".to_string(),
-            ..Default::default()
-        };
-        let err = mgr
-            .add(tier, true)
-            .await
-            .expect_err("no backend payload => construction error");
-        assert_eq!(
-            err.code, ERR_TIER_TYPE_UNSUPPORTED.code,
-            "STANDARD is not specially rejected; it reaches the type check"
-        );
+    async fn test_add_rejects_reserved_names() {
+        // Supersedes the former `test_add_does_not_reserve_standard_name_regression_anchor`
+        // (added by PR #4713 to pin the pre-fix behavior). RustFS now rejects the
+        // AWS/MinIO reserved storage-class names STANDARD and REDUCED_REDUNDANCY
+        // (RRS) as remote-tier names, matching MinIO parity.
+        //
+        // `tier_type` is deliberately `Unsupported`: before the guard existed,
+        // "STANDARD" reached `new_warm_backend` and failed with
+        // `ERR_TIER_TYPE_UNSUPPORTED`. Asserting `ERR_TIER_RESERVED_NAME` here
+        // proves the reserved-name guard fires *before* the type/backend check.
+        for reserved in [crate::config::storageclass::STANDARD, crate::config::storageclass::RRS] {
+            let mut mgr = empty_mgr();
+            let tier = TierConfig {
+                version: "v1".to_string(),
+                tier_type: TierType::Unsupported,
+                name: reserved.to_string(),
+                ..Default::default()
+            };
+            let err = mgr.add(tier, true).await.expect_err("reserved tier name must be rejected");
+            assert_eq!(
+                err.code, ERR_TIER_RESERVED_NAME.code,
+                "reserved tier name {reserved} must be rejected before the type check"
+            );
+            assert!(mgr.tiers.is_empty(), "rejected reserved tier {reserved} must not be persisted");
+        }
     }
 
     // ---- edit -----------------------------------------------------------
