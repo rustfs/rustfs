@@ -72,8 +72,8 @@ on:
     - cron: "0 6 * * 0"
 
 env:
-  S3_ACCESS_KEY: rustfsadmin
-  S3_SECRET_KEY: rustfsadmin
+  S3_ACCESS_KEY: rustfsadmin-ci
+  S3_SECRET_KEY: rustfssecret-ci
   S3_REGION: us-east-1
 
   RUST_LOG: info
