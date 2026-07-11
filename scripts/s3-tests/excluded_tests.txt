@@ -180,12 +180,6 @@ test_lifecycle_expiration_size_lt
 test_lifecycle_expiration_tags2
 test_lifecycle_expiration_versioned_tags2
 #
-# --- Validation gap: RustFS accepts Expiration{Days:0} (returns 200; only
-#     Days<0 is rejected in crates/lifecycle/src/core.rs validate()), whereas AWS
-#     and this test expect InvalidArgument. Enable after the product rejects
-#     zero-day Expiration rules. Tracking: still-excluded gap noted in ilm-10 PR.
-test_lifecycle_expiration_days0
-#
 # --- Storage-class transition to a remote/warm tier. Needs a real tier backend
 #     (the hermetic second-RustFS cold layer from ilm-7) which is not wired into
 #     the s3-tests topology. Queued behind ilm-7.
