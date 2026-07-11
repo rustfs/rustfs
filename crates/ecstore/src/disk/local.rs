@@ -13447,6 +13447,19 @@ mod test {
         assert!(!is_io_uring_unsupported(&Error::other("driver gone")));
     }
 
+    /// Non-vacuity gate for the io_uring tests (backlog#1179). Emits a grep-able
+    /// `SKIP <name>` line and, when `RUSTFS_URING_TESTS_MUST_RUN` is set — a CI
+    /// leg that guarantees io_uring is available (e.g. `seccomp=unconfined`) —
+    /// panics instead of skipping, so a suite that silently degraded to
+    /// StdBackend cannot merge green.
+    #[cfg(target_os = "linux")]
+    fn uring_test_skip(name: &str) {
+        if std::env::var_os("RUSTFS_URING_TESTS_MUST_RUN").is_some() {
+            panic!("SKIP {name}: io_uring unavailable but RUSTFS_URING_TESTS_MUST_RUN is set — this leg must exercise io_uring");
+        }
+        eprintln!("SKIP {name}: io_uring unavailable (restricted environment)");
+    }
+
     /// Per-disk probe cache (backlog#1101): a disk already recorded as
     /// unsupported is skipped by `try_new` without a fresh probe.
     #[cfg(target_os = "linux")]
@@ -13462,6 +13475,7 @@ mod test {
         // shutting its driver down.)
         let probe_dir = tempdir().expect("tempdir");
         if UringBackend::try_new(probe_dir.path().to_path_buf()).is_none() {
+            uring_test_skip("uring_probe_cache_skips_known_unsupported_disk");
             return;
         }
 
@@ -13579,7 +13593,7 @@ mod test {
         ) else {
             // Restricted environment (CI seccomp): io_uring is unavailable, so
             // there is no descriptor cache to exercise. Do not vacuously pass.
-            eprintln!("SKIP uring_fd_cache_hides_a_healed_shard_until_invalidated: io_uring unavailable");
+            uring_test_skip("uring_fd_cache_hides_a_healed_shard_until_invalidated");
             return;
         };
         assert!(backend.fd_cache.is_some(), "the cache must be on for this test to mean anything");
@@ -13742,7 +13756,7 @@ mod test {
         let uring_backend: Option<Arc<dyn LocalIoBackend>> =
             UringBackend::try_new(root.clone()).map(|b| Arc::new(b) as Arc<dyn LocalIoBackend>);
         if uring_backend.is_none() {
-            eprintln!("SKIP io_uring half: io_uring unavailable (restricted environment)");
+            uring_test_skip("io_uring_reclaims_page_cache_exactly_like_std (io_uring half)");
         }
 
         // `residency_after` reads the whole file first so the pages are certainly
@@ -13882,6 +13896,7 @@ mod test {
 
         // Skip if io_uring is unavailable on this host (restricted env).
         let Some(backend) = UringBackend::try_new(root) else {
+            uring_test_skip("uring_backend_latched_off_reads_via_std");
             return;
         };
         backend.active.store(false, Ordering::Relaxed);
