@@ -60,7 +60,7 @@ temp-env = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 tokio = { workspace = true, features = ["test-util"] }
 # Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
-# `rustfs_ecstore::api::tier::test_util` (rustfs/backlog#1148 ilm-6).
+# the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
 rustfs-ecstore = { workspace = true, features = ["test-util"] }
 
 [lib]

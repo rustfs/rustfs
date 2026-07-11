@@ -38,8 +38,8 @@ use uuid::Uuid;
 mod storage_api;
 
 use storage_api::lifecycle::{
-    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskAPI as _, DiskOption,
-    ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
+    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskOption, ECStore,
+    EcstoreError, Endpoint, EndpointServerPools, Endpoints, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
     MakeBucketOptions, MockWarmBackend, MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints,
     STORAGE_FORMAT_FILE, TransitionOptions, assert_transition_meta_consistent, enqueue_transition_for_existing_objects,
     expire_transitioned_object, free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
@@ -625,7 +625,7 @@ mod serial_tests {
             .expect("object should transition before expiry");
         let remote_object = transitioned.transitioned_object.name.clone();
         assert!(
-            backend.objects.lock().await.contains_key(&remote_object),
+            backend.contains(&remote_object).await,
             "transitioned remote object should exist in the mock tier before expiry"
         );
         assert_eq!(
@@ -713,7 +713,7 @@ mod serial_tests {
              ordering, #3491); remote cleanup is deferred to free-version recovery"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&remote_object),
+            backend.contains(&remote_object).await,
             "remote tier object must still exist immediately after expiry (deferred cleanup, #3491)"
         );
 

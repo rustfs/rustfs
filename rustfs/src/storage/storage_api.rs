@@ -335,8 +335,6 @@ pub(crate) mod ecstore_capacity {
 }
 
 pub(crate) mod ecstore_client {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::client::transition_api;
     pub(crate) use rustfs_ecstore::api::client::{admin_handler_utils, object_api_utils};
 }
 

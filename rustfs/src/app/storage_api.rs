@@ -804,12 +804,6 @@ pub(crate) mod bucket {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) mod transition_api {
-        pub(crate) type ReadCloser = crate::storage::storage_api::ecstore_client::transition_api::ReadCloser;
-        pub(crate) type ReaderImpl = crate::storage::storage_api::ecstore_client::transition_api::ReaderImpl;
-    }
-
     pub(crate) mod versioning_sys {
         pub(crate) type BucketVersioningSys = crate::storage::storage_api::ecstore_bucket::versioning_sys::BucketVersioningSys;
     }

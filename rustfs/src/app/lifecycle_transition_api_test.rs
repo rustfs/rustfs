@@ -895,13 +895,7 @@ async fn get_transitioned_object_uses_remote_codec_fallback_path() {
         assert_eq!(transitioned.transitioned_object.status, "complete");
         assert_eq!(transitioned.transitioned_object.tier, tier_name);
         assert!(!transitioned.transitioned_object.name.is_empty());
-        assert!(
-            backend
-                .objects
-                .lock()
-                .await
-                .contains_key(&transitioned.transitioned_object.name)
-        );
+        assert!(backend.contains(&transitioned.transitioned_object.name).await);
 
         let actual = read_object_bytes(&ecstore, bucket.as_str(), object).await;
         assert_eq!(actual, payload);
