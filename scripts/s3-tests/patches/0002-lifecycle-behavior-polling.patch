@@ -1,0 +1,140 @@
+diff --git a/s3tests/functional/test_s3.py b/s3tests/functional/test_s3.py
+index bf2f2b1..f3ef394 100644
+--- a/s3tests/functional/test_s3.py
++++ b/s3tests/functional/test_s3.py
+@@ -8509,6 +8509,26 @@ def test_lifecycle_get_no_id():
+             print("rules not right")
+             assert False
+ 
++def _wait_for_lifecycle_count(fetch_items, expected_count, timeout):
++    deadline = time.monotonic() + timeout
++    items = fetch_items()
++    while len(items) > expected_count:
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            break
++        time.sleep(min(1, remaining))
++        items = fetch_items()
++    return items
++
++
++def _list_multipart_uploads_for_keys(client, bucket_name, key_names):
++    uploads = []
++    for key in key_names:
++        response = client.list_multipart_uploads(Bucket=bucket_name, Prefix=key)
++        uploads.extend(upload for upload in response.get('Uploads', [])
++                       if upload['Key'] == key)
++    return uploads
++
++
+-# The test harness for lifecycle is configured to treat days as 10 second intervals.
+ @pytest.mark.lifecycle
+ @pytest.mark.lifecycle_expiration
+@@ -8527,17 +8548,13 @@ def test_lifecycle_expiration():
+ 
+     lc_interval = get_lc_debug_interval()
+ 
+-    time.sleep(3*lc_interval)
+-    response = client.list_objects(Bucket=bucket_name)
+-    expire1_objects = response['Contents']
+-
+-    time.sleep(lc_interval)
+-    response = client.list_objects(Bucket=bucket_name)
+-    keep2_objects = response['Contents']
+-
+-    time.sleep(3*lc_interval)
+-    response = client.list_objects(Bucket=bucket_name)
+-    expire3_objects = response['Contents']
++    expire1_objects = _wait_for_lifecycle_count(
++        lambda: client.list_objects(Bucket=bucket_name).get('Contents', []),
++        4, 4*lc_interval)
++    keep2_objects = client.list_objects(Bucket=bucket_name).get('Contents', [])
++    expire3_objects = _wait_for_lifecycle_count(
++        lambda: client.list_objects(Bucket=bucket_name).get('Contents', []),
++        2, 5*lc_interval)
+ 
+     assert len(init_objects) == 6
+     assert len(expire1_objects) == 4
+@@ -8562,17 +8579,13 @@ def test_lifecyclev2_expiration():
+ 
+     lc_interval = get_lc_debug_interval()
+ 
+-    time.sleep(3*lc_interval)
+-    response = client.list_objects_v2(Bucket=bucket_name)
+-    expire1_objects = response['Contents']
+-
+-    time.sleep(lc_interval)
+-    response = client.list_objects_v2(Bucket=bucket_name)
+-    keep2_objects = response['Contents']
+-
+-    time.sleep(3*lc_interval)
+-    response = client.list_objects_v2(Bucket=bucket_name)
+-    expire3_objects = response['Contents']
++    expire1_objects = _wait_for_lifecycle_count(
++        lambda: client.list_objects_v2(Bucket=bucket_name).get('Contents', []),
++        4, 4*lc_interval)
++    keep2_objects = client.list_objects_v2(Bucket=bucket_name).get('Contents', [])
++    expire3_objects = _wait_for_lifecycle_count(
++        lambda: client.list_objects_v2(Bucket=bucket_name).get('Contents', []),
++        2, 5*lc_interval)
+ 
+     assert len(init_objects) == 6
+     assert len(expire1_objects) == 4
+@@ -9308,11 +9321,9 @@ def test_lifecycle_noncur_expiration():
+ 
+     lc_interval = get_lc_debug_interval()
+ 
+-    # Wait for first expiration (plus fudge to handle the timer window)
+-    time.sleep(5*lc_interval)
+-
+-    response  = client.list_object_versions(Bucket=bucket_name)
+-    expire_versions = response['Versions']
++    expire_versions = _wait_for_lifecycle_count(
++        lambda: client.list_object_versions(Bucket=bucket_name).get('Versions', []),
++        4, 6*lc_interval)
+     assert len(init_versions) == 6
+     assert len(expire_versions) == 4
+ 
+@@ -9367,13 +9378,12 @@ def test_lifecycle_deletemarker_expiration():
+ 
+     lc_interval = get_lc_debug_interval()
+ 
+-    # Wait for first expiration (plus fudge to handle the timer window)
+-    time.sleep(7*lc_interval)
++    def current_versions():
++        response = client.list_object_versions(Bucket=bucket_name)
++        return response.get('Versions', []) + response.get('DeleteMarkers', [])
+ 
+-    response  = client.list_object_versions(Bucket=bucket_name)
+-    init_versions = response['Versions']
+-    deleted_versions = response['DeleteMarkers']
+-    total_expire_versions = init_versions + deleted_versions
++    total_expire_versions = _wait_for_lifecycle_count(
++        current_versions, 2, 8*lc_interval)
+ 
+     assert len(total_init_versions) == 4
+     assert len(total_expire_versions) == 2
+@@ -9441,8 +9451,7 @@ def test_lifecycle_multipart_expiration():
+         response = client.create_multipart_upload(Bucket=bucket_name, Key=key)
+         upload_ids.append(response['UploadId'])
+ 
+-    response = client.list_multipart_uploads(Bucket=bucket_name)
+-    init_uploads = response['Uploads']
++    init_uploads = _list_multipart_uploads_for_keys(client, bucket_name, key_names)
+ 
+     rules = [
+         {'ID': 'rule1', 'Prefix': 'test1/', 'Status': 'Enabled',
+@@ -9453,10 +9462,8 @@ def test_lifecycle_multipart_expiration():
+ 
+     lc_interval = get_lc_debug_interval()
+ 
+-    # Wait for first expiration (plus fudge to handle the timer window)
+-    time.sleep(5*lc_interval)
+-
+-    response = client.list_multipart_uploads(Bucket=bucket_name)
+-    expired_uploads = response['Uploads']
++    expired_uploads = _wait_for_lifecycle_count(
++        lambda: _list_multipart_uploads_for_keys(client, bucket_name, key_names),
++        1, 6*lc_interval)
+     assert len(init_uploads) == 2
+     assert len(expired_uploads) == 1

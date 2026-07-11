@@ -566,15 +566,14 @@ jobs:
           RUN_ROOT="${RUNNER_TEMP}/rustfs-s3tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
           mkdir -p "${RUN_ROOT}"
           S3_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-          # Serial (XDIST=0) for timing determinism: the cases sleep on multiples
-          # of the debug day and assert scanner-driven deletion.
           DEPLOY_MODE=binary \
           RUSTFS_BINARY=./target/debug/rustfs \
           TEST_MODE=single \
           MAXFAIL=0 \
           XDIST=0 \
           IMPLEMENTED_TESTS_FILE=scripts/s3-tests/lifecycle_behavior_tests.txt \
-          RUSTFS_ILM_DEBUG_DAY_SECS=10 \
+          RUSTFS_ILM_DEBUG_DAY_SECS=2 \
+          RUSTFS_ILM_PROCESS_TIME=1 \
           RUSTFS_SCANNER_ENABLED=true \
           RUSTFS_SCANNER_CYCLE=2 \
           RUSTFS_SCANNER_START_DELAY_SECS=0 \
