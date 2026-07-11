@@ -4359,6 +4359,11 @@ impl LocalDisk {
                 {
                     return Err(err);
                 };
+
+                // The version's data dir was staged or trashed; drop any cached
+                // io_uring descriptors under it so a deleted `part.N` cannot keep
+                // answering reads (rustfs/backlog#1175).
+                self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{dir}"));
             }
         }
 
@@ -6876,6 +6881,10 @@ impl DiskAPI for LocalDisk {
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
             self.move_to_trash(&file_path, false, false).await?;
+
+            // A cached io_uring descriptor under a just-removed path would keep
+            // its inode readable; drop it (rustfs/backlog#1175).
+            self.io_backend.invalidate_cached_fds_under(volume, path);
         }
 
         Ok(())
@@ -7239,6 +7248,13 @@ impl DiskAPI for LocalDisk {
             {
                 return Err(err);
             }
+
+            // The version's data dir was staged for rollback or trashed, so its
+            // `part.N` inodes no longer exist for readers. A cached io_uring
+            // descriptor would keep serving them, so drop every cached fd under
+            // this data dir (rustfs/backlog#1175). If a later rollback restores
+            // the dir, the next read simply re-opens it.
+            self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{uuid}"));
         }
 
         let commit_result = if !meta.versions.is_empty() {
