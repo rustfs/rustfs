@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub mod tier;
 pub mod tier_admin;
 pub mod tier_config;

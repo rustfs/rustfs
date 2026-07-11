@@ -14,27 +14,23 @@
 
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
-use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
 use rustfs_scanner::{
     ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
     scanner::init_data_scanner,
 };
-use rustfs_utils::path::path_join_buf;
 use s3s::dto::RestoreRequest;
 use serial_test::serial;
 use std::{
     collections::HashMap,
     env,
-    io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, Once, OnceLock},
     time::Duration,
 };
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
@@ -42,13 +38,13 @@ use uuid::Uuid;
 mod storage_api;
 
 use storage_api::lifecycle::{
-    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskAPI as _, DiskOption,
-    ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
-    MakeBucketOptions, MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints, ReadCloser, ReaderImpl,
-    STORAGE_FORMAT_FILE, ScannerWarmBackend, TierConfig, TierMinIO, TierType, TransitionOptions, WarmBackendGetOpts,
-    build_transition_put_options, enqueue_transition_for_existing_objects, expire_transitioned_object, get_bucket_metadata,
-    get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
-    is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, update_bucket_metadata,
+    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskOption, ECStore,
+    EcstoreError, Endpoint, EndpointServerPools, Endpoints, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
+    MakeBucketOptions, MockWarmBackend, MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints,
+    STORAGE_FORMAT_FILE, TransitionOptions, assert_transition_meta_consistent, enqueue_transition_for_existing_objects,
+    expire_transitioned_object, free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
+    init_bucket_metadata_sys, init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk,
+    path2_bucket_object_with_base_path, register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
 };
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
@@ -397,67 +393,6 @@ async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &
     }
 }
 
-async fn wait_for_remote_absence(backend: &MockWarmBackend, object: &str, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        if !backend.objects.lock().await.contains_key(object) {
-            return true;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn free_version_count(disk_path: &Path, bucket: &str, object: &str) -> usize {
-    let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
-    endpoint.set_pool_index(0);
-    endpoint.set_set_index(0);
-    endpoint.set_disk_index(0);
-    let disk = new_disk(
-        &endpoint,
-        &DiskOption {
-            cleanup: false,
-            health_check: false,
-        },
-    )
-    .await
-    .expect("failed to open local disk");
-    let data = disk
-        .read_metadata(bucket, &path_join_buf(&[object, STORAGE_FORMAT_FILE]))
-        .await;
-    let Ok(data) = data else {
-        return 0;
-    };
-    let meta = FileMeta::load(&data).expect("failed to load file metadata");
-    meta.get_file_info_versions(bucket, object, false)
-        .expect("failed to decode file info versions")
-        .free_versions
-        .len()
-}
-
-/// The free-version metadata removal lands asynchronously after the remote
-/// object disappears, so poll instead of asserting a single read.
-async fn wait_for_free_version_absence(disk_path: &Path, bucket: &str, object: &str, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        if free_version_count(disk_path, bucket, object).await == 0 {
-            return true;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 async fn object_version_count(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> usize {
     let mut marker = None;
     let mut version_marker = None;
@@ -488,22 +423,6 @@ async fn wait_for_version_count(ecstore: &Arc<ECStore>, bucket: &str, object: &s
 
     loop {
         if object_version_count(ecstore, bucket, object).await == expected {
-            return true;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn wait_for_remote_object_count(backend: &MockWarmBackend, expected: usize, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        if backend.objects.lock().await.len() == expected {
             return true;
         }
 
@@ -595,147 +514,11 @@ async fn scan_object_metadata(disk_path: &Path, bucket: &str, object: &str) {
     disk.get_size(item).await.expect("scanner get_size should succeed");
 }
 
-#[derive(Clone, Default)]
-struct MockStoredObject {
-    bytes: Vec<u8>,
-    metadata: HashMap<String, String>,
-}
-
-#[derive(Clone, Default)]
-struct MockWarmBackend {
-    objects: Arc<Mutex<HashMap<String, MockStoredObject>>>,
-    // Ordered log of remote-tier mutating operations observed by this backend
-    // (e.g. `remove:<obj>`). Used by the expire/GET race regression test to
-    // assert that `expire_transitioned_object` never issues a synchronous
-    // remote-tier removal (the #3491 local-first ordering contract).
-    ops_log: Arc<Mutex<Vec<String>>>,
-}
-
-#[allow(dead_code)]
-impl MockWarmBackend {
-    async fn remote_remove_count(&self) -> usize {
-        self.ops_log
-            .lock()
-            .await
-            .iter()
-            .filter(|op| op.starts_with("remove:"))
-            .count()
-    }
-}
-
-impl MockWarmBackend {
-    async fn put_bytes(&self, object: &str, bytes: Vec<u8>, metadata: HashMap<String, String>) -> String {
-        self.objects
-            .lock()
-            .await
-            .insert(object.to_string(), MockStoredObject { bytes, metadata });
-        Uuid::new_v4().to_string()
-    }
-
-    async fn read_bytes(&self, reader: ReaderImpl) -> Result<Vec<u8>, std::io::Error> {
-        match reader {
-            ReaderImpl::Body(bytes) => Ok(bytes.to_vec()),
-            ReaderImpl::ObjectBody(mut reader) => {
-                let mut buf = Vec::new();
-                reader.stream.read_to_end(&mut buf).await?;
-                Ok(buf)
-            }
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ScannerWarmBackend for MockWarmBackend {
-    async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
-        let bytes = self.read_bytes(r).await?;
-        Ok(self.put_bytes(object, bytes, HashMap::new()).await)
-    }
-
-    async fn put_with_meta(
-        &self,
-        object: &str,
-        r: ReaderImpl,
-        _length: i64,
-        meta: HashMap<String, String>,
-    ) -> Result<String, std::io::Error> {
-        let bytes = self.read_bytes(r).await?;
-        let opts = build_transition_put_options(String::new(), meta);
-        let mut metadata = opts.user_metadata.clone();
-        if !opts.content_type.is_empty() {
-            metadata.insert("content-type".to_string(), opts.content_type.clone());
-        }
-        if !opts.content_encoding.is_empty() {
-            metadata.insert("content-encoding".to_string(), opts.content_encoding.clone());
-        }
-        if !opts.cache_control.is_empty() {
-            metadata.insert("cache-control".to_string(), opts.cache_control.clone());
-        }
-        if !opts.internal.replication_status.as_str().is_empty() {
-            metadata.insert(
-                "x-amz-replication-status".to_string(),
-                opts.internal.replication_status.as_str().to_string(),
-            );
-        }
-        if !opts.legalhold.as_str().is_empty() {
-            metadata.insert("x-amz-object-lock-legal-hold".to_string(), opts.legalhold.as_str().to_string());
-        }
-        Ok(self.put_bytes(object, bytes, metadata).await)
-    }
-
-    async fn get(&self, object: &str, _rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        let objects = self.objects.lock().await;
-        let Some(stored) = objects.get(object) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "mock object not found"));
-        };
-        let bytes = &stored.bytes;
-
-        let start = opts.start_offset.max(0) as usize;
-        let end = if opts.length > 0 {
-            start.saturating_add(opts.length as usize).min(bytes.len())
-        } else {
-            bytes.len()
-        };
-
-        Ok(tokio::io::BufReader::new(Cursor::new(bytes[start.min(bytes.len())..end].to_vec())))
-    }
-
-    async fn remove(&self, object: &str, _rv: &str) -> Result<(), std::io::Error> {
-        self.ops_log.lock().await.push(format!("remove:{object}"));
-        self.objects.lock().await.remove(object);
-        Ok(())
-    }
-
-    async fn in_use(&self) -> Result<bool, std::io::Error> {
-        Ok(false)
-    }
-}
-
+/// Register the shared [`MockWarmBackend`] into the global tier config manager
+/// used by the scanner integration tests. Thin wrapper over the shared
+/// `register_mock_tier` helper (rustfs/backlog#1148 ilm-6).
 async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
-    let backend = MockWarmBackend::default();
-    let tier_config_mgr_handle = get_global_tier_config_mgr();
-    let mut tier_config_mgr = tier_config_mgr_handle.write().await;
-    tier_config_mgr.tiers.insert(
-        tier_name.to_string(),
-        TierConfig {
-            version: "v1".to_string(),
-            tier_type: TierType::MinIO,
-            name: tier_name.to_string(),
-            minio: Some(TierMinIO {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-                bucket: "mock-tier".to_string(),
-                endpoint: "http://127.0.0.1:0".to_string(),
-                prefix: format!("mock/{}/", Uuid::new_v4()),
-                region: String::new(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    );
-    tier_config_mgr
-        .driver_cache
-        .insert(tier_name.to_string(), Box::new(backend.clone()));
-    backend
+    register_mock_tier_util(&get_global_tier_config_mgr(), tier_name).await
 }
 
 async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> Option<ObjectInfo> {
@@ -842,11 +625,11 @@ mod serial_tests {
             .expect("object should transition before expiry");
         let remote_object = transitioned.transitioned_object.name.clone();
         assert!(
-            backend.objects.lock().await.contains_key(&remote_object),
+            backend.contains(&remote_object).await,
             "transitioned remote object should exist in the mock tier before expiry"
         );
         assert_eq!(
-            backend.remote_remove_count().await,
+            backend.remove_count().await,
             0,
             "no remote-tier removal should have happened before expiry"
         );
@@ -924,13 +707,13 @@ mod serial_tests {
         // remote `remove` was issued. Reverting to remote-first ordering makes
         // both assertions fail.
         assert_eq!(
-            backend.remote_remove_count().await,
+            backend.remove_count().await,
             0,
             "expire_transitioned_object must NOT issue a synchronous remote-tier removal (local-first \
              ordering, #3491); remote cleanup is deferred to free-version recovery"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&remote_object),
+            backend.contains(&remote_object).await,
             "remote tier object must still exist immediately after expiry (deferred cleanup, #3491)"
         );
 
@@ -953,7 +736,7 @@ mod serial_tests {
     #[serial]
     #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
     async fn test_transition_and_restore_flows() {
-        let (_disk_paths, ecstore) = setup_test_env().await;
+        let (disk_paths, ecstore) = setup_test_env().await;
 
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&tier_name).await;
@@ -993,11 +776,11 @@ mod serial_tests {
 
         assert_eq!(put_info.transitioned_object.status, "complete");
         assert_eq!(put_info.transitioned_object.tier, tier_name);
-        assert!(backend.objects.lock().await.contains_key(&put_info.transitioned_object.name));
+        assert!(backend.contains(&put_info.transitioned_object.name).await);
         {
-            let stored = backend.objects.lock().await;
-            let transitioned = stored
-                .get(&put_info.transitioned_object.name)
+            let transitioned = backend
+                .stored(&put_info.transitioned_object.name)
+                .await
                 .expect("transitioned object should be present in mock backend");
             assert_eq!(transitioned.metadata.get("content-type"), Some(&"text/plain".to_string()));
             assert!(
@@ -1009,6 +792,12 @@ mod serial_tests {
                 "transitioned objects must not invent object lock headers"
             );
         }
+
+        // Cross-shard xl.meta transition assertion helper (rustfs/backlog#1148 ilm-6):
+        // every disk must agree on the transition tuple for the object.
+        let put_meta = assert_transition_meta_consistent(&disk_paths, put_bucket.as_str(), put_object).await;
+        assert_eq!(put_meta.status, "complete");
+        assert_eq!(put_meta.tier, tier_name);
 
         let multipart_bucket = format!("test-immediate-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let multipart_object = "test/multipart.txt";
@@ -1063,13 +852,7 @@ mod serial_tests {
 
         assert_eq!(multipart_info.transitioned_object.status, "complete");
         assert_eq!(multipart_info.transitioned_object.tier, tier_name);
-        assert!(
-            backend
-                .objects
-                .lock()
-                .await
-                .contains_key(&multipart_info.transitioned_object.name)
-        );
+        assert!(backend.contains(&multipart_info.transitioned_object.name).await);
 
         let src_bucket = format!("test-immediate-copy-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let dst_bucket = format!("test-immediate-copy-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -1114,7 +897,7 @@ mod serial_tests {
 
         assert_eq!(copy_info.transitioned_object.status, "complete");
         assert_eq!(copy_info.transitioned_object.tier, tier_name);
-        assert!(backend.objects.lock().await.contains_key(&copy_info.transitioned_object.name));
+        assert!(backend.contains(&copy_info.transitioned_object.name).await);
 
         let bucket_name = format!("test-lifecycle-update-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let object_name = "test/existing.txt";
@@ -1137,7 +920,7 @@ mod serial_tests {
 
         assert_eq!(info.transitioned_object.status, "complete");
         assert_eq!(info.transitioned_object.tier, tier_name);
-        assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+        assert!(backend.contains(&info.transitioned_object.name).await);
 
         let bucket_name = format!("test-restore-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let object_name = "test/restore.txt";
@@ -1284,7 +1067,7 @@ mod serial_tests {
             .await
             .expect("object should transition before overwrite");
         let stale_remote_object = transitioned.transitioned_object.name.clone();
-        assert!(backend.objects.lock().await.contains_key(&stale_remote_object));
+        assert!(backend.contains(&stale_remote_object).await);
 
         ecstore
             .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
@@ -1296,7 +1079,7 @@ mod serial_tests {
             "deleting a transitioned null version should leave a free version for async cleanup"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&stale_remote_object),
+            backend.contains(&stale_remote_object).await,
             "stale transitioned remote object should still exist before scanner fallback runs"
         );
 
@@ -1304,7 +1087,9 @@ mod serial_tests {
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
-            wait_for_remote_absence(&backend, &stale_remote_object, TRANSITION_WAIT_TIMEOUT).await,
+            backend
+                .wait_for_remote_absence(&stale_remote_object, TRANSITION_WAIT_TIMEOUT)
+                .await,
             "scanner should enqueue stale free-version cleanup for the transitioned remote object"
         );
         assert!(
@@ -1344,7 +1129,7 @@ mod serial_tests {
             .await
             .expect("object should transition after compensation backfill");
         let stale_remote_object = transitioned.transitioned_object.name.clone();
-        assert!(backend.objects.lock().await.contains_key(&stale_remote_object));
+        assert!(backend.contains(&stale_remote_object).await);
 
         ecstore
             .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
@@ -1356,7 +1141,7 @@ mod serial_tests {
             "deleting a compensation-transitioned null version should leave a free version for async cleanup"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&stale_remote_object),
+            backend.contains(&stale_remote_object).await,
             "stale transitioned remote object should still exist before scanner cleanup runs"
         );
 
@@ -1364,7 +1149,9 @@ mod serial_tests {
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
-            wait_for_remote_absence(&backend, &stale_remote_object, TRANSITION_WAIT_TIMEOUT).await,
+            backend
+                .wait_for_remote_absence(&stale_remote_object, TRANSITION_WAIT_TIMEOUT)
+                .await,
             "scanner should clean stale remote object even after immediate compensation transitioned it"
         );
         assert!(
@@ -1400,7 +1187,7 @@ mod serial_tests {
             .await
             .expect("object should transition after immediate compensation backfill");
         let remote_object = transitioned.transitioned_object.name.clone();
-        assert!(backend.objects.lock().await.contains_key(&remote_object));
+        assert!(backend.contains(&remote_object).await);
 
         enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
             .await
@@ -1413,7 +1200,7 @@ mod serial_tests {
         assert_eq!(info.transitioned_object.status, "complete");
         assert_eq!(info.transitioned_object.tier, tier_name);
         assert_eq!(info.transitioned_object.name, remote_object);
-        assert!(backend.objects.lock().await.contains_key(&remote_object));
+        assert!(backend.contains(&remote_object).await);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1490,7 +1277,7 @@ mod serial_tests {
 
         assert_eq!(info.transitioned_object.status, "complete");
         assert_eq!(info.transitioned_object.tier, tier_name);
-        assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+        assert!(backend.contains(&info.transitioned_object.name).await);
 
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
@@ -1578,7 +1365,7 @@ mod serial_tests {
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
-            wait_for_remote_object_count(&backend, 2, TRANSITION_WAIT_TIMEOUT).await,
+            backend.wait_for_object_count(2, TRANSITION_WAIT_TIMEOUT).await,
             "noncurrent transition should still move the previous version into the remote tier"
         );
     }
@@ -1610,7 +1397,7 @@ mod serial_tests {
             .await
             .expect("current version should transition after compensation backfill");
         let remote_object = transitioned.transitioned_object.name.clone();
-        assert!(backend.objects.lock().await.contains_key(&remote_object));
+        assert!(backend.contains(&remote_object).await);
 
         ecstore
             .delete_object(
@@ -1626,7 +1413,7 @@ mod serial_tests {
             "versioned delete modeled with versioned flags should create a delete marker"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&remote_object),
+            backend.contains(&remote_object).await,
             "creating a delete marker should not remove the transitioned remote object version"
         );
     }
@@ -1658,7 +1445,7 @@ mod serial_tests {
             .await
             .expect("current version should transition after compensation backfill");
         let remote_object = transitioned.transitioned_object.name.clone();
-        assert!(backend.objects.lock().await.contains_key(&remote_object));
+        assert!(backend.contains(&remote_object).await);
 
         ecstore
             .delete_object(
@@ -1674,7 +1461,7 @@ mod serial_tests {
             "modeled versioned delete should create delete marker before cleanup"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&remote_object),
+            backend.contains(&remote_object).await,
             "delete marker creation should not remove transitioned remote object"
         );
 
@@ -1689,7 +1476,7 @@ mod serial_tests {
             "delete marker should remain before DelMarkerExpiration due time"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&remote_object),
+            backend.contains(&remote_object).await,
             "pre-due delete marker lifecycle scan should not remove transitioned remote object"
         );
 
@@ -1703,7 +1490,7 @@ mod serial_tests {
             "expired object delete marker lifecycle should eventually clean up the delete marker"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&remote_object),
+            backend.contains(&remote_object).await,
             "delete marker lifecycle cleanup should not remove transitioned remote object"
         );
     }
