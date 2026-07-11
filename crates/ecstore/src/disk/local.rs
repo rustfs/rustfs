@@ -9039,7 +9039,11 @@ mod test {
             }
         }
 
-        let _probe = os::file_sync_probe::set_blocking(dir.path());
+        // Use the disk's canonicalized root path — on macOS, tempfile returns
+        // /var/folders/... while LocalDisk resolves to /private/var/folders/...
+        // via dunce::canonicalize. The probe's starts_with check would fail
+        // with the non-canonical path, causing wait_for_active to hang.
+        let _probe = os::file_sync_probe::set_blocking(&disk.root);
         let first = {
             let disk = disk.clone();
             tokio::spawn(async move {
