@@ -24,9 +24,10 @@ use std::{
     io::ErrorKind,
     pin::Pin,
     sync::{Arc, OnceLock},
+    task::{Context, Poll},
     time::Duration,
 };
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::spawn;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
@@ -100,6 +101,56 @@ async fn take_fallback_candidate<T>(fallback_items: &Arc<TokioMutex<VecDeque<T>>
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn classify_listing_quorum_failure(errors: &[DiskError]) -> DiskError {
+    if errors.contains(&DiskError::Timeout) {
+        return DiskError::Timeout;
+    }
+    if let Some(first) = errors.first()
+        && !matches!(first, DiskError::Io(_))
+        && errors.iter().all(|err| err == first)
+    {
+        return first.clone();
+    }
+    DiskError::ErasureReadQuorum
+}
+
+struct PublishedBytesWriter<W> {
+    inner: W,
+    published: bool,
+}
+
+impl<W> PublishedBytesWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, published: false }
+    }
+
+    fn has_published(&self) -> bool {
+        self.published
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for PublishedBytesWriter<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                if written != 0 && !self.published {
+                    self.published = true;
+                }
+                Poll::Ready(Ok(written))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
@@ -223,12 +274,12 @@ async fn list_path_raw_inner(
         let (rd, wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
         jobs.push(spawn(async move {
+            let mut wr = PublishedBytesWriter::new(wr);
             #[cfg(test)]
             let test_primary_error = if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
                 match behavior {
                     TestReaderBehavior::Eof => return Ok(()),
                     TestReaderBehavior::Entries(entries) => {
-                        let mut wr = wr;
                         let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
                         out.write(&entries).await.expect("test entries should be written");
                         out.close().await.expect("test entries should close");
@@ -250,20 +301,17 @@ async fn list_path_raw_inner(
                     }
                     TestReaderBehavior::PrimaryErrorThenFallback(err) => Some(err),
                     TestReaderBehavior::PartialThenTimeout(entries) => {
-                        let mut wr = wr;
                         let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
                         let err = DiskError::Timeout;
-                        record_producer_error(&producer_errs_clone, disk_idx, &err);
                         let _ = out.write(&entries).await;
                         drop(out);
-                        return Err(err);
+                        Some(err)
                     }
                 }
             } else {
                 None
             };
 
-            let mut wr = wr;
             let wakl_opts = WalkDirOptions {
                 bucket: opts_clone.bucket.clone(),
                 base_dir: opts_clone.path.clone(),
@@ -283,6 +331,10 @@ async fn list_path_raw_inner(
             let mut last_err = None;
             #[cfg(test)]
             if let Some(err) = test_primary_error {
+                if wr.has_published() {
+                    record_producer_error(&producer_errs_clone, disk_idx, &err);
+                    return Err(err);
+                }
                 last_err = Some(err);
                 need_fallback = true;
             }
@@ -333,6 +385,10 @@ async fn list_path_raw_inner(
                                 "Metacache walk_dir failed"
                             );
                         }
+                        if wr.has_published() {
+                            record_producer_error(&producer_errs_clone, disk_idx, &err);
+                            return Err(err);
+                        }
                         last_err = Some(err);
                         need_fallback = true;
                     }
@@ -371,11 +427,17 @@ async fn list_path_raw_inner(
                             last_err = Some(err);
                             continue;
                         }
-                        TestReaderBehavior::Stall
-                        | TestReaderBehavior::IgnoreCancel
-                        | TestReaderBehavior::PartialThenTimeout(_) => {
+                        TestReaderBehavior::Stall | TestReaderBehavior::IgnoreCancel => {
                             last_err = Some(DiskError::Timeout);
                             continue;
+                        }
+                        TestReaderBehavior::PartialThenTimeout(entries) => {
+                            let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                            let err = DiskError::Timeout;
+                            let _ = out.write(&entries).await;
+                            drop(out);
+                            record_producer_error(&producer_errs_clone, disk_idx, &err);
+                            return Err(err);
                         }
                     }
                 }
@@ -488,6 +550,10 @@ async fn list_path_raw_inner(
                                 error = ?err,
                                 "Metacache fallback walk_dir failed"
                             );
+                        }
+                        if wr.has_published() {
+                            record_producer_error(&producer_errs_clone, disk_idx, &err);
+                            return Err(err);
                         }
                         last_err = Some(err);
                     }
@@ -693,15 +759,6 @@ async fn list_path_raw_inner(
                 if let Some(finished_fn) = opts.finished.as_ref() {
                     finished_fn(&errs).await;
                 }
-                if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
-                    return Err(DiskError::Timeout);
-                }
-                let mut err_iter = errs.iter().flatten();
-                if let Some(err) = err_iter.next()
-                    && err_iter.next().is_none()
-                {
-                    return Err(err.clone());
-                }
                 let mut combined_err = Vec::new();
                 errs.iter().zip(opts.disks.iter()).for_each(|(err, disk)| match (err, disk) {
                     (Some(err), Some(disk)) => {
@@ -723,7 +780,8 @@ async fn list_path_raw_inner(
                     error = %combined_err.join(", "),
                     "Metacache listing quorum failed"
                 );
-                return Err(DiskError::other(combined_err.join(", ")));
+                let failures = errs.iter().flatten().cloned().collect::<Vec<_>>();
+                return Err(classify_listing_quorum_failure(&failures));
             }
 
             // Break if all at EOF or error.
@@ -872,7 +930,7 @@ async fn list_path_raw_inner(
     }
 
     if job_errs.len() > max_disk_failures {
-        return Err(job_errs.remove(0));
+        return Err(classify_listing_quorum_failure(&job_errs));
     }
 
     // warn!("list_path_raw: done");
@@ -921,6 +979,44 @@ mod tests {
         .expect_err("impossible listing quorum should fail before producing partial results");
 
         assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_returns_typed_quorum_error_for_multiple_drive_failures() {
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::ProducerError(DiskError::other("/sensitive/disk-a")),
+                    TestReaderBehavior::ProducerError(DiskError::other("http://internal-node/disk-b")),
+                    TestReaderBehavior::Eof,
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("multiple producer failures beyond tolerance should fail listing quorum");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+        assert!(!err.to_string().contains("sensitive"));
+        assert!(!err.to_string().contains("internal-node"));
+    }
+
+    #[test]
+    fn listing_quorum_failure_never_returns_raw_io_details() {
+        let err = classify_listing_quorum_failure(&[DiskError::other("/sensitive/disk-a")]);
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+        assert!(!err.to_string().contains("sensitive"));
+
+        let access_denied = classify_listing_quorum_failure(&[DiskError::FileAccessDenied, DiskError::FileAccessDenied]);
+        assert_eq!(access_denied, DiskError::FileAccessDenied);
+
+        let mixed_timeout =
+            classify_listing_quorum_failure(&[DiskError::Timeout, DiskError::FileAccessDenied, DiskError::ErasureReadQuorum]);
+        assert_eq!(mixed_timeout, DiskError::Timeout);
     }
 
     #[test]
@@ -1063,6 +1159,27 @@ mod tests {
         )
         .await
         .expect_err("stalled reader should fail when read quorum cannot be met");
+
+        assert_eq!(err, DiskError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_prefers_timeout_for_mixed_errors_beyond_quorum_budget() {
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::ProducerError(DiskError::FileAccessDenied),
+                    TestReaderBehavior::ProducerError(DiskError::Timeout),
+                    TestReaderBehavior::Eof,
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("mixed failures beyond the tolerated budget should fail listing");
 
         assert_eq!(err, DiskError::Timeout);
     }
@@ -1211,8 +1328,9 @@ mod tests {
     async fn list_path_raw_returns_timeout_when_producer_fails_after_partial_entry() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
+        let claim_tracker = FallbackClaimTracker::default();
 
-        let err = list_path_raw(
+        let err = list_path_raw_with_claim_tracker(
             CancellationToken::new(),
             ListPathRawOptions {
                 disks: vec![None],
@@ -1223,6 +1341,7 @@ mod tests {
                     cached: None,
                     reusable: false,
                 }])],
+                test_fallback_reader_behaviors: vec![TestReaderBehavior::Entries(vec![fallback_test_entry()])],
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     let seen = seen_clone.clone();
                     Box::pin(async move {
@@ -1231,12 +1350,59 @@ mod tests {
                 })),
                 ..Default::default()
             },
+            claim_tracker.clone(),
         )
         .await
         .expect_err("producer timeout after partial output must fail the listing");
 
         assert_eq!(err, DiskError::Timeout);
         assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["bucket/object".to_string()]);
+        assert!(
+            claim_tracker.claimed_keys().await.is_empty(),
+            "fallback must not append a second metacache stream after partial output"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_does_not_try_second_fallback_after_partial_fallback_output() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let claim_tracker = FallbackClaimTracker::default();
+
+        let err = list_path_raw_with_claim_tracker(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::PrimaryErrorThenFallback(DiskError::DiskNotFound)],
+                test_fallback_reader_behaviors: vec![
+                    TestReaderBehavior::PartialThenTimeout(vec![MetaCacheEntry {
+                        name: "bucket/partial-fallback".to_string(),
+                        metadata: vec![1, 2, 3],
+                        cached: None,
+                        reusable: false,
+                    }]),
+                    TestReaderBehavior::Entries(vec![fallback_test_entry()]),
+                ],
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    let seen = seen_clone.clone();
+                    Box::pin(async move {
+                        seen.lock().expect("seen mutex poisoned").push(entry.name);
+                    })
+                })),
+                ..Default::default()
+            },
+            claim_tracker.clone(),
+        )
+        .await
+        .expect_err("a fallback timeout after partial output must fail the listing");
+
+        assert_eq!(err, DiskError::Timeout);
+        assert_eq!(
+            seen.lock().expect("seen mutex poisoned").as_slice(),
+            &["bucket/partial-fallback".to_string()]
+        );
+        assert_eq!(claim_tracker.claimed_keys().await.len(), 1, "a second fallback must not be claimed");
     }
 
     #[tokio::test]

@@ -271,6 +271,7 @@ pub struct ListPathOptions {
 
 const MARKER_TAG_VERSION: &str = "v2";
 const LEGACY_MARKER_TAG_VERSIONS: &[&str] = &["v1", MARKER_TAG_VERSION];
+const LIST_CACHE_MARKER_PREFIX: &str = "[rustfs_cache:";
 const LIST_CURSOR_SOURCE_WALKER: &str = "walker";
 const LIST_CURSOR_SOURCE_INDEX_KEY_ONLY: &str = "index_key_only";
 const LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE: &str = "index_verified_page";
@@ -1831,7 +1832,7 @@ impl ListContinuationV2 {
     fn encode_marker(&self, marker: &str) -> String {
         let mut marker_tag = String::with_capacity(marker.len() + 64);
         marker_tag.push_str(marker);
-        marker_tag.push_str("[rustfs_cache:");
+        marker_tag.push_str(LIST_CACHE_MARKER_PREFIX);
         marker_tag.push_str(self.version);
         match &self.id {
             Some(id) => {
@@ -1926,6 +1927,13 @@ impl ListContinuationV2 {
             None
         }
     }
+}
+
+pub(crate) fn list_marker_key(marker: &str) -> &str {
+    marker
+        .rfind(LIST_CACHE_MARKER_PREFIX)
+        .filter(|start_idx| marker[*start_idx..].ends_with(']'))
+        .map_or(marker, |start_idx| &marker[..start_idx])
 }
 
 fn normalize_list_quorum(value: &str) -> &'static str {
@@ -3085,7 +3093,7 @@ impl ListPathOptions {
         let Some(marker) = self.marker.clone() else {
             return;
         };
-        let Some(start_idx) = marker.rfind("[rustfs_cache:") else {
+        let Some(start_idx) = marker.rfind(LIST_CACHE_MARKER_PREFIX) else {
             return;
         };
         let Some(end_offset) = marker[start_idx..].rfind(']') else {
