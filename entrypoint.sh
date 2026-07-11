@@ -120,8 +120,8 @@ trim_credential() {
 # Credential policy: images ship no baked-in credentials, but default or
 # missing credentials only WARN — the container still starts (the binary falls
 # back to its built-in default, and warns when both keys end up default).
-# Hard ERRORs are reserved for malformed configuration (conflicting sources,
-# unreadable files, empty values). The binary also accepts credentials via
+# Hard failures (ERROR, exit 1) are reserved for malformed configuration
+# (conflicting sources, unreadable files, empty values). The binary also accepts credentials via
 # legacy/compat envs (RUSTFS_ROOT_*, MINIO_*) that this script does not
 # inspect, so the missing-credential warning is phrased conditionally.
 validate_credential_source() {
