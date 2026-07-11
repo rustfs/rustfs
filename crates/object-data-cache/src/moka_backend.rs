@@ -996,4 +996,57 @@ mod tests {
         assert_eq!(rejected, TASKS, "the gate must reject every fill in the burst when memory is constrained");
         assert_eq!(backend.entry_count(), 0, "no body may be admitted under memory pressure");
     }
+
+    /// A burst that begins while the snapshot still reads *high* must be bounded
+    /// to the real headroom, not admitted wholesale. Each fill is large enough
+    /// that only a handful fit the budget; without the admitted-bytes reservation
+    /// every fill would read the same stale-high snapshot and be admitted,
+    /// over-allocating far past the budget before the 5 s refresh (backlog#1107).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn moka_backend_gate_reservation_bounds_burst_under_stale_snapshot() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let backend = Arc::new(MokaBackend::new(&memory_gated_config(), Arc::clone(&stats)).expect("moka backend should build"));
+        // Stale-but-high snapshot: 500 KiB available, 20% floor = 200 KiB, so the
+        // real budget above the floor is ~300 KiB.
+        backend
+            .memory_gate
+            .set_test_snapshot(Some(crate::memory::ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000_000,
+                available_bytes: 500_000,
+            }));
+
+        // 20 concurrent fills of 40 KiB each = 800 KiB requested, far past the
+        // ~300 KiB budget. Only ~7 should fit.
+        const TASKS: usize = 20;
+        const BODY: usize = 40_000;
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let backend = Arc::clone(&backend);
+            handles.push(tokio::spawn(async move {
+                let plan = versioned_plan(&format!("object-{t}"), "v1", &format!("etag-{t}"));
+                backend.fill_body(&plan, Bytes::from(vec![0u8; BODY])).await
+            }));
+        }
+        let mut admitted = 0usize;
+        for handle in handles {
+            if handle.await.expect("burst task should complete") == ObjectDataCacheFillResult::Inserted {
+                admitted += 1;
+            }
+        }
+
+        // The reservation must cap the burst: not every fill gets in (that is the
+        // stale-snapshot overshoot), yet some do (the gate is not just rejecting
+        // everything). The exact count varies with the check-then-reserve race,
+        // but the admitted bytes must stay within a small multiple of the budget.
+        assert!(
+            admitted < TASKS,
+            "reservation must bound the burst — not admit the whole {TASKS}-fill storm"
+        );
+        assert!(admitted >= 1, "the gate must still admit fills that fit the budget");
+        assert!(
+            admitted * BODY <= 500_000,
+            "admitted bytes ({}) must not exceed the snapshot's available memory",
+            admitted * BODY
+        );
+    }
 }
