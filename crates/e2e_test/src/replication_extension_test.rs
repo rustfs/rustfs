@@ -2598,18 +2598,8 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         "source bucket start status missing: {:?}",
         started
     );
-
-    let started_target =
-        wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |target| !target.reset_id.is_empty()).await?;
-    let started_reset_id = started_target.reset_id.clone();
-    // Resync target status strings come from ResyncStatusType's Display impl: a freshly
-    // started reset is "Pending" (queued) or "Ongoing" (ResyncStarted), and may already
-    // be "Completed" for this tiny dataset.
-    assert!(
-        matches!(started_target.status.as_str(), "Pending" | "Ongoing" | "Completed"),
-        "unexpected start status: {:?}",
-        started_target
-    );
+    assert!(!started.resync_id.is_empty(), "start response omitted the resync id: {:?}", started);
+    let started_reset_id = started.resync_id.clone();
 
     let canceled = site_replication_resync_op(&source_env, "cancel", &remote_peer).await?;
     assert_eq!(canceled.status, "success", "unexpected cancel result: {:?}", canceled);
@@ -2622,15 +2612,9 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         canceled
     );
 
-    // On fast loopback the tiny dataset can finish before the cancel lands, so the reset
-    // settles at either "Canceled" (cancel won the race) or "Completed" (resync finished
-    // first) — both are valid terminal outcomes of issuing cancel, and the control-plane
-    // cancel itself is already asserted via the op response above. Either way the reset id
-    // is unchanged (only a fresh start mints a new one).
-    let canceled_target = wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |target| {
-        matches!(target.status.as_str(), "Canceled" | "Completed")
-    })
-    .await?;
+    let canceled_target =
+        wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |target| target.status == "Canceled").await?;
+    assert_eq!(canceled_target.status, "Canceled");
     assert_eq!(canceled_target.reset_id, started_reset_id);
 
     let restarted = site_replication_resync_op(&source_env, "start", &remote_peer).await?;
