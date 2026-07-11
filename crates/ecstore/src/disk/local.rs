@@ -35,7 +35,7 @@ use crate::disk::{
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
-use metrics::counter;
+use metrics::{counter, gauge};
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
@@ -242,6 +242,10 @@ const EVENT_DISK_LOCAL_RENAME_REJECTED: &str = "disk_local_rename_rejected";
 const EVENT_DISK_LOCAL_READ_VERSION_FALLBACK: &str = "disk_local_read_version_fallback";
 #[cfg(target_os = "linux")]
 const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback";
+/// A disk latched io_uring off at runtime and now reads via StdBackend
+/// (rustfs/backlog#1172). The gray-release signal operators watch for.
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_LATCH_OFF: &str = "disk_local_uring_latch_off";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
@@ -249,6 +253,21 @@ const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_fail
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
 const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
 const METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_direct_read_page_faults_total";
+// io_uring read-backend gray-release observability (rustfs/backlog#1172).
+#[cfg(target_os = "linux")]
+const METRIC_URING_LATCH_TOTAL: &str = "rustfs_io_uring_latch_off_total";
+#[cfg(target_os = "linux")]
+const METRIC_URING_FALLBACK_TOTAL: &str = "rustfs_io_uring_read_fallback_total";
+#[cfg(target_os = "linux")]
+const METRIC_URING_IN_FLIGHT: &str = "rustfs_io_uring_in_flight";
+#[cfg(target_os = "linux")]
+const METRIC_URING_CQ_OVERFLOW: &str = "rustfs_io_uring_cq_overflow";
+#[cfg(target_os = "linux")]
+const METRIC_URING_CANCEL_ALREADY: &str = "rustfs_io_uring_cancel_already";
+/// How often the per-disk driver StatsSnapshot is exported to metrics
+/// (rustfs/backlog#1172).
+#[cfg(target_os = "linux")]
+const URING_STATS_EXPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[inline(always)]
 fn record_mmap_copy_stage(metrics: MmapCopyStageMetrics, stage: &'static str, started_at: Option<std::time::Instant>) {
@@ -447,6 +466,16 @@ const DEFAULT_RUSTFS_IO_URING_READ_ENABLE: bool = false;
 /// capacity (2×), so CQ overflow is structurally unreachable.
 #[cfg(target_os = "linux")]
 const URING_QUEUE_DEPTH: u32 = 128;
+
+/// Maximum bytes handed to the driver in a single op on the buffered read path
+/// (rustfs/backlog#1174). Backpressure permits count OPS, not bytes, and the
+/// driver zero-fills a full-size buffer per op, so an unbounded single read could
+/// pin ~length bytes per permit. Reads at or below this cap take the fast
+/// single-op, zero-copy path; larger reads are split into sequential chunks so
+/// worst-case in-flight memory is bounded by `permits x this` per shard. Set high
+/// so ordinary shard reads are never chunked.
+#[cfg(target_os = "linux")]
+const URING_MAX_OP_LEN: usize = 128 << 20;
 
 /// Number of independent io_uring rings (each with its own driver thread) to run
 /// per disk (backlog#1145).
@@ -1963,6 +1992,16 @@ pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
     ///
     /// Backends that hold no descriptors ignore both methods.
     fn invalidate_cached_fds_under(&self, _volume: &str, _path: &str) {}
+
+    /// Drop every descriptor for `volume` — used when the whole bucket tree is
+    /// removed (`delete_volume`), where the exact object paths are unknown
+    /// (rustfs/backlog#1177).
+    fn invalidate_cached_fds_for_volume(&self, _volume: &str) {}
+
+    /// Drop ALL cached descriptors. Called when this disk instance is retired
+    /// (`close`) so a replacement instance's invalidations are never defeated by
+    /// this one continuing to serve stale fds (rustfs/backlog#1177).
+    async fn clear_cached_fds(&self) {}
 }
 
 /// Default [`LocalIoBackend`]: tokio blocking-pool file I/O plus the
@@ -2600,6 +2639,22 @@ fn is_io_uring_fd_cache_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_IO_URING_FD_CACHE, DEFAULT_RUSTFS_IO_URING_FD_CACHE)
 }
 
+/// Whether the soft `RLIMIT_NOFILE` has enough headroom to run the fd cache
+/// safely (rustfs/backlog#1178). The cache holds up to `FD_CACHE_CAPACITY` (512)
+/// descriptors PER DISK and `try_new` cannot know the disk count, so a low limit
+/// (the common 1024 default on a bare-metal / non-systemd run) would exhaust fds
+/// with just a couple of disks. Require ample headroom before enabling it;
+/// otherwise fall back to open-per-read. The packaged systemd unit sets
+/// 1,048,576, so tuned deployments are unaffected.
+#[cfg(target_os = "linux")]
+fn rlimit_allows_fd_cache() -> bool {
+    const MIN_SOFT_NOFILE: u64 = 16 << 10;
+    match rustix::process::getrlimit(rustix::process::Resource::Nofile).current {
+        Some(soft) => soft >= MIN_SOFT_NOFILE,
+        None => true, // no soft limit (unlimited)
+    }
+}
+
 /// Drop `offset..offset+length` from the page cache after an io_uring read,
 /// mirroring what `StdBackend::pread_bytes` does for the same range
 /// (backlog#1145).
@@ -2616,10 +2671,25 @@ fn reclaim_read_range(file: &std::fs::File, offset: u64, length: usize) -> Resul
     use rustix::fs::{Advice, fadvise};
 
     let length = u64::try_from(length).map_err(|_| DiskError::other("read reclaim length overflow"))?;
-    let Some(length) = NonZeroU64::new(length) else {
+    if length == 0 {
+        return Ok(());
+    }
+    // Page-align the reclaim window down to the containing page, matching
+    // StdBackend's mmap reclaim `[aligned_offset, offset + length)`
+    // (rustfs/backlog#1173). fadvise(DONTNEED) only drops fully-covered pages, so
+    // reclaiming the raw unaligned range would leave the head partial page
+    // resident that the mmap path drops — divergent residency for the same read
+    // (bitrot shards' 32-byte block headers keep offsets off page boundaries, so
+    // this is the common case, not a corner case).
+    let page = mmap_page_size()?;
+    let aligned_offset = offset - (offset % page);
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| DiskError::other("read reclaim range overflow"))?;
+    let Some(aligned_len) = NonZeroU64::new(end - aligned_offset) else {
         return Ok(());
     };
-    fadvise(file, offset, Some(length), Advice::DontNeed)
+    fadvise(file, aligned_offset, Some(aligned_len), Advice::DontNeed)
         .map_err(std::io::Error::from)
         .map_err(DiskError::from)
 }
@@ -2666,6 +2736,11 @@ struct FdKey {
 #[cfg(target_os = "linux")]
 struct FdCache {
     cache: moka::future::Cache<FdKey, Arc<std::fs::File>>,
+    /// Bumped by every invalidation. A miss-path open snapshots this before it
+    /// opens and refuses to insert if it moved, so an fd opened before a
+    /// heal/delete commit can never be resurrected into the cache after the
+    /// commit's invalidation ran (open-then-insert race, rustfs/backlog#1176).
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(target_os = "linux")]
@@ -2679,6 +2754,7 @@ impl FdCache {
                 // fails at runtime instead of dropping stale descriptors.
                 .support_invalidation_closures()
                 .build(),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2686,13 +2762,33 @@ impl FdCache {
         self.cache.get(key).await
     }
 
-    async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
-        self.cache.insert(key, file).await;
+    /// Current invalidation generation, snapshotted by the miss path before it
+    /// opens a descriptor (rustfs/backlog#1176).
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Insert a freshly-opened descriptor only if no invalidation happened since
+    /// it was opened (rustfs/backlog#1176). An invalidate that ran during the
+    /// open bumped the generation, so a stale pre-heal/pre-delete inode is never
+    /// cached. The post-insert re-check closes the tiny window where an
+    /// invalidate races the insert itself, by removing the entry we just added.
+    async fn insert_if_fresh(&self, key: FdKey, file: Arc<std::fs::File>, gen_at_open: u64) {
+        if self.generation.load(Ordering::Acquire) != gen_at_open {
+            return;
+        }
+        self.cache.insert(key.clone(), file).await;
+        if self.generation.load(Ordering::Acquire) != gen_at_open {
+            self.cache.invalidate(&key).await;
+        }
     }
 
     /// Drop the descriptor for exactly this path. Preferred wherever the caller
     /// knows the keys: unlike a predicate it costs nothing on later reads.
     async fn invalidate_exact(&self, volume: &str, path: &str) {
+        // Bump BEFORE the moka invalidation so a concurrent miss-path insert
+        // that snapshotted the old generation is refused (rustfs/backlog#1176).
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.cache
             .invalidate(&FdKey {
                 volume: volume.to_owned(),
@@ -2712,6 +2808,9 @@ impl FdCache {
     /// re-evaluated by subsequent `get`s, so registering one per write would tax
     /// the read path.
     fn invalidate_under(&self, volume: &str, prefix: &str) {
+        // Bump before registering the predicate so a concurrent miss-path insert
+        // that snapshotted the old generation is refused (rustfs/backlog#1176).
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let volume = volume.to_owned();
         let prefix = prefix.trim_end_matches('/').to_owned();
         let matches = move |k: &FdKey, _: &Arc<std::fs::File>| {
@@ -2723,6 +2822,32 @@ impl FdCache {
             // descriptor: correctness first, the cache refills on the next read.
             self.cache.invalidate_all();
         }
+    }
+
+    /// Drop every descriptor for `volume` — the whole bucket is gone
+    /// (rustfs/backlog#1177).
+    fn invalidate_volume(&self, volume: &str) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        let volume = volume.to_owned();
+        let matches = move |k: &FdKey, _: &Arc<std::fs::File>| k.volume == volume;
+        if self.cache.invalidate_entries_if(matches).is_err() {
+            self.cache.invalidate_all();
+        }
+    }
+
+    /// Drop ALL descriptors — this disk instance is being retired
+    /// (rustfs/backlog#1177).
+    fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.cache.invalidate_all();
+    }
+
+    /// Unconditional insert. Production reads go through `insert_if_fresh` (the
+    /// generation guard, rustfs/backlog#1176); this bare primitive is only for
+    /// tests that drive the cache directly.
+    #[cfg(test)]
+    async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
+        self.cache.insert(key, file).await;
     }
 
     #[cfg(test)]
@@ -2742,7 +2867,12 @@ impl FdCache {
 pub(crate) struct UringBackend {
     root: PathBuf,
     inner: StdBackend,
-    driver: Arc<rustfs_uring::UringDriver>,
+    /// Wrapped in `ManuallyDrop` so `Drop` can move the (last) `Arc` onto a
+    /// blocking thread: `UringDriver`'s own `Drop` joins its driver threads and
+    /// can block up to the bounded-drain timeout on a hung disk, which must never
+    /// run on a tokio worker during disk reconnect/shutdown (backlog#1170).
+    /// `ManuallyDrop` derefs transparently, so read call sites are unchanged.
+    driver: std::mem::ManuallyDrop<Arc<rustfs_uring::UringDriver>>,
     /// Runtime degradation latch (backlog#1101). Starts `true`; once a read
     /// returns a restriction-class errno (io_uring became unusable on this
     /// disk), it is set `false` and all further reads go straight to
@@ -2772,17 +2902,22 @@ pub(crate) struct UringBackend {
 static URING_UNSUPPORTED_DISKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
-/// True when a runtime io_uring read error means io_uring itself is unusable on
-/// this disk (→ latch off), as opposed to a per-read/file error `StdBackend`
-/// would hit too (backlog#1101). Restriction-class errnos only; data errors
-/// (EIO), missing files, and parameter errors do NOT latch. Mirrors the shape
-/// of [`is_direct_io_unsupported`].
+/// True when a runtime io_uring read error means the io_uring SUBSYSTEM is
+/// unusable on this disk (→ latch off), as opposed to a per-read/file error
+/// `StdBackend` would hit too (backlog#1101, narrowed in #1171). Data errors
+/// (EIO), missing files, and parameter errors do NOT latch.
+///
+/// Deliberately narrower than the probe-time restriction class (C7 in the driver
+/// warns the two must not be conflated): EACCES/EPERM at read time on an
+/// already-open fd are usually per-file (an LSM hooks security_file_permission on
+/// every read), and StdBackend would hit the same denial, so EACCES does NOT
+/// latch the whole disk. EPERM is kept because a seccomp/LSM policy applied after
+/// startup blocks io_uring_enter subsystem-wide. EOPNOTSUPP is classified
+/// per-path by the caller (O_DIRECT shape vs subsystem), so it is not latched
+/// here.
 #[cfg(target_os = "linux")]
 fn is_io_uring_unsupported(err: &std::io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
-    )
+    matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM))
 }
 
 /// Resolve `volume`/`path` to the on-disk object path, running the same volume
@@ -2814,6 +2949,28 @@ impl std::fmt::Debug for UringBackend {
 }
 
 #[cfg(target_os = "linux")]
+impl Drop for UringBackend {
+    fn drop(&mut self) {
+        // Take the driver Arc out and, if we are on a tokio runtime, drop it on a
+        // blocking thread. `UringDriver::Drop` sends Shutdown and joins each
+        // driver thread; on a hung disk that join can block up to the bounded
+        // drain timeout, which must not stall a runtime worker during disk
+        // reconnect/shutdown (backlog#1170). Off-runtime (tests, plain threads) a
+        // synchronous join is fine.
+        // SAFETY: `ManuallyDrop::take` runs exactly once, here in `Drop`, and the
+        // field is never used again.
+        #[allow(unsafe_code)]
+        let driver = unsafe { std::mem::ManuallyDrop::take(&mut self.driver) };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || drop(driver));
+            }
+            Err(_) => drop(driver),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl UringBackend {
     /// Probe io_uring on `root`; `Some(backend)` if usable, `None` to fall back
     /// to `StdBackend`. A restricted-environment errno degrades quietly; an
@@ -2838,14 +2995,36 @@ impl UringBackend {
                     shards,
                     "io_uring read backend enabled"
                 );
+                // Gate the fd cache on RLIMIT_NOFILE headroom (rustfs/backlog#1178):
+                // 512 fds/disk with a low soft limit and several disks would hit
+                // EMFILE. Fall back to open-per-read when the limit is too small.
+                let fd_cache = if is_io_uring_fd_cache_enabled() {
+                    if rlimit_allows_fd_cache() {
+                        Some(FdCache::new())
+                    } else {
+                        warn!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            root = %root.display(),
+                            "io_uring fd cache disabled: RLIMIT_NOFILE soft limit too low for 512 fds/disk; using open-per-read"
+                        );
+                        None
+                    }
+                } else {
+                    None
+                };
+                let driver = Arc::new(driver);
+                // Periodically export the driver StatsSnapshot to metrics so a
+                // gray release is not flying blind (rustfs/backlog#1172).
+                Self::spawn_stats_exporter(&driver, root.clone());
                 Some(Self {
                     inner: StdBackend::new(root.clone()),
                     root,
-                    driver: Arc::new(driver),
+                    driver: std::mem::ManuallyDrop::new(driver),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
-                    fd_cache: is_io_uring_fd_cache_enabled().then(FdCache::new),
+                    fd_cache,
                 })
             }
             Err(err) => {
@@ -2857,21 +3036,103 @@ impl UringBackend {
                         error = ?err,
                         "io_uring unavailable (restricted environment); using StdBackend"
                     );
+                    // Only a genuine environment restriction is permanently
+                    // negative-cached: it will not change without a restart.
+                    URING_UNSUPPORTED_DISKS
+                        .lock()
+                        .expect("uring probe cache mutex poisoned")
+                        .insert(root);
                 } else {
+                    // An unexpected error may be transient (ENOMEM/EMFILE under
+                    // startup fd/memory pressure, ring/eventfd setup, a partial
+                    // shard start). Do NOT latch the disk off io_uring forever;
+                    // fall back for now and let the next LocalDisk reconstruction
+                    // (disk reconnect) re-probe (rustfs/backlog#1171).
                     warn!(
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
                         root = %root.display(),
                         error = ?err,
-                        "io_uring probe failed unexpectedly; using StdBackend"
+                        "io_uring probe failed unexpectedly; using StdBackend (will re-probe on reconnect)"
                     );
                 }
-                URING_UNSUPPORTED_DISKS
-                    .lock()
-                    .expect("uring probe cache mutex poisoned")
-                    .insert(root);
                 None
             }
+        }
+    }
+
+    /// Latch io_uring off for this whole disk, logging the transition once at
+    /// warn (rustfs/backlog#1172). Without this the only signal operators ever
+    /// see is the startup "backend enabled" line, which stays true on dashboards
+    /// even after the first read latched the disk back to StdBackend forever.
+    /// `swap` makes the log fire exactly once, on the true -> false edge.
+    fn latch_active_off(&self, io_err: &std::io::Error) {
+        if self.active.swap(false, Ordering::Relaxed) {
+            counter!(METRIC_URING_LATCH_TOTAL, "root" => self.root.display().to_string()).increment(1);
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                event = EVENT_DISK_LOCAL_URING_LATCH_OFF,
+                root = %self.root.display(),
+                error = ?io_err,
+                "io_uring latched off for this disk; all reads now use StdBackend"
+            );
+        }
+    }
+
+    /// Count an io_uring -> StdBackend read fallback, so a gray release can see
+    /// how much traffic is actually on io_uring vs falling back
+    /// (rustfs/backlog#1172).
+    fn record_uring_fallback(&self) {
+        counter!(METRIC_URING_FALLBACK_TOTAL, "root" => self.root.display().to_string()).increment(1);
+    }
+
+    /// Spawn a low-frequency task that exports the per-disk driver StatsSnapshot
+    /// (in-flight, cq_overflow, submit_errors, cancel_already) to metrics so the
+    /// gray release has runtime signal (rustfs/backlog#1172). The task holds only
+    /// a `Weak` reference, so it never keeps the driver alive; when the last
+    /// strong reference is gone it stops on the next tick. Any temporary strong
+    /// reference it takes to read stats is dropped on the blocking pool so that,
+    /// if it turns out to be the last one, `UringDriver::Drop`'s thread join never
+    /// runs on an async worker (rustfs/backlog#1170).
+    fn spawn_stats_exporter(driver: &Arc<rustfs_uring::UringDriver>, root: PathBuf) {
+        // try_new may be constructed outside a tokio runtime (some unit tests
+        // build the backend directly); only run the exporter when a runtime is
+        // present. Production always constructs it from async LocalDisk::new.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(driver);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(URING_STATS_EXPORT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(driver) = weak.upgrade() else {
+                    break;
+                };
+                let s = driver.stats();
+                tokio::task::spawn_blocking(move || drop(driver));
+                // submit_errors is exported once the pinned rustfs-uring is bumped
+                // to a release that carries it (rustfs/backlog#1172, #1181).
+                let root = root.display().to_string();
+                gauge!(METRIC_URING_IN_FLIGHT, "root" => root.clone()).set(s.in_flight as f64);
+                gauge!(METRIC_URING_CQ_OVERFLOW, "root" => root.clone()).set(s.cq_overflow as f64);
+                gauge!(METRIC_URING_CANCEL_ALREADY, "root" => root).set(s.cancel_already as f64);
+            }
+        });
+    }
+
+    /// Classify an O_DIRECT read-side error and latch the right path off, matching
+    /// StdBackend (rustfs/backlog#1171). An O_DIRECT-shape error (EINVAL/EOPNOTSUPP)
+    /// latches only the native direct path; a genuine subsystem error latches
+    /// io_uring as a whole. Shared by the single-op and chunked read paths so the
+    /// classification lives in one place (rustfs/backlog#1174).
+    fn classify_direct_read_error(&self, io_err: &std::io::Error) {
+        if is_direct_io_unsupported(io_err) {
+            self.direct_uring.supported.store(false, Ordering::Relaxed);
+        } else if is_io_uring_unsupported(io_err) {
+            self.latch_active_off(io_err);
         }
     }
 
@@ -2909,6 +3170,11 @@ impl UringBackend {
         let file = match cached {
             Some(file) => file,
             None => {
+                // Snapshot the cache generation BEFORE opening (rustfs/backlog#1176):
+                // if a heal/delete invalidation runs while this open is in flight,
+                // the generation moves and insert_if_fresh refuses to cache the
+                // now-stale descriptor.
+                let gen_at_open = self.fd_cache.as_ref().map(|c| c.generation());
                 let root = self.root.clone();
                 let volume_owned = volume.to_owned();
                 let path_owned = path.to_owned();
@@ -2925,30 +3191,72 @@ impl UringBackend {
                 .await
                 .map_err(|e| DiskError::other(format!("uring pread join error: {e}")))??;
                 let file = Arc::new(file);
-                if let (Some(cache), Some(key)) = (self.fd_cache.as_ref(), key) {
-                    cache.insert(key, Arc::clone(&file)).await;
+                if let (Some(cache), Some(key), Some(gen_at_open)) = (self.fd_cache.as_ref(), key, gen_at_open) {
+                    cache.insert_if_fresh(key, Arc::clone(&file), gen_at_open).await;
                 }
                 file
             }
         };
 
         if length == 0 {
+            // Parity with StdBackend and the miss path (rustfs/backlog#1173): a
+            // zero-length read still rejects an offset past EOF. The miss path
+            // validated `meta.len() < end_offset` (end_offset == offset here), but
+            // a cache hit skipped it — so fstat the descriptor and match. This is
+            // a rare path (callers do not issue zero-length reads), so the one
+            // extra fstat is negligible.
+            match file.metadata() {
+                Ok(meta) if offset_u64 > meta.len() => return Err(DiskError::FileCorrupt),
+                Ok(_) => {}
+                Err(e) => return Err(DiskError::from(e)),
+            }
             return Ok(Bytes::new());
         }
 
         // The driver consumes the handle; keep one for the post-read reclaim.
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = match self.driver.read_at(file, offset_u64, length).await {
-            Ok(bytes) => bytes,
-            Err(io_err) => {
-                // Latch io_uring off for this disk if the errno says the
-                // subsystem is unusable (backlog#1101); the caller falls back
-                // to StdBackend for this and every future read.
-                if is_io_uring_unsupported(&io_err) {
-                    self.active.store(false, Ordering::Relaxed);
+        let bytes = if length <= URING_MAX_OP_LEN {
+            // Fast path: one op. The driver's Vec becomes the result with no copy.
+            match self.driver.read_at(file, offset_u64, length).await {
+                Ok(bytes) => bytes,
+                Err(io_err) => {
+                    // Latch io_uring off for this disk if the errno says the
+                    // subsystem is unusable (backlog#1101); the caller falls back
+                    // to StdBackend for this and every future read.
+                    if is_io_uring_unsupported(&io_err) {
+                        self.latch_active_off(&io_err);
+                    }
+                    return Err(DiskError::from(io_err));
                 }
-                return Err(DiskError::from(io_err));
             }
+        } else {
+            // Very large read: split into sequential chunks so a single op cannot
+            // pin ~length bytes of driver buffer, bounding worst-case in-flight
+            // memory (rustfs/backlog#1174). Chunks are awaited one at a time, so
+            // only one is in flight per read.
+            let mut assembled = Vec::with_capacity(length);
+            let mut done = 0usize;
+            while done < length {
+                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk_off = offset_u64 + done as u64;
+                let part = match self.driver.read_at(Arc::clone(&file), chunk_off, chunk).await {
+                    Ok(part) => part,
+                    Err(io_err) => {
+                        if is_io_uring_unsupported(&io_err) {
+                            self.latch_active_off(&io_err);
+                        }
+                        return Err(DiskError::from(io_err));
+                    }
+                };
+                if part.len() != chunk {
+                    // A short chunk before the end means EOF: the file is shorter
+                    // than offset + length, same as the miss path's meta check.
+                    return Err(DiskError::FileCorrupt);
+                }
+                assembled.extend_from_slice(&part);
+                done += chunk;
+            }
+            assembled
         };
         if bytes.len() != length {
             // The driver resubmits short reads, so a short result means EOF: the
@@ -3043,14 +3351,40 @@ impl UringBackend {
 
         let file = Arc::new(file);
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = match self.driver.read_at_direct(file, offset_u64, length, align).await {
-            Ok(bytes) => bytes,
-            Err(io_err) => {
-                if is_io_uring_unsupported(&io_err) {
-                    self.active.store(false, Ordering::Relaxed);
+        let bytes = if length <= URING_MAX_OP_LEN {
+            // Fast path: one op. The driver's Vec becomes the result with no copy.
+            match self.driver.read_at_direct(Arc::clone(&file), offset_u64, length, align).await {
+                Ok(bytes) => bytes,
+                Err(io_err) => {
+                    self.classify_direct_read_error(&io_err);
+                    return Err(DiskError::from(io_err));
                 }
-                return Err(DiskError::from(io_err));
             }
+        } else {
+            // Split a very large O_DIRECT read into sequential chunks so a single
+            // op cannot pin ~length bytes of driver buffer, bounding worst-case
+            // in-flight memory (rustfs/backlog#1174). read_at_direct aligns each
+            // chunk's sub-range internally; chunk sizes are a multiple of
+            // URING_MAX_OP_LEN, so boundary re-reads are at most one block.
+            let mut assembled = Vec::with_capacity(length);
+            let mut done = 0usize;
+            while done < length {
+                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk_off = offset_u64 + done as u64;
+                let part = match self.driver.read_at_direct(Arc::clone(&file), chunk_off, chunk, align).await {
+                    Ok(part) => part,
+                    Err(io_err) => {
+                        self.classify_direct_read_error(&io_err);
+                        return Err(DiskError::from(io_err));
+                    }
+                };
+                if part.len() != chunk {
+                    return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
+                }
+                assembled.extend_from_slice(&part);
+                done += chunk;
+            }
+            assembled
         };
         if bytes.len() != length {
             return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
@@ -3088,6 +3422,7 @@ impl LocalIoBackend for UringBackend {
         // Latched off (backlog#1101): io_uring proved unusable on this disk, so
         // skip it entirely and read via StdBackend.
         if !self.active.load(Ordering::Relaxed) {
+            self.record_uring_fallback();
             return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
         }
 
@@ -3112,6 +3447,7 @@ impl LocalIoBackend for UringBackend {
                                 "io_uring O_DIRECT read fell back to StdBackend (logged once per disk)"
                             );
                         }
+                        self.record_uring_fallback();
                         return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
                     }
                 }
@@ -3138,6 +3474,7 @@ impl LocalIoBackend for UringBackend {
                         "io_uring read fell back to StdBackend (logged once per disk)"
                     );
                 }
+                self.record_uring_fallback();
                 self.inner.pread_bytes(volume, path, offset, length, metrics).await
             }
         }
@@ -3164,6 +3501,18 @@ impl LocalIoBackend for UringBackend {
     fn invalidate_cached_fds_under(&self, volume: &str, path: &str) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_under(volume, path);
+        }
+    }
+
+    fn invalidate_cached_fds_for_volume(&self, volume: &str) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.invalidate_volume(volume);
+        }
+    }
+
+    async fn clear_cached_fds(&self) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.clear();
         }
     }
 }
@@ -4317,6 +4666,11 @@ impl LocalDisk {
                 {
                     return Err(err);
                 };
+
+                // The version's data dir was staged or trashed; drop any cached
+                // io_uring descriptors under it so a deleted `part.N` cannot keep
+                // answering reads (rustfs/backlog#1175).
+                self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{dir}"));
             }
         }
 
@@ -5372,6 +5726,12 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn close(&self) -> Result<()> {
+        // This disk instance is being retired (e.g. replaced by renew_disk on
+        // reconnect). Drop its cached descriptors so a replacement instance's
+        // invalidations are never defeated by this one continuing to serve stale
+        // fds through operations still holding a snapshot of it
+        // (rustfs/backlog#1177).
+        self.io_backend.clear_cached_fds().await;
         Ok(())
     }
 
@@ -6475,6 +6835,12 @@ impl DiskAPI for LocalDisk {
             {
                 rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
                     .map_err(to_file_error)?;
+                // The commit rename changed the dst part inodes before this fsync
+                // failed and rolled them back; drop any fd cached during that
+                // window so readers re-open the restored inode (rustfs/backlog#1177).
+                for part_path in &invalidate_part_paths {
+                    self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                }
                 return Err(to_file_error(err).into());
             }
 
@@ -6497,6 +6863,12 @@ impl DiskAPI for LocalDisk {
                     if let Err(err) = os::fsync_dir(dir).await {
                         rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
                             .map_err(to_file_error)?;
+                        // Same post-commit rollback window as above — drop cached
+                        // dst part fds so readers re-open the restored inode
+                        // (rustfs/backlog#1177).
+                        for part_path in &invalidate_part_paths {
+                            self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                        }
                         return Err(to_file_error(err).into());
                     }
                     if dir == dst_volume_dir.as_path() {
@@ -6549,7 +6921,7 @@ impl DiskAPI for LocalDisk {
             };
 
             let dst_path_for_failpoint = dst_path.to_string();
-            let (old_data_dir, version_signature, old_current_size) = tokio::task::spawn_blocking(move || {
+            let inline_commit = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -6701,7 +7073,24 @@ impl DiskAPI for LocalDisk {
                 ))
             })
             .await
-            .map_err(DiskError::from)??;
+            .map_err(DiskError::from)?;
+
+            // A post-commit rollback inside the closure (a commit-metadata fsync
+            // failure under strict durability) restores the old data dir; drop any
+            // fds cached during the committed window before propagating the error
+            // (rustfs/backlog#1177). The sync closure cannot call the async
+            // invalidate itself, so it is done here. Inline objects carry their
+            // data in xl.meta rather than separate part inodes, so this is mostly
+            // defensive, but it keeps the inline and streaming branches consistent.
+            let (old_data_dir, version_signature, old_current_size) = match inline_commit {
+                Ok(committed) => committed,
+                Err(err) => {
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Err(DiskError::from(err));
+                }
+            };
 
             // Cleanup
             if let Some(ref cleanup) = cleanup_path {
@@ -6834,6 +7223,10 @@ impl DiskAPI for LocalDisk {
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
             self.move_to_trash(&file_path, false, false).await?;
+
+            // A cached io_uring descriptor under a just-removed path would keep
+            // its inode readable; drop it (rustfs/backlog#1175).
+            self.io_backend.invalidate_cached_fds_under(volume, path);
         }
 
         Ok(())
@@ -7197,6 +7590,13 @@ impl DiskAPI for LocalDisk {
             {
                 return Err(err);
             }
+
+            // The version's data dir was staged for rollback or trashed, so its
+            // `part.N` inodes no longer exist for readers. A cached io_uring
+            // descriptor would keep serving them, so drop every cached fd under
+            // this data dir (rustfs/backlog#1175). If a later rollback restores
+            // the dir, the next read simply re-opens it.
+            self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{uuid}"));
         }
 
         let commit_result = if !meta.versions.is_empty() {
@@ -7347,6 +7747,12 @@ impl DiskAPI for LocalDisk {
                 return Err(e);
             }
         }
+
+        // The whole bucket tree is gone; drop every cached io_uring descriptor
+        // for it so a cache hit cannot keep serving a removed object (the read
+        // hit path skips the volume-access check, so nothing else would notice)
+        // (rustfs/backlog#1177).
+        self.io_backend.invalidate_cached_fds_for_volume(volume);
 
         Ok(())
     }
@@ -13130,20 +13536,41 @@ mod test {
         }
     }
 
-    /// The runtime degradation latch classifier (backlog#1101): only
-    /// restriction-class errnos latch io_uring off; data/parameter/missing-file
-    /// errors do not.
+    /// The runtime degradation latch classifier (backlog#1101, narrowed in
+    /// #1171): only subsystem-level errnos latch io_uring off for the whole disk.
+    /// EACCES/EOPNOTSUPP are per-file or per-path (handled by the caller) and
+    /// data/parameter/missing-file errors never latch.
     #[cfg(target_os = "linux")]
     #[test]
     fn io_uring_unsupported_classifies_restriction_errnos_only() {
         use std::io::Error;
-        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS, libc::EOPNOTSUPP] {
+        for errno in [libc::EPERM, libc::ENOSYS] {
             assert!(is_io_uring_unsupported(&Error::from_raw_os_error(errno)), "errno {errno} should latch");
         }
-        for errno in [libc::EIO, libc::EINVAL, libc::ENOENT, libc::EAGAIN] {
+        for errno in [
+            libc::EACCES,
+            libc::EOPNOTSUPP,
+            libc::EIO,
+            libc::EINVAL,
+            libc::ENOENT,
+            libc::EAGAIN,
+        ] {
             assert!(!is_io_uring_unsupported(&Error::from_raw_os_error(errno)), "errno {errno} must not latch");
         }
         assert!(!is_io_uring_unsupported(&Error::other("driver gone")));
+    }
+
+    /// Non-vacuity gate for the io_uring tests (backlog#1179). Emits a grep-able
+    /// `SKIP <name>` line and, when `RUSTFS_URING_TESTS_MUST_RUN` is set — a CI
+    /// leg that guarantees io_uring is available (e.g. `seccomp=unconfined`) —
+    /// panics instead of skipping, so a suite that silently degraded to
+    /// StdBackend cannot merge green.
+    #[cfg(target_os = "linux")]
+    fn uring_test_skip(name: &str) {
+        if std::env::var_os("RUSTFS_URING_TESTS_MUST_RUN").is_some() {
+            panic!("SKIP {name}: io_uring unavailable but RUSTFS_URING_TESTS_MUST_RUN is set — this leg must exercise io_uring");
+        }
+        eprintln!("SKIP {name}: io_uring unavailable (restricted environment)");
     }
 
     /// Per-disk probe cache (backlog#1101): a disk already recorded as
@@ -13161,6 +13588,7 @@ mod test {
         // shutting its driver down.)
         let probe_dir = tempdir().expect("tempdir");
         if UringBackend::try_new(probe_dir.path().to_path_buf()).is_none() {
+            uring_test_skip("uring_probe_cache_skips_known_unsupported_disk");
             return;
         }
 
@@ -13278,7 +13706,7 @@ mod test {
         ) else {
             // Restricted environment (CI seccomp): io_uring is unavailable, so
             // there is no descriptor cache to exercise. Do not vacuously pass.
-            eprintln!("SKIP uring_fd_cache_hides_a_healed_shard_until_invalidated: io_uring unavailable");
+            uring_test_skip("uring_fd_cache_hides_a_healed_shard_until_invalidated");
             return;
         };
         assert!(backend.fd_cache.is_some(), "the cache must be on for this test to mean anything");
@@ -13381,6 +13809,45 @@ mod test {
         .await;
     }
 
+    /// `delete_paths` is one of the primary object-delete entry points that
+    /// removes data without going through `LocalDisk::delete`; it must invalidate
+    /// the fd cache too, or a cached descriptor keeps a removed part readable
+    /// (backlog#1175/#1180).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_fd_cache_is_invalidated_by_delete_paths() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            async {
+                let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+                disk.make_volume("bucket").await.expect("operation should succeed");
+
+                disk.write_all("bucket", "obj/part.1", Bytes::from_static(b"v1"))
+                    .await
+                    .expect("operation should succeed");
+                let got = disk
+                    .read_file_mmap_copy("bucket", "obj/part.1", 0, 2)
+                    .await
+                    .expect("operation should succeed");
+                assert_eq!(got, Bytes::from_static(b"v1"), "first read seeds the descriptor cache");
+
+                disk.delete_paths("bucket", &["obj/part.1".to_string()])
+                    .await
+                    .expect("operation should succeed");
+                let err = disk.read_file_mmap_copy("bucket", "obj/part.1", 0, 2).await;
+                assert!(err.is_err(), "delete_paths must invalidate the cached descriptor, got {err:?}");
+            },
+        )
+        .await;
+    }
+
     /// Pages of `path` still resident in the page cache, via `mincore(2)`.
     /// `mincore` reports residency without faulting anything in, so measuring
     /// cannot perturb what it measures.
@@ -13441,7 +13908,7 @@ mod test {
         let uring_backend: Option<Arc<dyn LocalIoBackend>> =
             UringBackend::try_new(root.clone()).map(|b| Arc::new(b) as Arc<dyn LocalIoBackend>);
         if uring_backend.is_none() {
-            eprintln!("SKIP io_uring half: io_uring unavailable (restricted environment)");
+            uring_test_skip("io_uring_reclaims_page_cache_exactly_like_std (io_uring half)");
         }
 
         // `residency_after` reads the whole file first so the pages are certainly
@@ -13581,6 +14048,7 @@ mod test {
 
         // Skip if io_uring is unavailable on this host (restricted env).
         let Some(backend) = UringBackend::try_new(root) else {
+            uring_test_skip("uring_backend_latched_off_reads_via_std");
             return;
         };
         backend.active.store(false, Ordering::Relaxed);
