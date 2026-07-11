@@ -97,6 +97,76 @@ retries = 2
 #
 # Each e2e test spawns its own rustfs server on a random port with an isolated
 # temp dir (crates/e2e_test/src/common.rs), so the subset is parallel-safe.
+#
+# Replication PR subset (backlog#1147 repl-1): the second clause admits the 20
+# FAST bucket-replication tests from replication_extension_test — the
+# target-registration / replication-check / list / remove / delete admin paths
+# that validate config synchronously and never wait for asynchronous
+# replication convergence. Each spawns its own single-node rustfs server(s) on
+# random ports (source, plus an independent single-node target for the pair
+# checks — NOT a cluster), so the subset stays parallel-safe and single-digit
+# seconds. The SLOW data-plane tests (which poll for convergence at production
+# background-loop intervals) and all `_real_dual_node` / `_real_single_node`
+# site-replication tests run in the [profile.e2e-repl-nightly] lane below, NOT
+# here. This allowlist is the single source of truth for the PR/nightly split:
+# the nightly profile derives its set as "the replication module MINUS this
+# allowlist", so any new replication test lands in nightly by default (never
+# silently unrun) until it is explicitly blessed as fast here. Keep the two
+# regexes byte-identical. Count invariant: 20 here + 16 nightly = 36 total
+# (authority: `cargo nextest list`; docs/testing/e2e-suite-inventory.md).
 [profile.e2e-smoke]
-default-filter = 'package(e2e_test) & test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check)_test::/)'
+default-filter = """
+    package(e2e_test) & (
+        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check)_test::/)
+        | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
+    )
+"""
 fail-fast = false
+
+# ---------------------------------------------------------------------------
+# e2e-repl-nightly profile — scheduled full replication e2e lane (repl-1)
+# ---------------------------------------------------------------------------
+# backlog#1147 repl-1 (deps: ci-4). Runs the SLOW / cross-process replication
+# tests that are unfit for the per-PR e2e-smoke gate:
+#
+#   * 6 slow bucket-replication data-plane tests — they PUT an object and poll
+#     until it converges on the target at production background-loop intervals
+#     (health check 5s / MRF flush 10s), so each takes tens of seconds; two of
+#     them replicate over HTTPS.
+#   * 9 `_real_dual_node` site-replication tests — each spawns TWO full rustfs
+#     servers and drives the cross-process site-replication control plane.
+#   * 1 `_real_single_node` service-account round-trip test.
+#
+# The set is defined as "everything in replication_extension_test that is NOT
+# in the e2e-smoke PR allowlist above" (the negated clause is byte-identical to
+# the allowlist), so a newly added replication test automatically runs here
+# until it is explicitly promoted to the fast PR subset — no replication test
+# is ever silently left out of CI.
+#
+# #[serial] does NOT serialize under nextest (process-per-test; see the file
+# header). These tests need no cross-test serialization: each spawns its own
+# server(s) on random ports with isolated temp dirs, so they are parallel-safe
+# by construction — the same property the e2e-smoke subset relies on. If load
+# on the runner surfaces a real flake, quarantine the specific test with an
+# OPEN issue link (ci-10 / backlog#937 policy), never blanket-retry or exclude.
+#
+# Wired by .github/workflows/e2e-replication-nightly.yml (schedule +
+# workflow_dispatch), which builds the rustfs binary once, installs awscurl so
+# the STS dual-node test actually exercises its path (it skips gracefully with
+# a visible log line when awscurl is absent), and routes scheduled failures
+# through .github/actions/schedule-failure-issue (ci-8). Explicit division of
+# labor with ci-5's future e2e-full merge gate: these tests run ONLY here, not
+# double-run there. TODO(ci-7): fold this interim repl-owned lane into the ci
+# domain's consolidated scheduled e2e workflow once it exists.
+[profile.e2e-repl-nightly]
+default-filter = """
+    package(e2e_test)
+    & test(/^replication_extension_test::/)
+    & !test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
+"""
+fail-fast = false
+
+[profile.e2e-repl-nightly.junit]
+# Emitted to target/nextest/e2e-repl-nightly/junit.xml; uploaded by the nightly
+# workflow as the failure-triage artifact.
+path = "junit.xml"
