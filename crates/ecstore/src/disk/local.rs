@@ -452,6 +452,16 @@ const DEFAULT_RUSTFS_IO_URING_READ_ENABLE: bool = false;
 #[cfg(target_os = "linux")]
 const URING_QUEUE_DEPTH: u32 = 128;
 
+/// Maximum bytes handed to the driver in a single op on the buffered read path
+/// (rustfs/backlog#1174). Backpressure permits count OPS, not bytes, and the
+/// driver zero-fills a full-size buffer per op, so an unbounded single read could
+/// pin ~length bytes per permit. Reads at or below this cap take the fast
+/// single-op, zero-copy path; larger reads are split into sequential chunks so
+/// worst-case in-flight memory is bounded by `permits x this` per shard. Set high
+/// so ordinary shard reads are never chunked.
+#[cfg(target_os = "linux")]
+const URING_MAX_OP_LEN: usize = 128 << 20;
+
 /// Number of independent io_uring rings (each with its own driver thread) to run
 /// per disk (backlog#1145).
 ///
@@ -3095,17 +3105,48 @@ impl UringBackend {
 
         // The driver consumes the handle; keep one for the post-read reclaim.
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = match self.driver.read_at(file, offset_u64, length).await {
-            Ok(bytes) => bytes,
-            Err(io_err) => {
-                // Latch io_uring off for this disk if the errno says the
-                // subsystem is unusable (backlog#1101); the caller falls back
-                // to StdBackend for this and every future read.
-                if is_io_uring_unsupported(&io_err) {
-                    self.latch_active_off(&io_err);
+        let bytes = if length <= URING_MAX_OP_LEN {
+            // Fast path: one op. The driver's Vec becomes the result with no copy.
+            match self.driver.read_at(file, offset_u64, length).await {
+                Ok(bytes) => bytes,
+                Err(io_err) => {
+                    // Latch io_uring off for this disk if the errno says the
+                    // subsystem is unusable (backlog#1101); the caller falls back
+                    // to StdBackend for this and every future read.
+                    if is_io_uring_unsupported(&io_err) {
+                        self.latch_active_off(&io_err);
+                    }
+                    return Err(DiskError::from(io_err));
                 }
-                return Err(DiskError::from(io_err));
             }
+        } else {
+            // Very large read: split into sequential chunks so a single op cannot
+            // pin ~length bytes of driver buffer, bounding worst-case in-flight
+            // memory (rustfs/backlog#1174). Chunks are awaited one at a time, so
+            // only one is in flight per read.
+            let mut assembled = Vec::with_capacity(length);
+            let mut done = 0usize;
+            while done < length {
+                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk_off = offset_u64 + done as u64;
+                let part = match self.driver.read_at(Arc::clone(&file), chunk_off, chunk).await {
+                    Ok(part) => part,
+                    Err(io_err) => {
+                        if is_io_uring_unsupported(&io_err) {
+                            self.latch_active_off(&io_err);
+                        }
+                        return Err(DiskError::from(io_err));
+                    }
+                };
+                if part.len() != chunk {
+                    // A short chunk before the end means EOF: the file is shorter
+                    // than offset + length, same as the miss path's meta check.
+                    return Err(DiskError::FileCorrupt);
+                }
+                assembled.extend_from_slice(&part);
+                done += chunk;
+            }
+            assembled
         };
         if bytes.len() != length {
             // The driver resubmits short reads, so a short result means EOF: the
