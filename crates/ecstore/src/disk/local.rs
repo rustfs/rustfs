@@ -35,7 +35,7 @@ use crate::disk::{
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
-use metrics::counter;
+use metrics::{counter, gauge};
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
@@ -253,6 +253,21 @@ const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_fail
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
 const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
 const METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_direct_read_page_faults_total";
+// io_uring read-backend gray-release observability (rustfs/backlog#1172).
+#[cfg(target_os = "linux")]
+const METRIC_URING_LATCH_TOTAL: &str = "rustfs_io_uring_latch_off_total";
+#[cfg(target_os = "linux")]
+const METRIC_URING_FALLBACK_TOTAL: &str = "rustfs_io_uring_read_fallback_total";
+#[cfg(target_os = "linux")]
+const METRIC_URING_IN_FLIGHT: &str = "rustfs_io_uring_in_flight";
+#[cfg(target_os = "linux")]
+const METRIC_URING_CQ_OVERFLOW: &str = "rustfs_io_uring_cq_overflow";
+#[cfg(target_os = "linux")]
+const METRIC_URING_CANCEL_ALREADY: &str = "rustfs_io_uring_cancel_already";
+/// How often the per-disk driver StatsSnapshot is exported to metrics
+/// (rustfs/backlog#1172).
+#[cfg(target_os = "linux")]
+const URING_STATS_EXPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[inline(always)]
 fn record_mmap_copy_stage(metrics: MmapCopyStageMetrics, stage: &'static str, started_at: Option<std::time::Instant>) {
@@ -2998,10 +3013,14 @@ impl UringBackend {
                 } else {
                     None
                 };
+                let driver = Arc::new(driver);
+                // Periodically export the driver StatsSnapshot to metrics so a
+                // gray release is not flying blind (rustfs/backlog#1172).
+                Self::spawn_stats_exporter(&driver, root.clone());
                 Some(Self {
                     inner: StdBackend::new(root.clone()),
                     root,
-                    driver: std::mem::ManuallyDrop::new(Arc::new(driver)),
+                    driver: std::mem::ManuallyDrop::new(driver),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
@@ -3049,6 +3068,7 @@ impl UringBackend {
     /// `swap` makes the log fire exactly once, on the true -> false edge.
     fn latch_active_off(&self, io_err: &std::io::Error) {
         if self.active.swap(false, Ordering::Relaxed) {
+            counter!(METRIC_URING_LATCH_TOTAL, "root" => self.root.display().to_string()).increment(1);
             warn!(
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
@@ -3058,6 +3078,49 @@ impl UringBackend {
                 "io_uring latched off for this disk; all reads now use StdBackend"
             );
         }
+    }
+
+    /// Count an io_uring -> StdBackend read fallback, so a gray release can see
+    /// how much traffic is actually on io_uring vs falling back
+    /// (rustfs/backlog#1172).
+    fn record_uring_fallback(&self) {
+        counter!(METRIC_URING_FALLBACK_TOTAL, "root" => self.root.display().to_string()).increment(1);
+    }
+
+    /// Spawn a low-frequency task that exports the per-disk driver StatsSnapshot
+    /// (in-flight, cq_overflow, submit_errors, cancel_already) to metrics so the
+    /// gray release has runtime signal (rustfs/backlog#1172). The task holds only
+    /// a `Weak` reference, so it never keeps the driver alive; when the last
+    /// strong reference is gone it stops on the next tick. Any temporary strong
+    /// reference it takes to read stats is dropped on the blocking pool so that,
+    /// if it turns out to be the last one, `UringDriver::Drop`'s thread join never
+    /// runs on an async worker (rustfs/backlog#1170).
+    fn spawn_stats_exporter(driver: &Arc<rustfs_uring::UringDriver>, root: PathBuf) {
+        // try_new may be constructed outside a tokio runtime (some unit tests
+        // build the backend directly); only run the exporter when a runtime is
+        // present. Production always constructs it from async LocalDisk::new.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(driver);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(URING_STATS_EXPORT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(driver) = weak.upgrade() else {
+                    break;
+                };
+                let s = driver.stats();
+                tokio::task::spawn_blocking(move || drop(driver));
+                // submit_errors is exported once the pinned rustfs-uring is bumped
+                // to a release that carries it (rustfs/backlog#1172, #1181).
+                let root = root.display().to_string();
+                gauge!(METRIC_URING_IN_FLIGHT, "root" => root.clone()).set(s.in_flight as f64);
+                gauge!(METRIC_URING_CQ_OVERFLOW, "root" => root.clone()).set(s.cq_overflow as f64);
+                gauge!(METRIC_URING_CANCEL_ALREADY, "root" => root).set(s.cancel_already as f64);
+            }
+        });
     }
 
     /// Classify an O_DIRECT read-side error and latch the right path off, matching
@@ -3359,6 +3422,7 @@ impl LocalIoBackend for UringBackend {
         // Latched off (backlog#1101): io_uring proved unusable on this disk, so
         // skip it entirely and read via StdBackend.
         if !self.active.load(Ordering::Relaxed) {
+            self.record_uring_fallback();
             return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
         }
 
@@ -3383,6 +3447,7 @@ impl LocalIoBackend for UringBackend {
                                 "io_uring O_DIRECT read fell back to StdBackend (logged once per disk)"
                             );
                         }
+                        self.record_uring_fallback();
                         return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
                     }
                 }
@@ -3409,6 +3474,7 @@ impl LocalIoBackend for UringBackend {
                         "io_uring read fell back to StdBackend (logged once per disk)"
                     );
                 }
+                self.record_uring_fallback();
                 self.inner.pread_bytes(volume, path, offset, length, metrics).await
             }
         }
