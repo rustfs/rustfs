@@ -277,11 +277,14 @@ async fn test_lifecycle_versioned_current_version_expiry_creates_delete_marker()
     Ok(())
 }
 
-/// `Days=0` (immediate) expiry on an unversioned bucket. This is the simplest
-/// expiry path and needs no time control beyond the 1s scanner cycle. Proves the
-/// matching-prefix object is deleted and a non-matching object survives.
+/// `Days=0` expiration is invalid per S3 semantics (`Days` must be a positive
+/// integer >= 1). A `PutBucketLifecycleConfiguration` carrying a zero-day rule
+/// must be rejected with `InvalidArgument` (HTTP 400) — see crates/lifecycle
+/// `validate()` and the PutBucketLifecycleConfiguration handler. This is the
+/// self-managed counterpart of the localhost-only
+/// `test_bucket_lifecycle_rejects_zero_days` unit test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_lifecycle_zero_day_expiry() -> TestResult {
+async fn test_lifecycle_rejects_zero_day_rule() -> TestResult {
     let mut env = RustFSTestEnvironment::new().await?;
     env.start_rustfs_server_with_env(vec![], &fast_lifecycle_env()).await?;
 
@@ -289,30 +292,22 @@ async fn test_lifecycle_zero_day_expiry() -> TestResult {
     let bucket = "ilm3-zero-day";
     client.create_bucket().bucket(bucket).send().await?;
 
-    let matched_key = "zero-days/object.txt";
-    let survivor_key = "retain/object.txt";
-    client
-        .put_object()
+    let lifecycle = BucketLifecycleConfiguration::builder()
+        .rules(expiration_rule("expire-zero-days", "zero-days/", 0)?)
+        .build()?;
+    let err = client
+        .put_bucket_lifecycle_configuration()
         .bucket(bucket)
-        .key(matched_key)
-        .body(ByteStream::from_static(b"expire immediately"))
+        .lifecycle_configuration(lifecycle)
         .send()
-        .await?;
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(survivor_key)
-        .body(ByteStream::from_static(b"retain me"))
-        .send()
-        .await?;
+        .await
+        .expect_err("zero-day expiration lifecycle rule should be rejected");
 
-    put_expiration_config(&client, bucket, expiration_rule("expire-zero-days", "zero-days/", 0)?).await?;
-
-    wait_for_object_expired(&client, bucket, matched_key, StdDuration::from_secs(90)).await?;
-
-    assert!(
-        !object_is_gone(&client, bucket, survivor_key).await?,
-        "non-matching-prefix object must survive a prefix-scoped zero-day rule"
+    let service_error = err.as_service_error().expect("expected an S3 service error");
+    assert_eq!(
+        service_error.meta().code(),
+        Some("InvalidArgument"),
+        "expected InvalidArgument for zero-day expiration, got: {err:?}"
     );
 
     Ok(())
