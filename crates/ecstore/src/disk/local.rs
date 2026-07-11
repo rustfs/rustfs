@@ -35,7 +35,7 @@ use crate::disk::{
 use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
-use metrics::counter;
+use metrics::{counter, gauge};
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
@@ -253,6 +253,21 @@ const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_fail
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
 const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
 const METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_direct_read_page_faults_total";
+// io_uring read-backend gray-release observability (rustfs/backlog#1172).
+#[cfg(target_os = "linux")]
+const METRIC_URING_LATCH_TOTAL: &str = "rustfs_io_uring_latch_off_total";
+#[cfg(target_os = "linux")]
+const METRIC_URING_FALLBACK_TOTAL: &str = "rustfs_io_uring_read_fallback_total";
+#[cfg(target_os = "linux")]
+const METRIC_URING_IN_FLIGHT: &str = "rustfs_io_uring_in_flight";
+#[cfg(target_os = "linux")]
+const METRIC_URING_CQ_OVERFLOW: &str = "rustfs_io_uring_cq_overflow";
+#[cfg(target_os = "linux")]
+const METRIC_URING_CANCEL_ALREADY: &str = "rustfs_io_uring_cancel_already";
+/// How often the per-disk driver StatsSnapshot is exported to metrics
+/// (rustfs/backlog#1172).
+#[cfg(target_os = "linux")]
+const URING_STATS_EXPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[inline(always)]
 fn record_mmap_copy_stage(metrics: MmapCopyStageMetrics, stage: &'static str, started_at: Option<std::time::Instant>) {
@@ -2998,10 +3013,14 @@ impl UringBackend {
                 } else {
                     None
                 };
+                let driver = Arc::new(driver);
+                // Periodically export the driver StatsSnapshot to metrics so a
+                // gray release is not flying blind (rustfs/backlog#1172).
+                Self::spawn_stats_exporter(&driver, root.clone());
                 Some(Self {
                     inner: StdBackend::new(root.clone()),
                     root,
-                    driver: std::mem::ManuallyDrop::new(Arc::new(driver)),
+                    driver: std::mem::ManuallyDrop::new(driver),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
@@ -3049,6 +3068,7 @@ impl UringBackend {
     /// `swap` makes the log fire exactly once, on the true -> false edge.
     fn latch_active_off(&self, io_err: &std::io::Error) {
         if self.active.swap(false, Ordering::Relaxed) {
+            counter!(METRIC_URING_LATCH_TOTAL, "root" => self.root.display().to_string()).increment(1);
             warn!(
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
@@ -3057,6 +3077,62 @@ impl UringBackend {
                 error = ?io_err,
                 "io_uring latched off for this disk; all reads now use StdBackend"
             );
+        }
+    }
+
+    /// Count an io_uring -> StdBackend read fallback, so a gray release can see
+    /// how much traffic is actually on io_uring vs falling back
+    /// (rustfs/backlog#1172).
+    fn record_uring_fallback(&self) {
+        counter!(METRIC_URING_FALLBACK_TOTAL, "root" => self.root.display().to_string()).increment(1);
+    }
+
+    /// Spawn a low-frequency task that exports the per-disk driver StatsSnapshot
+    /// (in-flight, cq_overflow, submit_errors, cancel_already) to metrics so the
+    /// gray release has runtime signal (rustfs/backlog#1172). The task holds only
+    /// a `Weak` reference, so it never keeps the driver alive; when the last
+    /// strong reference is gone it stops on the next tick. Any temporary strong
+    /// reference it takes to read stats is dropped on the blocking pool so that,
+    /// if it turns out to be the last one, `UringDriver::Drop`'s thread join never
+    /// runs on an async worker (rustfs/backlog#1170).
+    fn spawn_stats_exporter(driver: &Arc<rustfs_uring::UringDriver>, root: PathBuf) {
+        // try_new may be constructed outside a tokio runtime (some unit tests
+        // build the backend directly); only run the exporter when a runtime is
+        // present. Production always constructs it from async LocalDisk::new.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(driver);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(URING_STATS_EXPORT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(driver) = weak.upgrade() else {
+                    break;
+                };
+                let s = driver.stats();
+                tokio::task::spawn_blocking(move || drop(driver));
+                // submit_errors is exported once the pinned rustfs-uring is bumped
+                // to a release that carries it (rustfs/backlog#1172, #1181).
+                let root = root.display().to_string();
+                gauge!(METRIC_URING_IN_FLIGHT, "root" => root.clone()).set(s.in_flight as f64);
+                gauge!(METRIC_URING_CQ_OVERFLOW, "root" => root.clone()).set(s.cq_overflow as f64);
+                gauge!(METRIC_URING_CANCEL_ALREADY, "root" => root).set(s.cancel_already as f64);
+            }
+        });
+    }
+
+    /// Classify an O_DIRECT read-side error and latch the right path off, matching
+    /// StdBackend (rustfs/backlog#1171). An O_DIRECT-shape error (EINVAL/EOPNOTSUPP)
+    /// latches only the native direct path; a genuine subsystem error latches
+    /// io_uring as a whole. Shared by the single-op and chunked read paths so the
+    /// classification lives in one place (rustfs/backlog#1174).
+    fn classify_direct_read_error(&self, io_err: &std::io::Error) {
+        if is_direct_io_unsupported(io_err) {
+            self.direct_uring.supported.store(false, Ordering::Relaxed);
+        } else if is_io_uring_unsupported(io_err) {
+            self.latch_active_off(io_err);
         }
     }
 
@@ -3275,23 +3351,40 @@ impl UringBackend {
 
         let file = Arc::new(file);
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = match self.driver.read_at_direct(file, offset_u64, length, align).await {
-            Ok(bytes) => bytes,
-            Err(io_err) => {
-                // Classify a read-side failure the same way StdBackend does
-                // (rustfs/backlog#1171): an O_DIRECT-shape error (EINVAL/EOPNOTSUPP
-                // — the fs accepted the O_DIRECT open but rejects the read shape,
-                // e.g. a wrong alignment guess) latches only the native O_DIRECT
-                // path off, so subsequent eligible reads take StdBackend's aligned
-                // path instead of repaying the open+failed-submit every time. Only
-                // a genuine subsystem error latches io_uring as a whole.
-                if is_direct_io_unsupported(&io_err) {
-                    self.direct_uring.supported.store(false, Ordering::Relaxed);
-                } else if is_io_uring_unsupported(&io_err) {
-                    self.latch_active_off(&io_err);
+        let bytes = if length <= URING_MAX_OP_LEN {
+            // Fast path: one op. The driver's Vec becomes the result with no copy.
+            match self.driver.read_at_direct(Arc::clone(&file), offset_u64, length, align).await {
+                Ok(bytes) => bytes,
+                Err(io_err) => {
+                    self.classify_direct_read_error(&io_err);
+                    return Err(DiskError::from(io_err));
                 }
-                return Err(DiskError::from(io_err));
             }
+        } else {
+            // Split a very large O_DIRECT read into sequential chunks so a single
+            // op cannot pin ~length bytes of driver buffer, bounding worst-case
+            // in-flight memory (rustfs/backlog#1174). read_at_direct aligns each
+            // chunk's sub-range internally; chunk sizes are a multiple of
+            // URING_MAX_OP_LEN, so boundary re-reads are at most one block.
+            let mut assembled = Vec::with_capacity(length);
+            let mut done = 0usize;
+            while done < length {
+                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk_off = offset_u64 + done as u64;
+                let part = match self.driver.read_at_direct(Arc::clone(&file), chunk_off, chunk, align).await {
+                    Ok(part) => part,
+                    Err(io_err) => {
+                        self.classify_direct_read_error(&io_err);
+                        return Err(DiskError::from(io_err));
+                    }
+                };
+                if part.len() != chunk {
+                    return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
+                }
+                assembled.extend_from_slice(&part);
+                done += chunk;
+            }
+            assembled
         };
         if bytes.len() != length {
             return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
@@ -3329,6 +3422,7 @@ impl LocalIoBackend for UringBackend {
         // Latched off (backlog#1101): io_uring proved unusable on this disk, so
         // skip it entirely and read via StdBackend.
         if !self.active.load(Ordering::Relaxed) {
+            self.record_uring_fallback();
             return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
         }
 
@@ -3353,6 +3447,7 @@ impl LocalIoBackend for UringBackend {
                                 "io_uring O_DIRECT read fell back to StdBackend (logged once per disk)"
                             );
                         }
+                        self.record_uring_fallback();
                         return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
                     }
                 }
@@ -3379,6 +3474,7 @@ impl LocalIoBackend for UringBackend {
                         "io_uring read fell back to StdBackend (logged once per disk)"
                     );
                 }
+                self.record_uring_fallback();
                 self.inner.pread_bytes(volume, path, offset, length, metrics).await
             }
         }
@@ -6825,7 +6921,7 @@ impl DiskAPI for LocalDisk {
             };
 
             let dst_path_for_failpoint = dst_path.to_string();
-            let (old_data_dir, version_signature, old_current_size) = tokio::task::spawn_blocking(move || {
+            let inline_commit = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -6977,7 +7073,24 @@ impl DiskAPI for LocalDisk {
                 ))
             })
             .await
-            .map_err(DiskError::from)??;
+            .map_err(DiskError::from)?;
+
+            // A post-commit rollback inside the closure (a commit-metadata fsync
+            // failure under strict durability) restores the old data dir; drop any
+            // fds cached during the committed window before propagating the error
+            // (rustfs/backlog#1177). The sync closure cannot call the async
+            // invalidate itself, so it is done here. Inline objects carry their
+            // data in xl.meta rather than separate part inodes, so this is mostly
+            // defensive, but it keeps the inline and streaming branches consistent.
+            let (old_data_dir, version_signature, old_current_size) = match inline_commit {
+                Ok(committed) => committed,
+                Err(err) => {
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Err(DiskError::from(err));
+                }
+            };
 
             // Cleanup
             if let Some(ref cleanup) = cleanup_path {
