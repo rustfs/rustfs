@@ -12878,6 +12878,12 @@ mod test {
         temp_env::with_var(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, Some("7"), || {
             assert_eq!(bitrot_size_mismatch_retry_count(), 7);
         });
+        temp_env::with_var_unset(ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS, || {
+            assert_eq!(
+                bitrot_size_mismatch_retry_delay(),
+                Duration::from_millis(DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS)
+            );
+        });
         temp_env::with_var(ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS, Some("42"), || {
             assert_eq!(bitrot_size_mismatch_retry_delay(), Duration::from_millis(42));
         });
