@@ -160,6 +160,11 @@ mod bucket_logging_test;
 #[cfg(test)]
 mod multipart_auth_test;
 
+// Negative presigned-URL (query-string SigV4) regression suite (backlog#1151
+// sec-2): expired, tampered signature, wrong secret, tampered target.
+#[cfg(test)]
+mod presigned_negative_test;
+
 #[cfg(test)]
 mod stale_multipart_cleanup_cluster_test;
 
