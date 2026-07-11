@@ -20,9 +20,27 @@
 use super::performance::PerformanceMetrics;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
+
+/// How many recorded operations elapse between P95/P99 recomputations.
+///
+/// The sliding-window mean (`avg`) is refreshed on every operation — it is O(1)
+/// and the autotuner reads it — but the percentiles need an O(n log n) sort of
+/// the window, so they are recomputed at most once per this many operations.
+/// Both consumers (the autotuner tick and OTEL export) sample on their own
+/// periodic cadence, never per-IO, so a bounded lag here is invisible to them
+/// while the per-op sort cost is amortised away.
+const PERCENTILE_RECOMPUTE_INTERVAL: u32 = 128;
+
+/// Sliding window of I/O latency samples plus a running sum, so the window mean
+/// is maintained in O(1) as samples enter and leave.
+struct LatencyWindow {
+    samples: VecDeque<Duration>,
+    /// Sum of `samples` in microseconds, kept in step with every push/pop.
+    sum_micros: u128,
+}
 
 /// Metrics collector for tracking I/O operations and computing latency percentiles.
 ///
@@ -31,10 +49,12 @@ use tokio::sync::RwLock;
 pub struct MetricsCollector {
     /// The underlying metrics (shared reference)
     metrics: Arc<PerformanceMetrics>,
-    /// I/O latency samples for percentile calculation
-    io_latency_samples: RwLock<VecDeque<Duration>>,
+    /// Sliding window of I/O latency samples (+ running sum) for mean/percentile calculation
+    io_latency: RwLock<LatencyWindow>,
     /// Maximum number of latency samples to keep
     max_latency_samples: usize,
+    /// Operations recorded since the last P95/P99 recompute (throttle counter).
+    ops_since_percentile: AtomicU32,
 }
 
 impl MetricsCollector {
@@ -47,8 +67,12 @@ impl MetricsCollector {
     pub fn new(metrics: Arc<PerformanceMetrics>, max_latency_samples: usize) -> Self {
         Self {
             metrics,
-            io_latency_samples: RwLock::new(VecDeque::new()),
+            io_latency: RwLock::new(LatencyWindow {
+                samples: VecDeque::new(),
+                sum_micros: 0,
+            }),
             max_latency_samples,
+            ops_since_percentile: AtomicU32::new(0),
         }
     }
 
@@ -88,46 +112,60 @@ impl MetricsCollector {
         // Report to metrics crate for OTEL export
         crate::record_data_transfer(bytes, duration.as_millis() as f64);
 
-        // Record latency sample for percentile calculation
-        let mut samples = self.io_latency_samples.write().await;
-        samples.push_back(duration);
+        // Update the sliding window and the O(1) running mean under a short write
+        // lock, and decide — still under the lock, so the count is exact — whether
+        // this op crosses the percentile-recompute throttle.
+        let (mean_us, recompute_percentiles) = {
+            let mut window = self.io_latency.write().await;
+            window.samples.push_back(duration);
+            window.sum_micros += duration.as_micros();
 
-        // Keep only the most recent samples (O(1) removal from front)
-        if samples.len() > self.max_latency_samples {
-            samples.pop_front();
+            // Keep only the most recent samples (O(1) removal from front).
+            if window.samples.len() > self.max_latency_samples
+                && let Some(old) = window.samples.pop_front()
+            {
+                window.sum_micros -= old.as_micros();
+            }
+
+            let len = window.samples.len() as u128;
+            let mean_us = window.sum_micros.checked_div(len).unwrap_or(0) as u64;
+
+            let n = self.ops_since_percentile.fetch_add(1, Ordering::Relaxed) + 1;
+            let recompute = n >= PERCENTILE_RECOMPUTE_INTERVAL;
+            if recompute {
+                self.ops_since_percentile.store(0, Ordering::Relaxed);
+            }
+            (mean_us, recompute)
+        };
+
+        // The mean is cheap and the autotuner reads it, so refresh it every op.
+        self.metrics.avg_io_latency_us.store(mean_us, Ordering::Relaxed);
+        crate::record_io_latency(mean_us as f64 / 1000.0); // Convert to ms
+
+        // The P95/P99 sort is the expensive part and only feeds OTEL export, so it
+        // is throttled to once per PERCENTILE_RECOMPUTE_INTERVAL operations.
+        if recompute_percentiles {
+            self.update_latency_percentiles().await;
         }
-
-        // Update latency percentiles
-        drop(samples); // Release write lock before calling update
-        self.update_latency_percentiles().await;
     }
 
-    /// Update the latency percentile metrics (P50, P95, P99).
+    /// Recompute the P95/P99 latency percentiles from the current window.
     ///
-    /// Calculates percentiles from the sliding window of latency samples
-    /// and updates both PerformanceMetrics and reports to metrics crate.
+    /// This sorts a snapshot of the window (O(n log n)), so it is driven on a
+    /// throttle from the record path rather than per operation. The mean is not
+    /// computed here — it is maintained in O(1) on every `record_io_operation`.
     async fn update_latency_percentiles(&self) {
-        let samples: tokio::sync::RwLockReadGuard<'_, VecDeque<Duration>> = self.io_latency_samples.read().await;
-        if samples.is_empty() {
-            return;
-        }
-
-        // Sort samples to calculate percentiles
-        let mut sorted: Vec<u128> = samples.iter().map(|d| d.as_micros()).collect();
-        drop(samples); // Release read lock before sort
-        sorted.sort();
+        // Snapshot the window micros under a read lock, then sort outside the lock.
+        let mut sorted: Vec<u128> = {
+            let window = self.io_latency.read().await;
+            if window.samples.is_empty() {
+                return;
+            }
+            window.samples.iter().map(|d| d.as_micros()).collect()
+        };
+        sorted.sort_unstable();
 
         let len = sorted.len();
-
-        // Calculate average (P50)
-        let sum: u128 = sorted.iter().sum();
-        let avg = (sum / len as u128) as u64;
-
-        // Update PerformanceMetrics
-        self.metrics.avg_io_latency_us.store(avg, Ordering::Relaxed);
-
-        // Report to metrics crate
-        crate::record_io_latency(avg as f64 / 1000.0); // Convert to ms
 
         // Calculate P95
         let p95_idx = ((len as f64) * 0.95) as usize;
@@ -146,7 +184,7 @@ impl MetricsCollector {
 
     /// Get the number of recorded latency samples.
     pub async fn sample_count(&self) -> usize {
-        self.io_latency_samples.read().await.len()
+        self.io_latency.read().await.samples.len()
     }
 
     /// Get the maximum number of samples this collector will retain.
@@ -190,11 +228,13 @@ mod tests {
         collector.record_io_operation(0, Duration::from_micros(400), true).await;
         collector.record_io_operation(0, Duration::from_micros(500), true).await;
 
-        // Check average
+        // The mean is refreshed on every op.
         let avg = metrics.avg_io_latency_us.load(Ordering::Relaxed);
         assert_eq!(avg, 300); // (100+200+300+400+500) / 5
 
-        // Check percentiles
+        // P95/P99 are throttled off the record path; force a recompute to exercise
+        // the percentile math directly.
+        collector.update_latency_percentiles().await;
         let p95 = metrics.p95_io_latency_us.load(Ordering::Relaxed);
         let p99 = metrics.p99_io_latency_us.load(Ordering::Relaxed);
 
@@ -202,6 +242,28 @@ mod tests {
         // P99 should be 500 (same as max)
         assert!(p95 >= 400); // Allow some tolerance
         assert_eq!(p99, 500);
+    }
+
+    #[tokio::test]
+    async fn test_percentiles_throttled_but_mean_updates_per_op() {
+        let metrics = Arc::new(PerformanceMetrics::new());
+        let collector = MetricsCollector::new(metrics.clone(), 1000);
+
+        // Fewer ops than the recompute interval: the mean tracks every op, but the
+        // percentiles must not have been recomputed yet (they stay at their init 0).
+        for _ in 0..(PERCENTILE_RECOMPUTE_INTERVAL - 1) {
+            collector.record_io_operation(0, Duration::from_micros(200), true).await;
+        }
+        assert_eq!(metrics.avg_io_latency_us.load(Ordering::Relaxed), 200);
+        assert_eq!(
+            metrics.p99_io_latency_us.load(Ordering::Relaxed),
+            0,
+            "percentiles must not be recomputed before the throttle interval"
+        );
+
+        // The op that crosses the interval triggers exactly one recompute.
+        collector.record_io_operation(0, Duration::from_micros(200), true).await;
+        assert_eq!(metrics.p99_io_latency_us.load(Ordering::Relaxed), 200);
     }
 
     #[tokio::test]
