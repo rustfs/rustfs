@@ -118,7 +118,9 @@ pin-project-lite.workspace = true
 md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
-rustix = { workspace = true }
+# "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
+# (backlog#1178); "fs" comes from the workspace default.
+rustix = { workspace = true, features = ["process"] }
 rustfs-madmin.workspace = true
 reqwest = { workspace = true }
 aes-gcm.workspace = true
@@ -145,11 +147,10 @@ aws-smithy-http-client.workspace = true
 metrics = { workspace = true }
 
 # Runtime-probed io_uring read backend (backlog#1104). Linux-only, from
-# crates.io once rustfs-uring 0.1.0 is published. The guard
-# scripts/check_no_tokio_io_uring.sh allows an explicit io-uring integration;
-# only the tokio "io-uring" runtime feature is banned.
+# crates.io. The guard scripts/check_no_tokio_io_uring.sh allows an explicit
+# io-uring integration; only the tokio "io-uring" runtime feature is banned.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustfs-uring = "0.1.0"
+rustfs-uring = "0.2.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

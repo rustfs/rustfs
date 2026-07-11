@@ -36,6 +36,12 @@ LIST_FILES = {
     "implemented": "implemented_tests.txt",
     "unimplemented": "unimplemented_tests.txt",
     "excluded": "excluded_tests.txt",
+    # Lifecycle behavior lane (backlog#1148 ilm-10): gated by its own ci.yml job
+    # against a debug-accelerated server. In the full `scope=all` sweep these run
+    # against the plain server (no scanner / no RUSTFS_ILM_DEBUG_DAY_SECS) and are
+    # EXPECTED to fail there, so a failure here is neither a regression nor an
+    # unclassified failure.
+    "behavior": "lifecycle_behavior_tests.txt",
 }
 
 
@@ -122,6 +128,7 @@ def main() -> int:
     promotions: dict[str, list[str]] = {"unimplemented": [], "excluded": []}
     unclassified_passed: list[str] = []
     unclassified_failed: list[str] = []
+    behavior_passed: list[str] = []
     counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
 
     for name, status in results.items():
@@ -129,13 +136,19 @@ def main() -> int:
         if status in ("failed", "error"):
             if name in lists["implemented"]:
                 regressions.append(name)
-            elif name not in lists["unimplemented"] and name not in lists["excluded"]:
+            elif (
+                name not in lists["unimplemented"]
+                and name not in lists["excluded"]
+                and name not in lists["behavior"]
+            ):
                 unclassified_failed.append(name)
         elif status == "passed":
             if name in lists["unimplemented"]:
                 promotions["unimplemented"].append(name)
             elif name in lists["excluded"]:
                 promotions["excluded"].append(name)
+            elif name in lists["behavior"]:
+                behavior_passed.append(name)
             elif name not in lists["implemented"]:
                 unclassified_passed.append(name)
 
@@ -161,6 +174,12 @@ def main() -> int:
         "Promotion candidates (from excluded_tests.txt)",
         promotions["excluded"],
         "Passing despite being excluded — re-evaluate the exclusion.",
+    )
+    lines += render_section(
+        "Lifecycle behavior lane (passing in this run)",
+        behavior_passed,
+        "Gated by the dedicated `s3-lifecycle-behavior-tests` lane; expected to "
+        "fail in the plain `scope=all` sweep (no debug day / scanner).",
     )
     lines += render_section(
         "Unclassified passes",

@@ -27,8 +27,8 @@ pub use report::{PrometheusMetric, report_metrics};
 pub use scheduler::{
     MetricsRuntimeCancellationSource, MetricsRuntimeController, MetricsRuntimeControllerSnapshot, MetricsRuntimeDesiredSnapshot,
     MetricsRuntimeDesiredState, MetricsRuntimeIntervalsSnapshot, MetricsRuntimeReconcilePlan, MetricsRuntimeServiceState,
-    MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_collectors,
-    init_metrics_runtime, metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
+    MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_runtime,
+    metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
 };
 pub(crate) use storage_api::metrics::{
     BucketOperations, BucketOptions, ObsBucketBandwidthMonitor, ObsEcstoreResult, ObsStore, StorageAdminApi,

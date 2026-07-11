@@ -70,6 +70,7 @@ use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
+const DEFAULT_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: bool = true;
 pub(in crate::set_disk) const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP: &str =
     "RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP";
 pub(in crate::set_disk) const SLOW_OBJECT_READ_LOG_THRESHOLD: Duration = Duration::from_secs(5);
@@ -990,7 +991,11 @@ pub(in crate::set_disk) fn get_bitrot_reader_setup_strategy(
 ) -> BitrotReaderSetupStrategy {
     match mode {
         BitrotReaderSetupMode::ReadQuorum
-            if prefer_data_blocks_first || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
+            if prefer_data_blocks_first
+                || rustfs_utils::get_env_bool(
+                    ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+                    DEFAULT_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+                ) =>
         {
             BitrotReaderSetupStrategy::DataBlocksFirst
         }
@@ -4200,6 +4205,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn bitrot_reader_setup_tracks_strategy_counters_and_deferred_readers() {
+        temp_env::with_var(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, None::<&str>, || {
+            assert!(matches!(
+                get_bitrot_reader_setup_strategy(BitrotReaderSetupMode::ReadQuorum, false),
+                BitrotReaderSetupStrategy::DataBlocksFirst
+            ));
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("false"), || {
+            assert!(matches!(
+                get_bitrot_reader_setup_strategy(BitrotReaderSetupMode::ReadQuorum, false),
+                BitrotReaderSetupStrategy::AllShards
+            ));
+        });
         temp_env::with_var(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true"), || {
             assert!(matches!(
                 get_bitrot_reader_setup_strategy(BitrotReaderSetupMode::ReadQuorum, false),

@@ -11,6 +11,13 @@
 _TODO (infra-11): unit / e2e-smoke / e2e-full / e2e-nightly / protocols /
 s3-tests / fuzz / perf, with naming conventions._
 
+### Security advisory regression tests
+
+Fixed GHSA advisories map to named, discoverable regression tests. The
+advisory -> test map lives in
+[`docs/testing/security-regressions.md`](security-regressions.md). sec-14
+(backlog#1151) formalizes the written admission policy in `AGENTS.md`.
+
 ## Serial groups & CI profiles
 
 _TODO (infra-11): document the `[test-groups]` mechanism and the `default` vs

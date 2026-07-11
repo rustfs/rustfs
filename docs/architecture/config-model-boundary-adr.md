@@ -173,7 +173,6 @@ Before pushing an extraction PR, run:
 - `cargo tree -p rustfs-ecstore --edges normal`
 - `./scripts/check_layer_dependencies.sh`
 - `./scripts/check_architecture_migration_rules.sh`
-- `./scripts/check_metrics_migration_refs.sh`
 - `cargo fmt --all --check`
 - `make pre-commit`
 

@@ -1469,3 +1469,60 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expirati
         "unexpected error message: {message}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
+    // S3 compatibility (ceph s3-tests `test_lifecycle_expiration_days0`): a rule with
+    // Expiration{Days:0} must be rejected with InvalidArgument through the real
+    // PutBucketLifecycleConfiguration handler, not merely at the crates/lifecycle
+    // io::Error layer. No object lock required.
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultBucketUsecase::from_global();
+
+    let bucket = format!("test-zero-day-exp-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    let lifecycle = BucketLifecycleConfiguration {
+        expiry_updated_at: None,
+        rules: vec![LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            expiration: Some(LifecycleExpiration {
+                days: Some(0),
+                ..Default::default()
+            }),
+            filter: Some(LifecycleRuleFilter {
+                prefix: Some("days0/".to_string()),
+                ..Default::default()
+            }),
+            id: Some("expire-zero-days".to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }],
+    };
+
+    let req = build_request(
+        PutBucketLifecycleConfigurationInput::builder()
+            .bucket(bucket.clone())
+            .lifecycle_configuration(Some(lifecycle))
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+
+    let err = usecase
+        .execute_put_bucket_lifecycle_configuration(req)
+        .await
+        .expect_err("zero-day expiration must be rejected with InvalidArgument");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    let message = err.message().unwrap_or_default();
+    assert!(
+        message.contains("'Days' for Expiration action must be a positive integer"),
+        "unexpected error message: {message}"
+    );
+}
