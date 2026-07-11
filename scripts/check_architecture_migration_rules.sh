@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+#
+# Permanent architecture-boundary guard (anti-regression), NOT a
+# migration-progress gate. "migration" in the name is historical: these rules
+# were established BY the ecstore/global-state migrations (backlog#815, #939,
+# #1052 — all closed) and now keep the resulting boundaries from rotting
+# (facade bypasses, compat-shim resurrection, owner-module drift). Closed
+# migration issues are NOT a reason to retire this script or its pins.
+# Runs in ci.yml Quick Checks and .github/workflows/architecture-migration-rules.yml.
 
 set -euo pipefail
 

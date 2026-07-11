@@ -1,3 +1,7 @@
+> **Archived migration snapshot** — moved from `docs/architecture/` (2026-07)
+> when the architecture-review ledger it fed closed out. Kept for history; not
+> maintained.
+
 # Startup Timeline Baseline
 
 This document records the current binary startup order before runtime/lifecycle
@@ -33,7 +37,7 @@ new startup semantics.
 | `RUN-007` | `rustfs/src/startup_storage.rs` | Publish endpoints and erasure type. | Updates global endpoints and erasure type. | Non-fatal in this path. | None |
 | `RUN-008` | `rustfs/src/startup_storage.rs` | Initialize local disks, prewarm local disk id map, and initialize lock clients. | Opens local disk state, primes disk id lookup, and creates global lock clients. | Local disk init is fatal; prewarm and lock-client setup are non-fatal in this path. | None |
 | `RUN-009` | `rustfs/src/startup_server.rs` | Initialize capacity management and service state manager. | Starts capacity management and moves service state to `Starting`. | Non-fatal in this path. | None |
-| `RUN-010` | `rustfs/src/startup_server.rs` | Start S3 HTTP listener and optional console listener before storage is ready. | Starts HTTP servers with readiness gates; console listener starts only when enabled and configured. | Fatal if a configured listener cannot start. | Requests remain gated until full readiness except probe/admin/console/rpc/tonic/table-catalog exempt paths; see [`readiness-matrix.md`](readiness-matrix.md) |
+| `RUN-010` | `rustfs/src/startup_server.rs` | Start S3 HTTP listener and optional console listener before storage is ready. | Starts HTTP servers with readiness gates; console listener starts only when enabled and configured. | Fatal if a configured listener cannot start. | Requests remain gated until full readiness except probe/admin/console/rpc/tonic/table-catalog exempt paths; see [`readiness-matrix.md`](../../architecture/readiness-matrix.md) |
 | `RUN-011` | `rustfs/src/startup_storage.rs` | Create cancellation token and initialize `ECStore`. | Creates the runtime cancellation token and storage engine. | Fatal if `ECStore::new` fails. | None |
 | `RUN-012` | `rustfs/src/startup_storage.rs` | Initialize ECStore config and global config system. | Initializes ECStore config, attempts server-config migration, then retries global config init up to 15 times. | Migration attempt is non-fatal in this path; global config init becomes fatal after retries. | Marks the `GlobalReadiness` `StorageReady` stage after global config init succeeds; later runtime readiness still rechecks storage, IAM, lock quorum, and gated peer health before `FullReady` |
 | `RUN-013` | `rustfs/src/startup_storage.rs` and `rustfs/src/startup_services.rs` | Start replication and KMS systems. | Starts background replication pool, then initializes KMS from startup services. | Replication init is non-fatal in this path; KMS init is fatal on error. | `StorageReady` stage is already marked; dynamic runtime storage readiness is still checked before `FullReady`; KMS compatibility readiness remains feature-gated health behavior |

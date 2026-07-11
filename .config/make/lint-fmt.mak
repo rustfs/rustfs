@@ -50,6 +50,11 @@ tokio-io-uring-check: ## Check tokio io-uring runtime feature stays removed
 	@echo "🚫 Checking tokio io-uring feature guard..."
 	./scripts/check_no_tokio_io_uring.sh
 
+.PHONY: extension-schema-check
+extension-schema-check: ## Check extension-schema stays a lightweight contract crate
+	@echo "🧩 Checking extension schema boundaries..."
+	./scripts/check_extension_schema_boundaries.sh
+
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check
 	@echo "🔨 Running compilation check..."
