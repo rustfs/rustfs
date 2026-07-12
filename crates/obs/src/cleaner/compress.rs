@@ -213,7 +213,11 @@ fn archive_header_ok(path: &Path, algorithm: CompressionAlgorithm) -> bool {
 /// a file is not portable (notably on Windows), so any failure is ignored.
 fn sync_parent_dir(path: &Path) {
     if let Some(parent) = path.parent() {
-        let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        let dir = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
         if let Ok(handle) = File::open(dir) {
             let _ = handle.sync_all();
         }
@@ -242,9 +246,7 @@ where
     // to recompression, whose atomic create_new+rename replaces the bad entry
     // (a symlink is replaced, never followed or deleted through).
     match std::fs::symlink_metadata(archive_path) {
-        Ok(meta)
-            if meta.file_type().is_file() && meta.len() > 0 && archive_header_ok(archive_path, algorithm_used) =>
-        {
+        Ok(meta) if meta.file_type().is_file() && meta.len() > 0 && archive_header_ok(archive_path, algorithm_used) => {
             debug!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?archive_path, state = "archive_exists", "log cleaner compression state changed");
             let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             return Ok(CompressionOutput {
