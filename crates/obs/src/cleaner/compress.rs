@@ -164,14 +164,18 @@ impl Drop for TmpFileGuard {
 /// `<archive>.tmp` as a symlink and have the compressor truncate/overwrite an
 /// arbitrary external file. The deletion path already refuses symlinks; this
 /// closes the same gap on the compression path.
-fn create_tmp_archive(path: &Path) -> std::io::Result<File> {
+fn create_tmp_archive(path: &Path, source_mode: Option<u32>) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
+        // Restrictive from creation: the temp file holds the full plaintext of
+        // a possibly-0600 audit log, so never expose it wider than the source.
+        opts.mode(source_mode.unwrap_or(0o600));
     }
+    let _ = source_mode;
     opts.open(path)
 }
 
@@ -234,7 +238,18 @@ where
     tmp_name.push(".tmp");
     let tmp_archive_path = std::path::PathBuf::from(tmp_name);
 
-    let output = create_tmp_archive(&tmp_archive_path)?;
+    // Read the source mode up front so the temp file is created restrictive
+    // (never wider than the source, default 0600) instead of the world-readable
+    // 0644 that File::create would leave until the post-write chmod.
+    #[cfg(unix)]
+    let source_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).ok().map(|m| m.permissions().mode())
+    };
+    #[cfg(not(unix))]
+    let source_mode: Option<u32> = None;
+
+    let output = create_tmp_archive(&tmp_archive_path, source_mode)?;
     // Arm a guard so any early return *or panic* between here and the final
     // rename removes the incomplete temporary archive instead of leaking it.
     let mut tmp_guard = TmpFileGuard::new(tmp_archive_path.clone());
