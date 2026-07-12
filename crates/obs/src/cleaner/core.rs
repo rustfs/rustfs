@@ -185,10 +185,10 @@ impl LogCleaner {
             }
         }
 
-        if !compressed_archives.is_empty() && self.compressed_file_retention_days > 0 {
-            let expired = self.select_expired_compressed(&mut compressed_archives);
-            if !expired.is_empty() {
-                let (d, f) = self.delete_files(&expired)?;
+        if !compressed_archives.is_empty() {
+            let to_delete = self.select_archives_to_delete(&mut compressed_archives);
+            if !to_delete.is_empty() {
+                let (d, f) = self.delete_files(&to_delete)?;
                 total_deleted += d;
                 total_freed += f;
             }
@@ -245,8 +245,16 @@ impl LogCleaner {
         to_delete
     }
 
-    /// Select compressed archives whose age exceeds the archive retention window.
-    fn select_expired_compressed(&self, files: &mut [FileInfo]) -> Vec<FileInfo> {
+    /// Select compressed archives to delete: those older than the retention
+    /// window, plus — regardless of retention — the oldest archives needed to
+    /// bring the archive set back under `max_total_size_bytes`.
+    ///
+    /// The byte cap is the crucial part: with `compressed_file_retention_days`
+    /// set to 0 (retention disabled) and compression enabled, age-based expiry
+    /// never fires, so without this cap archives would grow without bound (the
+    /// cap on regular logs does not cover them). Bounding the archive set by the
+    /// same byte budget keeps disk usage finite even when retention is off.
+    fn select_archives_to_delete(&self, files: &mut [FileInfo]) -> Vec<FileInfo> {
         if self.compressed_file_retention_days > MAX_RETENTION_DAYS_BEFORE_SATURATION {
             warn!(
                 event = EVENT_LOG_CLEANER_STATE,
@@ -258,19 +266,54 @@ impl LogCleaner {
                 "log cleaner state changed"
             );
         }
-        let retention = compressed_file_retention_window(self.compressed_file_retention_days);
-        let now = SystemTime::now();
-        let mut expired = Vec::new();
 
-        for file in files {
-            if let Ok(age) = now.duration_since(file.modified)
-                && age > retention
-            {
-                expired.push(file.clone());
+        // Oldest first so both age expiry and the byte-cap trim evict the
+        // longest-retained archives before newer ones.
+        files.sort_by_key(|f| f.modified);
+        let now = SystemTime::now();
+        let retention = compressed_file_retention_window(self.compressed_file_retention_days);
+        let retention_active = self.compressed_file_retention_days > 0;
+
+        let mut selected = vec![false; files.len()];
+
+        // 1. Age-based expiry (only when retention is enabled).
+        if retention_active {
+            for (idx, file) in files.iter().enumerate() {
+                if let Ok(age) = now.duration_since(file.modified)
+                    && age > retention
+                {
+                    selected[idx] = true;
+                }
             }
         }
 
-        expired
+        // 2. Byte-cap trim: drop the oldest surviving archives until the set
+        //    fits under the configured total. 0 means "no cap".
+        if self.max_total_size_bytes > 0 {
+            let mut remaining: u64 = files
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !selected[*idx])
+                .map(|(_, file)| file.size)
+                .sum();
+            for (idx, file) in files.iter().enumerate() {
+                if remaining <= self.max_total_size_bytes {
+                    break;
+                }
+                if selected[idx] {
+                    continue;
+                }
+                selected[idx] = true;
+                remaining = remaining.saturating_sub(file.size);
+            }
+        }
+
+        files
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| selected[*idx])
+            .map(|(_, file)| file.clone())
+            .collect()
     }
 
     /// Parallel compressor with work stealing.

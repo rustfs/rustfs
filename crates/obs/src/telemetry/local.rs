@@ -666,6 +666,19 @@ pub fn spawn_cleanup_task(
         "log cleaner state"
     );
 
+    // retention_days == 0 means "keep archives forever" (age expiry disabled),
+    // which is easy to misread as "delete immediately". Warn so an operator who
+    // enabled compression is aware archives rely solely on the byte cap.
+    if compress && retention_days == 0 {
+        warn!(
+            event = EVENT_LOG_CLEANER_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+            result = "archive_retention_disabled",
+            "compressed archives are kept forever (retention_days=0); disk is bounded only by max_total_size_bytes"
+        );
+    }
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));
         loop {
