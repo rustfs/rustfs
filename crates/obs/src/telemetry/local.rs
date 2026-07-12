@@ -88,12 +88,18 @@ pub(super) fn validate_stdout_sink(file_appender: &RollingAppender) -> Result<()
         return Ok(());
     }
 
-    // `st_dev` is already `u64` on Linux/glibc (making this conversion a no-op there) but is a
-    // signed `dev_t` on macOS/BSD, where the fallible conversion guards against a negative value.
-    #[allow(clippy::useless_conversion)]
-    let stdout_device = u64::try_from(stdout_stat.st_dev).map_err(|error| {
-        TelemetryError::LogSinkConflict(format!("stdout file descriptor returned an invalid device identifier: {error}"))
-    })?;
+    let stdout_device = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            stdout_stat.st_dev
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            u64::try_from(stdout_stat.st_dev).map_err(|error| {
+                TelemetryError::LogSinkConflict(format!("stdout file descriptor returned an invalid device identifier: {error}"))
+            })?
+        }
+    };
     let active_identity = file_appender
         .active_file_identity()
         .map_err(|error| TelemetryError::Io(error.to_string()))?;
