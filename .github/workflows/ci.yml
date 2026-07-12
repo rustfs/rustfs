@@ -377,13 +377,31 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      # ext4 supports O_DIRECT; the runner's default TMPDIR may sit on tmpfs or
+      # overlayfs, where open(O_DIRECT) returns EINVAL/EOPNOTSUPP and the native
+      # read_at_direct path silently latches off to the aligned StdBackend
+      # fallback. A dedicated ext4 loopback guarantees the native O_DIRECT read
+      # path is actually exercised, not just the fallback (rustfs/backlog#1220).
+      - name: Prepare ext4 loopback for O_DIRECT coverage
+        run: |
+          set -euo pipefail
+          dd if=/dev/zero of=/tmp/rustfs-odirect.img bs=1M count=1024
+          mkfs.ext4 -q -F /tmp/rustfs-odirect.img
+          sudo mkdir -p /mnt/rustfs-odirect
+          sudo mount -o loop /tmp/rustfs-odirect.img /mnt/rustfs-odirect
+          sudo chmod 1777 /mnt/rustfs-odirect
+          mount | grep rustfs-odirect
+
       # RUSTFS_URING_TESTS_MUST_RUN=1 makes the io_uring tests fail instead of
       # silently skipping if io_uring is unavailable, so this leg can never pass
       # vacuously. RUSTFS_IO_URING_READ_ENABLE=true selects the UringBackend.
+      # TMPDIR points every tempfile-based test fixture at the ext4 loopback so
+      # eligible reads keep O_DIRECT and the native path is covered end to end.
       - name: Run ecstore io_uring integration tests on real io_uring
         env:
           RUSTFS_IO_URING_READ_ENABLE: "true"
           RUSTFS_URING_TESTS_MUST_RUN: "1"
+          TMPDIR: /mnt/rustfs-odirect
         run: cargo test -p rustfs-ecstore uring_ -- --test-threads=1 --nocapture
 
   e2e-tests:
