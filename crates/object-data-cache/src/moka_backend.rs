@@ -330,8 +330,15 @@ impl MokaBackend {
     /// index). Rare admin `clear()` path only.
     pub async fn clear(&self) -> ObjectDataCacheInvalidationResult {
         let removed = self.index.remove_matching(|_| true).await.len();
-        self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
+        self.cache.invalidate_all();
+        for _ in 0..8 {
+            self.cache.run_pending_tasks().await;
+            if self.cache.entry_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         Self::invalidation_result(removed)
     }
 
