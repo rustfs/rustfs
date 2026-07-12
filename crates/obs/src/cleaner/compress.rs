@@ -155,6 +155,26 @@ impl Drop for TmpFileGuard {
     }
 }
 
+/// Create the temporary archive file, refusing to follow or overwrite a
+/// symlink planted at the temp path.
+///
+/// `create_new` (`O_CREAT|O_EXCL`) rejects a pre-existing entry, and on Unix
+/// `O_NOFOLLOW` additionally refuses a symlink at the final component. Without
+/// these, an attacker with write access to the log directory could pre-plant
+/// `<archive>.tmp` as a symlink and have the compressor truncate/overwrite an
+/// arbitrary external file. The deletion path already refuses symlinks; this
+/// closes the same gap on the compression path.
+fn create_tmp_archive(path: &Path) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
 /// Best-effort fsync of the directory containing `path`.
 ///
 /// Persisting the directory entry makes a rename (or, for the deletion path, an
@@ -214,7 +234,7 @@ where
     tmp_name.push(".tmp");
     let tmp_archive_path = std::path::PathBuf::from(tmp_name);
 
-    let output = File::create(&tmp_archive_path)?;
+    let output = create_tmp_archive(&tmp_archive_path)?;
     // Arm a guard so any early return *or panic* between here and the final
     // rename removes the incomplete temporary archive instead of leaking it.
     let mut tmp_guard = TmpFileGuard::new(tmp_archive_path.clone());
