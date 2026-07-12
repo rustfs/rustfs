@@ -1348,7 +1348,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
     let mut join_set = JoinSet::new();
 
     // Process each target
-    for (_, tgt_entry) in dsc.targets_map.iter() {
+    for tgt_entry in dsc.targets_map.values() {
         // Skip targets that should not be replicated
         if !tgt_entry.replicate {
             continue;
