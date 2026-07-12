@@ -550,6 +550,15 @@ jobs:
   # the intermediate 4-object plateau requires 4*lc_interval < 5*debug_day, i.e.
   # debug_day > 8. A smaller value lets the Days=5 rule fire inside the Days=1
   # poll window so the count collapses straight to 2 and the test fails (#4764).
+  #
+  # RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=1 is also required. A compacted directory
+  # is only re-descended (and its objects re-evaluated for ILM) once every
+  # DATA_USAGE_UPDATE_DIR_CYCLES scanner cycles (default 16). At the accelerated
+  # RUSTFS_SCANNER_CYCLE=2 that is ~32s between evaluations, so a Days=1 object
+  # that becomes due at debug_day (10s) is not actually expired until the next
+  # ~32s boundary (~42s), landing just past the 4*lc_interval (40s) poll window
+  # and making the count stall at 6 (#4767). Forcing every-cycle re-descent
+  # evaluates ILM within ~2s of the due time, well inside the poll window.
   s3-lifecycle-behavior-tests:
     name: S3 Lifecycle Behavior Tests
     needs: [ build-rustfs-debug-binary ]
@@ -583,6 +592,7 @@ jobs:
           RUSTFS_ILM_PROCESS_TIME=1 \
           RUSTFS_SCANNER_ENABLED=true \
           RUSTFS_SCANNER_CYCLE=2 \
+          RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=1 \
           RUSTFS_SCANNER_START_DELAY_SECS=0 \
           RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL=2s \
           S3_PORT="${S3_PORT}" \
