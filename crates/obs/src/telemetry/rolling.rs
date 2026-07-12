@@ -133,8 +133,20 @@ impl RollingAppender {
         Ok(appender)
     }
 
-    fn active_file_path(&self) -> PathBuf {
+    pub(crate) fn active_file_path(&self) -> PathBuf {
         self.dir.join(&self.filename)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn active_file_identity(&self) -> io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("rolling log file is not open"))?
+            .metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     fn open_file(&mut self) -> io::Result<()> {

@@ -47,7 +47,7 @@ use rustfs_config::observability::{
     DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP,
     DEFAULT_OBS_LOG_ZSTD_WORKERS,
 };
-use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED};
+use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use std::{collections::BTreeMap, fmt};
@@ -73,6 +73,50 @@ const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
 const STDERR_WARNING_PREFIX: &str = "[WARN]";
 const REQUEST_ID_CANONICAL: &str = "request_id";
 const REQUEST_ID_COMPAT: &str = "request-id";
+
+pub(super) fn resolve_file_stdout_mirror(configured: Option<bool>, is_production: bool) -> bool {
+    configured.unwrap_or(!is_production)
+}
+
+#[cfg(unix)]
+pub(super) fn validate_stdout_sink(file_appender: &RollingAppender) -> Result<(), TelemetryError> {
+    use std::os::fd::AsFd;
+
+    let stdout_stat = rustix::fs::fstat(std::io::stdout().as_fd())
+        .map_err(|error| TelemetryError::LogSinkConflict(format!("failed to inspect stdout file descriptor: {error}")))?;
+    if !rustix::fs::FileType::from_raw_mode(stdout_stat.st_mode).is_file() {
+        return Ok(());
+    }
+
+    let stdout_device = u64::try_from(stdout_stat.st_dev).map_err(|error| {
+        TelemetryError::LogSinkConflict(format!("stdout file descriptor returned an invalid device identifier: {error}"))
+    })?;
+    let active_identity = file_appender
+        .active_file_identity()
+        .map_err(|error| TelemetryError::Io(error.to_string()))?;
+    validate_distinct_file_identities((stdout_device, stdout_stat.st_ino), active_identity, &file_appender.active_file_path())
+}
+
+#[cfg(not(unix))]
+pub(super) fn validate_stdout_sink(_file_appender: &RollingAppender) -> Result<(), TelemetryError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_distinct_file_identities(
+    stdout_identity: (u64, u64),
+    active_identity: (u64, u64),
+    active_log_path: &std::path::Path,
+) -> Result<(), TelemetryError> {
+    if stdout_identity == active_identity {
+        return Err(TelemetryError::LogSinkConflict(format!(
+            "stdout and rolling log resolve to the same file {}; route stdout to journald or choose a different log file",
+            active_log_path.display()
+        )));
+    }
+
+    Ok(())
+}
 
 fn resolve_log_cleanup_interval_seconds(config: &OtelConfig) -> u64 {
     match config.log_cleanup_interval_seconds {
@@ -353,6 +397,7 @@ fn init_file_logging_internal(
 
     let file_appender =
         RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+    validate_stdout_sink(&file_appender)?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -367,7 +412,7 @@ fn init_file_logging_internal(
     // Optional stdout mirror: enabled explicitly via `log_stdout_enabled`, or
     // unconditionally in non-production environments so developers still see
     // immediate terminal output while file rotation remains enabled.
-    let (stdout_layer, stdout_guard) = if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
+    let (stdout_layer, stdout_guard) = if resolve_file_stdout_mirror(config.log_stdout_enabled, is_production) {
         let (stdout_nb, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
         let enable_color = std::io::stdout().is_terminal();
         (Some(build_json_log_layer(stdout_nb, enable_color, span_events)), Some(stdout_guard))
@@ -800,6 +845,127 @@ mod tests {
         assert!(!should_fallback_to_stdout(&TelemetryError::Io(
             "No such file or directory (os error 2)".to_string()
         )));
+    }
+
+    #[test]
+    fn stdout_mirror_configuration_overrides_environment_default() {
+        assert!(!resolve_file_stdout_mirror(None, true));
+        assert!(resolve_file_stdout_mirror(None, false));
+        assert!(resolve_file_stdout_mirror(Some(true), true));
+        assert!(resolve_file_stdout_mirror(Some(true), false));
+        assert!(!resolve_file_stdout_mirror(Some(false), true));
+        assert!(!resolve_file_stdout_mirror(Some(false), false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_sink_validation_rejects_file_aliases() {
+        use std::fs::{self, File};
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let active_path = temp_dir.path().join("rustfs.log");
+        let hardlink_path = temp_dir.path().join("stdout-hardlink.log");
+        let symlink_path = temp_dir.path().join("stdout-symlink.log");
+        File::create(&active_path).expect("create active log");
+        fs::hard_link(&active_path, &hardlink_path).expect("create hardlink");
+        std::os::unix::fs::symlink(&active_path, &symlink_path).expect("create symlink");
+
+        let active_metadata = fs::metadata(&active_path).expect("stat active log");
+        for alias in [&active_path, &hardlink_path, &symlink_path] {
+            let alias_metadata = fs::metadata(alias).expect("stat stdout alias");
+            assert!(matches!(
+                validate_distinct_file_identities(
+                    (alias_metadata.dev(), alias_metadata.ino()),
+                    (active_metadata.dev(), active_metadata.ino()),
+                    &active_path,
+                ),
+                Err(TelemetryError::LogSinkConflict(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_sink_validation_allows_distinct_files() {
+        use std::fs::{self, File};
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let stdout_path = temp_dir.path().join("stdout.log");
+        let active_path = temp_dir.path().join("rustfs.log");
+        File::create(&stdout_path).expect("create stdout log");
+        File::create(&active_path).expect("create active log");
+
+        let stdout_metadata = fs::metadata(&stdout_path).expect("stat stdout log");
+        let active_metadata = fs::metadata(&active_path).expect("stat active log");
+        assert!(
+            validate_distinct_file_identities(
+                (stdout_metadata.dev(), stdout_metadata.ino()),
+                (active_metadata.dev(), active_metadata.ino()),
+                &active_path,
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_logging_initialization_rejects_stdout_alias() {
+        const CHILD_ENV: &str = "RUSTFS_TEST_STDOUT_LOG_ALIAS_CHILD";
+        const PATH_ENV: &str = "RUSTFS_TEST_STDOUT_LOG_ALIAS_PATH";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            use std::fs::OpenOptions;
+
+            let active_path = std::path::PathBuf::from(std::env::var_os(PATH_ENV).expect("child log path must be set"));
+            let stdout_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&active_path)
+                .expect("open child stdout log");
+            rustix::stdio::dup2_stdout(&stdout_file).expect("redirect child stdout");
+
+            let config = OtelConfig {
+                log_filename: active_path.file_name().map(|name| name.to_string_lossy().into_owned()),
+                log_stdout_enabled: Some(false),
+                ..OtelConfig::default()
+            };
+            let log_directory = active_path.parent().expect("active log must have parent");
+            let runtime = tokio::runtime::Runtime::new().expect("create Tokio runtime");
+            runtime.block_on(async {
+                assert!(matches!(
+                    init_file_logging_internal(
+                        &config,
+                        log_directory.to_str().expect("log directory must be UTF-8"),
+                        "info",
+                        true,
+                    ),
+                    Err(TelemetryError::LogSinkConflict(_))
+                ));
+            });
+            return;
+        }
+
+        let temp_dir = tempdir().expect("create parent temp dir");
+        let active_path = temp_dir.path().join("rustfs.log");
+        let output = std::process::Command::new(std::env::current_exe().expect("resolve current test executable"))
+            .args([
+                "--exact",
+                "telemetry::local::tests::file_logging_initialization_rejects_stdout_alias",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(PATH_ENV, &active_path)
+            .output()
+            .expect("run isolated stdout alias child test");
+
+        assert!(
+            output.status.success(),
+            "stdout alias child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

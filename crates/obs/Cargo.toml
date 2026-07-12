@@ -74,6 +74,7 @@ rustfs-notify = { workspace = true }
 rustfs-security-governance = { workspace = true }
 rustfs-storage-api = { workspace = true }
 rustfs-utils = { workspace = true, features = ["ip"] }
+rustix = { workspace = true, features = ["fs", "stdio"] }
 chrono = { workspace = true }
 flate2 = { workspace = true }
 glob = { workspace = true }
