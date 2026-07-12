@@ -8,6 +8,10 @@
 
 **Tech Stack:** Rust, tracing/tracing-appender, Unix file metadata, systemd, shell guardrails.
 
+**Status updated:** 2026-07-12 after pulling `origin/houseme/pr-4765-ci-fix`.
+
+**Status legend:** `[x]` completed, `[ ]` pending final validation or external evidence.
+
 ---
 
 ### Task 1: Preserve stdout configuration intent
@@ -17,11 +21,11 @@
 - Modify: `crates/obs/src/telemetry/local.rs`
 - Modify: `crates/obs/src/telemetry/otel.rs`
 
-- [ ] Add table tests proving unset, explicit true, and explicit false behavior in production and development.
-- [ ] Run the focused tests and confirm non-production plus explicit false fails on the current implementation.
-- [ ] Preserve `None` when the environment variable is absent and add one shared mirror resolver.
-- [ ] Use the resolver in both local and OTLP file initialization.
-- [ ] Run focused tests and confirm all table cases pass.
+- [x] Add table tests proving unset, explicit true, and explicit false behavior in production and development.
+- [x] Run the focused tests and confirm non-production plus explicit false fails on the current implementation.
+- [x] Preserve `None` when the environment variable is absent and add one shared mirror resolver.
+- [x] Use the resolver in both local and OTLP file initialization.
+- [x] Run focused tests and confirm all table cases pass.
 
 ### Task 2: Reject same-inode stdout and rolling file sinks
 
@@ -31,11 +35,11 @@
 - Modify: `crates/obs/src/telemetry/rolling.rs` only if a read-only active-path accessor is required
 - Test: `crates/obs/src/telemetry/local.rs` test module or a focused Unix integration test
 
-- [ ] Add Unix tests for same inode, hardlink alias, and distinct regular files; isolate stdout descriptor mutation in a child process if descriptor replacement is required.
-- [ ] Run the focused tests and confirm the same-inode case is not rejected by current code.
-- [ ] Add a shared pre-registration validator comparing regular-file device and inode metadata.
-- [ ] Invoke validation from local and OTLP file setup before subscriber registration and cleanup startup.
-- [ ] Run the focused tests and existing rolling/cleaner tests.
+- [x] Add Unix tests for same inode, hardlink alias, and distinct regular files; isolate stdout descriptor mutation in a child process if descriptor replacement is required.
+- [x] Run the focused tests and confirm the same-inode case is not rejected by current code.
+- [x] Add a shared pre-registration validator comparing regular-file device and inode metadata.
+- [x] Invoke validation from local and OTLP file setup before subscriber registration and cleanup startup.
+- [x] Run the focused tests and existing rolling/cleaner tests.
 
 ### Task 3: Establish the packaged systemd single-writer contract
 
@@ -43,10 +47,10 @@
 - Modify: `deploy/build/rustfs.service`
 - Modify: `scripts/check_logging_guardrails.sh`
 
-- [ ] Add a guardrail assertion that fails while the unit appends stdout or stderr to a RustFS-managed log file.
-- [ ] Run the guardrail and confirm it fails against the current unit.
-- [ ] Change stdout and stderr to journald.
-- [ ] Run the guardrail and confirm it passes.
+- [x] Add a guardrail assertion that fails while the unit appends stdout or stderr to a RustFS-managed log file.
+- [x] Run the guardrail and confirm it fails against the current unit.
+- [x] Change stdout and stderr to journald.
+- [x] Run the guardrail and confirm it passes.
 
 ### Task 4: Bound ECStore hot-path tracing
 
@@ -55,9 +59,9 @@
 - Modify: `crates/ecstore/src/disk/local.rs`
 - Modify: `crates/ecstore/src/cluster/rpc/remote_disk.rs`
 
-- [ ] Change per-object/per-disk/per-RPC success spans to TRACE with `skip_all` across all three layers.
-- [ ] Keep useful scalar context only in existing explicit structured RemoteDisk trace events; do not automatically capture method arguments.
-- [ ] Add a static guard that rejects scoped instrumentation without exact TRACE + `skip_all`, and rejects DEBUG RemoteDisk success events.
+- [x] Change per-object/per-disk/per-RPC success spans to TRACE with `skip_all` across all three layers.
+- [x] Keep useful scalar context only in existing explicit structured RemoteDisk trace events; do not automatically capture method arguments.
+- [x] Add a static guard that rejects scoped instrumentation without exact TRACE + `skip_all`, and rejects DEBUG RemoteDisk success events.
 - [ ] Run the guard and focused crate tests.
 
 ### Task 5: Add combined regression guardrails
@@ -66,9 +70,9 @@
 - Modify: `scripts/check_logging_guardrails.sh`
 - Modify or create focused deployment/rotation tests as required
 
-- [ ] Guard the packaged systemd unit against append-to-active-log regression.
-- [ ] Guard ECStore data-path instrumentation against implicit INFO and heavy argument capture.
-- [ ] Verify Docker and Helm file logging remain distinct from container stdout without changing their persistence defaults.
+- [x] Guard the packaged systemd unit against append-to-active-log regression.
+- [x] Guard ECStore data-path instrumentation against implicit INFO and heavy argument capture.
+- [x] Verify Docker and Helm file logging remain distinct from container stdout without changing their persistence defaults.
 - [ ] Add the repeatable four-node Warp acceptance procedure and measurements to the implementation handoff.
 
 ### Task 6: Verify and review
@@ -76,10 +80,10 @@
 **Files:**
 - Review all files changed above
 
-- [ ] Run `cargo fmt --all --check`.
-- [ ] Run `cargo test -p rustfs-obs`.
-- [ ] Run `./scripts/check_logging_guardrails.sh`.
+- [x] Run `cargo fmt --all --check`.
+- [x] Run `cargo test -p rustfs-obs`.
+- [x] Run `./scripts/check_logging_guardrails.sh`.
 - [ ] Run `make pre-commit` and resolve any in-scope failures.
-- [ ] Run the applicable correctness, concurrency, compatibility, performance, and test-coverage adversarial passes over the final diff.
+- [x] Run the applicable correctness, concurrency, compatibility, performance, and test-coverage adversarial passes over the final diff.
 - [ ] Run `make pre-pr` after all findings are resolved.
-- [ ] Clean generated build artifacts according to repository policy.
+- [x] Clean generated build artifacts according to repository policy.
