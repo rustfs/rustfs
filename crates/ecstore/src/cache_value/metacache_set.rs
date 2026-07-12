@@ -15,7 +15,6 @@
 use crate::disk::disk_store::get_drive_walkdir_stall_timeout;
 use crate::disk::error::DiskError;
 use crate::disk::{self, DiskAPI, DiskStore, WalkDirOptions};
-use futures::future::join_all;
 use metrics::counter;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
 use std::{
@@ -28,8 +27,8 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::spawn;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
@@ -75,13 +74,22 @@ enum PeekOutcome {
     Ready(Option<MetaCacheEntry>),
     Error(rustfs_filemeta::Error),
     TimedOut,
+    Cancelled,
 }
 
-async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>, timeout_duration: Duration) -> PeekOutcome {
-    match timeout(timeout_duration, reader.peek()).await {
-        Ok(Ok(entry)) => PeekOutcome::Ready(entry),
-        Ok(Err(err)) => PeekOutcome::Error(err),
-        Err(_) => PeekOutcome::TimedOut,
+async fn peek_with_timeout<R: AsyncRead + Unpin>(
+    cancel: &CancellationToken,
+    reader: &mut MetacacheReader<R>,
+    timeout_duration: Duration,
+) -> PeekOutcome {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => PeekOutcome::Cancelled,
+        result = timeout(timeout_duration, reader.peek()) => match result {
+            Ok(Ok(entry)) => PeekOutcome::Ready(entry),
+            Ok(Err(err)) => PeekOutcome::Error(err),
+            Err(_) => PeekOutcome::TimedOut,
+        },
     }
 }
 
@@ -159,10 +167,24 @@ pub(crate) enum TestReaderBehavior {
     Eof,
     Entries(Vec<MetaCacheEntry>),
     Stall,
+    StallWithSignals {
+        entered: Arc<tokio::sync::Notify>,
+        stopped: Arc<tokio::sync::Notify>,
+    },
     IgnoreCancel,
     ProducerError(DiskError),
     PrimaryErrorThenFallback(DiskError),
     PartialThenTimeout(Vec<MetaCacheEntry>),
+}
+
+#[cfg(test)]
+struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+#[cfg(test)]
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -224,6 +246,8 @@ impl Clone for ListPathRawOptions {
 }
 
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
+    let rx = rx.child_token();
+    let _cancel_guard = rx.clone().drop_guard();
     list_path_raw_inner(rx, opts, None).await
 }
 
@@ -232,6 +256,8 @@ pub(crate) async fn list_path_raw_with_claim_tracker(
     opts: ListPathRawOptions,
     claim_tracker: FallbackClaimTracker,
 ) -> disk::error::Result<()> {
+    let rx = rx.child_token();
+    let _cancel_guard = rx.clone().drop_guard();
     list_path_raw_inner(rx, opts, Some(claim_tracker)).await
 }
 
@@ -250,7 +276,7 @@ async fn list_path_raw_inner(
     let log_bucket = opts.bucket.clone();
     let log_path = opts.path.clone();
 
-    let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
+    let mut jobs = JoinSet::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
     let fds = Arc::new(TokioMutex::new(opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>()));
     #[cfg(test)]
@@ -273,7 +299,7 @@ async fn list_path_raw_inner(
         let producer_errs_clone = producer_errs.clone();
         let (rd, wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
-        jobs.push(spawn(async move {
+        jobs.spawn(async move {
             let mut wr = PublishedBytesWriter::new(wr);
             #[cfg(test)]
             let test_primary_error = if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
@@ -289,6 +315,12 @@ async fn list_path_raw_inner(
                         let _held_writer = wr;
                         cancel_rx_clone.cancelled().await;
                         return Ok(());
+                    }
+                    TestReaderBehavior::StallWithSignals { entered, stopped } => {
+                        let _drop_signal = NotifyOnDrop(stopped);
+                        entered.notify_one();
+                        let _held_writer = &mut wr;
+                        std::future::pending::<Option<DiskError>>().await
                     }
                     TestReaderBehavior::IgnoreCancel => {
                         let _held_writer = wr;
@@ -427,7 +459,9 @@ async fn list_path_raw_inner(
                             last_err = Some(err);
                             continue;
                         }
-                        TestReaderBehavior::Stall | TestReaderBehavior::IgnoreCancel => {
+                        TestReaderBehavior::Stall
+                        | TestReaderBehavior::StallWithSignals { .. }
+                        | TestReaderBehavior::IgnoreCancel => {
                             last_err = Some(DiskError::Timeout);
                             continue;
                         }
@@ -566,10 +600,12 @@ async fn list_path_raw_inner(
 
             // warn!("list_path_raw: while need_fallback done");
             Ok(())
-        }));
+        });
     }
 
-    let revjob = spawn(async move {
+    let revjob_rx = rx.clone();
+    let mut revjobs = JoinSet::new();
+    revjobs.spawn(async move {
         let peek_timeout = opts
             .walkdir_stall_timeout
             .or({
@@ -597,7 +633,7 @@ async fn list_path_raw_inner(
             //     opts.bucket, opts.path, &current.name
             // );
 
-            if rx.is_cancelled() {
+            if revjob_rx.is_cancelled() {
                 return Ok(());
             }
 
@@ -618,7 +654,7 @@ async fn list_path_raw_inner(
                 let entry = if let Some(entry) = pending_entries[i].take() {
                     entry
                 } else {
-                    match peek_with_timeout(r, peek_timeout).await {
+                    match peek_with_timeout(&revjob_rx, r, peek_timeout).await {
                         PeekOutcome::Ready(res) => {
                             if let Some(entry) = res {
                                 // info!("read entry disk: {}, name: {}", i, entry.name);
@@ -703,6 +739,7 @@ async fn list_path_raw_inner(
                             *r = MetacacheReader::new(detached_rd);
                             continue;
                         }
+                        PeekOutcome::Cancelled => return Ok(()),
                     }
                 };
 
@@ -757,7 +794,11 @@ async fn list_path_raw_inner(
 
             if has_err > 0 && has_err > opts.disks.len() - opts.min_disks {
                 if let Some(finished_fn) = opts.finished.as_ref() {
-                    finished_fn(&errs).await;
+                    tokio::select! {
+                        biased;
+                        _ = revjob_rx.cancelled() => return Ok(()),
+                        _ = finished_fn(&errs) => {}
+                    }
                 }
                 let mut combined_err = Vec::new();
                 errs.iter().zip(opts.disks.iter()).for_each(|(err, disk)| match (err, disk) {
@@ -789,7 +830,11 @@ async fn list_path_raw_inner(
                 if has_err > 0
                     && let Some(finished_fn) = opts.finished.as_ref()
                 {
-                    finished_fn(&errs).await;
+                    tokio::select! {
+                        biased;
+                        _ = revjob_rx.cancelled() => return Ok(()),
+                        _ = finished_fn(&errs) => {}
+                    }
                 }
                 // Tolerated reader failures, including timeouts, must not turn a
                 // quorum EOF into a failed listing. The quorum failure branch above
@@ -805,7 +850,11 @@ async fn list_path_raw_inner(
 
                 if let Some(agreed_fn) = opts.agreed.as_ref() {
                     // warn!("list_path_raw: agreed_fn start, current: {:?}", &current.name);
-                    agreed_fn(current).await;
+                    tokio::select! {
+                        biased;
+                        _ = revjob_rx.cancelled() => return Ok(()),
+                        _ = agreed_fn(current) => {}
+                    }
                     // warn!("list_path_raw: agreed_fn done");
                 }
 
@@ -821,14 +870,21 @@ async fn list_path_raw_inner(
             }
 
             if let Some(partial_fn) = opts.partial.as_ref() {
-                partial_fn(MetaCacheEntries(top_entries), &errs).await;
+                tokio::select! {
+                    biased;
+                    _ = revjob_rx.cancelled() => return Ok(()),
+                    _ = partial_fn(MetaCacheEntries(top_entries), &errs) => {}
+                }
             }
         }
         Ok(())
     });
 
     let merge_started = std::time::Instant::now();
-    if let Err(err) = revjob.await.map_err(std::io::Error::other)? {
+    let Some(revjob) = revjobs.join_next().await else {
+        return Err(DiskError::Unexpected);
+    };
+    if let Err(err) = revjob.map_err(std::io::Error::other)? {
         rustfs_io_metrics::record_stage_duration("metacache_merge_failed", merge_started.elapsed().as_secs_f64() * 1000.0);
         if is_missing_path_error(&err) {
             debug!(
@@ -854,11 +910,14 @@ async fn list_path_raw_inner(
             );
         }
         cancel_rx.cancel();
-        for job in jobs {
-            job.abort();
-        }
+        jobs.abort_all();
 
         return Err(err);
+    }
+    if rx.is_cancelled() {
+        cancel_rx.cancel();
+        jobs.abort_all();
+        return Ok(());
     }
     rustfs_io_metrics::record_stage_duration("metacache_merge", merge_started.elapsed().as_secs_f64() * 1000.0);
 
@@ -867,16 +926,9 @@ async fn list_path_raw_inner(
     // or after the requested listing limit is satisfied). Cancel remaining walk
     // jobs before aborting them so list calls do not wait for slow remote streams.
     cancel_rx.cancel();
-
-    for job in jobs.iter() {
-        if !job.is_finished() {
-            job.abort();
-        }
-    }
-
-    let results = join_all(jobs).await;
+    jobs.abort_all();
     let mut job_errs = Vec::new();
-    for result in results {
+    while let Some(result) = jobs.join_next().await {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
@@ -1286,6 +1338,226 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_path_raw_cancels_a_blocked_peek_without_waiting_for_the_stall_timeout() {
+        let cancel = CancellationToken::new();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let list = tokio::spawn(list_path_raw(
+            cancel.clone(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::StallWithSignals {
+                    entered: entered.clone(),
+                    stopped: stopped.clone(),
+                }],
+                peek_timeout: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        ));
+
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("producer should block before cancellation");
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(1), list)
+            .await
+            .expect("cancellation should interrupt the blocked metacache peek")
+            .expect("listing task should not panic");
+        assert!(result.is_ok(), "cancellation should stop the listing cleanly, got {result:?}");
+        timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("cancellation should drop the blocked producer");
+    }
+
+    #[tokio::test]
+    async fn aborting_list_path_raw_drops_blocked_producers() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let list = tokio::spawn(list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::StallWithSignals {
+                    entered: entered.clone(),
+                    stopped: stopped.clone(),
+                }],
+                peek_timeout: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+        ));
+
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("producer should block before aborting the listing");
+        list.abort();
+        assert!(list.await.expect_err("listing task should be cancelled").is_cancelled());
+        timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("aborting the listing should drop the blocked producer");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_cancels_a_blocked_partial_callback() {
+        let cancel = CancellationToken::new();
+        let callback_started = Arc::new(tokio::sync::Notify::new());
+        let callback_started_clone = callback_started.clone();
+        let entry = MetaCacheEntry {
+            name: "bucket/object-a".to_string(),
+            metadata: vec![1],
+            ..Default::default()
+        };
+        let later_entry = MetaCacheEntry {
+            name: "bucket/object-b".to_string(),
+            metadata: vec![1],
+            ..Default::default()
+        };
+        let list = tokio::spawn(list_path_raw(
+            cancel.clone(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(vec![entry]),
+                    TestReaderBehavior::Entries(vec![later_entry]),
+                ],
+                partial: Some(Box::new(move |_, _| {
+                    let callback_started = callback_started_clone.clone();
+                    Box::pin(async move {
+                        callback_started.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                })),
+                ..Default::default()
+            },
+        ));
+
+        timeout(Duration::from_secs(1), callback_started.notified())
+            .await
+            .expect("partial callback should block before cancellation");
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(1), list)
+            .await
+            .expect("cancellation should interrupt the blocked partial callback")
+            .expect("listing task should not panic");
+        assert!(result.is_ok(), "cancellation should stop the listing cleanly, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_cancels_a_blocked_agreed_callback() {
+        let cancel = CancellationToken::new();
+        let callback_started = Arc::new(tokio::sync::Notify::new());
+        let callback_started_clone = callback_started.clone();
+        let entry = MetaCacheEntry {
+            name: "bucket/object".to_string(),
+            metadata: vec![1],
+            ..Default::default()
+        };
+        let list = tokio::spawn(list_path_raw(
+            cancel.clone(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry])],
+                agreed: Some(Box::new(move |_| {
+                    let callback_started = callback_started_clone.clone();
+                    Box::pin(async move {
+                        callback_started.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                })),
+                ..Default::default()
+            },
+        ));
+
+        timeout(Duration::from_secs(1), callback_started.notified())
+            .await
+            .expect("agreed callback should block before cancellation");
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(1), list)
+            .await
+            .expect("cancellation should interrupt the blocked agreed callback")
+            .expect("listing task should not panic");
+        assert!(result.is_ok(), "cancellation should stop the listing cleanly, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_cancels_a_blocked_finished_callback_after_quorum_failure() {
+        let cancel = CancellationToken::new();
+        let callback_started = Arc::new(tokio::sync::Notify::new());
+        let callback_started_clone = callback_started.clone();
+        let list = tokio::spawn(list_path_raw(
+            cancel.clone(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::ProducerError(DiskError::FileAccessDenied)],
+                finished: Some(Box::new(move |_| {
+                    let callback_started = callback_started_clone.clone();
+                    Box::pin(async move {
+                        callback_started.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                })),
+                ..Default::default()
+            },
+        ));
+
+        timeout(Duration::from_secs(1), callback_started.notified())
+            .await
+            .expect("finished callback should block before cancellation");
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(1), list)
+            .await
+            .expect("cancellation should interrupt the blocked finished callback")
+            .expect("listing task should not panic");
+        assert!(result.is_ok(), "cancellation should stop the listing cleanly, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_cancels_a_blocked_finished_callback_after_tolerated_error() {
+        let cancel = CancellationToken::new();
+        let callback_started = Arc::new(tokio::sync::Notify::new());
+        let callback_started_clone = callback_started.clone();
+        let list = tokio::spawn(list_path_raw(
+            cancel.clone(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Eof,
+                    TestReaderBehavior::Eof,
+                    TestReaderBehavior::ProducerError(DiskError::FileAccessDenied),
+                ],
+                finished: Some(Box::new(move |_| {
+                    let callback_started = callback_started_clone.clone();
+                    Box::pin(async move {
+                        callback_started.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                })),
+                ..Default::default()
+            },
+        ));
+
+        timeout(Duration::from_secs(1), callback_started.notified())
+            .await
+            .expect("finished callback should block before cancellation");
+        cancel.cancel();
+
+        let result = timeout(Duration::from_secs(1), list)
+            .await
+            .expect("cancellation should interrupt the blocked finished callback")
+            .expect("listing task should not panic");
+        assert!(result.is_ok(), "cancellation should stop the listing cleanly, got {result:?}");
+    }
+
+    #[tokio::test]
     async fn list_path_raw_ignores_closed_output_stream_after_quorum_eof() {
         list_path_raw(
             CancellationToken::new(),
@@ -1491,15 +1763,50 @@ mod tests {
     async fn peek_with_timeout_times_out_on_silent_reader() {
         let (_writer, reader) = tokio::io::duplex(64);
         let mut reader = MetacacheReader::new(reader);
+        let cancel = CancellationToken::new();
 
-        let outcome = peek_with_timeout(&mut reader, Duration::from_millis(20)).await;
+        let outcome = peek_with_timeout(&cancel, &mut reader, Duration::from_millis(20)).await;
         assert!(matches!(outcome, PeekOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn peek_with_timeout_stops_immediately_when_cancelled() {
+        struct PendingReader(Arc<tokio::sync::Notify>);
+
+        impl AsyncRead for PendingReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                self.get_mut().0.notify_one();
+                std::task::Poll::Pending
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut reader = MetacacheReader::new(PendingReader(entered.clone()));
+        let cancel = CancellationToken::new();
+        let wait_cancel = cancel.clone();
+
+        let wait = tokio::spawn(async move { peek_with_timeout(&wait_cancel, &mut reader, Duration::from_secs(60)).await });
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("peek should block before cancellation");
+        cancel.cancel();
+
+        let outcome = timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("cancellation should interrupt the pending peek")
+            .expect("peek task should not panic");
+        assert!(matches!(outcome, PeekOutcome::Cancelled));
     }
 
     #[tokio::test]
     async fn peek_with_timeout_reads_entry_before_deadline() {
         let (reader, writer) = tokio::io::duplex(256);
         let mut metacache_reader = MetacacheReader::new(reader);
+        let cancel = CancellationToken::new();
 
         tokio::spawn(async move {
             let mut writer = MetacacheWriter::new(writer);
@@ -1513,7 +1820,7 @@ mod tests {
             writer.close().await.expect("writer should close");
         });
 
-        let outcome = peek_with_timeout(&mut metacache_reader, Duration::from_secs(1)).await;
+        let outcome = peek_with_timeout(&cancel, &mut metacache_reader, Duration::from_secs(1)).await;
         match outcome {
             PeekOutcome::Ready(Some(entry)) => assert_eq!(entry.name, "bucket/object"),
             other => panic!("expected ready entry, got {other:?}"),

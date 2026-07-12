@@ -60,6 +60,7 @@ use tokio::io::duplex;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{OnceCell, RwLock};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
@@ -2660,7 +2661,8 @@ async fn read_fallback_listing_disk(
 ) -> Vec<FallbackListingEntry> {
     let (rd, mut wr) = duplex(64);
     let walk_endpoint = endpoint.clone();
-    let walk_job = tokio::spawn(async move {
+    let mut walk_jobs = JoinSet::new();
+    walk_jobs.spawn(async move {
         disk.walk_dir(
             WalkDirOptions {
                 bucket: options.bucket,
@@ -2716,10 +2718,10 @@ async fn read_fallback_listing_disk(
     }
     drop(reader);
 
-    match walk_job.await {
-        Ok(Ok(())) if stream_ok => entries,
-        Ok(Ok(())) => Vec::new(),
-        Ok(Err(err)) => {
+    match walk_jobs.join_next().await {
+        Some(Ok(Ok(()))) if stream_ok => entries,
+        Some(Ok(Ok(()))) => Vec::new(),
+        Some(Ok(Err(err))) => {
             debug!(
                 endpoint = %walk_endpoint,
                 error = ?err,
@@ -2727,7 +2729,7 @@ async fn read_fallback_listing_disk(
             );
             Vec::new()
         }
-        Err(err) => {
+        Some(Err(err)) => {
             debug!(
                 endpoint = %walk_endpoint,
                 error = ?err,
@@ -2735,6 +2737,7 @@ async fn read_fallback_listing_disk(
             );
             Vec::new()
         }
+        None => Vec::new(),
     }
 }
 
@@ -3986,6 +3989,7 @@ impl ECStore {
 
         // cancel channel
         let cancel = CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
 
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
 
@@ -5226,6 +5230,7 @@ impl Sets {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
@@ -6180,6 +6185,7 @@ impl SetDisks {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
