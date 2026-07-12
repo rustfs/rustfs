@@ -603,6 +603,15 @@ impl LogCleaner {
             }
         }
 
+        // Durability: persist the directory entries so the unlinks cannot be
+        // reordered ahead of the archive data that justified them. Best-effort;
+        // opening a directory as a file is not portable (e.g. Windows).
+        if !self.dry_run && deleted > 0 {
+            if let Ok(dir) = std::fs::File::open(&self.log_dir) {
+                let _ = dir.sync_all();
+            }
+        }
+
         Ok((deleted, freed))
     }
 }

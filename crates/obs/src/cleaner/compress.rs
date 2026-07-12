@@ -105,7 +105,10 @@ fn compress_gzip(path: &Path, level: u32, dry_run: bool) -> Result<CompressionOu
         let written = std::io::copy(reader, &mut encoder)?;
         let mut out = encoder.finish()?;
         out.flush()?;
-        Ok(written)
+        // Hand the underlying file back so the caller can `sync_all()` the
+        // archive data before renaming and deleting the source.
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        Ok((written, file))
     })
 }
 
@@ -118,8 +121,52 @@ fn compress_zstd(path: &Path, level: i32, workers: usize, dry_run: bool) -> Resu
         let written = std::io::copy(reader, &mut encoder)?;
         let mut out = encoder.finish()?;
         out.flush()?;
-        Ok(written)
+        // Hand the underlying file back so the caller can `sync_all()` the
+        // archive data before renaming and deleting the source.
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        Ok((written, file))
     })
+}
+
+/// RAII guard that removes a temporary archive on drop unless disarmed.
+///
+/// This makes the compression path panic-safe: an early return *or a panic*
+/// between creating the temp file and the final rename still cleans up the
+/// partial artifact instead of leaking a `*.tmp` orphan.
+struct TmpFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TmpFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Best-effort fsync of the directory containing `path`.
+///
+/// Persisting the directory entry makes a rename (or, for the deletion path, an
+/// unlink) of an entry within it durable across a crash. Opening a directory as
+/// a file is not portable (notably on Windows), so any failure is ignored.
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        if let Ok(handle) = File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
 }
 
 fn compress_with_writer<F>(
@@ -130,7 +177,7 @@ fn compress_with_writer<F>(
     mut writer_fn: F,
 ) -> Result<CompressionOutput, std::io::Error>
 where
-    F: FnMut(&mut BufReader<File>, BufWriter<File>) -> Result<u64, std::io::Error>,
+    F: FnMut(&mut BufReader<File>, BufWriter<File>) -> Result<(u64, File), std::io::Error>,
 {
     // Keep idempotent behavior: existing archive means this file has already
     // been handled in a previous cleanup pass.
@@ -168,14 +215,22 @@ where
     let tmp_archive_path = std::path::PathBuf::from(tmp_name);
 
     let output = File::create(&tmp_archive_path)?;
+    // Arm a guard so any early return *or panic* between here and the final
+    // rename removes the incomplete temporary archive instead of leaking it.
+    let mut tmp_guard = TmpFileGuard::new(tmp_archive_path.clone());
     let mut reader = BufReader::new(input);
     let writer = BufWriter::new(output);
 
-    if let Err(e) = writer_fn(&mut reader, writer) {
-        // Best-effort cleanup of the incomplete temporary archive.
-        let _ = std::fs::remove_file(&tmp_archive_path);
-        return Err(e);
-    }
+    let (_written, out_file) = writer_fn(&mut reader, writer)?;
+
+    // Durability: force the archive contents to stable storage *before* the
+    // rename. Without this, a crash after rename but before the page cache is
+    // flushed can leave a zero-length/truncated archive while the source is
+    // later deleted — permanent log/audit data loss. Renaming to a brand-new
+    // name (the `exists()` guard above guarantees this) means ext4's
+    // `auto_da_alloc` safety net does not apply, so the fsync is mandatory.
+    out_file.sync_all()?;
+    drop(out_file);
 
     // Preserve Unix mode bits so rotated archives keep the same access policy.
     #[cfg(unix)]
@@ -190,6 +245,13 @@ where
 
     // Atomically move the fully written temp file into its final location.
     std::fs::rename(&tmp_archive_path, archive_path)?;
+    // The archive now lives at its final path; disarm the guard so it is not
+    // removed on the way out.
+    tmp_guard.disarm();
+
+    // Persist the new directory entry so the rename survives a crash. Failure
+    // here is best-effort (e.g. platforms that reject opening a directory).
+    sync_parent_dir(archive_path);
 
     let output_bytes = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
     debug!(
