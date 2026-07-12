@@ -21,7 +21,7 @@ use super::performance::PerformanceMetrics;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// How many recorded operations elapse between P95/P99 recomputations.
@@ -34,12 +34,28 @@ use tokio::sync::RwLock;
 /// while the per-op sort cost is amortised away.
 const PERCENTILE_RECOMPUTE_INTERVAL: u32 = 128;
 
+/// Maximum wall-clock staleness of the P95/P99 percentiles before a recompute is
+/// forced regardless of the operation count.
+///
+/// The count throttle alone starves low-IOPS deployments: at a few operations
+/// per minute it can take hours to accumulate `PERCENTILE_RECOMPUTE_INTERVAL`
+/// samples, during which the exported p95/p99 stay pinned at their initial `0`
+/// (or a long-stale value). This time bound guarantees the percentiles refresh
+/// within a bounded delay even under trickle traffic, while leaving the hot,
+/// high-IOPS path governed by the cheaper count throttle.
+const PERCENTILE_RECOMPUTE_MAX_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Sliding window of I/O latency samples plus a running sum, so the window mean
 /// is maintained in O(1) as samples enter and leave.
 struct LatencyWindow {
     samples: VecDeque<Duration>,
     /// Sum of `samples` in microseconds, kept in step with every push/pop.
     sum_micros: u128,
+    /// When the P95/P99 percentiles were last recomputed, used to force a
+    /// refresh under low-traffic conditions where the count throttle rarely
+    /// fires. Seeded at construction so the first time-based refresh is measured
+    /// from collector start, not from an absent prior recompute.
+    last_percentile_at: Instant,
 }
 
 /// Metrics collector for tracking I/O operations and computing latency percentiles.
@@ -70,6 +86,7 @@ impl MetricsCollector {
             io_latency: RwLock::new(LatencyWindow {
                 samples: VecDeque::new(),
                 sum_micros: 0,
+                last_percentile_at: Instant::now(),
             }),
             max_latency_samples,
             ops_since_percentile: AtomicU32::new(0),
@@ -130,10 +147,22 @@ impl MetricsCollector {
             let len = window.samples.len() as u128;
             let mean_us = window.sum_micros.checked_div(len).unwrap_or(0) as u64;
 
+            // Two independent recompute triggers, both evaluated under the lock so
+            // the counter and the timestamp stay consistent:
+            //   * count: cheap amortisation for the hot, high-IOPS path;
+            //   * time:  a staleness ceiling so low-IOPS deployments do not export
+            //            an initial/stale 0 for p95/p99 while samples trickle in.
+            // We just pushed a sample, so the window is guaranteed non-empty and a
+            // time-forced recompute always has data to sort — including the first
+            // one, which can fire with far fewer than INTERVAL samples.
+            let now = Instant::now();
             let n = self.ops_since_percentile.fetch_add(1, Ordering::Relaxed) + 1;
-            let recompute = n >= PERCENTILE_RECOMPUTE_INTERVAL;
+            let count_due = n >= PERCENTILE_RECOMPUTE_INTERVAL;
+            let time_due = now.duration_since(window.last_percentile_at) >= PERCENTILE_RECOMPUTE_MAX_INTERVAL;
+            let recompute = count_due || time_due;
             if recompute {
                 self.ops_since_percentile.store(0, Ordering::Relaxed);
+                window.last_percentile_at = now;
             }
             (mean_us, recompute)
         };
@@ -264,6 +293,42 @@ mod tests {
         // The op that crosses the interval triggers exactly one recompute.
         collector.record_io_operation(0, Duration::from_micros(200), true).await;
         assert_eq!(metrics.p99_io_latency_us.load(Ordering::Relaxed), 200);
+    }
+
+    #[tokio::test]
+    async fn low_frequency_percentiles_recompute_on_time() {
+        let metrics = Arc::new(PerformanceMetrics::new());
+        let collector = MetricsCollector::new(metrics.clone(), 1000);
+
+        // Only a handful of ops — far below PERCENTILE_RECOMPUTE_INTERVAL — so the
+        // count throttle alone would never fire and p99 would stay pinned at its
+        // initial 0 (the low-IOPS staleness bug).
+        for _ in 0..5 {
+            collector.record_io_operation(0, Duration::from_micros(200), true).await;
+        }
+        assert_eq!(
+            metrics.p99_io_latency_us.load(Ordering::Relaxed),
+            0,
+            "count throttle alone must not have recomputed yet"
+        );
+
+        // Simulate enough wall-clock time elapsing since the last recompute by
+        // backdating the timestamp past the staleness ceiling.
+        {
+            let mut window = collector.io_latency.write().await;
+            window.last_percentile_at = Instant::now()
+                .checked_sub(PERCENTILE_RECOMPUTE_MAX_INTERVAL + Duration::from_secs(1))
+                .expect("monotonic clock has enough history to backdate");
+        }
+
+        // The next op must force a time-based recompute even though the sample
+        // count is still far below the interval — so p99 is no longer stuck at 0.
+        collector.record_io_operation(0, Duration::from_micros(200), true).await;
+        assert_eq!(
+            metrics.p99_io_latency_us.load(Ordering::Relaxed),
+            200,
+            "time-based trigger must refresh p99 on low-traffic deployments"
+        );
     }
 
     #[tokio::test]
