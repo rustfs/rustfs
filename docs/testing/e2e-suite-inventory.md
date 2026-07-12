@@ -54,7 +54,7 @@
 | quota_test | 13 |  |
 | reliability_disk_fault_test | 3 |  |
 | reliant | 6 |  |
-| replication_extension_test | 36 | 20 ✅ +16 🌙 |
+| replication_extension_test | 38 | 20 ✅ +18 🌙 |
 | security_boundary_test | 4 |  |
 | server_startup_failfast_test | 1 |  |
 | snowball_auto_extract_test | 6 |  |
@@ -63,4 +63,4 @@
 | tls_gen | 3 |  |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 394 tests across 47 modules · PR smoke subset: 83 tests / 18 modules** (17 full modules + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 16 tests** · generated 2026-07-10.
+**Total listed: 396 tests across 47 modules · PR smoke subset: 83 tests / 18 modules** (17 full modules + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 18 tests** · generated 2026-07-12.

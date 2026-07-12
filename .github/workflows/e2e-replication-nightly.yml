@@ -15,11 +15,11 @@
 # Nightly full replication e2e lane (backlog#1147 repl-1, deps: ci-4).
 #
 # The per-PR gate (ci.yml `e2e-tests` job, `--profile e2e-smoke`) runs the 20
-# FAST bucket-replication tests. This scheduled lane runs the remaining 16
+# FAST bucket-replication tests. This scheduled lane runs the remaining 18
 # heavier replication e2e tests that are unfit for a per-PR gate:
 #
-#   * 6 slow bucket-replication data-plane tests (PUT + poll for convergence at
-#     production background-loop intervals; two replicate over HTTPS).
+#   * 8 bucket-replication data-plane tests (PUT/delete + poll for convergence;
+#     two replicate over HTTPS).
 #   * 9 `_real_dual_node` site-replication tests (each spawns TWO rustfs
 #     servers and drives the cross-process site-replication control plane).
 #   * 1 `_real_single_node` service-account round-trip test.
@@ -28,7 +28,7 @@
 # .config/nextest.toml — the single wiring mechanism (repl-1 / ci-4). Do NOT
 # add ad-hoc cargo-test steps here; change the filterset instead.
 #
-# Explicit division of labor: these 16 tests run ONLY here, never double-run
+# Explicit division of labor: these 18 tests run ONLY here, never double-run
 # in ci-5's future e2e-full merge gate. TODO(ci-7): once the ci domain's
 # consolidated scheduled e2e workflow exists, fold this interim repl-owned lane
 # into it rather than growing a second scheduled entrypoint.
