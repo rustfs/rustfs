@@ -28,7 +28,7 @@ use crate::global::{
 };
 use crossbeam_channel::bounded;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use crossbeam_utils::thread;
+use crossbeam_utils::{Backoff, thread};
 use metrics::{counter, gauge, histogram};
 use rustfs_config::DEFAULT_LOG_KEEP_FILES;
 use std::path::PathBuf;
@@ -41,6 +41,11 @@ const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
 const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+/// Absolute ceiling on parallel compression workers, independent of config, so
+/// a mis-set `parallel_workers` on a directory with thousands of rotated logs
+/// cannot spawn thousands of threads (each of which may also start codec
+/// threads).
+const MAX_PARALLEL_COMPRESS_WORKERS: usize = 64;
 const MAX_RETENTION_DAYS_BEFORE_SATURATION: u64 = u64::MAX / SECONDS_PER_DAY;
 
 fn compressed_file_retention_window(days: u64) -> Duration {
@@ -328,7 +333,10 @@ impl LogCleaner {
             return self.serial_compress_and_delete(files);
         }
 
-        let worker_count = self.parallel_workers.min(files.len()).max(1);
+        let worker_count = self
+            .parallel_workers
+            .min(files.len())
+            .clamp(1, MAX_PARALLEL_COMPRESS_WORKERS);
         if worker_count <= 1 {
             return self.serial_compress_and_delete(files);
         }
@@ -370,6 +378,11 @@ impl LogCleaner {
                         .wrapping_mul(6364136223846793005)
                         .wrapping_add(1442695040888963407);
 
+                    // Escalating spin->yield backoff for the transient windows
+                    // where work is being redistributed, instead of a hot
+                    // `continue`/`yield_now` loop that burns CPU.
+                    let backoff = Backoff::new();
+
                     loop {
                         // Search order: local FIFO -> global injector batch ->
                         // random victim stealers.
@@ -380,7 +393,10 @@ impl LogCleaner {
                                 Steal::Success(file) => {
                                     Some(file)
                                 }
-                                Steal::Retry => continue,
+                                Steal::Retry => {
+                                    backoff.snooze();
+                                    continue;
+                                }
                                 Steal::Empty => {
                                     let stolen = Self::steal_from_victims(
                                         worker_id,
@@ -404,10 +420,13 @@ impl LogCleaner {
                         };
 
                         let Some(file) = task else {
-                            std::thread::yield_now();
+                            backoff.snooze();
                             continue;
                         };
 
+                        // Got work: reset the backoff so the next idle spell
+                        // starts from a cheap spin again.
+                        backoff.reset();
                         let mut file = file;
                         let compressed = match compress_file(&file.path, &options) {
                             Ok(output) => {

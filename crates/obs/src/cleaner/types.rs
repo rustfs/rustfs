@@ -154,13 +154,12 @@ impl fmt::Display for CompressionAlgorithm {
 
 /// Worker-thread default used by parallel compressor.
 ///
-/// The worker count follows CPU capacity but stays within [4, 8] to keep
-/// throughput stable and avoid oversubscription. The lower bound helps the
-/// work-stealing path on small machines still exercise concurrency, while the
-/// upper bound avoids swamping the host when each task may also use internal
-/// codec threads.
+/// The worker count follows CPU capacity, capped at 8 to avoid swamping the
+/// host when each task may also use internal codec threads. The lower bound is
+/// 1 (not 4) so a 1-2 vCPU container is not forced to run several concurrent
+/// compressions that monopolize its CPU.
 pub fn default_parallel_workers() -> usize {
-    num_cpus::get().clamp(4, 8)
+    num_cpus::get().clamp(1, 8)
 }
 
 /// Metadata for a single log file discovered by the scanner.
