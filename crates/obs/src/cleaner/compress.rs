@@ -209,28 +209,6 @@ fn open_source_no_follow(path: &Path) -> std::io::Result<File> {
     }
 }
 
-/// Cheap sanity check that an existing archive starts with the expected codec
-/// magic bytes, so a zero/truncated/foreign file is not trusted as a valid
-/// prior result. Only called on a confirmed regular, non-empty file.
-fn archive_header_ok(path: &Path, algorithm: CompressionAlgorithm) -> bool {
-    use std::io::Read;
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let mut buf = [0u8; 4];
-    let read = match file.read(&mut buf) {
-        Ok(read) => read,
-        Err(_) => return false,
-    };
-    match algorithm {
-        // gzip: 0x1f 0x8b
-        CompressionAlgorithm::Gzip => read >= 2 && buf[0] == 0x1f && buf[1] == 0x8b,
-        // zstd frame magic: 0x28 0xb5 0x2f 0xfd (little-endian 0xFD2FB528)
-        CompressionAlgorithm::Zstd => read >= 4 && buf == [0x28, 0xb5, 0x2f, 0xfd],
-    }
-}
-
 /// Best-effort fsync of the directory containing `path`.
 ///
 /// Persisting the directory entry makes a rename (or, for the deletion path, an
@@ -259,32 +237,21 @@ fn compress_with_writer<F>(
 where
     F: FnMut(&mut BufReader<File>, BufWriter<File>) -> Result<(u64, File), std::io::Error>,
 {
-    // Idempotency: an existing *complete* archive means a previous pass already
-    // handled this file, so we can skip recompression and let the caller delete
-    // the source. But we must not trust just any entry at `archive_path`:
-    //   * `Path::exists()` follows symlinks, so a planted `<archive>.gz` symlink
-    //     would green-light deleting the source with no real archive;
-    //   * a zero-length/truncated archive left by a crashed run (see OLC-01)
-    //     would be trusted, then the source deleted — unrecoverable loss.
-    // Use symlink_metadata (no follow) and require a regular, non-empty file
-    // with a valid codec header before trusting it. Anything else falls through
-    // to recompression, whose atomic create_new+rename replaces the bad entry
-    // (a symlink is replaced, never followed or deleted through).
-    match std::fs::symlink_metadata(archive_path) {
-        Ok(meta) if meta.file_type().is_file() && meta.len() > 0 && archive_header_ok(archive_path, algorithm_used) => {
-            debug!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?archive_path, state = "archive_exists", "log cleaner compression state changed");
-            let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            return Ok(CompressionOutput {
-                archive_path: archive_path.to_path_buf(),
-                algorithm_used,
-                input_bytes,
-                output_bytes: meta.len(),
-            });
-        }
-        Ok(_) => {
-            warn!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?archive_path, result = "archive_untrusted_recompressing", "log cleaner compression state changed");
-        }
-        Err(_) => {}
+    // Integrity over idempotency: never trust a pre-existing entry at
+    // `archive_path` as a valid prior result. The former fast path accepted any
+    // regular, non-empty file whose first 2-4 bytes matched the gzip/zstd magic.
+    // That header check does not prove the body is complete: an attacker with
+    // write access to the log directory (or a crashed prior run) can leave a file
+    // that starts with valid magic but is truncated/forged, and trusting it would
+    // let the caller delete the real source log — silent audit-data loss. Fully
+    // decoding every leftover to validate it would add real CPU cost and
+    // decode-bug surface, so instead we always recompress the source in this
+    // pass. The atomic create_new+rename below overwrites whatever sits at
+    // `archive_path` (a regular file or a planted symlink is replaced, never
+    // followed or deleted through) with a freshly written, fully-synced archive,
+    // so a partial or forged leftover can never be the basis for source deletion.
+    if std::fs::symlink_metadata(archive_path).is_ok() {
+        debug!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?archive_path, result = "leftover_archive_recompressing", "log cleaner compression state changed");
     }
 
     if dry_run {
@@ -453,5 +420,39 @@ mod tests {
         );
         // The secret must not have been copied anywhere in the directory.
         assert!(secret.exists(), "secret should be untouched");
+    }
+
+    /// A pre-existing archive whose header magic is valid but whose body is
+    /// truncated/forged must not be trusted as a completed prior result: it must
+    /// be recompressed into a complete archive, and the source must survive.
+    #[test]
+    fn truncated_magic_archive_is_not_trusted() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("app.log");
+        let payload = b"line1\nline2\nline3\n";
+        std::fs::write(&source, payload).expect("write source");
+
+        // Forged archive: valid gzip magic (0x1f 0x8b) but a truncated body.
+        let archive = dir.path().join("app.log.gz");
+        std::fs::write(&archive, [0x1f_u8, 0x8b, 0x00]).expect("write forged archive");
+
+        let out = compress_file(&source, &default_options(CompressionAlgorithm::Gzip)).expect("compression should succeed");
+        assert_eq!(out.archive_path, archive);
+
+        // The forged stub must have been replaced by a real archive that decodes
+        // back to the full source — proving it was not trusted (trusting it would
+        // let the caller delete the source and lose the log).
+        let file = File::open(&archive).expect("open archive");
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .expect("archive must be a complete gzip stream");
+        assert_eq!(decoded, payload, "recompressed archive must contain the full source");
+
+        // compress_file never deletes the source itself (the caller does, only
+        // after a valid archive), so the source log is still present here.
+        assert!(source.exists(), "source log must survive compression");
     }
 }
