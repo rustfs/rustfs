@@ -35,6 +35,11 @@ const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
 const EVENT_LOG_CLEANER_COMPRESSION_STATE: &str = "log_cleaner_compression_state";
 
+/// Conservative archive-size fraction used only for dry-run freed-byte
+/// projection. Chosen to under-estimate reclaim (never overstate it) since the
+/// true compression ratio is unknown until a real run.
+const DRY_RUN_ESTIMATED_ARCHIVE_RATIO: f64 = 0.5;
+
 /// Compression options shared by serial and parallel cleaner paths.
 ///
 /// The core cleaner prepares this immutable bundle once per cleanup pass and
@@ -257,12 +262,18 @@ where
 
     let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if dry_run {
-        info!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_compress", file = ?path, archive = ?archive_path, input_bytes, "log cleaner compression state changed");
+        // A real run keeps the archive on disk, so freed = input - archive. In
+        // dry-run we cannot know the true archive size, so estimate it with a
+        // deliberately conservative ratio: this keeps the projected freed bytes
+        // from overstating what a real run would reclaim (previously output_bytes
+        // was 0, so dry-run reported the full input as freed).
+        let estimated_output_bytes = (input_bytes as f64 * DRY_RUN_ESTIMATED_ARCHIVE_RATIO) as u64;
+        info!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_compress", file = ?path, archive = ?archive_path, input_bytes, estimated_output_bytes, "log cleaner compression state changed");
         return Ok(CompressionOutput {
             archive_path: archive_path.to_path_buf(),
             algorithm_used,
             input_bytes,
-            output_bytes: 0,
+            output_bytes: estimated_output_bytes,
         });
     }
 
