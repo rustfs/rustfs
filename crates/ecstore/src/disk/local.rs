@@ -4139,7 +4139,7 @@ impl LocalDisk {
         true
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn check_format_json(&self) -> Result<Metadata> {
         let md = fs::metadata(&self.format_path).await.map_err(to_unformatted_disk_error)?;
         Ok(md)
@@ -4376,7 +4376,7 @@ impl LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     #[async_recursion::async_recursion]
     async fn delete_file(
         &self,
@@ -4455,7 +4455,7 @@ impl LocalDisk {
     }
 
     /// read xl.meta raw data
-    #[tracing::instrument(level = "debug", skip(self, volume_dir, file_path))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_raw(
         &self,
         bucket: &str,
@@ -4549,7 +4549,7 @@ impl LocalDisk {
         Ok(data)
     }
 
-    #[tracing::instrument(level = "debug", skip(self, volume_dir, file_path))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all_data_with_dmtime(
         &self,
         volume: &str,
@@ -4874,7 +4874,7 @@ impl LocalDisk {
     }
 
     // write_all_private with check_path_length
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -5851,7 +5851,7 @@ impl DiskAPI for LocalDisk {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         let format_info = {
             let format_info = self.format_info.read().await;
@@ -5931,7 +5931,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         crate::hp_guard!("LocalDisk::read_all");
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
@@ -5948,13 +5948,13 @@ impl DiskAPI for LocalDisk {
         Ok(data)
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_all");
         self.write_all_public(volume, path, data).await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
         crate::hp_guard!("LocalDisk::delete");
         let volume_dir = self.get_bucket_path(volume)?;
@@ -5980,7 +5980,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume)
@@ -6059,7 +6059,7 @@ impl DiskAPI for LocalDisk {
         Ok(resp)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         let volume_dir = self.get_bucket_path(bucket)?;
 
@@ -6125,7 +6125,7 @@ impl DiskAPI for LocalDisk {
 
         Ok(ret)
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let volume_dir = self.get_bucket_path(volume)?;
         let file_path = self.get_object_path(volume, path)?;
@@ -6211,7 +6211,7 @@ impl DiskAPI for LocalDisk {
         Ok(resp)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
@@ -6334,7 +6334,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         crate::hp_guard!("LocalDisk::rename_file");
         let src_volume_dir = self.get_bucket_path(src_volume)?;
@@ -6406,7 +6406,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
         crate::hp_guard!("LocalDisk::create_file");
         if !origvolume.is_empty() {
@@ -6423,19 +6423,19 @@ impl DiskAPI for LocalDisk {
             .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         self.io_backend.open_write(volume, path, WriteMode::Append).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         crate::hp_guard!("LocalDisk::read_file");
         self.io_backend.open_full_read(volume, path).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         crate::hp_guard!("LocalDisk::read_file_stream");
         self.io_backend.open_read_stream(volume, path, offset, length).await
@@ -6445,14 +6445,14 @@ impl DiskAPI for LocalDisk {
     // SAFETY: Unix unsafe calls in this function only query page size and mmap
     // a read-only file region after bounds and alignment are validated.
     #[allow(unsafe_code)]
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         self.read_file_mmap_copy_with_metrics(volume, path, offset, length, None)
             .await
     }
 
     /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_mmap_copy_with_metrics(
         &self,
         volume: &str,
@@ -6464,7 +6464,7 @@ impl DiskAPI for LocalDisk {
         self.io_backend.pread_bytes(volume, path, offset, length, metrics).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
             let origvolume_dir = self.get_bucket_path(origvolume)?;
@@ -6496,7 +6496,7 @@ impl DiskAPI for LocalDisk {
     }
 
     // FIXME: TODO: io.writer TODO cancel
-    #[tracing::instrument(level = "debug", skip(self, wr))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         self.wait_for_startup_cleanup().await;
 
@@ -6593,7 +6593,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self, fi))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -7208,7 +7208,7 @@ impl DiskAPI for LocalDisk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
         for vol in volumes {
             if let Err(e) = self.make_volume(vol).await
@@ -7230,7 +7230,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volume(&self, volume: &str) -> Result<()> {
         if !Self::is_valid_volname(volume) {
             return Err(Error::other("Invalid arguments specified"));
@@ -7258,7 +7258,7 @@ impl DiskAPI for LocalDisk {
         Err(DiskError::VolumeExists)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
         let mut volumes = Vec::new();
 
@@ -7278,7 +7278,7 @@ impl DiskAPI for LocalDisk {
         Ok(volumes)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         let volume_dir = self.get_bucket_path(volume)?;
         let meta = lstat(&volume_dir).await.map_err(to_volume_error)?;
@@ -7294,7 +7294,7 @@ impl DiskAPI for LocalDisk {
         })
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
@@ -7318,7 +7318,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         if !fi.metadata.is_empty() {
             let file_path = self.get_object_path(volume, path)?;
@@ -7354,7 +7354,7 @@ impl DiskAPI for LocalDisk {
         Err(Error::other("Invalid Argument"))
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_metadata");
         let p = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
@@ -7381,7 +7381,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_version(
         &self,
         org_volume: &str,
@@ -7484,7 +7484,7 @@ impl DiskAPI for LocalDisk {
         Ok(fi)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         crate::hp_guard!("LocalDisk::read_xl");
         let file_path = self.get_object_path(volume, path)?;
@@ -7495,7 +7495,7 @@ impl DiskAPI for LocalDisk {
         Ok(RawFileInfo { buf })
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_version(
         &self,
         volume: &str,
@@ -7723,7 +7723,7 @@ impl DiskAPI for LocalDisk {
 
         Ok(())
     }
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         let mut errs = Vec::with_capacity(versions.len());
         for _ in 0..versions.len() {
@@ -7744,7 +7744,7 @@ impl DiskAPI for LocalDisk {
         errs
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
         let mut results = Vec::new();
         let mut found = 0;
@@ -7810,7 +7810,7 @@ impl DiskAPI for LocalDisk {
         Ok(results)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
@@ -7843,7 +7843,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn disk_info(&self, _: &DiskInfoOptions) -> Result<DiskInfo> {
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
         info.nr_requests = self.nrrequests;
@@ -7858,13 +7858,13 @@ impl DiskAPI for LocalDisk {
 
         Ok(info)
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn start_scan(&self) -> ScanGuard {
         self.scanning.fetch_add(1, Ordering::Release);
         ScanGuard(Arc::clone(&self.scanning))
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
         crate::hp_guard!("LocalDisk::read_metadata");
         let file_path = self.get_object_path(volume, path)?;
@@ -7899,7 +7899,7 @@ async fn wait_for_startup_cleanup_signal(
     .is_ok()
 }
 
-#[tracing::instrument]
+#[tracing::instrument(level = "trace", skip_all)]
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
