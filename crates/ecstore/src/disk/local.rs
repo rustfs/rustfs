@@ -38,7 +38,7 @@ use bytes::Bytes;
 use metrics::counter;
 #[cfg(target_os = "linux")]
 use metrics::gauge;
-use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
+use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     get_file_info, read_xl_meta_no_data_sync,
@@ -3627,7 +3627,6 @@ pub struct LocalDisk {
     pub major: u64,
     pub minor: u64,
     pub nrrequests: u64,
-    scan_locks: Arc<ParkingLotMutex<HashSet<(String, String)>>>,
     // Performance optimization fields
     path_cache: Arc<ParkingLotRwLock<HashMap<String, PathBuf>>>,
     current_dir: Arc<OnceLock<PathBuf>>,
@@ -3866,7 +3865,6 @@ impl LocalDisk {
             minor: Default::default(),
             major: Default::default(),
             nrrequests: Default::default(),
-            scan_locks: Arc::new(ParkingLotMutex::new(HashSet::new())),
             // // format_legacy,
             // format_file_info: Mutex::new(format_meta),
             // format_data: Mutex::new(format_data),
@@ -4227,20 +4225,6 @@ impl LocalDisk {
 
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
         reject_local_disk_symlink_components(&self.root, path)
-    }
-
-    fn try_acquire_scan_lock(&self, opts: &WalkDirOptions) -> Result<LocalScanLockGuard> {
-        let key = local_disk_scan_lock_key(&opts.bucket, &opts.base_dir, opts.filter_prefix.as_deref());
-        let mut scan_locks = self.scan_locks.lock();
-
-        if !scan_locks.insert(key.clone()) {
-            return Err(DiskError::DiskOngoingReq);
-        }
-
-        Ok(LocalScanLockGuard {
-            scan_locks: Arc::clone(&self.scan_locks),
-            key,
-        })
     }
 
     // Batch path generation with single lock acquisition
@@ -5540,34 +5524,6 @@ impl Drop for ScanGuard {
     }
 }
 
-struct LocalScanLockGuard {
-    scan_locks: Arc<ParkingLotMutex<HashSet<(String, String)>>>,
-    key: (String, String),
-}
-
-impl Drop for LocalScanLockGuard {
-    fn drop(&mut self) {
-        self.scan_locks.lock().remove(&self.key);
-    }
-}
-
-fn local_disk_scan_lock_key(bucket: &str, base_dir: &str, filter_prefix: Option<&str>) -> (String, String) {
-    let mut prefix = base_dir.trim_matches('/').to_owned();
-    if let Some(filter_prefix) = filter_prefix
-        .map(|prefix| prefix.trim_matches('/'))
-        .filter(|prefix| !prefix.is_empty())
-    {
-        if prefix.is_empty() {
-            prefix.push_str(filter_prefix);
-        } else {
-            prefix.push_str(SLASH_SEPARATOR);
-            prefix.push_str(filter_prefix);
-        }
-    }
-
-    (bucket.to_owned(), prefix)
-}
-
 fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
     if meta.versions.len() > 10 {
         return None;
@@ -6515,8 +6471,6 @@ impl DiskAPI for LocalDisk {
         {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
-
-        let _scan_lock = self.try_acquire_scan_lock(&opts)?;
 
         let mut wr = wr;
 
@@ -8891,7 +8845,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_local_disk_scan_rejects_concurrent_same_prefix_and_releases_on_cancel() {
+    async fn concurrent_local_disk_scans_of_same_prefix_succeed() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("temp dir should be created");
@@ -8920,28 +8874,18 @@ mod test {
         let first_scan = tokio::spawn(async move { first_disk.walk_dir(first_opts, &mut blocking_writer).await });
 
         entered_rx.await.expect("first scan should enter write path");
-
         let mut second_writer = tokio::io::sink();
         let second_scan = disk.walk_dir(opts.clone(), &mut second_writer).await;
         assert!(
-            matches!(second_scan, Err(DiskError::DiskOngoingReq)),
-            "concurrent scan of same bucket and prefix must be rejected, got {second_scan:?}"
+            second_scan.is_ok(),
+            "concurrent scan of same bucket and prefix must succeed, got {second_scan:?}"
         );
-
         first_scan.abort();
         assert!(
             first_scan
                 .await
                 .expect_err("first scan task should be cancelled")
-                .is_cancelled(),
-            "aborting the blocked scan should cancel the task"
-        );
-
-        let mut after_cancel_writer = tokio::io::sink();
-        let after_cancel = disk.walk_dir(opts, &mut after_cancel_writer).await;
-        assert!(
-            after_cancel.is_ok(),
-            "cancelled scan must release the bucket/prefix lock, got {after_cancel:?}"
+                .is_cancelled()
         );
     }
 
@@ -12732,18 +12676,6 @@ mod test {
             assert!(LocalDisk::is_valid_volname("valid/name"));
             assert!(LocalDisk::is_valid_volname("valid:name"));
         }
-    }
-
-    #[test]
-    fn test_local_disk_scan_lock_key_combines_base_and_filter_prefixes() {
-        assert_eq!(
-            local_disk_scan_lock_key("bucket", "", Some("/prefix/")),
-            ("bucket".to_string(), "prefix".to_string())
-        );
-        assert_eq!(
-            local_disk_scan_lock_key("bucket", "/base/", Some("/prefix/")),
-            ("bucket".to_string(), "base/prefix".to_string())
-        );
     }
 
     #[tokio::test]
