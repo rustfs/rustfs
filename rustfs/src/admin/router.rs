@@ -2538,7 +2538,7 @@ where
         }
 
         let canonical_path = canonicalize_admin_path(req.uri.path());
-        let uri = format!("{}|{}", &req.method, canonical_path.as_ref());
+        let uri = format!("{}|{}", req.method, canonical_path.as_ref());
 
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;

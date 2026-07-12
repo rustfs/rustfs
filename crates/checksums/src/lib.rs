@@ -291,6 +291,7 @@ struct Md5 {
     hasher: md5::Md5,
 }
 
+#[allow(dead_code)]
 impl Md5 {
     fn update(&mut self, bytes: &[u8]) {
         use md5::Digest;

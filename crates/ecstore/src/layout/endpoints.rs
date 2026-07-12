@@ -2209,7 +2209,7 @@ mod test {
                     if Some(&pools.setup_type) != test_case.expected_setup_type.as_ref() {
                         panic!(
                             "Test {}: setupType: expected = {:?}, got = {:?}",
-                            test_case.num, test_case.expected_setup_type, &pools.setup_type
+                            test_case.num, test_case.expected_setup_type, pools.setup_type
                         )
                     }
 

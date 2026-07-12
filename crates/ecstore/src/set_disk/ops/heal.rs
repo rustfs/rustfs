@@ -222,7 +222,7 @@ impl SetDisks {
                         }
 
                         if !latest_meta.deleted && !latest_meta.is_remote() {
-                            for (_, part_errs) in data_errs_by_part.iter() {
+                            for part_errs in data_errs_by_part.values() {
                                 if count_part_not_success(part_errs) > latest_meta.erasure.parity_blocks {
                                     cannot_heal = true;
                                     break;
