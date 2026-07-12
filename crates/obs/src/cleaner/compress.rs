@@ -262,13 +262,13 @@ where
         Err(_) => {}
     }
 
-    let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if dry_run {
         // A real run keeps the archive on disk, so freed = input - archive. In
         // dry-run we cannot know the true archive size, so estimate it with a
         // deliberately conservative ratio: this keeps the projected freed bytes
         // from overstating what a real run would reclaim (previously output_bytes
         // was 0, so dry-run reported the full input as freed).
+        let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let estimated_output_bytes = (input_bytes as f64 * DRY_RUN_ESTIMATED_ARCHIVE_RATIO) as u64;
         info!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_compress", file = ?path, archive = ?archive_path, input_bytes, estimated_output_bytes, "log cleaner compression state changed");
         return Ok(CompressionOutput {
@@ -283,22 +283,23 @@ where
     // helper remains side-effect free when the caller is evaluating policy.
     let input = File::open(path)?;
 
+    // Read the source mode from the already-open fd (no extra path stat, no
+    // TOCTOU) so the temp file is created restrictive — never wider than the
+    // source, default 0600 — instead of the world-readable 0644 that
+    // File::create would leave until a post-write chmod.
+    #[cfg(unix)]
+    let source_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        input.metadata().ok().map(|m| m.permissions().mode())
+    };
+    #[cfg(not(unix))]
+    let source_mode: Option<u32> = None;
+
     // Write to a temporary file first and then atomically rename it into place
     // so callers never observe a partially written archive at `archive_path`.
     let mut tmp_name = archive_path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp_archive_path = std::path::PathBuf::from(tmp_name);
-
-    // Read the source mode up front so the temp file is created restrictive
-    // (never wider than the source, default 0600) instead of the world-readable
-    // 0644 that File::create would leave until the post-write chmod.
-    #[cfg(unix)]
-    let source_mode = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).ok().map(|m| m.permissions().mode())
-    };
-    #[cfg(not(unix))]
-    let source_mode: Option<u32> = None;
 
     let output = create_tmp_archive(&tmp_archive_path, source_mode)?;
     // Arm a guard so any early return *or panic* between here and the final
@@ -318,15 +319,13 @@ where
     out_file.sync_all()?;
     drop(out_file);
 
-    // Preserve Unix mode bits so rotated archives keep the same access policy.
+    // Reapply the exact source mode: create_tmp_archive already set it at
+    // creation, but umask may have narrowed it, so restore it precisely —
+    // reusing the value already read from the fd rather than stat-ing again.
     #[cfg(unix)]
-    {
+    if let Some(mode) = source_mode {
         use std::os::unix::fs::PermissionsExt;
-
-        if let Ok(src_meta) = std::fs::metadata(path) {
-            let mode = src_meta.permissions().mode();
-            let _ = std::fs::set_permissions(&tmp_archive_path, std::fs::Permissions::from_mode(mode));
-        }
+        let _ = std::fs::set_permissions(&tmp_archive_path, std::fs::Permissions::from_mode(mode));
     }
 
     // Atomically move the fully written temp file into its final location.
