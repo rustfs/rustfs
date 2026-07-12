@@ -179,6 +179,28 @@ fn create_tmp_archive(path: &Path, source_mode: Option<u32>) -> std::io::Result<
     opts.open(path)
 }
 
+/// Cheap sanity check that an existing archive starts with the expected codec
+/// magic bytes, so a zero/truncated/foreign file is not trusted as a valid
+/// prior result. Only called on a confirmed regular, non-empty file.
+fn archive_header_ok(path: &Path, algorithm: CompressionAlgorithm) -> bool {
+    use std::io::Read;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 4];
+    let read = match file.read(&mut buf) {
+        Ok(read) => read,
+        Err(_) => return false,
+    };
+    match algorithm {
+        // gzip: 0x1f 0x8b
+        CompressionAlgorithm::Gzip => read >= 2 && buf[0] == 0x1f && buf[1] == 0x8b,
+        // zstd frame magic: 0x28 0xb5 0x2f 0xfd (little-endian 0xFD2FB528)
+        CompressionAlgorithm::Zstd => read >= 4 && buf == [0x28, 0xb5, 0x2f, 0xfd],
+    }
+}
+
 /// Best-effort fsync of the directory containing `path`.
 ///
 /// Persisting the directory entry makes a rename (or, for the deletion path, an
@@ -203,18 +225,34 @@ fn compress_with_writer<F>(
 where
     F: FnMut(&mut BufReader<File>, BufWriter<File>) -> Result<(u64, File), std::io::Error>,
 {
-    // Keep idempotent behavior: existing archive means this file has already
-    // been handled in a previous cleanup pass.
-    if archive_path.exists() {
-        debug!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?archive_path, state = "archive_exists", "log cleaner compression state changed");
-        let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let output_bytes = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
-        return Ok(CompressionOutput {
-            archive_path: archive_path.to_path_buf(),
-            algorithm_used,
-            input_bytes,
-            output_bytes,
-        });
+    // Idempotency: an existing *complete* archive means a previous pass already
+    // handled this file, so we can skip recompression and let the caller delete
+    // the source. But we must not trust just any entry at `archive_path`:
+    //   * `Path::exists()` follows symlinks, so a planted `<archive>.gz` symlink
+    //     would green-light deleting the source with no real archive;
+    //   * a zero-length/truncated archive left by a crashed run (see OLC-01)
+    //     would be trusted, then the source deleted — unrecoverable loss.
+    // Use symlink_metadata (no follow) and require a regular, non-empty file
+    // with a valid codec header before trusting it. Anything else falls through
+    // to recompression, whose atomic create_new+rename replaces the bad entry
+    // (a symlink is replaced, never followed or deleted through).
+    match std::fs::symlink_metadata(archive_path) {
+        Ok(meta)
+            if meta.file_type().is_file() && meta.len() > 0 && archive_header_ok(archive_path, algorithm_used) =>
+        {
+            debug!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?archive_path, state = "archive_exists", "log cleaner compression state changed");
+            let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            return Ok(CompressionOutput {
+                archive_path: archive_path.to_path_buf(),
+                algorithm_used,
+                input_bytes,
+                output_bytes: meta.len(),
+            });
+        }
+        Ok(_) => {
+            warn!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?archive_path, result = "archive_untrusted_recompressing", "log cleaner compression state changed");
+        }
+        Err(_) => {}
     }
 
     let input_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
