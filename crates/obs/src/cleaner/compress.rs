@@ -184,6 +184,31 @@ fn create_tmp_archive(path: &Path, source_mode: Option<u32>) -> std::io::Result<
     opts.open(path)
 }
 
+/// Open the compression source file, refusing to follow a symlink at the final
+/// path component on Unix.
+///
+/// The scanner selects a regular log file, but between that scan and this open
+/// an attacker with write access to the log directory can swap the entry for a
+/// symlink (a classic TOCTOU race). `O_NOFOLLOW` makes the open fail with
+/// `ELOOP` in that case instead of silently reading whatever the link targets
+/// (for example `/etc/shadow`), which would otherwise be copied verbatim into a
+/// world-inspectable archive. The temp/archive path already refuses symlinks via
+/// `create_tmp_archive`; this closes the same gap on the source side.
+fn open_source_no_follow(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        File::open(path)
+    }
+}
+
 /// Cheap sanity check that an existing archive starts with the expected codec
 /// magic bytes, so a zero/truncated/foreign file is not trusted as a valid
 /// prior result. Only called on a confirmed regular, non-empty file.
@@ -281,7 +306,10 @@ where
 
     // Create the output archive only after the dry-run short-circuit so this
     // helper remains side-effect free when the caller is evaluating policy.
-    let input = File::open(path)?;
+    // O_NOFOLLOW: refuse to open a symlink swapped in at the source path between
+    // the scan and this open (TOCTOU), which could redirect the read to an
+    // arbitrary privileged file.
+    let input = open_source_no_follow(path)?;
 
     // Read the source mode from the already-open fd (no extra path stat, no
     // TOCTOU) so the temp file is created restrictive — never wider than the
@@ -384,4 +412,46 @@ fn archive_path(path: &Path, algorithm: CompressionAlgorithm) -> PathBuf {
         .map_or_else(|| OsString::from("archive"), |n| n.to_os_string());
     file_name.push(format!(".{ext}"));
     path.with_file_name(file_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_options(algorithm: CompressionAlgorithm) -> CompressionOptions {
+        CompressionOptions {
+            algorithm,
+            gzip_level: 6,
+            zstd_level: 3,
+            zstd_workers: 1,
+            zstd_fallback_to_gzip: false,
+            dry_run: false,
+        }
+    }
+
+    /// A symlink planted at the source path must be refused (not followed) so a
+    /// TOCTOU swap cannot redirect compression to an arbitrary privileged file.
+    #[cfg(unix)]
+    #[test]
+    fn source_symlink_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Secret the attacker wants exfiltrated into the (broader-readable) archive.
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"top secret contents").expect("write secret");
+
+        // The scanner-visible log path is actually a symlink to the secret.
+        let source = dir.path().join("app.log");
+        std::os::unix::fs::symlink(&secret, &source).expect("symlink");
+
+        let err = compress_file(&source, &default_options(CompressionAlgorithm::Gzip))
+            .expect_err("compressing a symlinked source must fail");
+        // O_NOFOLLOW surfaces as ELOOP; accept any error but ensure no archive
+        // was produced from the symlink target.
+        assert!(
+            !dir.path().join("app.log.gz").exists(),
+            "no archive should be created from a symlinked source, err={err}"
+        );
+        // The secret must not have been copied anywhere in the directory.
+        assert!(secret.exists(), "secret should be untouched");
+    }
 }
