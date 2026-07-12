@@ -841,11 +841,25 @@ impl LogCleanerBuilder {
     /// Invalid glob patterns are ignored rather than failing construction, and
     /// codec-related numeric values are clamped into safe ranges.
     pub fn build(self) -> LogCleaner {
-        let patterns = self
-            .exclude_patterns
-            .into_iter()
-            .filter_map(|p| glob::Pattern::new(&p).ok())
-            .collect();
+        // Surface, rather than silently drop, invalid exclude globs: a dropped
+        // pattern turns "protect this file" into "delete this file", so an
+        // operator's typo (or a literal comma splitting a char-class) must be
+        // visible instead of failing open.
+        let mut patterns = Vec::new();
+        for raw in self.exclude_patterns {
+            match glob::Pattern::new(&raw) {
+                Ok(pattern) => patterns.push(pattern),
+                Err(err) => warn!(
+                    event = EVENT_LOG_CLEANER_STATE,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                    result = "invalid_exclude_pattern",
+                    pattern = %raw,
+                    error = %err,
+                    "log cleaner state changed"
+                ),
+            }
+        }
 
         LogCleaner {
             log_dir: self.log_dir,
