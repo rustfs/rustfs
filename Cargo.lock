@@ -9614,6 +9614,7 @@ dependencies = [
  "rustfs-security-governance",
  "rustfs-storage-api",
  "rustfs-utils",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sysinfo",

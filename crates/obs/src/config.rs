@@ -44,13 +44,12 @@ use rustfs_config::observability::{
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME,
-    DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED,
-    DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
-    SERVICE_VERSION, USE_STDOUT,
+    DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED,
+    DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::{
-    get_env_bool, get_env_bool_with_aliases, get_env_f64, get_env_opt_str, get_env_opt_u64, get_env_str, get_env_u64,
-    get_env_usize,
+    get_env_bool, get_env_bool_with_aliases, get_env_f64, get_env_opt_bool, get_env_opt_str, get_env_opt_u64, get_env_str,
+    get_env_u64, get_env_usize,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -310,7 +309,7 @@ impl OtelConfig {
             environment: Some(get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT)),
             // Local logging
             logger_level: Some(get_env_str(ENV_OBS_LOGGER_LEVEL, DEFAULT_LOG_LEVEL)),
-            log_stdout_enabled: Some(get_env_bool(ENV_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOG_STDOUT_ENABLED)),
+            log_stdout_enabled: get_env_opt_bool(ENV_OBS_LOG_STDOUT_ENABLED),
             log_directory,
             log_filename: Some(get_env_nonempty_str(ENV_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_FILENAME)),
             log_rotation_time,
@@ -492,6 +491,21 @@ mod tests {
             temp_env::with_var(ENV_OBS_LOG_FILENAME, Some(""), || {
                 let config = OtelConfig::extract_otel_config_from_env(None);
                 assert_eq!(config.log_filename.as_deref(), Some(DEFAULT_OBS_LOG_FILENAME));
+            });
+        });
+    }
+
+    #[test]
+    fn stdout_mirror_environment_preserves_unset_true_and_false() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_LOG_STDOUT_ENABLED, || {
+                assert_eq!(OtelConfig::extract_otel_config_from_env(None).log_stdout_enabled, None);
+            });
+            temp_env::with_var(ENV_OBS_LOG_STDOUT_ENABLED, Some("true"), || {
+                assert_eq!(OtelConfig::extract_otel_config_from_env(None).log_stdout_enabled, Some(true));
+            });
+            temp_env::with_var(ENV_OBS_LOG_STDOUT_ENABLED, Some("false"), || {
+                assert_eq!(OtelConfig::extract_otel_config_from_env(None).log_stdout_enabled, Some(false));
             });
         });
     }
