@@ -415,6 +415,11 @@ impl LogCleaner {
 
         let (deleted, freed) = self.delete_files(&deletable)?;
         let elapsed = started_at.elapsed().as_secs_f64();
+        // NOTE on metric scope: attempts/successes count only *victim* steals
+        // (not the injector `steal_batch_and_pop`), and a multi-task stolen
+        // batch counts as a single success. So this rate reflects inter-worker
+        // rebalancing efficiency, not total task acquisition — read it as a
+        // relative health signal, not an absolute throughput measure.
         let attempts = steal_attempts.load(Ordering::Relaxed);
         let successes = steal_successes.load(Ordering::Relaxed);
         let success_rate = if attempts == 0 {

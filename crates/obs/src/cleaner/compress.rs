@@ -305,7 +305,7 @@ where
     let mut reader = BufReader::new(input);
     let writer = BufWriter::new(output);
 
-    let (_written, out_file) = writer_fn(&mut reader, writer)?;
+    let (written, out_file) = writer_fn(&mut reader, writer)?;
 
     // Durability: force the archive contents to stable storage *before* the
     // rename. Without this, a crash after rename but before the page cache is
@@ -337,7 +337,19 @@ where
     // here is best-effort (e.g. platforms that reject opening a directory).
     sync_parent_dir(archive_path);
 
-    let output_bytes = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
+    // Use the copied byte count as the authoritative input size rather than a
+    // second metadata read on the source (which could silently read 0 on error
+    // and skew freed-byte accounting).
+    let input_bytes = written;
+    let output_bytes = match std::fs::metadata(archive_path) {
+        Ok(meta) => meta.len(),
+        Err(err) => {
+            // Conservative: assume no savings instead of silently reporting 0,
+            // which would overstate freed bytes as the full input.
+            warn!(event = EVENT_LOG_CLEANER_COMPRESSION_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, archive = ?archive_path, error = %err, result = "archive_metadata_read_failed", "log cleaner compression state changed");
+            input_bytes
+        }
+    };
     debug!(
         event = EVENT_LOG_CLEANER_COMPRESSION_STATE,
         component = LOG_COMPONENT_OBS,
