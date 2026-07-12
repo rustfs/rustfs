@@ -303,4 +303,279 @@ mod tests {
     fn test_parallel_cleanup_handles_results_within_channel_capacity() -> std::io::Result<()> {
         assert_parallel_cleanup_completes(6, 4)
     }
+
+    // ---- OLC-14: safety/correctness regression coverage ----
+
+    use std::time::SystemTime;
+
+    fn set_mtime_ago(path: &Path, ago: Duration) {
+        let when = SystemTime::now() - ago;
+        File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime")
+            .set_modified(when)
+            .expect("set mtime");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_matching_pattern_is_never_deleted() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let outside = TempDir::new()?;
+        let target = outside.path().join("precious.txt");
+        std::fs::write(&target, b"precious")?;
+        // A symlink named to match the managed pattern.
+        std::os::unix::fs::symlink(&target, dir.join("app.log.2024-01-01"))?;
+        create_log_file(&dir, "app.log.2024-01-02", 1024)?;
+
+        // keep_files=0 would delete every managed *regular* file.
+        let cleaner = make_cleaner(dir.clone(), 0, 0);
+        let _ = cleaner.cleanup()?;
+
+        assert!(target.exists(), "external symlink target must never be deleted");
+        assert!(
+            dir.join("app.log.2024-01-01").exists(),
+            "symlink entry must survive (skipped via symlink_metadata, not followed)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_archives_deleted_fresh_kept() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01.gz", 100)?;
+        create_log_file(&dir, "app.log.2024-01-02.gz", 100)?;
+        set_mtime_ago(&dir.join("app.log.2024-01-01.gz"), Duration::from_secs(2 * 24 * 3600));
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(100)
+            .compressed_file_retention_days(1)
+            .min_file_age_seconds(0)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 1, "only the aged archive should expire");
+        assert!(!dir.join("app.log.2024-01-01.gz").exists());
+        assert!(dir.join("app.log.2024-01-02.gz").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn archives_bounded_by_byte_cap_when_retention_disabled() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01.gz", 100)?;
+        create_log_file(&dir, "app.log.2024-01-02.gz", 100)?;
+        // Age the first so the oldest-first byte-cap trim evicts it.
+        set_mtime_ago(&dir.join("app.log.2024-01-01.gz"), Duration::from_secs(100));
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(100)
+            .compressed_file_retention_days(0) // retention disabled
+            .max_total_size_bytes(150) // 200 total > 150 -> trim the oldest
+            .min_file_age_seconds(0)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 1, "byte cap must bound archives even with retention off");
+        assert!(!dir.join("app.log.2024-01-01.gz").exists(), "oldest archive trimmed");
+        assert!(dir.join("app.log.2024-01-02.gz").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn gz_and_zst_files_classified_as_archives() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01.gz", 100)?;
+        create_log_file(&dir, "app.log.2024-01-02.zst", 100)?;
+        create_log_file(&dir, "app.log.2024-01-03", 100)?; // plain log
+
+        let result = scanner::scan_log_directory(&dir, "app.log.", Some("app.log"), FileMatchMode::Prefix, &[], 0, false, false)?;
+        assert_eq!(result.compressed_archives.len(), 2, "gz and zst are archives");
+        assert_eq!(result.logs.len(), 1, "only the plain file is a regular log");
+        Ok(())
+    }
+
+    #[test]
+    fn max_single_file_size_deletes_only_oversized() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01", 100)?;
+        create_log_file(&dir, "app.log.2024-01-02", 100)?;
+        create_log_file(&dir, "app.log.2024-01-03", 5000)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(3)
+            .max_total_size_bytes(0)
+            .max_single_file_size_bytes(1000)
+            .min_file_age_seconds(0)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 1);
+        assert!(!dir.join("app.log.2024-01-03").exists(), "oversized file removed");
+        assert!(dir.join("app.log.2024-01-01").exists());
+        assert!(dir.join("app.log.2024-01-02").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn min_age_protects_fresh_nonempty_log() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 0, "fresh non-empty log younger than min age must be untouched");
+        assert!(dir.join("app.log.2024-01-01").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn active_file_matching_pattern_is_protected() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        // The active file both equals active_filename AND matches the suffix pattern.
+        create_log_file(&dir, "current.rustfs.log", 1024)?;
+        create_log_file(&dir, "old.rustfs.log", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), ".rustfs.log".to_string(), "current.rustfs.log".to_string())
+            .match_mode(FileMatchMode::Suffix)
+            .keep_files(0)
+            .min_file_age_seconds(0)
+            .build();
+        let _ = cleaner.cleanup()?;
+
+        assert!(dir.join("current.rustfs.log").exists(), "active file must never be deleted");
+        assert!(!dir.join("old.rustfs.log").exists(), "non-active rotated log removed");
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_exclude_glob_does_not_abort_build() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.keep", 100)?;
+        create_log_file(&dir, "app.log.drop", 100)?;
+
+        // "[invalid" is dropped with a warning; "*keep*" is a valid exclude.
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .exclude_patterns(vec!["[invalid".to_string(), "*keep*".to_string()])
+            .min_file_age_seconds(0)
+            .build();
+        let _ = cleaner.cleanup()?;
+
+        assert!(dir.join("app.log.keep").exists(), "valid exclude must still protect its file");
+        assert!(!dir.join("app.log.drop").exists(), "non-excluded rotated log removed");
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_with_compression_creates_no_archive() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .compress_old_files(true)
+            .compression_algorithm(CompressionAlgorithm::Gzip)
+            .parallel_compress(false)
+            .min_file_age_seconds(0)
+            .dry_run(true)
+            .build();
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert!(deleted > 0, "dry-run reports intended deletions");
+        assert!(freed > 0, "dry-run reports projected freed bytes");
+        assert!(dir.join("app.log.2024-01-01").exists(), "dry-run must not delete");
+        assert!(!dir.join("app.log.2024-01-01.gz").exists(), "dry-run must not create an archive");
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_archive_round_trips_and_source_removed() -> std::io::Result<()> {
+        use std::io::Read;
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let content = vec![b'A'; 4096];
+        {
+            let mut f = File::create(dir.join("app.log.2024-01-01"))?;
+            f.write_all(&content)?;
+            f.flush()?;
+        }
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .compress_old_files(true)
+            .compression_algorithm(CompressionAlgorithm::Gzip)
+            .parallel_compress(false)
+            .min_file_age_seconds(0)
+            .build();
+        let _ = cleaner.cleanup()?;
+
+        assert!(!dir.join("app.log.2024-01-01").exists(), "source removed after compression");
+        let gz = dir.join("app.log.2024-01-01.gz");
+        assert!(gz.exists(), "archive created");
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(File::open(&gz)?).read_to_end(&mut decoded)?;
+        assert_eq!(decoded, content, "archive must decompress to the original bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn idempotent_archive_branch_trusts_valid_archive() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let content = vec![b'B'; 2048];
+        let write_source = || -> std::io::Result<()> {
+            let mut f = File::create(dir.join("app.log.2024-01-01"))?;
+            f.write_all(&content)?;
+            f.flush()
+        };
+        write_source()?;
+
+        let build = || {
+            LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+                .match_mode(FileMatchMode::Prefix)
+                .keep_files(0)
+                .compress_old_files(true)
+                .compression_algorithm(CompressionAlgorithm::Gzip)
+                .parallel_compress(false)
+                .min_file_age_seconds(0)
+                .build()
+        };
+
+        // Pass 1: create the archive and delete the source.
+        let _ = build().cleanup()?;
+        let gz = dir.join("app.log.2024-01-01.gz");
+        assert!(gz.exists());
+        let archive_len = std::fs::metadata(&gz)?.len();
+
+        // Recreate the source; pass 2 must trust the existing valid archive and
+        // delete the source again without rewriting the archive.
+        write_source()?;
+        let (deleted, _) = build().cleanup()?;
+        assert_eq!(deleted, 1);
+        assert!(!dir.join("app.log.2024-01-01").exists(), "source deleted via idempotent branch");
+        assert_eq!(std::fs::metadata(&gz)?.len(), archive_len, "existing valid archive unchanged");
+        Ok(())
+    }
 }
