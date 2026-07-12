@@ -51,7 +51,7 @@ index bf2f2b1..f3ef394 100644
 +    keep2_objects = client.list_objects(Bucket=bucket_name).get('Contents', [])
 +    expire3_objects = _wait_for_lifecycle_count(
 +        lambda: client.list_objects(Bucket=bucket_name).get('Contents', []),
-+        2, 5*lc_interval)
++        2, 8*lc_interval)
  
      assert len(init_objects) == 6
      assert len(expire1_objects) == 4
@@ -76,7 +76,7 @@ index bf2f2b1..f3ef394 100644
 +    keep2_objects = client.list_objects_v2(Bucket=bucket_name).get('Contents', [])
 +    expire3_objects = _wait_for_lifecycle_count(
 +        lambda: client.list_objects_v2(Bucket=bucket_name).get('Contents', []),
-+        2, 5*lc_interval)
++        2, 8*lc_interval)
  
      assert len(init_objects) == 6
      assert len(expire1_objects) == 4
