@@ -47,5 +47,4 @@ consider adding it to the script's `checked_files` list.
 Instruction/architecture docs (`AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`,
 `docs/architecture/*.md`) must not reference repo file paths that no longer
 exist. If your refactor moved code, update the docs that point at it — the
-error message lists `doc -> stale-path` pairs. Historical plans under
-`docs/superpowers/plans/` are exempt.
+error message lists `doc -> stale-path` pairs.
