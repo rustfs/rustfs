@@ -148,14 +148,14 @@ pub struct OtelConfig {
     pub metrics_export_enabled: Option<bool>,
     /// Whether to export logs via OTLP (default: `true`).
     pub logs_export_enabled: Option<bool>,
-    /// Whether to export profiles via pyroscope (default: `false`).
+    /// Whether to export profiles via pyroscope (default: `true`).
     pub profiling_export_enabled: Option<bool>,
     /// **[OTLP-only]** Mirror all signals to stdout in addition to OTLP export.
     /// Only applies when an OTLP endpoint is configured.
     pub use_stdout: Option<bool>,
-    /// Fraction of traces to sample, `0.0`–`1.0` (default: `0.1`).
+    /// Fraction of traces to sample, `0.0`–`1.0` (default: `1.0`).
     pub sample_ratio: Option<f64>,
-    /// Metrics export interval in seconds (default: `15`).
+    /// Metrics export interval in seconds (default: `30`).
     pub meter_interval: Option<u64>,
     /// OTel `service.name` attribute (default: `APP_NAME`).
     pub service_name: Option<String>,
@@ -165,7 +165,7 @@ pub struct OtelConfig {
     pub environment: Option<String>,
 
     // ── Local logging ─────────────────────────────────────────────────────────
-    /// Minimum log level directive (default: `info`).
+    /// Minimum log level directive (default: `error`).
     /// Respects `RUST_LOG` syntax when set via environment.
     pub logger_level: Option<String>,
     /// When `true`, a stdout JSON layer is always attached regardless of the
@@ -177,7 +177,8 @@ pub struct OtelConfig {
     /// Base name for log files (without date suffix), e.g. `rustfs`.
     /// Used for both rolling-appender naming and cleanup scanning.
     pub log_filename: Option<String>,
-    /// Rotation time granularity: `"hourly"` or `"daily"` (default: `"daily"`).
+    /// Rotation time granularity: `"minutely"`, `"hourly"`, or `"daily"`
+    /// (default: `"hourly"`; any unrecognized value falls back to `"daily"`).
     pub log_rotation_time: Option<String>,
     /// Number of rolling log files to retain (default: `30`).
     /// Used by both the rolling-appender (as a loose upper bound) and the
@@ -214,7 +215,7 @@ pub struct OtelConfig {
     pub log_delete_empty_files: Option<bool>,
     /// A file younger than this many seconds is never touched (default: `3600`).
     pub log_min_file_age_seconds: Option<u64>,
-    /// How often the background cleanup task runs, in seconds (default: `21600`).
+    /// How often the background cleanup task runs, in seconds (default: `1800`).
     pub log_cleanup_interval_seconds: Option<u64>,
     /// Log what *would* be deleted without actually removing anything
     /// (default: `false`).
