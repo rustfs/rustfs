@@ -657,7 +657,10 @@ pub fn spawn_cleanup_task(
         compression_algorithm = %compression_algorithm,
         parallel_compress,
         parallel_workers,
-        zstd_level,
+        // Echo the *effective* (post-clamp) levels so the log matches what the
+        // codec actually runs with, not the raw configured value.
+        gzip_level = cleaner.effective_gzip_level(),
+        zstd_level = cleaner.effective_zstd_level(),
         zstd_fallback_to_gzip,
         zstd_workers,
         "log cleaner state"

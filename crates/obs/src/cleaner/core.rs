@@ -115,6 +115,16 @@ impl LogCleaner {
         LogCleanerBuilder::new(log_dir, file_pattern, active_filename)
     }
 
+    /// Effective gzip level after clamping — what compression actually uses.
+    pub fn effective_gzip_level(&self) -> u32 {
+        self.gzip_compression_level
+    }
+
+    /// Effective zstd level after clamping — what compression actually uses.
+    pub fn effective_zstd_level(&self) -> i32 {
+        self.zstd_compression_level
+    }
+
     /// Perform one full cleanup pass.
     pub fn cleanup(&self) -> Result<(usize, u64), std::io::Error> {
         if !self.log_dir.exists() {
@@ -803,7 +813,9 @@ impl LogCleanerBuilder {
             max_total_size_bytes: self.max_total_size_bytes,
             max_single_file_size_bytes: self.max_single_file_size_bytes,
             compress_old_files: self.compress_old_files,
-            gzip_compression_level: self.gzip_compression_level.clamp(1, 9),
+            // gzip level 0 is a valid "store" (no compression) mode, so keep the
+            // lower bound at 0 rather than silently bumping it to 1.
+            gzip_compression_level: self.gzip_compression_level.clamp(0, 9),
             compressed_file_retention_days: self.compressed_file_retention_days,
             exclude_patterns: patterns,
             delete_empty_files: self.delete_empty_files,
@@ -812,7 +824,9 @@ impl LogCleanerBuilder {
             compression_algorithm: self.compression_algorithm,
             parallel_compress: self.parallel_compress,
             parallel_workers: self.parallel_workers.max(1),
-            zstd_compression_level: self.zstd_compression_level.clamp(1, 21),
+            // zstd level 0 means "codec default"; the real maximum is 22, not
+            // 21, so preserve both boundaries instead of silently narrowing.
+            zstd_compression_level: self.zstd_compression_level.clamp(0, 22),
             zstd_fallback_to_gzip: self.zstd_fallback_to_gzip,
             zstd_workers: self.zstd_workers.max(1),
         }

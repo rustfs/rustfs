@@ -48,9 +48,9 @@ const DRY_RUN_ESTIMATED_ARCHIVE_RATIO: f64 = 0.5;
 pub(super) struct CompressionOptions {
     /// Preferred compression codec for the current cleanup pass.
     pub algorithm: CompressionAlgorithm,
-    /// Gzip level (1..=9).
+    /// Gzip level (0..=9; 0 = store / no compression).
     pub gzip_level: u32,
-    /// Zstd level (1..=21).
+    /// Zstd level (0..=22; 0 = codec default).
     pub zstd_level: i32,
     /// Internal zstd worker threads used by zstdmt.
     pub zstd_workers: usize,
@@ -106,7 +106,7 @@ pub(super) fn compress_file(path: &Path, options: &CompressionOptions) -> Result
 fn compress_gzip(path: &Path, level: u32, dry_run: bool) -> Result<CompressionOutput, std::io::Error> {
     let archive_path = archive_path(path, CompressionAlgorithm::Gzip);
     compress_with_writer(path, &archive_path, dry_run, CompressionAlgorithm::Gzip, |reader, writer| {
-        let mut encoder = GzEncoder::new(writer, Compression::new(level.clamp(1, 9)));
+        let mut encoder = GzEncoder::new(writer, Compression::new(level.clamp(0, 9)));
         let written = std::io::copy(reader, &mut encoder)?;
         let mut out = encoder.finish()?;
         out.flush()?;
@@ -121,7 +121,7 @@ fn compress_gzip(path: &Path, level: u32, dry_run: bool) -> Result<CompressionOu
 fn compress_zstd(path: &Path, level: i32, workers: usize, dry_run: bool) -> Result<CompressionOutput, std::io::Error> {
     let archive_path = archive_path(path, CompressionAlgorithm::Zstd);
     compress_with_writer(path, &archive_path, dry_run, CompressionAlgorithm::Zstd, |reader, writer| {
-        let mut encoder = zstd::stream::Encoder::new(writer, level.clamp(1, 21))?;
+        let mut encoder = zstd::stream::Encoder::new(writer, level.clamp(0, 22))?;
         encoder.multithread(workers.max(1) as u32)?;
         let written = std::io::copy(reader, &mut encoder)?;
         let mut out = encoder.finish()?;
