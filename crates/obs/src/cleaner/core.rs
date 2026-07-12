@@ -42,7 +42,7 @@ const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
 const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 /// Absolute ceiling on parallel compression workers, independent of config, so
-/// a mis-set `parallel_workers` on a directory with thousands of rotated logs
+/// a misconfigured `parallel_workers` on a directory with thousands of rotated logs
 /// cannot spawn thousands of threads (each of which may also start codec
 /// threads).
 const MAX_PARALLEL_COMPRESS_WORKERS: usize = 64;
