@@ -88,9 +88,18 @@ pub(super) fn validate_stdout_sink(file_appender: &RollingAppender) -> Result<()
         return Ok(());
     }
 
-    let stdout_device = u64::try_from(stdout_stat.st_dev).map_err(|error| {
-        TelemetryError::LogSinkConflict(format!("stdout file descriptor returned an invalid device identifier: {error}"))
-    })?;
+    let stdout_device = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            stdout_stat.st_dev
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            u64::try_from(stdout_stat.st_dev).map_err(|error| {
+                TelemetryError::LogSinkConflict(format!("stdout file descriptor returned an invalid device identifier: {error}"))
+            })?
+        }
+    };
     let active_identity = file_appender
         .active_file_identity()
         .map_err(|error| TelemetryError::Io(error.to_string()))?;
