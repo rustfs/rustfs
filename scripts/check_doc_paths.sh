@@ -5,8 +5,7 @@
 # ARCHITECTURE.md / docs/architecture honest after refactors move code.
 #
 # Checked files: all tracked AGENTS.md, CLAUDE.md, ARCHITECTURE.md, and
-# docs/architecture/*.md (archived plans under docs/superpowers/plans are
-# intentionally NOT checked — they are historical).
+# docs/architecture/*.md.
 #
 # A reference is any token starting with crates/, rustfs/, scripts/, docs/,
 # .github/ or .config/ that ends in a known file extension. Tokens containing
