@@ -48,3 +48,11 @@ Instruction/architecture docs (`AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`,
 `docs/architecture/*.md`) must not reference repo file paths that no longer
 exist. If your refactor moved code, update the docs that point at it — the
 error message lists `doc -> stale-path` pairs.
+
+## `check_no_planning_docs.sh`
+
+Planning-type documents must not be committed (see AGENTS.md "Sources of
+Truth"). The guard fails if anything is tracked under `docs/superpowers/` —
+`.gitignore` already ignores it, but `git add -f` bypasses that, so this closes
+the hole. Fix by removing the listed file(s) with `git rm`; keep the plan or
+spec in the issue tracker or a local worktree instead.
