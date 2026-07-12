@@ -266,6 +266,13 @@ const METRIC_URING_IN_FLIGHT: &str = "rustfs_io_uring_in_flight";
 const METRIC_URING_CQ_OVERFLOW: &str = "rustfs_io_uring_cq_overflow";
 #[cfg(target_os = "linux")]
 const METRIC_URING_CANCEL_ALREADY: &str = "rustfs_io_uring_cancel_already";
+/// Read-side EINVAL/EOPNOTSUPP from a native O_DIRECT read that happened AFTER a
+/// successful O_DIRECT open (rustfs/backlog#1214). Unlike an open-time refusal
+/// (unsupported filesystem), this most likely means an alignment bug in the
+/// aligned read path, so it is surfaced with a counter + warn instead of a
+/// once-per-disk debug trace.
+#[cfg(target_os = "linux")]
+const METRIC_URING_DIRECT_READ_EINVAL_TOTAL: &str = "rustfs_io_uring_direct_read_einval_total";
 /// How often the per-disk driver StatsSnapshot is exported to metrics
 /// (rustfs/backlog#1172).
 #[cfg(target_os = "linux")]
@@ -3218,6 +3225,36 @@ impl UringBackend {
     /// classification lives in one place (rustfs/backlog#1174).
     fn classify_direct_read_error(&self, io_err: &std::io::Error) {
         if is_direct_io_unsupported(io_err) {
+            // This helper is only ever reached from the READ side: the O_DIRECT
+            // `open` in `pread_uring_direct` already succeeded, and an open-time
+            // refusal is handled separately as `DirectOpenError::ODirectRefused`
+            // before any read is issued. So an EINVAL/EOPNOTSUPP arriving here is
+            // a *read-time* error on an fd the kernel accepted for O_DIRECT. That
+            // is far more likely an alignment bug in the aligned read path than a
+            // filesystem that does not support O_DIRECT -- yet the old code
+            // latched the whole disk's native path off with only a once-per-disk
+            // debug trace, making a real correctness bug effectively invisible
+            // (rustfs/backlog#1214).
+            //
+            // Diagnostics only: the fallback behaviour is unchanged. The native
+            // O_DIRECT path is still latched off and the caller still falls back
+            // to StdBackend for this and every future eligible read. We only make
+            // the event observable -- a counter plus a once-per-disk `warn!`
+            // instead of a silent `debug!` -- so an operator can see an alignment
+            // regression rather than a mystery latency/CPU shift from buffered
+            // reads.
+            counter!(METRIC_URING_DIRECT_READ_EINVAL_TOTAL, "root" => self.root_label.clone()).increment(1);
+            if !self.direct_uring.fallback_logged.swap(true, Ordering::Relaxed) {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    root = %self.root.display(),
+                    error = ?io_err,
+                    "io_uring O_DIRECT read returned EINVAL/EOPNOTSUPP AFTER a successful O_DIRECT open; \
+                     this is more likely an alignment bug than an unsupported filesystem. Latching the \
+                     native O_DIRECT path off and reading via StdBackend (logged once per disk)"
+                );
+            }
             self.direct_uring.supported.store(false, Ordering::Relaxed);
         } else if is_io_uring_unsupported(io_err) {
             self.latch_active_off(io_err);
