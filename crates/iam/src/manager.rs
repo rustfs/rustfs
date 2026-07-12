@@ -695,7 +695,7 @@ where
         let mut user_exists = false;
         let mut ret = Vec::new();
 
-        for (_, v) in users.iter() {
+        for v in users.values() {
             let is_derived = v.credentials.is_service_account() || v.credentials.is_temp();
 
             if !is_derived && v.credentials.access_key.as_str() == access_key {
@@ -713,7 +713,7 @@ where
         }
 
         let sts_accounts = Arc::clone(&cache.sts_accounts);
-        for (_, v) in sts_accounts.iter() {
+        for v in sts_accounts.values() {
             if v.credentials.parent_user == access_key {
                 user_exists = true;
                 if v.credentials.is_temp() && !v.credentials.is_service_account() {
@@ -1384,7 +1384,7 @@ where
             let mut service_accounts_to_delete = Vec::new();
             let mut temp_accounts_to_delete = HashSet::new();
             let cache = self.cache.snapshot();
-            for (_, v) in cache.users.iter() {
+            for v in cache.users.values() {
                 let u = &v.credentials;
                 if u.parent_user.as_str() == access_key {
                     if u.is_service_account() {
@@ -1396,7 +1396,7 @@ where
                     }
                 }
             }
-            for (_, v) in cache.sts_accounts.iter() {
+            for v in cache.sts_accounts.values() {
                 let u = &v.credentials;
                 if u.parent_user.as_str() == access_key {
                     temp_accounts_to_delete.insert(u.access_key.clone());
@@ -1972,14 +1972,14 @@ where
             let mut temp_accounts_to_delete = HashSet::new();
             if user_type == UserType::Reg {
                 let cache = self.cache.snapshot();
-                for (_, v) in cache.users.iter() {
+                for v in cache.users.values() {
                     let u = &v.credentials;
                     if u.parent_user.as_str() == name && u.is_service_account() {
                         service_accounts_to_delete.push(u.access_key.clone());
                     }
                 }
 
-                for (_, u) in cache.sts_accounts.iter() {
+                for u in cache.sts_accounts.values() {
                     let u = &u.credentials;
                     if u.parent_user.as_str() == name {
                         temp_accounts_to_delete.insert(u.access_key.clone());

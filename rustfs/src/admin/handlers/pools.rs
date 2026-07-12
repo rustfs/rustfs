@@ -786,7 +786,7 @@ impl Operation for StartDecommission {
         if let Some(first_idx) = pools_indices.first().copied()
             && let Some(client) = decommission_peer_target(&endpoints, first_idx, "start decommission", audit)?
         {
-            let pool_context = format!("pools {:?}", &pools_indices);
+            let pool_context = format!("pools {:?}", pools_indices);
             client
                 .start_decommission(pools_indices.clone())
                 .await
@@ -819,7 +819,7 @@ impl Operation for StartDecommission {
             validate_start_decommission_guards(decommission_running, rebalance_running)?;
 
             if !pools_indices.is_empty() {
-                let pool_context = format!("pools {:?}", &pools_indices);
+                let pool_context = format!("pools {:?}", pools_indices);
                 store
                     .decommission(ctx.clone(), pools_indices.clone())
                     .await

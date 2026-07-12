@@ -1203,7 +1203,7 @@ pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate:
 
     let name_clone = name.clone();
     tokio::spawn(async move {
-        let _ = save_config(store_clone, &format!("{}{}", &name_clone, ".bkp"), buf_clone).await;
+        let _ = save_config(store_clone, &format!("{}{}", name_clone, ".bkp"), buf_clone).await;
     });
     save_config(store, &name, buf).await?;
     Ok(())

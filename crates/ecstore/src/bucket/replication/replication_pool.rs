@@ -1405,7 +1405,7 @@ pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo
     }
 
     if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, runtime_sources::replication_stats()) {
-        for (k, _v) in rs.targets.iter() {
+        for k in rs.targets.keys() {
             let ri = ReplicatedTargetInfo {
                 arn: k.clone(),
                 size: 0,

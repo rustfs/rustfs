@@ -153,7 +153,7 @@ where
             }
             *this.buffer = out;
             *this.pos = 0;
-            this.temp_buffer.truncate(0); // More efficient way to clear
+            this.temp_buffer.clear(); // More efficient way to clear
             let to_copy = min(buf.remaining(), this.buffer.len());
             buf.put_slice(&this.buffer[..to_copy]);
             *this.pos += to_copy;

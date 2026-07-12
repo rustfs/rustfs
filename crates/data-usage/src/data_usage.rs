@@ -434,7 +434,7 @@ impl ReplicationAllStats {
         if self.replica_size != 0 && self.replica_count != 0 {
             return false;
         }
-        for (_, v) in self.targets.iter() {
+        for v in self.targets.values() {
             if !v.empty() {
                 return false;
             }

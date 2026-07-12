@@ -423,7 +423,7 @@ fn get_set_indexes<T: AsRef<str>>(
             if !has_set_drive_count {
                 return Err(Error::other(format!(
                     "Invalid set drive count {}. Acceptable values for {:?} number drives are {:?}",
-                    set_drive_count, common_size, &set_counts
+                    set_drive_count, common_size, set_counts
                 )));
             }
             set_drive_count
@@ -432,7 +432,7 @@ fn get_set_indexes<T: AsRef<str>>(
             if set_counts.is_empty() {
                 return Err(Error::other(format!(
                     "No symmetric distribution detected with input endpoints , drives {} cannot be spread symmetrically by any supported erasure set sizes {:?}",
-                    common_size, &set_counts
+                    common_size, set_counts
                 )));
             }
             // Final set size with all the symmetry accounted for.
