@@ -80,6 +80,9 @@ the repository. Only durable reference — the architecture set under
 and the test-suite references under `docs/testing/` — belongs in version
 control; `.gitignore` ignores everything else under `docs/` by default, so a new
 plan file will not be tracked unless someone force-adds it — don't.
+`scripts/check_no_planning_docs.sh` (wired into `make pre-commit`/`pre-pr` and
+CI) fails the build if anything is committed under `docs/superpowers/`, even via
+`git add -f`.
 
 ## Verification Before PR
 
