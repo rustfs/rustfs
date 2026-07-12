@@ -45,6 +45,7 @@
 | **GET 发布健康度** | `grafana-get-rollout-health.json` | 监控优化发布：按 reader path 的延迟、early-stop 命中率、codec streaming 使用率、pipeline 失败率 |
 | **GET 数据完整性** | `grafana-get-data-integrity.json` | 监控数据安全：bitrot 校验失败、decode 错误、short read、shard 读取结果 |
 | **GET 资源影响** | `grafana-get-resource-impact.json` | 监控资源使用：并发请求数、IO 队列利用率、disk permit 等待、RSS 趋势 |
+| **对象数据缓存** | `grafana-object-data-cache.json` | 监控 GET body 缓存（`rustfs_object_data_cache_*`）：命中率、查找/规划/填充结果、填充耗时分位、命中 vs 填充吞吐、条目数/加权字节、在途填充、内存压力拒绝、失效、按尺寸档拆分 |
 
 ### Prometheus 告警规则
 
