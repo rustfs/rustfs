@@ -32,6 +32,10 @@ pub struct MokaBackend {
     index: Arc<ObjectDataCacheIdentityIndex>,
     singleflight: ObjectDataCacheSingleflight,
     memory_gate: ObjectDataCacheMemoryGate,
+    /// Cache capacity in weighted bytes. Used to derive how much the cache can
+    /// still grow (`max_capacity - weighted_size()`), which caps the memory
+    /// gate's in-window reservation deduction (backlog#1212).
+    max_capacity: u64,
     /// Bounds the number of concurrent distinct-key fills. Singleflight only
     /// dedups per key, so without this limiter distinct-key fills are unbounded.
     fill_semaphore: Arc<Semaphore>,
@@ -144,6 +148,7 @@ impl MokaBackend {
             index,
             singleflight: ObjectDataCacheSingleflight::new(Arc::clone(&stats)),
             memory_gate: ObjectDataCacheMemoryGate::new(config, stats),
+            max_capacity,
             fill_semaphore: Arc::new(Semaphore::new(fill_permits)),
             #[cfg(test)]
             fill_barrier: std::sync::Mutex::new(None),
@@ -204,7 +209,16 @@ impl MokaBackend {
             Err(_) => return leader.finish(ObjectDataCacheFillResult::SkippedFillConcurrency),
         };
 
-        if !self.memory_gate.allows_fill(u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
+        // How much the cache can still grow before it is at capacity. This caps
+        // the gate's in-window reservation so sustained gross churn (net size
+        // flat, far below capacity) cannot be mistaken for real memory growth
+        // and falsely skip fills (backlog#1212). weighted_size() is moka's
+        // lazily-maintained approximation, which is all this bound needs.
+        let cache_growth_headroom = self.max_capacity.saturating_sub(self.cache.weighted_size());
+        if !self
+            .memory_gate
+            .allows_fill(u64::try_from(bytes.len()).unwrap_or(u64::MAX), cache_growth_headroom)
+        {
             return leader.finish(ObjectDataCacheFillResult::SkippedMemoryPressure);
         }
 
