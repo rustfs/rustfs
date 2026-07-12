@@ -14,7 +14,7 @@
 
 use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
-    rustfs_binary_path,
+    replication_fast_env, rustfs_binary_path,
 };
 use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -304,6 +304,19 @@ async fn put_bucket_replication(
     bucket: &str,
     target_arn: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    put_bucket_replication_with_delete_statuses(env, bucket, target_arn, "Enabled", None).await
+}
+
+async fn put_bucket_replication_with_delete_statuses(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    target_arn: &str,
+    delete_marker_status: &str,
+    version_delete_status: Option<&str>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let delete_replication = version_delete_status
+        .map(|status| format!("<DeleteReplication><Status>{status}</Status></DeleteReplication>"))
+        .unwrap_or_default();
     let body = format!(
         r#"<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Role></Role>
@@ -312,8 +325,9 @@ async fn put_bucket_replication(
     <Priority>1</Priority>
     <Status>Enabled</Status>
     <DeleteMarkerReplication>
-      <Status>Enabled</Status>
+      <Status>{delete_marker_status}</Status>
     </DeleteMarkerReplication>
+    {delete_replication}
     <ExistingObjectReplication>
       <Status>Enabled</Status>
     </ExistingObjectReplication>
@@ -839,6 +853,94 @@ async fn wait_for_replicated_sha256(
             }
             Err(err) => return Err(err.into()),
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReplicatedVersion {
+    key: String,
+    version_id: String,
+    delete_marker: bool,
+    e_tag: Option<String>,
+}
+
+async fn list_replication_state(client: &Client, bucket: &str) -> Result<Vec<ReplicatedVersion>, Box<dyn Error + Send + Sync>> {
+    let mut state = Vec::new();
+    let mut key_marker = None;
+    let mut version_id_marker = None;
+
+    loop {
+        let output = client
+            .list_object_versions()
+            .bucket(bucket)
+            .set_key_marker(key_marker)
+            .set_version_id_marker(version_id_marker)
+            .send()
+            .await?;
+
+        for version in output.versions() {
+            state.push(ReplicatedVersion {
+                key: version.key().ok_or("listed object version omitted key")?.to_string(),
+                version_id: version
+                    .version_id()
+                    .ok_or("listed object version omitted version ID")?
+                    .to_string(),
+                delete_marker: false,
+                e_tag: Some(version.e_tag().ok_or("listed object version omitted ETag")?.to_string()),
+            });
+        }
+        for marker in output.delete_markers() {
+            state.push(ReplicatedVersion {
+                key: marker.key().ok_or("listed delete marker omitted key")?.to_string(),
+                version_id: marker
+                    .version_id()
+                    .ok_or("listed delete marker omitted version ID")?
+                    .to_string(),
+                delete_marker: true,
+                e_tag: None,
+            });
+        }
+
+        if output.is_truncated() != Some(true) {
+            break;
+        }
+        key_marker = Some(
+            output
+                .next_key_marker()
+                .ok_or("truncated version listing omitted next key marker")?
+                .to_string(),
+        );
+        version_id_marker = output.next_version_id_marker().map(str::to_string);
+    }
+
+    state.sort();
+    Ok(state)
+}
+
+async fn assert_replication_converged(
+    source_client: &Client,
+    source_bucket: &str,
+    target_client: &Client,
+    target_bucket: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut consecutive_matches = 0;
+
+    loop {
+        let source = list_replication_state(source_client, source_bucket).await?;
+        let target = list_replication_state(target_client, target_bucket).await?;
+        if source == target {
+            consecutive_matches += 1;
+            if consecutive_matches == 2 {
+                return Ok(());
+            }
+        } else {
+            consecutive_matches = 0;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("replication did not converge in time; source={source:?}, target={target:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -1676,7 +1778,10 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
     let err = set_replication_target(&source_env, source_bucket, &target_env, target_bucket)
         .await
         .expect_err("unversioned target bucket should be rejected during remote target setup");
-    assert!(err.to_string().contains("not versioned"), "unexpected set remote target error: {err}");
+    assert!(
+        err.to_string().contains("Remote target bucket not versioned"),
+        "unversioned destination must not be misreported as the source: {err}"
+    );
 
     Ok(())
 }
@@ -2438,6 +2543,188 @@ async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<()
         .await?;
 
     wait_for_replicated_object(&target_client, target_bucket, object_key, body).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-delete-state-src";
+    let target_bucket = "replication-delete-state-dst";
+    let object_key = "versioned-object.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+
+    let first_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from_static(b"versioned replication payload v1"))
+        .send()
+        .await?;
+    let purged_version_id = first_put
+        .version_id()
+        .ok_or("first source PUT omitted version ID")?
+        .to_string();
+    let second_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from_static(b"versioned replication payload v2"))
+        .send()
+        .await?;
+    let retained_version_id = second_put
+        .version_id()
+        .ok_or("second source PUT omitted version ID")?
+        .to_string();
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    let delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .send()
+        .await?;
+    let delete_marker_version_id = delete.version_id().ok_or("source DELETE omitted marker version ID")?;
+    assert_eq!(delete.delete_marker(), Some(true));
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+    assert!(
+        list_replication_state(&target_client, target_bucket)
+            .await?
+            .iter()
+            .any(|entry| entry.delete_marker && entry.version_id == delete_marker_version_id),
+        "target did not preserve the source delete-marker version ID"
+    );
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .version_id(&purged_version_id)
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+    let target_state = list_replication_state(&target_client, target_bucket).await?;
+    assert!(
+        target_state.iter().all(|entry| entry.version_id != purged_version_id),
+        "target retained the explicitly purged object version"
+    );
+    assert!(
+        target_state
+            .iter()
+            .any(|entry| !entry.delete_marker && entry.version_id == retained_version_id),
+        "target removed the non-selected object version: {target_state:?}"
+    );
+    let retained = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(object_key)
+        .version_id(&retained_version_id)
+        .send()
+        .await?;
+    assert_eq!(retained.body.collect().await?.into_bytes().as_ref(), b"versioned replication payload v2");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-no-delete-marker-src";
+    let target_bucket = "replication-no-delete-marker-dst";
+    let object_key = "retained-object.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, source_bucket, &target_arn, "Disabled", None).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from_static(b"delete-marker replication disabled"))
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    let delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .send()
+        .await?;
+    let delete_marker_version_id = delete
+        .version_id()
+        .ok_or("source DELETE omitted marker version ID")?
+        .to_string();
+
+    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let target_state = list_replication_state(&target_client, target_bucket).await?;
+        assert!(
+            target_state.iter().all(|entry| !entry.delete_marker),
+            "disabled delete-marker replication unexpectedly created a target marker: {target_state:?}"
+        );
+        if tokio::time::Instant::now() >= observation_deadline {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let retained = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(object_key)
+        .send()
+        .await?;
+    assert_eq!(
+        retained.body.collect().await?.into_bytes().as_ref(),
+        b"delete-marker replication disabled"
+    );
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .version_id(delete_marker_version_id)
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
 
     Ok(())
 }

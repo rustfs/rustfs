@@ -330,9 +330,12 @@ impl MokaBackend {
     /// index). Rare admin `clear()` path only.
     pub async fn clear(&self) -> ObjectDataCacheInvalidationResult {
         let removed = self.index.remove_matching(|_| true).await.len();
-        self.cache.run_pending_tasks().await;
         self.cache.invalidate_all();
-        for _ in 0..8 {
+        // Moka processes invalidations lazily. A single run_pending_tasks() may
+        // not evict all entries if concurrent fill tasks recently committed
+        // writes. Drain in a loop until the entry count reaches zero, yielding
+        // between rounds so the runtime can schedule moka's maintenance.
+        for _ in 0..256 {
             self.cache.run_pending_tasks().await;
             if self.cache.entry_count() == 0 {
                 break;

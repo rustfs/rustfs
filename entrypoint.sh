@@ -191,43 +191,72 @@ process_data_volumes() {
   # Convert comma/tab to space
   VOLUME_LIST_RAW=$(echo "$VOLUME_RAW" | tr ',\t' ' ')
   
-  VOLUME_LIST=""
-  for vol in $VOLUME_LIST_RAW; do
-      # Helper to manually expand {N..M} since sh doesn't support it on variables
-      if echo "$vol" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; then
-           PREFIX=${vol%%\{*}
-           SUFFIX=${vol##*\}}
-           RANGE=${vol#*\{}
-           RANGE=${RANGE%\}}
-           RANGE=$(echo "$RANGE" | sed 's/\.\.\./../')
-           START=${RANGE%%..*}
-           END=${RANGE##*..}
-           
-           # Check if START and END are numbers
-           if [ "$START" -eq "$START" ] 2>/dev/null && [ "$END" -eq "$END" 2>/dev/null ]; then
-               i=$START
-               while [ "$i" -le "$END" ]; do
-                 VOLUME_LIST="$VOLUME_LIST ${PREFIX}${i}${SUFFIX}"
-                 i=$((i+1))
-               done
-           else
-               # Fallback if not numbers
-               VOLUME_LIST="$VOLUME_LIST $vol"
-           fi
-      else
-           VOLUME_LIST="$VOLUME_LIST $vol"
-      fi
+  # Manually expand {N...M} ranges since sh doesn't support brace expansion on
+  # variables. A single token can carry MORE than one range — the distributed
+  # form "http://rustfs{1...4}:9000/data/rustfs{0...3}" has two — so expand the
+  # FIRST range in each token and re-scan until no ranges remain. Operating on
+  # only the first brace (via #*{ / %%}* rather than ##*} / %}) is what keeps
+  # multi-range tokens intact; the previous single-pass expander collapsed them
+  # to "http://rustfs1" and silently dropped the disk path.
+  VOLUME_LIST="$VOLUME_LIST_RAW"
+  while echo "$VOLUME_LIST" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; do
+      NEXT_LIST=""
+      for vol in $VOLUME_LIST; do
+          if echo "$vol" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; then
+               PREFIX=${vol%%\{*}
+               REST=${vol#*\}}
+               RANGE=${vol#*\{}
+               RANGE=${RANGE%%\}*}
+               RANGE=$(echo "$RANGE" | sed 's/\.\.\./../')
+               START=${RANGE%%..*}
+               END=${RANGE##*..}
+
+               # Check if START and END are numbers
+               if [ "$START" -eq "$START" ] 2>/dev/null && [ "$END" -eq "$END" 2>/dev/null ]; then
+                   i=$START
+                   while [ "$i" -le "$END" ]; do
+                     NEXT_LIST="$NEXT_LIST ${PREFIX}${i}${REST}"
+                     i=$((i+1))
+                   done
+               else
+                   # Fallback if not numbers
+                   NEXT_LIST="$NEXT_LIST $vol"
+               fi
+          else
+               NEXT_LIST="$NEXT_LIST $vol"
+          fi
+      done
+      VOLUME_LIST="$NEXT_LIST"
   done
 
+  # CREATE_DIRS holds every local filesystem path that must exist before
+  # startup. DATA_VOLUMES holds only the paths that are also appended as CLI
+  # args (bare absolute paths). Distributed URL-form endpoints are read from
+  # RUSTFS_VOLUMES by rustfs directly, so they must NOT be appended as args,
+  # but their local path component still has to exist on disk — otherwise
+  # LocalDisk init aborts with VolumeNotFound (rustfs no longer auto-creates
+  # the disk root).
+  CREATE_DIRS=""
   for vol in $VOLUME_LIST; do
     case "$vol" in
-      /*) DATA_VOLUMES="$DATA_VOLUMES $vol" ;;
-      *)  : ;; # skip non-absolute paths (including http(s):// URLs)
+      /*)
+        DATA_VOLUMES="$DATA_VOLUMES $vol"
+        CREATE_DIRS="$CREATE_DIRS $vol"
+        ;;
+      *://*)
+        # e.g. http://node0:9000/data/rustfs0 -> /data/rustfs0
+        vol_rest=${vol#*://}
+        case "$vol_rest" in
+          */*) CREATE_DIRS="$CREATE_DIRS /${vol_rest#*/}" ;;
+          *)   : ;; # URL without a path component; nothing local to create
+        esac
+        ;;
+      *)  : ;; # skip anything else we don't recognize
     esac
   done
-  
-  echo "Initializing data directories:$DATA_VOLUMES"
-  for vol in $DATA_VOLUMES; do
+
+  echo "Initializing data directories:$CREATE_DIRS"
+  for vol in $CREATE_DIRS; do
     if [ ! -d "$vol" ]; then
       echo "  mkdir -p $vol"
       mkdir -p "$vol"

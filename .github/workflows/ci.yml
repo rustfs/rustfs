@@ -543,6 +543,13 @@ jobs:
   # cannot be applied to the s3-implemented-tests lane above because a global
   # RUSTFS_ILM_DEBUG_DAY_SECS also shrinks the x-amz-expiration header those tests
   # assert on (test_lifecycle_expiration_header_*). Hence a separate server here.
+  #
+  # RUSTFS_ILM_DEBUG_DAY_SECS MUST stay equal to the s3-tests lc_debug_interval
+  # default (10s). test_lifecycle_expiration polls the Days=1 rule with a
+  # 4*lc_interval window while the Days=5 rule fires at 5*debug_day; observing
+  # the intermediate 4-object plateau requires 4*lc_interval < 5*debug_day, i.e.
+  # debug_day > 8. A smaller value lets the Days=5 rule fire inside the Days=1
+  # poll window so the count collapses straight to 2 and the test fails (#4764).
   s3-lifecycle-behavior-tests:
     name: S3 Lifecycle Behavior Tests
     needs: [ build-rustfs-debug-binary ]
@@ -572,7 +579,7 @@ jobs:
           MAXFAIL=0 \
           XDIST=0 \
           IMPLEMENTED_TESTS_FILE=scripts/s3-tests/lifecycle_behavior_tests.txt \
-          RUSTFS_ILM_DEBUG_DAY_SECS=2 \
+          RUSTFS_ILM_DEBUG_DAY_SECS=10 \
           RUSTFS_ILM_PROCESS_TIME=1 \
           RUSTFS_SCANNER_ENABLED=true \
           RUSTFS_SCANNER_CYCLE=2 \
