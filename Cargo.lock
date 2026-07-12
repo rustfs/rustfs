@@ -9593,6 +9593,7 @@ dependencies = [
  "futures-util",
  "glob",
  "jiff",
+ "libc",
  "metrics",
  "num_cpus",
  "nvml-wrapper",

@@ -28,6 +28,11 @@ use rustfs_config::observability::{
 use std::fmt;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use tracing::warn;
+
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
+const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
 
 /// Strategy for matching log files against a pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +60,25 @@ impl FileMatchMode {
     /// configuration handling permissive and aligned with the historical
     /// cleaner default used by rolling log filenames.
     pub fn from_config_str(value: &str) -> Self {
-        if value.trim().eq_ignore_ascii_case(DEFAULT_OBS_LOG_MATCH_MODE_PREFIX) {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case(DEFAULT_OBS_LOG_MATCH_MODE_PREFIX) {
             Self::Prefix
+        } else if trimmed.eq_ignore_ascii_case(DEFAULT_OBS_LOG_MATCH_MODE) {
+            Self::Suffix
         } else {
+            // A non-empty unrecognized value is almost certainly a typo (e.g.
+            // "prefixx"); warn so the silent fallback to suffix is visible.
+            if !trimmed.is_empty() {
+                warn!(
+                    event = EVENT_LOG_CLEANER_STATE,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                    result = "unknown_match_mode",
+                    value = %value,
+                    fallback = DEFAULT_OBS_LOG_MATCH_MODE,
+                    "log cleaner state changed"
+                );
+            }
             Self::Suffix
         }
     }
@@ -97,7 +118,26 @@ impl CompressionAlgorithm {
     /// to the crate default so observability startup remains resilient.
     pub fn from_config_str(value: &str) -> Self {
         let normalized = value.trim().to_ascii_lowercase();
-        Self::parse_normalized(&normalized).unwrap_or_default()
+        match Self::parse_normalized(&normalized) {
+            Some(algorithm) => algorithm,
+            None => {
+                let fallback = Self::default();
+                // A non-empty unrecognized value is almost certainly a typo;
+                // warn so the silent fallback to the default codec is visible.
+                if !normalized.is_empty() {
+                    warn!(
+                        event = EVENT_LOG_CLEANER_STATE,
+                        component = LOG_COMPONENT_OBS,
+                        subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                        result = "unknown_compression_algorithm",
+                        value = %value,
+                        fallback = %fallback,
+                        "log cleaner state changed"
+                    );
+                }
+                fallback
+            }
+        }
     }
 
     /// Archive suffix (without dot) used for this algorithm.
@@ -154,13 +194,12 @@ impl fmt::Display for CompressionAlgorithm {
 
 /// Worker-thread default used by parallel compressor.
 ///
-/// The worker count follows CPU capacity but stays within [4, 8] to keep
-/// throughput stable and avoid oversubscription. The lower bound helps the
-/// work-stealing path on small machines still exercise concurrency, while the
-/// upper bound avoids swamping the host when each task may also use internal
-/// codec threads.
+/// The worker count follows CPU capacity, capped at 8 to avoid swamping the
+/// host when each task may also use internal codec threads. The lower bound is
+/// 1 (not 4) so a 1-2 vCPU container is not forced to run several concurrent
+/// compressions that monopolize its CPU.
 pub fn default_parallel_workers() -> usize {
-    num_cpus::get().clamp(4, 8)
+    num_cpus::get().clamp(1, 8)
 }
 
 /// Metadata for a single log file discovered by the scanner.

@@ -654,14 +654,31 @@ pub fn spawn_cleanup_task(
         component = LOG_COMPONENT_OBS,
         subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
         state = "configured",
+        match_mode = %match_mode,
         compression_algorithm = %compression_algorithm,
         parallel_compress,
         parallel_workers,
-        zstd_level,
+        // Echo the *effective* (post-clamp) levels so the log matches what the
+        // codec actually runs with, not the raw configured value.
+        gzip_level = cleaner.effective_gzip_level(),
+        zstd_level = cleaner.effective_zstd_level(),
         zstd_fallback_to_gzip,
         zstd_workers,
         "log cleaner state"
     );
+
+    // retention_days == 0 means "keep archives forever" (age expiry disabled),
+    // which is easy to misread as "delete immediately". Warn so an operator who
+    // enabled compression is aware archives rely solely on the byte cap.
+    if compress && retention_days == 0 {
+        warn!(
+            event = EVENT_LOG_CLEANER_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+            result = "archive_retention_disabled",
+            "compressed archives are kept forever (retention_days=0); disk is bounded only by max_total_size_bytes"
+        );
+    }
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));
