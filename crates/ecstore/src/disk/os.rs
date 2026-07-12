@@ -195,7 +195,9 @@ pub(crate) mod file_sync_probe {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex, RwLock};
+    use std::time::Duration;
     use tokio::sync::Notify;
+    use tokio::time::timeout;
 
     static ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
     static BLOCK_MUTEX: Mutex<()> = Mutex::new(());
@@ -206,6 +208,7 @@ pub(crate) mod file_sync_probe {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     static FAIL_ON_ATTEMPT: AtomicUsize = AtomicUsize::new(usize::MAX);
     static BLOCK: AtomicBool = AtomicBool::new(false);
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
     pub(crate) struct ProbeGuard;
 
@@ -298,23 +301,45 @@ pub(crate) mod file_sync_probe {
     }
 
     pub(crate) async fn wait_for_active(target: usize) {
-        loop {
-            let changed = ACTIVE_CHANGED.notified();
-            if ACTIVE.load(Ordering::SeqCst) >= target {
-                return;
+        timeout(WAIT_TIMEOUT, async {
+            loop {
+                let changed = ACTIVE_CHANGED.notified();
+                if ACTIVE.load(Ordering::SeqCst) >= target {
+                    return;
+                }
+                changed.await;
             }
-            changed.await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for {target} active file sync probes; active={}, peak={}, attempts={}",
+                ACTIVE.load(Ordering::SeqCst),
+                PEAK.load(Ordering::SeqCst),
+                ATTEMPTS.load(Ordering::SeqCst)
+            )
+        });
     }
 
     pub(super) async fn wait_for_idle() {
-        loop {
-            let changed = ACTIVE_CHANGED.notified();
-            if ACTIVE.load(Ordering::SeqCst) == 0 {
-                return;
+        timeout(WAIT_TIMEOUT, async {
+            loop {
+                let changed = ACTIVE_CHANGED.notified();
+                if ACTIVE.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                changed.await;
             }
-            changed.await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for file sync probes to become idle; active={}, peak={}, attempts={}",
+                ACTIVE.load(Ordering::SeqCst),
+                PEAK.load(Ordering::SeqCst),
+                ATTEMPTS.load(Ordering::SeqCst)
+            )
+        });
     }
 
     pub(crate) fn release() {
