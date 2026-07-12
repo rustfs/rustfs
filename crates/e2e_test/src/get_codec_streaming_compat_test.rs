@@ -39,6 +39,20 @@
 //! **zero** — proving the codec path actually ran rather than silently falling
 //! back to the very path it is being compared against.
 //!
+//! Beyond the all-healthy happy path, the suite also drives the codec/legacy
+//! A/B under two conditions the `DiskFaultHarness` makes reachable:
+//!
+//!   * Parity reconstruction: one data disk is taken offline
+//!     (`take_disk_offline`) and the SAME object matrix is GET both ways while
+//!     the EC 2+2 set rebuilds each large object from the surviving shards. The
+//!     codec-streaming reader gate never inspects drive health, so the codec
+//!     fast path is exercised end-to-end through reconstruction; the test
+//!     asserts byte- and header-equality vs the legacy path AND that the codec
+//!     phase never fell back to a duplex pipe while reconstructing.
+//!   * Missing object: a GET for an absent key is compared across both phases
+//!     to prove the error semantics (HTTP status + S3 error code) are identical
+//!     — the codec env must not perturb the NoSuchKey negative path.
+//!
 //! Topology: single-node 4-disk EC set (default 2 data + 2 parity) via the
 //! in-process `DiskFaultHarness` (see `chaos.rs`). Small objects are inlined
 //! into `xl.meta` (served identically on both paths); large objects span one or
@@ -49,6 +63,7 @@ mod tests {
     use crate::chaos::DiskFaultHarness;
     use crate::common::init_logging;
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
     use serial_test::serial;
@@ -63,6 +78,9 @@ mod tests {
     const MIB: usize = 1024 * 1024;
     const BUCKET: &str = "codec-streaming-compat";
     const CONTENT_TYPE: &str = "application/x-rustfs-compat";
+    /// A key that is never uploaded — used to compare the NoSuchKey negative
+    /// path across the legacy and codec phases.
+    const MISSING_KEY: &str = "does-not-exist/ghost.bin";
 
     /// Marker the legacy duplex GET path logs once per full-object read
     /// (`crates/ecstore/src/set_disk/ops/object.rs`). Its presence/absence in a
@@ -142,6 +160,23 @@ mod tests {
             len: body.len(),
             headers,
         })
+    }
+
+    /// GET a key expected to be absent, projecting the wire-visible error
+    /// semantics — HTTP status code plus the S3 error code — so the legacy and
+    /// codec phases can be asserted to reject a missing object identically. A
+    /// missing object fails during metadata resolution, before the reader-path
+    /// gate is consulted, so both phases MUST agree; a divergence here would
+    /// mean the codec env perturbed the negative path.
+    async fn missing_key_semantics(client: &Client, key: &str) -> Result<(u16, String), Box<dyn Error + Send + Sync>> {
+        match client.get_object().bucket(BUCKET).key(key).send().await {
+            Ok(_) => Err(format!("GET {key} unexpectedly succeeded; expected a NoSuchKey error").into()),
+            Err(err) => {
+                let status = err.raw_response().map(|r| r.status().as_u16()).unwrap_or(0);
+                let code = err.as_service_error().and_then(|e| e.code()).unwrap_or("<none>").to_string();
+                Ok((status, code))
+            }
+        }
     }
 
     /// Env that opens every codec-streaming gate to 100% for the codec phase.
@@ -335,6 +370,37 @@ mod tests {
             "baseline phase should have used the legacy duplex path for the {num_large} large objects, but only saw {dup_base} duplex markers in {base_log}"
         );
 
+        // Legacy negative path: a GET for an absent key must fail with a
+        // well-formed NoSuchKey (404). Captured now so Phase B can prove the
+        // codec env returns the identical error semantics.
+        let legacy_missing = missing_key_semantics(&client, MISSING_KEY).await?;
+        assert_eq!(
+            legacy_missing,
+            (404, "NoSuchKey".to_string()),
+            "legacy GET of a missing key should be 404/NoSuchKey, got {legacy_missing:?}"
+        );
+
+        // ---- Phase A degraded: pull one data disk, force parity reconstruction ----
+        // With disk0 offline the EC 2+2 set must rebuild every large object's
+        // data from the surviving data+parity shards. Record the legacy-duplex
+        // bytes and headers produced under reconstruction so Phase B can prove
+        // the codec path reconstructs the same bytes and headers. The duplex
+        // marker snapshot (`dup_base`) is already taken, so these extra reads do
+        // not affect the path-confirmation assertion above.
+        harness.take_disk_offline(0)?;
+        let mut baseline_degraded: BTreeMap<String, GetView> = BTreeMap::new();
+        for (shape, data) in plain {
+            let view = get_full(&client, shape.key).await?;
+            assert_eq!(view.sha256, sha256_hex(data), "degraded baseline body mismatch for {}", shape.key);
+            assert_eq!(view.len, data.len(), "degraded baseline length mismatch for {}", shape.key);
+            baseline_degraded.insert(shape.key.to_string(), view);
+        }
+        let mp_view = get_full(&client, multipart_key).await?;
+        assert_eq!(mp_view.sha256, sha256_hex(&multipart_body), "degraded baseline multipart body mismatch");
+        baseline_degraded.insert(multipart_key.to_string(), mp_view);
+        // Restore the disk so Phase B restarts from a clean, complete disk set.
+        harness.bring_disk_online(0)?;
+
         // ---- Phase B: codec streaming (gates opened) ----
         harness.kill_server();
         for (k, v) in codec_env() {
@@ -354,6 +420,14 @@ mod tests {
         let mp_view = get_full(&client, multipart_key).await?;
         assert_eq!(mp_view.sha256, sha256_hex(&multipart_body), "codec multipart body mismatch");
         codec.insert(multipart_key.to_string(), mp_view);
+
+        // Negative-path equivalence: the codec env must return the exact same
+        // status + error code as the legacy phase for a missing key.
+        let codec_missing = missing_key_semantics(&client, MISSING_KEY).await?;
+        assert_eq!(
+            codec_missing, legacy_missing,
+            "NoSuchKey error semantics diverged between codec and legacy phases: codec={codec_missing:?} legacy={legacy_missing:?}"
+        );
 
         // Snapshot the codec-phase duplex count BEFORE issuing the ranged GET
         // (range falls back to the duplex path by design and would pollute it).
@@ -382,18 +456,75 @@ mod tests {
             "codec phase created {dup_codec} duplex pipe(s) for full GETs; the codec-streaming fast path was not exercised (see {codec_log})"
         );
 
-        // Range GET still served correctly while codec streaming is enabled
-        // (ranges fall back to the legacy path by gate design).
+        // Range GET while codec streaming is enabled. NOTE ON COVERAGE: the
+        // reader gate unconditionally routes every ranged request back to the
+        // legacy duplex path (`GetCodecStreamingFallbackReason::Range`), so both
+        // `baseline_range` and `codec_range` are produced by the SAME legacy
+        // path. This assertion therefore only verifies that ranged GETs keep
+        // working (and keep falling back to legacy) with the codec gates open —
+        // it does NOT exercise or validate a codec-streaming range reader, which
+        // does not exist. It must not be read as codec range-correctness
+        // coverage.
         let codec_range = get_range(&client, "large-3mib", range_spec).await?;
         assert_eq!(
             codec_range.sha256, baseline_range.sha256,
-            "ranged GET body diverged under codec streaming"
+            "ranged GET body diverged with codec streaming enabled (both served by the legacy range path)"
         );
-        assert_eq!(codec_range.len, baseline_range.len, "ranged GET length diverged under codec streaming");
+        assert_eq!(
+            codec_range.len, baseline_range.len,
+            "ranged GET length diverged with codec streaming enabled"
+        );
+
+        // ---- Phase B degraded: the same reconstruction, now on the codec path ----
+        // Re-run the reconstruction A/B with the codec-streaming gates still
+        // open. The reader gate decision is independent of drive health (it
+        // never inspects disk state), so the codec fast path is exercised
+        // end-to-end while the EC set rebuilds each large object from the
+        // surviving shards — this is a real codec-vs-legacy reconstruction test,
+        // not legacy-vs-legacy. Snapshot the duplex count first (the range GET
+        // above already used the duplex path) so we can measure only the markers
+        // these degraded codec GETs add.
+        let dup_codec_before_degraded = count_marker(&codec_log, DUPLEX_MARKER);
+        harness.take_disk_offline(0)?;
+        let mut codec_degraded: BTreeMap<String, GetView> = BTreeMap::new();
+        for (shape, data) in plain {
+            let view = get_full(&client, shape.key).await?;
+            assert_eq!(view.sha256, sha256_hex(data), "degraded codec body mismatch for {}", shape.key);
+            codec_degraded.insert(shape.key.to_string(), view);
+        }
+        let mp_view = get_full(&client, multipart_key).await?;
+        assert_eq!(mp_view.sha256, sha256_hex(&multipart_body), "degraded codec multipart body mismatch");
+        codec_degraded.insert(multipart_key.to_string(), mp_view);
+        harness.bring_disk_online(0)?;
+
+        // A/B under parity reconstruction: codec == legacy, byte-for-byte and
+        // header-for-header, for every object in the matrix.
+        for key in baseline_degraded.keys() {
+            let b = &baseline_degraded[key];
+            let c = &codec_degraded[key];
+            assert_eq!(c.sha256, b.sha256, "degraded body hash diverged for {key} (parity reconstruction)");
+            assert_eq!(c.len, b.len, "degraded body length diverged for {key} (parity reconstruction)");
+            assert_eq!(
+                c.headers, b.headers,
+                "degraded response headers diverged for {key} (parity reconstruction)\nbaseline={:#?}\ncodec={:#?}",
+                b.headers, c.headers
+            );
+        }
+
+        // Path confirmation under reconstruction: the codec fast path must have
+        // served the reconstructed large objects without ever falling back to
+        // the legacy duplex pipe. Without this, the equivalence above could be
+        // legacy-vs-legacy and prove nothing about codec reconstruction.
+        sleep(Duration::from_millis(300)).await;
+        let dup_codec_degraded = count_marker(&codec_log, DUPLEX_MARKER).saturating_sub(dup_codec_before_degraded);
+        assert_eq!(
+            dup_codec_degraded, 0,
+            "codec phase created {dup_codec_degraded} duplex pipe(s) while reconstructing large objects with disk0 offline; the codec fast path was not exercised under degraded reads (see {codec_log})"
+        );
 
         info!(
             objects = baseline.len(),
-            "codec streaming produced byte- and header-identical GET responses vs legacy duplex"
+            "codec streaming produced byte- and header-identical GET responses vs legacy duplex (healthy + parity-reconstructed + NoSuchKey)"
         );
 
         // Best-effort cleanup of the capture logs.

@@ -189,6 +189,18 @@ pub fn get_drive_walkdir_timeout() -> Duration {
     )
 }
 
+/// Per-read stall budget for a directory walk: a walk read is failed only if
+/// the drive stops answering for this long, not for a walk simply taking a
+/// while (see `with_walk_stall_deadline` in `disk/local.rs`).
+///
+/// Wide-directory tuning (rustfs/backlog#1216): because a whole-directory
+/// enumeration (`list_dir` with `count = -1`) is bounded by this budget as one
+/// unit, a very wide flat prefix (millions of immediate children) can make a
+/// single `readdir` exceed the default on a healthy disk and fail ListObjects.
+/// Deployments with such directories should raise
+/// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS`, or select the high-latency
+/// drive-timeout profile (which raises this default automatically), to widen
+/// the budget without a code change.
 pub fn get_drive_walkdir_stall_timeout() -> Duration {
     get_drive_timeout_duration(
         rustfs_config::ENV_DRIVE_WALKDIR_STALL_TIMEOUT_SECS,

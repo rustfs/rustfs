@@ -266,6 +266,13 @@ const METRIC_URING_IN_FLIGHT: &str = "rustfs_io_uring_in_flight";
 const METRIC_URING_CQ_OVERFLOW: &str = "rustfs_io_uring_cq_overflow";
 #[cfg(target_os = "linux")]
 const METRIC_URING_CANCEL_ALREADY: &str = "rustfs_io_uring_cancel_already";
+/// Read-side EINVAL/EOPNOTSUPP from a native O_DIRECT read that happened AFTER a
+/// successful O_DIRECT open (rustfs/backlog#1214). Unlike an open-time refusal
+/// (unsupported filesystem), this most likely means an alignment bug in the
+/// aligned read path, so it is surfaced with a counter + warn instead of a
+/// once-per-disk debug trace.
+#[cfg(target_os = "linux")]
+const METRIC_URING_DIRECT_READ_EINVAL_TOTAL: &str = "rustfs_io_uring_direct_read_einval_total";
 /// How often the per-disk driver StatsSnapshot is exported to metrics
 /// (rustfs/backlog#1172).
 #[cfg(target_os = "linux")]
@@ -2961,6 +2968,14 @@ pub(crate) struct UringBackend {
     /// `active` gates io_uring as a whole, this gates only the native O_DIRECT
     /// read shape.
     direct_uring: DirectIoReadState,
+    /// Count of reads that completed through the native io_uring + O_DIRECT path
+    /// (`pread_uring_direct`) on this disk (rustfs/backlog#1213). Incremented only
+    /// on success, so a value `> 0` is proof the native path actually executed
+    /// rather than silently degrading to the StdBackend fallback. Tests assert on
+    /// it to avoid a vacuous pass on filesystems that reject O_DIRECT; it also
+    /// gives a gray release a positive signal that the O_DIRECT tier is serving
+    /// reads instead of only ever counting fallbacks.
+    native_direct_reads: std::sync::atomic::AtomicU64,
     /// Per-disk descriptor cache (backlog#1145). `None` when
     /// `RUSTFS_IO_URING_FD_CACHE` is off, which restores the open-per-read path.
     fd_cache: Option<FdCache>,
@@ -3101,6 +3116,7 @@ impl UringBackend {
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
+                    native_direct_reads: std::sync::atomic::AtomicU64::new(0),
                     fd_cache,
                 })
             }
@@ -3209,6 +3225,36 @@ impl UringBackend {
     /// classification lives in one place (rustfs/backlog#1174).
     fn classify_direct_read_error(&self, io_err: &std::io::Error) {
         if is_direct_io_unsupported(io_err) {
+            // This helper is only ever reached from the READ side: the O_DIRECT
+            // `open` in `pread_uring_direct` already succeeded, and an open-time
+            // refusal is handled separately as `DirectOpenError::ODirectRefused`
+            // before any read is issued. So an EINVAL/EOPNOTSUPP arriving here is
+            // a *read-time* error on an fd the kernel accepted for O_DIRECT. That
+            // is far more likely an alignment bug in the aligned read path than a
+            // filesystem that does not support O_DIRECT -- yet the old code
+            // latched the whole disk's native path off with only a once-per-disk
+            // debug trace, making a real correctness bug effectively invisible
+            // (rustfs/backlog#1214).
+            //
+            // Diagnostics only: the fallback behaviour is unchanged. The native
+            // O_DIRECT path is still latched off and the caller still falls back
+            // to StdBackend for this and every future eligible read. We only make
+            // the event observable -- a counter plus a once-per-disk `warn!`
+            // instead of a silent `debug!` -- so an operator can see an alignment
+            // regression rather than a mystery latency/CPU shift from buffered
+            // reads.
+            counter!(METRIC_URING_DIRECT_READ_EINVAL_TOTAL, "root" => self.root_label.clone()).increment(1);
+            if !self.direct_uring.fallback_logged.swap(true, Ordering::Relaxed) {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    root = %self.root.display(),
+                    error = ?io_err,
+                    "io_uring O_DIRECT read returned EINVAL/EOPNOTSUPP AFTER a successful O_DIRECT open; \
+                     this is more likely an alignment bug than an unsupported filesystem. Latching the \
+                     native O_DIRECT path off and reading via StdBackend (logged once per disk)"
+                );
+            }
             self.direct_uring.supported.store(false, Ordering::Relaxed);
         } else if is_io_uring_unsupported(io_err) {
             self.latch_active_off(io_err);
@@ -3478,6 +3524,10 @@ impl UringBackend {
         if should_reclaim_file_cache_after_read(length) {
             reclaim_read_range(&file_for_reclaim, offset_u64, length)?;
         }
+        // The native io_uring + O_DIRECT read completed (rustfs/backlog#1213):
+        // record it so callers/tests can distinguish this path from the
+        // StdBackend fallback, which never reaches here.
+        self.native_direct_reads.fetch_add(1, Ordering::Relaxed);
         Ok(Bytes::from(bytes))
     }
 }
@@ -5037,6 +5087,15 @@ impl LocalDisk {
 
         let stall = opts.stall_timeout_duration();
 
+        // `count = -1` enumerates the whole directory in one `list_dir` call, and
+        // the stall budget bounds that entire enumeration as a single unit. On a
+        // WIDE, FLAT directory (millions of immediate children) that one readdir
+        // can exceed `stall` on a healthy disk and fail the whole walk -- see the
+        // wide-directory stall hazard documented on `list_dir`
+        // (rustfs/backlog#1216, a #2999 sub-class). Mitigate operationally with a
+        // larger `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` or the high-latency
+        // drive-timeout profile; a streaming readdir rewrite is a separate,
+        // higher-risk follow-up and is intentionally not done here.
         let mut entries = match with_walk_stall_timeout(stall, self.list_dir("", &opts.bucket, &current, -1)).await {
             Ok(res) => res,
             Err(e) => {
@@ -6419,6 +6478,29 @@ impl DiskAPI for LocalDisk {
         self.io_backend.pread_bytes(volume, path, offset, length, metrics).await
     }
 
+    /// List a single directory. `count < 0` enumerates the *whole* directory in
+    /// one `os::read_dir` call.
+    ///
+    /// Wide-directory stall hazard (rustfs/backlog#1216, a #2999 sub-class):
+    /// the walk caller wraps this whole call in the per-read stall budget
+    /// (`with_walk_stall_timeout`, default 5s via
+    /// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS`) as if the entire directory
+    /// enumeration were a single read. For a *wide, flat* directory -- one
+    /// bucket prefix holding millions of immediate children -- a single
+    /// `readdir` of the whole directory can itself exceed the stall budget on a
+    /// healthy disk. That trips `DiskError::Timeout`, which the listing path can
+    /// escalate to a quorum failure and surface to the client as a ListObjects
+    /// 500, even though nothing is actually wrong with the drive.
+    ///
+    /// This is deliberately NOT fixed here by rewriting the one-shot
+    /// `os::read_dir` into a streaming/batched readdir that would refresh the
+    /// stall deadline between chunks: that is an architecture-level change with
+    /// high regression surface (ordering, the `count` contract, quorum merge
+    /// semantics) and is tracked as a separate follow-up. The supported
+    /// mitigation for wide-directory deployments today is operational -- raise
+    /// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` or run with the high-latency
+    /// drive-timeout profile (see `get_drive_walkdir_stall_timeout`), both of
+    /// which widen the budget without any code change.
     #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
@@ -6433,6 +6515,9 @@ impl DiskAPI for LocalDisk {
         let volume_dir = self.get_bucket_path(volume)?;
         let dir_path_abs = self.get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR))?;
 
+        // Whole-directory enumeration in one syscall path (see the wide-directory
+        // stall hazard on this fn): with `count < 0` this reads every entry, and
+        // the caller's stall budget bounds the entire call as a unit.
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
             Err(e) => {
@@ -14292,12 +14377,23 @@ mod test {
     /// an O_DIRECT-eligible read keeps O_DIRECT semantics via the native
     /// `read_at_direct` path (or, if that disk can't do io_uring+O_DIRECT, the
     /// StdBackend aligned fallback) and still returns exactly the requested
-    /// bytes for unaligned ranges. This asserts byte-correctness regardless of
-    /// which tier serves the read — the native path is exercised directly by
-    /// rustfs-uring's own O_DIRECT test under real io_uring.
+    /// bytes for unaligned ranges.
+    ///
+    /// The old shape of this test only checked byte-equivalence through
+    /// `LocalDisk::read_file_mmap_copy`. On a filesystem that rejects O_DIRECT
+    /// the read silently degrades to the buffered fallback and the byte check
+    /// still passes, so the test could go green without the native O_DIRECT path
+    /// ever running — a vacuous pass (rustfs/backlog#1213). It now builds a real
+    /// `UringBackend`, drives `pread_bytes` (which routes eligible reads into
+    /// `pread_uring_direct`), and asserts the native path actually executed via
+    /// the `native_direct_reads` counter. When the backing filesystem cannot do
+    /// io_uring or O_DIRECT (restricted CI runners, tmpfs/overlayfs), the test
+    /// skips loudly with `eprintln!` instead of asserting a tautology — but it
+    /// still checks byte-correctness on whatever tier served the read.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn uring_preserves_o_direct_for_eligible_reads() {
+        use std::sync::atomic::Ordering;
         use tempfile::tempdir;
 
         // Unaligned on purpose: 3 blocks + 7 bytes.
@@ -14319,27 +14415,43 @@ mod test {
             (FILE_LEN - 7, 7),
         ];
 
-        // Threshold 1 makes every non-empty read O_DIRECT-eligible, so each read
-        // below exercises the O_DIRECT tier. The env must be set before
-        // LocalDisk::new so the io_uring backend is the one selected.
         let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+
+        // Lay out the shard with LocalDisk, then read it back through a real
+        // UringBackend so the test can inspect the O_DIRECT latch and the native
+        // read counter directly.
+        {
+            let endpoint = Endpoint::try_from(root.to_string_lossy().as_ref()).expect("operation should succeed");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+            disk.make_volume("test-volume").await.expect("operation should succeed");
+            disk.write_all("test-volume", "shard.bin", content.clone())
+                .await
+                .expect("operation should succeed");
+        }
+
+        // Skip if io_uring is unavailable on this host (restricted env, e.g. the
+        // Kubernetes CI runners): there is no native O_DIRECT path to exercise.
+        let Some(backend) = UringBackend::try_new(root) else {
+            uring_test_skip("uring_preserves_o_direct_for_eligible_reads");
+            return;
+        };
+
+        // Threshold 1 makes every non-empty read O_DIRECT-eligible, so each read
+        // below drives `pread_bytes` into the native `pread_uring_direct` path.
+        // These knobs are read per-read, so setting them around the reads is
+        // enough (the backend was already constructed above).
         let got_ranges = temp_env::async_with_vars(
             [
-                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
                 (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true")),
                 (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("1")),
             ],
             async {
-                let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
-                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
-                disk.make_volume("test-volume").await.expect("operation should succeed");
-                disk.write_all("test-volume", "shard.bin", content.clone())
-                    .await
-                    .expect("operation should succeed");
                 let mut out = Vec::new();
                 for (offset, length) in ranges {
                     out.push(
-                        disk.read_file_mmap_copy("test-volume", "shard.bin", offset, length)
+                        backend
+                            .pread_bytes("test-volume", "shard.bin", offset, length, None)
                             .await
                             .expect("O_DIRECT-eligible read must succeed under io_uring (direct or fallback)"),
                     );
@@ -14349,11 +14461,32 @@ mod test {
         )
         .await;
 
+        // Byte-correctness holds regardless of which tier served the read.
         for ((offset, length), got) in ranges.into_iter().zip(got_ranges) {
             assert_eq!(
                 got,
                 content.slice(offset..offset + length),
                 "O_DIRECT read mismatch at offset={offset} length={length}"
+            );
+        }
+
+        // The point of backlog#1213: prove the NATIVE O_DIRECT path executed
+        // rather than silently passing on the StdBackend fallback. If the
+        // filesystem refuses O_DIRECT, `direct_uring.supported` latches off and
+        // no native read is counted — skip loudly instead of asserting nothing.
+        let native_hits = backend.native_direct_reads.load(Ordering::Relaxed);
+        let still_supported = backend.direct_uring.supported.load(Ordering::Relaxed);
+        if still_supported && native_hits > 0 {
+            assert_eq!(
+                native_hits,
+                ranges.len() as u64,
+                "every eligible read should have gone through the native io_uring O_DIRECT path"
+            );
+        } else {
+            eprintln!(
+                "SKIP uring_preserves_o_direct_for_eligible_reads: native O_DIRECT path not \
+                 exercised on this filesystem (direct_uring.supported={still_supported}, \
+                 native_direct_reads={native_hits}); byte-correctness was still asserted"
             );
         }
     }

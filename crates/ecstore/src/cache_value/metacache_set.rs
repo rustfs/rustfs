@@ -606,6 +606,37 @@ async fn list_path_raw_inner(
     let revjob_rx = rx.clone();
     let mut revjobs = JoinSet::new();
     revjobs.spawn(async move {
+        // Consumer-side peek timeout, and a caveat worth understanding
+        // (rustfs/backlog#1217).
+        //
+        // This budget is the SAME SOURCE and SAME VALUE as the producer-side
+        // walk stall budget: both default to `walkdir_stall_timeout` and fall
+        // back to `get_drive_walkdir_stall_timeout()` (5s). But the two measure
+        // different things:
+        //   * producer stall: bounds a single drive READ inside the walk (see
+        //     `with_walk_stall_deadline` in `disk/local.rs`);
+        //   * this consumer peek: bounds the interval between two ADJACENT
+        //     entries arriving from a drive's reader (`peek_with_timeout`).
+        //
+        // Because they are coupled to the same value, the consumer cannot wait
+        // meaningfully longer for the next entry than the producer is allowed to
+        // spend producing one. When a drive walks a region dense with
+        // non-listable internal items (many entries the producer filters out
+        // before emitting the next visible one), a HEALTHY drive can take longer
+        // than one budget to hand the consumer its next entry. The consumer then
+        // classifies it as `PeekOutcome::TimedOut` and DETACHES that reader (it
+        // is replaced by a drained duplex below), dropping a good drive from the
+        // merge. That caps the "large prefix always succeeds" guarantee: a wide
+        // enough non-listable stretch can knock healthy drives out of quorum.
+        //
+        // This is left documented, not decoupled. Giving the consumer peek an
+        // independent, strictly-larger budget would reduce these false detaches,
+        // but it also delays detaching a genuinely dead drive by the same amount
+        // and shifts listing tail-latency semantics; that trade-off wants soak
+        // data before it changes the default, so it is deferred to a follow-up.
+        // The constraint for any such change: the consumer peek must be >= the
+        // producer stall (never stricter), so it can never declare a drive
+        // stalled before the producer itself would have failed.
         let peek_timeout = opts
             .walkdir_stall_timeout
             .or({
