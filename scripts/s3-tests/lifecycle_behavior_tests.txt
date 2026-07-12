@@ -20,8 +20,21 @@
 #   RUSTFS_ILM_DEBUG_DAY_SECS=10   (1 "day" = 10s, matches s3-tests lc_debug_interval)
 #   RUSTFS_SCANNER_ENABLED=true
 #   RUSTFS_SCANNER_CYCLE=2         (scan every 2s, well under a debug-day)
+#   RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=1  (re-descend compacted dirs every cycle so
+#                                  ILM is evaluated ~every 2s, not once per 16 cycles;
+#                                  without this a Days=1 object due at 10s is not
+#                                  expired until the next ~32s boundary — #4772)
 #   RUSTFS_SCANNER_START_DELAY_SECS=0
 #   RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL=2s  (multipart abort lane)
+#
+# Polling windows (patches/0002): each assertion polls list_objects until the
+# expected count is reached or a N*lc_interval deadline elapses. The Days=5
+# (expire3) window uses 8*lc_interval rather than 5: its deadline only starts
+# after the Days=1 poll returns (~1 debug-day in), so a 5*lc_interval window left
+# only ~1 debug-day of slack past the Days=5 due time — a single slow scanner
+# cycle (observed ~13s under CI load) could push the expiry just past it and
+# stall the count at 4 (assert 4 == 2). 8*lc_interval restores comfortable slack;
+# the target count (2) is terminal so a wider window never over-expires.
 #
 # Point run.sh at this file with IMPLEMENTED_TESTS_FILE=<this path>.
 #
