@@ -860,6 +860,21 @@ impl LogCleanerBuilder {
     /// Invalid glob patterns are ignored rather than failing construction, and
     /// codec-related numeric values are clamped into safe ranges.
     pub fn build(self) -> LogCleaner {
+        // Defense-in-depth for the active-file guard: the scanner protects the
+        // live log by exact filename equality against `active_filename`. An
+        // empty value silently disables that protection, so a non-empty
+        // `file_pattern` could then make the live log a deletion candidate.
+        // Warn instead of failing so misuse of the public builder is visible.
+        if self.active_filename.trim().is_empty() && !self.file_pattern.trim().is_empty() {
+            warn!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                result = "empty_active_filename",
+                "active log filename is empty; the active-file exclusion is disabled and the live log may become a deletion candidate"
+            );
+        }
+
         // Surface, rather than silently drop, invalid exclude globs: a dropped
         // pattern turns "protect this file" into "delete this file", so an
         // operator's typo (or a literal comma splitting a char-class) must be
