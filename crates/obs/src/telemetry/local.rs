@@ -654,6 +654,7 @@ pub fn spawn_cleanup_task(
         component = LOG_COMPONENT_OBS,
         subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
         state = "configured",
+        match_mode = %match_mode,
         compression_algorithm = %compression_algorithm,
         parallel_compress,
         parallel_workers,
