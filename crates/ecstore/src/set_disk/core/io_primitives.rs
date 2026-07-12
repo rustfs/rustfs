@@ -70,6 +70,36 @@ use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
+/// Default reader-setup strategy for the GET read path (rustfs/backlog#1215,
+/// #1159, #923).
+///
+/// `true` means "data-blocks-first" is the default for every full-object GET:
+/// the bitrot reader setup schedules only the `data_shards` data blocks up
+/// front and *defers* the parity shards (see [`BitrotReaderSetupStrategy`] and
+/// `DeferredReaderStripeHandle`). Parity reads are engaged lazily, only when a
+/// data shard turns out to be missing/corrupt and reconstruction needs them.
+///
+/// Why this is the default (do NOT flip it back to `false` here):
+/// - It is the deliberate, already-rolled-out direction from backlog#1159/#923.
+///   deferred-parity is now the full-object GET default path, not an
+///   experiment; changing this constant to `false` would silently revert that
+///   rollout for every deployment that has not set the env var.
+///
+/// Known trade-off (the reason this constant carries a hazard note at all):
+/// - Deferring parity means the parity disks are engaged *late*. A data disk
+///   that is slow-but-not-dead (high tail latency, not an outright failure)
+///   therefore holds up the read longer than the all-shards strategy would,
+///   because the faster parity shards are not raced against it until a data
+///   shard is declared missing. This can raise GET p99 on clusters with a
+///   chronically slow data drive. `MetadataFanoutObservation` / the deferred
+///   stripe handles are where a "slow data disk engaged deferred parity" signal
+///   would be recorded.
+///
+/// Rollback switch: set `RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP=false` (see
+/// [`ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP`]) to restore the
+/// all-shards-up-front behaviour for a deployment without changing this
+/// default. This is an operational escape hatch for the tail-latency case
+/// above; it is intentionally an env override, not a code change.
 const DEFAULT_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: bool = true;
 pub(in crate::set_disk) const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP: &str =
     "RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP";
@@ -987,6 +1017,14 @@ impl BitrotReaderSetupStrategy {
     }
 }
 
+/// Resolve which bitrot reader-setup strategy a read uses.
+///
+/// For `ReadQuorum` (the full-object GET path) the default is data-blocks-first
+/// / deferred-parity (see [`DEFAULT_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP`]
+/// for the rollout rationale and the tail-latency trade-off). Operators can
+/// force the older all-shards-up-front behaviour per deployment by setting
+/// `RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP=false`; the constant default must
+/// stay `true` (rustfs/backlog#1215/#1159/#923).
 pub(in crate::set_disk) fn get_bitrot_reader_setup_strategy(
     mode: BitrotReaderSetupMode,
     prefer_data_blocks_first: bool,
