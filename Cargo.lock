@@ -5050,8 +5050,7 @@ dependencies = [
 [[package]]
 name = "hyper"
 version = "1.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498"
+source = "git+https://github.com/hyperium/hyper.git?rev=ccc1e850dc0cda3e71b0acd11f60ca3d48d09034#ccc1e850dc0cda3e71b0acd11f60ca3d48d09034"
 dependencies = [
  "atomic-waker",
  "bytes",
