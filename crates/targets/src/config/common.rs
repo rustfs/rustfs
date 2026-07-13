@@ -20,8 +20,8 @@ use rustfs_config::server_config::KVS;
 use rustfs_config::{
     DEFAULT_DELIMITER, ENABLE_KEY, EnableState, NATS_CREDENTIALS_FILE, NATS_JETSTREAM_ACK_TIMEOUT_SECS, NATS_JETSTREAM_ENABLE,
     NATS_JETSTREAM_STREAM_NAME, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
-    NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR,
-    PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME,
+    NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_TLS_CA,
+    PULSAR_TOPIC, PULSAR_USERNAME,
 };
 use rustfs_utils::egress::validate_outbound_url;
 use std::collections::HashSet;
@@ -190,15 +190,20 @@ pub(super) fn validate_pulsar_broker_config(broker: &str, config: &KVS, default_
     }
 
     let tls_ca = config.lookup(PULSAR_TLS_CA).unwrap_or_default();
-    let tls_allow_insecure = parse_target_bool(config.lookup(PULSAR_TLS_ALLOW_INSECURE).as_deref()).unwrap_or(false);
-    let tls_hostname_verification = parse_target_bool(config.lookup(PULSAR_TLS_HOSTNAME_VERIFICATION).as_deref()).unwrap_or(true);
 
     if !tls_ca.is_empty() && !Path::new(&tls_ca).is_absolute() {
         return Err(TargetError::Configuration("Pulsar tls_ca must be an absolute path".to_string()));
     }
-    if url.scheme() != "pulsar+ssl" && (!tls_ca.is_empty() || tls_allow_insecure || !tls_hostname_verification) {
+    // A CA bundle is TLS trust material a plaintext `pulsar://` broker silently
+    // ignores, so treat it as a genuine misconfiguration. The
+    // `tls_allow_insecure` / `tls_hostname_verification` toggles, however, are
+    // inert on a non-TLS broker (the Pulsar client only honours them for
+    // `pulsar+ssl`); rejecting non-default values would leave a persisted
+    // target permanently offline after a restart even though the flags do
+    // nothing — see issue #4796.
+    if url.scheme() != "pulsar+ssl" && !tls_ca.is_empty() {
         return Err(TargetError::Configuration(
-            "Pulsar TLS settings are only allowed with pulsar+ssl brokers".to_string(),
+            "Pulsar tls_ca is only allowed with pulsar+ssl brokers".to_string(),
         ));
     }
 
@@ -227,7 +232,8 @@ mod tests {
     use rustfs_config::server_config::KVS;
     use rustfs_config::{
         NATS_JETSTREAM_ACK_TIMEOUT_SECS, NATS_JETSTREAM_ENABLE, NATS_JETSTREAM_STREAM_NAME, NATS_PASSWORD, NATS_QUEUE_DIR,
-        NATS_SUBJECT, NATS_TOKEN, NATS_USERNAME, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TOPIC,
+        NATS_SUBJECT, NATS_TOKEN, NATS_USERNAME, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION,
+        PULSAR_TOPIC,
     };
     use std::str::FromStr;
 
@@ -393,14 +399,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_pulsar_broker_config_rejects_tls_flags_without_tls_scheme() {
+    fn validate_pulsar_broker_config_rejects_tls_ca_without_tls_scheme() {
+        let mut config = KVS::new();
+        config.insert(PULSAR_TOPIC.to_string(), "events".to_string());
+        config.insert(PULSAR_TLS_CA.to_string(), "/etc/ssl/certs/ca.pem".to_string());
+
+        let err = validate_pulsar_broker_config("pulsar://127.0.0.1:6650", &config, "")
+            .expect_err("a CA bundle should require pulsar+ssl");
+
+        assert!(err.to_string().contains("only allowed with pulsar+ssl"));
+    }
+
+    #[test]
+    fn validate_pulsar_broker_config_accepts_inert_tls_toggles_without_tls_scheme() {
+        // The TLS toggles are no-ops on a plaintext broker, so a persisted
+        // config carrying non-default values must still load — otherwise the
+        // target is stuck offline after a restart (issue #4796).
         let mut config = KVS::new();
         config.insert(PULSAR_TOPIC.to_string(), "events".to_string());
         config.insert(PULSAR_TLS_ALLOW_INSECURE.to_string(), "on".to_string());
+        config.insert(PULSAR_TLS_HOSTNAME_VERIFICATION.to_string(), "off".to_string());
 
-        let err = validate_pulsar_broker_config("pulsar://127.0.0.1:6650", &config, "")
-            .expect_err("TLS flags should require pulsar+ssl");
-
-        assert!(err.to_string().contains("only allowed with pulsar+ssl"));
+        validate_pulsar_broker_config("pulsar://127.0.0.1:6650", &config, "")
+            .expect("inert TLS toggles must not fail a plaintext broker");
     }
 }

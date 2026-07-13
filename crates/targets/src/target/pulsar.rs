@@ -113,9 +113,16 @@ impl PulsarArgs {
         let parsed = Url::parse(&self.broker)
             .map_err(|e| TargetError::Configuration(format!("Invalid Pulsar broker URL: {e} (value: '{}')", self.broker)))?;
         let tls_enabled = parsed.scheme() == "pulsar+ssl";
-        if !tls_enabled && (!self.tls_ca.is_empty() || self.tls_allow_insecure || !self.tls_hostname_verification) {
+        // A CA bundle is TLS trust material a plaintext `pulsar://` broker
+        // silently ignores, so treat it as a genuine misconfiguration. The
+        // `tls_allow_insecure` / `tls_hostname_verification` toggles, however,
+        // are inert on a non-TLS broker (they only take effect for
+        // `pulsar+ssl`); rejecting non-default values would leave a persisted
+        // target permanently offline after a restart even though the flags do
+        // nothing — see issue #4796.
+        if !tls_enabled && !self.tls_ca.is_empty() {
             return Err(TargetError::Configuration(
-                "Pulsar TLS settings are only allowed with pulsar+ssl brokers".to_string(),
+                "Pulsar tls_ca is only allowed with pulsar+ssl brokers".to_string(),
             ));
         }
 
@@ -539,6 +546,29 @@ mod tests {
     fn validate_pulsar_rejects_relative_queue_dir() {
         let args = PulsarArgs {
             queue_dir: "relative/path".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_pulsar_accepts_inert_tls_toggles_on_plaintext_broker() {
+        // `tls_allow_insecure` / `tls_hostname_verification` are no-ops on a
+        // `pulsar://` broker, so a target persisted with these non-default
+        // values must still validate — otherwise it stays offline after a
+        // restart (issue #4796).
+        let args = PulsarArgs {
+            tls_allow_insecure: true,
+            tls_hostname_verification: false,
+            ..base_args()
+        };
+        args.validate().expect("inert TLS toggles must not fail a plaintext broker");
+    }
+
+    #[test]
+    fn validate_pulsar_rejects_tls_ca_on_plaintext_broker() {
+        let args = PulsarArgs {
+            tls_ca: "/etc/ssl/certs/ca.pem".to_string(),
             ..base_args()
         };
         assert!(args.validate().is_err());

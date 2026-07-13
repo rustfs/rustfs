@@ -274,7 +274,7 @@ pretty_assertions = "1.4.1"
 rand = { version = "0.10.2", features = ["serde"] }
 ratelimit = "0.10.1"
 rayon = "1.12.0"
-reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "7.0.1", features = ["simd-accel"] }
+reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "7.0.2", features = ["simd-accel"] }
 #reed-solomon-erasure = { version = "6.0", features = ["simd-accel"], git = "https://github.com/houseme/reed-solomon-erasure",rev = "main" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.0" }
@@ -362,3 +362,21 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = true
+
+# Pin hyper to a revision that carries the HTTP/1 "flush buffered data before
+# shutdown" fix (hyperium/hyper#4018, commit 72046cc7). This lands as a
+# `[patch.crates-io]` entry — not on the `hyper` workspace dependency — so that
+# every consumer in the tree, including the transitive `hyper-util` server path
+# (`conn::auto` / `GracefulShutdown`) that actually drives our connections,
+# resolves to the fixed hyper rather than the buggy crates.io copy.
+#
+# hyper <= 1.10.1 can call `poll_shutdown()` on the socket while response bytes
+# are still buffered (a prior `poll_flush()` returned `Poll::Pending` and the
+# result was discarded). A backpressured / slow-reading peer then receives a
+# graceful FIN before the full Content-Length body is flushed, which standard S3
+# clients (minio-go / warp) report as `unexpected EOF` on large-object GET under
+# load. The fix is not in any crates.io release yet as of hyper 1.10.1; drop
+# this patch once a released version (> 1.10.1) contains commit 72046cc7.
+# See rustfs/backlog#1232.
+[patch.crates-io]
+hyper = { git = "https://github.com/hyperium/hyper.git", rev = "ccc1e850dc0cda3e71b0acd11f60ca3d48d09034" }
