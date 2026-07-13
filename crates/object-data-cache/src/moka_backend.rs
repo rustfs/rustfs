@@ -339,18 +339,27 @@ impl MokaBackend {
     }
 
     /// Drops every cached body and resets the identity index. The index scan
-    /// yields the tracked key count for the outcome label; `invalidate_all`
-    /// then clears moka in one call (also dropping any entry not tracked in the
-    /// index). Rare admin `clear()` path only.
+    /// yields the tracked key count for the outcome label, then the cache is
+    /// drained explicitly so even a body that is no longer tracked by the
+    /// index cannot survive the clear path. Rare admin `clear()` path only.
     pub async fn clear(&self) -> ObjectDataCacheInvalidationResult {
-        let removed = self.index.remove_matching(|_| true).await.len();
-        self.cache.invalidate_all();
-        // Moka processes invalidations lazily. A single run_pending_tasks() may
-        // not evict all entries if concurrent fill tasks recently committed
-        // writes. Drain in a loop until the entry count reaches zero, yielding
-        // between rounds so the runtime can schedule moka's maintenance.
+        let keys_to_remove = self.index.remove_matching(|_| true).await;
+        let removed = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.cache.remove(&key).await;
+        }
+
+        // Moka maintenance is still needed to retire queued removals, but clear
+        // must not rely on lazy invalidation alone: under heavy contention an
+        // entry can remain physically resident (and still counted) even though
+        // the invalidation fence already hides it from lookups.
         for _ in 0..256 {
             self.cache.run_pending_tasks().await;
+            let lingering_keys: Vec<_> = self.cache.iter().map(|(key, _)| key.as_ref().clone()).collect();
+            for key in lingering_keys {
+                self.cache.remove(&key).await;
+            }
+
             if self.cache.entry_count() == 0 {
                 break;
             }
