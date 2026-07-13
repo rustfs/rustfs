@@ -200,13 +200,14 @@ use crate::app::object_data_cache::{
     fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
     invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
-    invalidate_object_data_cache_objects_before_mutation, lookup_get_object_body_cache_hit,
+    invalidate_object_data_cache_objects_before_mutation, invalidate_object_data_cache_prefix_after_delete,
+    invalidate_object_data_cache_prefix_before_mutation, lookup_get_object_body_cache_hit,
 };
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
-const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+pub(crate) const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
 const MEDIUM_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
 const HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
 const VERY_HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 1024 * 1024;
@@ -337,6 +338,12 @@ struct GetObjectReadSetup {
     info: ObjectInfo,
     final_stream: DynReader,
     buffered_body: Option<Bytes>,
+    /// ODC-16: `buffered_body` is the body the ecstore cache hook served, so the
+    /// app layer serves it as the object-data-cache source without a re-lookup.
+    cache_hook_served: bool,
+    /// ODC-16: the cache hook probed this read (served or missed), so the app
+    /// layer must skip its own lookup.
+    cache_hook_probed: bool,
     rs: Option<HTTPRangeSpec>,
     content_type: Option<ContentType>,
     last_modified: Option<Timestamp>,
@@ -1497,7 +1504,7 @@ where
     Ok(ChunkedBytesReader::new(chunks))
 }
 
-fn object_seek_support_threshold() -> usize {
+pub(crate) fn object_seek_support_threshold() -> usize {
     static OBJECT_SEEK_SUPPORT_THRESHOLD: OnceLock<usize> = OnceLock::new();
     *OBJECT_SEEK_SUPPORT_THRESHOLD.get_or_init(|| {
         rustfs_utils::get_env_usize(
@@ -2730,6 +2737,11 @@ impl DefaultObjectUsecase {
             );
         }
 
+        // ODC-16: capture whether the ecstore cache hook already probed this
+        // read, so the app layer does not repeat the lookup it ran after fresh
+        // metadata resolution.
+        let cache_hook_served = reader.is_cache_hook_served();
+        let cache_hook_probed = reader.cache_hook_probed();
         let info = reader.object_info;
         let stream = reader.stream;
         let buffered_body = reader.buffered_body;
@@ -2843,6 +2855,8 @@ impl DefaultObjectUsecase {
             info,
             final_stream,
             buffered_body,
+            cache_hook_served,
+            cache_hook_probed,
             rs,
             content_type,
             last_modified,
@@ -3140,6 +3154,8 @@ impl DefaultObjectUsecase {
         has_range: bool,
         encryption_applied: bool,
         buffered_body: Option<Bytes>,
+        cache_hook_served: bool,
+        cache_hook_probed: bool,
         bucket: &str,
         key: &str,
         mut lifecycle: GetObjectBodyLifecycle,
@@ -3158,16 +3174,35 @@ impl DefaultObjectUsecase {
         };
         let cache_plan = build_get_object_body_cache_plan(cache_adapter, cache_request);
 
-        match lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await {
-            GetObjectBodyCacheLookup::Hit(bytes) => {
-                return Ok(Self::build_memory_bytes_blob(
-                    bytes,
-                    response_content_length,
-                    GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
-                    lifecycle,
-                ));
+        // ODC-16 (backlog#1121): when the ecstore hook already served this body
+        // from the cache, serve it straight through as the object-data-cache
+        // source. Re-running the lookup here would record a second hit, double
+        // the hit_bytes, and do redundant moka work for one hook-served GET.
+        if cache_hook_served && let Some(bytes) = buffered_body.clone() {
+            return Ok(Self::build_memory_bytes_blob(
+                bytes,
+                response_content_length,
+                GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
+                lifecycle,
+            ));
+        }
+
+        // ODC-16: only look up when the hook did not probe this read. When it did
+        // probe (a served body handled above, or a miss), its result is
+        // authoritative because it ran after fresh metadata resolution, so the
+        // app layer skips its own lookup and only uses the plan to fill.
+        if !cache_hook_probed {
+            match lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await {
+                GetObjectBodyCacheLookup::Hit(bytes) => {
+                    return Ok(Self::build_memory_bytes_blob(
+                        bytes,
+                        response_content_length,
+                        GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
+                        lifecycle,
+                    ));
+                }
+                GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
             }
-            GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
         }
 
         if let Some(buffered_body) = buffered_body {
@@ -4059,6 +4094,8 @@ impl DefaultObjectUsecase {
         event_info: Option<ObjectInfo>,
         final_stream: DynReader,
         buffered_body: Option<Bytes>,
+        cache_hook_served: bool,
+        cache_hook_probed: bool,
         rs: Option<HTTPRangeSpec>,
         content_type: Option<ContentType>,
         last_modified: Option<Timestamp>,
@@ -4111,6 +4148,8 @@ impl DefaultObjectUsecase {
             rs.is_some(),
             encryption_applied,
             buffered_body,
+            cache_hook_served,
+            cache_hook_probed,
             bucket,
             key,
             lifecycle,
@@ -4277,6 +4316,8 @@ impl DefaultObjectUsecase {
             info,
             final_stream,
             buffered_body,
+            cache_hook_served,
+            cache_hook_probed,
             rs,
             content_type,
             last_modified,
@@ -4309,6 +4350,8 @@ impl DefaultObjectUsecase {
                 event_info,
                 final_stream,
                 buffered_body,
+                cache_hook_served,
+                cache_hook_probed,
                 rs,
                 content_type,
                 last_modified,
@@ -5501,7 +5544,14 @@ impl DefaultObjectUsecase {
         };
 
         let cache_adapter = self.object_data_cache();
-        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        // A force (delete_prefix) delete removes every object under `key` as a
+        // prefix, so invalidating only the exact key would strand every cached
+        // body beneath it. Use the prefix primitive in that branch (ODC-27).
+        if force_delete {
+            let _ = invalidate_object_data_cache_prefix_before_mutation(&cache_adapter, &bucket, &key).await;
+        } else {
+            let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        }
 
         let obj_info = {
             match store.delete_object(&bucket, &key, opts.clone()).await {
@@ -5532,7 +5582,11 @@ impl DefaultObjectUsecase {
                 "failed to persist transitioned object cleanup journal"
             );
         }
-        let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
+        if force_delete {
+            let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;
+        } else {
+            let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
+        }
 
         // Fast in-memory update for immediate quota and admin usage consistency
         if delete_creates_delete_marker(&opts) {
@@ -7124,6 +7178,8 @@ mod tests {
             version_id: None,
             etag,
             size,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         for _ in 0..400 {
@@ -7534,6 +7590,8 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"hello")).await;
@@ -7552,6 +7610,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7592,6 +7652,8 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"oops")).await;
@@ -7608,6 +7670,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7665,6 +7729,8 @@ mod tests {
             false,
             false,
             Some(Bytes::from_static(b"hello")),
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7688,6 +7754,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7733,6 +7801,8 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
 
@@ -7748,6 +7818,8 @@ mod tests {
             false,
             false,
             Some(Bytes::from_static(b"oops")),
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7764,6 +7836,144 @@ mod tests {
         assert!(
             matches!(lookup, rustfs_object_data_cache::ObjectDataCacheLookup::Miss),
             "size-mismatched buffered body must not be filled into cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_hook_served_records_no_second_lookup() {
+        // ODC-16 (backlog#1121): a hook-served GET must record exactly one
+        // lookup — the ecstore hook's. The app layer, handed the cache body as
+        // buffered_body with cache_hook_served=true, must serve it directly
+        // without a second lookup (which would double the hits and hit_bytes).
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "test-bucket",
+            object: "hook-served",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let hit_body = Bytes::from_static(b"hello");
+        assert_eq!(
+            adapter.cache().fill_body(&plan, hit_body.clone()).await,
+            rustfs_object_data_cache::ObjectDataCacheFillResult::Inserted
+        );
+
+        // Simulate the ecstore hook: it performs exactly one lookup after fresh
+        // metadata resolution, hits, and hands the body forward as buffered_body.
+        assert!(matches!(
+            adapter.lookup_body(&plan).await,
+            rustfs_object_data_cache::ObjectDataCacheLookup::Hit(_)
+        ));
+        let lookups_after_hook = adapter.cache().stats().lookups;
+        assert_eq!(lookups_after_hook, 1, "the hook performs exactly one lookup");
+
+        let _body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(hit_body),
+            /* cache_hook_served */ true,
+            /* cache_hook_probed */ true,
+            "test-bucket",
+            "hook-served",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await
+        .expect("hook-served body handoff should succeed");
+
+        assert_eq!(
+            adapter.cache().stats().lookups,
+            lookups_after_hook,
+            "a hook-served GET must not record a second lookup in the app layer"
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "hook-served body handoff must not read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_hook_miss_skips_app_lookup() {
+        // ODC-16: when the hook probed and missed, its miss is authoritative
+        // (it ran after fresh metadata resolution), so the app layer must not
+        // run a second lookup — it only fills from the buffered body.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+
+        let lookups_before = adapter.cache().stats().lookups;
+        let _body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"hello")),
+            /* cache_hook_served */ false,
+            /* cache_hook_probed */ true,
+            "test-bucket",
+            "hook-missed",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await
+        .expect("hook-miss buffered-body handoff should succeed");
+
+        assert_eq!(
+            adapter.cache().stats().lookups,
+            lookups_before,
+            "a hook-probed miss must not trigger an app-layer lookup"
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "buffered-body handoff must not read from the fallback reader"
         );
     }
 
@@ -7805,6 +8015,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "materialized-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7828,6 +8040,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "materialized-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7885,6 +8099,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "mismatch-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7932,6 +8148,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "too-large-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8679,6 +8897,8 @@ mod tests {
                 Some(info),
                 wrap_reader(tokio::io::empty()),
                 None,
+                false,
+                false,
                 None,
                 None,
                 None,

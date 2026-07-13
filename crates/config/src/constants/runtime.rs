@@ -38,10 +38,11 @@ pub const ENV_RUNTIME_DIAL9_ROTATION_COUNT: &str = "RUSTFS_RUNTIME_DIAL9_ROTATIO
 pub const ENV_RUNTIME_DIAL9_S3_BUCKET: &str = "RUSTFS_RUNTIME_DIAL9_S3_BUCKET";
 /// Accepted but not honoured; see [`ENV_RUNTIME_DIAL9_S3_BUCKET`].
 pub const ENV_RUNTIME_DIAL9_S3_PREFIX: &str = "RUSTFS_RUNTIME_DIAL9_S3_PREFIX";
-/// Capture async backtraces for tasks that stall on a worker.
-pub const ENV_RUNTIME_DIAL9_TASK_DUMP_ENABLED: &str = "RUSTFS_RUNTIME_DIAL9_TASK_DUMP_ENABLED";
-/// Mean idle duration for task-dump Poisson sampling, in milliseconds.
-pub const ENV_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS: &str = "RUSTFS_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS";
+// Note: there are deliberately no task-dump knobs. dial9 only captures task
+// dumps for futures spawned through `dial9_tokio_telemetry::spawn`, and RustFS
+// spawns with `tokio::spawn` throughout, so the switch could never do anything.
+// Measured: 0 dumps via tokio::spawn vs 14709 via dial9::spawn on an identical
+// workload. See rustfs/backlog#1157 (D9-16).
 
 // Default values for Tokio runtime
 pub const DEFAULT_WORKER_THREADS: usize = 16;
@@ -62,9 +63,6 @@ pub const DEFAULT_RUNTIME_DIAL9_OUTPUT_DIR: &str = "/var/log/rustfs/telemetry";
 pub const DEFAULT_RUNTIME_DIAL9_FILE_PREFIX: &str = "rustfs-tokio";
 pub const DEFAULT_RUNTIME_DIAL9_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 pub const DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT: usize = 10;
-pub const DEFAULT_RUNTIME_DIAL9_TASK_DUMP_ENABLED: bool = false;
-/// Matches dial9's own default mean idle duration for task-dump sampling.
-pub const DEFAULT_RUNTIME_DIAL9_TASK_DUMP_IDLE_THRESHOLD_MS: u64 = 10;
 // Note: S3 bucket/prefix have no default; absence means upload is disabled (modeled as Option<String>)
 
 /// Maximum transition workers used as a local fallback when runtime env is unset.
@@ -120,6 +118,25 @@ pub const ENV_OBJECT_SEEK_SUPPORT_THRESHOLD: &str = "RUSTFS_OBJECT_SEEK_SUPPORT_
 pub const DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD: usize = 10 * 1024 * 1024;
 
 // Object data cache configuration
+
+/// Enables the in-memory object body cache, which serves whole-object GET
+/// responses without an erasure read.
+///
+/// # Timing side channel
+///
+/// A cache hit skips the erasure read, bitrot verification and decode, so it is
+/// reliably faster than a miss. Any principal authorized to read an object can
+/// therefore infer, by timing a single GET, whether *someone* read that object
+/// within the entry's lifetime (see `RUSTFS_OBJECT_DATA_CACHE_TTL_SECS` and
+/// `..._TIME_TO_IDLE_SECS`).
+///
+/// This never crosses an authorization boundary — the probe requires read
+/// access to the exact bucket and object, checked before the cache is consulted
+/// — but it does disclose co-tenants' recent access patterns on objects the
+/// observer may already read. Leave the cache disabled where access-pattern
+/// confidentiality matters, such as a bucket shared read-only between competing
+/// tenants. Timing noise is not a viable mitigation: it would cost exactly the
+/// latency the cache exists to save.
 pub const ENV_OBJECT_DATA_CACHE_ENABLE: &str = "RUSTFS_OBJECT_DATA_CACHE_ENABLE";
 pub const ENV_OBJECT_DATA_CACHE_MODE: &str = "RUSTFS_OBJECT_DATA_CACHE_MODE";
 pub const ENV_OBJECT_DATA_CACHE_MAX_BYTES: &str = "RUSTFS_OBJECT_DATA_CACHE_MAX_BYTES";

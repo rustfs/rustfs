@@ -1759,6 +1759,7 @@ mod tests {
                 parity_blocks: 0,
                 data_blocks: 0,
                 version_id: None,
+                data_dir: None,
                 delete_marker: false,
                 transitioned_object: Default::default(),
                 restore_ongoing: false,
@@ -1824,6 +1825,7 @@ mod tests {
                 }),
                 object_info: self.object_info(bucket, object),
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 
@@ -3042,6 +3044,7 @@ mod tests {
                 stream: Box::new(Cursor::new(data)),
                 object_info,
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 

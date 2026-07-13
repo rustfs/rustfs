@@ -572,6 +572,7 @@ mod tests {
                 stream: Box::new(Cursor::new(self.read_payload.clone())),
                 object_info: self.object_info(bucket, object, self.read_payload.len()),
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 

@@ -60,7 +60,7 @@ use opentelemetry_sdk::{
 use percent_encoding::percent_decode_str;
 use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
 use std::collections::HashMap;
@@ -200,6 +200,7 @@ pub(super) fn init_observability_http(
 
             let file_appender =
                 RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+            crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
@@ -220,8 +221,10 @@ pub(super) fn init_observability_http(
                     log_directory,
                     rotation = %rotation_str,
                     keep_files,
-                    stdout_mirror_enabled = config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED)
-                        || !is_production,
+                    stdout_mirror_enabled = crate::telemetry::local::resolve_file_stdout_mirror(
+                        config.log_stdout_enabled,
+                        is_production,
+                    ),
                     logger_level,
                     is_production,
                     "Initialized local logging fallback for observability"
@@ -243,7 +246,7 @@ pub(super) fn init_observability_http(
 
     // Optional stdout mirror (matching init_file_logging_internal logic)
     // This is separate from OTLP stdout logic. If file logging is enabled, we honor its stdout rules.
-    if force_stdout_logging || config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
+    if force_stdout_logging || crate::telemetry::local::resolve_file_stdout_mirror(config.log_stdout_enabled, is_production) {
         let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
         stdout_guard = Some(stdout_g);
         stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events));

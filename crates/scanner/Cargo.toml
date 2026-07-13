@@ -59,6 +59,9 @@ serial_test = { workspace = true }
 temp-env = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 tokio = { workspace = true, features = ["test-util"] }
+# Enables the shared MockWarmBackend / xl.meta assertion helpers exposed via
+# the ecstore `api::tier::test_util` facade module (rustfs/backlog#1148 ilm-6).
+rustfs-ecstore = { workspace = true, features = ["test-util"] }
 
 [lib]
 doctest = false

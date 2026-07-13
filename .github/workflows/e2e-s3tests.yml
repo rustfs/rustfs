@@ -85,8 +85,8 @@ on:
 
 env:
   # main user
-  S3_ACCESS_KEY: rustfsadmin
-  S3_SECRET_KEY: rustfsadmin
+  S3_ACCESS_KEY: rustfsadmin-ci
+  S3_SECRET_KEY: rustfssecret-ci
   # alt user (must be different from main for many s3-tests)
   S3_ALT_ACCESS_KEY: rustfsalt
   S3_ALT_SECRET_KEY: rustfsalt
@@ -108,6 +108,11 @@ env:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs['test-mode'] || 'single' }}
   cancel-in-progress: true
+
+# Only alert-on-failure needs more than read access; it declares its own
+# job-level `issues: write`.
+permissions:
+  contents: read
 
 defaults:
   run:
@@ -169,6 +174,10 @@ jobs:
         run: |
           docker network inspect rustfs-net >/dev/null 2>&1 || docker network create rustfs-net
           docker rm -f rustfs-single >/dev/null 2>&1 || true
+          # The four disks share one physical device on the runner (a single
+          # loopback filesystem), so the local physical-disk-independence guard
+          # would refuse to start. Bypass it — this is the CI use case the guard
+          # explicitly sanctions via RUSTFS_UNSAFE_BYPASS_DISK_CHECK.
           docker run -d --name rustfs-single \
             --network rustfs-net \
             -p "${S3_PORT}:9000" \
@@ -176,6 +185,7 @@ jobs:
             -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
             -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
             -e RUSTFS_VOLUMES="/data/rustfs{0...3}" \
+            -e RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true \
             -v /tmp/rustfs-single:/data \
             rustfs-ci
 
@@ -195,6 +205,10 @@ jobs:
               RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
               RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
               RUSTFS_VOLUMES: "http://rustfs{1...4}:9000/data/rustfs{0...3}"
+              # Each node's four disks share one physical device inside its
+              # container, so bypass the local physical-disk-independence guard
+              # (the CI use case it explicitly sanctions).
+              RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
 
           services:
             rustfs1:
@@ -325,3 +339,22 @@ jobs:
         with:
           name: s3tests-${{ env.TEST_MODE }}
           path: artifacts/**
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [s3tests]
+    # `always()` is required: without it this job is skipped when a needed
+    # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
+    # dispatch failures are already watched by a human.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

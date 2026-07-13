@@ -37,6 +37,23 @@ impl SetDisks {
         Box::pin(self.heal_object_with_regen(bucket, object, version_id, opts, true)).await
     }
 
+    /// Best-effort orphan-data-dir reclaim for an object that is healthy on this
+    /// set. Wraps [`Self::reclaim_orphan_data_dirs`] with the shared logging so
+    /// both `heal_object` exits — the already-healthy early return and the
+    /// post-heal tail — reclaim identically. Never fails the heal: delete errors
+    /// are logged and swallowed. Callers must gate this on `!opts.dry_run`.
+    async fn reclaim_orphan_data_dirs_best_effort(&self, bucket: &str, object: &str) {
+        match self.reclaim_orphan_data_dirs(bucket, object).await {
+            Ok(removed) if removed > 0 => {
+                info!(bucket, object, removed, "heal_object: reclaimed orphaned data directories");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(bucket, object, error = %e, "heal_object: orphan data-dir reclaim failed");
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn heal_object_with_regen(
         &self,
@@ -209,6 +226,16 @@ impl SetDisks {
                         }
 
                         if disks_to_heal_count == 0 {
+                            // The object is already healthy: no disk needs healing.
+                            // This is the common case for the very objects PR #4356
+                            // targets — a valid `xl.meta` plus a leaked pre-#3510
+                            // data dir needs no shard healing, so it would otherwise
+                            // return here and never reach the post-heal reclaim tail
+                            // below. Sweep the strays on this path too (issues #3231,
+                            // #3191). Skipped on dry-run, like every mutating step.
+                            if !opts.dry_run {
+                                self.reclaim_orphan_data_dirs_best_effort(bucket, object).await;
+                            }
                             return Ok((result, None));
                         }
 
@@ -222,7 +249,7 @@ impl SetDisks {
                         }
 
                         if !latest_meta.deleted && !latest_meta.is_remote() {
-                            for (_, part_errs) in data_errs_by_part.iter() {
+                            for part_errs in data_errs_by_part.values() {
                                 if count_part_not_success(part_errs) > latest_meta.erasure.parity_blocks {
                                     cannot_heal = true;
                                     break;
@@ -661,15 +688,7 @@ impl SetDisks {
                         // by pre-#3510 unversioned overwrites, which the dangling paths
                         // above never touch (issues #3231, #3191). Best effort — a
                         // failure must not fail the heal.
-                        match self.reclaim_orphan_data_dirs(bucket, object).await {
-                            Ok(removed) if removed > 0 => {
-                                info!(bucket, object, removed, "heal_object: reclaimed orphaned data directories");
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!(bucket, object, error = %e, "heal_object: orphan data-dir reclaim failed");
-                            }
-                        }
+                        self.reclaim_orphan_data_dirs_best_effort(bucket, object).await;
 
                         Ok((result, None))
                     }

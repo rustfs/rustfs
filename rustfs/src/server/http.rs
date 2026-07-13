@@ -90,6 +90,13 @@ const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_re
 const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+
+/// Cached handle for the per-response-body-chunk byte counter. A streamed GET
+/// emits many chunks, so resolving the `counter!` registry entry once — the
+/// global recorder is installed at startup before any response streams — avoids
+/// a registry lookup on every chunk.
+static RESP_BODY_BYTES_COUNTER: std::sync::LazyLock<metrics::Counter> =
+    std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL));
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
@@ -1320,7 +1327,7 @@ fn process_connection(
                         })
                         .on_response(trace_on_response)
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
+                            RESP_BODY_BYTES_COUNTER.increment(chunk.len() as u64);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1480,7 +1487,7 @@ fn process_connection(
                         })
                         .on_response(trace_on_response)
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
+                            RESP_BODY_BYTES_COUNTER.increment(chunk.len() as u64);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();

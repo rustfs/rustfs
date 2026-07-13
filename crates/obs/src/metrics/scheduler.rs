@@ -1496,11 +1496,6 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     });
 }
 
-/// Backward-compatible alias kept during migration.
-pub fn init_metrics_collectors(token: CancellationToken) {
-    init_metrics_runtime(token);
-}
-
 fn advance_deadline(deadline: &mut Instant, interval: Duration, now: Instant) {
     if *deadline > now {
         return;

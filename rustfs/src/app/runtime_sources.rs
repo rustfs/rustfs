@@ -63,3 +63,9 @@ pub(crate) fn current_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
 pub(crate) fn current_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
     root_runtime_sources::current_tier_config_handle().unwrap_or_else(TierConfigMgr::new)
 }
+
+/// Test-only: publish a default-interface `AppContext` around the given store
+/// so usecases constructed via `from_global()` resolve this store
+/// (rustfs/backlog#1148 ilm-1).
+#[cfg(test)]
+pub(crate) use crate::runtime_sources::install_test_app_context;

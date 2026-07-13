@@ -41,6 +41,7 @@ DISKS=4
 CONCURRENCY=8
 DURATION="30s"
 ROUNDS=3
+COOLDOWN_SECS=""         # empty -> load driver default; CI passes a short value
 LOCAL_ADDRESS="127.0.0.1:9000"
 ACCESS_KEY="rustfsadmin"
 SECRET_KEY="rustfsadmin"
@@ -57,9 +58,32 @@ SKIP_BUILD="false"
 EXTERNAL_ENDPOINT=""     # set -> external mode (warp targets this cluster)
 DEPLOY_HOOK=""           # external mode: command to deploy a phase's binary
 HEALTH_PATH="/health"
+# Readiness poll budget. The server binds its public listener only after startup
+# converges (erasure-format load + IAM); its own budget is
+# RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS (default 120s). Polling must outlast
+# that, otherwise a slow cold start on a shared CI runner looks like a failure —
+# this is exactly what killed the first two nightly runs (60s poll < 120s
+# startup budget). Default 180s; override with --health-timeout.
+HEALTH_TIMEOUT_SECS=180
 
-# Workloads: name|warp-mode|size. put-4mib obj/s, get-4mib MiB/s, mixed-256k p99.
-WORKLOADS=("put-4mib|put|4MiB" "get-4mib|get|4MiB" "mixed-256k|mixed|256KiB")
+# Workloads: name|warp-mode|size.
+#   put-4kib / get-4kib — the #4221 fsync regression size (~-10% @4KiB), invisible
+#     until now; put-4mib / get-4mib — bulk obj/s & MiB/s; get-10mib — the historical
+#     large-GET EOF size; mixed-256k — p99 latency.
+# Tradeoff: 6 workloads × 2 phases × 2 drive-sync = 24 cells. Until perf-3 caches
+# the baseline binary (the ~65min double build dominates the 90min job), CI keeps
+# the matrix under budget with short warp params (--duration/--rounds/--cooldown
+# passed by the workflow), NOT by dropping cells. A 1KiB cell (optional per
+# perf-1) is deferred until that caching frees wall-clock; re-enable by adding
+# e.g. "put-1kib|put|1KiB" here.
+WORKLOADS=(
+  "put-4kib|put|4KiB"
+  "put-4mib|put|4MiB"
+  "get-4kib|get|4KiB"
+  "get-4mib|get|4MiB"
+  "get-10mib|get|10MiB"
+  "mixed-256k|mixed|256KiB"
+)
 # Durability matrix: label|RUSTFS_DRIVE_SYNC_ENABLE value.
 DRIVE_SYNC_MATRIX=("sync-on|true" "sync-off|false")
 
@@ -87,6 +111,9 @@ Common:
   --concurrency <n>       warp --concurrent (default 8).
   --duration <dur>        warp --duration (default 30s).
   --rounds <n>            Rounds per cell for the median (default 3).
+  --cooldown <n>          Seconds between rounds/sizes, forwarded to the load
+                          driver (default: driver default, 20s).
+  --health-timeout <n>    Seconds to poll readiness after bring-up (default 180).
   --fail-pct <n>          Gate fail budget (default 10).
   --warn-pct <n>          Gate warn budget (default 5).
   --allow-regression      Pass the gate despite a FAIL (deliberate tradeoff).
@@ -109,6 +136,8 @@ while [[ $# -gt 0 ]]; do
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     --duration) DURATION="$2"; shift 2 ;;
     --rounds) ROUNDS="$2"; shift 2 ;;
+    --cooldown) COOLDOWN_SECS="$2"; shift 2 ;;
+    --health-timeout) HEALTH_TIMEOUT_SECS="$2"; shift 2 ;;
     --fail-pct) FAIL_PCT="$2"; shift 2 ;;
     --warn-pct) WARN_PCT="$2"; shift 2 ;;
     --allow-regression) ALLOW_REGRESSION="true"; shift ;;
@@ -157,10 +186,15 @@ build_ref_binary() {
   local ref="$1" dest="$OUT_DIR/rustfs-baseline"
   if [[ -n "$BASELINE_BIN" ]]; then echo "$BASELINE_BIN"; return; fi
   local wt="$OUT_DIR/baseline-worktree"
-  run git worktree add --detach "$wt" "$ref"
-  run bash -c "cd '$wt' && cargo build --release --bin rustfs"
-  run cp "$wt/target/release/rustfs" "$dest" 2>/dev/null || true
-  run git worktree remove --force "$wt" 2>/dev/null || true
+  # This function returns the binary path on stdout, so every command's
+  # stdout must be routed to stderr: `git worktree add` prints "HEAD is now
+  # at …" on stdout, which polluted the captured path and made the rig exec
+  # a two-line string as the binary (2026-07-10 dispatch run failure).
+  run git worktree add --detach "$wt" "$ref" >&2
+  run bash -c "cd '$wt' && cargo build --release --bin rustfs" >&2
+  run cp "$wt/target/release/rustfs" "$dest" 2>/dev/null >&2 || true
+  run git worktree remove --force "$wt" 2>/dev/null >&2 || true
+  [[ "$DRY_RUN" == "true" || -x "$dest" ]] || { echo "error: baseline binary missing at $dest (baseline build failed?)" >&2; return 1; }
   echo "$dest"
 }
 
@@ -184,7 +218,13 @@ else
 fi
 
 # --- Deployment: bring a phase up, tear it down -----------------------------
+# Server logs live under OUT_DIR (not $DATA_ROOT) so they ride along in the CI
+# artifact and the run is diagnosable after the fact — the missing piece that
+# left the first nightly failures unexplained.
+SERVER_LOG_DIR="$OUT_DIR/server-logs"
+run mkdir -p "$SERVER_LOG_DIR"
 SERVER_PID=""
+SERVER_LOG=""
 tear_down() {
   # Local mode owns the server process; external mode leaves lifecycle to the
   # deploy hook / cluster orchestrator.
@@ -195,14 +235,32 @@ tear_down() {
 }
 trap tear_down EXIT INT TERM
 
+# Dump the tail of the current server log to stderr (job log) so a startup
+# failure is visible without downloading the artifact.
+dump_server_log() {
+  [[ -n "$SERVER_LOG" && -f "$SERVER_LOG" ]] || return 0
+  echo "----- last 50 lines of $SERVER_LOG -----" >&2
+  tail -n 50 "$SERVER_LOG" >&2 || true
+  echo "----------------------------------------" >&2
+}
+
 wait_health() {
   [[ "$DRY_RUN" == "true" ]] && return 0
   local i
-  for ((i = 0; i < 60; i++)); do
+  for ((i = 0; i < HEALTH_TIMEOUT_SECS; i++)); do
+    # Local mode owns the process: if it already exited (port bind failure,
+    # panic, disk-check abort), stop polling and surface the log immediately
+    # instead of waiting out the full budget.
+    if [[ "$EXTERNAL" != "true" && -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "error: rustfs server (pid $SERVER_PID) exited before becoming healthy after ${i}s" >&2
+      dump_server_log
+      return 1
+    fi
     if curl -fsS "http://${ADDRESS}${HEALTH_PATH}" >/dev/null 2>&1; then return 0; fi
     sleep 1
   done
-  echo "error: endpoint http://${ADDRESS}${HEALTH_PATH} did not become healthy" >&2
+  echo "error: endpoint http://${ADDRESS}${HEALTH_PATH} did not become healthy within ${HEALTH_TIMEOUT_SECS}s" >&2
+  dump_server_log
   return 1
 }
 
@@ -224,12 +282,26 @@ bring_up() {
   local disks=() d
   for ((d = 1; d <= DISKS; d++)); do disks+=("$node_dir/d$d"); done
   run mkdir -p "${disks[@]}"
+  SERVER_LOG="$SERVER_LOG_DIR/$phase-sync-$drive_sync.log"
   if [[ "$DRY_RUN" == "true" ]]; then
     { printf 'DRY-RUN: RUSTFS_DRIVE_SYNC_ENABLE=%s %q server' "$drive_sync" "$bin"
       printf ' %q' "${disks[@]}"; printf '\n'; } >&2
     SERVER_PID="dry-run"
     return 0
   fi
+  # Record the startup environment next to the log so a failed run is
+  # self-explanatory in the artifact.
+  cat >"$SERVER_LOG_DIR/$phase-sync-$drive_sync.env" <<EOF
+phase=$phase
+drive_sync=$drive_sync
+binary=$bin
+address=$ADDRESS
+disks=${disks[*]}
+health_url=http://${ADDRESS}${HEALTH_PATH}
+health_timeout_secs=$HEALTH_TIMEOUT_SECS
+uname=$(uname -a 2>/dev/null || echo unknown)
+warp_version=$("$WARP_BIN" --version 2>/dev/null | head -n1 || echo unknown)
+EOF
   RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true \
   RUSTFS_ADDRESS="$ADDRESS" \
   RUSTFS_ACCESS_KEY="$ACCESS_KEY" \
@@ -237,7 +309,7 @@ bring_up() {
   RUSTFS_REGION="$REGION" \
   RUSTFS_CONSOLE_ENABLE=false \
   RUSTFS_DRIVE_SYNC_ENABLE="$drive_sync" \
-    "$bin" server "${disks[@]}" >"$node_dir/rustfs.log" 2>&1 &
+    "$bin" server "${disks[@]}" >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   wait_health
 }
@@ -254,6 +326,7 @@ measure() {
     --region "$REGION" --sizes "$size" --concurrency "$CONCURRENCY"
     --duration "$DURATION" --rounds "$ROUNDS" --out-dir "$cell"
   )
+  [[ -n "$COOLDOWN_SECS" ]] && args+=(--cooldown-secs "$COOLDOWN_SECS")
   [[ -n "$baseline_csv" ]] && args+=(--baseline-csv "$baseline_csv")
   run "$ENHANCED_BENCH" "${args[@]}"
   echo "$cell"

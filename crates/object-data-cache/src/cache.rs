@@ -45,6 +45,16 @@ pub struct ObjectDataCache {
     backend: ObjectDataCacheBackendKind,
     config: Arc<ObjectDataCacheConfig>,
     stats: Arc<ObjectDataCacheStats>,
+    /// Effective fill ceiling in bytes: a body larger than this is planned
+    /// `SkipTooLarge` even when it fits `max_entry_bytes`. The app layer sets it
+    /// to `min(max_entry_bytes, seek-support threshold, 64 MiB buffer cap)` so a
+    /// `max_entry_bytes` above the in-memory GET fill limits is not reported as
+    /// eligible while fill could never materialize it (backlog#1129 / ODC-24).
+    /// `0` means "no additional clamp" — eligibility rests on `max_entry_bytes`
+    /// alone (the default, used by engine-level tests). The concurrency-driven
+    /// shrink of the fill threshold is dynamic and cannot be captured at plan
+    /// time; this static ceiling is the conservative floor.
+    fill_ceiling_bytes: u64,
     /// Monotonic origin for the cache-state publish debounce.
     created_at: Instant,
     /// Millis since `created_at` of the last cache-state gauge publish, or `0`
@@ -62,6 +72,7 @@ impl ObjectDataCache {
             backend: ObjectDataCacheBackendKind::Noop(NoopBackend),
             config,
             stats,
+            fill_ceiling_bytes: 0,
             created_at: Instant::now(),
             last_entry_publish_ms: AtomicU64::new(0),
         }
@@ -82,9 +93,30 @@ impl ObjectDataCache {
             backend,
             config: Arc::new(config),
             stats,
+            fill_ceiling_bytes: 0,
             created_at: Instant::now(),
             last_entry_publish_ms: AtomicU64::new(0),
         })
+    }
+
+    /// Sets the effective fill ceiling (backlog#1129 / ODC-24). The app layer
+    /// applies this at startup so a body above the in-memory GET fill limits is
+    /// planned `SkipTooLarge` instead of being reported eligible. `0` disables
+    /// the extra clamp.
+    #[must_use]
+    pub fn with_fill_ceiling_bytes(mut self, fill_ceiling_bytes: u64) -> Self {
+        self.fill_ceiling_bytes = fill_ceiling_bytes;
+        self
+    }
+
+    /// Effective size above which a body is planned `SkipTooLarge`:
+    /// `max_entry_bytes` clamped by the fill ceiling when one is set.
+    fn effective_size_ceiling(&self) -> u64 {
+        if self.fill_ceiling_bytes == 0 {
+            self.config.max_entry_bytes
+        } else {
+            self.config.max_entry_bytes.min(self.fill_ceiling_bytes)
+        }
     }
 
     /// Produces a lightweight GET plan from request metadata.
@@ -100,7 +132,11 @@ impl ObjectDataCache {
             return ObjectDataCacheGetPlan::Disabled;
         }
 
-        if request.size > self.config.max_entry_bytes {
+        // ODC-24: clamp eligibility to the effective fill ceiling, not just
+        // `max_entry_bytes`. A body in the gap between `max_entry_bytes` and the
+        // in-memory GET fill limits could never fill, so admitting it here would
+        // report it "eligible" while it kept a permanent 0% hit rate.
+        if request.size > self.effective_size_ceiling() {
             record_plan_decision(self.backend.as_metric_label(), self.config.mode, "skip", "too_large", request.size);
             return ObjectDataCacheGetPlan::SkipTooLarge;
         }
@@ -108,12 +144,14 @@ impl ObjectDataCache {
         record_plan_decision(self.backend.as_metric_label(), self.config.mode, "cacheable", "eligible", request.size);
 
         ObjectDataCacheGetPlan::Cacheable {
-            key: ObjectDataCacheKey::new(
+            key: ObjectDataCacheKey::with_write_anchors(
                 request.bucket,
                 request.object,
                 request.version_id.as_deref(),
                 request.etag,
                 request.size,
+                request.data_dir_u128,
+                request.mod_time_unix_nanos,
                 request.body_variant,
             ),
         }
@@ -221,31 +259,91 @@ impl ObjectDataCache {
     /// Invalidates all cache entries associated with the object identity.
     pub async fn invalidate_object(
         &self,
-        _identity: ObjectDataCacheIdentity,
-        _reason: ObjectDataCacheInvalidationReason,
+        identity: ObjectDataCacheIdentity,
+        reason: ObjectDataCacheInvalidationReason,
     ) -> ObjectDataCacheInvalidationResult {
         let result = match &self.backend {
             ObjectDataCacheBackendKind::Noop(backend) => backend.invalidate_object().await,
-            ObjectDataCacheBackendKind::Moka(backend) => backend.invalidate_object(&_identity).await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.invalidate_object(&identity).await,
         };
+        self.finish_invalidation(result, reason)
+    }
 
+    /// Invalidates every cached body under `bucket`/`prefix`.
+    ///
+    /// Drops the cached bodies of every identity in `bucket` whose object key
+    /// starts with `prefix`. Backed by a full identity-index scan, so it must
+    /// stay on the rare force-delete and admin paths and never touch the GET or
+    /// fill hot path (ODC-27, backlog#1132).
+    pub async fn invalidate_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
+        let result = match &self.backend {
+            ObjectDataCacheBackendKind::Noop(backend) => backend.invalidate_prefix().await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.invalidate_prefix(bucket, prefix).await,
+        };
+        self.finish_invalidation(result, reason)
+    }
+
+    /// Invalidates every cached body in `bucket`.
+    ///
+    /// Backed by a full identity-index scan; keep it on the rare bucket-delete
+    /// and admin paths only (ODC-28, backlog#1133).
+    pub async fn invalidate_bucket(
+        &self,
+        bucket: &str,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
+        let result = match &self.backend {
+            ObjectDataCacheBackendKind::Noop(backend) => backend.invalidate_bucket().await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.invalidate_bucket(bucket).await,
+        };
+        self.finish_invalidation(result, reason)
+    }
+
+    /// Drops every cached body and resets the identity index.
+    ///
+    /// The only production remediation for a poisoned or stale entry short of a
+    /// node restart (ODC-C2, backlog#1143). Rare admin path only.
+    pub async fn clear(&self, reason: ObjectDataCacheInvalidationReason) -> ObjectDataCacheInvalidationResult {
+        let result = match &self.backend {
+            ObjectDataCacheBackendKind::Noop(backend) => backend.clear().await,
+            ObjectDataCacheBackendKind::Moka(backend) => backend.clear().await,
+        };
+        self.finish_invalidation(result, reason)
+    }
+
+    /// Shared post-processing for every invalidation primitive: bump the
+    /// invalidation counter, refresh the cache-state gauge only when something
+    /// was removed, and emit the outcome-labelled metric. A mutating op
+    /// invalidates twice by design (before + after) and the vast majority of
+    /// those touch identities that were never cached, so the no-op path skips
+    /// the gauge refresh (backlog#1141).
+    fn finish_invalidation(
+        &self,
+        result: ObjectDataCacheInvalidationResult,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
         self.stats.record_invalidation();
         let outcome = invalidation_outcome(&result);
-        // A mutating op invalidates twice by design (before + after); the vast
-        // majority of those touch identities that were never cached. Only refresh
-        // the cache-state gauge when something was actually removed so the
-        // no-op path stays cheap (backlog#1141).
         if outcome != INVALIDATION_OUTCOME_NOOP {
             self.refresh_entry_count();
         }
-        record_invalidation(self.backend.as_metric_label(), _reason.as_metric_label(), outcome);
-
+        record_invalidation(self.backend.as_metric_label(), reason.as_metric_label(), outcome);
         result
     }
 
     /// Returns the current stats snapshot.
     pub fn stats(&self) -> ObjectDataCacheStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Returns the configured runtime mode, for admin status reporting.
+    pub fn mode(&self) -> crate::config::ObjectDataCacheMode {
+        self.config.mode
     }
 
     /// Returns true when the cache facade is fully disabled.
@@ -296,7 +394,11 @@ const fn invalidation_outcome(result: &ObjectDataCacheInvalidationResult) -> &'s
 }
 
 /// Protocol-neutral GET request metadata for cache planning.
-#[derive(Debug, Clone)]
+///
+/// Derives `Default` so tests construct it with `..Default::default()`; a new
+/// field then does not have to be added to every literal (which is how the
+/// `mod_time` seam bug arose during backlog#1111).
+#[derive(Debug, Clone, Default)]
 pub struct ObjectDataCacheGetRequest<'a> {
     /// Bucket name.
     pub bucket: &'a str,
@@ -308,6 +410,12 @@ pub struct ObjectDataCacheGetRequest<'a> {
     pub etag: &'a str,
     /// Object size in bytes.
     pub size: u64,
+    /// Resolved version's `data_dir` UUID as a `u128`, or `None`. Primary
+    /// write-unique key component (backlog#1111 / ODC-06).
+    pub data_dir_u128: Option<u128>,
+    /// Resolved version's modification time as Unix nanoseconds, or `0` when
+    /// absent. Second write-unique anchor.
+    pub mod_time_unix_nanos: i128,
     /// Supported response body variant.
     pub body_variant: ObjectDataCacheBodyVariant,
 }
@@ -397,6 +505,15 @@ pub enum ObjectDataCacheInvalidationReason {
     AfterCopySuccess,
     /// Invalidation after a successful complete multipart upload.
     AfterCompleteMultipartSuccess,
+    /// Invalidation after an ecstore-internal lifecycle/scanner expiry deleted
+    /// the object body (ODC-26).
+    AfterLifecycleExpiry,
+    /// Invalidation after a forced prefix delete removed every object under a
+    /// prefix (ODC-27).
+    AfterPrefixDelete,
+    /// Invalidation after a bucket delete removed every object in the bucket
+    /// (ODC-28).
+    AfterBucketDelete,
     /// Manual invalidation requested by the caller.
     Manual,
 }
@@ -409,6 +526,9 @@ impl ObjectDataCacheInvalidationReason {
             Self::AfterDeleteSuccess => "after_delete_success",
             Self::AfterCopySuccess => "after_copy_success",
             Self::AfterCompleteMultipartSuccess => "after_complete_multipart_success",
+            Self::AfterLifecycleExpiry => "after_lifecycle_expiry",
+            Self::AfterPrefixDelete => "after_prefix_delete",
+            Self::AfterBucketDelete => "after_bucket_delete",
             Self::Manual => "manual",
         }
     }
@@ -430,10 +550,10 @@ pub enum ObjectDataCacheInvalidationResult {
 mod tests {
     use super::{
         ObjectDataCache, ObjectDataCacheFillResult, ObjectDataCacheGetPlan, ObjectDataCacheGetRequest,
-        ObjectDataCacheInvalidationReason, ObjectDataCacheLookup,
+        ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult, ObjectDataCacheLookup,
     };
     use crate::config::{ObjectDataCacheConfig, ObjectDataCacheMode};
-    use crate::key::{ObjectDataCacheBodyVariant, ObjectDataCacheIdentity};
+    use crate::key::ObjectDataCacheIdentity;
     use bytes::Bytes;
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -463,10 +583,9 @@ mod tests {
         ObjectDataCacheGetRequest {
             bucket,
             object,
-            version_id: None,
             etag,
             size,
-            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+            ..Default::default()
         }
     }
 
@@ -636,16 +755,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_invalidation_reasons_map_to_distinct_labels() {
+        assert_eq!(
+            ObjectDataCacheInvalidationReason::AfterLifecycleExpiry.as_metric_label(),
+            "after_lifecycle_expiry"
+        );
+        assert_eq!(
+            ObjectDataCacheInvalidationReason::AfterPrefixDelete.as_metric_label(),
+            "after_prefix_delete"
+        );
+        assert_eq!(
+            ObjectDataCacheInvalidationReason::AfterBucketDelete.as_metric_label(),
+            "after_bucket_delete"
+        );
+    }
+
+    #[test]
+    fn prefix_invalidation_of_cached_identity_labels_reason_and_removed() {
+        // ODC-27: a prefix flush that drops a cached body is labelled with its
+        // own reason and outcome=removed so dashboards attribute the churn.
+        let cache = fill_enabled_cache();
+        let metrics = capture_metrics(|| async {
+            let plan = cache.plan_get(plain_request("bucket", "photos/a", "etag", 5));
+            assert_eq!(
+                cache.fill_body(&plan, Bytes::from_static(b"hello")).await,
+                ObjectDataCacheFillResult::Inserted
+            );
+            let result = cache
+                .invalidate_prefix("bucket", "photos/", ObjectDataCacheInvalidationReason::AfterPrefixDelete)
+                .await;
+            assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
+        });
+
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_invalidations_total",
+            ("reason", "after_prefix_delete")
+        ));
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_invalidations_total",
+            ("outcome", "removed")
+        ));
+    }
+
+    #[test]
+    fn bucket_invalidation_of_uncached_bucket_labels_noop() {
+        // ODC-28: a bucket flush that matched nothing is a no-op and must not
+        // refresh the entries gauge.
+        let cache = fill_enabled_cache();
+        let metrics = capture_metrics(|| async {
+            let result = cache
+                .invalidate_bucket("empty-bucket", ObjectDataCacheInvalidationReason::AfterBucketDelete)
+                .await;
+            assert_eq!(result, ObjectDataCacheInvalidationResult::NoOp);
+        });
+
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_invalidations_total",
+            ("outcome", "noop")
+        ));
+        assert!(
+            !has_gauge(&metrics, "rustfs_object_data_cache_entries"),
+            "a no-op bucket flush must not refresh the entries gauge"
+        );
+    }
+
+    #[test]
+    fn clear_of_cached_cache_labels_manual_and_removed() {
+        // ODC-C2: an admin clear reuses the Manual reason and reports removed.
+        let cache = fill_enabled_cache();
+        let metrics = capture_metrics(|| async {
+            let plan = cache.plan_get(plain_request("bucket", "object", "etag", 5));
+            assert_eq!(
+                cache.fill_body(&plan, Bytes::from_static(b"hello")).await,
+                ObjectDataCacheFillResult::Inserted
+            );
+            let result = cache.clear(ObjectDataCacheInvalidationReason::Manual).await;
+            assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
+            assert!(matches!(cache.lookup_body(&plan).await, ObjectDataCacheLookup::Miss));
+        });
+
+        assert!(has_counter_with_label(
+            &metrics,
+            "rustfs_object_data_cache_invalidations_total",
+            ("reason", "manual")
+        ));
+    }
+
     #[tokio::test]
     async fn fill_body_rejects_size_mismatch() {
         let cache = fill_enabled_cache();
         let plan = cache.plan_get(ObjectDataCacheGetRequest {
             bucket: "bucket",
             object: "object",
-            version_id: None,
             etag: "etag",
             size: 5,
-            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+            ..Default::default()
         });
 
         let fill = cache.fill_body(&plan, Bytes::from_static(b"oops")).await;
@@ -653,5 +861,56 @@ mod tests {
 
         assert_eq!(fill, ObjectDataCacheFillResult::SkippedSizeMismatch);
         assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
+    }
+
+    #[test]
+    fn plan_clamps_size_eligibility_to_fill_ceiling() {
+        // ODC-24 (backlog#1129): a body in the gap between `max_entry_bytes` and
+        // the effective fill ceiling must plan `SkipTooLarge`, not `Cacheable`,
+        // so it stops being reported as eligible while it can never fill.
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::HitOnly,
+            max_bytes: 32 * 1024 * 1024,
+            max_memory_percent: 0,
+            max_entry_bytes: 16 * 1024 * 1024,
+            ..ObjectDataCacheConfig::default()
+        };
+        let cache = ObjectDataCache::new(config)
+            .expect("clamped cache config should initialize")
+            .with_fill_ceiling_bytes(4 * 1024 * 1024);
+
+        // Within the ceiling: eligible.
+        assert!(matches!(
+            cache.plan_get(plain_request("bucket", "object", "etag", 4 * 1024 * 1024)),
+            ObjectDataCacheGetPlan::Cacheable { .. }
+        ));
+        // In the gap (ceiling < size <= max_entry_bytes): skipped as too large.
+        assert_eq!(
+            cache.plan_get(plain_request("bucket", "object", "etag", 4 * 1024 * 1024 + 1)),
+            ObjectDataCacheGetPlan::SkipTooLarge
+        );
+        assert_eq!(
+            cache.plan_get(plain_request("bucket", "object", "etag", 16 * 1024 * 1024)),
+            ObjectDataCacheGetPlan::SkipTooLarge
+        );
+    }
+
+    #[test]
+    fn plan_carries_mod_time_into_key() {
+        // ODC-06: the resolved modification time must reach the key so two
+        // writes with identical etag + size derive different keys.
+        let cache = hit_only_cache();
+        let request = ObjectDataCacheGetRequest {
+            bucket: "bucket",
+            object: "object",
+            etag: "etag",
+            size: 5,
+            mod_time_unix_nanos: 42,
+            ..Default::default()
+        };
+        let ObjectDataCacheGetPlan::Cacheable { key } = cache.plan_get(request) else {
+            panic!("plan should be cacheable");
+        };
+        assert_eq!(key.mod_time_unix_nanos, 42);
     }
 }

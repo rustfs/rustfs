@@ -128,6 +128,15 @@ jobs:
       - name: Check tokio io-uring feature guard
         run: ./scripts/check_no_tokio_io_uring.sh
 
+      - name: Check extension schema boundaries
+        run: ./scripts/check_extension_schema_boundaries.sh
+
+      - name: Check body-cache whitelist guard
+        run: ./scripts/check_body_cache_whitelist.sh
+
+      - name: Check no planning docs committed
+        run: ./scripts/check_no_planning_docs.sh
+
   test-and-lint:
     name: Test and Lint
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
@@ -170,13 +179,57 @@ jobs:
       # Explicit gate for migration-critical suites. These tests already ran in
       # the full nextest pass above; a single filtered nextest invocation keeps
       # the named gate without rebuilding or re-running them one package at a time.
+      #
+      # The gate selects tests by name substring (data_movement / rebalance /
+      # decommission / source_cleanup / delete_marker), so renames can silently
+      # thin it. The script owns the filter expression and first verifies the
+      # selected-test count against the committed floor in
+      # .config/migration-gate-floor.txt before running the gate; renames or
+      # removals must update that file consciously (see the script header).
       # Kept on the default profile (no --profile ci): a second --profile ci run
       # would clobber target/nextest/ci/junit.xml, and none of these tests are
       # quarantined so they gain nothing from the ci profile's retry overrides.
       - name: Run rebalance/decommission migration proofs
+        run: ./scripts/check_migration_gate_count.sh
+
+  # Dedicated serial lane for the ILM / lifecycle integration tests. These tests
+  # drive the object layer through process-global singletons (the GLOBAL_ENV
+  # ECStore, the global tier-config manager, background-expiry workers) and bind
+  # fixed ports (9002 for the scanner suite, 9003 for the app suite), so they are
+  # marked #[ignore] to keep them out of the default parallel `cargo nextest run
+  # --all` pass. Run them here explicitly with `--run-ignored ignored-only` and
+  # `-j1` so no two of them share global state or race for a port at once.
+  # serial_test's #[serial] does NOT serialize across nextest's process-per-test
+  # boundary (see .config/nextest.toml); `-j1` is what actually serializes them.
+  # See rustfs/backlog#1148 (ilm-1) and #1155.
+  test-ilm-integration-serial:
+    name: ILM Integration (serial)
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: sm-standard-4
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-ilm-serial
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Three scanner tests fail on main independently of this lane (restore of
+      # a transitioned multipart object, noncurrent transition/expiry after an
+      # immediate compensation transition); they keep #[ignore] with a backlog
+      # reference and are excluded here by name until fixed (rustfs/backlog#1148).
+      - name: Run ignored ILM integration tests serially
         run: |
-          cargo nextest run -p rustfs-ecstore --lib \
-            -E 'test(data_movement) or test(rebalance) or test(decommission) or test(source_cleanup) or test(delete_marker)'
+          cargo nextest run -j1 --run-ignored ignored-only \
+            -p rustfs-scanner -p rustfs \
+            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_transition_and_restore_flows) or test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition))'
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
@@ -300,6 +353,57 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  uring-integration:
+    name: io_uring Integration (real)
+    # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
+    # a container, applies no seccomp filter that would block io_uring_setup — so
+    # the probe succeeds and the tests exercise the real UringBackend/FdCache/
+    # latch paths instead of the StdBackend fallback (rustfs/backlog#1179). The
+    # self-hosted sm-standard runners cannot guarantee this.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-uring
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # ext4 supports O_DIRECT; the runner's default TMPDIR may sit on tmpfs or
+      # overlayfs, where open(O_DIRECT) returns EINVAL/EOPNOTSUPP and the native
+      # read_at_direct path silently latches off to the aligned StdBackend
+      # fallback. A dedicated ext4 loopback guarantees the native O_DIRECT read
+      # path is actually exercised, not just the fallback (rustfs/backlog#1220).
+      - name: Prepare ext4 loopback for O_DIRECT coverage
+        run: |
+          set -euo pipefail
+          dd if=/dev/zero of=/tmp/rustfs-odirect.img bs=1M count=1024
+          mkfs.ext4 -q -F /tmp/rustfs-odirect.img
+          sudo mkdir -p /mnt/rustfs-odirect
+          sudo mount -o loop /tmp/rustfs-odirect.img /mnt/rustfs-odirect
+          sudo chmod 1777 /mnt/rustfs-odirect
+          mount | grep rustfs-odirect
+
+      # RUSTFS_URING_TESTS_MUST_RUN=1 makes the io_uring tests fail instead of
+      # silently skipping if io_uring is unavailable, so this leg can never pass
+      # vacuously. RUSTFS_IO_URING_READ_ENABLE=true selects the UringBackend.
+      # TMPDIR points every tempfile-based test fixture at the ext4 loopback so
+      # eligible reads keep O_DIRECT and the native path is covered end to end.
+      - name: Run ecstore io_uring integration tests on real io_uring
+        env:
+          RUSTFS_IO_URING_READ_ENABLE: "true"
+          RUSTFS_URING_TESTS_MUST_RUN: "1"
+          TMPDIR: /mnt/rustfs-odirect
+        run: cargo test -p rustfs-ecstore uring_ -- --test-threads=1 --nocapture
+
   e2e-tests:
     name: End-to-End Tests
     needs: [ build-rustfs-debug-binary ]
@@ -309,7 +413,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      # Full setup with dependency caching: the migration-proof step below
+      # Full setup with dependency caching: the smoke-suite step below
       # compiles the e2e_test crate, which pulls in most of the workspace.
       # Without a restored cache this was a cold multi-GB build on every run.
       - name: Setup Rust environment
@@ -331,8 +435,13 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
-      - name: Run delete-marker migration proof
-        run: cargo test -p e2e_test delete_marker_migration_semantics -- --nocapture --test-threads=1
+      # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
+      # profile.e2e-smoke default-filter in .config/nextest.toml is the single
+      # wiring mechanism for e2e tests in CI — extend that filter instead of
+      # adding new e2e jobs here. Each test spawns its own rustfs server on a
+      # random port and reuses the downloaded debug binary above.
+      - name: Run e2e smoke suite
+        run: cargo nextest run --profile e2e-smoke -p e2e_test
 
       - name: Install s3s-e2e test tool
         uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
@@ -443,6 +552,80 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: s3tests-implemented-${{ github.run_number }}
+          path: artifacts/s3tests-single/**
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # Dedicated lifecycle behavior lane (backlog#1148 ilm-10, master plan #1155).
+  #
+  # These ceph/s3-tests cases assert that objects/versions/uploads are actually
+  # removed by the background scanner and the stale-multipart cleanup loop, so
+  # they need a debug-accelerated day plus an enabled scanner. That configuration
+  # cannot be applied to the s3-implemented-tests lane above because a global
+  # RUSTFS_ILM_DEBUG_DAY_SECS also shrinks the x-amz-expiration header those tests
+  # assert on (test_lifecycle_expiration_header_*). Hence a separate server here.
+  #
+  # RUSTFS_ILM_DEBUG_DAY_SECS MUST stay equal to the s3-tests lc_debug_interval
+  # default (10s). test_lifecycle_expiration polls the Days=1 rule with a
+  # 4*lc_interval window while the Days=5 rule fires at 5*debug_day; observing
+  # the intermediate 4-object plateau requires 4*lc_interval < 5*debug_day, i.e.
+  # debug_day > 8. A smaller value lets the Days=5 rule fire inside the Days=1
+  # poll window so the count collapses straight to 2 and the test fails (#4764).
+  #
+  # RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=1 is also required. A compacted directory
+  # is only re-descended (and its objects re-evaluated for ILM) once every
+  # DATA_USAGE_UPDATE_DIR_CYCLES scanner cycles (default 16). At the accelerated
+  # RUSTFS_SCANNER_CYCLE=2 that is ~32s between evaluations, so a Days=1 object
+  # that becomes due at debug_day (10s) is not actually expired until the next
+  # ~32s boundary (~42s), landing just past the 4*lc_interval (40s) poll window
+  # and making the count stall at 6 (#4767). Forcing every-cycle re-descent
+  # evaluates ILM within ~2s of the due time, well inside the poll window.
+  s3-lifecycle-behavior-tests:
+    name: S3 Lifecycle Behavior Tests
+    needs: [ build-rustfs-debug-binary ]
+    runs-on: sm-standard-4
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Download debug binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: rustfs-debug-binary
+          path: target/debug
+
+      - name: Make binary executable
+        run: chmod +x ./target/debug/rustfs
+
+      - name: Run lifecycle behavior s3-tests
+        run: |
+          RUN_ROOT="${RUNNER_TEMP}/rustfs-s3tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          mkdir -p "${RUN_ROOT}"
+          S3_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+          DEPLOY_MODE=binary \
+          RUSTFS_BINARY=./target/debug/rustfs \
+          TEST_MODE=single \
+          MAXFAIL=0 \
+          XDIST=0 \
+          IMPLEMENTED_TESTS_FILE=scripts/s3-tests/lifecycle_behavior_tests.txt \
+          RUSTFS_ILM_DEBUG_DAY_SECS=10 \
+          RUSTFS_ILM_PROCESS_TIME=1 \
+          RUSTFS_SCANNER_ENABLED=true \
+          RUSTFS_SCANNER_CYCLE=2 \
+          RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=1 \
+          RUSTFS_SCANNER_START_DELAY_SECS=0 \
+          RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL=2s \
+          S3_PORT="${S3_PORT}" \
+          DATA_ROOT="${RUN_ROOT}" \
+          S3TESTS_CONF=artifacts/s3tests-single/s3tests.conf \
+          ./scripts/s3-tests/run.sh
+
+      - name: Upload s3 test artifacts
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: s3tests-lifecycle-behavior-${{ github.run_number }}
           path: artifacts/s3tests-single/**
           if-no-files-found: ignore
           retention-days: 3

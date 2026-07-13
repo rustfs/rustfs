@@ -2195,6 +2195,7 @@ mod tests {
                 stream: Box::new(Cursor::new(Vec::<u8>::new())),
                 object_info: ObjectInfo::default(),
                 buffered_body: None,
+                body_source: Default::default(),
             };
 
             let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
@@ -2234,6 +2235,7 @@ mod tests {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
                 object_info: ObjectInfo::default(),
                 buffered_body: None,
+                body_source: Default::default(),
             };
 
             let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
@@ -2270,6 +2272,7 @@ mod tests {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
                 object_info: ObjectInfo::default(),
                 buffered_body: Some(Bytes::from_static(b"123")),
+                body_source: Default::default(),
             };
 
             let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
@@ -2306,6 +2309,7 @@ mod tests {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
                 object_info: ObjectInfo::default(),
                 buffered_body: None,
+                body_source: Default::default(),
             };
 
             let mut reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));

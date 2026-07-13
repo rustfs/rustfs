@@ -45,8 +45,8 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
                 ExpiryState, LifecycleOps, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
                 apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
-                enqueue_transition_immediate, get_global_expiry_state, get_global_transition_state, init_background_expiry,
-                post_restore_opts, run_stale_multipart_upload_cleanup_once, validate_transition_tier,
+                enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
+                init_background_expiry, post_restore_opts, run_stale_multipart_upload_cleanup_once, validate_transition_tier,
             };
         }
 
@@ -351,8 +351,8 @@ pub mod notification {
 
 pub mod object {
     pub use crate::object_api::{
-        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader,
-        RangedDecompressReader, StreamConsumer, register_get_object_body_cache_hook,
+        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectReader, ObjectInfo, ObjectMutationHook, ObjectOptions,
+        PutObjReader, RangedDecompressReader, StreamConsumer, register_get_object_body_cache_hook, register_object_mutation_hook,
     };
 }
 
@@ -427,6 +427,15 @@ pub mod tier {
     pub mod warm_backend {
         pub use crate::services::tier::warm_backend::{
             WarmBackend, WarmBackendGetOpts, WarmBackendImpl, build_transition_put_options, check_warm_backend, new_warm_backend,
+        };
+    }
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::services::tier::test_util::{
+            FaultConfig, MockStoredObject, MockWarmBackend, MockWarmOp, TransitionMeta, assert_transition_meta_consistent,
+            free_version_count, read_transition_meta, register_mock_tier, register_mock_tier_backend,
+            wait_for_free_version_absence,
         };
     }
 }

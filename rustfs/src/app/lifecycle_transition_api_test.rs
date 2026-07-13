@@ -16,7 +16,6 @@ use super::storage_api::test::bucket::{
     lifecycle,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
-    transition_api::{ReadCloser, ReaderImpl},
 };
 use super::storage_api::test::contract::{
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
@@ -26,7 +25,7 @@ use super::storage_api::test::contract::{
 };
 use super::storage_api::test::ecfs::FS;
 use super::storage_api::test::object_utils::to_s3s_etag;
-use super::storage_api::test::runtime::{AppWarmBackend, TierConfig, TierType, WarmBackendGetOpts};
+use super::storage_api::test::runtime::{MockWarmBackend, register_mock_tier as register_mock_tier_util};
 use super::storage_api::test::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
     StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
@@ -44,17 +43,15 @@ use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
 use std::{
-    collections::HashMap,
     convert::Infallible,
     env, fs as stdfs,
-    io::Cursor,
     path::PathBuf,
     sync::{Arc, Once, OnceLock},
     time::Duration,
 };
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Barrier, Mutex};
+use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -136,6 +133,12 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+
+    // The usecases resolve the object store through the ambient AppContext
+    // since the backlog#1052 InstanceContext migration; without one installed
+    // every store-touching usecase call fails with InternalError "Not init".
+    // Publish a default-interface context wrapping this test store.
+    crate::app::runtime_sources::install_test_app_context(ecstore.clone()).await;
 
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
@@ -279,90 +282,11 @@ fn del_marker_expiration_lifecycle_configuration(days: i32) -> BucketLifecycleCo
     }
 }
 
-#[derive(Clone, Default)]
-struct MockWarmBackend {
-    objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-}
-
-impl MockWarmBackend {
-    async fn put_bytes(&self, object: &str, bytes: Vec<u8>) -> String {
-        self.objects.lock().await.insert(object.to_string(), bytes);
-        Uuid::new_v4().to_string()
-    }
-
-    async fn read_bytes(&self, reader: ReaderImpl) -> Result<Vec<u8>, std::io::Error> {
-        match reader {
-            ReaderImpl::Body(bytes) => Ok(bytes.to_vec()),
-            ReaderImpl::ObjectBody(mut reader) => {
-                let mut buf = Vec::new();
-                reader.stream.read_to_end(&mut buf).await?;
-                Ok(buf)
-            }
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl AppWarmBackend for MockWarmBackend {
-    async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
-        let bytes = self.read_bytes(r).await?;
-        Ok(self.put_bytes(object, bytes).await)
-    }
-
-    async fn put_with_meta(
-        &self,
-        object: &str,
-        r: ReaderImpl,
-        _length: i64,
-        _meta: HashMap<String, String>,
-    ) -> Result<String, std::io::Error> {
-        let bytes = self.read_bytes(r).await?;
-        Ok(self.put_bytes(object, bytes).await)
-    }
-
-    async fn get(&self, object: &str, _rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        let objects = self.objects.lock().await;
-        let Some(bytes) = objects.get(object) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "mock object not found"));
-        };
-
-        let start = opts.start_offset.max(0) as usize;
-        let end = if opts.length > 0 {
-            start.saturating_add(opts.length as usize).min(bytes.len())
-        } else {
-            bytes.len()
-        };
-
-        Ok(tokio::io::BufReader::new(Cursor::new(bytes[start.min(bytes.len())..end].to_vec())))
-    }
-
-    async fn remove(&self, object: &str, _rv: &str) -> Result<(), std::io::Error> {
-        self.objects.lock().await.remove(object);
-        Ok(())
-    }
-
-    async fn in_use(&self) -> Result<bool, std::io::Error> {
-        Ok(false)
-    }
-}
-
+/// Register the shared [`MockWarmBackend`] into this instance's tier config
+/// manager. Thin wrapper over the shared `register_mock_tier` helper
+/// (rustfs/backlog#1148 ilm-6).
 async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
-    let backend = MockWarmBackend::default();
-    let tier_config_mgr_handle = current_tier_config_handle();
-    let mut tier_config_mgr = tier_config_mgr_handle.write().await;
-    tier_config_mgr.tiers.insert(
-        tier_name.to_string(),
-        TierConfig {
-            version: "v1".to_string(),
-            tier_type: TierType::MinIO,
-            name: tier_name.to_string(),
-            ..Default::default()
-        },
-    );
-    tier_config_mgr
-        .driver_cache
-        .insert(tier_name.to_string(), Box::new(backend.clone()));
-    backend
+    register_mock_tier_util(&current_tier_config_handle(), tier_name).await
 }
 
 async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> Option<ObjectInfo> {
@@ -432,22 +356,6 @@ where
     rustfs_io_metrics::set_get_stage_metrics_enabled(metrics_was_enabled);
     if let Err(err) = result {
         std::panic::resume_unwind(err);
-    }
-}
-
-async fn wait_for_remote_absence(backend: &MockWarmBackend, object: &str, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        if !backend.objects.lock().await.contains_key(object) {
-            return true;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -538,11 +446,11 @@ async fn live_object_version_count(ecstore: &Arc<ECStore>, bucket: &str, object:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_object_if_none_match_existing_object_returns_precondition_failed() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let fs = FS::new();
-    let usecase = DefaultObjectUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
 
     let bucket = format!("test-put-if-none-match-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let object = "test/object.txt";
@@ -591,10 +499,10 @@ async fn put_object_if_none_match_existing_object_returns_precondition_failed() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn copy_object_if_none_match_existing_destination_returns_precondition_failed() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultObjectUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
 
     let src_bucket = format!("test-copy-if-none-match-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let dst_bucket = format!("test-copy-if-none-match-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -640,11 +548,11 @@ async fn copy_object_if_none_match_existing_destination_returns_precondition_fai
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explicit_overwrite() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let fs = FS::new();
-    let usecase = DefaultObjectUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
 
     let bucket = format!("test-copy-object-lock-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let src_object = "test/source.txt";
@@ -728,7 +636,7 @@ async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explic
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn concurrent_reverse_copy_object_does_not_deadlock_with_reader_locks() {
     temp_env::async_with_vars([(ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
         let (_disk_paths, ecstore) = setup_test_env().await;
@@ -768,13 +676,13 @@ async fn concurrent_reverse_copy_object_does_not_deadlock_with_reader_locks() {
         let start_a = start.clone();
         let a_to_b = tokio::spawn(async move {
             start_a.wait().await;
-            let usecase = DefaultObjectUsecase::without_context();
+            let usecase = DefaultObjectUsecase::from_global();
             Box::pin(usecase.execute_copy_object(build_request(a_to_b_input, Method::PUT))).await
         });
         let start_b = start.clone();
         let b_to_a = tokio::spawn(async move {
             start_b.wait().await;
-            let usecase = DefaultObjectUsecase::without_context();
+            let usecase = DefaultObjectUsecase::from_global();
             Box::pin(usecase.execute_copy_object(build_request(b_to_a_input, Method::PUT))).await
         });
 
@@ -809,11 +717,11 @@ async fn concurrent_reverse_copy_object_does_not_deadlock_with_reader_locks() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_and_copy_object_transition_immediately_via_usecases() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let fs = FS::new();
-    let usecase = DefaultObjectUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
     let backend = register_mock_tier(&tier_name).await;
@@ -845,7 +753,7 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
 
     assert_eq!(put_info.transitioned_object.status, "complete");
     assert_eq!(put_info.transitioned_object.tier, tier_name);
-    assert!(backend.objects.lock().await.contains_key(&put_info.transitioned_object.name));
+    assert!(backend.contains(&put_info.transitioned_object.name).await);
 
     let src_bucket = format!("test-api-copy-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let dst_bucket = format!("test-api-copy-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -881,15 +789,15 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
 
     assert_eq!(copy_info.transitioned_object.status, "complete");
     assert_eq!(copy_info.transitioned_object.tier, tier_name);
-    assert!(backend.objects.lock().await.contains_key(&copy_info.transitioned_object.name));
+    assert!(backend.contains(&copy_info.transitioned_object.name).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn complete_multipart_upload_transitions_immediately_via_usecase() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultMultipartUsecase::without_context();
+    let usecase = DefaultMultipartUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
     let backend = register_mock_tier(&tier_name).await;
@@ -938,12 +846,12 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
 
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
-    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+    assert!(backend.contains(&info.transitioned_object.name).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn get_transitioned_object_uses_remote_codec_fallback_path() {
     with_get_codec_streaming_remote_probe_env(|| async {
         let (_disk_paths, ecstore) = setup_test_env().await;
@@ -987,13 +895,7 @@ async fn get_transitioned_object_uses_remote_codec_fallback_path() {
         assert_eq!(transitioned.transitioned_object.status, "complete");
         assert_eq!(transitioned.transitioned_object.tier, tier_name);
         assert!(!transitioned.transitioned_object.name.is_empty());
-        assert!(
-            backend
-                .objects
-                .lock()
-                .await
-                .contains_key(&transitioned.transitioned_object.name)
-        );
+        assert!(backend.contains(&transitioned.transitioned_object.name).await);
 
         let actual = read_object_bytes(&ecstore, bucket.as_str(), object).await;
         assert_eq!(actual, payload);
@@ -1003,10 +905,10 @@ async fn get_transitioned_object_uses_remote_codec_fallback_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultObjectUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
     let backend = register_mock_tier(&tier_name).await;
@@ -1030,7 +932,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         .expect("object should transition before delete usecase runs");
     let remote_object = transitioned.transitioned_object.name.clone();
 
-    assert!(backend.objects.lock().await.contains_key(&remote_object));
+    assert!(backend.contains(&remote_object).await);
 
     let mut req = build_request(
         DeleteObjectInput::builder()
@@ -1052,14 +954,14 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
     );
 
     assert!(
-        wait_for_remote_absence(&backend, &remote_object, TRANSITION_WAIT_TIMEOUT).await,
+        backend.wait_for_remote_absence(&remote_object, TRANSITION_WAIT_TIMEOUT).await,
         "transitioned object should be removed from remote tier after delete usecase"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
     let (disk_paths, ecstore) = setup_test_env().await;
     let manager = create_isolated_manager(HybridStrategyConfig::default());
@@ -1102,7 +1004,7 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn immediate_transition_timeout_eventually_completes_via_compensation() {
     let (_disk_paths, ecstore) = setup_test_env().await;
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
@@ -1128,15 +1030,15 @@ async fn immediate_transition_timeout_eventually_completes_via_compensation() {
 
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
-    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+    assert!(backend.contains(&info.transitioned_object.name).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn compensation_driven_copy_still_completes_transition() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultObjectUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
     let backend = register_mock_tier(&tier_name).await;
@@ -1178,15 +1080,15 @@ async fn compensation_driven_copy_still_completes_transition() {
 
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
-    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+    assert!(backend.contains(&info.transitioned_object.name).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn compensation_driven_complete_multipart_upload_still_transitions() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultMultipartUsecase::without_context();
+    let usecase = DefaultMultipartUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
     let backend = register_mock_tier(&tier_name).await;
@@ -1238,15 +1140,15 @@ async fn compensation_driven_complete_multipart_upload_still_transitions() {
 
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
-    assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+    assert!(backend.contains(&info.transitioned_object.name).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultObjectUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
     let backend = register_mock_tier(&tier_name).await;
@@ -1270,7 +1172,7 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
         .expect("object should eventually transition after compensation backfill");
     let remote_object = transitioned.transitioned_object.name.clone();
 
-    assert!(backend.objects.lock().await.contains_key(&remote_object));
+    assert!(backend.contains(&remote_object).await);
 
     let mut req = build_request(
         DeleteObjectInput::builder()
@@ -1292,17 +1194,17 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
     );
 
     assert!(
-        wait_for_remote_absence(&backend, &remote_object, TRANSITION_WAIT_TIMEOUT).await,
+        backend.wait_for_remote_absence(&remote_object, TRANSITION_WAIT_TIMEOUT).await,
         "transitioned object should be removed from remote tier after delete usecase"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultObjectUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
     let backend = register_mock_tier(&tier_name).await;
@@ -1326,7 +1228,7 @@ async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
         .expect("object should eventually transition after compensation backfill");
     let remote_object = transitioned.transitioned_object.name.clone();
 
-    assert!(backend.objects.lock().await.contains_key(&remote_object));
+    assert!(backend.contains(&remote_object).await);
 
     let req = build_request(
         DeleteObjectInput::builder()
@@ -1346,18 +1248,18 @@ async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
         "versioned delete should create a delete marker after compensation-driven transition"
     );
     assert!(
-        backend.objects.lock().await.contains_key(&remote_object),
+        backend.contains(&remote_object).await,
         "creating a delete marker should not remove the transitioned remote object version"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultObjectUsecase::without_context();
-    let bucket_usecase = DefaultBucketUsecase::without_context();
+    let usecase = DefaultObjectUsecase::from_global();
+    let bucket_usecase = DefaultBucketUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
     let backend = register_mock_tier(&tier_name).await;
@@ -1381,7 +1283,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
         .expect("object should eventually transition after compensation backfill");
     let remote_object = transitioned.transitioned_object.name.clone();
 
-    assert!(backend.objects.lock().await.contains_key(&remote_object));
+    assert!(backend.contains(&remote_object).await);
 
     let req = build_request(
         DeleteObjectInput::builder()
@@ -1401,7 +1303,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
         "versioned delete should create a delete marker before lifecycle cleanup"
     );
     assert!(
-        backend.objects.lock().await.contains_key(&remote_object),
+        backend.contains(&remote_object).await,
         "delete marker creation should keep the transitioned remote object version"
     );
 
@@ -1423,17 +1325,17 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
         "delete marker should remain visible after lifecycle update until cleanup completes"
     );
     assert!(
-        backend.objects.lock().await.contains_key(&remote_object),
+        backend.contains(&remote_object).await,
         "delete marker lifecycle cleanup should not remove the transitioned remote object version"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultBucketUsecase::without_context();
+    let usecase = DefaultBucketUsecase::from_global();
 
     let bucket = format!("test-api-expire-existing-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let object = "test/existing.txt";
@@ -1464,10 +1366,10 @@ async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_bucket_lifecycle_configuration_allows_expired_delete_marker_on_object_lock_bucket() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultBucketUsecase::without_context();
+    let usecase = DefaultBucketUsecase::from_global();
 
     let bucket = format!("test-lock-expired-del-marker-{}", &Uuid::new_v4().simple().to_string()[..8]);
     create_test_bucket(&ecstore, bucket.as_str()).await;
@@ -1492,10 +1394,10 @@ async fn put_bucket_lifecycle_configuration_allows_expired_delete_marker_on_obje
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_bucket_lifecycle_configuration_rejects_del_marker_expiration_on_object_lock_bucket() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultBucketUsecase::without_context();
+    let usecase = DefaultBucketUsecase::from_global();
 
     let bucket = format!("test-lock-del-marker-exp-{}", &Uuid::new_v4().simple().to_string()[..8]);
     create_test_bucket(&ecstore, bucket.as_str()).await;
@@ -1528,10 +1430,10 @@ async fn put_bucket_lifecycle_configuration_rejects_del_marker_expiration_on_obj
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
-#[ignore = "requires isolated global object layer state"]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expiration_on_object_lock_bucket() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let usecase = DefaultBucketUsecase::without_context();
+    let usecase = DefaultBucketUsecase::from_global();
 
     let bucket = format!("test-lock-del-marker-exp0-{}", &Uuid::new_v4().simple().to_string()[..8]);
     create_test_bucket(&ecstore, bucket.as_str()).await;
@@ -1558,6 +1460,63 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expirati
         message.contains(
             "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket"
         ),
+        "unexpected error message: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[serial]
+#[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
+    // S3 compatibility (ceph s3-tests `test_lifecycle_expiration_days0`): a rule with
+    // Expiration{Days:0} must be rejected with InvalidArgument through the real
+    // PutBucketLifecycleConfiguration handler, not merely at the crates/lifecycle
+    // io::Error layer. No object lock required.
+    let (_disk_paths, ecstore) = setup_test_env().await;
+    let usecase = DefaultBucketUsecase::from_global();
+
+    let bucket = format!("test-zero-day-exp-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_test_bucket(&ecstore, bucket.as_str()).await;
+
+    let lifecycle = BucketLifecycleConfiguration {
+        expiry_updated_at: None,
+        rules: vec![LifecycleRule {
+            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            abort_incomplete_multipart_upload: None,
+            del_marker_expiration: None,
+            expiration: Some(LifecycleExpiration {
+                days: Some(0),
+                ..Default::default()
+            }),
+            filter: Some(LifecycleRuleFilter {
+                prefix: Some("days0/".to_string()),
+                ..Default::default()
+            }),
+            id: Some("expire-zero-days".to_string()),
+            noncurrent_version_expiration: None,
+            noncurrent_version_transitions: None,
+            prefix: None,
+            transitions: None,
+        }],
+    };
+
+    let req = build_request(
+        PutBucketLifecycleConfigurationInput::builder()
+            .bucket(bucket.clone())
+            .lifecycle_configuration(Some(lifecycle))
+            .build()
+            .unwrap(),
+        Method::PUT,
+    );
+
+    let err = usecase
+        .execute_put_bucket_lifecycle_configuration(req)
+        .await
+        .expect_err("zero-day expiration must be rejected with InvalidArgument");
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    let message = err.message().unwrap_or_default();
+    assert!(
+        message.contains("'Days' for Expiration action must be a positive integer"),
         "unexpected error message: {message}"
     );
 }

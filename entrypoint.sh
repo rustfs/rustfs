@@ -35,15 +35,21 @@ resolve_credential_source() {
   CREDENTIAL_FILE_SET=false
   CREDENTIAL_FILE_VALUE=""
 
+  # ${VAR+x} distinguishes unset from present-but-empty: an env var explicitly
+  # set to "" (e.g. an unexpanded compose interpolation) is a malformed value
+  # that must hit the empty-value hard failure, not the missing-credential
+  # warning — the binary would otherwise run with an empty root credential.
+  eval "CREDENTIAL_ENV_PRESENT=\${$CREDENTIAL_ENV_NAME+x}"
   eval "CREDENTIAL_ENV_VALUE=\${$CREDENTIAL_ENV_NAME:-}"
+  eval "CREDENTIAL_ENV_FILE_PRESENT=\${$CREDENTIAL_FILE_ENV_NAME+x}"
   eval "CREDENTIAL_ENV_FILE_VALUE=\${$CREDENTIAL_FILE_ENV_NAME:-}"
 
-  if [ -n "$CREDENTIAL_ENV_VALUE" ]; then
+  if [ -n "$CREDENTIAL_ENV_PRESENT" ]; then
     CREDENTIAL_DIRECT_SET=true
     CREDENTIAL_DIRECT_VALUE="$CREDENTIAL_ENV_VALUE"
   fi
 
-  if [ -n "$CREDENTIAL_ENV_FILE_VALUE" ]; then
+  if [ -n "$CREDENTIAL_ENV_FILE_PRESENT" ]; then
     CREDENTIAL_FILE_SET=true
     CREDENTIAL_FILE_VALUE="$CREDENTIAL_ENV_FILE_VALUE"
   fi
@@ -103,10 +109,26 @@ resolve_credential_source() {
   echo "missing"
 }
 
+# Mirrors the binary's .trim() so the empty/default checks below agree with
+# what the server will actually use: strips CR (CRLF-edited files) and
+# surrounding blanks. Comparison only — the value passed to the binary is
+# untouched.
+trim_credential() {
+  printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Credential policy: images ship no baked-in credentials, but default or
+# missing credentials only WARN — the container still starts (the binary falls
+# back to its built-in default, and warns when both keys end up default).
+# Hard failures (ERROR, exit 1) are reserved for malformed configuration
+# (conflicting sources, unreadable files, empty values). The binary also accepts credentials via
+# legacy/compat envs (RUSTFS_ROOT_*, MINIO_*) that this script does not
+# inspect, so the missing-credential warning is phrased conditionally.
 validate_credential_source() {
   CREDENTIAL_NAME="$1"
   FILE_NAME="$2"
-  CREDENTIAL_SOURCE="$3"
+  ALIAS_HINT="$3"
+  CREDENTIAL_SOURCE="$4"
 
   case "$CREDENTIAL_SOURCE" in
     error:*)
@@ -118,18 +140,16 @@ validate_credential_source() {
       exit 1
       ;;
     missing)
-      echo "ERROR: $CREDENTIAL_NAME or $FILE_NAME must be set explicitly for container startup." >&2
-      exit 1
+      echo "WARNING: $CREDENTIAL_NAME or $FILE_NAME is not set; unless credentials are provided via another supported source (e.g. $ALIAS_HINT), rustfs falls back to its built-in default credential. Set non-default credentials for production deployments." >&2
       ;;
     value:*)
-      CREDENTIAL_VALUE="${CREDENTIAL_SOURCE#value:}"
+      CREDENTIAL_VALUE=$(trim_credential "${CREDENTIAL_SOURCE#value:}")
       if [ -z "$CREDENTIAL_VALUE" ]; then
         echo "ERROR: $CREDENTIAL_NAME must not be empty." >&2
         exit 1
       fi
       if [ "$CREDENTIAL_VALUE" = "$DEFAULT_ROOT_CREDENTIAL" ]; then
-        echo "ERROR: $CREDENTIAL_NAME must not use the default $DEFAULT_ROOT_CREDENTIAL credential." >&2
-        exit 1
+        echo "WARNING: $CREDENTIAL_NAME uses the default $DEFAULT_ROOT_CREDENTIAL credential. Set non-default credentials for production deployments; with an all-default pair, multi-node clusters additionally need RUSTFS_RPC_SECRET to derive internode RPC auth." >&2
       fi
       ;;
     file:*)
@@ -142,18 +162,16 @@ validate_credential_source() {
         echo "ERROR: $FILE_NAME points to an unreadable file." >&2
         exit 1
       fi
-      if IFS= read -r CREDENTIAL_FILE_CONTENT < "$CREDENTIAL_FILE"; then
-        :
-      else
-        CREDENTIAL_FILE_CONTENT=""
-      fi
+      # `read` fails at EOF-without-newline but still fills the variable;
+      # keep the partial line so newline-less secret files stay valid.
+      IFS= read -r CREDENTIAL_FILE_CONTENT < "$CREDENTIAL_FILE" || :
+      CREDENTIAL_FILE_CONTENT=$(trim_credential "$CREDENTIAL_FILE_CONTENT")
       if [ -z "$CREDENTIAL_FILE_CONTENT" ]; then
         echo "ERROR: $FILE_NAME must not be empty." >&2
         exit 1
       fi
       if [ "$CREDENTIAL_FILE_CONTENT" = "$DEFAULT_ROOT_CREDENTIAL" ]; then
-        echo "ERROR: $FILE_NAME must not contain the default $DEFAULT_ROOT_CREDENTIAL credential." >&2
-        exit 1
+        echo "WARNING: $FILE_NAME contains the default $DEFAULT_ROOT_CREDENTIAL credential. Set non-default credentials for production deployments; with an all-default pair, multi-node clusters additionally need RUSTFS_RPC_SECRET to derive internode RPC auth." >&2
       fi
       ;;
   esac
@@ -162,8 +180,8 @@ validate_credential_source() {
 if [ "$1" = "/usr/bin/rustfs" ]; then
   ACCESS_SOURCE=$(resolve_credential_source "RUSTFS_ACCESS_KEY" "RUSTFS_ACCESS_KEY_FILE" "access-key" "access-key-file" "$@")
   SECRET_SOURCE=$(resolve_credential_source "RUSTFS_SECRET_KEY" "RUSTFS_SECRET_KEY_FILE" "secret-key" "secret-key-file" "$@")
-  validate_credential_source "RUSTFS_ACCESS_KEY" "RUSTFS_ACCESS_KEY_FILE" "$ACCESS_SOURCE"
-  validate_credential_source "RUSTFS_SECRET_KEY" "RUSTFS_SECRET_KEY_FILE" "$SECRET_SOURCE"
+  validate_credential_source "RUSTFS_ACCESS_KEY" "RUSTFS_ACCESS_KEY_FILE" "RUSTFS_ROOT_USER or MINIO_ROOT_USER" "$ACCESS_SOURCE"
+  validate_credential_source "RUSTFS_SECRET_KEY" "RUSTFS_SECRET_KEY_FILE" "RUSTFS_ROOT_PASSWORD or MINIO_ROOT_PASSWORD" "$SECRET_SOURCE"
 fi
 
 # 2) Process data volumes (separate from log directory)
@@ -173,43 +191,72 @@ process_data_volumes() {
   # Convert comma/tab to space
   VOLUME_LIST_RAW=$(echo "$VOLUME_RAW" | tr ',\t' ' ')
   
-  VOLUME_LIST=""
-  for vol in $VOLUME_LIST_RAW; do
-      # Helper to manually expand {N..M} since sh doesn't support it on variables
-      if echo "$vol" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; then
-           PREFIX=${vol%%\{*}
-           SUFFIX=${vol##*\}}
-           RANGE=${vol#*\{}
-           RANGE=${RANGE%\}}
-           RANGE=$(echo "$RANGE" | sed 's/\.\.\./../')
-           START=${RANGE%%..*}
-           END=${RANGE##*..}
-           
-           # Check if START and END are numbers
-           if [ "$START" -eq "$START" ] 2>/dev/null && [ "$END" -eq "$END" 2>/dev/null ]; then
-               i=$START
-               while [ "$i" -le "$END" ]; do
-                 VOLUME_LIST="$VOLUME_LIST ${PREFIX}${i}${SUFFIX}"
-                 i=$((i+1))
-               done
-           else
-               # Fallback if not numbers
-               VOLUME_LIST="$VOLUME_LIST $vol"
-           fi
-      else
-           VOLUME_LIST="$VOLUME_LIST $vol"
-      fi
+  # Manually expand {N...M} ranges since sh doesn't support brace expansion on
+  # variables. A single token can carry MORE than one range — the distributed
+  # form "http://rustfs{1...4}:9000/data/rustfs{0...3}" has two — so expand the
+  # FIRST range in each token and re-scan until no ranges remain. Operating on
+  # only the first brace (via #*{ / %%}* rather than ##*} / %}) is what keeps
+  # multi-range tokens intact; the previous single-pass expander collapsed them
+  # to "http://rustfs1" and silently dropped the disk path.
+  VOLUME_LIST="$VOLUME_LIST_RAW"
+  while echo "$VOLUME_LIST" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; do
+      NEXT_LIST=""
+      for vol in $VOLUME_LIST; do
+          if echo "$vol" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; then
+               PREFIX=${vol%%\{*}
+               REST=${vol#*\}}
+               RANGE=${vol#*\{}
+               RANGE=${RANGE%%\}*}
+               RANGE=$(echo "$RANGE" | sed 's/\.\.\./../')
+               START=${RANGE%%..*}
+               END=${RANGE##*..}
+
+               # Check if START and END are numbers
+               if [ "$START" -eq "$START" ] 2>/dev/null && [ "$END" -eq "$END" 2>/dev/null ]; then
+                   i=$START
+                   while [ "$i" -le "$END" ]; do
+                     NEXT_LIST="$NEXT_LIST ${PREFIX}${i}${REST}"
+                     i=$((i+1))
+                   done
+               else
+                   # Fallback if not numbers
+                   NEXT_LIST="$NEXT_LIST $vol"
+               fi
+          else
+               NEXT_LIST="$NEXT_LIST $vol"
+          fi
+      done
+      VOLUME_LIST="$NEXT_LIST"
   done
 
+  # CREATE_DIRS holds every local filesystem path that must exist before
+  # startup. DATA_VOLUMES holds only the paths that are also appended as CLI
+  # args (bare absolute paths). Distributed URL-form endpoints are read from
+  # RUSTFS_VOLUMES by rustfs directly, so they must NOT be appended as args,
+  # but their local path component still has to exist on disk — otherwise
+  # LocalDisk init aborts with VolumeNotFound (rustfs no longer auto-creates
+  # the disk root).
+  CREATE_DIRS=""
   for vol in $VOLUME_LIST; do
     case "$vol" in
-      /*) DATA_VOLUMES="$DATA_VOLUMES $vol" ;;
-      *)  : ;; # skip non-absolute paths (including http(s):// URLs)
+      /*)
+        DATA_VOLUMES="$DATA_VOLUMES $vol"
+        CREATE_DIRS="$CREATE_DIRS $vol"
+        ;;
+      *://*)
+        # e.g. http://node0:9000/data/rustfs0 -> /data/rustfs0
+        vol_rest=${vol#*://}
+        case "$vol_rest" in
+          */*) CREATE_DIRS="$CREATE_DIRS /${vol_rest#*/}" ;;
+          *)   : ;; # URL without a path component; nothing local to create
+        esac
+        ;;
+      *)  : ;; # skip anything else we don't recognize
     esac
   done
-  
-  echo "Initializing data directories:$DATA_VOLUMES"
-  for vol in $DATA_VOLUMES; do
+
+  echo "Initializing data directories:$CREATE_DIRS"
+  for vol in $CREATE_DIRS; do
     if [ ! -d "$vol" ]; then
       echo "  mkdir -p $vol"
       mkdir -p "$vol"

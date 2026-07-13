@@ -250,10 +250,9 @@ pub async fn check_object_lock_for_deletion(
                 let now = objectlock::utc_now_ntp();
                 let retain_until = if let Some(days) = default_retention.days {
                     mod_time.saturating_add(time::Duration::days(days as i64))
-                } else if let Some(years) = default_retention.years {
-                    add_years(mod_time, years)
                 } else {
-                    return None; // No retention period specified
+                    let years = default_retention.years?;
+                    add_years(mod_time, years)
                 };
 
                 if retain_until.unix_timestamp() > now.unix_timestamp()

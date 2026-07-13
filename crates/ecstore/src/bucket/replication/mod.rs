@@ -39,6 +39,7 @@ mod replication_storage_boundary;
 mod replication_tagging_boundary;
 mod replication_target_boundary;
 mod replication_target_config_bridge;
+pub(crate) mod replication_timing;
 mod replication_versioning_boundary;
 mod runtime_boundary;
 

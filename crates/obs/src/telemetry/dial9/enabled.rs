@@ -23,7 +23,7 @@ use super::config::Dial9Config;
 use super::state::{dial9_runtime_state, measure_disk_usage_bytes};
 use super::{EVENT_DIAL9_STATE, LOG_COMPONENT_OBS, LOG_SUBSYSTEM_DIAL9};
 use crate::TelemetryError;
-use dial9_tokio_telemetry::telemetry::{ProcessResourceUsageConfig, RotatingWriter, TaskDumpConfig, TracedRuntime};
+use dial9_tokio_telemetry::telemetry::{ProcessResourceUsageConfig, RotatingWriter, TracedRuntime};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -50,11 +50,6 @@ impl Dial9SessionGuard {
     /// Whether the underlying telemetry session is recording.
     pub fn is_active(&self) -> bool {
         self.guard.is_enabled()
-    }
-
-    /// The configuration this session was built from.
-    pub fn config(&self) -> &Dial9Config {
-        &self.config
     }
 }
 
@@ -115,18 +110,15 @@ pub fn build_traced_runtime(
         .with_runtime_name(RUNTIME_NAME)
         .with_process_resource_usage(ProcessResourceUsageConfig::default());
 
-    let traced = if config.task_dump_enabled {
-        traced.with_task_dumps(
-            TaskDumpConfig::builder()
-                .idle_threshold(config.task_dump_idle_threshold)
-                .build(),
-        )
-    } else {
-        traced
-    };
-
     // `build_and_start` rather than `build`: `build` returns a live guard that
     // never records, writing segments that contain only a header.
+    //
+    // No `with_task_dumps` here. dial9 captures a task dump only for futures it
+    // wrapped itself, i.e. those spawned via `dial9_tokio_telemetry::spawn`;
+    // `tokio::spawn` gets no wrapper. RustFS spawns with `tokio::spawn`
+    // throughout, so calling `with_task_dumps` records nothing. Measured on an
+    // identical workload: 0 dumps via `tokio::spawn`, 14709 via `dial9::spawn`.
+    // See rustfs/backlog#1157 (D9-16) and dial9-rs/dial9#477.
     //
     // No `with_s3_uploader` here: dial9's `worker-s3` feature carries a
     // vulnerable TLS stack. See the note in `crates/obs/Cargo.toml`.
@@ -165,7 +157,6 @@ fn finish_traced_runtime(
         output_dir = %config.output_dir,
         file_prefix = %config.file_prefix,
         disk_budget_bytes = config.total_disk_budget(),
-        task_dumps = config.task_dump_enabled,
         "dial9 state changed"
     );
 

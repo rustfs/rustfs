@@ -172,6 +172,8 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/storageinfo"),
         admin_route(Method::GET, "/v3/datausageinfo"),
         admin_route(Method::GET, "/v3/metrics"),
+        admin_route(Method::GET, "/v3/object-data-cache/stats"),
+        admin_route(Method::POST, "/v3/object-data-cache/flush"),
         admin_route(Method::GET, "/v3/pools/list"),
         admin_route(Method::GET, "/v3/pools/status"),
         admin_route(Method::GET, "/v3/decommission/status"),
@@ -270,6 +272,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/site-replication/peer/bucket-meta"),
         admin_route(Method::GET, "/v3/site-replication/peer/idp-settings"),
         admin_route(Method::PUT, "/v3/site-replication/edit"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/edit-capabilities"),
         admin_route(Method::PUT, "/v3/site-replication/peer/edit"),
         admin_route(Method::PUT, "/v3/site-replication/peer/remove"),
         admin_route(Method::PUT, "/v3/site-replication/resync/op"),
@@ -1190,6 +1193,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-meta"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/peer/idp-settings"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/edit"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/edit-capabilities"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/edit"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/remove"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/resync/op"));

@@ -55,6 +55,9 @@ pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
     context::set_test_outbound_tls_generation(generation);
 }
 
+#[cfg(test)]
+pub(crate) use context::install_test_app_context;
+
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     context::get_global_app_context()
 }

@@ -117,6 +117,14 @@ impl ObjectDataCacheMemorySnapshot {
 struct MemorySnapshotCell {
     total_bytes: AtomicU64,
     available_bytes: AtomicU64,
+    /// Bytes admitted by the gate since the last snapshot refresh. The snapshot
+    /// is sampled at most every 5 s, so a burst that begins while it still reads
+    /// high could all pass a plain check-then-act gate and over-allocate before
+    /// the next refresh. Subtracting this running total from `available_bytes`
+    /// shrinks the effective budget as the burst proceeds, bounding cumulative
+    /// admission to the real headroom; the refresh resets it because the fresh
+    /// reading already reflects those allocations (backlog#1107).
+    admitted_since_refresh: AtomicU64,
 }
 
 impl MemorySnapshotCell {
@@ -124,12 +132,16 @@ impl MemorySnapshotCell {
         Self {
             total_bytes: AtomicU64::new(snapshot.total_bytes),
             available_bytes: AtomicU64::new(snapshot.available_bytes),
+            admitted_since_refresh: AtomicU64::new(0),
         }
     }
 
+    /// Stores a fresh snapshot and resets the admitted-bytes counter: the new
+    /// reading already accounts for whatever was admitted since the last one.
     fn store(&self, snapshot: ObjectDataCacheMemorySnapshot) {
         self.total_bytes.store(snapshot.total_bytes, Ordering::Relaxed);
         self.available_bytes.store(snapshot.available_bytes, Ordering::Relaxed);
+        self.admitted_since_refresh.store(0, Ordering::Relaxed);
     }
 
     fn load(&self) -> ObjectDataCacheMemorySnapshot {
@@ -137,6 +149,14 @@ impl MemorySnapshotCell {
             total_bytes: self.total_bytes.load(Ordering::Relaxed),
             available_bytes: self.available_bytes.load(Ordering::Relaxed),
         }
+    }
+
+    fn admitted(&self) -> u64 {
+        self.admitted_since_refresh.load(Ordering::Relaxed)
+    }
+
+    fn reserve(&self, bytes: u64) {
+        self.admitted_since_refresh.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -153,7 +173,7 @@ impl Drop for RefresherGuard {
 /// Memory gate that keeps a cheap, lock-free snapshot for fill-path checks.
 ///
 /// The snapshot is sampled off the fill path by a dedicated periodic refresher
-/// (see [`spawn_refresher`](ObjectDataCacheMemoryGate::spawn_refresher)) that
+/// (the private `spawn_refresher` task) that
 /// runs the blocking `sysinfo` read on a `spawn_blocking` thread. `allows_fill`
 /// only reads atomics, so it never blocks a tokio worker and concurrent fills
 /// never serialize on a refresh.
@@ -242,7 +262,12 @@ impl ObjectDataCacheMemoryGate {
     ///
     /// This is lock-free and does no blocking sysinfo read: it only reads the
     /// atomic snapshot maintained by the periodic refresher.
-    pub fn allows_fill(&self, required_bytes: u64) -> bool {
+    ///
+    /// `cache_growth_headroom` is how many more bytes the cache itself can hold
+    /// before it is at capacity (`max_capacity - weighted_size()`). It caps how
+    /// far the in-window reservation may shrink the budget: see the reservation
+    /// note below.
+    pub fn allows_fill(&self, required_bytes: u64, cache_growth_headroom: u64) -> bool {
         // A zero floor opts out of the gate, so fill admission never depends on
         // a live memory reading — which differs between a host and a container.
         // This must short-circuit before any snapshot read (see 51a97a81c).
@@ -255,12 +280,36 @@ impl ObjectDataCacheMemoryGate {
             return true;
         }
 
+        // Effective budget is the snapshot's available memory minus what the
+        // gate has already admitted since that snapshot was taken. This bounds a
+        // burst that arrives faster than the 5 s refresh: each admission shrinks
+        // the budget the next one sees, so cumulative admission cannot exceed the
+        // real headroom even though every fill reads the same (stale) snapshot.
+        //
+        // `admitted_since_refresh` counts GROSS admitted bytes and never rolls
+        // back on a fill that is later evicted, cancelled, or loses the
+        // invalidation race; it only resets on the 5 s refresh. Under sustained
+        // churn (net footprint flat, far below capacity) the raw counter would
+        // balloon past the real memory the cache consumes and falsely trip the
+        // gate, skipping the hottest fills until the next refresh. The cache can
+        // never hold more than `max_capacity`, so a burst adds at most
+        // `cache_growth_headroom` bytes of real memory before moka evicts to stay
+        // bounded (net-zero churn beyond that point). Capping the deduction there
+        // keeps the reservation honest without treating gross churn as growth
+        // (backlog#1212).
+        let reserved = self.snapshot.admitted().min(cache_growth_headroom);
+        let effective_available = snapshot.available_bytes.saturating_sub(reserved);
+
         let min_free = u64::from(self.min_free_memory_percent);
-        let has_percent_budget = snapshot.available_bytes.saturating_mul(100) >= snapshot.total_bytes.saturating_mul(min_free);
-        let has_entry_budget = snapshot.available_bytes >= required_bytes;
+        let has_percent_budget = effective_available.saturating_mul(100) >= snapshot.total_bytes.saturating_mul(min_free);
+        let has_entry_budget = effective_available >= required_bytes;
         let allowed = has_percent_budget && has_entry_budget;
 
-        if !allowed {
+        if allowed {
+            // Reserve the admitted bytes so a concurrent fill sees a smaller
+            // budget; the reservation clears on the next snapshot refresh.
+            self.snapshot.reserve(required_bytes);
+        } else {
             record_memory_pressure(&self.stats, "moka");
         }
 
@@ -352,7 +401,7 @@ mod tests {
             available_bytes: 16 * 1024 * 1024,
         }));
 
-        assert!(!gate.allows_fill(1024));
+        assert!(!gate.allows_fill(1024, u64::MAX));
         assert_eq!(stats.snapshot().memory_pressure_events, 1);
     }
 
@@ -365,7 +414,7 @@ mod tests {
             available_bytes: 500,
         }));
 
-        assert!(gate.allows_fill(100));
+        assert!(gate.allows_fill(100, u64::MAX));
     }
 
     #[test]
@@ -385,7 +434,7 @@ mod tests {
             available_bytes: 1,
         }));
 
-        assert!(gate.allows_fill(512));
+        assert!(gate.allows_fill(512, u64::MAX));
         assert_eq!(stats.snapshot().memory_pressure_events, 0);
     }
 
@@ -398,8 +447,65 @@ mod tests {
             available_bytes: 100,
         }));
 
-        assert!(!gate.allows_fill(128));
+        assert!(!gate.allows_fill(128, u64::MAX));
         assert_eq!(stats.snapshot().memory_pressure_events, 1);
+    }
+
+    // backlog#1212: `admitted_since_refresh` counts GROSS admitted bytes and
+    // never rolls back on an evicted/cancelled/lost-race fill, so a churn window
+    // (net footprint flat, far below capacity) balloons the raw counter past the
+    // memory the cache actually holds. Deducting it wholesale falsely trips the
+    // gate; capping the deduction at the cache's growth headroom fixes it.
+    #[test]
+    fn reservation_deduction_capped_at_growth_headroom_avoids_false_pressure() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::clone(&stats));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000_000,
+            available_bytes: 500_000, // 50% free, well above the 20% floor
+        }));
+        // A churn window admitted far more GROSS bytes than the cache can hold;
+        // repeated insert/evict never rolled the counter back, so it now dwarfs
+        // the real available memory even though the live footprint stays tiny.
+        gate.snapshot.reserve(10_000_000);
+
+        // Uncapped, the raw gross counter swamps the budget and falsely signals
+        // memory pressure even though the cache's net footprint is flat.
+        assert!(
+            !gate.allows_fill(1_000, u64::MAX),
+            "raw gross admitted-bytes deduction should falsely suppress (the bug being fixed)"
+        );
+
+        // Capping the deduction at the cache's growth headroom (net size flat,
+        // far below capacity) restores admission: gross churn is no longer
+        // mistaken for real memory growth.
+        assert!(
+            gate.allows_fill(1_000, 100_000),
+            "capping the reservation at cache growth headroom must not falsely suppress"
+        );
+    }
+
+    // backlog#1212: capping the deduction must not defeat the reservation under
+    // genuine cache growth. When the cache still has room to grow, the in-window
+    // reservation must still shrink the budget so a burst cannot over-admit.
+    #[test]
+    fn reservation_still_bounds_burst_within_growth_headroom() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let gate = ObjectDataCacheMemoryGate::new(&ObjectDataCacheConfig::default(), Arc::clone(&stats));
+        gate.set_test_snapshot(Some(ObjectDataCacheMemorySnapshot {
+            total_bytes: 1_000_000,
+            available_bytes: 300_000, // 30% free; floor is 20% = 200_000
+        }));
+        // The cache can still grow well past the reserved amount, so the cap does
+        // not bind and the reservation is deducted in full.
+        gate.snapshot.reserve(150_000);
+
+        // 300_000 available - 150_000 reserved = 150_000 effective, below the
+        // 200_000 floor: the reservation must still suppress the fill.
+        assert!(
+            !gate.allows_fill(1_000, u64::MAX),
+            "reservation must still bound a burst while the cache can genuinely grow"
+        );
     }
 
     // ODC-14: `allows_fill` must read the atomic snapshot without performing an
@@ -419,7 +525,7 @@ mod tests {
         gate.store_raw_snapshot_for_test(sentinel);
 
         // Exercise the gate on the atomic path (no test_override installed).
-        let _ = gate.allows_fill(1);
+        let _ = gate.allows_fill(1, u64::MAX);
 
         let after = gate.raw_snapshot_for_test();
         assert_eq!(

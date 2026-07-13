@@ -16,7 +16,7 @@ use bytes::Bytes;
 use rustfs_object_data_cache::{
     ObjectDataCache, ObjectDataCacheConfig, ObjectDataCacheConfigError, ObjectDataCacheFillResult, ObjectDataCacheGetPlan,
     ObjectDataCacheGetRequest, ObjectDataCacheIdentity, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult,
-    ObjectDataCacheLookup, ObjectDataCacheMode,
+    ObjectDataCacheLookup, ObjectDataCacheMode, ObjectDataCacheStatsSnapshot,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
@@ -44,9 +44,14 @@ pub(crate) struct ObjectDataCacheAdapter {
 
 impl ObjectDataCacheAdapter {
     /// Creates an adapter from validated cache configuration.
+    ///
+    /// ODC-24 (backlog#1129): the engine's size eligibility is clamped to the
+    /// in-memory GET fill limits so a `max_entry_bytes` above them is not
+    /// reported as eligible while fill could never materialize the body.
     pub(crate) fn new(config: ObjectDataCacheConfig) -> Result<Self, ObjectDataCacheConfigError> {
+        let fill_ceiling = resolve_fill_ceiling_bytes(config.max_entry_bytes);
         Ok(Self {
-            cache: Arc::new(ObjectDataCache::new(config)?),
+            cache: Arc::new(ObjectDataCache::new(config)?.with_fill_ceiling_bytes(fill_ceiling)),
         })
     }
 
@@ -120,12 +125,75 @@ impl ObjectDataCacheAdapter {
     ) -> ObjectDataCacheInvalidationResult {
         self.cache.invalidate_object(identity, reason).await
     }
+
+    /// Executes an engine-level prefix invalidation (ODC-27).
+    pub(crate) async fn invalidate_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
+        self.cache.invalidate_prefix(bucket, prefix, reason).await
+    }
+
+    /// Executes an engine-level bucket invalidation (ODC-28).
+    pub(crate) async fn invalidate_bucket(
+        &self,
+        bucket: &str,
+        reason: ObjectDataCacheInvalidationReason,
+    ) -> ObjectDataCacheInvalidationResult {
+        self.cache.invalidate_bucket(bucket, reason).await
+    }
+
+    /// Drops every cached body and resets the identity index (ODC-C2 flush).
+    pub(crate) async fn clear(&self, reason: ObjectDataCacheInvalidationReason) -> ObjectDataCacheInvalidationResult {
+        self.cache.clear(reason).await
+    }
+
+    /// Current cache statistics snapshot (ODC-C2 admin stats).
+    pub(crate) fn stats(&self) -> ObjectDataCacheStatsSnapshot {
+        self.cache.stats()
+    }
+
+    /// Configured runtime mode (ODC-C2 admin stats).
+    pub(crate) fn mode(&self) -> ObjectDataCacheMode {
+        self.cache.mode()
+    }
 }
 
 impl ObjectDataCacheAdapter {
     fn from_config_or_disabled(config: ObjectDataCacheConfig, source: &str) -> Arc<Self> {
+        let mode = config.mode;
+        let max_entry_bytes = config.max_entry_bytes;
+        // `Self::new` applies the ODC-24 fill-ceiling clamp; this startup path
+        // only adds the resolved-config logging on top.
         match Self::new(config) {
-            Ok(adapter) => Arc::new(adapter),
+            Ok(adapter) => {
+                if !adapter.is_disabled() {
+                    let ceiling = resolve_fill_ceiling_bytes(max_entry_bytes);
+                    // ODC-19: log the resolved mode at startup, and warn when the
+                    // operator explicitly selected the never-filling HitOnly mode.
+                    tracing::info!(source, ?mode, "object data cache enabled");
+                    // ODC-24: warn when the excess above the effective ceiling is inert.
+                    if max_entry_bytes > ceiling {
+                        warn!(
+                            source,
+                            max_entry_bytes,
+                            effective_fill_ceiling = ceiling,
+                            "RUSTFS_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES exceeds the in-memory GET fill limit; \
+                             bodies above the effective cap are planned SkipTooLarge"
+                        );
+                    }
+                    if mode == ObjectDataCacheMode::HitOnly {
+                        warn!(
+                            source,
+                            "object data cache mode 'hit_only' never populates the cache; it only \
+                             serves as a runtime-downgrade target and keeps a permanent 0% hit rate"
+                        );
+                    }
+                }
+                Arc::new(adapter)
+            }
             Err(err) => {
                 warn!(
                     error = %err,
@@ -136,6 +204,17 @@ impl ObjectDataCacheAdapter {
             }
         }
     }
+}
+
+/// Resolves the effective fill ceiling from the app-layer in-memory GET fill
+/// limits: `min(max_entry_bytes, seek-support threshold, 64 MiB buffer cap)`
+/// (backlog#1129 / ODC-24). The concurrency-driven shrink of the fill threshold
+/// is dynamic and cannot be captured here, so this static ceiling is the
+/// conservative floor.
+fn resolve_fill_ceiling_bytes(max_entry_bytes: u64) -> u64 {
+    let seek_threshold = crate::app::object_usecase::object_seek_support_threshold() as u64;
+    let hard_cap = u64::try_from(crate::app::object_usecase::MAX_GET_OBJECT_MEMORY_BUFFER_BYTES).unwrap_or(u64::MAX);
+    max_entry_bytes.min(seek_threshold).min(hard_cap)
 }
 
 impl Default for ObjectDataCacheAdapter {
@@ -210,9 +289,13 @@ fn object_data_cache_config_from_values(values: ObjectDataCacheEnvValues) -> Obj
             config.mode = ObjectDataCacheMode::Disabled;
         }
         Some(true) if !mode_explicit => {
-            // Enable flag without an explicit mode: start at the safest
-            // enabled stage instead of silently staying disabled.
-            config.mode = ObjectDataCacheMode::HitOnly;
+            // Enable flag without an explicit mode: start at the safest stage
+            // that actually populates the cache. `HitOnly` never fills, so it
+            // would keep a permanent 0% hit rate and pay per-GET overhead for
+            // nothing (backlog#1124 / ODC-19). `FillBufferedOnly` fills only
+            // from bodies the GET path already buffered — no extra
+            // materialization — so it is both safe and effective.
+            config.mode = ObjectDataCacheMode::FillBufferedOnly;
         }
         _ => {}
     }
@@ -382,13 +465,67 @@ mod tests {
     }
 
     #[test]
-    fn object_data_cache_enable_true_without_mode_defaults_to_hit_only() {
+    fn object_data_cache_enable_true_without_mode_defaults_to_fill_buffered_only() {
+        // ODC-19 (backlog#1124): ENABLE=true with no explicit mode must default
+        // to a mode that actually populates the cache. HitOnly never fills.
         let config = object_data_cache_config_from_values(ObjectDataCacheEnvValues {
             enabled: Some(true),
             ..ObjectDataCacheEnvValues::default()
         });
 
-        assert_eq!(config.mode, ObjectDataCacheMode::HitOnly);
+        assert_eq!(config.mode, ObjectDataCacheMode::FillBufferedOnly);
+    }
+
+    #[test]
+    fn resolve_fill_ceiling_clamps_large_max_entry_bytes() {
+        // ODC-24 (backlog#1129): a max_entry_bytes above the in-memory GET fill
+        // limits is clamped down; the ceiling never exceeds the 64 MiB hard cap.
+        let huge = 512 * 1024 * 1024;
+        let ceiling = super::resolve_fill_ceiling_bytes(huge);
+        assert!(ceiling < huge, "a huge max_entry_bytes must be clamped down");
+        assert!(
+            ceiling <= u64::try_from(crate::app::object_usecase::MAX_GET_OBJECT_MEMORY_BUFFER_BYTES).unwrap(),
+            "the ceiling must not exceed the 64 MiB hard cap"
+        );
+    }
+
+    #[test]
+    fn resolve_fill_ceiling_leaves_small_max_entry_bytes_untouched() {
+        // A small max_entry_bytes is already below the fill limits, so it is the
+        // binding constraint and passes through unchanged.
+        assert_eq!(super::resolve_fill_ceiling_bytes(4096), 4096);
+    }
+
+    #[test]
+    fn startup_adapter_clamps_plan_eligibility_to_fill_ceiling() {
+        // ODC-24: an adapter built on the startup path with a `max_entry_bytes`
+        // above the in-memory GET fill limits must plan a gap-sized object
+        // `SkipTooLarge`, not `Cacheable` — otherwise it reports eligible while
+        // it can never fill.
+        let adapter = ObjectDataCacheAdapter::from_config_or_disabled(
+            ObjectDataCacheConfig {
+                mode: ObjectDataCacheMode::HitOnly,
+                max_bytes: 200 * 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 128 * 1024 * 1024,
+                ..ObjectDataCacheConfig::default()
+            },
+            "test",
+        );
+
+        // 32 MiB is within max_entry_bytes (128 MiB) but above the effective
+        // ceiling (<= 64 MiB hard cap, and the 10 MiB default seek threshold).
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "bucket",
+            object: "object",
+            version_id: None,
+            etag: "etag",
+            size: 32 * 1024 * 1024,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        assert_eq!(plan, rustfs_object_data_cache::ObjectDataCacheGetPlan::SkipTooLarge);
     }
 
     #[test]
@@ -453,7 +590,7 @@ mod tests {
         temp_env::with_vars(vars, || {
             let config = object_data_cache_config_from_env().expect("valid numeric env should be applied");
 
-            assert_eq!(config.mode, ObjectDataCacheMode::HitOnly);
+            assert_eq!(config.mode, ObjectDataCacheMode::FillBufferedOnly);
             assert_eq!(config.max_entry_bytes, 2_097_152);
         });
     }

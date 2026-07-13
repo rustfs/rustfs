@@ -192,7 +192,7 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
-type InlineBitrotReader = coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>;
+type InlineBitrotReader = coding::BitrotReader<crate::io_support::bitrot::ShardReader>;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
@@ -429,7 +429,13 @@ const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJEC
 // --- Codec Streaming Configuration ---
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false; // Disabled until rollout gates are ready
+// Emergency kill-switch, not the primary enablement knob. The single switch that
+// turns codec streaming on/off is `RUSTFS_GET_CODEC_STREAMING_ROLLOUT` (default
+// `off`). This flag defaults to `true` and only exists to force-disable the fast
+// path regardless of rollout (set to `false`). Body/header compatibility is
+// confirmed by the GET codec-streaming parity e2e net + bench A/B (backlog#1183),
+// so it no longer gates enablement. See `get_codec_streaming_reader_gate`.
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
@@ -439,6 +445,10 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: usize = MI_B;
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
 
+// Primary single switch for the codec-streaming GET fast path. `off` (default)
+// keeps GET on the legacy duplex path; `on` (aliases `full`/`production`, plus
+// the legacy `internal`/`benchmark`) opts it in. Combine with
+// `..._ROLLOUT_PCT` for a partial (percentage-based) rollout.
 const ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "off";
 
@@ -918,18 +928,35 @@ fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
 fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
     let rollout = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT);
     match rollout.trim() {
+        // Clean production token. `internal`/`benchmark` remain accepted aliases
+        // for backward compatibility; all three opt the fast path in.
+        value
+            if value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("full")
+                || value.eq_ignore_ascii_case("production") =>
+        {
+            GetCodecStreamingRollout::On
+        }
         value if value.eq_ignore_ascii_case("internal") => GetCodecStreamingRollout::Internal,
         value if value.eq_ignore_ascii_case("benchmark") => GetCodecStreamingRollout::Benchmark,
         _ => GetCodecStreamingRollout::Off,
     }
 }
 
+/// Emergency kill-switch (defaults to `true`). Set
+/// `RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED=false` to force the fast path
+/// off. Body compatibility is confirmed by the parity e2e net + bench (backlog#1183),
+/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
 fn is_get_codec_streaming_body_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, false)
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, true)
 }
 
+/// Emergency kill-switch (defaults to `true`). Set
+/// `RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=false` to force the fast path
+/// off. Header compatibility is confirmed by the parity e2e net + bench (backlog#1183),
+/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
 fn is_get_codec_streaming_header_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, false)
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, true)
 }
 
 fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
@@ -954,7 +981,11 @@ enum GetCodecStreamingDecision {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GetCodecStreamingRollout {
+    /// Default. Codec streaming disabled; GET uses the legacy duplex path.
     Off,
+    /// Production enablement token (`on`/`full`/`production`).
+    On,
+    /// Backward-compatible aliases that also opt the fast path in.
     Internal,
     Benchmark,
 }

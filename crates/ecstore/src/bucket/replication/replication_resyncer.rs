@@ -318,6 +318,20 @@ impl ReplicationResyncer {
                 return Ok(());
             }
 
+            if state.resync_status == ResyncStatusType::ResyncCanceled && status != ResyncStatusType::ResyncCanceled {
+                debug!(
+                    event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %opts.bucket,
+                    arn = %opts.arn,
+                    incoming_status = %status,
+                    reason = "canceled_status_is_terminal",
+                    "Skipped resync status update after cancellation"
+                );
+                return Ok(());
+            }
+
             if state.resync_id.is_empty() {
                 state.resync_id = opts.resync_id.clone();
             }
@@ -339,7 +353,24 @@ impl ReplicationResyncer {
             (bucket_status.clone(), status_duration)
         };
 
-        save_resync_status(&opts.bucket, &bucket_status, obj_layer).await?;
+        save_resync_status(&opts.bucket, &bucket_status, obj_layer.clone()).await?;
+        if status != ResyncStatusType::ResyncCanceled {
+            let canceled_status = self
+                .status_map
+                .read()
+                .await
+                .get(&opts.bucket)
+                .filter(|current| {
+                    current.targets_map.get(&opts.arn).is_some_and(|target| {
+                        target.resync_id == opts.resync_id && target.resync_status == ResyncStatusType::ResyncCanceled
+                    })
+                })
+                .cloned();
+            if let Some(canceled_status) = canceled_status {
+                save_resync_status(&opts.bucket, &canceled_status, obj_layer).await?;
+                return Ok(());
+            }
+        }
         if let Some(stats) = runtime_sources::replication_stats() {
             stats.record_resync_status(&opts.bucket, status, status_duration).await;
         }
@@ -1317,7 +1348,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
     let mut join_set = JoinSet::new();
 
     // Process each target
-    for (_, tgt_entry) in dsc.targets_map.iter() {
+    for tgt_entry in dsc.targets_map.values() {
         // Skip targets that should not be replicated
         if !tgt_entry.replicate {
             continue;

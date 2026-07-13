@@ -15,6 +15,9 @@
 use crate::cluster::rpc::build_auth_headers;
 use crate::disk::error::{Error, Result};
 use crate::disk::{FileReader, FileWriter};
+use crate::storage_api_contracts::internode::{
+    WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
+};
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_config::{
@@ -22,6 +25,7 @@ use rustfs_config::{
     KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
 use rustfs_rio::{HttpReader, HttpWriter};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -180,7 +184,17 @@ fn build_put_file_stream_url(request: &WriteStreamRequest) -> String {
 }
 
 fn build_walk_dir_url(request: &WalkDirStreamRequest) -> String {
-    format!("{}{}?disk={}", request.endpoint, WALK_DIR_PATH, urlencoding::encode(&request.disk))
+    let body_sha256 = hex_simd::encode_to_string(Sha256::digest(&request.body), hex_simd::AsciiCase::Lower);
+    format!(
+        "{}{}?disk={}&{}={}&{}={}",
+        request.endpoint,
+        WALK_DIR_PATH,
+        urlencoding::encode(&request.disk),
+        WALK_DIR_STREAM_COMPLETION_QUERY,
+        WALK_DIR_STREAM_COMPLETION_V1,
+        WALK_DIR_BODY_SHA256_QUERY,
+        body_sha256
+    )
 }
 
 fn json_headers() -> HeaderMap {
@@ -300,7 +314,11 @@ mod tests {
 
         assert_eq!(
             url,
-            "http://node1:9000/rustfs/rpc/walk_dir?disk=http%3A%2F%2Fnode1%3A9000%2Fdata%2Frustfs0"
+            concat!(
+                "http://node1:9000/rustfs/rpc/walk_dir?disk=http%3A%2F%2Fnode1%3A9000%2Fdata%2Frustfs0",
+                "&walk_dir_stream_completion=error-v1",
+                "&walk_dir_body_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )
         );
     }
 

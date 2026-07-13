@@ -131,7 +131,7 @@ pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> 
 /// Resolve object data cache adapter using AppContext-first precedence.
 #[expect(
     dead_code,
-    reason = "ST-05 exposes the global resolver; app use sites start in later cache phases"
+    reason = "admin/app read sites resolve through the _for_context variant re-exported by runtime_sources"
 )]
 pub(crate) fn resolve_object_data_cache_handle() -> Option<Arc<ObjectDataCacheAdapter>> {
     let context = get_global_app_context();

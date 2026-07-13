@@ -82,6 +82,11 @@ impl AppContext {
         // Let ecstore probe this cache inside get_object_reader, after
         // metadata resolution but before the erasure data read (backlog#802).
         crate::app::object_data_cache::register_object_data_cache_body_hook(Arc::clone(&object_data_cache));
+        // Let ecstore's internal delete paths (lifecycle/scanner expiry,
+        // noncurrent-version cleanup, restored-copy expiry) drop the removed
+        // object's cached body instead of leaving it resident until TTL
+        // (ODC-26, backlog#1131).
+        crate::app::object_data_cache::register_object_data_cache_mutation_hook(Arc::clone(&object_data_cache));
 
         Self {
             object_store,
@@ -368,4 +373,18 @@ pub fn publish_global_app_context(context: Arc<AppContext>) -> Arc<AppContext> {
 /// Get global application context if it has been initialized.
 pub fn get_global_app_context() -> Option<Arc<AppContext>> {
     APP_CONTEXT_SINGLETON.get().cloned()
+}
+
+/// Test-only: initialize IAM around the given store, build a
+/// default-interface context, and publish it as the process-global context so
+/// usecases constructed via `from_global()` resolve this store
+/// (rustfs/backlog#1148 ilm-1).
+#[cfg(test)]
+pub async fn install_test_app_context(object_store: Arc<ECStore>) {
+    let iam = rustfs_iam::init_iam_sys(object_store.clone())
+        .await
+        .expect("init IAM system for test AppContext");
+    let kms = Arc::new(KmsServiceManager::new());
+    let context = AppContext::with_default_interfaces(object_store, iam, kms);
+    publish_global_app_context(Arc::new(context));
 }

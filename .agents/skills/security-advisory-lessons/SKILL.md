@@ -26,7 +26,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 
 ### 1. Scope the change
 - Identify touched routes, protocol frontends, handlers, storage paths, credentials, logs, browser surfaces, CI/release code, and policy checks.
-- Treat these paths as security-sensitive by default: `rustfs/src/admin/`, `rustfs/src/storage/`, `rustfs/src/auth.rs`, `rustfs/src/server/layer.rs`, `crates/iam/`, `crates/policy/`, `crates/credentials/`, `crates/ecstore/src/rpc/`, `crates/protocols/`, `crates/rio/`, and console preview/auth code.
+- Treat these paths as security-sensitive by default: `rustfs/src/admin/`, `rustfs/src/storage/`, `rustfs/src/auth.rs`, `rustfs/src/server/layer.rs`, `crates/iam/`, `crates/policy/`, `crates/credentials/`, `crates/ecstore/src/rpc/`, `crates/protocols/`, `crates/rio/`, OIDC/STS federation code, and console preview/auth code.
 
 ### 2. Map to advisory classes
 - Read [advisory-patterns.md](references/advisory-patterns.md) for matching GHSA lessons.
@@ -59,9 +59,15 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 
 ### IAM and service accounts
 - Treat imported IAM payload fields as attacker-controlled: `parent`, `claims`, `accessKey`, `secretKey`, status, policy names, and groups.
-- For service account create/update/import, prove parent ownership or root/admin authority before writing credentials or claims.
+- For service account create/update/import, prove parent ownership or root/admin authority before writing credentials or claims; an action permission alone must not allow choosing root or another user as `target_user`.
 - Do not let `deny_only` or "no explicit deny" become an allow decision that skips required allow checks.
 - Test cross-user list/update/import flows with wrong, correct, self, parent, and root identities.
+
+### STS, OIDC, and federation flows
+- Every STS endpoint must have an explicit authentication story: SigV4 where required, OIDC token verification for web identity, and role/session policy validation before issuing credentials.
+- JWT session tokens must be signed and verified by a trusted issuer/key path, not by service-account-controlled material or a reused root secret.
+- Public OIDC bootstrap and callback routes must treat `Host`, `X-Forwarded-Proto`, redirect targets, `state`, and callback parameters as untrusted; credential-bearing redirects require a configured, allowlisted origin.
+- OIDC discovery and validation URLs are SSRF sinks. Resolve and classify hostnames at connection time, reject rebinding to loopback/private/link-local ranges, and do not rely on literal string checks.
 
 ### S3 copy, multipart, and presigned POST
 - Multipart copy must enforce source `GetObject` and destination `PutObject` semantics equivalent to `CopyObject`, including copy-source and policy conditions.
@@ -113,6 +119,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 
 ### Trusted proxy and network identity
 - Only honor `X-Forwarded-For` or `X-Real-IP` when the request came from a configured trusted proxy.
+- Apply the same trusted-proxy rule to scheme and host derivation; direct clients must not control security-sensitive redirects through `Host`, `X-Forwarded-Host`, or `X-Forwarded-Proto`.
 - Direct clients must use the socket peer address for `aws:SourceIp` and policy condition evaluation.
 - Add tests for direct spoofed headers and trusted-proxy headers.
 
@@ -130,6 +137,8 @@ Use these prompts while reviewing a diff:
 - Does a public/default/empty config change security behavior from fail-closed to fail-open?
 - Is any attacker-controlled value later used as a path, policy condition, credential identity, log field, URL, Origin, or response body?
 - Does this response contain stored replication, remote target, or service credentials that need redaction or stricter authorization?
+- Can this STS/OIDC path issue credentials without SigV4, trusted issuer validation, allowlisted redirects, or trusted-proxy host/scheme handling?
+- Does this outbound validation path resolve attacker-supplied hostnames and reject private, loopback, link-local, and rebound addresses at the actual connection boundary?
 - Is an archive entry, object key, or policy resource normalized differently between authorization and storage?
 - Is the same operation implemented in multiple paths, such as `CopyObject` vs `UploadPartCopy`, and do all paths enforce the same security contract?
 - Does a preview or browser-surface fix preserve the original security invariant when adding alternate viewers or file-type detection?

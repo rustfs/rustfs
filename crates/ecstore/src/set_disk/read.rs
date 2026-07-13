@@ -3771,7 +3771,10 @@ mod tests {
 
         temp_env::async_with_vars(
             [
-                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, data_blocks_first.then_some("true")),
+                (
+                    ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+                    Some(if data_blocks_first { "true" } else { "false" }),
+                ),
                 (
                     ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP,
                     codec_data_blocks_first.then_some("true"),
@@ -4837,13 +4840,62 @@ mod tests {
     }
 
     #[test]
-    fn codec_streaming_reader_gate_defaults_to_disabled() {
+    fn codec_streaming_reader_gate_defaults_to_off() {
+        // With no env set the `..._ROLLOUT` switch defaults to `off`, so GET stays
+        // on the legacy duplex path. The compat kill-switches now default to
+        // confirmed (backlog#1183), so the fallback reason is the rollout switch,
+        // not the retired `Disabled`/`*Unconfirmed` reasons.
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_enabled_by_rollout_switch_alone() {
+        // The single switch: `..._ROLLOUT=on` opts the fast path in with the
+        // ENABLE / *_COMPAT_CONFIRMED kill-switches left unset (they default on).
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Use
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_force_disabled_by_enable_kill_switch() {
+        // Even with the rollout switch on, `ENABLE=false` force-disables the fast path.
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
             ],
             || {

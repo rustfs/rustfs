@@ -31,8 +31,21 @@
 //!
 //! Trace segments are written to disk continuously and evicted oldest-first
 //! once `RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE * RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT`
-//! bytes are retained. Under a high poll rate the budget can wrap in minutes,
-//! so size it against the window you need to capture.
+//! bytes are retained. Measured at ~0.16 MiB/s (13k events/s) under a 66 MiB/s
+//! warp workload, so the default 1 GiB budget wraps after roughly 108 minutes.
+//! Scale that by your own event rate before relying on a long capture.
+//!
+//! # What it does not see
+//!
+//! A drive stall does not show up here. RustFS performs disk I/O on the blocking
+//! pool and through io_uring, never on an async worker, so a slow drive does not
+//! lengthen any poll. Injecting 200 ms of drive latency cut throughput by 64%
+//! and left the poll-duration distribution unchanged. Use the `rustfs_io_*`
+//! metrics and the drive-stall budget for that; dial9 answers a different
+//! question — which task held a worker, and for how long.
+//!
+//! Task dumps would answer *where* it was stuck, but dial9 only captures them
+//! for futures spawned through its own `spawn`. See rustfs/backlog#1157 (D9-16).
 //!
 //! # Known observability gap
 //!
@@ -43,6 +56,7 @@
 //! is therefore no `writer_healthy` metric: it could only ever be hard-coded to
 //! `1`. Watch `rustfs_dial9_disk_usage_bytes` — a session that is recording but
 //! whose disk usage stops growing has most likely hit this state.
+//! Reported upstream as dial9-rs/dial9#658.
 
 mod config;
 mod state;

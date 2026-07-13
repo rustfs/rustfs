@@ -36,7 +36,9 @@ use crate::erasure::coding::{self, bitrot_verify};
 use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
-use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
+#[cfg(target_os = "linux")]
+use metrics::gauge;
+use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     get_file_info, read_xl_meta_no_data_sync,
@@ -65,7 +67,7 @@ use tokio::fs::{self, File};
 #[cfg(not(unix))]
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -242,6 +244,10 @@ const EVENT_DISK_LOCAL_RENAME_REJECTED: &str = "disk_local_rename_rejected";
 const EVENT_DISK_LOCAL_READ_VERSION_FALLBACK: &str = "disk_local_read_version_fallback";
 #[cfg(target_os = "linux")]
 const EVENT_DISK_LOCAL_DIRECT_IO_FALLBACK: &str = "disk_local_direct_io_fallback";
+/// A disk latched io_uring off at runtime and now reads via StdBackend
+/// (rustfs/backlog#1172). The gray-release signal operators watch for.
+#[cfg(target_os = "linux")]
+const EVENT_DISK_LOCAL_URING_LATCH_OFF: &str = "disk_local_uring_latch_off";
 const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
 const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
 const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
@@ -249,6 +255,28 @@ const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_fail
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
 const METRIC_GET_OBJECT_MMAP_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_mmap_page_faults_total";
 const METRIC_GET_OBJECT_DIRECT_READ_PAGE_FAULTS_TOTAL: &str = "rustfs_io_get_object_direct_read_page_faults_total";
+// io_uring read-backend gray-release observability (rustfs/backlog#1172).
+#[cfg(target_os = "linux")]
+const METRIC_URING_LATCH_TOTAL: &str = "rustfs_io_uring_latch_off_total";
+#[cfg(target_os = "linux")]
+const METRIC_URING_FALLBACK_TOTAL: &str = "rustfs_io_uring_read_fallback_total";
+#[cfg(target_os = "linux")]
+const METRIC_URING_IN_FLIGHT: &str = "rustfs_io_uring_in_flight";
+#[cfg(target_os = "linux")]
+const METRIC_URING_CQ_OVERFLOW: &str = "rustfs_io_uring_cq_overflow";
+#[cfg(target_os = "linux")]
+const METRIC_URING_CANCEL_ALREADY: &str = "rustfs_io_uring_cancel_already";
+/// Read-side EINVAL/EOPNOTSUPP from a native O_DIRECT read that happened AFTER a
+/// successful O_DIRECT open (rustfs/backlog#1214). Unlike an open-time refusal
+/// (unsupported filesystem), this most likely means an alignment bug in the
+/// aligned read path, so it is surfaced with a counter + warn instead of a
+/// once-per-disk debug trace.
+#[cfg(target_os = "linux")]
+const METRIC_URING_DIRECT_READ_EINVAL_TOTAL: &str = "rustfs_io_uring_direct_read_einval_total";
+/// How often the per-disk driver StatsSnapshot is exported to metrics
+/// (rustfs/backlog#1172).
+#[cfg(target_os = "linux")]
+const URING_STATS_EXPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[inline(always)]
 fn record_mmap_copy_stage(metrics: MmapCopyStageMetrics, stage: &'static str, started_at: Option<std::time::Instant>) {
@@ -423,14 +451,46 @@ enum LocalReadCopyMethod {
     DirectReadCopy,
 }
 
-/// Check if O_DIRECT reads are enabled.
-fn is_direct_io_read_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE)
+/// Snapshot an env-sourced read-path switch once, then serve it from memory.
+///
+/// The value comes from the process environment, which is fixed at launch, so a
+/// per-read `std::env::var` (a global lock plus a `String` allocation, and for
+/// bools a `to_ascii_lowercase`) is pure hot-path tax at the IOPS these reads run
+/// at. In production the closure runs once via `LazyLock`; under `cfg(test)` it
+/// runs every call so `temp_env` overrides stay observable and tests keep their
+/// isolation. Invalid-value fallback (backlog#1130) lives in the closure, so it
+/// is identical on both paths.
+macro_rules! cached_read_env {
+    ($(#[$meta:meta])* fn $name:ident() -> $ty:ty = $read:expr;) => {
+        $(#[$meta])*
+        #[inline]
+        fn $name() -> $ty {
+            fn read_env() -> $ty {
+                $read
+            }
+            #[cfg(test)]
+            {
+                read_env()
+            }
+            #[cfg(not(test))]
+            {
+                static VALUE: std::sync::LazyLock<$ty> = std::sync::LazyLock::new(read_env as fn() -> $ty);
+                *VALUE
+            }
+        }
+    };
 }
 
-/// Check if O_DIRECT shard/part data writes are enabled.
-fn is_direct_io_write_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE)
+cached_read_env! {
+    /// Check if O_DIRECT reads are enabled.
+    fn is_direct_io_read_enabled() -> bool =
+        rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE);
+}
+
+cached_read_env! {
+    /// Check if O_DIRECT shard/part data writes are enabled.
+    fn is_direct_io_write_enabled() -> bool =
+        rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE);
 }
 
 /// Enable the runtime-probed io_uring read backend (backlog#1104). Default:
@@ -447,6 +507,16 @@ const DEFAULT_RUSTFS_IO_URING_READ_ENABLE: bool = false;
 /// capacity (2×), so CQ overflow is structurally unreachable.
 #[cfg(target_os = "linux")]
 const URING_QUEUE_DEPTH: u32 = 128;
+
+/// Maximum bytes handed to the driver in a single op on the buffered read path
+/// (rustfs/backlog#1174). Backpressure permits count OPS, not bytes, and the
+/// driver zero-fills a full-size buffer per op, so an unbounded single read could
+/// pin ~length bytes per permit. Reads at or below this cap take the fast
+/// single-op, zero-copy path; larger reads are split into sequential chunks so
+/// worst-case in-flight memory is bounded by `permits x this` per shard. Set high
+/// so ordinary shard reads are never chunked.
+#[cfg(target_os = "linux")]
+const URING_MAX_OP_LEN: usize = 128 << 20;
 
 /// Number of independent io_uring rings (each with its own driver thread) to run
 /// per disk (backlog#1145).
@@ -772,21 +842,30 @@ pub(crate) fn effective_durability(volume: &str) -> DurabilityMode {
     bucket_durability::lookup(volume).unwrap_or(global)
 }
 
-/// Get the O_DIRECT read threshold size.
-fn get_direct_io_read_threshold() -> usize {
-    rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD)
+cached_read_env! {
+    /// Get the O_DIRECT read threshold size.
+    fn get_direct_io_read_threshold() -> usize =
+        rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD);
+}
+
+cached_read_env! {
+    /// Whether mmap reads should fault the mapping in with `MAP_POPULATE`.
+    fn mmap_populate_enabled() -> bool =
+        rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE);
 }
 
 fn should_populate_mmap_read(length: usize) -> bool {
-    length > 0 && rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE)
+    length > 0 && mmap_populate_enabled()
 }
 
-fn local_read_copy_method() -> LocalReadCopyMethod {
-    let method = rustfs_utils::get_env_str(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY);
-    match method.as_str() {
-        RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY => LocalReadCopyMethod::DirectReadCopy,
-        _ => LocalReadCopyMethod::MmapCopy,
-    }
+cached_read_env! {
+    fn local_read_copy_method() -> LocalReadCopyMethod = {
+        let method = rustfs_utils::get_env_str(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY);
+        match method.as_str() {
+            RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY => LocalReadCopyMethod::DirectReadCopy,
+            _ => LocalReadCopyMethod::MmapCopy,
+        }
+    };
 }
 
 /// Runtime state for the true O_DIRECT read path (Linux only).
@@ -1416,6 +1495,10 @@ fn should_fail_before_old_metadata_backup(_dst_path: &str) -> bool {
 /// build, but the arming static and [`should_crash_rename_data_at`] are
 /// `#[cfg(test)]`; in production the guard is a const-`false` no-op, so the
 /// injection points compile away to nothing.
+// The `After<step>` naming is deliberate: every crash point names the
+// commit-sequence step it fires immediately after, so the shared prefix is the
+// point, not noise.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenameDataCrashPoint {
     /// After the data dir has been renamed into its destination but before the
@@ -1426,6 +1509,14 @@ pub(crate) enum RenameDataCrashPoint {
     /// commit rename that makes the new version visible. Still pre-commit, so a
     /// crash here must also leave the object readable as the old version.
     AfterBackupBeforeMetaCommit,
+    /// After the xl.meta commit rename has made the new version visible, in the
+    /// same window the graceful [`should_fail_after_metadata_commit`] failpoint
+    /// covers — but as a hard power loss with **no** rollback. The commit rename
+    /// already landed on disk, so a crash here must leave the object readable as
+    /// the *new* version. This is the post-commit counterpart to the two
+    /// pre-commit points above, closing the "old or new, never mixed" invariant
+    /// (rustfs/backlog#878) from the new-version side.
+    AfterMetaCommit,
 }
 
 #[cfg(test)]
@@ -1612,25 +1703,36 @@ impl<R: AsyncRead + Unpin> AsyncRead for StallTimeoutReader<R> {
 }
 
 fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
-    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "ok".to_string()).increment(1);
-    counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => kind.to_string()).increment(reclaim_len as u64);
-    metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => kind.to_string())
-        .record(started.elapsed().as_secs_f64());
+    // Runs per read-stream page-cache reclaim window; skip the whole emission
+    // (three metric-key constructions) when general metrics are disabled.
+    if !rustfs_io_metrics::metrics_enabled() {
+        return;
+    }
+    // `kind`, "ok" and "err" are all `&'static str`; the `metrics` macros take
+    // static label values directly, so pass them as-is instead of allocating a
+    // `String` per reclaim.
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind, "result" => "ok").increment(1);
+    counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => kind).increment(reclaim_len as u64);
+    metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => kind).record(started.elapsed().as_secs_f64());
 }
 
 fn record_file_cache_reclaim_error(kind: &'static str) {
-    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "err".to_string()).increment(1);
+    if !rustfs_io_metrics::metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind, "result" => "err").increment(1);
 }
 
-fn bitrot_size_mismatch_retry_count() -> usize {
-    rustfs_utils::get_env_u64(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT) as usize
+cached_read_env! {
+    fn bitrot_size_mismatch_retry_count() -> usize =
+        rustfs_utils::get_env_u64(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT) as usize;
 }
 
-fn bitrot_size_mismatch_retry_delay() -> Duration {
-    Duration::from_millis(rustfs_utils::get_env_u64(
+cached_read_env! {
+    fn bitrot_size_mismatch_retry_delay() -> Duration = Duration::from_millis(rustfs_utils::get_env_u64(
         ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
         DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
-    ))
+    ));
 }
 
 fn is_bitrot_size_mismatch_error(err: &std::io::Error) -> bool {
@@ -1857,23 +1959,38 @@ impl AsyncWrite for FileCacheReclaimWriter {
     }
 }
 
+cached_read_env! {
+    fn file_cache_reclaim_write_enabled() -> bool = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+    );
+}
+
 fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
     if file_size <= 0 {
         return false;
     }
 
-    if !rustfs_utils::get_env_bool(
-        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
-        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
-    ) {
+    if !file_cache_reclaim_write_enabled() {
         return false;
     }
 
-    let threshold = rustfs_utils::get_env_usize(
+    // Same threshold as the read-side reclaim (backlog#1182): reuse its snapshot.
+    file_size as usize >= file_cache_reclaim_threshold()
+}
+
+cached_read_env! {
+    fn file_cache_reclaim_read_enabled() -> bool = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+    );
+}
+
+cached_read_env! {
+    fn file_cache_reclaim_threshold() -> usize = rustfs_utils::get_env_usize(
         rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
         rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
     );
-    file_size as usize >= threshold
 }
 
 fn should_reclaim_file_cache_after_read(length: usize) -> bool {
@@ -1881,18 +1998,11 @@ fn should_reclaim_file_cache_after_read(length: usize) -> bool {
         return false;
     }
 
-    if !rustfs_utils::get_env_bool(
-        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
-        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
-    ) {
+    if !file_cache_reclaim_read_enabled() {
         return false;
     }
 
-    let threshold = rustfs_utils::get_env_usize(
-        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
-        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
-    );
-    length >= threshold
+    length >= file_cache_reclaim_threshold()
 }
 
 /// Write-open semantics for [`LocalIoBackend::open_write`].
@@ -1951,6 +2061,16 @@ pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
     ///
     /// Backends that hold no descriptors ignore both methods.
     fn invalidate_cached_fds_under(&self, _volume: &str, _path: &str) {}
+
+    /// Drop every descriptor for `volume` — used when the whole bucket tree is
+    /// removed (`delete_volume`), where the exact object paths are unknown
+    /// (rustfs/backlog#1177).
+    fn invalidate_cached_fds_for_volume(&self, _volume: &str) {}
+
+    /// Drop ALL cached descriptors. Called when this disk instance is retired
+    /// (`close`) so a replacement instance's invalidations are never defeated by
+    /// this one continuing to serve stale fds (rustfs/backlog#1177).
+    async fn clear_cached_fds(&self) {}
 }
 
 /// Default [`LocalIoBackend`]: tokio blocking-pool file I/O plus the
@@ -2562,9 +2682,6 @@ impl LocalIoBackend for StdBackend {
     }
 }
 
-/// Runtime-probed io_uring read backend (backlog#1104).
-///
-/// Wraps a [`StdBackend`] for everything except positioned reads, which go
 /// Enable the per-disk descriptor cache for io_uring reads (backlog#1145).
 #[cfg(target_os = "linux")]
 const ENV_RUSTFS_IO_URING_FD_CACHE: &str = "RUSTFS_IO_URING_FD_CACHE";
@@ -2588,6 +2705,22 @@ fn is_io_uring_fd_cache_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_IO_URING_FD_CACHE, DEFAULT_RUSTFS_IO_URING_FD_CACHE)
 }
 
+/// Whether the soft `RLIMIT_NOFILE` has enough headroom to run the fd cache
+/// safely (rustfs/backlog#1178). The cache holds up to `FD_CACHE_CAPACITY` (512)
+/// descriptors PER DISK and `try_new` cannot know the disk count, so a low limit
+/// (the common 1024 default on a bare-metal / non-systemd run) would exhaust fds
+/// with just a couple of disks. Require ample headroom before enabling it;
+/// otherwise fall back to open-per-read. The packaged systemd unit sets
+/// 1,048,576, so tuned deployments are unaffected.
+#[cfg(target_os = "linux")]
+fn rlimit_allows_fd_cache() -> bool {
+    const MIN_SOFT_NOFILE: u64 = 16 << 10;
+    match rustix::process::getrlimit(rustix::process::Resource::Nofile).current {
+        Some(soft) => soft >= MIN_SOFT_NOFILE,
+        None => true, // no soft limit (unlimited)
+    }
+}
+
 /// Drop `offset..offset+length` from the page cache after an io_uring read,
 /// mirroring what `StdBackend::pread_bytes` does for the same range
 /// (backlog#1145).
@@ -2604,10 +2737,25 @@ fn reclaim_read_range(file: &std::fs::File, offset: u64, length: usize) -> Resul
     use rustix::fs::{Advice, fadvise};
 
     let length = u64::try_from(length).map_err(|_| DiskError::other("read reclaim length overflow"))?;
-    let Some(length) = NonZeroU64::new(length) else {
+    if length == 0 {
+        return Ok(());
+    }
+    // Page-align the reclaim window down to the containing page, matching
+    // StdBackend's mmap reclaim `[aligned_offset, offset + length)`
+    // (rustfs/backlog#1173). fadvise(DONTNEED) only drops fully-covered pages, so
+    // reclaiming the raw unaligned range would leave the head partial page
+    // resident that the mmap path drops — divergent residency for the same read
+    // (bitrot shards' 32-byte block headers keep offsets off page boundaries, so
+    // this is the common case, not a corner case).
+    let page = mmap_page_size()?;
+    let aligned_offset = offset - (offset % page);
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| DiskError::other("read reclaim range overflow"))?;
+    let Some(aligned_len) = NonZeroU64::new(end - aligned_offset) else {
         return Ok(());
     };
-    fadvise(file, offset, Some(length), Advice::DontNeed)
+    fadvise(file, aligned_offset, Some(aligned_len), Advice::DontNeed)
         .map_err(std::io::Error::from)
         .map_err(DiskError::from)
 }
@@ -2654,19 +2802,32 @@ struct FdKey {
 #[cfg(target_os = "linux")]
 struct FdCache {
     cache: moka::future::Cache<FdKey, Arc<std::fs::File>>,
+    /// Bumped by every invalidation. A miss-path open snapshots this before it
+    /// opens and refuses to insert if it moved, so an fd opened before a
+    /// heal/delete commit can never be resurrected into the cache after the
+    /// commit's invalidation ran (open-then-insert race, rustfs/backlog#1176).
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(target_os = "linux")]
 impl FdCache {
     fn new() -> Self {
+        Self::with_ttl(FD_CACHE_TTL)
+    }
+
+    /// Build a cache with an explicit TTL backstop. Production goes through
+    /// `new` (`FD_CACHE_TTL`); tests inject a short TTL to exercise the backstop
+    /// eviction (rustfs/backlog#1180) without a multi-second wait.
+    fn with_ttl(ttl: std::time::Duration) -> Self {
         Self {
             cache: moka::future::Cache::builder()
                 .max_capacity(FD_CACHE_CAPACITY)
-                .time_to_live(FD_CACHE_TTL)
+                .time_to_live(ttl)
                 // Required for `invalidate_entries_if`; without it that call
                 // fails at runtime instead of dropping stale descriptors.
                 .support_invalidation_closures()
                 .build(),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2674,13 +2835,33 @@ impl FdCache {
         self.cache.get(key).await
     }
 
-    async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
-        self.cache.insert(key, file).await;
+    /// Current invalidation generation, snapshotted by the miss path before it
+    /// opens a descriptor (rustfs/backlog#1176).
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Insert a freshly-opened descriptor only if no invalidation happened since
+    /// it was opened (rustfs/backlog#1176). An invalidate that ran during the
+    /// open bumped the generation, so a stale pre-heal/pre-delete inode is never
+    /// cached. The post-insert re-check closes the tiny window where an
+    /// invalidate races the insert itself, by removing the entry we just added.
+    async fn insert_if_fresh(&self, key: FdKey, file: Arc<std::fs::File>, gen_at_open: u64) {
+        if self.generation.load(Ordering::Acquire) != gen_at_open {
+            return;
+        }
+        self.cache.insert(key.clone(), file).await;
+        if self.generation.load(Ordering::Acquire) != gen_at_open {
+            self.cache.invalidate(&key).await;
+        }
     }
 
     /// Drop the descriptor for exactly this path. Preferred wherever the caller
     /// knows the keys: unlike a predicate it costs nothing on later reads.
     async fn invalidate_exact(&self, volume: &str, path: &str) {
+        // Bump BEFORE the moka invalidation so a concurrent miss-path insert
+        // that snapshotted the old generation is refused (rustfs/backlog#1176).
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.cache
             .invalidate(&FdKey {
                 volume: volume.to_owned(),
@@ -2700,6 +2881,9 @@ impl FdCache {
     /// re-evaluated by subsequent `get`s, so registering one per write would tax
     /// the read path.
     fn invalidate_under(&self, volume: &str, prefix: &str) {
+        // Bump before registering the predicate so a concurrent miss-path insert
+        // that snapshotted the old generation is refused (rustfs/backlog#1176).
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let volume = volume.to_owned();
         let prefix = prefix.trim_end_matches('/').to_owned();
         let matches = move |k: &FdKey, _: &Arc<std::fs::File>| {
@@ -2713,6 +2897,32 @@ impl FdCache {
         }
     }
 
+    /// Drop every descriptor for `volume` — the whole bucket is gone
+    /// (rustfs/backlog#1177).
+    fn invalidate_volume(&self, volume: &str) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        let volume = volume.to_owned();
+        let matches = move |k: &FdKey, _: &Arc<std::fs::File>| k.volume == volume;
+        if self.cache.invalidate_entries_if(matches).is_err() {
+            self.cache.invalidate_all();
+        }
+    }
+
+    /// Drop ALL descriptors — this disk instance is being retired
+    /// (rustfs/backlog#1177).
+    fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.cache.invalidate_all();
+    }
+
+    /// Unconditional insert. Production reads go through `insert_if_fresh` (the
+    /// generation guard, rustfs/backlog#1176); this bare primitive is only for
+    /// tests that drive the cache directly.
+    #[cfg(test)]
+    async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
+        self.cache.insert(key, file).await;
+    }
+
     #[cfg(test)]
     async fn entry_count(&self) -> u64 {
         self.cache.run_pending_tasks().await;
@@ -2720,6 +2930,9 @@ impl FdCache {
     }
 }
 
+/// Runtime-probed io_uring read backend (backlog#1104).
+///
+/// Wraps a [`StdBackend`] for everything except positioned reads, which go
 /// through rustfs-uring's cancel-safe `UringDriver`. Constructed only when
 /// `RUSTFS_IO_URING_READ_ENABLE` is set AND the per-disk probe succeeds; on any
 /// per-read driver error a read falls back to the inner `StdBackend`, so
@@ -2729,8 +2942,17 @@ impl FdCache {
 #[cfg(target_os = "linux")]
 pub(crate) struct UringBackend {
     root: PathBuf,
+    /// Caches `root.display().to_string()` for the metric `"root"` label. `root`
+    /// never changes after construction, so formatting the `Path` on every
+    /// fallback emission is pure waste (rustfs/backlog#1185).
+    root_label: String,
     inner: StdBackend,
-    driver: Arc<rustfs_uring::UringDriver>,
+    /// Wrapped in `ManuallyDrop` so `Drop` can move the (last) `Arc` onto a
+    /// blocking thread: `UringDriver`'s own `Drop` joins its driver threads and
+    /// can block up to the bounded-drain timeout on a hung disk, which must never
+    /// run on a tokio worker during disk reconnect/shutdown (backlog#1170).
+    /// `ManuallyDrop` derefs transparently, so read call sites are unchanged.
+    driver: std::mem::ManuallyDrop<Arc<rustfs_uring::UringDriver>>,
     /// Runtime degradation latch (backlog#1101). Starts `true`; once a read
     /// returns a restriction-class errno (io_uring became unusable on this
     /// disk), it is set `false` and all further reads go straight to
@@ -2746,6 +2968,14 @@ pub(crate) struct UringBackend {
     /// `active` gates io_uring as a whole, this gates only the native O_DIRECT
     /// read shape.
     direct_uring: DirectIoReadState,
+    /// Count of reads that completed through the native io_uring + O_DIRECT path
+    /// (`pread_uring_direct`) on this disk (rustfs/backlog#1213). Incremented only
+    /// on success, so a value `> 0` is proof the native path actually executed
+    /// rather than silently degrading to the StdBackend fallback. Tests assert on
+    /// it to avoid a vacuous pass on filesystems that reject O_DIRECT; it also
+    /// gives a gray release a positive signal that the O_DIRECT tier is serving
+    /// reads instead of only ever counting fallbacks.
+    native_direct_reads: std::sync::atomic::AtomicU64,
     /// Per-disk descriptor cache (backlog#1145). `None` when
     /// `RUSTFS_IO_URING_FD_CACHE` is off, which restores the open-per-read path.
     fd_cache: Option<FdCache>,
@@ -2760,17 +2990,41 @@ pub(crate) struct UringBackend {
 static URING_UNSUPPORTED_DISKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
-/// True when a runtime io_uring read error means io_uring itself is unusable on
-/// this disk (→ latch off), as opposed to a per-read/file error `StdBackend`
-/// would hit too (backlog#1101). Restriction-class errnos only; data errors
-/// (EIO), missing files, and parameter errors do NOT latch. Mirrors the shape
-/// of [`is_direct_io_unsupported`].
+/// True when a runtime io_uring read error means the io_uring SUBSYSTEM is
+/// unusable on this disk (→ latch off), as opposed to a per-read/file error
+/// `StdBackend` would hit too (backlog#1101, narrowed in #1171). Data errors
+/// (EIO), missing files, and parameter errors do NOT latch.
+///
+/// Deliberately narrower than the probe-time restriction class (C7 in the driver
+/// warns the two must not be conflated): EACCES/EPERM at read time on an
+/// already-open fd are usually per-file (an LSM hooks security_file_permission on
+/// every read), and StdBackend would hit the same denial, so EACCES does NOT
+/// latch the whole disk. EPERM is kept because a seccomp/LSM policy applied after
+/// startup blocks io_uring_enter subsystem-wide. EOPNOTSUPP is classified
+/// per-path by the caller (O_DIRECT shape vs subsystem), so it is not latched
+/// here.
 #[cfg(target_os = "linux")]
 fn is_io_uring_unsupported(err: &std::io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
-    )
+    matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM))
+}
+
+/// Resolve `volume`/`path` to the on-disk object path, running the same volume
+/// access and path-length checks `StdBackend::pread_bytes` does before opening
+/// (backlog#1102/#1145).
+///
+/// Blocking (`access_std` stats the volume dir), so it is called inside the
+/// `spawn_blocking` closures of both io_uring read paths. It is the one piece
+/// they genuinely share; each caller opens the returned path its own way
+/// (buffered vs `O_DIRECT`) and maps the error into its own type.
+#[cfg(target_os = "linux")]
+fn resolve_uring_object_path(root: &Path, volume: &str, path: &str) -> Result<PathBuf> {
+    let volume_dir = local_disk_bucket_path(root, volume)?;
+    if !skip_access_checks(volume) {
+        access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+    }
+    let file_path = local_disk_object_path(root, volume, path)?;
+    check_path_length(file_path.to_string_lossy().as_ref())?;
+    Ok(file_path)
 }
 
 #[cfg(target_os = "linux")]
@@ -2779,6 +3033,28 @@ impl std::fmt::Debug for UringBackend {
         f.debug_struct("UringBackend")
             .field("root", &self.root)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for UringBackend {
+    fn drop(&mut self) {
+        // Take the driver Arc out and, if we are on a tokio runtime, drop it on a
+        // blocking thread. `UringDriver::Drop` sends Shutdown and joins each
+        // driver thread; on a hung disk that join can block up to the bounded
+        // drain timeout, which must not stall a runtime worker during disk
+        // reconnect/shutdown (backlog#1170). Off-runtime (tests, plain threads) a
+        // synchronous join is fine.
+        // SAFETY: `ManuallyDrop::take` runs exactly once, here in `Drop`, and the
+        // field is never used again.
+        #[allow(unsafe_code)]
+        let driver = unsafe { std::mem::ManuallyDrop::take(&mut self.driver) };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || drop(driver));
+            }
+            Err(_) => drop(driver),
+        }
     }
 }
 
@@ -2807,14 +3083,41 @@ impl UringBackend {
                     shards,
                     "io_uring read backend enabled"
                 );
+                // Gate the fd cache on RLIMIT_NOFILE headroom (rustfs/backlog#1178):
+                // 512 fds/disk with a low soft limit and several disks would hit
+                // EMFILE. Fall back to open-per-read when the limit is too small.
+                let fd_cache = if is_io_uring_fd_cache_enabled() {
+                    if rlimit_allows_fd_cache() {
+                        Some(FdCache::new())
+                    } else {
+                        warn!(
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            root = %root.display(),
+                            "io_uring fd cache disabled: RLIMIT_NOFILE soft limit too low for 512 fds/disk; using open-per-read"
+                        );
+                        None
+                    }
+                } else {
+                    None
+                };
+                let driver = Arc::new(driver);
+                // Periodically export the driver StatsSnapshot to metrics so a
+                // gray release is not flying blind (rustfs/backlog#1172).
+                Self::spawn_stats_exporter(&driver, root.clone());
+                // Compute the metric label once, before `root` moves into the
+                // struct (rustfs/backlog#1185).
+                let root_label = root.display().to_string();
                 Some(Self {
                     inner: StdBackend::new(root.clone()),
                     root,
-                    driver: Arc::new(driver),
+                    root_label,
+                    driver: std::mem::ManuallyDrop::new(driver),
                     active: std::sync::atomic::AtomicBool::new(true),
                     fallback_logged: std::sync::atomic::AtomicBool::new(false),
                     direct_uring: DirectIoReadState::new(),
-                    fd_cache: is_io_uring_fd_cache_enabled().then(FdCache::new),
+                    native_direct_reads: std::sync::atomic::AtomicU64::new(0),
+                    fd_cache,
                 })
             }
             Err(err) => {
@@ -2826,21 +3129,135 @@ impl UringBackend {
                         error = ?err,
                         "io_uring unavailable (restricted environment); using StdBackend"
                     );
+                    // Only a genuine environment restriction is permanently
+                    // negative-cached: it will not change without a restart.
+                    URING_UNSUPPORTED_DISKS
+                        .lock()
+                        .expect("uring probe cache mutex poisoned")
+                        .insert(root);
                 } else {
+                    // An unexpected error may be transient (ENOMEM/EMFILE under
+                    // startup fd/memory pressure, ring/eventfd setup, a partial
+                    // shard start). Do NOT latch the disk off io_uring forever;
+                    // fall back for now and let the next LocalDisk reconstruction
+                    // (disk reconnect) re-probe (rustfs/backlog#1171).
                     warn!(
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
                         root = %root.display(),
                         error = ?err,
-                        "io_uring probe failed unexpectedly; using StdBackend"
+                        "io_uring probe failed unexpectedly; using StdBackend (will re-probe on reconnect)"
                     );
                 }
-                URING_UNSUPPORTED_DISKS
-                    .lock()
-                    .expect("uring probe cache mutex poisoned")
-                    .insert(root);
                 None
             }
+        }
+    }
+
+    /// Latch io_uring off for this whole disk, logging the transition once at
+    /// warn (rustfs/backlog#1172). Without this the only signal operators ever
+    /// see is the startup "backend enabled" line, which stays true on dashboards
+    /// even after the first read latched the disk back to StdBackend forever.
+    /// `swap` makes the log fire exactly once, on the true -> false edge.
+    fn latch_active_off(&self, io_err: &std::io::Error) {
+        if self.active.swap(false, Ordering::Relaxed) {
+            counter!(METRIC_URING_LATCH_TOTAL, "root" => self.root.display().to_string()).increment(1);
+            warn!(
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                event = EVENT_DISK_LOCAL_URING_LATCH_OFF,
+                root = %self.root.display(),
+                error = ?io_err,
+                "io_uring latched off for this disk; all reads now use StdBackend"
+            );
+        }
+    }
+
+    /// Count an io_uring -> StdBackend read fallback, so a gray release can see
+    /// how much traffic is actually on io_uring vs falling back
+    /// (rustfs/backlog#1172).
+    fn record_uring_fallback(&self) {
+        // Clone the cached label (one alloc of a short string) instead of
+        // re-formatting the `Path` per read (rustfs/backlog#1185).
+        counter!(METRIC_URING_FALLBACK_TOTAL, "root" => self.root_label.clone()).increment(1);
+    }
+
+    /// Spawn a low-frequency task that exports the per-disk driver StatsSnapshot
+    /// (in-flight, cq_overflow, submit_errors, cancel_already) to metrics so the
+    /// gray release has runtime signal (rustfs/backlog#1172). The task holds only
+    /// a `Weak` reference, so it never keeps the driver alive; when the last
+    /// strong reference is gone it stops on the next tick. Any temporary strong
+    /// reference it takes to read stats is dropped on the blocking pool so that,
+    /// if it turns out to be the last one, `UringDriver::Drop`'s thread join never
+    /// runs on an async worker (rustfs/backlog#1170).
+    fn spawn_stats_exporter(driver: &Arc<rustfs_uring::UringDriver>, root: PathBuf) {
+        // try_new may be constructed outside a tokio runtime (some unit tests
+        // build the backend directly); only run the exporter when a runtime is
+        // present. Production always constructs it from async LocalDisk::new.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(driver);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(URING_STATS_EXPORT_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(driver) = weak.upgrade() else {
+                    break;
+                };
+                let s = driver.stats();
+                tokio::task::spawn_blocking(move || drop(driver));
+                // submit_errors is exported once the pinned rustfs-uring is bumped
+                // to a release that carries it (rustfs/backlog#1172, #1181).
+                let root = root.display().to_string();
+                gauge!(METRIC_URING_IN_FLIGHT, "root" => root.clone()).set(s.in_flight as f64);
+                gauge!(METRIC_URING_CQ_OVERFLOW, "root" => root.clone()).set(s.cq_overflow as f64);
+                gauge!(METRIC_URING_CANCEL_ALREADY, "root" => root).set(s.cancel_already as f64);
+            }
+        });
+    }
+
+    /// Classify an O_DIRECT read-side error and latch the right path off, matching
+    /// StdBackend (rustfs/backlog#1171). An O_DIRECT-shape error (EINVAL/EOPNOTSUPP)
+    /// latches only the native direct path; a genuine subsystem error latches
+    /// io_uring as a whole. Shared by the single-op and chunked read paths so the
+    /// classification lives in one place (rustfs/backlog#1174).
+    fn classify_direct_read_error(&self, io_err: &std::io::Error) {
+        if is_direct_io_unsupported(io_err) {
+            // This helper is only ever reached from the READ side: the O_DIRECT
+            // `open` in `pread_uring_direct` already succeeded, and an open-time
+            // refusal is handled separately as `DirectOpenError::ODirectRefused`
+            // before any read is issued. So an EINVAL/EOPNOTSUPP arriving here is
+            // a *read-time* error on an fd the kernel accepted for O_DIRECT. That
+            // is far more likely an alignment bug in the aligned read path than a
+            // filesystem that does not support O_DIRECT -- yet the old code
+            // latched the whole disk's native path off with only a once-per-disk
+            // debug trace, making a real correctness bug effectively invisible
+            // (rustfs/backlog#1214).
+            //
+            // Diagnostics only: the fallback behaviour is unchanged. The native
+            // O_DIRECT path is still latched off and the caller still falls back
+            // to StdBackend for this and every future eligible read. We only make
+            // the event observable -- a counter plus a once-per-disk `warn!`
+            // instead of a silent `debug!` -- so an operator can see an alignment
+            // regression rather than a mystery latency/CPU shift from buffered
+            // reads.
+            counter!(METRIC_URING_DIRECT_READ_EINVAL_TOTAL, "root" => self.root_label.clone()).increment(1);
+            if !self.direct_uring.fallback_logged.swap(true, Ordering::Relaxed) {
+                warn!(
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    root = %self.root.display(),
+                    error = ?io_err,
+                    "io_uring O_DIRECT read returned EINVAL/EOPNOTSUPP AFTER a successful O_DIRECT open; \
+                     this is more likely an alignment bug than an unsupported filesystem. Latching the \
+                     native O_DIRECT path off and reading via StdBackend (logged once per disk)"
+                );
+            }
+            self.direct_uring.supported.store(false, Ordering::Relaxed);
+        } else if is_io_uring_unsupported(io_err) {
+            self.latch_active_off(io_err);
         }
     }
 
@@ -2865,30 +3282,34 @@ impl UringBackend {
         //     unreachable keeps serving its already-open descriptors for at most
         //     `FD_CACHE_TTL`, after which the re-open re-runs the check. Disk
         //     health is tracked independently of this per-read probe.
-        let key = self.fd_cache.as_ref().map(|_| FdKey {
-            volume: volume.to_owned(),
-            path: path.to_owned(),
-            direct: false,
+        // The cache handle and its lookup key travel together: `Some` exactly when
+        // the fd cache is enabled, so neither use site below re-checks presence.
+        let cache_entry = self.fd_cache.as_ref().map(|cache| {
+            let key = FdKey {
+                volume: volume.to_owned(),
+                path: path.to_owned(),
+                direct: false,
+            };
+            (cache, key)
         });
-        let cached = match (self.fd_cache.as_ref(), key.as_ref()) {
-            (Some(cache), Some(key)) => cache.get(key).await,
-            _ => None,
+        let cached = match &cache_entry {
+            Some((cache, key)) => cache.get(key).await,
+            None => None,
         };
 
         let file = match cached {
             Some(file) => file,
             None => {
+                // Snapshot the cache generation BEFORE opening (rustfs/backlog#1176):
+                // if a heal/delete invalidation runs while this open is in flight,
+                // the generation moves and insert_if_fresh refuses to cache the
+                // now-stale descriptor.
+                let gen_at_open = cache_entry.as_ref().map(|(cache, _)| cache.generation());
                 let root = self.root.clone();
                 let volume_owned = volume.to_owned();
                 let path_owned = path.to_owned();
                 let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-                    let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
-                    if !skip_access_checks(&volume_owned) {
-                        access_std(&volume_dir)
-                            .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
-                    }
-                    let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
-                    check_path_length(file_path.to_string_lossy().as_ref())?;
+                    let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned)?;
                     let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
                     let meta = file.metadata().map_err(DiskError::from)?;
                     let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
@@ -2900,30 +3321,72 @@ impl UringBackend {
                 .await
                 .map_err(|e| DiskError::other(format!("uring pread join error: {e}")))??;
                 let file = Arc::new(file);
-                if let (Some(cache), Some(key)) = (self.fd_cache.as_ref(), key) {
-                    cache.insert(key, Arc::clone(&file)).await;
+                if let (Some((cache, key)), Some(gen_at_open)) = (cache_entry, gen_at_open) {
+                    cache.insert_if_fresh(key, Arc::clone(&file), gen_at_open).await;
                 }
                 file
             }
         };
 
         if length == 0 {
+            // Parity with StdBackend and the miss path (rustfs/backlog#1173): a
+            // zero-length read still rejects an offset past EOF. The miss path
+            // validated `meta.len() < end_offset` (end_offset == offset here), but
+            // a cache hit skipped it — so fstat the descriptor and match. This is
+            // a rare path (callers do not issue zero-length reads), so the one
+            // extra fstat is negligible.
+            match file.metadata() {
+                Ok(meta) if offset_u64 > meta.len() => return Err(DiskError::FileCorrupt),
+                Ok(_) => {}
+                Err(e) => return Err(DiskError::from(e)),
+            }
             return Ok(Bytes::new());
         }
 
         // The driver consumes the handle; keep one for the post-read reclaim.
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = match self.driver.read_at(file, offset_u64, length).await {
-            Ok(bytes) => bytes,
-            Err(io_err) => {
-                // Latch io_uring off for this disk if the errno says the
-                // subsystem is unusable (backlog#1101); the caller falls back
-                // to StdBackend for this and every future read.
-                if is_io_uring_unsupported(&io_err) {
-                    self.active.store(false, Ordering::Relaxed);
+        let bytes = if length <= URING_MAX_OP_LEN {
+            // Fast path: one op. The driver's Vec becomes the result with no copy.
+            match self.driver.read_at(file, offset_u64, length).await {
+                Ok(bytes) => bytes,
+                Err(io_err) => {
+                    // Latch io_uring off for this disk if the errno says the
+                    // subsystem is unusable (backlog#1101); the caller falls back
+                    // to StdBackend for this and every future read.
+                    if is_io_uring_unsupported(&io_err) {
+                        self.latch_active_off(&io_err);
+                    }
+                    return Err(DiskError::from(io_err));
                 }
-                return Err(DiskError::from(io_err));
             }
+        } else {
+            // Very large read: split into sequential chunks so a single op cannot
+            // pin ~length bytes of driver buffer, bounding worst-case in-flight
+            // memory (rustfs/backlog#1174). Chunks are awaited one at a time, so
+            // only one is in flight per read.
+            let mut assembled = Vec::with_capacity(length);
+            let mut done = 0usize;
+            while done < length {
+                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk_off = offset_u64 + done as u64;
+                let part = match self.driver.read_at(Arc::clone(&file), chunk_off, chunk).await {
+                    Ok(part) => part,
+                    Err(io_err) => {
+                        if is_io_uring_unsupported(&io_err) {
+                            self.latch_active_off(&io_err);
+                        }
+                        return Err(DiskError::from(io_err));
+                    }
+                };
+                if part.len() != chunk {
+                    // A short chunk before the end means EOF: the file is shorter
+                    // than offset + length, same as the miss path's meta check.
+                    return Err(DiskError::FileCorrupt);
+                }
+                assembled.extend_from_slice(&part);
+                done += chunk;
+            }
+            assembled
         };
         if bytes.len() != length {
             // The driver resubmits short reads, so a short result means EOF: the
@@ -2968,13 +3431,7 @@ impl UringBackend {
 
         let opened = tokio::task::spawn_blocking(move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
             use std::os::unix::fs::OpenOptionsExt;
-            let volume_dir = local_disk_bucket_path(&root, &volume_owned).map_err(DirectOpenError::Disk)?;
-            if !skip_access_checks(&volume_owned) {
-                access_std(&volume_dir)
-                    .map_err(|e| DirectOpenError::Disk(DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied))))?;
-            }
-            let file_path = local_disk_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
-            check_path_length(file_path.to_string_lossy().as_ref()).map_err(DirectOpenError::Disk)?;
+            let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
             let file = match std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
@@ -3024,14 +3481,40 @@ impl UringBackend {
 
         let file = Arc::new(file);
         let file_for_reclaim = Arc::clone(&file);
-        let bytes = match self.driver.read_at_direct(file, offset_u64, length, align).await {
-            Ok(bytes) => bytes,
-            Err(io_err) => {
-                if is_io_uring_unsupported(&io_err) {
-                    self.active.store(false, Ordering::Relaxed);
+        let bytes = if length <= URING_MAX_OP_LEN {
+            // Fast path: one op. The driver's Vec becomes the result with no copy.
+            match self.driver.read_at_direct(Arc::clone(&file), offset_u64, length, align).await {
+                Ok(bytes) => bytes,
+                Err(io_err) => {
+                    self.classify_direct_read_error(&io_err);
+                    return Err(DiskError::from(io_err));
                 }
-                return Err(DiskError::from(io_err));
             }
+        } else {
+            // Split a very large O_DIRECT read into sequential chunks so a single
+            // op cannot pin ~length bytes of driver buffer, bounding worst-case
+            // in-flight memory (rustfs/backlog#1174). read_at_direct aligns each
+            // chunk's sub-range internally; chunk sizes are a multiple of
+            // URING_MAX_OP_LEN, so boundary re-reads are at most one block.
+            let mut assembled = Vec::with_capacity(length);
+            let mut done = 0usize;
+            while done < length {
+                let chunk = (length - done).min(URING_MAX_OP_LEN);
+                let chunk_off = offset_u64 + done as u64;
+                let part = match self.driver.read_at_direct(Arc::clone(&file), chunk_off, chunk, align).await {
+                    Ok(part) => part,
+                    Err(io_err) => {
+                        self.classify_direct_read_error(&io_err);
+                        return Err(DiskError::from(io_err));
+                    }
+                };
+                if part.len() != chunk {
+                    return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
+                }
+                assembled.extend_from_slice(&part);
+                done += chunk;
+            }
+            assembled
         };
         if bytes.len() != length {
             return Err(DiskError::other("io_uring O_DIRECT returned a short read"));
@@ -3041,6 +3524,10 @@ impl UringBackend {
         if should_reclaim_file_cache_after_read(length) {
             reclaim_read_range(&file_for_reclaim, offset_u64, length)?;
         }
+        // The native io_uring + O_DIRECT read completed (rustfs/backlog#1213):
+        // record it so callers/tests can distinguish this path from the
+        // StdBackend fallback, which never reaches here.
+        self.native_direct_reads.fetch_add(1, Ordering::Relaxed);
         Ok(Bytes::from(bytes))
     }
 }
@@ -3069,6 +3556,7 @@ impl LocalIoBackend for UringBackend {
         // Latched off (backlog#1101): io_uring proved unusable on this disk, so
         // skip it entirely and read via StdBackend.
         if !self.active.load(Ordering::Relaxed) {
+            self.record_uring_fallback();
             return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
         }
 
@@ -3093,6 +3581,7 @@ impl LocalIoBackend for UringBackend {
                                 "io_uring O_DIRECT read fell back to StdBackend (logged once per disk)"
                             );
                         }
+                        self.record_uring_fallback();
                         return self.inner.pread_bytes(volume, path, offset, length, metrics).await;
                     }
                 }
@@ -3119,6 +3608,7 @@ impl LocalIoBackend for UringBackend {
                         "io_uring read fell back to StdBackend (logged once per disk)"
                     );
                 }
+                self.record_uring_fallback();
                 self.inner.pread_bytes(volume, path, offset, length, metrics).await
             }
         }
@@ -3145,6 +3635,18 @@ impl LocalIoBackend for UringBackend {
     fn invalidate_cached_fds_under(&self, volume: &str, path: &str) {
         if let Some(cache) = self.fd_cache.as_ref() {
             cache.invalidate_under(volume, path);
+        }
+    }
+
+    fn invalidate_cached_fds_for_volume(&self, volume: &str) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.invalidate_volume(volume);
+        }
+    }
+
+    async fn clear_cached_fds(&self) {
+        if let Some(cache) = self.fd_cache.as_ref() {
+            cache.clear();
         }
     }
 }
@@ -3175,7 +3677,6 @@ pub struct LocalDisk {
     pub major: u64,
     pub minor: u64,
     pub nrrequests: u64,
-    scan_locks: Arc<ParkingLotMutex<HashSet<(String, String)>>>,
     // Performance optimization fields
     path_cache: Arc<ParkingLotRwLock<HashMap<String, PathBuf>>>,
     current_dir: Arc<OnceLock<PathBuf>>,
@@ -3187,6 +3688,7 @@ pub struct LocalDisk {
     startup_cleanup_notify: Arc<Notify>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
     io_backend: Arc<dyn LocalIoBackend>,
+    file_sync_permits: Arc<Semaphore>,
 }
 
 impl Drop for LocalDisk {
@@ -3413,7 +3915,6 @@ impl LocalDisk {
             minor: Default::default(),
             major: Default::default(),
             nrrequests: Default::default(),
-            scan_locks: Arc::new(ParkingLotMutex::new(HashSet::new())),
             // // format_legacy,
             // format_file_info: Mutex::new(format_meta),
             // format_data: Mutex::new(format_data),
@@ -3424,6 +3925,7 @@ impl LocalDisk {
             startup_cleanup_notify,
             exit_signal: None,
             io_backend: build_local_io_backend(root.clone()),
+            file_sync_permits: os::disk_file_sync_limiter(&root),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
             log_startup_disk_error("get_disk_info", &root, err);
@@ -3685,7 +4187,7 @@ impl LocalDisk {
         true
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn check_format_json(&self) -> Result<Metadata> {
         let md = fs::metadata(&self.format_path).await.map_err(to_unformatted_disk_error)?;
         Ok(md)
@@ -3773,20 +4275,6 @@ impl LocalDisk {
 
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
         reject_local_disk_symlink_components(&self.root, path)
-    }
-
-    fn try_acquire_scan_lock(&self, opts: &WalkDirOptions) -> Result<LocalScanLockGuard> {
-        let key = local_disk_scan_lock_key(&opts.bucket, &opts.base_dir, opts.filter_prefix.as_deref());
-        let mut scan_locks = self.scan_locks.lock();
-
-        if !scan_locks.insert(key.clone()) {
-            return Err(DiskError::DiskOngoingReq);
-        }
-
-        Ok(LocalScanLockGuard {
-            scan_locks: Arc::clone(&self.scan_locks),
-            key,
-        })
     }
 
     // Batch path generation with single lock acquisition
@@ -3922,7 +4410,7 @@ impl LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     #[async_recursion::async_recursion]
     async fn delete_file(
         &self,
@@ -4001,7 +4489,7 @@ impl LocalDisk {
     }
 
     /// read xl.meta raw data
-    #[tracing::instrument(level = "debug", skip(self, volume_dir, file_path))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_raw(
         &self,
         bucket: &str,
@@ -4095,7 +4583,7 @@ impl LocalDisk {
         Ok(data)
     }
 
-    #[tracing::instrument(level = "debug", skip(self, volume_dir, file_path))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all_data_with_dmtime(
         &self,
         volume: &str,
@@ -4298,6 +4786,11 @@ impl LocalDisk {
                 {
                     return Err(err);
                 };
+
+                // The version's data dir was staged or trashed; drop any cached
+                // io_uring descriptors under it so a deleted `part.N` cannot keep
+                // answering reads (rustfs/backlog#1175).
+                self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{dir}"));
             }
         }
 
@@ -4415,7 +4908,7 @@ impl LocalDisk {
     }
 
     // write_all_private with check_path_length
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -4594,6 +5087,15 @@ impl LocalDisk {
 
         let stall = opts.stall_timeout_duration();
 
+        // `count = -1` enumerates the whole directory in one `list_dir` call, and
+        // the stall budget bounds that entire enumeration as a single unit. On a
+        // WIDE, FLAT directory (millions of immediate children) that one readdir
+        // can exceed `stall` on a healthy disk and fail the whole walk -- see the
+        // wide-directory stall hazard documented on `list_dir`
+        // (rustfs/backlog#1216, a #2999 sub-class). Mitigate operationally with a
+        // larger `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` or the high-latency
+        // drive-timeout profile; a streaming readdir rewrite is a separate,
+        // higher-risk follow-up and is intentionally not done here.
         let mut entries = match with_walk_stall_timeout(stall, self.list_dir("", &opts.bucket, &current, -1)).await {
             Ok(res) => res,
             Err(e) => {
@@ -4676,12 +5178,11 @@ impl LocalDisk {
                 }
 
                 let metadata =
-                    with_walk_stall_timeout(stall, self.read_metadata(bucket, format!("{}/{}", &current, &entry).as_str()))
-                        .await?;
+                    with_walk_stall_timeout(stall, self.read_metadata(bucket, format!("{}/{}", current, entry).as_str())).await?;
 
                 let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
-                let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
+                let name = decode_dir_object(format!("{}/{}", current, name).as_str());
 
                 if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
                     *objs_returned += 1;
@@ -4793,7 +5294,7 @@ impl LocalDisk {
                 meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
             }
 
-            let fname = format!("{}/{}", &meta.name, STORAGE_FORMAT_FILE);
+            let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
 
             match with_walk_stall_timeout(stall, self.read_metadata(&opts.bucket, fname.as_str())).await {
                 Ok(res) => {
@@ -5082,34 +5583,6 @@ impl Drop for ScanGuard {
     }
 }
 
-struct LocalScanLockGuard {
-    scan_locks: Arc<ParkingLotMutex<HashSet<(String, String)>>>,
-    key: (String, String),
-}
-
-impl Drop for LocalScanLockGuard {
-    fn drop(&mut self) {
-        self.scan_locks.lock().remove(&self.key);
-    }
-}
-
-fn local_disk_scan_lock_key(bucket: &str, base_dir: &str, filter_prefix: Option<&str>) -> (String, String) {
-    let mut prefix = base_dir.trim_matches('/').to_owned();
-    if let Some(filter_prefix) = filter_prefix
-        .map(|prefix| prefix.trim_matches('/'))
-        .filter(|prefix| !prefix.is_empty())
-    {
-        if prefix.is_empty() {
-            prefix.push_str(filter_prefix);
-        } else {
-            prefix.push_str(SLASH_SEPARATOR);
-            prefix.push_str(filter_prefix);
-        }
-    }
-
-    (bucket.to_owned(), prefix)
-}
-
 fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
     if meta.versions.len() > 10 {
         return None;
@@ -5353,6 +5826,12 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn close(&self) -> Result<()> {
+        // This disk instance is being retired (e.g. replaced by renew_disk on
+        // reconnect). Drop its cached descriptors so a replacement instance's
+        // invalidations are never defeated by this one continuing to serve stale
+        // fds through operations still holding a snapshot of it
+        // (rustfs/backlog#1177).
+        self.io_backend.clear_cached_fds().await;
         Ok(())
     }
 
@@ -5386,7 +5865,7 @@ impl DiskAPI for LocalDisk {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         let format_info = {
             let format_info = self.format_info.read().await;
@@ -5466,7 +5945,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         crate::hp_guard!("LocalDisk::read_all");
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
@@ -5483,13 +5962,13 @@ impl DiskAPI for LocalDisk {
         Ok(data)
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_all");
         self.write_all_public(volume, path, data).await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
         crate::hp_guard!("LocalDisk::delete");
         let volume_dir = self.get_bucket_path(volume)?;
@@ -5515,7 +5994,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume)
@@ -5594,7 +6073,7 @@ impl DiskAPI for LocalDisk {
         Ok(resp)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         let volume_dir = self.get_bucket_path(bucket)?;
 
@@ -5660,7 +6139,7 @@ impl DiskAPI for LocalDisk {
 
         Ok(ret)
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         let volume_dir = self.get_bucket_path(volume)?;
         let file_path = self.get_object_path(volume, path)?;
@@ -5746,7 +6225,7 @@ impl DiskAPI for LocalDisk {
         Ok(resp)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         let src_volume_dir = self.get_bucket_path(src_volume)?;
         let dst_volume_dir = self.get_bucket_path(dst_volume)?;
@@ -5869,7 +6348,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         crate::hp_guard!("LocalDisk::rename_file");
         let src_volume_dir = self.get_bucket_path(src_volume)?;
@@ -5941,7 +6420,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
         crate::hp_guard!("LocalDisk::create_file");
         if !origvolume.is_empty() {
@@ -5958,19 +6437,19 @@ impl DiskAPI for LocalDisk {
             .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         self.io_backend.open_write(volume, path, WriteMode::Append).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         crate::hp_guard!("LocalDisk::read_file");
         self.io_backend.open_full_read(volume, path).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         crate::hp_guard!("LocalDisk::read_file_stream");
         self.io_backend.open_read_stream(volume, path, offset, length).await
@@ -5980,14 +6459,14 @@ impl DiskAPI for LocalDisk {
     // SAFETY: Unix unsafe calls in this function only query page size and mmap
     // a read-only file region after bounds and alignment are validated.
     #[allow(unsafe_code)]
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         self.read_file_mmap_copy_with_metrics(volume, path, offset, length, None)
             .await
     }
 
     /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_mmap_copy_with_metrics(
         &self,
         volume: &str,
@@ -5999,7 +6478,30 @@ impl DiskAPI for LocalDisk {
         self.io_backend.pread_bytes(volume, path, offset, length, metrics).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    /// List a single directory. `count < 0` enumerates the *whole* directory in
+    /// one `os::read_dir` call.
+    ///
+    /// Wide-directory stall hazard (rustfs/backlog#1216, a #2999 sub-class):
+    /// the walk caller wraps this whole call in the per-read stall budget
+    /// (`with_walk_stall_timeout`, default 5s via
+    /// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS`) as if the entire directory
+    /// enumeration were a single read. For a *wide, flat* directory -- one
+    /// bucket prefix holding millions of immediate children -- a single
+    /// `readdir` of the whole directory can itself exceed the stall budget on a
+    /// healthy disk. That trips `DiskError::Timeout`, which the listing path can
+    /// escalate to a quorum failure and surface to the client as a ListObjects
+    /// 500, even though nothing is actually wrong with the drive.
+    ///
+    /// This is deliberately NOT fixed here by rewriting the one-shot
+    /// `os::read_dir` into a streaming/batched readdir that would refresh the
+    /// stall deadline between chunks: that is an architecture-level change with
+    /// high regression surface (ordering, the `count` contract, quorum merge
+    /// semantics) and is tracked as a separate follow-up. The supported
+    /// mitigation for wide-directory deployments today is operational -- raise
+    /// `RUSTFS_DRIVE_WALKDIR_STALL_TIMEOUT_SECS` or run with the high-latency
+    /// drive-timeout profile (see `get_drive_walkdir_stall_timeout`), both of
+    /// which widen the budget without any code change.
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         if !origvolume.is_empty() {
             let origvolume_dir = self.get_bucket_path(origvolume)?;
@@ -6013,6 +6515,9 @@ impl DiskAPI for LocalDisk {
         let volume_dir = self.get_bucket_path(volume)?;
         let dir_path_abs = self.get_object_path(volume, dir_path.trim_start_matches(SLASH_SEPARATOR))?;
 
+        // Whole-directory enumeration in one syscall path (see the wide-directory
+        // stall hazard on this fn): with `count < 0` this reads every entry, and
+        // the caller's stall budget bounds the entire call as a unit.
         let entries = match os::read_dir(&dir_path_abs, count).await {
             Ok(res) => res,
             Err(e) => {
@@ -6031,7 +6536,7 @@ impl DiskAPI for LocalDisk {
     }
 
     // FIXME: TODO: io.writer TODO cancel
-    #[tracing::instrument(level = "debug", skip(self, wr))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         self.wait_for_startup_cleanup().await;
 
@@ -6051,8 +6556,6 @@ impl DiskAPI for LocalDisk {
         {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
-
-        let _scan_lock = self.try_acquire_scan_lock(&opts)?;
 
         let mut wr = wr;
 
@@ -6128,7 +6631,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self, fi))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -6182,8 +6685,8 @@ impl DiskAPI for LocalDisk {
         }
 
         // xl.meta path
-        let src_file_path = self.get_object_path(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str())?;
-        let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", &dst_path, STORAGE_FORMAT_FILE).as_str())?;
+        let src_file_path = self.get_object_path(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str())?;
+        let dst_file_path = self.get_object_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
         // data_dir path
         let has_data_dir_path = {
@@ -6199,11 +6702,11 @@ impl DiskAPI for LocalDisk {
             if let Some(data_dir) = has_data_dir {
                 let src_data_path = self.get_object_path(
                     src_volume,
-                    rustfs_utils::path::retain_slash(format!("{}/{}", &src_path, data_dir).as_str()).as_str(),
+                    rustfs_utils::path::retain_slash(format!("{}/{}", src_path, data_dir).as_str()).as_str(),
                 )?;
                 let dst_data_path = self.get_object_path(
                     dst_volume,
-                    rustfs_utils::path::retain_slash(format!("{}/{}", &dst_path, data_dir).as_str()).as_str(),
+                    rustfs_utils::path::retain_slash(format!("{}/{}", dst_path, data_dir).as_str()).as_str(),
                 )?;
 
                 Some((src_data_path, dst_data_path))
@@ -6311,13 +6814,13 @@ impl DiskAPI for LocalDisk {
             // rename below to report through the existing rollback path. Payload
             // durability is kept by both strict and relaxed.
             // Bound to a local so the borrow lives across the join! below.
-            let tmp_meta_rel_path = format!("{}/{}", &src_path, STORAGE_FORMAT_FILE);
+            let tmp_meta_rel_path = format!("{}/{}", src_path, STORAGE_FORMAT_FILE);
             let tmp_meta_write =
                 self.write_all_private(src_volume, &tmp_meta_rel_path, new_dst_buf.into(), tmp_meta_sync, src_file_parent);
             let shard_sync = async {
                 if durability.syncs_data_shards()
                     && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
-                    && let Err(err) = os::sync_dir_files(src_data_path).await
+                    && let Err(err) = os::sync_dir_files_with_limiter(src_data_path, self.file_sync_permits.clone()).await
                     && err.kind() != ErrorKind::NotFound
                 {
                     return Err::<(), DiskError>(to_file_error(err).into());
@@ -6385,7 +6888,7 @@ impl DiskAPI for LocalDisk {
                 && let Err(err) = self
                     .write_all_private(
                         dst_volume,
-                        &format!("{}/{}/{}", &dst_path, &old_data_dir, STORAGE_FORMAT_FILE_BACKUP),
+                        &format!("{}/{}/{}", dst_path, old_data_dir, STORAGE_FORMAT_FILE_BACKUP),
                         dst_buf.clone().into(),
                         backup_sync,
                         &skip_parent,
@@ -6438,6 +6941,15 @@ impl DiskAPI for LocalDisk {
                 return Err(DiskError::Unexpected);
             }
 
+            // Crash-consistency injection: hard power loss immediately after the
+            // xl.meta commit rename but before the durability fsync. Unlike the
+            // graceful failpoint above, no rollback runs — the commit rename is
+            // already on disk, so the harness asserts the object reads back as
+            // the new version.
+            if should_crash_rename_data_at(RenameDataCrashPoint::AfterMetaCommit, dst_path) {
+                return Err(DiskError::Unexpected);
+            }
+
             // Persist the directory entries for both the data dir and xl.meta renames;
             // without this the commit itself can vanish on power loss. Relaxed tiers
             // accept that window (documented in docs/operations/durability-modes.md).
@@ -6447,6 +6959,12 @@ impl DiskAPI for LocalDisk {
             {
                 rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
                     .map_err(to_file_error)?;
+                // The commit rename changed the dst part inodes before this fsync
+                // failed and rolled them back; drop any fd cached during that
+                // window so readers re-open the restored inode (rustfs/backlog#1177).
+                for part_path in &invalidate_part_paths {
+                    self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                }
                 return Err(to_file_error(err).into());
             }
 
@@ -6469,6 +6987,12 @@ impl DiskAPI for LocalDisk {
                     if let Err(err) = os::fsync_dir(dir).await {
                         rollback_committed_rename_std(&dst_file_path, committed_new_data_path, rollback_data_dir)
                             .map_err(to_file_error)?;
+                        // Same post-commit rollback window as above — drop cached
+                        // dst part fds so readers re-open the restored inode
+                        // (rustfs/backlog#1177).
+                        for part_path in &invalidate_part_paths {
+                            self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                        }
                         return Err(to_file_error(err).into());
                     }
                     if dir == dst_volume_dir.as_path() {
@@ -6521,7 +7045,7 @@ impl DiskAPI for LocalDisk {
             };
 
             let dst_path_for_failpoint = dst_path.to_string();
-            let (old_data_dir, version_signature, old_current_size) = tokio::task::spawn_blocking(move || {
+            let inline_commit = tokio::task::spawn_blocking(move || {
                 // Read existing xl.meta
                 let has_dst_buf = match std::fs::read(&dst) {
                     Ok(buf) => Some(Bytes::from(buf)),
@@ -6673,7 +7197,24 @@ impl DiskAPI for LocalDisk {
                 ))
             })
             .await
-            .map_err(DiskError::from)??;
+            .map_err(DiskError::from)?;
+
+            // A post-commit rollback inside the closure (a commit-metadata fsync
+            // failure under strict durability) restores the old data dir; drop any
+            // fds cached during the committed window before propagating the error
+            // (rustfs/backlog#1177). The sync closure cannot call the async
+            // invalidate itself, so it is done here. Inline objects carry their
+            // data in xl.meta rather than separate part inodes, so this is mostly
+            // defensive, but it keeps the inline and streaming branches consistent.
+            let (old_data_dir, version_signature, old_current_size) = match inline_commit {
+                Ok(committed) => committed,
+                Err(err) => {
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Err(DiskError::from(err));
+                }
+            };
 
             // Cleanup
             if let Some(ref cleanup) = cleanup_path {
@@ -6705,7 +7246,7 @@ impl DiskAPI for LocalDisk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
         for vol in volumes {
             if let Err(e) = self.make_volume(vol).await
@@ -6727,7 +7268,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volume(&self, volume: &str) -> Result<()> {
         if !Self::is_valid_volname(volume) {
             return Err(Error::other("Invalid arguments specified"));
@@ -6755,7 +7296,7 @@ impl DiskAPI for LocalDisk {
         Err(DiskError::VolumeExists)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
         let mut volumes = Vec::new();
 
@@ -6775,7 +7316,7 @@ impl DiskAPI for LocalDisk {
         Ok(volumes)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         let volume_dir = self.get_bucket_path(volume)?;
         let meta = lstat(&volume_dir).await.map_err(to_volume_error)?;
@@ -6791,7 +7332,7 @@ impl DiskAPI for LocalDisk {
         })
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
@@ -6806,12 +7347,16 @@ impl DiskAPI for LocalDisk {
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
             self.move_to_trash(&file_path, false, false).await?;
+
+            // A cached io_uring descriptor under a just-removed path would keep
+            // its inode readable; drop it (rustfs/backlog#1175).
+            self.io_backend.invalidate_cached_fds_under(volume, path);
         }
 
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         if !fi.metadata.is_empty() {
             let file_path = self.get_object_path(volume, path)?;
@@ -6819,7 +7364,7 @@ impl DiskAPI for LocalDisk {
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
             let buf = self
-                .read_all(volume, format!("{}/{}", &path, STORAGE_FORMAT_FILE).as_str())
+                .read_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())
                 .await
                 .map_err(|e| {
                     if e == DiskError::FileNotFound && fi.version_id.is_some() {
@@ -6847,7 +7392,7 @@ impl DiskAPI for LocalDisk {
         Err(Error::other("Invalid Argument"))
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_metadata");
         let p = self.get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
@@ -6874,7 +7419,7 @@ impl DiskAPI for LocalDisk {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_version(
         &self,
         org_volume: &str,
@@ -6977,7 +7522,7 @@ impl DiskAPI for LocalDisk {
         Ok(fi)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         crate::hp_guard!("LocalDisk::read_xl");
         let file_path = self.get_object_path(volume, path)?;
@@ -6988,7 +7533,7 @@ impl DiskAPI for LocalDisk {
         Ok(RawFileInfo { buf })
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_version(
         &self,
         volume: &str,
@@ -7169,6 +7714,13 @@ impl DiskAPI for LocalDisk {
             {
                 return Err(err);
             }
+
+            // The version's data dir was staged for rollback or trashed, so its
+            // `part.N` inodes no longer exist for readers. A cached io_uring
+            // descriptor would keep serving them, so drop every cached fd under
+            // this data dir (rustfs/backlog#1175). If a later rollback restores
+            // the dir, the next read simply re-opens it.
+            self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{uuid}"));
         }
 
         let commit_result = if !meta.versions.is_empty() {
@@ -7209,7 +7761,7 @@ impl DiskAPI for LocalDisk {
 
         Ok(())
     }
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         let mut errs = Vec::with_capacity(versions.len());
         for _ in 0..versions.len() {
@@ -7230,13 +7782,13 @@ impl DiskAPI for LocalDisk {
         errs
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
         let mut results = Vec::new();
         let mut found = 0;
 
         for v in req.files.iter() {
-            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", &req.prefix, v).as_str())?;
+            let fpath = self.get_object_path(&req.bucket, format!("{}/{}", req.prefix, v).as_str())?;
             let mut res = ReadMultipleResp {
                 bucket: req.bucket.clone(),
                 prefix: req.prefix.clone(),
@@ -7296,7 +7848,7 @@ impl DiskAPI for LocalDisk {
         Ok(results)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         let p = self.get_bucket_path(volume)?;
 
@@ -7320,10 +7872,16 @@ impl DiskAPI for LocalDisk {
             }
         }
 
+        // The whole bucket tree is gone; drop every cached io_uring descriptor
+        // for it so a cache hit cannot keep serving a removed object (the read
+        // hit path skips the volume-access check, so nothing else would notice)
+        // (rustfs/backlog#1177).
+        self.io_backend.invalidate_cached_fds_for_volume(volume);
+
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn disk_info(&self, _: &DiskInfoOptions) -> Result<DiskInfo> {
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
         info.nr_requests = self.nrrequests;
@@ -7338,13 +7896,13 @@ impl DiskAPI for LocalDisk {
 
         Ok(info)
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn start_scan(&self) -> ScanGuard {
         self.scanning.fetch_add(1, Ordering::Release);
         ScanGuard(Arc::clone(&self.scanning))
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
         crate::hp_guard!("LocalDisk::read_metadata");
         let file_path = self.get_object_path(volume, path)?;
@@ -7379,7 +7937,7 @@ async fn wait_for_startup_cleanup_signal(
     .is_ok()
 }
 
-#[tracing::instrument]
+#[tracing::instrument(level = "trace", skip_all)]
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
@@ -7657,6 +8215,24 @@ mod test {
                 .await;
 
             match crash {
+                Some(RenameDataCrashPoint::AfterMetaCommit) => {
+                    // Hard power loss right after the xl.meta commit rename: the
+                    // commit landed and no rollback ran, so the object must read
+                    // back as the new version — whether or not an old version
+                    // preceded it. This is the new-version half of the "old or
+                    // new, never mixed" invariant (rustfs/backlog#878).
+                    assert!(result.is_err(), "{mode:?}/AfterMetaCommit: an armed crash must surface as an error");
+                    let fi = read.expect("new version must be readable after a post-commit crash");
+                    assert_eq!(
+                        fi.data_dir,
+                        Some(new_data_dir),
+                        "{mode:?}/AfterMetaCommit: read must resolve to the committed new data dir, never roll back to the old one"
+                    );
+                    assert!(
+                        object_dir.join(new_data_dir.to_string()).exists(),
+                        "{mode:?}/AfterMetaCommit: new data dir must remain on disk after the commit rename"
+                    );
+                }
                 Some(point) => {
                     assert!(result.is_err(), "{mode:?}/{point:?}: an armed crash must surface as an error");
                     match &old_meta {
@@ -7745,6 +8321,32 @@ mod test {
             run_scenario(DurabilityMode::Strict, None, true).await;
             run_scenario(DurabilityMode::Relaxed, None, true).await;
             run_scenario(DurabilityMode::Strict, None, false).await;
+        }
+
+        // Post-commit hard-crash points: the counterpart to the pre-commit
+        // cases above. A crash right after the xl.meta commit rename (no
+        // rollback) must leave the *new* version readable, closing the "old or
+        // new, never mixed" invariant from the new-version side. Relaxed is
+        // exercised alongside Strict so the durability relaxations are held to
+        // the same invariant.
+        #[tokio::test]
+        async fn overwrite_post_commit_crash_keeps_new_version_strict() {
+            run_scenario(DurabilityMode::Strict, Some(RenameDataCrashPoint::AfterMetaCommit), true).await;
+        }
+
+        #[tokio::test]
+        async fn overwrite_post_commit_crash_keeps_new_version_relaxed() {
+            run_scenario(DurabilityMode::Relaxed, Some(RenameDataCrashPoint::AfterMetaCommit), true).await;
+        }
+
+        #[tokio::test]
+        async fn fresh_post_commit_crash_keeps_new_version_strict() {
+            run_scenario(DurabilityMode::Strict, Some(RenameDataCrashPoint::AfterMetaCommit), false).await;
+        }
+
+        #[tokio::test]
+        async fn fresh_post_commit_crash_keeps_new_version_relaxed() {
+            run_scenario(DurabilityMode::Relaxed, Some(RenameDataCrashPoint::AfterMetaCommit), false).await;
         }
     }
 
@@ -8328,7 +8930,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_local_disk_scan_rejects_concurrent_same_prefix_and_releases_on_cancel() {
+    async fn concurrent_local_disk_scans_of_same_prefix_succeed() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("temp dir should be created");
@@ -8357,28 +8959,18 @@ mod test {
         let first_scan = tokio::spawn(async move { first_disk.walk_dir(first_opts, &mut blocking_writer).await });
 
         entered_rx.await.expect("first scan should enter write path");
-
         let mut second_writer = tokio::io::sink();
         let second_scan = disk.walk_dir(opts.clone(), &mut second_writer).await;
         assert!(
-            matches!(second_scan, Err(DiskError::DiskOngoingReq)),
-            "concurrent scan of same bucket and prefix must be rejected, got {second_scan:?}"
+            second_scan.is_ok(),
+            "concurrent scan of same bucket and prefix must succeed, got {second_scan:?}"
         );
-
         first_scan.abort();
         assert!(
             first_scan
                 .await
                 .expect_err("first scan task should be cancelled")
-                .is_cancelled(),
-            "aborting the blocked scan should cancel the task"
-        );
-
-        let mut after_cancel_writer = tokio::io::sink();
-        let after_cancel = disk.walk_dir(opts, &mut after_cancel_writer).await;
-        assert!(
-            after_cancel.is_ok(),
-            "cancelled scan must release the bucket/prefix lock, got {after_cancel:?}"
+                .is_cancelled()
         );
     }
 
@@ -8441,6 +9033,93 @@ mod test {
                 .join(STORAGE_FORMAT_FILE)
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(file_sync_probe)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_shares_file_sync_limit_across_one_disk() {
+        use tempfile::tempdir;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "shared-sync-limit-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let first_data_dir = Uuid::from_u128(1);
+        let second_data_dir = Uuid::from_u128(2);
+        for (tmp_object, data_dir) in [("tmp-first", first_data_dir), ("tmp-second", second_data_dir)] {
+            let tmp_data_dir = dir
+                .path()
+                .join(RUSTFS_META_TMP_BUCKET)
+                .join(tmp_object)
+                .join(data_dir.to_string());
+            fs::create_dir_all(&tmp_data_dir)
+                .await
+                .expect("staged data dir should be created");
+            for part in 1..=os::MAX_PARALLEL_FILE_SYNCS {
+                fs::write(tmp_data_dir.join(format!("part.{part}")), b"shard")
+                    .await
+                    .expect("staged shard should be written");
+            }
+        }
+
+        // Use the disk's canonicalized root path — on macOS, tempfile returns
+        // /var/folders/... while LocalDisk resolves to /private/var/folders/...
+        // via dunce::canonicalize. The probe's starts_with check would fail
+        // with the non-canonical path, causing wait_for_active to hang.
+        let _probe = os::file_sync_probe::set_blocking(&disk.root);
+        let first = {
+            let disk = disk.clone();
+            tokio::spawn(async move {
+                let fi = test_file_info("first-object", Uuid::from_u128(11), Some(first_data_dir), None);
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, "tmp-first", fi, bucket, "first-object")
+                    .await
+            })
+        };
+        let second = {
+            let disk = disk.clone();
+            tokio::spawn(async move {
+                let fi = test_file_info("second-object", Uuid::from_u128(12), Some(second_data_dir), None);
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, "tmp-second", fi, bucket, "second-object")
+                    .await
+            })
+        };
+        os::file_sync_probe::wait_for_active(os::MAX_PARALLEL_FILE_SYNCS).await;
+
+        assert_eq!(
+            disk.file_sync_permits.available_permits(),
+            0,
+            "concurrent rename_data calls must share the LocalDisk sync limit"
+        );
+        assert_eq!(
+            os::file_sync_probe::peak(),
+            os::MAX_PARALLEL_FILE_SYNCS,
+            "one disk must not exceed its shared file-sync capacity"
+        );
+        let reconnected = LocalDisk::new(&endpoint, false).await.expect("local disk should reconnect");
+        assert!(
+            Arc::ptr_eq(&disk.file_sync_permits, &reconnected.file_sync_permits),
+            "reconnecting the same disk must preserve its file-sync limiter"
+        );
+        assert_eq!(
+            reconnected.file_sync_permits.available_permits(),
+            0,
+            "reconnected disk must inherit the outstanding sync budget"
+        );
+
+        os::file_sync_probe::release();
+        first
+            .await
+            .expect("first rename_data task should join")
+            .expect("first rename_data should commit");
+        second
+            .await
+            .expect("second rename_data task should join")
+            .expect("second rename_data should commit");
     }
 
     #[tokio::test]
@@ -9953,6 +10632,66 @@ mod test {
                 .expect("part data should be restored"),
             b"old-data"
         );
+        assert!(!object_dir.join(rollback_dir.to_string()).exists());
+    }
+
+    // backlog#1158 safety premise: the set layer fans the undo out to every online
+    // disk on a quorum-failed delete, including disks that never staged a rollback
+    // (e.g. a disk that errored before staging). A delete-undo on such a disk must be
+    // a safe no-op that leaves the committed object untouched.
+    #[tokio::test]
+    async fn test_delete_version_undo_is_noop_when_nothing_staged() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("aaaaaaaa-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("bbbbbbbb-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("cccccccc-1111-2222-3333-444444444444").expect("rollback dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        // A committed object exists on this disk, but no rollback state was staged.
+        let object_dir = dir.path().join(bucket).join("dir/object");
+        let data_path = object_dir.join(data_dir.to_string());
+        fs::create_dir_all(&data_path).await.expect("data dir should be created");
+        fs::write(data_path.join("part.1"), b"live-data")
+            .await
+            .expect("part data should be written");
+        let fi = test_file_info(object, version_id, Some(data_dir), None);
+        let meta = test_meta(fi.clone());
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), meta.clone())
+            .await
+            .expect("metadata should be written");
+
+        // Undo targeting a rollback dir that was never created must be an Ok no-op.
+        disk.delete_version(
+            bucket,
+            object,
+            fi.clone(),
+            false,
+            DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("undo with no staged rollback state must be a no-op");
+
+        // The committed object is untouched.
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("metadata should remain"),
+            meta
+        );
+        assert_eq!(fs::read(data_path.join("part.1")).await.expect("data should remain"), b"live-data");
         assert!(!object_dir.join(rollback_dir.to_string()).exists());
     }
 
@@ -11678,7 +12417,7 @@ mod test {
             .resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET))
             .expect("operation should succeed");
 
-        println!("ppp :{:?}", &tmpp);
+        println!("ppp :{:?}", tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
@@ -11702,7 +12441,7 @@ mod test {
             .resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET))
             .expect("operation should succeed");
 
-        println!("ppp :{:?}", &tmpp);
+        println!("ppp :{:?}", tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
@@ -12024,18 +12763,6 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_local_disk_scan_lock_key_combines_base_and_filter_prefixes() {
-        assert_eq!(
-            local_disk_scan_lock_key("bucket", "", Some("/prefix/")),
-            ("bucket".to_string(), "prefix".to_string())
-        );
-        assert_eq!(
-            local_disk_scan_lock_key("bucket", "/base/", Some("/prefix/")),
-            ("bucket".to_string(), "base/prefix".to_string())
-        );
-    }
-
     #[tokio::test]
     async fn test_read_file_exists() {
         let test_file = "./test_read_exists.txt";
@@ -12285,6 +13012,12 @@ mod test {
         temp_env::with_var(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, Some("7"), || {
             assert_eq!(bitrot_size_mismatch_retry_count(), 7);
         });
+        temp_env::with_var_unset(ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS, || {
+            assert_eq!(
+                bitrot_size_mismatch_retry_delay(),
+                Duration::from_millis(DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS)
+            );
+        });
         temp_env::with_var(ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS, Some("42"), || {
             assert_eq!(bitrot_size_mismatch_retry_delay(), Duration::from_millis(42));
         });
@@ -12311,7 +13044,9 @@ mod test {
 
         let recorder = crate::test_metrics::CapturingRecorder::default();
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        let previous_metrics_gate = rustfs_io_metrics::metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        rustfs_io_metrics::set_metrics_enabled(true);
         metrics::with_local_recorder(&recorder, || {
             record_mmap_copy_stage(metrics(), "mmap_copy", None);
             record_mmap_copy_stage(metrics(), "mmap_copy", Some(std::time::Instant::now()));
@@ -12327,6 +13062,7 @@ mod test {
             }
         });
         rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+        rustfs_io_metrics::set_metrics_enabled(previous_metrics_gate);
 
         assert_eq!(
             recorder.histogram_sample_count("rustfs_io_get_object_stage_duration_seconds"),
@@ -12998,20 +13734,41 @@ mod test {
         }
     }
 
-    /// The runtime degradation latch classifier (backlog#1101): only
-    /// restriction-class errnos latch io_uring off; data/parameter/missing-file
-    /// errors do not.
+    /// The runtime degradation latch classifier (backlog#1101, narrowed in
+    /// #1171): only subsystem-level errnos latch io_uring off for the whole disk.
+    /// EACCES/EOPNOTSUPP are per-file or per-path (handled by the caller) and
+    /// data/parameter/missing-file errors never latch.
     #[cfg(target_os = "linux")]
     #[test]
     fn io_uring_unsupported_classifies_restriction_errnos_only() {
         use std::io::Error;
-        for errno in [libc::EPERM, libc::EACCES, libc::ENOSYS, libc::EOPNOTSUPP] {
+        for errno in [libc::EPERM, libc::ENOSYS] {
             assert!(is_io_uring_unsupported(&Error::from_raw_os_error(errno)), "errno {errno} should latch");
         }
-        for errno in [libc::EIO, libc::EINVAL, libc::ENOENT, libc::EAGAIN] {
+        for errno in [
+            libc::EACCES,
+            libc::EOPNOTSUPP,
+            libc::EIO,
+            libc::EINVAL,
+            libc::ENOENT,
+            libc::EAGAIN,
+        ] {
             assert!(!is_io_uring_unsupported(&Error::from_raw_os_error(errno)), "errno {errno} must not latch");
         }
         assert!(!is_io_uring_unsupported(&Error::other("driver gone")));
+    }
+
+    /// Non-vacuity gate for the io_uring tests (backlog#1179). Emits a grep-able
+    /// `SKIP <name>` line and, when `RUSTFS_URING_TESTS_MUST_RUN` is set — a CI
+    /// leg that guarantees io_uring is available (e.g. `seccomp=unconfined`) —
+    /// panics instead of skipping, so a suite that silently degraded to
+    /// StdBackend cannot merge green.
+    #[cfg(target_os = "linux")]
+    fn uring_test_skip(name: &str) {
+        if std::env::var_os("RUSTFS_URING_TESTS_MUST_RUN").is_some() {
+            panic!("SKIP {name}: io_uring unavailable but RUSTFS_URING_TESTS_MUST_RUN is set — this leg must exercise io_uring");
+        }
+        eprintln!("SKIP {name}: io_uring unavailable (restricted environment)");
     }
 
     /// Per-disk probe cache (backlog#1101): a disk already recorded as
@@ -13029,6 +13786,7 @@ mod test {
         // shutting its driver down.)
         let probe_dir = tempdir().expect("tempdir");
         if UringBackend::try_new(probe_dir.path().to_path_buf()).is_none() {
+            uring_test_skip("uring_probe_cache_skips_known_unsupported_disk");
             return;
         }
 
@@ -13146,7 +13904,7 @@ mod test {
         ) else {
             // Restricted environment (CI seccomp): io_uring is unavailable, so
             // there is no descriptor cache to exercise. Do not vacuously pass.
-            eprintln!("SKIP uring_fd_cache_hides_a_healed_shard_until_invalidated: io_uring unavailable");
+            uring_test_skip("uring_fd_cache_hides_a_healed_shard_until_invalidated");
             return;
         };
         assert!(backend.fd_cache.is_some(), "the cache must be on for this test to mean anything");
@@ -13249,6 +14007,267 @@ mod test {
         .await;
     }
 
+    /// `delete_paths` is one of the primary object-delete entry points that
+    /// removes data without going through `LocalDisk::delete`; it must invalidate
+    /// the fd cache too, or a cached descriptor keeps a removed part readable
+    /// (backlog#1175/#1180).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_fd_cache_is_invalidated_by_delete_paths() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            async {
+                let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+                disk.make_volume("bucket").await.expect("operation should succeed");
+
+                disk.write_all("bucket", "obj/part.1", Bytes::from_static(b"v1"))
+                    .await
+                    .expect("operation should succeed");
+                let got = disk
+                    .read_file_mmap_copy("bucket", "obj/part.1", 0, 2)
+                    .await
+                    .expect("operation should succeed");
+                assert_eq!(got, Bytes::from_static(b"v1"), "first read seeds the descriptor cache");
+
+                disk.delete_paths("bucket", &["obj/part.1".to_string()])
+                    .await
+                    .expect("operation should succeed");
+                let err = disk.read_file_mmap_copy("bucket", "obj/part.1", 0, 2).await;
+                assert!(err.is_err(), "delete_paths must invalidate the cached descriptor, got {err:?}");
+            },
+        )
+        .await;
+    }
+
+    /// The real `rename_data` commit path — heal's write-then-commit, and the
+    /// two production copies at `LocalDisk::rename_data` — must invalidate the
+    /// destination part descriptors, not merely `rename_file`/`delete`
+    /// (backlog#1180 item 1). Heal reuses a version's `data_dir` and lands the
+    /// rebuilt shard on the SAME `<object>/<data_dir>/part.N` path, so a
+    /// descriptor cached before the commit would keep serving the pre-heal inode.
+    ///
+    /// Faithfulness: it drives `disk.rename_data(...)` for real (non-inline part,
+    /// so `invalidate_part_paths` is non-empty), not a raw `fs::rename` + manual
+    /// invalidate. Non-vacuity: after seeding the cache it removes the on-disk
+    /// data dir out of band — the cached fd keeps the old inode alive — and
+    /// asserts a read still returns the OLD bytes, which fails outright if the
+    /// cache is off, so the test cannot pass without a live cache. Removing the
+    /// dir also clears the path for the directory rename `rename_data` performs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_fd_cache_is_invalidated_by_rename_data() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            async {
+                let root = root_dir.path().to_path_buf();
+                // The invalidation only means anything when a descriptor is
+                // actually cached: io_uring must be available AND the fd cache on
+                // (RLIMIT_NOFILE headroom, backlog#1178). Probe the (existing)
+                // root to decide; otherwise there is nothing to exercise.
+                let cache_on = UringBackend::try_new(root.clone())
+                    .map(|b| b.fd_cache.is_some())
+                    .unwrap_or(false);
+                if !cache_on {
+                    uring_test_skip("uring_fd_cache_is_invalidated_by_rename_data");
+                    return;
+                }
+
+                let data_dir = Uuid::new_v4();
+                let version_id = Uuid::new_v4();
+                let part_rel = format!("object/{data_dir}/part.1");
+
+                let endpoint = Endpoint::try_from(root.to_string_lossy().as_ref()).expect("operation should succeed");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+                // `LocalDisk::new` already creates the system buckets, so the tmp
+                // bucket exists; `ensure_test_volume` tolerates that.
+                ensure_test_volume(&disk, "bucket").await;
+                ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+                // 1. Seed the descriptor cache: write the destination part and read
+                //    it, caching an open fd to that (pre-heal) inode.
+                disk.write_all("bucket", &part_rel, Bytes::from_static(b"oldshard"))
+                    .await
+                    .expect("operation should succeed");
+                let got = disk.read_file_mmap_copy("bucket", &part_rel, 0, 8).await.expect("seed read");
+                assert_eq!(got, Bytes::from_static(b"oldshard"), "first read seeds the descriptor cache");
+
+                // 2. Remove the destination data dir out of band. The cached fd
+                //    keeps the old inode alive and readable, and clears the path so
+                //    the real rename_data below can move a fresh data dir onto it (a
+                //    directory rename cannot land on a non-empty dir). No LocalDisk
+                //    mutation runs here, so nothing invalidates the cache.
+                std::fs::remove_dir_all(root.join("bucket").join(format!("object/{data_dir}")))
+                    .expect("remove destination data dir out of band");
+
+                // Liveness gate (non-vacuity): the cache must still serve the
+                // removed inode. With the cache off this read would fail, so this
+                // assertion is what proves the descriptor is genuinely cached.
+                let stale = disk
+                    .read_file_mmap_copy("bucket", &part_rel, 0, 8)
+                    .await
+                    .expect("a cached descriptor must still read the removed inode");
+                assert_eq!(
+                    stale,
+                    Bytes::from_static(b"oldshard"),
+                    "a cached descriptor is expected to still see the pre-commit inode — proves the cache is live"
+                );
+
+                // 3. Stage the rebuilt shard in the tmp bucket under the SAME
+                //    data_dir (exactly as heal does) and commit it with the real
+                //    rename_data (non-inline: data=None, size>0, one part).
+                let src_object = "heal-src";
+                disk.write_all(
+                    RUSTFS_META_TMP_BUCKET,
+                    &format!("{src_object}/{data_dir}/part.1"),
+                    Bytes::from_static(b"newshard"),
+                )
+                .await
+                .expect("stage rebuilt shard");
+
+                let mut fi = test_file_info("object", version_id, Some(data_dir), None);
+                fi.size = 8;
+                fi.add_object_part(1, "etag".to_string(), 8, Some(OffsetDateTime::now_utc()), 8, None, None);
+                disk.rename_data(RUSTFS_META_TMP_BUCKET, src_object, fi, "bucket", "object")
+                    .await
+                    .expect("real rename_data must commit the rebuilt shard");
+
+                // 4. The read must now see the committed shard: rename_data
+                //    invalidated the cached descriptor for `{dst}/{data_dir}/part.N`.
+                let healed = disk
+                    .read_file_mmap_copy("bucket", &part_rel, 0, 8)
+                    .await
+                    .expect("post-commit read");
+                assert_eq!(
+                    healed,
+                    Bytes::from_static(b"newshard"),
+                    "rename_data must invalidate the cached descriptor so the committed shard is visible"
+                );
+            },
+        )
+        .await;
+    }
+
+    /// The TTL backstop (backlog#1178/#1180): `FdCache` must stop serving a
+    /// descriptor once `time_to_live` elapses even when no mutation path ever
+    /// calls an explicit `invalidate_*`. This is the safety net for a future
+    /// write path that forgets to invalidate — the stale descriptor self-evicts
+    /// rather than masking a replaced inode indefinitely. An injected short TTL
+    /// exercises the backstop without the production 5s wait; a static check
+    /// pins the production value so a change to it is a conscious edit.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fd_cache_ttl_evicts_without_explicit_invalidation() {
+        use std::fs::File;
+
+        assert_eq!(
+            FD_CACHE_TTL,
+            std::time::Duration::from_secs(5),
+            "the production TTL backstop value is pinned; update this assertion deliberately if it changes"
+        );
+
+        let dir = tempfile::tempdir().expect("operation should succeed");
+        let ttl = std::time::Duration::from_millis(200);
+        let cache = FdCache::with_ttl(ttl);
+        let key = FdKey {
+            volume: "v".into(),
+            path: "object/dd/part.1".into(),
+            direct: false,
+        };
+        let file = Arc::new(File::create(dir.path().join("f")).expect("operation should succeed"));
+        cache.insert(key.clone(), file).await;
+        assert!(cache.get(&key).await.is_some(), "a freshly inserted descriptor must be served");
+
+        // Well past the TTL (10x margin against scheduler jitter): the backstop
+        // must drop the descriptor with no explicit invalidation in between.
+        tokio::time::sleep(ttl * 10).await;
+        assert!(
+            cache.get(&key).await.is_none(),
+            "the TTL backstop must stop serving a descriptor once time_to_live elapses"
+        );
+        assert_eq!(cache.entry_count().await, 0, "the expired entry must be evicted, not merely hidden");
+    }
+
+    /// Zero-length read bounds parity on the cache-HIT path (backlog#1173/#1180).
+    /// A `length == 0` read past EOF must be rejected identically whether the
+    /// descriptor is freshly opened (miss path) or served from the cache: the
+    /// cache-hit branch fstats the descriptor to reproduce the miss path's
+    /// `offset > len` check instead of returning empty unconditionally. Seeds
+    /// the cache with a normal read so the zero-length reads are hits, then pins
+    /// that UringBackend and StdBackend agree on every case.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uring_zero_length_read_bounds_match_std_on_cache_hit() {
+        use tempfile::tempdir;
+
+        let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+        let Some(backend) = temp_env::with_vars(
+            [
+                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
+                (ENV_RUSTFS_IO_URING_FD_CACHE, Some("true")),
+            ],
+            || UringBackend::try_new(root.clone()),
+        ) else {
+            uring_test_skip("uring_zero_length_read_bounds_match_std_on_cache_hit");
+            return;
+        };
+        assert!(
+            backend.fd_cache.is_some(),
+            "the cache-hit branch is the point of this test; the cache must be on"
+        );
+
+        let volume = "bucket";
+        let object = "obj/dd/part.1";
+        std::fs::create_dir_all(root.join(volume).join("obj/dd")).expect("operation should succeed");
+        let content: &[u8] = b"exactly-fifteen"; // 15 bytes
+        std::fs::write(root.join(volume).join(object), content).expect("operation should succeed");
+        let len = content.len();
+
+        // A normal read seeds the descriptor cache, so the zero-length reads
+        // below take the cache-hit branch (3206) rather than the miss path.
+        let seed = backend.pread_bytes(volume, object, 0, len, None).await.expect("seed read");
+        assert_eq!(seed, Bytes::copy_from_slice(content));
+
+        // StdBackend over the same file is the parity oracle.
+        let std_backend = StdBackend::new(root.clone());
+        for offset in [0usize, len, len + 1] {
+            let uring = backend.pread_bytes(volume, object, offset, 0, None).await;
+            let std = std_backend.pread_bytes(volume, object, offset, 0, None).await;
+            if offset > len {
+                assert!(
+                    matches!(uring, Err(DiskError::FileCorrupt)),
+                    "zero-length read past EOF must be rejected on the cache-hit path (offset={offset}), got {uring:?}"
+                );
+                assert!(
+                    matches!(std, Err(DiskError::FileCorrupt)),
+                    "StdBackend oracle must reject the same zero-length read past EOF (offset={offset}), got {std:?}"
+                );
+            } else {
+                let u = uring.unwrap_or_else(|e| panic!("zero-length read at/inside EOF must succeed (offset={offset}): {e:?}"));
+                let s = std.unwrap_or_else(|e| {
+                    panic!("StdBackend zero-length read at/inside EOF must succeed (offset={offset}): {e:?}")
+                });
+                assert!(
+                    u.is_empty() && s.is_empty(),
+                    "zero-length read at/inside EOF must be empty (offset={offset})"
+                );
+            }
+        }
+    }
+
     /// Pages of `path` still resident in the page cache, via `mincore(2)`.
     /// `mincore` reports residency without faulting anything in, so measuring
     /// cannot perturb what it measures.
@@ -13309,7 +14328,7 @@ mod test {
         let uring_backend: Option<Arc<dyn LocalIoBackend>> =
             UringBackend::try_new(root.clone()).map(|b| Arc::new(b) as Arc<dyn LocalIoBackend>);
         if uring_backend.is_none() {
-            eprintln!("SKIP io_uring half: io_uring unavailable (restricted environment)");
+            uring_test_skip("io_uring_reclaims_page_cache_exactly_like_std (io_uring half)");
         }
 
         // `residency_after` reads the whole file first so the pages are certainly
@@ -13358,12 +14377,23 @@ mod test {
     /// an O_DIRECT-eligible read keeps O_DIRECT semantics via the native
     /// `read_at_direct` path (or, if that disk can't do io_uring+O_DIRECT, the
     /// StdBackend aligned fallback) and still returns exactly the requested
-    /// bytes for unaligned ranges. This asserts byte-correctness regardless of
-    /// which tier serves the read — the native path is exercised directly by
-    /// rustfs-uring's own O_DIRECT test under real io_uring.
+    /// bytes for unaligned ranges.
+    ///
+    /// The old shape of this test only checked byte-equivalence through
+    /// `LocalDisk::read_file_mmap_copy`. On a filesystem that rejects O_DIRECT
+    /// the read silently degrades to the buffered fallback and the byte check
+    /// still passes, so the test could go green without the native O_DIRECT path
+    /// ever running — a vacuous pass (rustfs/backlog#1213). It now builds a real
+    /// `UringBackend`, drives `pread_bytes` (which routes eligible reads into
+    /// `pread_uring_direct`), and asserts the native path actually executed via
+    /// the `native_direct_reads` counter. When the backing filesystem cannot do
+    /// io_uring or O_DIRECT (restricted CI runners, tmpfs/overlayfs), the test
+    /// skips loudly with `eprintln!` instead of asserting a tautology — but it
+    /// still checks byte-correctness on whatever tier served the read.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn uring_preserves_o_direct_for_eligible_reads() {
+        use std::sync::atomic::Ordering;
         use tempfile::tempdir;
 
         // Unaligned on purpose: 3 blocks + 7 bytes.
@@ -13385,27 +14415,43 @@ mod test {
             (FILE_LEN - 7, 7),
         ];
 
-        // Threshold 1 makes every non-empty read O_DIRECT-eligible, so each read
-        // below exercises the O_DIRECT tier. The env must be set before
-        // LocalDisk::new so the io_uring backend is the one selected.
         let root_dir = tempdir().expect("operation should succeed");
+        let root = root_dir.path().to_path_buf();
+
+        // Lay out the shard with LocalDisk, then read it back through a real
+        // UringBackend so the test can inspect the O_DIRECT latch and the native
+        // read counter directly.
+        {
+            let endpoint = Endpoint::try_from(root.to_string_lossy().as_ref()).expect("operation should succeed");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+            disk.make_volume("test-volume").await.expect("operation should succeed");
+            disk.write_all("test-volume", "shard.bin", content.clone())
+                .await
+                .expect("operation should succeed");
+        }
+
+        // Skip if io_uring is unavailable on this host (restricted env, e.g. the
+        // Kubernetes CI runners): there is no native O_DIRECT path to exercise.
+        let Some(backend) = UringBackend::try_new(root) else {
+            uring_test_skip("uring_preserves_o_direct_for_eligible_reads");
+            return;
+        };
+
+        // Threshold 1 makes every non-empty read O_DIRECT-eligible, so each read
+        // below drives `pread_bytes` into the native `pread_uring_direct` path.
+        // These knobs are read per-read, so setting them around the reads is
+        // enough (the backend was already constructed above).
         let got_ranges = temp_env::async_with_vars(
             [
-                (ENV_RUSTFS_IO_URING_READ_ENABLE, Some("true")),
                 (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, Some("true")),
                 (ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, Some("1")),
             ],
             async {
-                let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
-                let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
-                disk.make_volume("test-volume").await.expect("operation should succeed");
-                disk.write_all("test-volume", "shard.bin", content.clone())
-                    .await
-                    .expect("operation should succeed");
                 let mut out = Vec::new();
                 for (offset, length) in ranges {
                     out.push(
-                        disk.read_file_mmap_copy("test-volume", "shard.bin", offset, length)
+                        backend
+                            .pread_bytes("test-volume", "shard.bin", offset, length, None)
                             .await
                             .expect("O_DIRECT-eligible read must succeed under io_uring (direct or fallback)"),
                     );
@@ -13415,11 +14461,32 @@ mod test {
         )
         .await;
 
+        // Byte-correctness holds regardless of which tier served the read.
         for ((offset, length), got) in ranges.into_iter().zip(got_ranges) {
             assert_eq!(
                 got,
                 content.slice(offset..offset + length),
                 "O_DIRECT read mismatch at offset={offset} length={length}"
+            );
+        }
+
+        // The point of backlog#1213: prove the NATIVE O_DIRECT path executed
+        // rather than silently passing on the StdBackend fallback. If the
+        // filesystem refuses O_DIRECT, `direct_uring.supported` latches off and
+        // no native read is counted — skip loudly instead of asserting nothing.
+        let native_hits = backend.native_direct_reads.load(Ordering::Relaxed);
+        let still_supported = backend.direct_uring.supported.load(Ordering::Relaxed);
+        if still_supported && native_hits > 0 {
+            assert_eq!(
+                native_hits,
+                ranges.len() as u64,
+                "every eligible read should have gone through the native io_uring O_DIRECT path"
+            );
+        } else {
+            eprintln!(
+                "SKIP uring_preserves_o_direct_for_eligible_reads: native O_DIRECT path not \
+                 exercised on this filesystem (direct_uring.supported={still_supported}, \
+                 native_direct_reads={native_hits}); byte-correctness was still asserted"
             );
         }
     }
@@ -13449,6 +14516,7 @@ mod test {
 
         // Skip if io_uring is unavailable on this host (restricted env).
         let Some(backend) = UringBackend::try_new(root) else {
+            uring_test_skip("uring_backend_latched_off_reads_via_std");
             return;
         };
         backend.active.store(false, Ordering::Relaxed);

@@ -1,0 +1,53 @@
+# Lifecycle behavior tests (ceph/s3-tests) — backlog#1148 ilm-10, master plan #1155
+# =================================================================================
+#
+# These upstream lifecycle tests exercise *real expiration behavior*: they PUT a
+# lifecycle rule with Days/NoncurrentDays/DaysAfterInitiation, sleep a multiple of
+# the debug interval, then assert objects/versions/uploads were actually removed by
+# the background scanner and the stale-multipart cleanup loop.
+#
+# They CANNOT run in the default single-server gate (implemented_tests.txt) because:
+#   1. The default harness disables the background scanner (run.sh sets
+#      RUSTFS_SCANNER_ENABLED=false) — nothing expires.
+#   2. A real day is 86400s; without acceleration a Days=1 rule takes 24h.
+#   3. Enabling RUSTFS_ILM_DEBUG_DAY_SECS *globally* would break the already-passing
+#      x-amz-expiration header tests (test_lifecycle_expiration_header_*), which
+#      assert `(expiry-date - now).days == Days` — the header is computed from the
+#      same debug-scaled expected_expiry_time().
+#
+# So this list is run by a DEDICATED lane (ci.yml job `s3-lifecycle-behavior-tests`)
+# against a server started with:
+#   RUSTFS_ILM_DEBUG_DAY_SECS=10   (1 "day" = 10s, matches s3-tests lc_debug_interval)
+#   RUSTFS_SCANNER_ENABLED=true
+#   RUSTFS_SCANNER_CYCLE=2         (scan every 2s, well under a debug-day)
+#   RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=1  (re-descend compacted dirs every cycle so
+#                                  ILM is evaluated ~every 2s, not once per 16 cycles;
+#                                  without this a Days=1 object due at 10s is not
+#                                  expired until the next ~32s boundary — #4772)
+#   RUSTFS_SCANNER_START_DELAY_SECS=0
+#   RUSTFS_API_STALE_UPLOADS_CLEANUP_INTERVAL=2s  (multipart abort lane)
+#
+# Polling windows (patches/0002): each assertion polls list_objects until the
+# expected count is reached or a N*lc_interval deadline elapses. The Days=5
+# (expire3) window uses 8*lc_interval rather than 5: its deadline only starts
+# after the Days=1 poll returns (~1 debug-day in), so a 5*lc_interval window left
+# only ~1 debug-day of slack past the Days=5 due time — a single slow scanner
+# cycle (observed ~13s under CI load) could push the expiry just past it and
+# stall the count at 4 (assert 4 == 2). 8*lc_interval restores comfortable slack;
+# the target count (2) is terminal so a wider window never over-expires.
+#
+# Point run.sh at this file with IMPLEMENTED_TESTS_FILE=<this path>.
+#
+# First batch (ilm-10). Each entry was verified against the pinned upstream source
+# and the RustFS evaluator/scanner/stale-multipart execution paths.
+
+# Basic prefix expiration: Days=1 / Days=5 rules, scanner-driven deletion.
+test_lifecycle_expiration
+# Same as above but validates ListObjectsV2 sees the expirations.
+test_lifecyclev2_expiration
+# Versioned NoncurrentVersionExpiration (NoncurrentDays): noncurrent versions removed.
+test_lifecycle_noncur_expiration
+# ExpiredObjectDeleteMarker + NoncurrentVersionExpiration cascade on a versioned bucket.
+test_lifecycle_deletemarker_expiration
+# AbortIncompleteMultipartUpload (DaysAfterInitiation): stale-multipart cleanup loop.
+test_lifecycle_multipart_expiration

@@ -66,6 +66,9 @@ make pre-commit
 make pre-pr
 ```
 
+> `make test` requires [cargo-nextest](https://nexte.st) (CI runs it and only nextest honours `.config/nextest.toml` test-groups). Install it with `cargo install cargo-nextest --locked` or a prebuilt binary (see https://nexte.st/docs/installation/). To run the plain `cargo test` fallback anyway (results not authoritative — serialization semantics differ from CI), set `RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1`.
+
+### 🔒 Automated Pre-commit Hooks
 #### What `make pre-commit` and `make pre-pr` actually run
 
 `make pre-commit` is the **fast** gate. It runs, in order
@@ -76,8 +79,9 @@ make pre-pr
 3. `architecture-migration-check` — `./scripts/check_architecture_migration_rules.sh`
 4. `logging-guardrails-check` — `./scripts/check_logging_guardrails.sh`
 5. `tokio-io-uring-check` — `./scripts/check_no_tokio_io_uring.sh`
-6. `doc-paths-check` — `./scripts/check_doc_paths.sh`
-7. `quick-check` — `cargo check --workspace --exclude e2e_test`
+6. `extension-schema-check` — `./scripts/check_extension_schema_boundaries.sh`
+7. `doc-paths-check` — `./scripts/check_doc_paths.sh`
+8. `quick-check` — `cargo check --workspace --exclude e2e_test`
 
 **`make pre-commit` does NOT run clippy and does NOT run any tests.**
 A green `make pre-commit` is not enough to open a pull request.

@@ -178,9 +178,9 @@ impl IpUtils {
                 continue;
             }
 
-            match Self::parse_ip_or_cidr(part) {
-                Ok(network) => networks.push(network),
-                Err(e) => return Err(e),
+            {
+                let network = Self::parse_ip_or_cidr(part)?;
+                networks.push(network)
             }
         }
 

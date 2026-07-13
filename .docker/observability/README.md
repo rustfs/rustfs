@@ -45,6 +45,7 @@ Three pre-built Grafana dashboards are included for monitoring RustFS GET perfor
 | **GET Rollout Health** | `grafana-get-rollout-health.json` | Monitors optimization rollout: latency by reader path, early-stop hit rate, codec streaming usage, pipeline failures |
 | **GET Data Integrity** | `grafana-get-data-integrity.json` | Monitors data safety: bitrot verify failures, decode errors, short reads, shard read outcomes |
 | **GET Resource Impact** | `grafana-get-resource-impact.json` | Monitors resource usage: concurrent requests, IO queue utilization, disk permit wait, RSS trend |
+| **Object Data Cache** | `grafana-object-data-cache.json` | Monitors the GET body cache (`rustfs_object_data_cache_*`): hit ratio, lookup/plan/fill outcomes, fill duration quantiles, hit vs fill throughput, entries/weighted bytes, inflight fills, memory-pressure skips, invalidations, and size-class breakdowns |
 
 ### Prometheus Alert Rules
 

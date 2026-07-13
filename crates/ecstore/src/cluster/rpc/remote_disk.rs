@@ -68,7 +68,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Request, service::interceptor::InterceptedService, transport::Channel};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -827,14 +827,13 @@ impl RemoteDisk {
             .expect("operation should succeed")
             .as_nanos() as i64;
         self.health.last_started.store(now, std::sync::atomic::Ordering::Relaxed);
-        self.health.increment_waiting();
+        let _waiting_guard = self.health.waiting_guard();
 
         if timeout_duration == Duration::ZERO {
             let operation_result = operation().await;
             if operation_result.is_ok() {
                 self.health.log_success();
             }
-            self.health.decrement_waiting();
             self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                 .await;
             return operation_result;
@@ -845,18 +844,16 @@ impl RemoteDisk {
 
         match result {
             Ok(operation_result) => {
-                // Log success and decrement waiting counter
+                // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
                     self.health.log_success();
                 }
-                self.health.decrement_waiting();
                 self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                     .await;
                 operation_result
             }
             Err(_) => {
                 // Timeout occurred, mark disk as potentially faulty
-                self.health.decrement_waiting();
                 counter!(
                     "rustfs_drive_op_timeout_total",
                     "endpoint" => self.endpoint.to_string(),
@@ -1154,40 +1151,40 @@ fn decode_batch_read_version_response_items(
 
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn to_string(&self) -> String {
         self.endpoint.to_string()
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn is_online(&self) -> bool {
         // If disk is marked as faulty, consider it offline
         !self.health.is_faulty()
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn is_local(&self) -> bool {
         false
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn host_name(&self) -> String {
         self.endpoint.host_port()
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn close(&self) -> Result<()> {
         self.cancel_token.cancel();
         Ok(())
     }
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         Ok(*self.id.lock().await)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         let mut lock = self.id.lock().await;
         *lock = id;
@@ -1195,12 +1192,12 @@ impl DiskAPI for RemoteDisk {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn path(&self) -> PathBuf {
         PathBuf::from(self.endpoint.get_file_path())
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn get_disk_location(&self) -> DiskLocation {
         DiskLocation {
             pool_idx: {
@@ -1227,9 +1224,9 @@ impl DiskAPI for RemoteDisk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volume(&self, volume: &str) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1264,9 +1261,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1301,9 +1298,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1342,9 +1339,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1381,9 +1378,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1419,7 +1416,7 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_version(
         &self,
         volume: &str,
@@ -1428,7 +1425,7 @@ impl DiskAPI for RemoteDisk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1479,9 +1476,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1609,9 +1606,9 @@ impl DiskAPI for RemoteDisk {
             .collect()
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1649,9 +1646,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1725,9 +1722,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1774,7 +1771,7 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_version(
         &self,
         _org_volume: &str,
@@ -1783,7 +1780,7 @@ impl DiskAPI for RemoteDisk {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1836,7 +1833,7 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self, req))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
         validate_batch_read_version_item_count(req.items.len())?;
 
@@ -1847,7 +1844,7 @@ impl DiskAPI for RemoteDisk {
         }
         record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_ATTEMPT);
 
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1929,9 +1926,9 @@ impl DiskAPI for RemoteDisk {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -1974,7 +1971,7 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -1983,7 +1980,7 @@ impl DiskAPI for RemoteDisk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2035,9 +2032,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, _origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
-        debug!("list_dir {}/{}", volume, dir_path);
+        trace!(volume, dir_path, "Remote disk list_dir RPC started");
 
         self.execute_with_timeout(
             || async {
@@ -2067,9 +2064,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self, wr))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2145,12 +2142,12 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         self.read_file_stream(volume, path, 0, 0).await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         // warn!(
         //     "disk remote read_file_stream {}/{}/{} offset={} length={}",
@@ -2180,7 +2177,7 @@ impl DiskAPI for RemoteDisk {
 
     /// Buffered read for remote disks.
     /// The transport stream is collected into owned Bytes for caller sharing.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         // For remote disks, use the regular reader and read into Bytes
         let reader = self.read_file_stream(volume, path, offset, length).await?;
@@ -2195,9 +2192,9 @@ impl DiskAPI for RemoteDisk {
         Ok(Bytes::from(buffer))
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2224,7 +2221,7 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter> {
         // warn!(
         //     "disk remote create_file {}/{}/{} file_size={}",
@@ -2249,9 +2246,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2292,9 +2289,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2336,9 +2333,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2379,9 +2376,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2422,9 +2419,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2461,9 +2458,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2504,9 +2501,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2552,9 +2549,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2605,9 +2602,9 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
-        debug!(
+        trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -2658,7 +2655,7 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
         // disk_info is idempotent/read-only, so it is eligible for the P3-3 bounded retry.
         self.execute_read_with_retry(
@@ -2689,7 +2686,7 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     fn start_scan(&self) -> ScanGuard {
         self.scanning.fetch_add(1, Ordering::Relaxed);
         ScanGuard(Arc::clone(&self.scanning))
@@ -3312,6 +3309,33 @@ mod tests {
         RemoteDisk::new(&endpoint, &disk_option, data_transport)
             .await
             .expect("operation should succeed")
+    }
+
+    #[tokio::test]
+    async fn remote_disk_health_wrapper_balances_task_cancellation() {
+        let disk = Arc::new(new_remote_disk_with_transport(Arc::new(RecordingInternodeDataTransport::default())).await);
+        let task_disk = Arc::clone(&disk);
+        let task = tokio::spawn(async move {
+            task_disk
+                .execute_with_timeout_for_op(
+                    "cancellation-test",
+                    || async { std::future::pending::<Result<()>>().await },
+                    Duration::ZERO,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while disk.health.waiting_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation should enter remote disk health tracking");
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(disk.health.waiting_count(), 0);
     }
 
     #[derive(Debug)]

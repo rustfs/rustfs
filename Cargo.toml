@@ -142,7 +142,7 @@ futures = "0.3.32"
 futures-core = "0.3.32"
 futures-lite = "2.6.1"
 futures-util = "0.3.32"
-pollster = "0.4.0"
+pollster = "1.0.1"
 pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime", "telemetry"] }
 lapin = { version = "4.10.0", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 hyper = { version = "1.10.1", features = ["http2", "http1", "server"] }
@@ -266,7 +266,7 @@ netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.12.1"
 parking_lot = "0.12.5"
-path-absolutize = "3.1.1"
+path-absolutize = "4.0.1"
 path-clean = "1.0.1"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
@@ -305,7 +305,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.23.4", features = ["v4", "fast-rng", "macro-diagnostics"] }
+uuid = { version = "1.23.5", features = ["v4", "fast-rng", "macro-diagnostics"] }
 vaultrs = { version = "0.8.0" }
 walkdir = "2.5.0"
 windows = { version = "0.62.2" }

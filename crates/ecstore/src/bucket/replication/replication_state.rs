@@ -208,7 +208,7 @@ impl ReplicationStats {
         let now = SystemTime::now();
 
         let cache_read = cache.read().await;
-        for (_bucket, stats) in cache_read.iter() {
+        for stats in cache_read.values() {
             for stat in stats.stats.values() {
                 // Now we can update the moving averages using interior mutability
                 stat.xfer_rate_lrg.measure.update_exponential_moving_average(now);

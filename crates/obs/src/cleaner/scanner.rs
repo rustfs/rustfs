@@ -34,6 +34,11 @@ use tracing::debug;
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
 const EVENT_LOG_CLEANER_SCAN_STATE: &str = "log_cleaner_scan_state";
+/// Small grace window before removing an orphan `*.tmp` archive. Orphans are
+/// never live-written after the rename that would have promoted them, so they
+/// are exempt from `min_file_age_seconds`; the grace only avoids racing a temp
+/// file another process may be mid-write on a shared directory.
+const ORPHAN_TMP_GRACE_SECONDS: u64 = 60;
 
 /// Result of a single pass directory scan.
 ///
@@ -146,9 +151,9 @@ pub(super) fn scan_log_directory(
         let matched_suffix = CompressionAlgorithm::compressed_suffixes()
             .into_iter()
             .find(|suffix| filename.ends_with(suffix));
-        let matched_tmp_suffix = compressed_tmp_suffix(filename);
+        let matched_tmp_suffix_len = compressed_tmp_suffix_len(filename);
         let is_compressed = matched_suffix.is_some();
-        let is_tmp_archive = matched_tmp_suffix.is_some();
+        let is_tmp_archive = matched_tmp_suffix_len.is_some();
 
         // Perform matching on the logical log filename.
         // Examples:
@@ -159,8 +164,8 @@ pub(super) fn scan_log_directory(
         // to both raw and already-compressed generations.
         let name_to_match = if let Some(suffix) = matched_suffix {
             &filename[..filename.len() - suffix.len()]
-        } else if let Some(suffix) = matched_tmp_suffix {
-            &filename[..filename.len() - suffix.len()]
+        } else if let Some(len) = matched_tmp_suffix_len {
+            &filename[..filename.len() - len]
         } else {
             filename
         };
@@ -184,7 +189,9 @@ pub(super) fn scan_log_directory(
         let age = now.duration_since(modified).ok();
 
         if is_tmp_archive {
-            if !is_old_enough_for_cleanup(age, min_file_age_seconds) {
+            // Orphan temp archives are exempt from min_file_age_seconds (they
+            // are not live logs); only a short grace window applies.
+            if !is_old_enough_for_cleanup(age, ORPHAN_TMP_GRACE_SECONDS) {
                 continue;
             }
 
@@ -253,8 +260,14 @@ pub(super) fn is_excluded(filename: &str, patterns: &[glob::Pattern]) -> bool {
     patterns.iter().any(|p| p.matches(filename))
 }
 
-fn compressed_tmp_suffix(filename: &str) -> Option<&'static str> {
-    [".gz.tmp", ".zst.tmp"].into_iter().find(|suffix| filename.ends_with(suffix))
+/// Length of the matched compressed-temp suffix (e.g. `.gz.tmp`), derived from
+/// [`CompressionAlgorithm::compressed_suffixes`] rather than hardcoded, so a new
+/// codec cannot leave orphan `*.<ext>.tmp` files the scanner never recognizes.
+fn compressed_tmp_suffix_len(filename: &str) -> Option<usize> {
+    CompressionAlgorithm::compressed_suffixes().into_iter().find_map(|suffix| {
+        let tmp_suffix = format!("{suffix}.tmp");
+        filename.ends_with(&tmp_suffix).then_some(tmp_suffix.len())
+    })
 }
 
 fn is_old_enough_for_cleanup(age: Option<Duration>, min_file_age_seconds: u64) -> bool {
@@ -304,10 +317,29 @@ mod tests {
         let dir = tmp.path();
         let filename = "2026-07-08.rustfs.log.gz.tmp";
         create_empty_file(dir, filename)?;
+        // Age the orphan past the grace window so it is eligible for removal.
+        let old = SystemTime::now() - Duration::from_secs(ORPHAN_TMP_GRACE_SECONDS + 60);
+        File::options().write(true).open(dir.join(filename))?.set_modified(old)?;
 
         let _ = scan_log_directory(dir, ".rustfs.log", Some("active.log"), FileMatchMode::Suffix, &[], 0, true, false)?;
 
         assert!(!dir.join(filename).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_orphan_tmp_kept_within_grace() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path();
+        // `.zst.tmp` also verifies the suffix is derived from compressed_suffixes.
+        let filename = "2026-07-08.rustfs.log.zst.tmp";
+        create_empty_file(dir, filename)?;
+
+        // Fresh (age ~0) is within the grace window; min_file_age is irrelevant
+        // to orphan temp files and must not keep them around beyond the grace.
+        let _ = scan_log_directory(dir, ".rustfs.log", Some("active.log"), FileMatchMode::Suffix, &[], 999_999, true, false)?;
+
+        assert!(dir.join(filename).exists(), "fresh orphan tmp should be kept within grace");
         Ok(())
     }
 

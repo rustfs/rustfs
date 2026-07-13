@@ -19,7 +19,7 @@ pub mod local_snapshot;
 
 use crate::storage_api_contracts::{
     bucket::{BucketOperations as _, BucketOptions},
-    list::ListOperations as _,
+    list::{ListOperations as _, StorageListObjectVersionsInfo},
     object::ObjectIO as _,
 };
 use crate::{
@@ -27,8 +27,9 @@ use crate::{
     config::com::read_config,
     disk::DiskAPI,
     error::{Error, classify_system_path_failure_reason},
+    object_api::ObjectInfo,
     runtime::sources as runtime_sources,
-    store::ECStore,
+    store::{ECStore, list_objects::list_marker_key},
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
@@ -39,6 +40,7 @@ use rustfs_io_metrics::record_system_path_failure;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
+    future::Future,
     sync::{Arc, LazyLock, OnceLock},
     time::{Duration, SystemTime},
 };
@@ -53,6 +55,7 @@ const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
+const LIVE_BUCKET_USAGE_MAX_ENTRIES: u64 = 1024;
 
 #[derive(Debug, Clone)]
 struct CachedBucketUsage {
@@ -67,9 +70,11 @@ struct CachedBucketUsage {
 
 type UsageMemoryCache = Arc<RwLock<HashMap<String, CachedBucketUsage>>>;
 type CacheUpdating = Arc<RwLock<bool>>;
+type LiveBucketUsageCache = moka::future::Cache<String, BucketUsageInfo>;
 
 static USAGE_MEMORY_CACHE: OnceLock<UsageMemoryCache> = OnceLock::new();
 static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
+static LIVE_BUCKET_USAGE_CACHE: OnceLock<LiveBucketUsageCache> = OnceLock::new();
 
 /// Deferred persist thresholds for compression totals: persist after this many
 /// operations recorded, but no more often than the min interval.
@@ -108,6 +113,14 @@ fn memory_cache() -> &'static UsageMemoryCache {
 
 fn cache_updating() -> &'static CacheUpdating {
     USAGE_CACHE_UPDATING.get_or_init(|| Arc::new(RwLock::new(false)))
+}
+
+fn live_bucket_usage_cache() -> &'static LiveBucketUsageCache {
+    LIVE_BUCKET_USAGE_CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(LIVE_BUCKET_USAGE_MAX_ENTRIES)
+            .build()
+    })
 }
 
 // Data usage storage paths
@@ -208,6 +221,7 @@ async fn clear_bucket_usage_memory(bucket: &str) {
 }
 
 pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    live_bucket_usage_cache().invalidate(bucket).await;
     clear_bucket_usage_memory(bucket).await;
 
     let data_usage_info = load_data_usage_from_backend(store.clone()).await?;
@@ -442,79 +456,203 @@ pub async fn aggregate_local_snapshots(store: Arc<ECStore>) -> Result<(Vec<DiskU
 }
 
 /// Calculate accurate bucket usage statistics by enumerating objects through the object layer.
+#[derive(Default)]
+struct BucketUsageAccumulator {
+    current_object_name: Option<String>,
+    // FileMeta caps versions per object, so replay detection remains bounded.
+    current_object_versions: HashSet<Option<[u8; 16]>>,
+    current_live_versions: u64,
+    objects_count: u64,
+    versions_count: u64,
+    total_size: u64,
+    delete_markers: u64,
+    size_histogram: SizeHistogram,
+    versions_histogram: VersionsHistogram,
+}
+
+impl BucketUsageAccumulator {
+    fn record(&mut self, bucket: &str, object: &ObjectInfo) -> Result<(), Error> {
+        if object.is_dir {
+            return Ok(());
+        }
+
+        if self
+            .current_object_name
+            .as_deref()
+            .is_some_and(|current_name| object.name.as_str() != current_name)
+        {
+            self.finish_current_object();
+        }
+
+        record_version_listing_entry(
+            bucket,
+            &mut self.current_object_name,
+            &mut self.current_object_versions,
+            &object.name,
+            object.version_id.as_ref().map(|version_id| version_id.as_bytes()),
+        )?;
+
+        if object.delete_marker {
+            self.delete_markers = self.delete_markers.saturating_add(1);
+            return Ok(());
+        }
+
+        let object_size = object.size.max(0) as u64;
+        self.current_live_versions = self.current_live_versions.saturating_add(1);
+        self.size_histogram.add(object_size);
+        self.total_size = self.total_size.saturating_add(object_size);
+        self.versions_count = self.versions_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish_current_object(&mut self) {
+        if self.current_live_versions > 0 {
+            self.objects_count = self.objects_count.saturating_add(1);
+            self.versions_histogram.add(self.current_live_versions);
+        }
+        self.current_live_versions = 0;
+    }
+
+    fn finish(mut self) -> BucketUsageInfo {
+        self.finish_current_object();
+        BucketUsageInfo {
+            size: self.total_size,
+            objects_count: self.objects_count,
+            versions_count: self.versions_count,
+            delete_markers_count: self.delete_markers,
+            object_size_histogram: self.size_histogram.to_map(),
+            object_versions_histogram: self.versions_histogram.to_map(),
+            ..Default::default()
+        }
+    }
+}
+
+type UsageVersionPage = StorageListObjectVersionsInfo<ObjectInfo>;
+
 pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Result<BucketUsageInfo, Error> {
+    let bucket = bucket_name.to_string();
+    compute_bucket_usage_with_pages(bucket_name, move |marker, version_marker| {
+        let store = Arc::clone(&store);
+        let bucket = bucket.clone();
+        async move {
+            store
+                .list_object_versions(&bucket, "", marker, version_marker, None, 1000)
+                .await
+        }
+    })
+    .await
+}
+
+async fn compute_bucket_usage_with_pages<F, Fut>(bucket_name: &str, mut fetch_page: F) -> Result<BucketUsageInfo, Error>
+where
+    F: FnMut(Option<String>, Option<String>) -> Fut,
+    Fut: Future<Output = Result<UsageVersionPage, Error>>,
+{
     let mut marker: Option<String> = None;
     let mut version_marker: Option<String> = None;
-    let mut object_names: HashSet<String> = HashSet::new();
-    let mut object_versions: HashMap<String, u64> = HashMap::new();
-    let mut versions_count: u64 = 0;
-    let mut total_size: u64 = 0;
-    let mut delete_markers: u64 = 0;
-    let mut size_histogram = SizeHistogram::default();
+    let mut usage = BucketUsageAccumulator::default();
 
     loop {
-        let result = store
-            .clone()
-            .list_object_versions(
-                bucket_name,
-                "", // prefix
-                marker.clone(),
-                version_marker.clone(),
-                None, // delimiter
-                1000, // max_keys
-            )
-            .await?;
+        let result = fetch_page(marker.clone(), version_marker.clone()).await?;
 
+        let page_entries = result.objects.len();
         for object in result.objects.iter() {
-            if object.is_dir {
-                continue;
-            }
-
-            if object.delete_marker {
-                delete_markers = delete_markers.saturating_add(1);
-                continue;
-            }
-
-            let object_size = object.size.max(0) as u64;
-            object_names.insert(object.name.clone());
-            *object_versions.entry(object.name.clone()).or_insert(0) += 1;
-            size_histogram.add(object_size);
-            total_size = total_size.saturating_add(object_size);
-            versions_count = versions_count.saturating_add(1);
+            usage.record(bucket_name, object)?;
         }
 
         if !result.is_truncated {
             break;
         }
+        ensure_truncated_version_page_has_entries(bucket_name, page_entries)?;
 
-        marker = result.next_marker.clone();
-        version_marker = result.next_version_idmarker.clone();
-        if marker.is_none() {
-            info!(
-                "Bucket {} version listing marked truncated but no marker returned; stopping early",
-                bucket_name
-            );
-            break;
+        advance_version_listing_cursor(
+            bucket_name,
+            &mut marker,
+            &mut version_marker,
+            result.next_marker,
+            result.next_version_idmarker,
+        )?;
+    }
+
+    Ok(usage.finish())
+}
+
+fn ensure_truncated_version_page_has_entries(bucket: &str, page_entries: usize) -> Result<(), Error> {
+    if page_entries == 0 {
+        return Err(Error::other(format!("bucket {bucket} version listing returned an empty truncated page")));
+    }
+    Ok(())
+}
+
+fn record_version_listing_entry(
+    bucket: &str,
+    current_object_name: &mut Option<String>,
+    current_object_versions: &mut HashSet<Option<[u8; 16]>>,
+    object_name: &str,
+    version_id: Option<&[u8; 16]>,
+) -> Result<(), Error> {
+    match current_object_name.as_deref() {
+        Some(current_name) if object_name < current_name => {
+            return Err(Error::other(format!("bucket {bucket} version listing returned an out-of-order object")));
         }
+        Some(current_name) if object_name > current_name => {
+            current_object_versions.clear();
+            *current_object_name = Some(object_name.to_string());
+        }
+        None => *current_object_name = Some(object_name.to_string()),
+        Some(_) => {}
     }
 
-    let objects_count = object_names.len() as u64;
-    let mut versions_histogram = VersionsHistogram::default();
-    for version_count in object_versions.values() {
-        versions_histogram.add(*version_count);
+    if !current_object_versions.insert(version_id.copied()) {
+        return Err(Error::other(format!(
+            "bucket {bucket} version listing returned a repeated object version"
+        )));
     }
+    Ok(())
+}
 
-    let usage = BucketUsageInfo {
-        size: total_size,
-        objects_count,
-        versions_count,
-        delete_markers_count: delete_markers,
-        object_size_histogram: size_histogram.to_map(),
-        object_versions_histogram: versions_histogram.to_map(),
-        ..Default::default()
-    };
+fn advance_version_listing_cursor(
+    bucket: &str,
+    marker: &mut Option<String>,
+    version_marker: &mut Option<String>,
+    next_marker: Option<String>,
+    next_version_marker: Option<String>,
+) -> Result<(), Error> {
+    let next_marker = next_marker
+        .filter(|next_marker| !next_marker.is_empty())
+        .ok_or_else(|| Error::other(format!("bucket {bucket} version listing was truncated without a key marker")))?;
+    let next_version_marker = next_version_marker
+        .filter(|next_version_marker| !next_version_marker.is_empty())
+        .ok_or_else(|| Error::other(format!("bucket {bucket} version listing was truncated without a version marker")))?;
+    let current_key_marker = marker.as_deref().map(list_marker_key);
+    let next_key_marker = list_marker_key(&next_marker);
+    if current_key_marker == Some(next_key_marker) && version_marker.as_deref() == Some(next_version_marker.as_str()) {
+        return Err(Error::other(format!(
+            "bucket {bucket} version listing returned a repeated continuation marker"
+        )));
+    }
+    if current_key_marker.is_some_and(|marker| next_key_marker < marker) {
+        return Err(Error::other(format!("bucket {bucket} version listing returned a regressing key marker")));
+    }
+    *marker = Some(next_marker);
+    *version_marker = Some(next_version_marker);
+    Ok(())
+}
 
-    Ok(usage)
+async fn coalesce_live_bucket_usage<F>(bucket: String, init: F) -> Result<BucketUsageInfo, Error>
+where
+    F: Future<Output = Result<BucketUsageInfo, Error>> + Send + 'static,
+{
+    let result = live_bucket_usage_cache().try_get_with(bucket.clone(), init).await;
+    live_bucket_usage_cache().invalidate(&bucket).await;
+    result.map_err(|err| Error::other(err.to_string()))
+}
+
+fn apply_live_bucket_usage_to_response(data_usage_info: &mut DataUsageInfo, bucket: &str, usage: &BucketUsageInfo) {
+    data_usage_info.bucket_sizes.insert(bucket.to_string(), usage.size);
+    data_usage_info.buckets_usage.insert(bucket.to_string(), usage.clone());
+    set_buckets_count_from_usage(data_usage_info);
+    data_usage_info.calculate_totals();
 }
 
 pub async fn refresh_bucket_usage_from_object_layer(
@@ -522,13 +660,12 @@ pub async fn refresh_bucket_usage_from_object_layer(
     data_usage_info: &mut DataUsageInfo,
     bucket: &str,
 ) -> Result<BucketUsageInfo, Error> {
-    let refresh_started_at = SystemTime::now();
-    let usage = compute_bucket_usage(store, bucket).await?;
-    replace_bucket_usage_memory_from_authoritative(bucket, usage.clone(), refresh_started_at).await;
-    data_usage_info.bucket_sizes.insert(bucket.to_string(), usage.size);
-    data_usage_info.buckets_usage.insert(bucket.to_string(), usage.clone());
-    set_buckets_count_from_usage(data_usage_info);
-    data_usage_info.calculate_totals();
+    let bucket_name = bucket.to_string();
+    let usage =
+        coalesce_live_bucket_usage(bucket_name.clone(), async move { compute_bucket_usage(store, &bucket_name).await }).await?;
+    // Request-time listings are not linearizable with writes on other nodes.
+    // Keep the live result response-local instead of promoting it into the quota cache.
+    apply_live_bucket_usage_to_response(data_usage_info, bucket, &usage);
     Ok(usage)
 }
 
@@ -546,45 +683,26 @@ pub async fn refresh_versioned_bucket_usage_from_object_layer(store: Arc<ECStore
             Vec::new()
         }
     };
-    let buckets = bucket_names_for_versioned_refresh(data_usage_info, listed_bucket_names);
-    let mut changed = false;
+    let mut buckets = data_usage_info.buckets_usage.keys().cloned().collect::<HashSet<String>>();
+    buckets.extend(listed_bucket_names.into_iter().filter(|bucket| !bucket.is_empty()));
+    let mut buckets = buckets.into_iter().collect::<Vec<_>>();
+    buckets.sort();
 
     for bucket in buckets {
         let Ok(versioning) = BucketVersioningSys::get(&bucket).await else {
             continue;
         };
-
         if !versioning.enabled() && !versioning.suspended() {
             continue;
         }
-
         if let Err(err) = refresh_bucket_usage_from_object_layer(store.clone(), data_usage_info, &bucket).await {
             debug!(
                 bucket = %bucket,
                 error = %err,
                 "failed to refresh versioned bucket usage from object layer"
             );
-            continue;
         }
-        changed = true;
     }
-
-    if changed {
-        set_buckets_count_from_usage(data_usage_info);
-        data_usage_info.calculate_totals();
-    }
-}
-
-fn bucket_names_for_versioned_refresh(
-    data_usage_info: &DataUsageInfo,
-    listed_bucket_names: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    let mut buckets = data_usage_info.buckets_usage.keys().cloned().collect::<HashSet<String>>();
-    buckets.extend(listed_bucket_names.into_iter().filter(|bucket| !bucket.is_empty()));
-
-    let mut buckets = buckets.into_iter().collect::<Vec<_>>();
-    buckets.sort();
-    buckets
 }
 
 async fn ensure_bucket_usage_cached(bucket: &str) {
@@ -629,6 +747,7 @@ fn bucket_usage_counts_match(left: &BucketUsageInfo, right: &BucketUsageInfo) ->
         && left.delete_markers_count == right.delete_markers_count
 }
 
+#[cfg(test)]
 async fn replace_bucket_usage_memory_from_authoritative(bucket: &str, usage: BucketUsageInfo, refresh_started_at: SystemTime) {
     let mut cache = memory_cache().write().await;
     if let Some(existing) = cache.get(bucket)
@@ -1084,7 +1203,7 @@ pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate:
 
     let name_clone = name.clone();
     tokio::spawn(async move {
-        let _ = save_config(store_clone, &format!("{}{}", &name_clone, ".bkp"), buf_clone).await;
+        let _ = save_config(store_clone, &format!("{}{}", name_clone, ".bkp"), buf_clone).await;
     });
     save_config(store, &name, buf).await?;
     Ok(())
@@ -1251,6 +1370,216 @@ mod tests {
         info.buckets_count = info.buckets_usage.len() as u64;
         info.calculate_totals();
         info
+    }
+
+    #[tokio::test]
+    async fn compute_usage_preserves_same_object_across_1000_entry_page_boundary() {
+        let first_page = UsageVersionPage {
+            is_truncated: true,
+            next_marker: Some("object-a".to_string()),
+            next_version_idmarker: Some(uuid::Uuid::from_u128(1000).to_string()),
+            objects: (1..=1000_u128)
+                .map(|version| ObjectInfo {
+                    name: "object-a".to_string(),
+                    size: 1,
+                    version_id: Some(uuid::Uuid::from_u128(version)),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let second_page = UsageVersionPage {
+            objects: vec![
+                ObjectInfo {
+                    name: "object-a".to_string(),
+                    size: 1,
+                    version_id: Some(uuid::Uuid::from_u128(1001)),
+                    ..Default::default()
+                },
+                ObjectInfo {
+                    name: "object-a".to_string(),
+                    version_id: Some(uuid::Uuid::from_u128(1002)),
+                    delete_marker: true,
+                    ..Default::default()
+                },
+                ObjectInfo {
+                    name: "object-b".to_string(),
+                    size: 2,
+                    version_id: Some(uuid::Uuid::from_u128(1003)),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let pages = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([first_page, second_page])));
+        let fetch_pages = Arc::clone(&pages);
+
+        let usage = compute_bucket_usage_with_pages("bucket-a", move |marker, version_marker| {
+            let page = fetch_pages
+                .lock()
+                .expect("page queue lock should not be poisoned")
+                .pop_front()
+                .expect("pagination must not request an unexpected page");
+            if page.is_truncated {
+                assert_eq!((marker, version_marker), (None, None));
+            } else {
+                let expected_version_marker = uuid::Uuid::from_u128(1000).to_string();
+                assert_eq!(marker.as_deref(), Some("object-a"));
+                assert_eq!(version_marker.as_deref(), Some(expected_version_marker.as_str()));
+            }
+            async move { Ok(page) }
+        })
+        .await
+        .expect("two-page usage aggregation should succeed");
+
+        assert!(pages.lock().expect("page queue lock should not be poisoned").is_empty());
+        assert_eq!(usage.objects_count, 2);
+        assert_eq!(usage.versions_count, 1002);
+        assert_eq!(usage.delete_markers_count, 1);
+        assert_eq!(usage.size, 1003);
+        assert_eq!(usage.object_versions_histogram.get("SINGLE_VERSION"), Some(&1));
+        assert_eq!(usage.object_versions_histogram.get("BETWEEN_1000_AND_10000"), Some(&1));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn live_bucket_usage_refreshes_are_coalesced_only_while_in_flight() {
+        const BUCKET: &str = "coalesced-live-usage-test";
+        live_bucket_usage_cache().invalidate(BUCKET).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for _ in 0..8 {
+            let calls = Arc::clone(&calls);
+            tasks.push(tokio::spawn(coalesce_live_bucket_usage(BUCKET.to_string(), async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok(BucketUsageInfo {
+                    objects_count: 7,
+                    size: 42,
+                    ..Default::default()
+                })
+            })));
+        }
+
+        for task in tasks {
+            let usage = task
+                .await
+                .expect("coalesced refresh task should not panic")
+                .expect("coalesced refresh should succeed");
+            assert_eq!((usage.objects_count, usage.size), (7, 42));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let calls_after_batch = Arc::clone(&calls);
+        coalesce_live_bucket_usage(BUCKET.to_string(), async move {
+            calls_after_batch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(BucketUsageInfo::default())
+        })
+        .await
+        .expect("a later refresh should run after the in-flight entry is removed");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        live_bucket_usage_cache().invalidate(BUCKET).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn live_usage_updates_response_without_replacing_quota_memory() {
+        clear_usage_memory_cache_for_test().await;
+        let persisted = data_usage_info_for_test("bucket-a", 100, 1_000, SystemTime::now());
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        let mut response = persisted.clone();
+
+        apply_live_bucket_usage_to_response(&mut response, "bucket-a", &BucketUsageInfo::default());
+
+        assert_eq!(response.buckets_usage.get("bucket-a").map(|usage| usage.objects_count), Some(0));
+        assert_eq!(get_bucket_usage_memory("bucket-a").await, Some(1_000));
+    }
+
+    #[test]
+    fn version_listing_cursor_rejects_incomplete_or_non_advancing_pages() {
+        let mut marker = Some("object-a".to_string());
+        let mut version_marker = Some("version-a".to_string());
+
+        assert!(
+            advance_version_listing_cursor("bucket-a", &mut marker, &mut version_marker, None, Some("version-b".to_string()),)
+                .is_err()
+        );
+        assert!(
+            advance_version_listing_cursor("bucket-a", &mut marker, &mut version_marker, Some("object-a".to_string()), None,)
+                .is_err()
+        );
+        assert!(
+            advance_version_listing_cursor(
+                "bucket-a",
+                &mut marker,
+                &mut version_marker,
+                Some("object-a".to_string()),
+                Some("version-a".to_string()),
+            )
+            .is_err()
+        );
+        assert!(ensure_truncated_version_page_has_entries("bucket-a", 0).is_err());
+        ensure_truncated_version_page_has_entries("bucket-a", 1).expect("a truncated page with an entry can advance");
+
+        let mut tagged_marker = Some("object-a[rustfs_cache:v2,id:old]".to_string());
+        let mut tagged_version_marker = Some("version-a".to_string());
+        assert!(
+            advance_version_listing_cursor(
+                "bucket-a",
+                &mut tagged_marker,
+                &mut tagged_version_marker,
+                Some("object-a[rustfs_cache:v2,id:new]".to_string()),
+                Some("version-a".to_string()),
+            )
+            .is_err(),
+            "different cache tags for the same logical marker must not count as progress"
+        );
+    }
+
+    #[test]
+    fn version_listing_rejects_replayed_and_out_of_order_entries() {
+        let version_a = uuid::Uuid::from_u128(1);
+        let version_b = uuid::Uuid::from_u128(2);
+        let mut current_object = None;
+        let mut current_versions = HashSet::new();
+
+        record_version_listing_entry(
+            "bucket-a",
+            &mut current_object,
+            &mut current_versions,
+            "object-b",
+            Some(version_a.as_bytes()),
+        )
+        .expect("first version should be accepted");
+        assert!(
+            record_version_listing_entry(
+                "bucket-a",
+                &mut current_object,
+                &mut current_versions,
+                "object-b",
+                Some(version_a.as_bytes()),
+            )
+            .is_err()
+        );
+        record_version_listing_entry(
+            "bucket-a",
+            &mut current_object,
+            &mut current_versions,
+            "object-c",
+            Some(version_b.as_bytes()),
+        )
+        .expect("a lexicographically later object should reset version history");
+        assert!(
+            record_version_listing_entry(
+                "bucket-a",
+                &mut current_object,
+                &mut current_versions,
+                "object-a",
+                Some(version_a.as_bytes()),
+            )
+            .is_err()
+        );
     }
 
     fn aggregate_for_test(
@@ -1572,24 +1901,6 @@ mod tests {
                 .map(|usage| { (usage.objects_count, usage.versions_count, usage.delete_markers_count, usage.size,) }),
             Some((2, 2, 1, 30))
         );
-    }
-
-    #[test]
-    fn versioned_refresh_bucket_names_include_live_buckets_without_usage_snapshot() {
-        let mut persisted = DataUsageInfo::default();
-        persisted.buckets_usage.insert(
-            "bucket-a".to_string(),
-            BucketUsageInfo {
-                objects_count: 1,
-                versions_count: 1,
-                size: 10,
-                ..Default::default()
-            },
-        );
-
-        let buckets = bucket_names_for_versioned_refresh(&persisted, vec!["bucket-b".to_string(), "bucket-a".to_string()]);
-
-        assert_eq!(buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
     }
 
     #[tokio::test]

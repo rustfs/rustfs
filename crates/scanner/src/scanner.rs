@@ -1237,6 +1237,7 @@ mod tests {
                 stream: Box::new(Cursor::new(data)),
                 object_info: ObjectInfo::default(),
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 

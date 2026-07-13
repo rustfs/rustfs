@@ -32,6 +32,10 @@ pub struct MokaBackend {
     index: Arc<ObjectDataCacheIdentityIndex>,
     singleflight: ObjectDataCacheSingleflight,
     memory_gate: ObjectDataCacheMemoryGate,
+    /// Cache capacity in weighted bytes. Used to derive how much the cache can
+    /// still grow (`max_capacity - weighted_size()`), which caps the memory
+    /// gate's in-window reservation deduction (backlog#1212).
+    max_capacity: u64,
     /// Bounds the number of concurrent distinct-key fills. Singleflight only
     /// dedups per key, so without this limiter distinct-key fills are unbounded.
     fill_semaphore: Arc<Semaphore>,
@@ -144,6 +148,7 @@ impl MokaBackend {
             index,
             singleflight: ObjectDataCacheSingleflight::new(Arc::clone(&stats)),
             memory_gate: ObjectDataCacheMemoryGate::new(config, stats),
+            max_capacity,
             fill_semaphore: Arc::new(Semaphore::new(fill_permits)),
             #[cfg(test)]
             fill_barrier: std::sync::Mutex::new(None),
@@ -204,7 +209,16 @@ impl MokaBackend {
             Err(_) => return leader.finish(ObjectDataCacheFillResult::SkippedFillConcurrency),
         };
 
-        if !self.memory_gate.allows_fill(u64::try_from(bytes.len()).unwrap_or(u64::MAX)) {
+        // How much the cache can still grow before it is at capacity. This caps
+        // the gate's in-window reservation so sustained gross churn (net size
+        // flat, far below capacity) cannot be mistaken for real memory growth
+        // and falsely skip fills (backlog#1212). weighted_size() is moka's
+        // lazily-maintained approximation, which is all this bound needs.
+        let cache_growth_headroom = self.max_capacity.saturating_sub(self.cache.weighted_size());
+        if !self
+            .memory_gate
+            .allows_fill(u64::try_from(bytes.len()).unwrap_or(u64::MAX), cache_growth_headroom)
+        {
             return leader.finish(ObjectDataCacheFillResult::SkippedMemoryPressure);
         }
 
@@ -293,6 +307,68 @@ impl MokaBackend {
             self.cache.remove(&key).await;
         }
 
+        Self::invalidation_result(removed)
+    }
+
+    /// Invalidates every cached key of an identity in `bucket` whose object key
+    /// starts with `prefix`. Full index scan; rare force-delete/admin path only.
+    pub async fn invalidate_prefix(&self, bucket: &str, prefix: &str) -> ObjectDataCacheInvalidationResult {
+        let keys_to_remove = self
+            .index
+            .remove_matching(|identity| identity.bucket.as_ref() == bucket && identity.object.starts_with(prefix))
+            .await;
+        let removed = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.cache.remove(&key).await;
+        }
+        Self::invalidation_result(removed)
+    }
+
+    /// Invalidates every cached key of every identity in `bucket`. Full index
+    /// scan; rare bucket-delete/admin path only.
+    pub async fn invalidate_bucket(&self, bucket: &str) -> ObjectDataCacheInvalidationResult {
+        let keys_to_remove = self
+            .index
+            .remove_matching(|identity| identity.bucket.as_ref() == bucket)
+            .await;
+        let removed = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.cache.remove(&key).await;
+        }
+        Self::invalidation_result(removed)
+    }
+
+    /// Drops every cached body and resets the identity index. The index scan
+    /// yields the tracked key count for the outcome label, then the cache is
+    /// drained explicitly so even a body that is no longer tracked by the
+    /// index cannot survive the clear path. Rare admin `clear()` path only.
+    pub async fn clear(&self) -> ObjectDataCacheInvalidationResult {
+        let keys_to_remove = self.index.remove_matching(|_| true).await;
+        let removed = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.cache.remove(&key).await;
+        }
+
+        // Moka maintenance is still needed to retire queued removals, but clear
+        // must not rely on lazy invalidation alone: under heavy contention an
+        // entry can remain physically resident (and still counted) even though
+        // the invalidation fence already hides it from lookups.
+        for _ in 0..256 {
+            self.cache.run_pending_tasks().await;
+            let lingering_keys: Vec<_> = self.cache.iter().map(|(key, _)| key.as_ref().clone()).collect();
+            for key in lingering_keys {
+                self.cache.remove(&key).await;
+            }
+
+            if self.cache.entry_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Self::invalidation_result(removed)
+    }
+
+    const fn invalidation_result(removed: usize) -> ObjectDataCacheInvalidationResult {
         if removed > 0 {
             ObjectDataCacheInvalidationResult::Removed { keys: removed }
         } else {
@@ -400,6 +476,110 @@ mod tests {
             .await;
 
         assert_eq!(result, ObjectDataCacheInvalidationResult::NoOp);
+    }
+
+    fn bucketed_plan(bucket: &str, object: &str, etag: &str) -> ObjectDataCacheGetPlan {
+        ObjectDataCacheGetPlan::Cacheable {
+            key: ObjectDataCacheKey::new(bucket, object, None, etag, 5, ObjectDataCacheBodyVariant::FullObjectPlainV1),
+        }
+    }
+
+    // ODC-27: prefix invalidation drops only the identities under the prefix and
+    // leaves every other cached body intact.
+    #[tokio::test]
+    async fn moka_backend_invalidate_prefix_removes_only_matching_prefix() {
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let plan_a = cacheable_plan("photos/a.jpg", "etag-a");
+        let plan_b = cacheable_plan("photos/b.jpg", "etag-b");
+        let plan_c = cacheable_plan("videos/c.mp4", "etag-c");
+
+        let _ = backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
+        let _ = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
+        let _ = backend.fill_body(&plan_c, Bytes::from_static(b"ccccc")).await;
+
+        let result = backend.invalidate_prefix("bucket", "photos/").await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 2 });
+        assert!(matches!(backend.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
+        assert!(matches!(backend.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));
+        assert!(
+            matches!(backend.lookup_body(&plan_c).await, ObjectDataCacheLookup::Hit(_)),
+            "an object outside the prefix must survive"
+        );
+    }
+
+    // ODC-27: a prefix that matches nothing cached is a no-op.
+    #[tokio::test]
+    async fn moka_backend_invalidate_prefix_uncached_is_noop() {
+        let backend =
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let _ = backend
+            .fill_body(&cacheable_plan("photos/a.jpg", "e"), Bytes::from_static(b"aaaaa"))
+            .await;
+
+        let result = backend.invalidate_prefix("bucket", "videos/").await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::NoOp);
+    }
+
+    // ODC-28: bucket invalidation drops every identity in the bucket and leaves
+    // other buckets untouched.
+    #[tokio::test]
+    async fn moka_backend_invalidate_bucket_removes_only_that_bucket() {
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let plan_a = bucketed_plan("bucket-a", "o1", "etag-a");
+        let plan_b = bucketed_plan("bucket-a", "o2", "etag-b");
+        let plan_other = bucketed_plan("bucket-b", "o3", "etag-c");
+
+        let _ = backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
+        let _ = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
+        let _ = backend.fill_body(&plan_other, Bytes::from_static(b"ccccc")).await;
+
+        let result = backend.invalidate_bucket("bucket-a").await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 2 });
+        assert!(matches!(backend.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
+        assert!(matches!(backend.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));
+        assert!(
+            matches!(backend.lookup_body(&plan_other).await, ObjectDataCacheLookup::Hit(_)),
+            "an object in another bucket must survive a bucket flush"
+        );
+    }
+
+    // ODC-C2: clear drops every cached body and empties the identity index.
+    #[tokio::test]
+    async fn moka_backend_clear_removes_everything() {
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = MokaBackend::new(&config, Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+        let plan_a = bucketed_plan("bucket-a", "o1", "etag-a");
+        let plan_b = bucketed_plan("bucket-b", "o2", "etag-b");
+
+        let _ = backend.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
+        let _ = backend.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
+
+        let result = backend.clear().await;
+
+        assert_eq!(result, ObjectDataCacheInvalidationResult::Removed { keys: 2 });
+        assert!(matches!(backend.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
+        assert!(matches!(backend.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));
+        assert_eq!(backend.entry_count(), 0, "clear must drain cached entries before returning");
+        assert_eq!(backend.index.identity_count().await, 0, "clear must empty the identity index");
+    }
+
+    #[tokio::test]
+    async fn moka_backend_clear_empty_cache_is_noop() {
+        let backend =
+            MokaBackend::new(&enabled_config(), Arc::new(ObjectDataCacheStats::default())).expect("moka backend should build");
+
+        assert_eq!(backend.clear().await, ObjectDataCacheInvalidationResult::NoOp);
     }
 
     #[tokio::test]
@@ -729,5 +909,177 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(!cached, "a cancelled fill must not leave an orphaned body after a racing invalidation");
+    }
+
+    // ---- Concurrency stress (backlog#1107 production-readiness follow-up) ----
+    //
+    // The deterministic race tests above pin specific interleavings with an
+    // injected barrier. These drive sustained, real-parallelism contention on a
+    // small key space to catch leaks and state corruption the pinned tests
+    // cannot: a leaked singleflight leader, a stranded semaphore permit, an
+    // index/cache divergence that only shows up under volume.
+
+    /// Hammer fill / lookup / invalidate concurrently on a few hot identities,
+    /// then assert the shared machinery is neither leaked nor corrupted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn moka_backend_concurrency_storm_leaves_no_leaked_state() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        // Long TTL so entries survive the storm — we want fill-vs-invalidate
+        // races, not just expiry churn.
+        let mut config = enabled_config();
+        config.ttl = Duration::from_secs(30);
+        config.time_to_idle = Duration::from_secs(30);
+        let backend = Arc::new(MokaBackend::new(&config, Arc::clone(&stats)).expect("moka backend should build"));
+
+        const TASKS: usize = 48;
+        const ITERS: usize = 400;
+        const KEYS: usize = 6; // small pool → heavy contention on shared identities
+
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let backend = Arc::clone(&backend);
+            handles.push(tokio::spawn(async move {
+                for i in 0..ITERS {
+                    let k = (t + i) % KEYS;
+                    let object = format!("object-{}", k % 3);
+                    let plan = versioned_plan(&object, &format!("v{k}"), &format!("etag-{k}"));
+                    // Deterministic per-(task,iter) mix: mostly fills, plus
+                    // lookups and invalidations racing against them.
+                    match (t + i) % 4 {
+                        0 | 1 => {
+                            let _ = backend.fill_body(&plan, Bytes::from_static(b"hello")).await;
+                        }
+                        2 => {
+                            let _ = backend.lookup_body(&plan).await;
+                        }
+                        _ => {
+                            let identity = ObjectDataCacheIdentity::new("bucket", object.as_str());
+                            let _ = backend.invalidate_object(&identity).await;
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("stress task must not panic or deadlock");
+        }
+
+        // Every fill_body call returned, so no singleflight leader may still be
+        // registered: a non-zero count means a fill leaked its in-flight slot.
+        assert_eq!(
+            stats.snapshot().inflight_fills,
+            0,
+            "the concurrency storm leaked an in-flight fill (singleflight/semaphore not released)"
+        );
+
+        // The shared state is not corrupted: a fresh, uncontended sequence must
+        // still fill, hit, and invalidate correctly.
+        let clean = versioned_plan("fresh-object", "v1", "fresh-etag");
+        assert_eq!(
+            backend.fill_body(&clean, Bytes::from_static(b"hello")).await,
+            ObjectDataCacheFillResult::Inserted,
+            "a clean fill after the storm must still insert"
+        );
+        assert!(matches!(backend.lookup_body(&clean).await, ObjectDataCacheLookup::Hit(_)));
+        let _ = backend
+            .invalidate_object(&ObjectDataCacheIdentity::new("bucket", "fresh-object"))
+            .await;
+        assert!(
+            matches!(backend.lookup_body(&clean).await, ObjectDataCacheLookup::Miss),
+            "invalidation must still win after a concurrency storm"
+        );
+
+        let _ = backend.clear().await;
+        assert_eq!(backend.entry_count(), 0, "clear() must drop every entry");
+    }
+
+    /// A memory-constrained container (low snapshot) must reject an entire
+    /// concurrent fill burst — admission is bounded, not a check-then-act race
+    /// that lets the burst through. This is the CI-runnable proxy for the
+    /// OOM-under-burst concern; it does not cover the separate 5s-stale-snapshot
+    /// overshoot, which needs byte-based reservation in the gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn moka_backend_gate_bounds_admission_under_concurrent_burst() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let backend = Arc::new(MokaBackend::new(&memory_gated_config(), Arc::clone(&stats)).expect("moka backend should build"));
+        // Simulate a pod whose available memory is far below the free floor.
+        backend
+            .memory_gate
+            .set_test_snapshot(Some(crate::memory::ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000,
+                available_bytes: 50,
+            }));
+
+        const TASKS: usize = 32;
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let backend = Arc::clone(&backend);
+            handles.push(tokio::spawn(async move {
+                let plan = versioned_plan(&format!("object-{t}"), "v1", &format!("etag-{t}"));
+                backend.fill_body(&plan, Bytes::from_static(b"hello")).await
+            }));
+        }
+        let mut rejected = 0;
+        for handle in handles {
+            if handle.await.expect("burst task should complete") == ObjectDataCacheFillResult::SkippedMemoryPressure {
+                rejected += 1;
+            }
+        }
+
+        assert_eq!(rejected, TASKS, "the gate must reject every fill in the burst when memory is constrained");
+        assert_eq!(backend.entry_count(), 0, "no body may be admitted under memory pressure");
+    }
+
+    /// A burst that begins while the snapshot still reads *high* must be bounded
+    /// to the real headroom, not admitted wholesale. Each fill is large enough
+    /// that only a handful fit the budget; without the admitted-bytes reservation
+    /// every fill would read the same stale-high snapshot and be admitted,
+    /// over-allocating far past the budget before the 5 s refresh (backlog#1107).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn moka_backend_gate_reservation_bounds_burst_under_stale_snapshot() {
+        let stats = Arc::new(ObjectDataCacheStats::default());
+        let backend = Arc::new(MokaBackend::new(&memory_gated_config(), Arc::clone(&stats)).expect("moka backend should build"));
+        // Stale-but-high snapshot: 500 KiB available, 20% floor = 200 KiB, so the
+        // real budget above the floor is ~300 KiB.
+        backend
+            .memory_gate
+            .set_test_snapshot(Some(crate::memory::ObjectDataCacheMemorySnapshot {
+                total_bytes: 1_000_000,
+                available_bytes: 500_000,
+            }));
+
+        // 20 concurrent fills of 40 KiB each = 800 KiB requested, far past the
+        // ~300 KiB budget. Only ~7 should fit.
+        const TASKS: usize = 20;
+        const BODY: usize = 40_000;
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let backend = Arc::clone(&backend);
+            handles.push(tokio::spawn(async move {
+                let plan = versioned_plan(&format!("object-{t}"), "v1", &format!("etag-{t}"));
+                backend.fill_body(&plan, Bytes::from(vec![0u8; BODY])).await
+            }));
+        }
+        let mut admitted = 0usize;
+        for handle in handles {
+            if handle.await.expect("burst task should complete") == ObjectDataCacheFillResult::Inserted {
+                admitted += 1;
+            }
+        }
+
+        // The reservation must cap the burst: not every fill gets in (that is the
+        // stale-snapshot overshoot), yet some do (the gate is not just rejecting
+        // everything). The exact count varies with the check-then-reserve race,
+        // but the admitted bytes must stay within a small multiple of the budget.
+        assert!(
+            admitted < TASKS,
+            "reservation must bound the burst — not admit the whole {TASKS}-fill storm"
+        );
+        assert!(admitted >= 1, "the gate must still admit fills that fit the budget");
+        assert!(
+            admitted * BODY <= 500_000,
+            "admitted bytes ({}) must not exceed the snapshot's available memory",
+            admitted * BODY
+        );
     }
 }

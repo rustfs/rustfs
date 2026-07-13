@@ -157,26 +157,47 @@ test_encryption_sse_c_multipart_invalid_chunks_1
 test_encryption_sse_c_multipart_invalid_chunks_2
 test_get_multipart_checksum_object_attributes
 test_head_bucket_usage
-test_lifecycle_cloud_multiple_transition
-test_lifecycle_cloud_transition
-test_lifecycle_cloud_transition_large_obj
-test_lifecycle_deletemarker_expiration
+# -----------------------------------------------------------------------------
+# Lifecycle behavior (backlog#1148 ilm-10, master plan #1155)
+#
+# The upstream "Vendor-specific" label on these was inaccurate: the real blocker
+# was the absence of a Ceph `lc_debug_interval` equivalent, so Days>=1 expiration
+# behavior could not be exercised in seconds. RUSTFS_ILM_DEBUG_DAY_SECS (ilm-5)
+# now provides that. The first batch of expiration tests has been moved into the
+# dedicated behavior lane: scripts/s3-tests/lifecycle_behavior_tests.txt
+# (run by the ci.yml job `s3-lifecycle-behavior-tests`). The entries below are
+# NOT vendor-specific — they stay excluded from the DEFAULT single-server gate
+# for the specific reasons noted, and are queued for later batches.
+#
+# --- Batch 2 candidates: expiration with tag / size filters + noncurrent counts.
+#     These need the same debug/scanner lane as batch 1 plus tag/size-filter and
+#     NewerNoncurrentVersions coverage (see ilm-9). Queued for ilm-10 batch 2.
 test_lifecycle_deletemarker_expiration_with_days_tag
-test_lifecycle_expiration
-test_lifecycle_expiration_days0
 test_lifecycle_expiration_newer_noncurrent
 test_lifecycle_expiration_noncur_tags1
 test_lifecycle_expiration_size_gt
 test_lifecycle_expiration_size_lt
 test_lifecycle_expiration_tags2
 test_lifecycle_expiration_versioned_tags2
-test_lifecycle_multipart_expiration
-test_lifecycle_noncur_cloud_transition
-test_lifecycle_noncur_expiration
+#
+# --- Storage-class transition to a remote/warm tier. Needs a real tier backend
+#     (the hermetic second-RustFS cold layer from ilm-7) which is not wired into
+#     the s3-tests topology. Queued behind ilm-7.
 test_lifecycle_noncur_transition
 test_lifecycle_transition
+#
+# --- Single-rule multi-level Transition (hot->warm->cold). RustFS only honors
+#     transitions.first() (core.rs:676); multi-level semantics are undecided and
+#     tracked as a product item (ex-ilm-20). Do not enable until that lands.
 test_lifecycle_transition_single_rule_multi_trans
-test_lifecyclev2_expiration
+#
+# --- Cloud (S3/remote) transition + restore. Requires the [s3 cloud] endpoint
+#     the RustFS SNSD harness does not provision; depends on ilm-7 tier carrier.
+test_lifecycle_cloud_multiple_transition
+test_lifecycle_cloud_transition
+test_lifecycle_cloud_transition_large_obj
+test_lifecycle_noncur_cloud_transition
+# -----------------------------------------------------------------------------
 test_list_buckets_anonymous
 test_list_buckets_paginated
 test_list_multipart_upload

@@ -103,6 +103,11 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
             if errors.get(i).and_then(|err| err.as_ref()).is_some() {
                 continue;
             }
+            // Evict any cached body for the successfully deleted noncurrent
+            // version so it does not sit resident until TTL (ODC-26).
+            if let Some(target) = to_del.get(i) {
+                crate::object_api::notify_object_mutation(bucket, &target.object_name).await;
+            }
             let Some(replication_state) = replication_candidates.get(i).and_then(|c| c.clone()) else {
                 continue;
             };
