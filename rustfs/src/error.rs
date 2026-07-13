@@ -269,6 +269,7 @@ impl From<StorageError> for ApiError {
             StorageError::InvalidPart(_, _, _) => S3ErrorCode::InvalidPart,
             StorageError::EntityTooSmall(_, _, _) => S3ErrorCode::EntityTooSmall,
             StorageError::PreconditionFailed => S3ErrorCode::PreconditionFailed,
+            StorageError::NotModified => S3ErrorCode::NotModified,
             StorageError::InvalidRangeSpec(_) => S3ErrorCode::InvalidRange,
             _ => S3ErrorCode::InternalError,
         };
@@ -478,6 +479,7 @@ mod tests {
             (StorageError::VolumeNotFound, S3ErrorCode::NoSuchBucket),
             (StorageError::FileNotFound, S3ErrorCode::NoSuchKey),
             (StorageError::FileVersionNotFound, S3ErrorCode::NoSuchVersion),
+            (StorageError::NotModified, S3ErrorCode::NotModified),
             (StorageError::MalformedUploadID("test".into()), S3ErrorCode::InvalidArgument),
             (
                 StorageError::InvalidUploadID("bucket".into(), "object".into(), "uploadid".into()),
