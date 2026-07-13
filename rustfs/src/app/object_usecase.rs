@@ -179,7 +179,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -2322,6 +2322,57 @@ async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> O
     build_put_object_expiration_header(&event)
 }
 
+/// Cadence for the "I/O queue congestion detected" WARN. Under sustained
+/// overload (client concurrency at or above the disk-read permit pool) every
+/// GET observes >=80% utilization, so an unthrottled WARN floods the log
+/// from the already saturated hot path; congestion metrics stay per-request.
+const IO_QUEUE_CONGESTION_WARN_INTERVAL_MS: u64 = 5_000;
+
+/// At-most-one-WARN-per-interval limiter for the I/O queue congestion log.
+/// Callers supply monotonic milliseconds so tests can drive the clock.
+struct IoQueueCongestionWarnThrottle {
+    /// Timestamp of the last emitted WARN; `u64::MAX` until the first one.
+    last_warn_ms: AtomicU64,
+    /// Congested requests left unlogged since the last emitted WARN.
+    suppressed: AtomicU64,
+}
+
+impl IoQueueCongestionWarnThrottle {
+    const fn new() -> Self {
+        Self {
+            last_warn_ms: AtomicU64::new(u64::MAX),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// Claim the right to emit one WARN. Returns the number of events
+    /// suppressed since the previous emission, or `None` while the interval
+    /// window is still closed (the event is counted, not logged).
+    fn claim(&self, now_ms: u64) -> Option<u64> {
+        let last = self.last_warn_ms.load(Ordering::Relaxed);
+        let window_open = last == u64::MAX || now_ms.saturating_sub(last) >= IO_QUEUE_CONGESTION_WARN_INTERVAL_MS;
+        if window_open
+            && self
+                .last_warn_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            Some(self.suppressed.swap(0, Ordering::Relaxed))
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Monotonic milliseconds since the first call, for production callers.
+    fn now_ms() -> u64 {
+        static ANCHOR: OnceLock<std::time::Instant> = OnceLock::new();
+        ANCHOR.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+}
+
+static IO_QUEUE_CONGESTION_WARN_THROTTLE: IoQueueCongestionWarnThrottle = IoQueueCongestionWarnThrottle::new();
+
 #[derive(Clone, Default)]
 pub struct DefaultObjectUsecase {
     context: Option<Arc<AppContext>>,
@@ -2594,16 +2645,22 @@ impl DefaultObjectUsecase {
         let queue_utilization = queue_snapshot.utilization_percent();
 
         if queue_snapshot.is_congested(80.0) {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                queue_utilization = format!("{:.1}%", queue_utilization),
-                permits_in_use = queue_status.permits_in_use,
-                total_permits = queue_status.total_permits,
-                "I/O queue congestion detected"
-            );
-
+            // Metrics count every congested request; only the WARN is rate
+            // limited, because under saturation every GET crosses the
+            // threshold and per-request WARNs flood the log.
             rustfs_io_metrics::record_io_queue_congestion();
+
+            if let Some(suppressed_warns) = IO_QUEUE_CONGESTION_WARN_THROTTLE.claim(IoQueueCongestionWarnThrottle::now_ms()) {
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    queue_utilization = format!("{:.1}%", queue_utilization),
+                    permits_in_use = queue_status.permits_in_use,
+                    total_permits = queue_status.total_permits,
+                    suppressed_warns,
+                    "I/O queue congestion detected"
+                );
+            }
         }
 
         Self::ensure_get_object_not_timed_out(wrapper, timeout_config, bucket, key, GetObjectTimeoutStage::BeforeRead)?;
@@ -6750,6 +6807,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
+
+    #[test]
+    fn io_queue_congestion_warn_throttle_emits_once_per_interval() {
+        let throttle = IoQueueCongestionWarnThrottle::new();
+        // The first congested request logs immediately.
+        assert_eq!(throttle.claim(0), Some(0));
+        // Requests inside the window are counted, not logged.
+        assert_eq!(throttle.claim(1), None);
+        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS - 1), None);
+        // The next emission reports how many stayed silent.
+        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS), Some(2));
+        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS + 1), None);
+    }
+
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,
