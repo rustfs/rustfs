@@ -26,7 +26,7 @@ use std::{
 };
 use tokio::fs;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Check path length according to OS limits.
 pub fn check_path_length(path_name: &str) -> Result<()> {
@@ -543,13 +543,31 @@ async fn reliable_rename_inner(
                 continue;
             }
             if warn_on_failure {
-                warn!(
-                    "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
-                    src_file_path.as_ref(),
-                    dst_file_path.as_ref(),
-                    base_dir.as_ref(),
-                    e
-                );
+                // NotFound is an expected outcome for speculative renames (staging
+                // a dataDir that inline objects never had, trashing an already-
+                // removed tmp path, restoring an absent rollback backup): those
+                // callers treat FileNotFound as acceptable, and on per-request
+                // delete paths a WARN becomes a log storm (one line per disk per
+                // DELETE). Keep it at debug so quorum-masked cases (e.g. a tmp
+                // file lost before a commit rename) stay diagnosable; genuine
+                // failures keep the WARN. The error is returned either way.
+                if e.kind() == io::ErrorKind::NotFound {
+                    debug!(
+                        "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
+                        src_file_path.as_ref(),
+                        dst_file_path.as_ref(),
+                        base_dir.as_ref(),
+                        e
+                    );
+                } else {
+                    warn!(
+                        "reliable_rename failed. src_file_path: {:?}, dst_file_path: {:?}, base_dir: {:?}, err: {:?}",
+                        src_file_path.as_ref(),
+                        dst_file_path.as_ref(),
+                        base_dir.as_ref(),
+                        e
+                    );
+                }
             }
             return Err(e);
         }
@@ -647,10 +665,70 @@ pub fn file_exists(path: impl AsRef<Path>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+    use tracing_subscriber::fmt::MakeWriter;
 
     fn file_sync_limiter() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(MAX_PARALLEL_FILE_SYNCS))
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    /// Capture WARN-level output on the current thread; tokio tests here run on
+    /// the current-thread runtime, so the guard covers the whole test body.
+    fn warn_capture() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
     }
 
     #[test]
@@ -687,6 +765,51 @@ mod tests {
             .expect("missing cleanup source must be ignored");
 
         assert!(!dst.exists());
+    }
+
+    #[tokio::test]
+    async fn rename_all_missing_source_skips_rename_warn() {
+        // Callers like delete_version's rollback staging accept FileNotFound
+        // (inline objects have no dataDir), so a missing source must not emit
+        // the per-disk "reliable_rename failed" WARN — under delete storms it
+        // was pure log noise. The error itself is still returned.
+        let temp_dir = tempdir().expect("create temp dir");
+        let src = temp_dir.path().join("missing");
+        let dst = temp_dir.path().join("dst");
+
+        let (logs, _guard) = warn_capture();
+        let err = rename_all(&src, &dst, temp_dir.path())
+            .await
+            .expect_err("missing source must still fail");
+
+        assert!(matches!(err, DiskError::FileNotFound));
+        let captured = logs.contents();
+        assert!(
+            !captured.contains("reliable_rename failed"),
+            "NotFound must not emit the reliable_rename WARN, got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_all_real_failure_still_warns() {
+        // Renaming a file onto an existing directory fails on every platform
+        // with a non-NotFound error; genuine failures must keep the WARN.
+        let temp_dir = tempdir().expect("create temp dir");
+        let src = temp_dir.path().join("src");
+        std::fs::write(&src, b"payload").expect("write src");
+        let dst = temp_dir.path().join("dst-dir");
+        std::fs::create_dir(&dst).expect("create dst dir");
+
+        let (logs, _guard) = warn_capture();
+        rename_all(&src, &dst, temp_dir.path())
+            .await
+            .expect_err("rename onto an existing directory must fail");
+
+        let captured = logs.contents();
+        assert!(
+            captured.contains("reliable_rename failed"),
+            "genuine rename failure must keep the WARN, got: {captured}"
+        );
     }
 
     #[test]
