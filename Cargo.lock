@@ -9210,9 +9210,9 @@ dependencies = [
 
 [[package]]
 name = "rustfs-erasure-codec"
-version = "7.0.1"
+version = "7.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c31c2f2ff65a5075aad1fe29d350f1a154bdb097ff0057ee846ec1faf5701098"
+checksum = "6548bf01cd47c0a7809f004b69c49e46e323744d0c23d2b7180843cbef16eafe"
 dependencies = [
  "cc",
  "hashlink",
