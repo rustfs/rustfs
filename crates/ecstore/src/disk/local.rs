@@ -4755,9 +4755,7 @@ impl LocalDisk {
                         .await);
                     }
                     let rollback_data_path = rollback_path.join(dir.to_string());
-                    if let Err(err) = rename_all(&dir_path, &rollback_data_path, &rollback_path).await
-                        && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
-                    {
+                    if let Err(err) = rename_all_ignore_missing_source(&dir_path, &rollback_data_path, &rollback_path).await {
                         return Err(restore_delete_rollback_after_error(
                             object_dir,
                             &xlpath,
@@ -7681,10 +7679,7 @@ impl DiskAPI for LocalDisk {
                     .await);
                 }
                 let rollback_data_path = rollback_path.join(uuid.to_string());
-                if let Err(err) = rename_all(&old_path, &rollback_data_path, &rollback_path).await
-                    && err != DiskError::FileNotFound
-                    && err != DiskError::VolumeNotFound
-                {
+                if let Err(err) = rename_all_ignore_missing_source(&old_path, &rollback_data_path, &rollback_path).await {
                     return Err(restore_delete_rollback_after_error(
                         file_path.as_path(),
                         &xl_path,
@@ -7962,10 +7957,56 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 mod test {
     use super::*;
     use rustfs_filemeta::ErasureInfo;
-    use std::io;
+    use std::io::{self, Write};
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let buffer = self
+                .buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .clone();
+            String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("captured logs mutex should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
 
     fn test_file_info(name: &str, version_id: Uuid, data_dir: Option<Uuid>, data: Option<Bytes>) -> FileInfo {
         let size = data
@@ -10374,6 +10415,149 @@ mod test {
             !object_dir.join(existing_data_dir.to_string()).exists(),
             "deleted version data directory should leave the object path"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_delete_version_missing_inline_data_dir_does_not_warn() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/inline-object";
+        let version_id = Uuid::parse_str("31313131-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("32323232-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("33333333-1111-2222-3333-444444444444").expect("rollback dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        let fi = test_file_info(object, version_id, Some(data_dir), Some(Bytes::from_static(b"inline")));
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(fi.clone()))
+            .await
+            .expect("inline metadata should be written");
+        assert!(!object_dir.join(data_dir.to_string()).exists());
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        disk.delete_version(
+            bucket,
+            object,
+            fi,
+            false,
+            DeleteOptions {
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("missing inline data dir should not fail deletion");
+
+        assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
+        assert!(
+            object_dir
+                .join(rollback_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .exists()
+        );
+        assert!(!logs.contents().contains("reliable_rename failed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_delete_versions_missing_inline_data_dir_does_not_warn() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/inline-object-batch";
+        let version_id = Uuid::parse_str("34343434-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("35353535-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("36363636-1111-2222-3333-444444444444").expect("rollback dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        let fi = test_file_info(object, version_id, Some(data_dir), Some(Bytes::from_static(b"inline")));
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(fi.clone()))
+            .await
+            .expect("inline metadata should be written");
+        assert!(!object_dir.join(data_dir.to_string()).exists());
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        disk.delete_versions_internal(
+            bucket,
+            object,
+            &[fi],
+            &DeleteOptions {
+                old_data_dir: Some(rollback_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("missing inline data dir should not fail batch deletion");
+
+        assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
+        assert!(
+            object_dir
+                .join(rollback_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .exists()
+        );
+        assert!(!logs.contents().contains("reliable_rename failed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_ignore_missing_source_helper_still_warns_on_real_error() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&src).await.expect("source dir should be created");
+        fs::write(src.join("part.1"), b"live-data")
+            .await
+            .expect("source data should be written");
+        fs::create_dir_all(&dst).await.expect("destination dir should be created");
+        fs::write(dst.join("sentinel"), b"conflict")
+            .await
+            .expect("destination conflict should be written");
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let err = rename_all_ignore_missing_source(&src, &dst, dir.path())
+            .await
+            .expect_err("a non-empty rollback destination must reject rename");
+
+        assert_ne!(err, DiskError::FileNotFound);
+        assert!(src.exists());
+        assert!(dst.join("sentinel").exists());
+        assert!(logs.contents().contains("reliable_rename failed"));
     }
 
     #[tokio::test]
