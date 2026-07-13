@@ -352,13 +352,18 @@ impl MokaBackend {
         // Moka maintenance is still needed to retire queued removals, but clear
         // must not rely on lazy invalidation alone: under heavy contention an
         // entry can remain physically resident (and still counted) even though
-        // the invalidation fence already hides it from lookups.
+        // the invalidation fence already hides it from lookups. Sweep both the
+        // entries visible to iteration and a fallback invalidate_all fence so
+        // delayed internal writes cannot strand a counted entry.
         for _ in 0..256 {
             self.cache.run_pending_tasks().await;
             let lingering_keys: Vec<_> = self.cache.iter().map(|(key, _)| key.as_ref().clone()).collect();
             for key in lingering_keys {
                 self.cache.remove(&key).await;
             }
+
+            self.cache.invalidate_all();
+            self.cache.run_pending_tasks().await;
 
             if self.cache.entry_count() == 0 {
                 break;
