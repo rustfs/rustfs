@@ -59,7 +59,6 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - High-level architecture and crate map: `ARCHITECTURE.md`
 - Migration guardrails, readiness contracts, support matrices:
   `docs/architecture/README.md` (routes by audience)
-- Historical implementation plans and trackers: `docs/superpowers/plans/`
 - Shared agent skills (all tools): `.agents/skills/` — each `SKILL.md` carries
   a frontmatter `description` stating when it applies. Scan the descriptions
   before starting a task and follow any skill that matches, even if your tool
@@ -70,6 +69,20 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 
 Avoid duplicating long crate lists or command matrices in instruction files.
 Reference the source files above instead.
+
+Do not commit planning-type documents — one-shot implementation/optimization
+plans, task trackers, migration-progress ledgers, phase/PR templates,
+issue-scoped benchmark-result snapshots or optimization conclusions, or
+agent-generated working notes (e.g. anything a `superpowers`/scratch workflow
+produces). Keep that work in the issue tracker or your local worktree, not in
+the repository. Only durable reference — the architecture set under
+`docs/architecture/`, repeatable operational runbooks under `docs/operations/`,
+and the test-suite references under `docs/testing/` — belongs in version
+control; `.gitignore` ignores everything else under `docs/` by default, so a new
+plan file will not be tracked unless someone force-adds it — don't.
+`scripts/check_no_planning_docs.sh` (wired into `make pre-commit`/`pre-pr` and
+CI) fails the build if anything is committed under `docs/superpowers/`, even via
+`git add -f`.
 
 ## Verification Before PR
 
@@ -107,6 +120,11 @@ do not loosen or skip a guard script, add entries to a baseline or allowance
 list, suppress a lint with `#[allow]`, mark a failing test `#[ignore]`, or
 delete or relax a failing assertion to get green. If a check itself is wrong,
 change it deliberately and state the rationale in the PR.
+
+For flaky tests, do not paper over them with retries. Follow the flake policy
+in [docs/testing/README.md](docs/testing/README.md) (open an issue within 24h,
+quarantine with an issue link, fix or delete within 30 days); the local
+`default` nextest profile never retries.
 
 ## Adversarial Validation (Default On)
 

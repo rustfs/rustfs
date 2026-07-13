@@ -41,21 +41,16 @@ const EVENT_SERVER_READY: &str = "server_ready";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 const EVENT_EMBEDDED_SERVER_STATE: &str = "embedded_server_state";
 
-/// Guards against a second embedded server starting in the same process.
-///
-/// Phase 5 (backlog#939) moved per-instance runtime state (erasure setup,
-/// region, deployment id, endpoints, service handles, disk registry, cancel
-/// token) into `ECStore`'s `InstanceContext`, and backlog#1052 S1 threads an
-/// explicit context through the storage startup path, so a second server's
-/// *storage-layer* state could now stay isolated. This guard is still
-/// intentionally **retained**: embedded startup shares the bootstrap context
-/// (see `run_embedded_startup`), the request path resolves the store per
-/// request through the process-level `GLOBAL_OBJECT_API`/`AppContext`
-/// singletons (a second listener would serve the first instance's data), and
-/// IAM/bucket-metadata/config/credentials remain process singletons. Lifting
-/// the guard is staged in backlog#1052 (S2 per-server dispatch, S3 app
-/// subsystems, S4 node-identity globals, then S5 removes this guard); until
-/// then, rejecting the second start is safer than the failure it would become.
+/// Guards against a second embedded server startup racing the *irreversible*
+/// stages of the first one. backlog#1052 S1–S3 made the storage layer, the
+/// request path, and the app subsystems either per-instance or tolerant of
+/// double-init, so two embedded servers can coexist in the same process (the
+/// legacy hard rejection is gone). The guard now only serializes access to
+/// the shared bootstrap-context write-once cells during startup: the first
+/// startup runs, and any startup that overlaps with it before it hands off
+/// the bootstrap context is rejected — a narrow window that only matters if
+/// two `RustFSServerBuilder::build()` futures race, which no supported API
+/// path does today.
 static EMBEDDED_SERVER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +91,14 @@ fn mark_embedded_global_init_started(
         .map_err(|_| EmbeddedStartupAlreadyStarted)?;
     *global_init_started = true;
     Ok(())
+}
+
+/// Release the embedded startup guard so a subsequent startup in the same
+/// process can proceed (backlog#1052 S5). The guard only serializes the
+/// bootstrap-context write window; once startup has handed off, another
+/// server can begin.
+pub(crate) fn release_embedded_startup_guard() {
+    EMBEDDED_SERVER_STARTED.store(false, Ordering::SeqCst);
 }
 
 pub(crate) struct StartupRuntimeLifecycle {

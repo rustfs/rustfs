@@ -27,6 +27,34 @@ python3 scripts/table-catalog/pyiceberg_smoke.py \
   --cleanup
 ```
 
+To persist the successful PyIceberg run as live conformance evidence, provide
+an output path and the operator-recorded deployment metadata:
+
+```bash
+python3 scripts/table-catalog/pyiceberg_smoke.py \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key rustfsadmin \
+  --secret-key rustfsadmin \
+  --bucket rustfs-s3table-smoke \
+  --replace \
+  --cleanup \
+  --rustfs-build rustfs-v1.0.0-beta.8 \
+  --git-sha "$(git rev-parse HEAD)" \
+  --catalog-backing durable-strong \
+  --live-evidence-output /tmp/rustfs-pyiceberg-live-evidence.json
+```
+
+The evidence file uses the schema printed by:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py --print-live-evidence-schema
+```
+
+The smoke helper validates the record before writing it. Missing deployment
+metadata, mismatched expected and observed status, invalid row counts, or
+claim promotion beyond the client boundary are treated as evidence failures
+instead of support-matrix proof.
+
 The smoke test covers:
 
 - create or reuse the S3 bucket
@@ -131,6 +159,7 @@ python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-failure-cove
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-vendor-profiles
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-unsupported-inventory
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
+python3 scripts/table-catalog/engine_compatibility.py --print-live-evidence-schema
 ```
 
 Use these outputs when updating release notes, PR descriptions, or follow-up

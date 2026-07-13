@@ -13,6 +13,23 @@
 // limitations under the License.
 
 //! Core WebDAV tests
+//!
+//! # Security regression coverage
+//!
+//! GHSA-3p3x-734c-h5vx (constant-time secret comparison on the WebDAV/FTPS
+//! password login path, fixed in rustfs/rustfs#4403) is anchored end-to-end by
+//! the authentication-failure block in [`test_webdav_core_operations`], marked
+//! with a `GHSA-3p3x` comment. It drives the `ct_eq` rejection branch in
+//! `WebDavAuth::authenticate` (`crates/protocols/src/webdav/server.rs`): a
+//! valid access key with a wrong secret is rejected (the exact branch the
+//! advisory hardened), and an unknown user is rejected with the same status so
+//! the two failures are indistinguishable. The sibling FTPS assertion lives in
+//! `ftps_core.rs`; the internode RPC fail-closed advisory
+//! (GHSA-r5qv-rc46-hv8q, rustfs/rustfs#4402) is anchored by the `ghsa_r5qv_*`
+//! unit tests in `crates/ecstore/src/cluster/rpc/http_auth.rs`. See
+//! `docs/testing/security-regressions.md` for the full advisory -> test map.
+//!
+//! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx>
 
 use crate::common::local_http_client;
 use crate::common::rustfs_binary_path_with_features;
@@ -151,6 +168,7 @@ pub async fn test_webdav_core_operations() -> Result<()> {
     let mut server_process = Command::new(&binary_path)
         .arg("--address")
         .arg(S3_TEST_ADDRESS)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_WEBDAV_ENABLE", "true")
         .env("RUSTFS_WEBDAV_ADDRESS", WEBDAV_ADDRESS)
         .env("RUSTFS_WEBDAV_TLS_ENABLED", "false") // No TLS for testing
@@ -652,15 +670,38 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         );
         info!("PASS: DELETE bucket '{}' successful", bucket_name);
 
-        // Test authentication failure
-        info!("Testing WebDAV: Authentication failure");
-        let resp = client
+        // Security regression (GHSA-3p3x-734c-h5vx): constant-time secret
+        // comparison on the WebDAV password login path (fixed in
+        // rustfs/rustfs#4403). A valid access key with a wrong secret must be
+        // rejected via the `ct_eq` branch in `WebDavAuth::authenticate`, and an
+        // unknown user must be rejected with the same status so the two are
+        // indistinguishable. Behavior-only assertion (no timing checks).
+        info!("Testing WebDAV (GHSA-3p3x): valid access key + wrong secret is rejected");
+        let wrong_secret_resp = client
             .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
-            .header("Authorization", "Basic aW52YWxpZDppbnZhbGlk") // invalid:invalid
+            .header("Authorization", basic_auth_header_for(DEFAULT_ACCESS_KEY, "definitely-not-the-secret"))
             .send()
             .await?;
-        assert_eq!(resp.status().as_u16(), 401, "Invalid auth should return 401, got: {}", resp.status());
-        info!("PASS: Authentication failure test successful");
+        let wrong_secret_status = wrong_secret_resp.status().as_u16();
+        assert_eq!(
+            wrong_secret_status, 401,
+            "valid access key + wrong secret should return 401, got: {wrong_secret_status}"
+        );
+        info!("PASS: WebDAV wrong secret rejected with 401");
+
+        info!("Testing WebDAV (GHSA-3p3x): unknown user is rejected");
+        let unknown_user_resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", basic_auth_header_for("no-such-access-key", "definitely-not-the-secret"))
+            .send()
+            .await?;
+        let unknown_user_status = unknown_user_resp.status().as_u16();
+        assert_eq!(unknown_user_status, 401, "unknown user should return 401, got: {unknown_user_status}");
+        assert_eq!(
+            wrong_secret_status, unknown_user_status,
+            "invalid-user and invalid-secret failures must be indistinguishable at the protocol layer"
+        );
+        info!("PASS: WebDAV authentication failure (GHSA-3p3x) test successful");
 
         info!("WebDAV core tests passed");
         Ok(())

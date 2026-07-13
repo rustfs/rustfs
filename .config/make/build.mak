@@ -35,6 +35,25 @@ build-gnu-arm64: ## Build aarch64 GNU version
 	./build-rustfs.sh --platform aarch64-unknown-linux-gnu
 
 
+## —— Profiling build (dial9 Tokio runtime telemetry) ------------------------------------------
+
+# dial9 hooks Tokio's unstable runtime instrumentation, so it needs
+# `--cfg tokio_unstable`. That flag is deliberately absent from
+# .cargo/config.toml: it is not free, and release binaries do not carry it.
+# Setting RUSTFLAGS here replaces (never appends to) the config-file value, and
+# crates/obs/build.rs fails the build if the feature and the flag disagree.
+#
+# There are no task-dump or S3-upload features — see the notes in
+# crates/obs/Cargo.toml for why.
+DIAL9_FEATURES ?= dial9
+DIAL9_RUSTFLAGS ?= --cfg tokio_unstable
+
+.PHONY: build-profiling
+build-profiling: ## Build RustFS with dial9 Tokio runtime telemetry (diagnostic builds only)
+	@echo "🔬 Building RustFS with dial9 telemetry (features: $(DIAL9_FEATURES))..."
+	@echo "⚠️  Diagnostic build: telemetry writes trace segments to disk continuously."
+	RUSTFLAGS="$(DIAL9_RUSTFLAGS)" cargo build --release --bin rustfs --features $(DIAL9_FEATURES)
+
 .PHONY: build-cross-all
 build-cross-all: core-deps ## Build binaries for all architectures
 	@echo "🔧 Building all target architectures..."

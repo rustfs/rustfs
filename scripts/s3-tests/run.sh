@@ -159,7 +159,10 @@ PY
 
 # Test list files location
 TEST_LISTS_DIR="${SCRIPT_DIR}"
-IMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/implemented_tests.txt"
+# IMPLEMENTED_TESTS_FILE may be overridden to run an alternate exact-node-id
+# whitelist (e.g. lifecycle_behavior_tests.txt for the dedicated lifecycle
+# behavior lane, which needs RUSTFS_ILM_DEBUG_DAY_SECS + the scanner enabled).
+IMPLEMENTED_TESTS_FILE="${IMPLEMENTED_TESTS_FILE:-${TEST_LISTS_DIR}/implemented_tests.txt}"
 UNIMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/unimplemented_tests.txt"
 EXCLUDED_TESTS_FILE="${TEST_LISTS_DIR}/excluded_tests.txt"
 S3_TEST_FILE="s3tests/functional/test_s3.py"

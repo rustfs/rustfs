@@ -21,8 +21,9 @@
 //! (after the reader is built) means a hit no longer saves any disk I/O.
 
 use crate::object_api::ObjectInfo;
+use crate::object_api::hook_slot::HookSlot;
 use bytes::Bytes;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// Serves full-object GET bodies from a cache keyed by object identity.
 ///
@@ -35,15 +36,40 @@ pub trait GetObjectBodyCacheHook: Send + Sync + 'static {
     async fn lookup(&self, bucket: &str, object: &str, info: &ObjectInfo) -> Option<Bytes>;
 }
 
-static GET_OBJECT_BODY_CACHE_HOOK: OnceLock<Arc<dyn GetObjectBodyCacheHook>> = OnceLock::new();
+// A `HookSlot` (RwLock<Option<Arc<dyn ...>>>) rather than `ArcSwapOption`:
+// arc-swap's `RefCnt` is implemented only for the sized `Arc<T>` (it stores a
+// thin `*mut T`), so it cannot hold an `Arc<dyn GetObjectBodyCacheHook>`
+// without a sized newtype wrapper. The probe reads this slot once per
+// full-object GET, but the read guard only clones an `Arc`, which is negligible
+// next to the metadata quorum fan-out already completed before the probe.
+// Registration is a startup / config-reload event, so writer contention is a
+// non-issue.
+static GET_OBJECT_BODY_CACHE_HOOK: HookSlot<dyn GetObjectBodyCacheHook> = HookSlot::new();
 
-/// Register the process-wide GET body cache hook. First registration wins;
-/// later calls are ignored so tests and re-inits cannot swap the hook midway.
+/// Register (or re-register) the process-wide GET body cache hook.
+///
+/// Re-registration atomically swaps to `hook`, so a rebuilt `AppContext`
+/// (config reload, or the test re-init pattern) leaves ecstore's GET probe
+/// pointed at the newest adapter. A first-wins slot would instead pin the probe
+/// to the original adapter while every usecase-layer fill and invalidation
+/// targeted the replacement, silently degrading the feature to a 0% hit rate
+/// and stranding entries in the unreachable cache until their TTL (backlog#1126).
 pub fn register_get_object_body_cache_hook(hook: Arc<dyn GetObjectBodyCacheHook>) {
-    let _ = GET_OBJECT_BODY_CACHE_HOOK.set(hook);
+    GET_OBJECT_BODY_CACHE_HOOK.register(
+        hook,
+        "GET object body cache hook re-registered with a different instance; \
+         the previous adapter's cache is now unreachable by ecstore's GET probe",
+    );
 }
 
 /// The registered hook, if any.
-pub(crate) fn get_object_body_cache_hook() -> Option<&'static Arc<dyn GetObjectBodyCacheHook>> {
+pub(crate) fn get_object_body_cache_hook() -> Option<Arc<dyn GetObjectBodyCacheHook>> {
     GET_OBJECT_BODY_CACHE_HOOK.get()
+}
+
+/// Test-only: unregister the hook so tests can register and clear the slot
+/// deterministically without leaking a hook into unrelated tests.
+#[cfg(test)]
+pub(crate) fn clear_get_object_body_cache_hook() {
+    GET_OBJECT_BODY_CACHE_HOOK.clear();
 }

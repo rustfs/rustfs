@@ -6,8 +6,9 @@ contracts, boundary rules, and support matrices.
 Two rules keep this directory healthy:
 
 1. **Durable reference only.** One-shot implementation plans, task trackers,
-   and PR templates live in [`docs/superpowers/plans/`](../superpowers/plans/)
-   and are archived there when their work closes.
+   and PR templates do not belong in the repository — keep them in the issue
+   tracker or your local worktree. When their work closes, delete them rather
+   than archiving them here.
 2. **No copies of other sources of truth.** Crate lists come from
    `Cargo.toml`, CI steps from `.github/workflows/ci.yml`, code structure from
    the code. `scripts/check_doc_paths.sh` fails the pre-commit gate when a
@@ -51,12 +52,11 @@ Two rules keep this directory healthy:
 - [obs-ecstore-dependency-inventory.md](obs-ecstore-dependency-inventory.md)
 - [background-services-inventory.md](background-services-inventory.md)
 - [admin-route-action-snapshot.md](admin-route-action-snapshot.md)
-- [startup-timeline.md](startup-timeline.md)
-- [scheduler-baseline.md](scheduler-baseline.md)
-- [profiling-numa-capability-inventory.md](profiling-numa-capability-inventory.md)
-- [kms-development-defaults-inventory.md](kms-development-defaults-inventory.md)
 - [compat-cleanup-register.md](compat-cleanup-register.md)
 
 Historical plans and trackers (rebalance/decommission phases,
-migration-progress ledger) were moved to
-[`docs/superpowers/plans/`](../superpowers/plans/) in 2026-07.
+migration-progress ledger, and the one-shot migration snapshots that fed it —
+startup timeline, scheduler baseline, profiling/NUMA capability inventory, KMS
+development defaults inventory) were retired in 2026-07 once the
+architecture-review ledger they served closed out (backlog#660/#665). Planning
+documents are no longer kept in the repository.

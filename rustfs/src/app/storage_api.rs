@@ -70,14 +70,6 @@ pub(crate) mod data_usage {
         .await
     }
 
-    pub(crate) async fn refresh_versioned_bucket_usage_from_object_layer(
-        store: Arc<crate::storage::storage_api::ECStore>,
-        data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
-    ) {
-        crate::storage::storage_api::ecstore_data_usage::refresh_versioned_bucket_usage_from_object_layer(store, data_usage_info)
-            .await;
-    }
-
     pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
         crate::storage::storage_api::ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
     }
@@ -153,14 +145,11 @@ pub(crate) mod runtime {
     pub(crate) type TierConfigMgr = crate::storage::storage_api::TierConfigMgr;
     pub(crate) type TransitionState = crate::storage::storage_api::TransitionState;
 
+    // Shared MockWarmBackend + register_mock_tier helper (rustfs/backlog#1148 ilm-6).
+    // The mock (and the tier types it used to need) now live in ecstore behind
+    // the `test-util` feature.
     #[cfg(test)]
-    pub(crate) type TierConfig = crate::storage::storage_api::ecstore_tier::tier_config::TierConfig;
-    #[cfg(test)]
-    pub(crate) type TierType = crate::storage::storage_api::ecstore_tier::tier_config::TierType;
-    #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_tier::warm_backend::WarmBackend as AppWarmBackend;
-    #[cfg(test)]
-    pub(crate) type WarmBackendGetOpts = crate::storage::storage_api::ecstore_tier::warm_backend::WarmBackendGetOpts;
+    pub(crate) use crate::storage::storage_api::ecstore_tier::test_util::{MockWarmBackend, register_mock_tier};
 
     pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
         crate::storage::storage_api::ecstore_config::set_global_storage_class(cfg);
@@ -206,7 +195,7 @@ pub(crate) mod runtime {
         crate::storage::storage_api::set_object_store_resolver(resolver)
     }
 
-    pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
+    pub(crate) fn get_global_notification_sys() -> Option<std::sync::Arc<NotificationSys>> {
         crate::storage::storage_api::get_global_notification_sys()
     }
 
@@ -813,12 +802,6 @@ pub(crate) mod bucket {
         pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
             crate::storage::storage_api::ecstore_bucket::utils::serialize(val)
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) mod transition_api {
-        pub(crate) type ReadCloser = crate::storage::storage_api::ecstore_client::transition_api::ReadCloser;
-        pub(crate) type ReaderImpl = crate::storage::storage_api::ecstore_client::transition_api::ReaderImpl;
     }
 
     pub(crate) mod versioning_sys {

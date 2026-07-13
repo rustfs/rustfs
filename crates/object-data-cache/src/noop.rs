@@ -29,9 +29,25 @@ impl NoopBackend {
         ObjectDataCacheFillResult::SkippedDisabled
     }
 
-    /// Returns a successful no-op invalidation result.
+    /// Returns a no-op invalidation result: a disabled cache holds nothing, so
+    /// nothing is ever removed.
     pub async fn invalidate_object(&self) -> ObjectDataCacheInvalidationResult {
-        ObjectDataCacheInvalidationResult::Success
+        ObjectDataCacheInvalidationResult::NoOp
+    }
+
+    /// Prefix invalidation on a disabled cache removes nothing.
+    pub async fn invalidate_prefix(&self) -> ObjectDataCacheInvalidationResult {
+        ObjectDataCacheInvalidationResult::NoOp
+    }
+
+    /// Bucket invalidation on a disabled cache removes nothing.
+    pub async fn invalidate_bucket(&self) -> ObjectDataCacheInvalidationResult {
+        ObjectDataCacheInvalidationResult::NoOp
+    }
+
+    /// Clearing a disabled cache removes nothing.
+    pub async fn clear(&self) -> ObjectDataCacheInvalidationResult {
+        ObjectDataCacheInvalidationResult::NoOp
     }
 }
 
@@ -53,6 +69,6 @@ mod tests {
 
         assert!(matches!(lookup, ObjectDataCacheLookup::SkipDisabled));
         assert!(matches!(fill, ObjectDataCacheFillResult::SkippedDisabled));
-        assert!(matches!(invalidation, ObjectDataCacheInvalidationResult::Success));
+        assert!(matches!(invalidation, ObjectDataCacheInvalidationResult::NoOp));
     }
 }

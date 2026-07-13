@@ -192,7 +192,7 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
-type InlineBitrotReader = coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>;
+type InlineBitrotReader = coding::BitrotReader<crate::io_support::bitrot::ShardReader>;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
@@ -429,7 +429,13 @@ const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJEC
 // --- Codec Streaming Configuration ---
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false; // Disabled until rollout gates are ready
+// Emergency kill-switch, not the primary enablement knob. The single switch that
+// turns codec streaming on/off is `RUSTFS_GET_CODEC_STREAMING_ROLLOUT` (default
+// `off`). This flag defaults to `true` and only exists to force-disable the fast
+// path regardless of rollout (set to `false`). Body/header compatibility is
+// confirmed by the GET codec-streaming parity e2e net + bench A/B (backlog#1183),
+// so it no longer gates enablement. See `get_codec_streaming_reader_gate`.
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = true;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
@@ -439,6 +445,10 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: usize = MI_B;
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
 
+// Primary single switch for the codec-streaming GET fast path. `off` (default)
+// keeps GET on the legacy duplex path; `on` (aliases `full`/`production`, plus
+// the legacy `internal`/`benchmark`) opts it in. Combine with
+// `..._ROLLOUT_PCT` for a partial (percentage-based) rollout.
 const ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "off";
 
@@ -918,18 +928,35 @@ fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
 fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
     let rollout = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT);
     match rollout.trim() {
+        // Clean production token. `internal`/`benchmark` remain accepted aliases
+        // for backward compatibility; all three opt the fast path in.
+        value
+            if value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("full")
+                || value.eq_ignore_ascii_case("production") =>
+        {
+            GetCodecStreamingRollout::On
+        }
         value if value.eq_ignore_ascii_case("internal") => GetCodecStreamingRollout::Internal,
         value if value.eq_ignore_ascii_case("benchmark") => GetCodecStreamingRollout::Benchmark,
         _ => GetCodecStreamingRollout::Off,
     }
 }
 
+/// Emergency kill-switch (defaults to `true`). Set
+/// `RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED=false` to force the fast path
+/// off. Body compatibility is confirmed by the parity e2e net + bench (backlog#1183),
+/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
 fn is_get_codec_streaming_body_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, false)
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, true)
 }
 
+/// Emergency kill-switch (defaults to `true`). Set
+/// `RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=false` to force the fast path
+/// off. Header compatibility is confirmed by the parity e2e net + bench (backlog#1183),
+/// so this no longer gates enablement — the `..._ROLLOUT` switch does.
 fn is_get_codec_streaming_header_compat_confirmed() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, false)
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, true)
 }
 
 fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
@@ -954,7 +981,11 @@ enum GetCodecStreamingDecision {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GetCodecStreamingRollout {
+    /// Default. Codec streaming disabled; GET uses the legacy duplex path.
     Off,
+    /// Production enablement token (`on`/`full`/`production`).
+    On,
+    /// Backward-compatible aliases that also opt the fast path in.
     Internal,
     Benchmark,
 }
@@ -3901,6 +3932,69 @@ mod tests {
                 .join(STORAGE_FORMAT_FILE_BACKUP)
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_inline_quorum_failure_rolls_back_destination_object() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let disk_root = dir.path().join("disk0");
+        fs::create_dir_all(&disk_root).await.expect("disk root should be created");
+        let endpoint = Endpoint::try_from(disk_root.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let bucket = "bucket";
+        let object = "inline-object";
+        let tmp_object = "tmp-inline-object";
+        let version_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("version id should parse");
+
+        match disk.make_volume(bucket).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("bucket should be available: {err:?}"),
+        }
+        match disk.make_volume(RUSTFS_META_TMP_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("tmp bucket should be available: {err:?}"),
+        }
+
+        let object_dir = disk_root.join(bucket).join(object);
+        fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+        let mut old_fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 1);
+        old_fi.name = object.to_string();
+        old_fi.version_id = Some(version_id);
+        old_fi.data = Some(Bytes::from_static(b"old-inline"));
+        old_fi.size = 10;
+        old_fi.mod_time = Some(OffsetDateTime::now_utc());
+        let mut old_meta = FileMeta::default();
+        old_meta.add_version(old_fi).expect("old metadata should accept file info");
+        let old_meta_buf = old_meta.marshal_msg().expect("old metadata should encode");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), old_meta_buf.clone())
+            .await
+            .expect("old metadata should be written");
+
+        let mut new_fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 1);
+        new_fi.name = object.to_string();
+        new_fi.version_id = Some(version_id);
+        new_fi.data = Some(Bytes::from_static(b"new-inline"));
+        new_fi.size = 10;
+        new_fi.mod_time = Some(OffsetDateTime::now_utc());
+
+        let disks = vec![Some(disk), None];
+        let file_infos = vec![new_fi.clone(), new_fi];
+        let result = SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, tmp_object, &file_infos, bucket, object, 2).await;
+
+        assert!(result.is_err());
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("destination metadata should remain readable");
+        assert_eq!(restored_meta, old_meta_buf);
     }
 
     #[test]

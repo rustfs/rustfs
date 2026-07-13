@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::startup::services::{ECStore, EndpointServerPools};
+use crate::storage_api::startup::services::{ECStore, EndpointServerPools, ServerContextSlot};
 use crate::{
     config::Config,
     init::{init_buffer_profile_system, init_kms_system},
@@ -48,10 +48,11 @@ pub(crate) async fn init_embedded_startup_runtime_services(
     store: Arc<ECStore>,
     ctx: CancellationToken,
     readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
 ) -> Result<EmbeddedStartupServiceRuntime> {
     init_embedded_optional_service_runtime(config).await;
     let buckets = init_embedded_bucket_metadata_runtime(store.clone()).await?;
-    let iam_bootstrap = init_embedded_iam_runtime(store, ctx, readiness)
+    let iam_bootstrap = init_embedded_iam_runtime(store, ctx, readiness, server_ctx)
         .await
         .map_err(|err| std::io::Error::other(format!("IAM bootstrap setup: {err}")))?;
     init_embedded_notification_runtime(endpoint_pools, buckets).await;
@@ -66,6 +67,7 @@ pub(crate) async fn init_startup_runtime_services(
     ctx: CancellationToken,
     readiness: Arc<GlobalReadiness>,
     state_manager: Arc<ServiceStateManager>,
+    server_ctx: Arc<ServerContextSlot>,
 ) -> Result<StartupServiceRuntime> {
     init_kms_system(config).await?;
 
@@ -76,7 +78,7 @@ pub(crate) async fn init_startup_runtime_services(
     init_deadlock_detector_runtime();
 
     let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
-    let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager).await?;
+    let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx).await?;
     init_auth_integrations().await?;
     init_notification_runtime(endpoint_pools, buckets).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;

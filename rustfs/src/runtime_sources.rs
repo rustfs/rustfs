@@ -16,7 +16,7 @@ use crate::app::context;
 use std::sync::Arc;
 
 pub(crate) use context::{
-    AppContext, NotifyInterface, default_notify_interface as fallback_notify_interface,
+    AppContext, NotifyInterface, ServerContextSlot, default_notify_interface as fallback_notify_interface,
     default_object_data_cache_handle as fallback_object_data_cache_handle,
     default_outbound_tls_runtime_interface as fallback_outbound_tls_runtime_interface,
     default_s3select_db_interface as fallback_s3select_db_interface,
@@ -54,6 +54,9 @@ pub(crate) use context::{
 pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
     context::set_test_outbound_tls_generation(generation);
 }
+
+#[cfg(test)]
+pub(crate) use context::install_test_app_context;
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     context::get_global_app_context()

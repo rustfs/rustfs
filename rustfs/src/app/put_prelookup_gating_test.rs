@@ -23,84 +23,16 @@
 //! - an unknown bucket (metadata lookup error) fails closed (gate = true),
 //!   so a degraded metadata subsystem can never silently drop the WORM check.
 
+use super::gating_test_env::shared_gating_ecstore;
 use super::object_usecase::put_prelookup_worm_gate;
-use super::storage_api::test::bucket::metadata_sys;
-use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
-use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+use super::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use serial_test::serial;
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use tempfile::TempDir;
-use tokio::fs;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-static PUT_GATING_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = OnceLock::new();
-
-async fn setup_put_gating_env() -> Arc<ECStore> {
-    if let Some((_paths, store, _)) = PUT_GATING_ENV.get() {
-        return store.clone();
-    }
-
-    let temp_dir = TempDir::new().expect("create temp dir for put prelookup gating test");
-    let temp_path = temp_dir.path().to_path_buf();
-
-    let disk_paths = vec![
-        temp_path.join("disk1"),
-        temp_path.join("disk2"),
-        temp_path.join("disk3"),
-        temp_path.join("disk4"),
-    ];
-    for disk_path in &disk_paths {
-        fs::create_dir_all(disk_path).await.unwrap();
-    }
-
-    let mut endpoints = Vec::new();
-    for (i, disk_path) in disk_paths.iter().enumerate() {
-        let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(i);
-        endpoints.push(endpoint);
-    }
-
-    let pool_endpoints = PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: 4,
-        endpoints: Endpoints::from(endpoints),
-        cmd_line: "put-prelookup-gating-test".to_string(),
-        platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
-    };
-
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
-        .await
-        .unwrap();
-
-    let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let buckets_list = ecstore
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
-
-    let _ = PUT_GATING_ENV.set((disk_paths, ecstore.clone(), temp_dir));
-    ecstore
-}
 
 #[tokio::test]
 #[serial]
 async fn worm_gate_keeps_prelookup_for_object_lock_bucket() {
-    let ecstore = setup_put_gating_env().await;
+    let ecstore = shared_gating_ecstore().await;
     let bucket = format!("put-gate-lock-{}", Uuid::new_v4());
 
     ecstore
@@ -123,7 +55,7 @@ async fn worm_gate_keeps_prelookup_for_object_lock_bucket() {
 #[tokio::test]
 #[serial]
 async fn worm_gate_allows_skip_for_plain_bucket() {
-    let ecstore = setup_put_gating_env().await;
+    let ecstore = shared_gating_ecstore().await;
     let bucket = format!("put-gate-plain-{}", Uuid::new_v4());
 
     ecstore
@@ -140,7 +72,7 @@ async fn worm_gate_allows_skip_for_plain_bucket() {
 #[tokio::test]
 #[serial]
 async fn worm_gate_fails_closed_when_bucket_metadata_is_unavailable() {
-    let _ecstore = setup_put_gating_env().await;
+    let _ecstore = shared_gating_ecstore().await;
     let missing_bucket = format!("put-gate-missing-{}", Uuid::new_v4());
 
     assert!(

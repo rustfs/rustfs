@@ -378,9 +378,7 @@ pub(crate) mod versioning_sys {
 pub(crate) mod storageclass {
     pub(crate) const INLINE_BLOCK_ENV: &str = super::ecstore_config::storageclass::INLINE_BLOCK_ENV;
     pub(crate) const OPTIMIZE_ENV: &str = super::ecstore_config::storageclass::OPTIMIZE_ENV;
-    pub(crate) const RRS: &str = super::ecstore_config::storageclass::RRS;
     pub(crate) const RRS_ENV: &str = super::ecstore_config::storageclass::RRS_ENV;
-    pub(crate) const STANDARD: &str = super::ecstore_config::storageclass::STANDARD;
     pub(crate) const STANDARD_ENV: &str = super::ecstore_config::storageclass::STANDARD_ENV;
 
     pub(crate) type Config = super::ecstore_config::storageclass::Config;
@@ -449,6 +447,7 @@ pub(crate) static ERR_TIER_INVALID_CREDENTIALS: AdminErrorRef =
 pub(crate) static ERR_TIER_NAME_NOT_UPPERCASE: AdminErrorRef =
     AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_NAME_NOT_UPPERCASE);
 pub(crate) static ERR_TIER_NOT_FOUND: AdminErrorRef = AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_NOT_FOUND);
+pub(crate) static ERR_TIER_RESERVED_NAME: AdminErrorRef = AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_RESERVED_NAME);
 
 pub(crate) mod data_usage {
     use std::sync::Arc;
@@ -474,14 +473,6 @@ pub(crate) mod data_usage {
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend(store).await
-    }
-
-    pub(crate) async fn refresh_versioned_bucket_usage_from_object_layer(
-        store: Arc<crate::storage::storage_api::ECStore>,
-        data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
-    ) {
-        crate::storage::storage_api::ecstore_data_usage::refresh_versioned_bucket_usage_from_object_layer(store, data_usage_info)
-            .await;
     }
 
     pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
@@ -592,10 +583,9 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod tier {
-    pub(crate) use super::storageclass;
     pub(crate) use super::{
         AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
         ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
-        ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType,
+        ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierCreds, TierType,
     };
 }

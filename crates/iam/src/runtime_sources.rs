@@ -24,6 +24,6 @@ pub(crate) fn current_server_config() -> Option<ServerConfig> {
     get_global_server_config()
 }
 
-pub(crate) fn notification_sys() -> Option<&'static IamNotificationSys> {
+pub(crate) fn notification_sys() -> Option<std::sync::Arc<IamNotificationSys>> {
     ecstore_notification_sys()
 }

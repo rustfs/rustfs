@@ -22,7 +22,7 @@ use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations, BucketOptions};
 use super::storage_api::admin_usecase::data_usage::{
     apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_bucket_usage_from_object_layer,
-    refresh_versioned_bucket_usage_from_object_layer, replace_bucket_usage_memory_from_info,
+    replace_bucket_usage_memory_from_info,
 };
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
@@ -249,11 +249,9 @@ impl DefaultAdminUsecase {
             error!("load_data_usage_from_backend failed {:?}", e);
             Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed")
         })?;
-        refresh_versioned_bucket_usage_from_object_layer(store.clone(), &mut info).await;
         replace_bucket_usage_memory_from_info(&info).await;
         apply_bucket_usage_memory_overlay(&mut info).await;
         Self::refresh_live_bucket_usage_for_data_usage_info(store.clone(), &mut info).await;
-        apply_bucket_usage_memory_overlay(&mut info).await;
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 

@@ -170,10 +170,10 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
         read_data: bool,
+        caller_allows_early_stop: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
-        // Read-only callers (GET/HEAD/tag read) may use the metadata early-stop
-        // fast path.
-        self.get_object_fileinfo_gated(bucket, object, opts, read_data, true).await
+        self.get_object_fileinfo_gated(bucket, object, opts, read_data, caller_allows_early_stop)
+            .await
     }
 
     /// Like `get_object_fileinfo`, but `allow_early_stop=false` forces the full
@@ -329,7 +329,7 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> (ObjectInfo, usize, Option<StorageError>) {
-        let fi = match self.get_object_fileinfo(bucket, object, opts, false).await {
+        let fi = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
             Ok((fi, _, _)) => fi,
             Err(e) => return (ObjectInfo::default(), 0, Some(e)),
         };
@@ -2783,6 +2783,8 @@ mod tests {
         accumulator.observe_file_info(&metadata_early_stop_candidate("object", 1));
         assert!(accumulator.early_stop_decision().is_none());
         accumulator.observe_file_info(&metadata_early_stop_candidate("object", 2));
+        assert!(accumulator.early_stop_decision().is_none());
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 3));
 
         assert_eq!(
             accumulator.early_stop_decision(),
@@ -2790,7 +2792,7 @@ mod tests {
                 reason: GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM
             })
         );
-        assert_eq!(accumulator.valid_responses, 2);
+        assert_eq!(accumulator.valid_responses, 3);
     }
 
     #[test]
@@ -2799,25 +2801,31 @@ mod tests {
 
         accumulator.observe_file_info(&metadata_early_stop_candidate("object", 1));
         accumulator.observe_file_info(&metadata_early_stop_candidate("object", 2));
+        assert!(accumulator.early_stop_decision().is_none());
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 3));
 
         assert!(accumulator.early_stop_decision().is_some());
-        assert_eq!(accumulator.candidate_votes, 2);
+        assert_eq!(accumulator.candidate_votes, 3);
     }
 
     #[test]
     fn metadata_quorum_accumulator_partial_result_remains_quorum_compatible() {
         let first = metadata_early_stop_candidate("object", 1);
         let second = metadata_early_stop_candidate("object", 2);
-        let parts_metadata = vec![first.clone(), second, FileInfo::default(), FileInfo::default()];
+        let third = metadata_early_stop_candidate("object", 3);
+        let parts_metadata = vec![first.clone(), second, third, FileInfo::default()];
         let errs = vec![None, None, None, None];
 
-        let (read_quorum, _) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
+        let (read_quorum, write_quorum) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
             .expect("partial early-stop metadata should preserve read quorum");
         let read_quorum = usize::try_from(read_quorum).expect("read quorum should be non-negative");
+        let write_quorum = usize::try_from(write_quorum).expect("write quorum should be non-negative");
+        let selection_quorum = SetDisks::latest_fileinfo_selection_quorum("", &parts_metadata, &errs, read_quorum, write_quorum);
         let selected = SetDisks::pick_valid_fileinfo(&parts_metadata, None, Some("etag-1".to_string()), read_quorum)
             .expect("partial early-stop metadata should preserve selected FileInfo");
 
         assert_eq!(read_quorum, 2);
+        assert_eq!(selection_quorum, 3);
         assert_eq!(selected.name, first.name);
         assert_eq!(selected.get_etag(), first.get_etag());
     }
@@ -2869,6 +2877,8 @@ mod tests {
         deleted.deleted = true;
 
         accumulator.observe_file_info(&deleted);
+        accumulator.observe_file_info(&deleted);
+        assert!(accumulator.early_stop_decision().is_none());
         accumulator.observe_file_info(&deleted);
 
         assert_eq!(
@@ -3004,6 +3014,22 @@ mod tests {
                 assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
                 assert!(should_allow_metadata_early_stop(false, "", false, false));
                 assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
+            },
+        );
+    }
+
+    #[test]
+    fn metadata_early_stop_rejects_healing_and_free_version_requests() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+            ],
+            || {
+                assert!(!should_allow_metadata_early_stop(false, "", true, false));
+                assert!(!should_allow_metadata_early_stop(false, "", false, true));
+                assert!(!should_allow_metadata_early_stop(false, "version-id", true, false));
+                assert!(!should_allow_metadata_early_stop(false, "version-id", false, true));
             },
         );
     }
@@ -3745,7 +3771,10 @@ mod tests {
 
         temp_env::async_with_vars(
             [
-                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, data_blocks_first.then_some("true")),
+                (
+                    ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
+                    Some(if data_blocks_first { "true" } else { "false" }),
+                ),
                 (
                     ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP,
                     codec_data_blocks_first.then_some("true"),
@@ -4811,13 +4840,62 @@ mod tests {
     }
 
     #[test]
-    fn codec_streaming_reader_gate_defaults_to_disabled() {
+    fn codec_streaming_reader_gate_defaults_to_off() {
+        // With no env set the `..._ROLLOUT` switch defaults to `off`, so GET stays
+        // on the legacy duplex path. The compat kill-switches now default to
+        // confirmed (backlog#1183), so the fallback reason is the rollout switch,
+        // not the retired `Disabled`/`*Unconfirmed` reasons.
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_enabled_by_rollout_switch_alone() {
+        // The single switch: `..._ROLLOUT=on` opts the fast path in with the
+        // ENABLE / *_COMPAT_CONFIRMED kill-switches left unset (they default on).
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Use
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_force_disabled_by_enable_kill_switch() {
+        // Even with the rollout switch on, `ENABLE=false` force-disables the fast path.
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
             ],
             || {

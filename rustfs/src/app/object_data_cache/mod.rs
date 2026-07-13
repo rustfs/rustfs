@@ -18,6 +18,7 @@ mod adapter;
 mod body;
 mod hook;
 mod invalidation;
+mod mutation_hook;
 mod planner;
 
 pub(crate) use adapter::ObjectDataCacheAdapter;
@@ -29,7 +30,9 @@ pub(crate) use hook::register_object_data_cache_body_hook;
 pub(crate) use invalidation::{
     invalidate_object_data_cache_after_complete_multipart_success, invalidate_object_data_cache_after_copy_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
-    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
-    invalidate_object_data_cache_objects_before_mutation,
+    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_bucket_after_delete,
+    invalidate_object_data_cache_objects_after_delete_success, invalidate_object_data_cache_objects_before_mutation,
+    invalidate_object_data_cache_prefix_after_delete, invalidate_object_data_cache_prefix_before_mutation,
 };
+pub(crate) use mutation_hook::register_object_data_cache_mutation_hook;
 pub(crate) use planner::{GetObjectBodyCachePlan, GetObjectBodyCacheRequest, build_get_object_body_cache_plan};

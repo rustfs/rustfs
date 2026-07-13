@@ -68,6 +68,8 @@ pub enum TelemetryError {
     Io(String),
     #[error("Set permissions failed: {0}")]
     SetPermissions(String),
+    #[error("Log sink conflict: {0}")]
+    LogSinkConflict(String),
 }
 
 impl From<std::io::Error> for TelemetryError {

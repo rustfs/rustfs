@@ -1,0 +1,104 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Schedule Failure Issue"
+description: >-
+  Open (or update) a tracking issue when a scheduled workflow run fails.
+  Dedupes by workflow name: if an open issue titled
+  "[scheduled-failure] <workflow name>" already exists, the failure is
+  appended as a comment; otherwise a new issue is created. This is the
+  single alerting mechanism for all scheduled pipelines (backlog#1149 ci-8).
+
+inputs:
+  github-token:
+    description: >-
+      Token with issues:write on the repository. Pass secrets.GITHUB_TOKEN
+      from a job that declares `permissions: issues: write` (scope the
+      permission to the alert job only, never workflow-wide).
+    required: true
+  workflow-name:
+    description: "Workflow name used for the issue title (the dedupe key)."
+    required: false
+    default: ${{ github.workflow }}
+  label:
+    description: >-
+      Label applied when a new issue is created. Must already exist in the
+      repository; if applying it fails, the issue is created without a label.
+      Set to an empty string to skip labeling.
+    required: false
+    default: "infrastructure"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Open or update failure-tracking issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        WORKFLOW_NAME: ${{ inputs.workflow-name }}
+        ISSUE_LABEL: ${{ inputs.label }}
+      run: |
+        set -euo pipefail
+
+        title="[scheduled-failure] ${WORKFLOW_NAME}"
+        run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+        # Failed job names for this run attempt. The alert job runs while the
+        # run as a whole is still in progress, so inspect the jobs that have
+        # already completed with a non-success conclusion.
+        failed_jobs="$(gh api \
+          "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs" \
+          --paginate \
+          --jq '.jobs[]
+                | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled")
+                | "- `\(.name)` (\(.conclusion))"')"
+        if [ -z "${failed_jobs}" ]; then
+          failed_jobs="- (failed job not recorded yet — see the run page)"
+        fi
+
+        body="$(cat <<EOF
+        Scheduled run of **${WORKFLOW_NAME}** failed.
+
+        - Run: ${run_url} (attempt ${GITHUB_RUN_ATTEMPT})
+        - Event: \`${GITHUB_EVENT_NAME}\`
+        - Ref: \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA}\`
+
+        Failed jobs:
+        ${failed_jobs}
+        EOF
+        )"
+
+        # Dedupe by exact title among OPEN issues (a closed issue means the
+        # earlier breakage was resolved; a new failure gets a fresh issue).
+        # GitHub search strips the [] characters, so search loosely and match
+        # the exact title with jq.
+        existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --limit 100 \
+          --search "\"scheduled-failure\" in:title" --json number,title \
+          | jq -r --arg title "${title}" 'map(select(.title == $title)) | (.[0].number // empty)')"
+
+        if [ -n "${existing}" ]; then
+          echo "Appending comment to existing open issue #${existing}"
+          gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          exit 0
+        fi
+
+        echo "Creating new issue: ${title}"
+        if [ -n "${ISSUE_LABEL}" ]; then
+          if gh issue create --repo "${GITHUB_REPOSITORY}" \
+               --title "${title}" --body "${body}" --label "${ISSUE_LABEL}"; then
+            exit 0
+          fi
+          echo "::warning::issue creation with label '${ISSUE_LABEL}' failed (missing label?); retrying without a label"
+        fi
+        gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"

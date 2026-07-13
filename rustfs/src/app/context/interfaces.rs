@@ -87,7 +87,7 @@ pub trait NotifyInterface: Send + Sync {
 
 /// Notification system handle interface for admin peer orchestration.
 pub trait NotificationSystemInterface: Send + Sync {
-    fn handle(&self) -> Option<&'static NotificationSys>;
+    fn handle(&self) -> Option<Arc<NotificationSys>>;
 }
 
 /// Bucket metadata interface for application-layer use-cases.
@@ -175,6 +175,15 @@ pub trait LocalNodeNameInterface: Send + Sync {
 /// Action credentials interface for admin handler integration.
 pub trait ActionCredentialInterface: Send + Sync {
     fn get(&self) -> Option<Credentials>;
+
+    /// Publish this context's action credentials (backlog#1052 S3).
+    ///
+    /// Returns `false` if the process global was already initialized *and*
+    /// this handle already held credentials — matching the pre-existing
+    /// fail-fast contract of `rustfs_credentials::init_global_action_credentials`,
+    /// now scoped to the handle. Single-instance: the first server wins and
+    /// subsequent no-op or return false, exactly as before.
+    fn publish(&self, credentials: Credentials) -> bool;
 }
 
 /// Region interface for application-layer use-cases.

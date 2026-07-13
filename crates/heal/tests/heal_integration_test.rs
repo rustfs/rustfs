@@ -226,6 +226,127 @@ mod serial_tests {
         info!("Heal object basic test passed");
     }
 
+    // Regression for PR #4356 review (issues #3231, #3191): healing an object that
+    // needs no shard repair must still reclaim leaked pre-#3510 data dirs.
+    //
+    // The reclaim was originally wired only into `heal_object`'s post-heal tail,
+    // which is unreachable when `disks_to_heal_count == 0` — exactly the state of
+    // the objects the sweep targets (valid `xl.meta`, all shards present, plus one
+    // orphaned UUID data dir). A healthy heal took the early return and reclaimed
+    // nothing. This drives the full heal path on an untouched object and asserts
+    // the stray dir is swept, while a dry-run heal leaves it in place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_heal_object_reclaims_orphan_data_dir_when_healthy() {
+        let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+
+        let bucket_name = "test-heal-reclaim-orphan";
+        let object_name = "healthy-object.bin";
+        let test_data = non_inline_test_data();
+
+        create_test_bucket(&ecstore, bucket_name).await;
+        upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
+
+        // Plant a leaked, unreferenced UUID data dir under the object on every disk
+        // that actually holds the object (i.e. has an `xl.meta`). Planting on a disk
+        // without `xl.meta` would (correctly) trip the fail-closed guard and abort
+        // the whole reclaim, so we only seed disks that carry the object.
+        let orphan_dir = uuid::Uuid::new_v4().to_string();
+        let mut seeded_orphans: Vec<PathBuf> = Vec::new();
+        for disk_path in &disk_paths {
+            let obj_dir = disk_path.join(bucket_name).join(object_name);
+            if !obj_dir.join("xl.meta").exists() {
+                continue;
+            }
+            let stray = obj_dir.join(&orphan_dir);
+            fs::create_dir_all(&stray).await.expect("orphan data dir should be created");
+            fs::write(stray.join("part.1"), b"leaked pre-#3510 data")
+                .await
+                .expect("orphan part should be written");
+            seeded_orphans.push(stray);
+        }
+        assert!(
+            !seeded_orphans.is_empty(),
+            "test setup failed: no disk carried the object to seed an orphan under"
+        );
+
+        let dry_run_opts = HealOpts {
+            dry_run: true,
+            recreate: true,
+            remove: false,
+            update_parity: true,
+            ..Default::default()
+        };
+        let (_res, err) = heal_storage
+            .heal_object(bucket_name, object_name, None, &dry_run_opts)
+            .await
+            .expect("dry-run heal should succeed");
+        assert!(err.is_none(), "dry-run heal returned error: {err:?}");
+        for stray in &seeded_orphans {
+            assert!(stray.exists(), "dry-run heal must NOT remove the orphan data dir: {stray:?}");
+        }
+
+        // Snapshot the live (referenced) data dirs so we can assert they survive.
+        let mut live_dirs: Vec<PathBuf> = Vec::new();
+        for disk_path in &disk_paths {
+            let obj_dir = disk_path.join(bucket_name).join(object_name);
+            if !obj_dir.join("xl.meta").exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&obj_dir)
+                .min_depth(1)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if entry.file_type().is_dir() && name != orphan_dir {
+                    live_dirs.push(entry.into_path());
+                }
+            }
+        }
+        assert!(!live_dirs.is_empty(), "expected at least one live data dir to remain");
+
+        let heal_opts = HealOpts {
+            dry_run: false,
+            recreate: true,
+            remove: false,
+            update_parity: true,
+            ..Default::default()
+        };
+        let (_res, err) = heal_storage
+            .heal_object(bucket_name, object_name, None, &heal_opts)
+            .await
+            .expect("heal should succeed");
+        assert!(err.is_none(), "heal returned error: {err:?}");
+
+        for stray in &seeded_orphans {
+            assert!(!stray.exists(), "healthy heal must reclaim the orphan data dir: {stray:?}");
+        }
+        for live in &live_dirs {
+            assert!(live.exists(), "referenced data dir must be preserved: {live:?}");
+        }
+        for disk_path in &disk_paths {
+            let obj_dir = disk_path.join(bucket_name).join(object_name);
+            if obj_dir.exists() {
+                assert!(obj_dir.join("xl.meta").exists(), "xl.meta must be preserved: {obj_dir:?}");
+            }
+        }
+
+        // The object must remain intact and readable after the reclaim.
+        let mut reader = ecstore
+            .get_object_reader(bucket_name, object_name, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("Failed to get object reader after reclaim");
+        let mut downloaded_data = Vec::new();
+        tokio::io::copy(&mut reader, &mut downloaded_data)
+            .await
+            .expect("Failed to read object after reclaim");
+        assert_eq!(downloaded_data, test_data, "object contents must survive orphan reclaim");
+
+        info!("Heal object orphan-reclaim test passed");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_bucket_basic() {

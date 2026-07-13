@@ -63,13 +63,15 @@ use super::storage_api::bucket_usecase::{
 use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
+use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
-    current_notify_interface_for_context, current_object_store_handle_for_context,
+    current_notify_interface_for_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
+use crate::storage::storage_api::lock_bucket_targets_metadata;
 use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;
@@ -1084,6 +1086,14 @@ impl DefaultBucketUsecase {
         }
     }
 
+    /// Build the use-case bound to an explicit application context
+    /// (backlog#1052 S6): the per-server request path passes its own context
+    /// so the use-case resolves that server's store; `None` falls back to the
+    /// ambient default.
+    pub fn with_context(context: Option<std::sync::Arc<crate::runtime_sources::AppContext>>) -> Self {
+        Self { context }
+    }
+
     fn global_region(&self) -> Option<Region> {
         self.context.as_ref().and_then(|context| context.region().get())
     }
@@ -1184,6 +1194,13 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+
+        // Drop every cached object body for the now-deleted bucket so dead
+        // bytes do not sit resident until TTL. Covers both the normal and the
+        // force-delete path, which share this single delete_bucket call
+        // (ODC-28, backlog#1133).
+        let cache_adapter = current_object_data_cache_for_context(self.context.as_deref());
+        let _ = invalidate_object_data_cache_bucket_after_delete(&cache_adapter, &input.bucket).await;
 
         // Invalidate bucket validation cache
         crate::storage::invalidate_bucket_validation_cache(&input.bucket);
@@ -1439,6 +1456,7 @@ impl DefaultBucketUsecase {
             .get_bucket_info(&bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
+        let targets_guard = lock_bucket_targets_metadata(&bucket).await;
         let replication_config = match metadata_sys::get_replication_config(&bucket).await {
             Ok((config, _)) => Some(config),
             Err(StorageError::ConfigNotFound) => None,
@@ -1461,6 +1479,7 @@ impl DefaultBucketUsecase {
             }
             return Err(err);
         }
+        drop(targets_guard);
 
         notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context);
 
@@ -2280,11 +2299,13 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let targets_guard = lock_bucket_targets_metadata(&bucket).await;
         validate_bucket_replication_update(&bucket, &replication_configuration).await?;
         let data = serialize_config(&replication_configuration)?;
         metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+        drop(targets_guard);
 
         notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context);
 

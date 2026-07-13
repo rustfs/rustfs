@@ -738,7 +738,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Starts the MRF persister — ongoing background task.
     ///
     /// Drains `mrf_save_rx` (entries that overflowed the normal worker channels) and
-    /// writes them to the on-disk MRF file every 10 seconds or when 1 000 new
+    /// writes them to the on-disk MRF file every flush interval (default 10s,
+    /// overridable via `RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS`) or when 1 000 new
     /// entries accumulate.  Each flush rewrites the whole cumulative backlog so no
     /// previously-persisted (and not-yet-replayed) entry is lost; the file is only
     /// consumed and cleared at startup.
@@ -762,7 +763,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             let mut flushed_len = 0usize;
             let mut dirty = false;
             let mut capped = false;
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            // Flush interval: `RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS` (default 10000ms,
+            // clamped to >=10ms), read once when the persister task starts.
+            let mut interval = tokio::time::interval(super::replication_timing::mrf_flush_interval());
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
@@ -992,6 +995,14 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Start the resync routine that runs in a loop
     async fn start_resync_routine(self: Arc<Self>, buckets: Vec<String>, cancellation_token: CancellationToken) {
+        // Retry-poll sleep upper bound: `RUSTFS_REPL_RESYNC_POLL_MAX_MS`
+        // (default 60000ms, clamped to >=10ms), read once when this routine
+        // starts. The anti-busy-spin floor is min(1s, max) so the default
+        // keeps the historical "sleep at least one second" behavior while
+        // short test overrides stay short.
+        let max_sleep = super::replication_timing::resync_poll_max_sleep();
+        let max_sleep_ms = u64::try_from(max_sleep.as_millis()).unwrap_or(u64::MAX).max(1);
+        let floor_sleep = Duration::from_secs(1).min(max_sleep);
         // Run the replication resync in a loop
         loop {
             let self_clone = self.clone();
@@ -1007,14 +1018,14 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 }
             }
 
-            // Generate random duration between 0 and 1 minute
+            // Generate a random duration between 0 and `max_sleep` (default 1 minute)
             use rand::RngExt;
-            let duration_millis = rand::rng().random_range(0..60_000);
+            let duration_millis = rand::rng().random_range(0..max_sleep_ms);
             let mut duration = Duration::from_millis(duration_millis);
 
-            // Make sure to sleep at least a second to avoid high CPU ticks
-            if duration < Duration::from_secs(1) {
-                duration = Duration::from_secs(1);
+            // Make sure to sleep at least `floor_sleep` to avoid high CPU ticks
+            if duration < floor_sleep {
+                duration = floor_sleep;
             }
 
             tokio::time::sleep(duration).await;
@@ -1394,7 +1405,7 @@ pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo
     }
 
     if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, runtime_sources::replication_stats()) {
-        for (k, _v) in rs.targets.iter() {
+        for k in rs.targets.keys() {
             let ri = ReplicatedTargetInfo {
                 arn: k.clone(),
                 size: 0,
@@ -1614,6 +1625,7 @@ mod tests {
                     ..Default::default()
                 },
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 

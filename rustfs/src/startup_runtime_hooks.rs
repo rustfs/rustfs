@@ -16,8 +16,8 @@ use crate::license::license_status;
 use crate::startup_runtime_sources;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::future::Future;
-use std::io::{Error, Result};
-use tracing::{debug, info};
+use std::io::Result;
+use tracing::{debug, info, warn};
 
 const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -35,24 +35,39 @@ pub(crate) fn log_startup_runtime_diagnostics() {
 }
 
 fn log_dial9_runtime_status() {
-    if rustfs_obs::dial9::is_enabled() {
-        info!(
+    let supported = rustfs_obs::dial9::is_supported();
+    let configured = rustfs_obs::dial9::is_configured();
+
+    match (supported, configured) {
+        (true, true) => info!(
             target: "rustfs::main",
             event = EVENT_DIAL9_RUNTIME_STATUS,
             component = LOG_COMPONENT_MAIN,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             enabled = true,
             "Dial9 Tokio runtime telemetry is enabled"
-        );
-    } else {
-        debug!(
+        ),
+        // Requested but unavailable. This is the case an operator most needs to
+        // see: the process otherwise runs to completion recording nothing.
+        (false, true) => warn!(
             target: "rustfs::main",
             event = EVENT_DIAL9_RUNTIME_STATUS,
             component = LOG_COMPONENT_MAIN,
             subsystem = LOG_SUBSYSTEM_STARTUP,
             enabled = false,
+            supported = false,
+            remedy = "rebuild with --features dial9 (see `make build-profiling`)",
+            "Dial9 Tokio runtime telemetry is configured but not compiled into this binary"
+        ),
+        (_, false) => debug!(
+            target: "rustfs::main",
+            event = EVENT_DIAL9_RUNTIME_STATUS,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            enabled = false,
+            supported,
             "Dial9 Tokio runtime telemetry is disabled"
-        );
+        ),
     }
 }
 
@@ -105,10 +120,33 @@ pub(crate) fn install_default_crypto_provider() {
 }
 
 pub(crate) async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<()> {
-    let guard = startup_runtime_sources::init_observability_guard(obs_endpoint)
-        .await
-        .map_err(|err| Error::other(format!("init_obs: {err}")))?;
-    startup_runtime_sources::set_observability_guard(guard).map_err(|err| Error::other(format!("set_global_guard: {err}")))?;
+    // Observability is a process-global tracing subscriber and can only be
+    // installed once. A second embedded server in the same process reuses the
+    // first server's subscriber — try to publish anyway (first server wins),
+    // and treat both an init failure and a set failure as "already set" so a
+    // second startup does not abort (backlog#1052 S5).
+    match startup_runtime_sources::init_observability_guard(obs_endpoint).await {
+        Ok(guard) => {
+            if let Err(err) = startup_runtime_sources::set_observability_guard(guard) {
+                debug!(
+                    component = LOG_COMPONENT_EMBEDDED,
+                    subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                    event = "observability_guard_reused",
+                    error = %err,
+                    "process already has an observability guard installed; second server reuses it"
+                );
+            }
+        }
+        Err(err) => {
+            debug!(
+                component = LOG_COMPONENT_EMBEDDED,
+                subsystem = LOG_SUBSYSTEM_EMBEDDED,
+                event = "observability_init_skipped",
+                error = %err,
+                "observability already initialized; second server reuses the process subscriber"
+            );
+        }
+    }
 
     install_embedded_default_crypto_provider();
     rustfs_trusted_proxies::init();

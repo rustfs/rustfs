@@ -34,6 +34,10 @@ workspace = true
 default = []
 rio-v2 = ["dep:rustfs-rio-v2"]
 hotpath = ["dep:hotpath", "hotpath/hotpath", "rustfs-filemeta/hotpath", "rustfs-rio/hotpath"]
+# Exposes shared lifecycle/tier test utilities (MockWarmBackend, fault
+# injection, xl.meta transition assertions) via `api::tier::test_util`.
+# Enable only from `[dev-dependencies]` (rustfs/backlog#1148 ilm-6).
+test-util = []
 
 [dependencies]
 hotpath = { workspace = true, optional = true }
@@ -114,7 +118,9 @@ pin-project-lite.workspace = true
 md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
-rustix = { workspace = true }
+# "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
+# (backlog#1178); "fs" comes from the workspace default.
+rustix = { workspace = true, features = ["process"] }
 rustfs-madmin.workspace = true
 reqwest = { workspace = true }
 aes-gcm.workspace = true
@@ -139,6 +145,12 @@ aws-smithy-http-client.workspace = true
 
 # Observability and Metrics
 metrics = { workspace = true }
+
+# Runtime-probed io_uring read backend (backlog#1104). Linux-only, from
+# crates.io. The guard scripts/check_no_tokio_io_uring.sh allows an explicit
+# io-uring integration; only the tokio "io-uring" runtime feature is banned.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustfs-uring = "0.2.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

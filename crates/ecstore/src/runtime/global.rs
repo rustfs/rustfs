@@ -100,9 +100,13 @@ pub fn global_rustfs_port() -> u16 {
 /// # Returns
 /// * None
 pub fn set_global_rustfs_port(value: u16) {
-    GLOBAL_RUSTFS_PORT
-        .set(value)
-        .expect("GLOBAL_RUSTFS_PORT should be initialized once during startup");
+    // A second embedded server publishes into its own context slot for
+    // request dispatch (backlog#1052 S2), but the process still exposes a
+    // single rustfs port to clients that ask the process directly; ignore
+    // second inits with a warning instead of panicking.
+    if GLOBAL_RUSTFS_PORT.set(value).is_err() {
+        warn!("global rustfs port already initialized, ignoring re-initialization");
+    }
 }
 
 /// Set the global deployment id

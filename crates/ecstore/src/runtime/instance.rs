@@ -42,6 +42,7 @@
 use super::global::TypeLocalDiskSetDrives;
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState};
+use crate::bucket::metadata_sys::BucketMetadataSys;
 use crate::bucket::replication::{DynReplicationPool, ReplicationStats};
 use crate::disk::DiskStore;
 use crate::layout::endpoints::{EndpointServerPools, SetupType};
@@ -139,6 +140,18 @@ pub struct InstanceContext {
     local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
     local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
     local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
+    /// This instance's bucket metadata system (backlog#1052 S3).
+    ///
+    /// Set once when storage startup initializes bucket metadata for this
+    /// instance's store; holds the store handle plus the bucket→metadata
+    /// cache, so it is inherently per-store. Replaces the process-global
+    /// bucket-metadata static (whose double-init panicked process-wide).
+    ///
+    /// Uses `std::sync::Mutex` instead of `OnceLock` so test fixtures that
+    /// share the bootstrap context can reinitialize the metadata system with
+    /// their own `ECStore` without panicking. Production startup still sets
+    /// this exactly once.
+    bucket_metadata_sys: std::sync::Mutex<Option<Arc<RwLock<BucketMetadataSys>>>>,
     /// This instance's background-services cancellation token (Phase 5 Slice 13,
     /// backlog#939).
     ///
@@ -178,6 +191,7 @@ impl InstanceContext {
             local_disk_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_id_map: Arc::new(RwLock::new(HashMap::new())),
             local_disk_set_drives: Arc::new(RwLock::new(Vec::new())),
+            bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
         }
     }
@@ -310,6 +324,25 @@ impl InstanceContext {
         self.local_disk_set_drives.clone()
     }
 
+    /// Set this instance's bucket metadata system. Replaces any existing
+    /// value so test fixtures that share the bootstrap context can
+    /// reinitialize with their own store. Returns `true` if this is the
+    /// first initialization (no previous value existed).
+    pub fn init_bucket_metadata_sys(&self, sys: Arc<RwLock<BucketMetadataSys>>) -> bool {
+        let mut guard = self.bucket_metadata_sys.lock().expect("bucket_metadata_sys lock poisoned");
+        let is_first = guard.is_none();
+        *guard = Some(sys);
+        is_first
+    }
+
+    /// This instance's bucket metadata system, if initialized.
+    pub fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
+        self.bucket_metadata_sys
+            .lock()
+            .expect("bucket_metadata_sys lock poisoned")
+            .clone()
+    }
+
     /// Set this instance's background-services cancellation token (once).
     pub fn init_background_cancel_token(&self, token: CancellationToken) -> Result<(), CancellationToken> {
         self.background_cancel_token.set(token)
@@ -366,6 +399,10 @@ impl std::fmt::Debug for InstanceContext {
             .field("expiry_state_set", &self.expiry_state.get().is_some())
             .field("transition_state_set", &self.transition_state.get().is_some())
             .field("bucket_monitor_set", &self.bucket_monitor.get().is_some())
+            .field(
+                "bucket_metadata_sys_set",
+                &self.bucket_metadata_sys.lock().map(|g| g.is_some()).unwrap_or(false),
+            )
             .field("replication_stats_set", &self.replication_stats.get().is_some())
             .field("replication_pool_set", &self.replication_pool.get().is_some())
             .field("background_cancel_token_set", &self.background_cancel_token.get().is_some())

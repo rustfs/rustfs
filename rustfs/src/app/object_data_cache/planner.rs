@@ -16,6 +16,7 @@
 
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::app::storage_api::object_usecase::StorageObjectInfo;
+use crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps as _;
 use rustfs_object_data_cache::{ObjectDataCacheBodyVariant, ObjectDataCacheGetPlan, ObjectDataCacheGetRequest};
 
 /// App-layer GET request snapshot used for cache planning.
@@ -53,7 +54,14 @@ pub(crate) fn build_get_object_body_cache_plan(
         || request.info.delete_marker
         || request.info.version_only
         || request.info.metadata_only
-        || request.response_content_length < 0
+        // Remote (transitioned) objects are served from the warm tier; the
+        // ecstore hook already refuses them (hook.rs is_remote()), so the
+        // usecase-layer planner must exclude them too for a uniform contract.
+        || request.info.is_remote()
+        // Zero-length bodies save no I/O — ecstore returns an empty body before
+        // the hook probe — so admitting them only creates useless entries and
+        // inflates hit metrics. Mirrors should_buffer_get_object_in_memory_with_threshold.
+        || request.response_content_length <= 0
     {
         return GetObjectBodyCachePlan::Skip;
     }
@@ -73,12 +81,27 @@ pub(crate) fn build_get_object_body_cache_plan(
         .version_id
         .filter(|version_id| !version_id.is_nil())
         .map(|version_id| version_id.to_string());
+    // ODC-06 (backlog#1111): make the key write-unique. `data_dir` is the xl.meta
+    // directory UUID that ecstore regenerates on every body write, so it is
+    // distinct across overwrites regardless of content (MD5 collision) or
+    // timestamp; it is the primary anchor. `mod_time` is a second anchor for the
+    // rare read where `data_dir` is unresolved. Both derive here — the one place
+    // the ecstore hook and the usecase layer share — so both sites produce an
+    // identical key by construction.
+    let data_dir_u128 = request.info.data_dir.map(|data_dir| data_dir.as_u128());
+    let mod_time_unix_nanos = request
+        .info
+        .mod_time
+        .map(|mod_time| mod_time.unix_timestamp_nanos())
+        .unwrap_or(0);
     let engine_request = ObjectDataCacheGetRequest {
         bucket: request.bucket,
         object: request.key,
         version_id,
         etag,
         size,
+        data_dir_u128,
+        mod_time_unix_nanos,
         body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
     };
 
@@ -176,6 +199,185 @@ mod tests {
         );
 
         assert!(matches!(plan, GetObjectBodyCachePlan::Skip));
+    }
+
+    #[test]
+    fn plan_skips_remote_transitioned_objects() {
+        // backlog#1138: transitioned (remote-tier) objects are served from the
+        // warm backend; the ecstore hook already refuses them, so the
+        // usecase-layer planner must exclude them too for a uniform contract.
+        let adapter = enabled_adapter();
+        let mut info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            ..Default::default()
+        };
+        info.transitioned_object.status = "complete".to_string();
+
+        let plan = build_get_object_body_cache_plan(
+            &adapter,
+            GetObjectBodyCacheRequest {
+                bucket: "bucket",
+                key: "object",
+                info: &info,
+                response_content_length: 4,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        );
+
+        assert!(matches!(plan, GetObjectBodyCachePlan::Skip));
+    }
+
+    #[test]
+    fn plan_skips_zero_length_objects() {
+        // backlog#1142: ecstore returns an empty body before the hook probe, so
+        // a zero-length GET saves no I/O; admitting it only inflates hit metrics.
+        let adapter = enabled_adapter();
+        let info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 0,
+            ..Default::default()
+        };
+
+        let plan = build_get_object_body_cache_plan(
+            &adapter,
+            GetObjectBodyCacheRequest {
+                bucket: "bucket",
+                key: "object",
+                info: &info,
+                response_content_length: 0,
+                has_range: false,
+                part_number: None,
+                encryption_applied: false,
+            },
+        );
+
+        assert!(matches!(plan, GetObjectBodyCachePlan::Skip));
+    }
+
+    fn cacheable_key(plan: &GetObjectBodyCachePlan) -> rustfs_object_data_cache::ObjectDataCacheKey {
+        match plan {
+            GetObjectBodyCachePlan::Cacheable(rustfs_object_data_cache::ObjectDataCacheGetPlan::Cacheable { key }) => key.clone(),
+            other => panic!("expected a cacheable plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_and_planner_derive_identical_keys() {
+        // ODC-16 correctness guard: the ecstore hook and the usecase planner both
+        // route through build_get_object_body_cache_plan, so for the same object
+        // they must derive byte-identical keys — otherwise every GET misses. The
+        // hook builds its request with response_content_length = get_actual_size;
+        // the usecase builds the same for a plain, non-range GET.
+        let adapter = enabled_adapter();
+        let info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            actual_size: 4,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp_nanos(1_234_567_890).unwrap()),
+            ..Default::default()
+        };
+
+        let hook_request = GetObjectBodyCacheRequest {
+            bucket: "bucket",
+            key: "object",
+            info: &info,
+            response_content_length: info.get_actual_size().expect("actual size"),
+            has_range: false,
+            part_number: None,
+            encryption_applied: false,
+        };
+        let usecase_request = GetObjectBodyCacheRequest {
+            bucket: "bucket",
+            key: "object",
+            info: &info,
+            response_content_length: 4,
+            has_range: false,
+            part_number: None,
+            encryption_applied: false,
+        };
+
+        let hook_key = cacheable_key(&build_get_object_body_cache_plan(&adapter, hook_request));
+        let usecase_key = cacheable_key(&build_get_object_body_cache_plan(&adapter, usecase_request));
+
+        assert_eq!(hook_key, usecase_key, "hook and planner must derive the same key");
+        // ODC-06: the modification time flows into the key.
+        assert_eq!(hook_key.mod_time_unix_nanos, 1_234_567_890);
+    }
+
+    #[test]
+    fn planner_key_changes_with_mod_time() {
+        // ODC-06 (backlog#1111): an unversioned overwrite advances mod_time, so
+        // the same etag + size must derive a different key.
+        let adapter = enabled_adapter();
+        let mut info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            actual_size: 4,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp_nanos(1_000).unwrap()),
+            ..Default::default()
+        };
+        let make_request = |info: &crate::storage::storage_api::StorageObjectInfo| {
+            build_get_object_body_cache_plan(
+                &adapter,
+                GetObjectBodyCacheRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    info,
+                    response_content_length: 4,
+                    has_range: false,
+                    part_number: None,
+                    encryption_applied: false,
+                },
+            )
+        };
+        let old_key = cacheable_key(&make_request(&info));
+        info.mod_time = Some(time::OffsetDateTime::from_unix_timestamp_nanos(2_000).unwrap());
+        let new_key = cacheable_key(&make_request(&info));
+
+        assert_ne!(old_key, new_key, "keys differing only by mod_time must not collide");
+    }
+
+    #[test]
+    fn planner_key_changes_with_data_dir() {
+        // ODC-06 (backlog#1111): data_dir is regenerated on every body write, so
+        // an overwrite yields a different key even when etag + size AND mod_time
+        // are identical — the case mod_time alone cannot cover. Also confirms
+        // data_dir actually reaches the key (data_dir_u128 == the UUID's u128).
+        let adapter = enabled_adapter();
+        let dir_a = uuid::Uuid::from_u128(0xA);
+        let dir_b = uuid::Uuid::from_u128(0xB);
+        let mut info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 4,
+            actual_size: 4,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp_nanos(1_000).unwrap()),
+            data_dir: Some(dir_a),
+            ..Default::default()
+        };
+        let make_request = |info: &crate::storage::storage_api::StorageObjectInfo| {
+            build_get_object_body_cache_plan(
+                &adapter,
+                GetObjectBodyCacheRequest {
+                    bucket: "bucket",
+                    key: "object",
+                    info,
+                    response_content_length: 4,
+                    has_range: false,
+                    part_number: None,
+                    encryption_applied: false,
+                },
+            )
+        };
+        let key_a = cacheable_key(&make_request(&info));
+        assert_eq!(key_a.data_dir_u128, Some(dir_a.as_u128()), "data_dir must reach the key");
+
+        // Same etag/size/mod_time, only data_dir differs → different key.
+        info.data_dir = Some(dir_b);
+        let key_b = cacheable_key(&make_request(&info));
+        assert_ne!(key_a, key_b, "keys differing only by data_dir must not collide");
     }
 
     #[test]

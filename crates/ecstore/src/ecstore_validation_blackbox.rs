@@ -20,7 +20,7 @@ use tokio::sync::RwLock;
 
 /// Returns the backing [`tempfile::TempDir`]s alongside the set so callers keep
 /// them alive for the test's duration and the directories are removed on drop.
-async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
+pub(crate) async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
     let format = FormatV3::new(1, drive_count);
     let mut dirs = Vec::with_capacity(drive_count);
     let mut endpoints = Vec::with_capacity(drive_count);
@@ -205,11 +205,11 @@ async fn blackbox_get_restores_body_and_enqueues_repair_after_one_corrupt_shard(
     let mut heal_rx = rustfs_common::heal_channel::init_heal_channel()
         .expect("this must be the only ecstore test that owns the heal channel receiver");
 
-    // Force the data-blocks-first reader setup (see
-    // ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP in set_disk/core/io_primitives.rs):
-    // under the default all-shards strategy the corrupt shard's failed open can
-    // lose the setup-quorum race, in which case no repair is submitted and the
-    // enqueue assertion below would be a coin flip.
+    // Keep data-blocks-first reader setup explicit for this deterministic
+    // repair assertion (see ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP in
+    // set_disk/core/io_primitives.rs): if a caller opts back into all-shards,
+    // the corrupt shard's failed open can lose the setup-quorum race, making
+    // the enqueue assertion below a coin flip.
     temp_env::async_with_vars([("RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP", Some("true"))], async {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
         let bucket = "bb-corrupt-shard-repair";

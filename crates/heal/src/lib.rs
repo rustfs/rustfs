@@ -143,6 +143,10 @@ pub fn get_heal_channel_processor() -> Option<&'static Arc<tokio::sync::Mutex<He
     GLOBAL_HEAL_CHANNEL_PROCESSOR.get()
 }
 
+pub fn heal_runtime_initialized() -> bool {
+    get_heal_manager().is_some() && get_heal_channel_processor().is_some()
+}
+
 pub fn current_heal_active_tasks() -> u64 {
     GLOBAL_HEAL_ACTIVE_TASKS.load(Ordering::Relaxed)
 }

@@ -13,175 +13,302 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use aws_config::meta::region::RegionProviderChain;
+//! Self-managed lifecycle *expiry* end-to-end tests (backlog#1148 ilm-3).
+//!
+//! Each test spawns its own `rustfs` binary on a random port with an isolated
+//! temp dir via [`RustFSTestEnvironment`], so there is no dependency on a
+//! pre-started `localhost:9000` server and no `#[ignore]`. Expiry is driven to
+//! completion in seconds using two independent, per-test time-control tools:
+//!
+//! * **`mod_time` back-dating** (see [`put_object_with_backdated_mtime`]): write
+//!   an object whose stored `mod_time` is already in the past, so a `Days`-based
+//!   rule is due immediately without accelerating the day length. Used by
+//!   [`test_lifecycle_expiry_backdated_mtime`].
+//! * **`RUSTFS_ILM_DEBUG_DAY_SECS`** (ilm-5): compress one lifecycle "day" to a
+//!   couple of seconds so a `Days=1` rule fires shortly after a normal PUT. Used
+//!   by [`test_lifecycle_versioned_current_version_expiry_creates_delete_marker`].
+//!
+//! In every case the scanner must actually *run* for expiry to apply, so each
+//! server is started with `RUSTFS_SCANNER_CYCLE=1` (1-second scan cycle) and a
+//! small `RUSTFS_ILM_PROCESS_TIME` rounding boundary. Tests poll for the
+//! terminal state instead of sleeping a fixed wall-clock interval.
+
+use crate::common::RustFSTestEnvironment;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::{Credentials, Region};
-use bytes::Bytes;
-use serial_test::serial;
-use std::error::Error;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    BucketLifecycleConfiguration, BucketVersioningStatus, ExpirationStatus, LifecycleExpiration, LifecycleRule,
+    LifecycleRuleFilter, VersioningConfiguration,
+};
+use std::time::Duration as StdDuration;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
-const ENDPOINT: &str = "http://localhost:9000";
-const ACCESS_KEY: &str = "rustfsadmin";
-const SECRET_KEY: &str = "rustfsadmin";
-const BUCKET: &str = "test-basic-bucket";
+type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-async fn create_aws_s3_client() -> Result<Client, Box<dyn Error>> {
-    let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
-    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(region_provider)
-        .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "static"))
-        .endpoint_url(ENDPOINT)
-        .load()
-        .await;
+/// Internal replication headers that back-date a written object's `mod_time`.
+///
+/// These are the RustFS side of the MinIO-compatible replication protocol
+/// (`crates/utils/src/http/header_compat.rs`; consumed in
+/// `rustfs/src/storage/options.rs::put_opts_from_headers`). Sending
+/// `x-rustfs-source-replication-request: true` routes the PUT through the
+/// replica branch and, when `x-rustfs-source-mtime` (RFC3339) is present, forces
+/// the stored `mod_time` to that value.
+const HDR_SOURCE_REPLICATION_REQUEST: &str = "x-rustfs-source-replication-request";
+const HDR_SOURCE_MTIME: &str = "x-rustfs-source-mtime";
 
-    let client = Client::from_conf(
-        aws_sdk_s3::Config::from(&shared_config)
-            .to_builder()
-            .force_path_style(true)
-            .build(),
-    );
-    Ok(client)
+/// PUT an object whose stored `mod_time` is back-dated to `mtime`.
+///
+/// # Side effects / caveats
+///
+/// This uses the internal source-replication backdoor, so the write sets
+/// `ObjectOptions::replication_request = true` and takes the replica code path.
+/// That flag by itself does **not** set the object's replication *status* to
+/// `Pending`/`Failed` — only an `x-amz-bucket-replication-status: replica`
+/// header would set `REPLICA` status, and the test bucket has no replication
+/// configuration — so lifecycle expiry is **not** gated
+/// (`crates/lifecycle/src/evaluator.rs::replication_status_blocks_lifecycle`
+/// only blocks on `Pending`/`Failed`). The passing
+/// [`test_lifecycle_expiry_backdated_mtime`] is the end-to-end proof that a
+/// back-dated object is still expired by the scanner.
+async fn put_object_with_backdated_mtime(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    mtime: OffsetDateTime,
+) -> TestResult {
+    let mtime_rfc3339 = mtime.format(&Rfc3339)?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(body.to_vec()))
+        .customize()
+        .mutate_request(move |req| {
+            req.headers_mut().insert(HDR_SOURCE_REPLICATION_REQUEST, "true");
+            req.headers_mut().insert(HDR_SOURCE_MTIME, mtime_rfc3339.clone());
+        })
+        .send()
+        .await?;
+    Ok(())
 }
 
-async fn setup_test_bucket(client: &Client) -> Result<(), Box<dyn Error>> {
-    match client.create_bucket().bucket(BUCKET).send().await {
-        Ok(_) => {}
+/// Returns `true` once `GET bucket/key` fails with `NoSuchKey`, `false` while it
+/// still succeeds. Any other error is surfaced.
+async fn object_is_gone(client: &Client, bucket: &str, key: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(_) => Ok(false),
         Err(e) => {
-            let error_str = e.to_string();
-            if !error_str.contains("BucketAlreadyOwnedByYou") && !error_str.contains("BucketAlreadyExists") {
-                return Err(e.into());
+            if let Some(service_error) = e.as_service_error() {
+                if service_error.is_no_such_key() {
+                    return Ok(true);
+                }
+                return Err(format!("expected NoSuchKey, got: {e:?}").into());
             }
+            Err(format!("expected a service error, got: {e:?}").into())
         }
     }
-    Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_bucket_lifecycle_configuration() -> Result<(), Box<dyn std::error::Error>> {
-    use aws_sdk_s3::types::{BucketLifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter};
-    use chrono::{Duration as ChronoDuration, Utc};
-    use tokio::time::Duration;
-
-    let client = create_aws_s3_client().await?;
-    setup_test_bucket(&client).await?;
-
-    // Upload test object first
-    let test_content = "Test object for lifecycle expiration";
-    let lifecycle_object_key = "lifecycle-test-object.txt";
-    let untouched_object_key = "keep-object.txt";
-    client
-        .put_object()
-        .bucket(BUCKET)
-        .key(lifecycle_object_key)
-        .body(Bytes::from(test_content.as_bytes()).into())
-        .send()
-        .await?;
-    client
-        .put_object()
-        .bucket(BUCKET)
-        .key(untouched_object_key)
-        .body(Bytes::from("should-stay".as_bytes()).into())
-        .send()
-        .await?;
-
-    // Verify object exists initially
-    let resp = client.get_object().bucket(BUCKET).key(lifecycle_object_key).send().await?;
-    assert!(resp.content_length().unwrap_or(0) > 0);
-    let untouched_resp = client.get_object().bucket(BUCKET).key(untouched_object_key).send().await?;
-    assert!(untouched_resp.content_length().unwrap_or(0) > 0);
-
-    // Use a past midnight UTC date to trigger immediate lifecycle expiry without requiring days=0.
-    let yesterday_midnight_utc = Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight should always be valid")
-        - ChronoDuration::days(1);
-    let expiration = LifecycleExpiration::builder()
-        .date(aws_sdk_s3::primitives::DateTime::from_secs(yesterday_midnight_utc.and_utc().timestamp()))
-        .build();
-    let filter = LifecycleRuleFilter::builder().prefix(lifecycle_object_key).build();
-    let rule = LifecycleRule::builder()
-        .id("expire-test-object")
-        .filter(filter)
-        .expiration(expiration)
-        .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
-        .build()?;
-    let lifecycle = BucketLifecycleConfiguration::builder().rules(rule).build()?;
-
-    client
-        .put_bucket_lifecycle_configuration()
-        .bucket(BUCKET)
-        .lifecycle_configuration(lifecycle)
-        .send()
-        .await?;
-
-    // Verify lifecycle configuration was set
-    let resp = client.get_bucket_lifecycle_configuration().bucket(BUCKET).send().await?;
-    let rules = resp.rules();
-    assert!(rules.iter().any(|r| r.id().unwrap_or("") == "expire-test-object"));
-
-    // Poll for deletion instead of using a fixed sleep to keep the test deterministic.
-    // Default scanner cycle interval is 60s with jitter, so allow enough time for one full cycle.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+/// Poll until `GET bucket/key` returns `NoSuchKey`, or fail after `deadline`.
+///
+/// The scanner cycle is 1s under test, so expiry normally lands within a few
+/// seconds; the deadline is a generous safety net, not the expected wall-clock.
+async fn wait_for_object_expired(client: &Client, bucket: &str, key: &str, deadline: StdDuration) -> TestResult {
+    let start = std::time::Instant::now();
     loop {
-        let get_result = client.get_object().bucket(BUCKET).key(lifecycle_object_key).send().await;
-        match get_result {
-            Ok(_) => {
-                if tokio::time::Instant::now() >= deadline {
-                    panic!("Expected object to be deleted by lifecycle rule within 150s, but it still exists");
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(e) => {
-                if let Some(service_error) = e.as_service_error() {
-                    if service_error.is_no_such_key() {
-                        println!("Lifecycle configuration test completed - object was successfully deleted by lifecycle rule");
-                        break;
-                    }
-                    panic!("Expected NoSuchKey error, but got: {e:?}");
-                } else {
-                    panic!("Expected service error, but got: {e:?}");
-                }
-            }
+        if object_is_gone(client, bucket, key).await? {
+            return Ok(());
         }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "object {bucket}/{key} was not expired by the lifecycle scanner within {}s",
+                deadline.as_secs()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
     }
+}
 
-    println!("Lifecycle configuration test completed.");
+/// Build a prefix-scoped `Days`-based expiration rule.
+fn expiration_rule(id: &str, prefix: &str, days: i32) -> Result<LifecycleRule, Box<dyn std::error::Error + Send + Sync>> {
+    let rule = LifecycleRule::builder()
+        .id(id)
+        .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
+        .expiration(LifecycleExpiration::builder().days(days).build())
+        .status(ExpirationStatus::Enabled)
+        .build()?;
+    Ok(rule)
+}
 
-    // Non-matching prefix object should remain available.
-    let untouched_after = client.get_object().bucket(BUCKET).key(untouched_object_key).send().await?;
-    assert!(untouched_after.content_length().unwrap_or(0) > 0);
+async fn put_expiration_config(client: &Client, bucket: &str, rule: LifecycleRule) -> TestResult {
+    let lifecycle = BucketLifecycleConfiguration::builder().rules(rule).build()?;
+    client
+        .put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(lifecycle)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Env applied to every server in this module: run the scanner every second and
+/// shrink the ILM processing/rounding boundary so `Days`-based deadlines are not
+/// rounded up to the next real day.
+fn fast_lifecycle_env() -> Vec<(&'static str, &'static str)> {
+    vec![("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_ILM_PROCESS_TIME", "1")]
+}
+
+/// `Days=1` expiry driven purely by `mod_time` back-dating (no day-length
+/// acceleration). Proves:
+/// * a matching-prefix object whose `mod_time` is 25h old is expired (the rule's
+///   1-day deadline is already in the past);
+/// * the `put_object_with_backdated_mtime` backdoor does not trip the
+///   replication gate that would otherwise block expiry;
+/// * a non-matching-prefix object with the **same** back-dated `mod_time`
+///   survives, isolating the prefix filter (not recency) as the cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lifecycle_expiry_backdated_mtime() -> TestResult {
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &fast_lifecycle_env()).await?;
+
+    let client = env.create_s3_client();
+    let bucket = "ilm3-backdated";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let matched_key = "expire/object.txt";
+    let survivor_key = "keep/object.txt";
+    // 25h in the past: older than the 1-day rule with a normal 86400s day length.
+    let backdated = OffsetDateTime::now_utc() - time::Duration::hours(25);
+
+    put_object_with_backdated_mtime(&client, bucket, matched_key, b"expire me", backdated).await?;
+    put_object_with_backdated_mtime(&client, bucket, survivor_key, b"keep me", backdated).await?;
+
+    // Both objects exist before the lifecycle rule is installed.
+    assert!(!object_is_gone(&client, bucket, matched_key).await?);
+    assert!(!object_is_gone(&client, bucket, survivor_key).await?);
+
+    put_expiration_config(&client, bucket, expiration_rule("expire-backdated", "expire/", 1)?).await?;
+
+    // Matching, back-dated object is expired by the scanner.
+    wait_for_object_expired(&client, bucket, matched_key, StdDuration::from_secs(90)).await?;
+
+    // Negative control: identical back-dating, non-matching prefix -> survives.
+    assert!(
+        !object_is_gone(&client, bucket, survivor_key).await?,
+        "non-matching-prefix object must not be expired by a prefix-scoped rule"
+    );
 
     Ok(())
 }
 
+/// `Days=1` current-version expiry on a **versioned** bucket, accelerated with
+/// `RUSTFS_ILM_DEBUG_DAY_SECS`. Proves that current-version expiry inserts a
+/// delete marker (rather than permanently removing the object): after expiry a
+/// plain `GET` returns `NoSuchKey`, `ListObjectVersions` shows a latest delete
+/// marker, and the original data version is retained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-#[ignore = "requires running RustFS server at localhost:9000"]
-async fn test_bucket_lifecycle_accepts_zero_days() -> Result<(), Box<dyn std::error::Error>> {
-    use aws_sdk_s3::types::{BucketLifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter};
+async fn test_lifecycle_versioned_current_version_expiry_creates_delete_marker() -> TestResult {
+    let mut env = RustFSTestEnvironment::new().await?;
+    // One lifecycle "day" == 2s, plus the fast scanner/rounding env.
+    let mut extra_env = fast_lifecycle_env();
+    extra_env.push(("RUSTFS_ILM_DEBUG_DAY_SECS", "2"));
+    env.start_rustfs_server_with_env(vec![], &extra_env).await?;
 
-    let client = create_aws_s3_client().await?;
-    setup_test_bucket(&client).await?;
-
-    let expiration = LifecycleExpiration::builder().days(0).build();
-    let filter = LifecycleRuleFilter::builder().prefix("zero-days/").build();
-    let rule = LifecycleRule::builder()
-        .id("expire-zero-days")
-        .filter(filter)
-        .expiration(expiration)
-        .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
-        .build()?;
-    let lifecycle = BucketLifecycleConfiguration::builder().rules(rule).build()?;
-
+    let client = env.create_s3_client();
+    let bucket = "ilm3-versioned";
+    client.create_bucket().bucket(bucket).send().await?;
     client
-        .put_bucket_lifecycle_configuration()
-        .bucket(BUCKET)
-        .lifecycle_configuration(lifecycle)
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
         .send()
         .await?;
+
+    let key = "versioned/object.txt";
+    let put = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"versioned payload"))
+        .send()
+        .await?;
+    let data_version_id = put
+        .version_id()
+        .map(str::to_string)
+        .expect("versioned PUT returns a version id");
+
+    put_expiration_config(&client, bucket, expiration_rule("expire-versioned", "versioned/", 1)?).await?;
+
+    // Current version expiry adds a delete marker; a plain GET now 404s.
+    wait_for_object_expired(&client, bucket, key, StdDuration::from_secs(90)).await?;
+
+    // ListObjectVersions: original data version retained, latest is a delete marker.
+    let versions = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
+
+    let data_versions = versions.versions();
+    assert!(
+        data_versions.iter().any(|v| v.version_id() == Some(data_version_id.as_str())),
+        "original data version {data_version_id} must be retained, got: {data_versions:?}"
+    );
+
+    let delete_markers = versions.delete_markers();
+    assert!(
+        delete_markers.iter().any(|m| m.is_latest() == Some(true)),
+        "expiry on a versioned bucket must create a latest delete marker, got: {delete_markers:?}"
+    );
+
+    // The retained data version is still directly readable by version id.
+    let by_version = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .version_id(&data_version_id)
+        .send()
+        .await?;
+    assert_eq!(by_version.body.collect().await?.into_bytes().as_ref(), b"versioned payload");
+
+    Ok(())
+}
+
+/// `Days=0` expiration is invalid per S3 semantics (`Days` must be a positive
+/// integer >= 1). A `PutBucketLifecycleConfiguration` carrying a zero-day rule
+/// must be rejected with `InvalidArgument` (HTTP 400) — see crates/lifecycle
+/// `validate()` and the PutBucketLifecycleConfiguration handler. This is the
+/// self-managed counterpart of the localhost-only
+/// `test_bucket_lifecycle_rejects_zero_days` unit test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lifecycle_rejects_zero_day_rule() -> TestResult {
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &fast_lifecycle_env()).await?;
+
+    let client = env.create_s3_client();
+    let bucket = "ilm3-zero-day";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let lifecycle = BucketLifecycleConfiguration::builder()
+        .rules(expiration_rule("expire-zero-days", "zero-days/", 0)?)
+        .build()?;
+    let err = client
+        .put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(lifecycle)
+        .send()
+        .await
+        .expect_err("zero-day expiration lifecycle rule should be rejected");
+
+    let service_error = err.as_service_error().expect("expected an S3 service error");
+    assert_eq!(
+        service_error.meta().code(),
+        Some("InvalidArgument"),
+        "expected InvalidArgument for zero-day expiration, got: {err:?}"
+    );
 
     Ok(())
 }

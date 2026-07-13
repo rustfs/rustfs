@@ -27,8 +27,16 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 ### IAM import, service accounts, and privilege boundaries
 
 - `GHSA-566f-q62r-wcr8`: `ImportIam` accepted attacker-controlled service account `parent`, `claims`, `accessKey`, and `secretKey`, enabling persistent backdoor accounts under root. Lesson: imported IAM payloads are untrusted data and must be validated against privilege boundaries.
+- `GHSA-5354-r3w2-34m8`: `AddServiceAccount` checked `CreateServiceAccountAdminAction` but trusted caller-supplied `target_user`, allowing service accounts under the root parent. Lesson: service-account create paths must validate parent ownership or root/admin authority, not only the create action.
 - `GHSA-xgr5-qc6w-vcg9`: `deny_only=true` skipped allow checks and let restricted service accounts mint unrestricted children. Lesson: deny-only logic must never become implicit allow for privilege creation.
 - `GHSA-mm2q-qcmx-gw4w`: leaked service account access keys plus update-without-ownership formed an escalation chain. Lesson: service-account identifiers are security-sensitive because update APIs consume them.
+
+### STS, OIDC, and federation flows
+
+- `GHSA-5qfg-mf7r-jp3w`: `AssumeRoleWithWebIdentity` was reachable without the required request authentication and could issue temporary credentials from crafted web identity input. Lesson: every STS route needs explicit SigV4 or trusted identity-provider validation before role assumption.
+- `GHSA-ccrv-v8v9-ch9q`: service-account-controlled material could self-sign JWT session tokens with forged policy claims. Lesson: session tokens must be signed by a trusted issuer/key path and validation must reject self-signed or principal-controlled tokens.
+- `GHSA-9pjf-w3c2-m32r`, `GHSA-4x2q-cpx9-9h26`, and `GHSA-xvpm-p3f7-34c3`: public OIDC authorize/callback flows trusted request `Host` or forwarded scheme when building credential-bearing redirects. Lesson: OIDC redirects must use configured allowlisted origins and trusted-proxy handling; never derive the post-login credential destination from direct client headers.
+- `GHSA-m479-9x88-94w6`, `GHSA-frwq-mfqx-83p8`, `GHSA-q9q8-rf9r-fg9f`, and `GHSA-j5c2-hhf7-6gf5`: OIDC validation accepted attacker-controlled discovery URLs because hostname checks rejected only literal forbidden IPs, allowing DNS rebinding SSRF. Lesson: outbound federation URL validation must resolve and classify hostnames at the connection boundary and reject loopback, private, link-local, and rebound addresses.
 
 ### S3 copy, multipart, and upload policy validation
 
@@ -50,7 +58,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 ### Secrets, defaults, and cryptographic misuse
 
-- `GHSA-j59h-h7q5-q348`: RustFS shipped known default root credentials that could authenticate to S3, admin APIs, IAM, KMS, and console surfaces. Lesson: root credentials must be operator-provided or generated per install; known defaults and warnings are not acceptable for network-reachable deployments.
+- `GHSA-j59h-h7q5-q348`, `GHSA-3wm5-wpm5-hmfm`, `GHSA-6wc8-xm48-qhmx`, and `GHSA-9gf3-jx4p-4xxf`: RustFS shipped known default root credentials that could authenticate to S3, admin APIs, IAM, KMS, console, and token-signing surfaces. Lesson: root credentials must be operator-provided or generated per install; known defaults and warnings are not acceptable for network-reachable deployments.
 - `GHSA-h956-rh7x-ppgj`: gRPC used the hard-coded token `rustfs rpc` on both client and server. Lesson: source-visible shared tokens are authentication bypasses.
 - `GHSA-r5qv-rc46-hv8q`: internode RPC HMAC secret fell back to the public default `rustfsadmin`. Lesson: RPC/internode auth must fail closed instead of silently using public defaults.
 - `GHSA-75fx-qg6f-8rm7` and `GHSA-68cw-96m3-h2cf`: internode RPC secrets were derivable from known root credentials, making raw storage RPC signatures forgeable when explicit RPC secrets were unset. Lesson: RPC auth keys must be independent random secrets, never derived from S3 root credentials, and raw storage RPC should not share the public S3 listener without an internode-only boundary.

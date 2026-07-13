@@ -60,6 +60,7 @@ use tokio::io::duplex;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{OnceCell, RwLock};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
@@ -271,6 +272,7 @@ pub struct ListPathOptions {
 
 const MARKER_TAG_VERSION: &str = "v2";
 const LEGACY_MARKER_TAG_VERSIONS: &[&str] = &["v1", MARKER_TAG_VERSION];
+const LIST_CACHE_MARKER_PREFIX: &str = "[rustfs_cache:";
 const LIST_CURSOR_SOURCE_WALKER: &str = "walker";
 const LIST_CURSOR_SOURCE_INDEX_KEY_ONLY: &str = "index_key_only";
 const LIST_CURSOR_SOURCE_INDEX_VERIFIED_PAGE: &str = "index_verified_page";
@@ -1831,7 +1833,7 @@ impl ListContinuationV2 {
     fn encode_marker(&self, marker: &str) -> String {
         let mut marker_tag = String::with_capacity(marker.len() + 64);
         marker_tag.push_str(marker);
-        marker_tag.push_str("[rustfs_cache:");
+        marker_tag.push_str(LIST_CACHE_MARKER_PREFIX);
         marker_tag.push_str(self.version);
         match &self.id {
             Some(id) => {
@@ -1926,6 +1928,13 @@ impl ListContinuationV2 {
             None
         }
     }
+}
+
+pub(crate) fn list_marker_key(marker: &str) -> &str {
+    marker
+        .rfind(LIST_CACHE_MARKER_PREFIX)
+        .filter(|start_idx| marker[*start_idx..].ends_with(']'))
+        .map_or(marker, |start_idx| &marker[..start_idx])
 }
 
 fn normalize_list_quorum(value: &str) -> &'static str {
@@ -2652,7 +2661,8 @@ async fn read_fallback_listing_disk(
 ) -> Vec<FallbackListingEntry> {
     let (rd, mut wr) = duplex(64);
     let walk_endpoint = endpoint.clone();
-    let walk_job = tokio::spawn(async move {
+    let mut walk_jobs = JoinSet::new();
+    walk_jobs.spawn(async move {
         disk.walk_dir(
             WalkDirOptions {
                 bucket: options.bucket,
@@ -2708,10 +2718,10 @@ async fn read_fallback_listing_disk(
     }
     drop(reader);
 
-    match walk_job.await {
-        Ok(Ok(())) if stream_ok => entries,
-        Ok(Ok(())) => Vec::new(),
-        Ok(Err(err)) => {
+    match walk_jobs.join_next().await {
+        Some(Ok(Ok(()))) if stream_ok => entries,
+        Some(Ok(Ok(()))) => Vec::new(),
+        Some(Ok(Err(err))) => {
             debug!(
                 endpoint = %walk_endpoint,
                 error = ?err,
@@ -2719,7 +2729,7 @@ async fn read_fallback_listing_disk(
             );
             Vec::new()
         }
-        Err(err) => {
+        Some(Err(err)) => {
             debug!(
                 endpoint = %walk_endpoint,
                 error = ?err,
@@ -2727,6 +2737,7 @@ async fn read_fallback_listing_disk(
             );
             Vec::new()
         }
+        None => Vec::new(),
     }
 }
 
@@ -3085,7 +3096,7 @@ impl ListPathOptions {
         let Some(marker) = self.marker.clone() else {
             return;
         };
-        let Some(start_idx) = marker.rfind("[rustfs_cache:") else {
+        let Some(start_idx) = marker.rfind(LIST_CACHE_MARKER_PREFIX) else {
             return;
         };
         let Some(end_offset) = marker[start_idx..].rfind(']') else {
@@ -3978,6 +3989,7 @@ impl ECStore {
 
         // cancel channel
         let cancel = CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
 
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
 
@@ -5218,6 +5230,7 @@ impl Sets {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
@@ -6172,6 +6185,7 @@ impl SetDisks {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
         let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
         let (sender, recv) = mpsc::channel(o.limit as usize);
 
@@ -6372,7 +6386,7 @@ impl SetDisks {
                 filter_prefix: opts.filter_prefix.clone(),
                 forward_to: opts.marker.clone(),
                 per_disk_limit: limit,
-                skip_total_timeout: false,
+                skip_total_timeout: true,
                 walkdir_timeout: opts.walkdir_timeout,
                 walkdir_stall_timeout: opts.walkdir_stall_timeout,
             },
@@ -6395,6 +6409,10 @@ impl SetDisks {
                 forward_to: opts.marker,
                 min_disks: raw_min_disks,
                 per_disk_limit: limit,
+                // A foreground listing is bounded by lack of drive progress (the walk
+                // stall timeout) and by the page limit, never by how long a healthy
+                // walk takes — a large prefix on slow media is not a fault (#4644).
+                skip_walkdir_total_timeout: true,
                 walkdir_timeout: opts.walkdir_timeout,
                 walkdir_stall_timeout: opts.walkdir_stall_timeout,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
@@ -6588,13 +6606,14 @@ mod test {
         VersionMarker, current_list_objects_mutation_sequence, encode_persistent_list_metadata_object,
         enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
         latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
-        latest_listing_required_object_quorum, list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
-        list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
-        list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
-        list_objects_index_provider_from_env, list_objects_index_provider_state_from_env, list_objects_key_only_provider_health,
-        list_objects_metadata_fast_guardrails_from_env, list_objects_paginate, list_objects_quorum_from_env,
-        list_quorum_from_env, load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one,
-        merge_entry_channels, namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
+        latest_listing_required_object_quorum, list_marker_key, list_metadata_resolution_params,
+        list_objects_from_metadata_snapshot_candidates, list_objects_from_verified_index_candidates,
+        list_objects_from_verified_index_candidates_with_optional_stats, list_objects_from_verified_index_candidates_with_stats,
+        list_objects_index_mode_from_env, list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
+        list_objects_key_only_provider_health, list_objects_metadata_fast_guardrails_from_env, list_objects_paginate,
+        list_objects_quorum_from_env, list_quorum_from_env, load_namespace_mutation_journal_state,
+        load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels,
+        namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
         namespace_mutation_journal_chaos_enabled_from_env, namespace_mutation_journal_chaos_sequence_from_env,
         namespace_mutation_journal_chaos_status_from_env, normalize_list_quorum, observe_list_objects_mutations_with_store,
         parse_namespace_mutation_journal_state, parse_persistent_key_only_index, parse_persistent_list_metadata_object,
@@ -9035,6 +9054,22 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
+    }
+
+    #[test]
+    fn list_marker_key_strips_only_trailing_cache_tag() {
+        assert_eq!(
+            list_marker_key("photos/2026/image.jpg[rustfs_cache:v2,id:list-cache-id,src:walker,gen:live]"),
+            "photos/2026/image.jpg"
+        );
+        assert_eq!(
+            list_marker_key("photos/[rustfs_cache:v2]/image.jpg"),
+            "photos/[rustfs_cache:v2]/image.jpg"
+        );
+        assert_eq!(
+            list_marker_key("photos/image.jpg[rustfs_cache:v2,id:list-cache-id"),
+            "photos/image.jpg[rustfs_cache:v2,id:list-cache-id"
+        );
     }
 
     #[test]

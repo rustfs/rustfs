@@ -336,11 +336,11 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             if (method, path) == ("GET", config_path):
                 return {"version": 1}
             if (method, path) == ("POST", maintenance_path):
-                return {"job": {"job-id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
+                return {"job": {"job_id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("GET", job_path):
                 return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("POST", quarantine_path):
-                return {"action": "INSPECT", "report": {"job": {"job-id": "job-1"}}}
+                return {"action": "INSPECT", "report": {"job": {"job_id": "job-1"}}}
             if (method, path) == ("GET", scheduler_path):
                 return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1", "audit-events": [{"action": "PLANNED"}]}]}
             if (method, path) == ("POST", scheduler_run_path):
@@ -406,11 +406,11 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             if (method, path) == ("GET", config_path):
                 return {"version": 1}
             if (method, path) == ("POST", maintenance_path):
-                return {"job": {"job-id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
+                return {"job": {"job_id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("GET", pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1")):
                 return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}, "audit-events": [{"action": "PLANNED"}]}
             if (method, path) == ("POST", quarantine_path):
-                return {"action": "INSPECT", "report": {"job": {"job-id": "job-1"}}}
+                return {"action": "INSPECT", "report": {"job": {"job_id": "job-1"}}}
             if (method, path) == ("GET", scheduler_path):
                 return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1", "audit-events": [{"action": "PLANNED"}]}]}
             if (method, path) == ("POST", scheduler_run_path):
@@ -913,6 +913,66 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(selected["name"], "rustfs")
         self.assertEqual(selected["catalog_uri"], "http://127.0.0.1:9000/iceberg")
         self.assertEqual(selected["warehouse"], "rustfs-s3table-smoke")
+
+    def test_pyiceberg_live_evidence_record_uses_runtime_smoke_result(self) -> None:
+        args = self.parse_with_args([
+            "--endpoint",
+            "http://127.0.0.1:9000",
+            "--bucket",
+            "lake",
+            "--namespace",
+            "smoke",
+            "--table",
+            "events",
+            "--live-evidence-output",
+            "/tmp/rustfs-live-evidence.json",
+        ])
+        result = pyiceberg_smoke.SmokeResult(
+            metadata_location="s3://lake/tables/table-id/metadata/v2.metadata.json",
+            row_count=2,
+            cleanup_result="not-requested",
+            table_warehouse_location="s3://lake/tables/table-id",
+        )
+
+        record = pyiceberg_smoke.pyiceberg_live_evidence_record(
+            args,
+            result,
+            client_version="0.10.0",
+            rustfs_build="rustfs-test",
+            git_sha="abc123",
+            catalog_backing="durable-strong",
+            run_timestamp_utc="2026-07-09T00:00:00Z",
+            operator="ci",
+            command="python3 scripts/table-catalog/pyiceberg_smoke.py --live-evidence-output /tmp/rustfs-live-evidence.json",
+        )
+
+        self.assertEqual(record["client_name"], "PyIceberg")
+        self.assertEqual(record["client_version"], "0.10.0")
+        self.assertEqual(record["warehouse"], "lake")
+        self.assertEqual(record["metadata_location"], "s3://lake/tables/table-id/metadata/v2.metadata.json")
+        self.assertEqual(record["row_count"], 2)
+        self.assertEqual(record["claim"], "automated-smoke")
+
+    def test_live_evidence_command_redacts_cli_secrets(self) -> None:
+        command = pyiceberg_smoke.redacted_command(
+            [
+                "pyiceberg_smoke.py",
+                "--endpoint",
+                "http://127.0.0.1:9000",
+                "--access-key",
+                "root-access",
+                "--secret-key=root-secret",
+                "--bucket",
+                "lake",
+            ]
+        )
+
+        self.assertIn("--access-key '<redacted>'", command)
+        self.assertIn("--secret-key", command)
+        self.assertIn("<redacted>", command)
+        self.assertNotIn("root-access", command)
+        self.assertNotIn("root-secret", command)
+        self.assertIn("--bucket lake", command)
 
     def test_print_vendor_profiles_renders_selected_aws_profile(self) -> None:
         args = self.parse_with_args(

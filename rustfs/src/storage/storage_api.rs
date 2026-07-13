@@ -14,10 +14,33 @@
 
 //! Storage owner-local boundary for ECStore facade and storage contract symbols.
 
-use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, LazyLock};
 
 use rustfs_storage_api as storage_contracts;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
+
+const BUCKET_TARGETS_METADATA_LOCK_SHARDS: usize = 256;
+static BUCKET_TARGETS_METADATA_LOCKS: LazyLock<Vec<Arc<Mutex<()>>>> = LazyLock::new(|| {
+    (0..BUCKET_TARGETS_METADATA_LOCK_SHARDS)
+        .map(|_| Arc::new(Mutex::new(())))
+        .collect()
+});
+
+pub(crate) async fn lock_bucket_targets_metadata(bucket: &str) -> OwnedMutexGuard<()> {
+    BUCKET_TARGETS_METADATA_LOCKS[bucket_targets_metadata_lock_shard(bucket)]
+        .clone()
+        .lock_owned()
+        .await
+}
+
+fn bucket_targets_metadata_lock_shard(bucket: &str) -> usize {
+    let mut hasher = DefaultHasher::new();
+    bucket.hash(&mut hasher);
+    hasher.finish() as usize % BUCKET_TARGETS_METADATA_LOCK_SHARDS
+}
 
 pub(crate) mod contract {
     pub(crate) mod admin {
@@ -188,6 +211,9 @@ pub(crate) mod rpc_consumer {
 
     pub(crate) mod http_service {
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
+        #[cfg(test)]
+        pub(crate) use super::super::storage_contracts::WALK_DIR_BODY_SHA256_QUERY;
+        pub(crate) use super::super::storage_contracts::WALK_DIR_STREAM_COMPLETION_V1;
         pub(crate) use super::super::{StorageDiskRpcExt, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature};
     }
 
@@ -332,8 +358,6 @@ pub(crate) mod ecstore_capacity {
 }
 
 pub(crate) mod ecstore_client {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::client::transition_api;
     pub(crate) use rustfs_ecstore::api::client::{admin_handler_utils, object_api_utils};
 }
 
@@ -361,8 +385,8 @@ pub(crate) mod ecstore_data_usage {
         apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_data_usage_from_backend,
         record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
         record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
-        refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
-        remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
+        refresh_bucket_usage_from_object_layer, remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info,
+        store_compression_total_in_backend,
     };
 }
 
@@ -441,7 +465,9 @@ pub(crate) mod ecstore_rpc {
 }
 
 pub(crate) mod ecstore_object {
-    pub(crate) use rustfs_ecstore::api::object::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
+    pub(crate) use rustfs_ecstore::api::object::{
+        GetObjectBodyCacheHook, ObjectMutationHook, register_get_object_body_cache_hook, register_object_mutation_hook,
+    };
 }
 
 pub(crate) mod ecstore_set_disk {
@@ -459,9 +485,11 @@ pub(crate) mod ecstore_storage {
 
 pub(crate) mod ecstore_tier {
     pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::tier::warm_backend;
     pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers};
+    // Shared lifecycle/tier test utilities behind ecstore's `test-util` feature
+    // (rustfs/backlog#1148 ilm-6). Only linked into test builds.
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::tier::test_util;
 }
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
@@ -518,6 +546,7 @@ pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
+pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerContextSlot;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type ObjectPartInfo = rustfs_filemeta::ObjectPartInfo;
@@ -777,6 +806,12 @@ pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Res
 /// threads through the storage foundation (Phase 5 follow-up, backlog#1052).
 pub(crate) fn bootstrap_instance_ctx() -> Arc<InstanceContext> {
     ecstore_runtime::bootstrap_ctx()
+}
+
+/// Construct a fresh per-server instance context (backlog#1052 S5): a second
+/// embedded server owns its own erasure/region/endpoint/deployment id cells.
+pub(crate) fn new_instance_ctx() -> Arc<InstanceContext> {
+    Arc::new(InstanceContext::new())
 }
 
 pub(crate) fn init_lock_clients(endpoint_pools: EndpointServerPools) {
@@ -1304,7 +1339,7 @@ pub(crate) fn set_workload_admission_snapshot_provider(
     rustfs_ecstore::set_workload_admission_snapshot_provider(provider)
 }
 
-pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
+pub(crate) fn get_global_notification_sys() -> Option<Arc<NotificationSys>> {
     ecstore_notification::get_global_notification_sys()
 }
 
@@ -1422,4 +1457,37 @@ pub(crate) async fn store_compression_total_in_backend() {
 
 pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
     ecstore_data_usage::init_compression_total_memory_from_backend(store).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bucket_targets_metadata_lock_shard, lock_bucket_targets_metadata};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn bucket_target_metadata_locks_serialize_only_matching_shards() {
+        let bucket = "bucket-target-lock";
+        let other = (0..1000)
+            .map(|index| format!("other-bucket-{index}"))
+            .find(|candidate| bucket_targets_metadata_lock_shard(candidate) != bucket_targets_metadata_lock_shard(bucket))
+            .expect("find bucket on another lock shard");
+
+        let guard = lock_bucket_targets_metadata(bucket).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lock_bucket_targets_metadata(bucket))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), lock_bucket_targets_metadata(&other))
+                .await
+                .is_ok()
+        );
+        drop(guard);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), lock_bucket_targets_metadata(bucket))
+                .await
+                .is_ok()
+        );
+    }
 }

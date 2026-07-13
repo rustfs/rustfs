@@ -15,7 +15,7 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_object_store_handle, current_replication_stats_handle, current_runtime_port};
+use crate::admin::runtime_sources::{current_replication_stats_handle, current_runtime_port, object_store_from_req};
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
@@ -29,6 +29,7 @@ use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -300,7 +301,7 @@ impl Operation for GetReplicationMetricsHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -358,7 +359,7 @@ impl Operation for SetRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -431,6 +432,7 @@ impl Operation for SetRemoteTargetHandler {
         if remote_target.arn.is_empty() {
             return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "ARN is empty".to_string()));
         }
+        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
 
         if update {
             let Some(mut target) = bucket_target_sys
@@ -506,7 +508,7 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(s3_error!(InvalidRequest, "bucket is required"));
             }
 
-            let Some(store) = current_object_store_handle() else {
+            let Some(store) = object_store_from_req(&req) else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
@@ -567,7 +569,7 @@ impl Operation for RemoveRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "arn is required"));
         };
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 
@@ -577,6 +579,7 @@ impl Operation for RemoveRemoteTargetHandler {
             .map_err(ApiError::from)?;
 
         let sys = BucketTargetSys::get();
+        let _targets_guard = lock_bucket_targets_metadata(bucket).await;
 
         let targets = sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
@@ -673,7 +676,7 @@ impl Operation for ReplicationDiffHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -835,7 +838,7 @@ impl Operation for ReplicationMrfHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 

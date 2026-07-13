@@ -14,13 +14,13 @@
 
 use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
-    rustfs_binary_path,
+    replication_fast_env, rustfs_binary_path,
 };
 use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
 use aws_sdk_s3::{Client, Config};
 use http::header::{CONTENT_TYPE, HOST};
 use local_ip_address::local_ip;
@@ -37,6 +37,7 @@ use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::net::IpAddr;
@@ -45,9 +46,15 @@ use std::process::Command;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::fs;
 use tokio::time::{Duration, sleep};
-use uuid::Uuid;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
+
+/// A replication source server validates the remote target endpoint, and the e2e
+/// target runs on loopback (127.0.0.1), which RustFS's SSRF egress guard rejects by
+/// default. This suite opts its source servers into the loopback allowance explicitly
+/// so the shared harness (`RustFSTestEnvironment` / the cluster harness) stays
+/// fail-closed and every other e2e scenario keeps exercising the production SSRF policy.
+const LOOPBACK_REPLICATION_TARGET_ENV: &[(&str, &str)] = &[("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true")];
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
@@ -297,6 +304,19 @@ async fn put_bucket_replication(
     bucket: &str,
     target_arn: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    put_bucket_replication_with_delete_statuses(env, bucket, target_arn, "Enabled", None).await
+}
+
+async fn put_bucket_replication_with_delete_statuses(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    target_arn: &str,
+    delete_marker_status: &str,
+    version_delete_status: Option<&str>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let delete_replication = version_delete_status
+        .map(|status| format!("<DeleteReplication><Status>{status}</Status></DeleteReplication>"))
+        .unwrap_or_default();
     let body = format!(
         r#"<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Role></Role>
@@ -305,8 +325,9 @@ async fn put_bucket_replication(
     <Priority>1</Priority>
     <Status>Enabled</Status>
     <DeleteMarkerReplication>
-      <Status>Enabled</Status>
+      <Status>{delete_marker_status}</Status>
     </DeleteMarkerReplication>
+    {delete_replication}
     <ExistingObjectReplication>
       <Status>Enabled</Status>
     </ExistingObjectReplication>
@@ -398,6 +419,14 @@ async fn delete_bucket_replication(
     signed_request(http::Method::DELETE, &url, &env.access_key, &env.secret_key, None, None).await
 }
 
+async fn get_bucket_replication(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/{bucket}?replication", env.url);
+    signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await
+}
+
 async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let client = env.create_s3_client();
     client
@@ -425,29 +454,15 @@ fn trusted_https_client(ca_cert_pem: &str) -> Result<reqwest::Client, Box<dyn Er
     Ok(reqwest::Client::builder().no_proxy().add_root_certificate(ca_cert).build()?)
 }
 
-async fn new_private_tmp_test_env() -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
-    let temp_dir = format!("/private/tmp/rustfs_e2e_test_{}", Uuid::new_v4());
-    fs::create_dir_all(&temp_dir)
-        .await
-        .map_err(|err| std::io::Error::other(format!("create temp dir {temp_dir} failed: {err}")))?;
-    let port = RustFSTestEnvironment::find_available_port()
-        .await
-        .map_err(|err| std::io::Error::other(format!("find available port failed: {err}")))?;
-    let address = format!("127.0.0.1:{port}");
-    let url = format!("http://{address}");
-
-    Ok(RustFSTestEnvironment {
-        temp_dir,
-        address,
-        url,
-        access_key: "rustfsadmin".to_string(),
-        secret_key: "rustfsadmin".to_string(),
-        process: None,
-    })
+async fn new_replication_source_env() -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
+    // Reuse the shared harness's portable temp-dir/port setup. This previously built
+    // a bespoke `/private/tmp/...` path, which only exists on macOS and is unwritable
+    // on the Linux CI runner, so the HTTPS-target tests failed before starting RustFS.
+    RustFSTestEnvironment::new().await
 }
 
-async fn new_private_tmp_https_target_env() -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
-    let mut env = new_private_tmp_test_env().await?;
+async fn new_replication_https_target_env() -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
+    let mut env = new_replication_source_env().await?;
     let public_ip = local_ip().map_err(|err| std::io::Error::other(format!("resolve local IP failed: {err}")))?;
     let port = env
         .address
@@ -812,6 +827,123 @@ async fn wait_for_replicated_object(
     }
 }
 
+async fn wait_for_replicated_sha256(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    expected_sha256: [u8; 32],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    loop {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(output) => {
+                let body = output.body.collect().await?.into_bytes();
+                let actual_sha256: [u8; 32] = Sha256::digest(&body).into();
+                if actual_sha256 == expected_sha256 {
+                    return Ok(());
+                }
+                return Err(
+                    format!("replicated object SHA-256 mismatch: expected {expected_sha256:?}, got {actual_sha256:?}").into(),
+                );
+            }
+            Err(_err) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReplicatedVersion {
+    key: String,
+    version_id: String,
+    delete_marker: bool,
+    e_tag: Option<String>,
+}
+
+async fn list_replication_state(client: &Client, bucket: &str) -> Result<Vec<ReplicatedVersion>, Box<dyn Error + Send + Sync>> {
+    let mut state = Vec::new();
+    let mut key_marker = None;
+    let mut version_id_marker = None;
+
+    loop {
+        let output = client
+            .list_object_versions()
+            .bucket(bucket)
+            .set_key_marker(key_marker)
+            .set_version_id_marker(version_id_marker)
+            .send()
+            .await?;
+
+        for version in output.versions() {
+            state.push(ReplicatedVersion {
+                key: version.key().ok_or("listed object version omitted key")?.to_string(),
+                version_id: version
+                    .version_id()
+                    .ok_or("listed object version omitted version ID")?
+                    .to_string(),
+                delete_marker: false,
+                e_tag: Some(version.e_tag().ok_or("listed object version omitted ETag")?.to_string()),
+            });
+        }
+        for marker in output.delete_markers() {
+            state.push(ReplicatedVersion {
+                key: marker.key().ok_or("listed delete marker omitted key")?.to_string(),
+                version_id: marker
+                    .version_id()
+                    .ok_or("listed delete marker omitted version ID")?
+                    .to_string(),
+                delete_marker: true,
+                e_tag: None,
+            });
+        }
+
+        if output.is_truncated() != Some(true) {
+            break;
+        }
+        key_marker = Some(
+            output
+                .next_key_marker()
+                .ok_or("truncated version listing omitted next key marker")?
+                .to_string(),
+        );
+        version_id_marker = output.next_version_id_marker().map(str::to_string);
+    }
+
+    state.sort();
+    Ok(state)
+}
+
+async fn assert_replication_converged(
+    source_client: &Client,
+    source_bucket: &str,
+    target_client: &Client,
+    target_bucket: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut consecutive_matches = 0;
+
+    loop {
+        let source = list_replication_state(source_client, source_bucket).await?;
+        let target = list_replication_state(target_client, target_bucket).await?;
+        if source == target {
+            consecutive_matches += 1;
+            if consecutive_matches == 2 {
+                return Ok(());
+            }
+        } else {
+            consecutive_matches = 0;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("replication did not converge in time; source={source:?}, target={target:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn run_replication_check(
     env: &RustFSTestEnvironment,
     bucket: &str,
@@ -1028,6 +1160,23 @@ async fn wait_for_object_on_target(
     Err(format!("object {bucket}/{key} was not replicated in time").into())
 }
 
+async fn wait_for_bucket_on_target(client: &aws_sdk_s3::Client, bucket: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for _ in 0..40 {
+        match client.head_bucket().bucket(bucket).send().await {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                if matches!(err.code(), Some("NotFound" | "NoSuchBucket")) {
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+
+    Err(format!("bucket {bucket} was not replicated to the target site in time").into())
+}
+
 async fn wait_for_user_get_object(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     let mut last_error = None;
     for _ in 0..40 {
@@ -1060,6 +1209,26 @@ async fn list_replication_targets_request(
         url.push_str(&urlencoding::encode(bucket));
     }
     signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await
+}
+
+async fn wait_for_remote_target_arn(env: &RustFSTestEnvironment, bucket: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    for _ in 0..40 {
+        let response = list_replication_targets_request(env, Some(bucket)).await?;
+        if response.status() == StatusCode::OK {
+            let targets: Vec<serde_json::Value> = response.json().await?;
+            if let Some(arn) = targets
+                .first()
+                .and_then(|target| target.get("arn"))
+                .and_then(|arn| arn.as_str())
+                .filter(|arn| !arn.is_empty())
+            {
+                return Ok(arn.to_string());
+            }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!("site replication did not configure a remote target for bucket {bucket} in time").into())
 }
 
 async fn site_replication_add(
@@ -1256,6 +1425,29 @@ async fn wait_for_site_replication_disabled(
     wait_for_site_replication_info(env, |info| !info.enabled && info.sites.is_empty()).await
 }
 
+async fn assert_site_replication_bucket_detached(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let targets_response = list_replication_targets_request(env, Some(bucket)).await?;
+    if targets_response.status() != StatusCode::OK {
+        return Err(format!("list remote targets failed after site removal: {}", targets_response.status()).into());
+    }
+    let targets: Vec<serde_json::Value> = targets_response.json().await?;
+    if !targets.is_empty() {
+        return Err(format!("site removal left remote targets for {bucket}: {targets:?}").into());
+    }
+
+    let replication_response = get_bucket_replication(env, bucket).await?;
+    if replication_response.status() != StatusCode::NOT_FOUND {
+        let status = replication_response.status();
+        let body = replication_response.text().await.unwrap_or_default();
+        return Err(format!("site removal left replication config for {bucket}: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
 async fn wait_for_site_replication_info<F>(
     env: &RustFSTestEnvironment,
     predicate: F,
@@ -1325,7 +1517,9 @@ async fn build_replication_pair(
     enable_target_versioning: bool,
 ) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment, String), Box<dyn Error + Send + Sync>> {
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1370,7 +1564,9 @@ async fn test_replication_check_rejects_target_without_object_lock() -> Result<(
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1412,7 +1608,9 @@ async fn test_set_remote_target_rejects_unversioned_source_bucket() -> Result<()
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1449,7 +1647,8 @@ async fn test_replication_check_rejects_unversioned_source_bucket() -> Result<()
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-check-source-unversioned";
     let client = env.create_s3_client();
@@ -1472,7 +1671,8 @@ async fn test_replication_check_rejects_missing_replication_config() -> Result<(
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-check-missing-config";
     let client = env.create_s3_client();
@@ -1495,7 +1695,8 @@ async fn test_replication_check_rejects_invalid_bucket() -> Result<(), Box<dyn E
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let response = run_replication_check(&env, "replication-check-no-such-bucket").await?;
     let status = response.status();
@@ -1513,7 +1714,8 @@ async fn test_set_remote_target_rejects_same_bucket_on_same_deployment() -> Resu
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-check-same-target";
     let client = env.create_s3_client();
@@ -1556,7 +1758,9 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1574,7 +1778,10 @@ async fn test_set_remote_target_rejects_unversioned_target_bucket() -> Result<()
     let err = set_replication_target(&source_env, source_bucket, &target_env, target_bucket)
         .await
         .expect_err("unversioned target bucket should be rejected during remote target setup");
-    assert!(err.to_string().contains("not versioned"), "unexpected set remote target error: {err}");
+    assert!(
+        err.to_string().contains("Remote target bucket not versioned"),
+        "unversioned destination must not be misreported as the source: {err}"
+    );
 
     Ok(())
 }
@@ -1585,7 +1792,9 @@ async fn test_set_remote_target_update_requires_arn() -> Result<(), Box<dyn Erro
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1635,7 +1844,9 @@ async fn test_set_remote_target_update_rejects_missing_target() -> Result<(), Bo
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -1686,7 +1897,9 @@ async fn test_set_remote_target_rejects_invalid_target_url() -> Result<(), Box<d
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-invalid-target-url-src";
     let source_client = source_env.create_s3_client();
@@ -1726,15 +1939,15 @@ async fn test_set_remote_target_rejects_self_signed_https_target_without_skip_tl
 -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
-    let mut source_env = new_private_tmp_test_env()
+    let mut source_env = new_replication_source_env()
         .await
         .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
     source_env
-        .start_rustfs_server(vec![])
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
         .await
         .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
 
-    let mut target_env = new_private_tmp_https_target_env()
+    let mut target_env = new_replication_https_target_env()
         .await
         .map_err(|err| std::io::Error::other(format!("create target env failed: {err}")))?;
     let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
@@ -1811,15 +2024,15 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
 {
     init_logging();
 
-    let mut source_env = new_private_tmp_test_env()
+    let mut source_env = new_replication_source_env()
         .await
         .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
     source_env
-        .start_rustfs_server(vec![])
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
         .await
         .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
 
-    let mut target_env = new_private_tmp_https_target_env()
+    let mut target_env = new_replication_https_target_env()
         .await
         .map_err(|err| std::io::Error::other(format!("create target env failed: {err}")))?;
     let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
@@ -1903,15 +2116,15 @@ async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_
 {
     init_logging();
 
-    let mut source_env = new_private_tmp_test_env()
+    let mut source_env = new_replication_source_env()
         .await
         .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
     source_env
-        .start_rustfs_server(vec![])
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
         .await
         .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
 
-    let mut target_env = new_private_tmp_https_target_env()
+    let mut target_env = new_replication_https_target_env()
         .await
         .map_err(|err| std::io::Error::other(format!("create target env failed: {err}")))?;
     let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
@@ -1987,15 +2200,15 @@ async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_
 async fn test_set_remote_target_allows_private_ca_https_target_with_ca_cert_pem() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
-    let mut source_env = new_private_tmp_test_env()
+    let mut source_env = new_replication_source_env()
         .await
         .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
     source_env
-        .start_rustfs_server(vec![])
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
         .await
         .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
 
-    let mut target_env = new_private_tmp_https_target_env()
+    let mut target_env = new_replication_https_target_env()
         .await
         .map_err(|err| std::io::Error::other(format!("create target env failed: {err}")))?;
     let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
@@ -2079,7 +2292,8 @@ async fn test_list_remote_targets_rejects_empty_bucket() -> Result<(), Box<dyn E
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let response = list_replication_targets_request(&env, Some("")).await?;
     let status = response.status();
@@ -2098,7 +2312,8 @@ async fn test_list_remote_targets_rejects_invalid_bucket() -> Result<(), Box<dyn
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let response = list_replication_targets_request(&env, Some("missing-replication-target-bucket")).await?;
     let status = response.status();
@@ -2116,7 +2331,9 @@ async fn test_remove_remote_target_rejects_missing_target() -> Result<(), Box<dy
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2155,7 +2372,8 @@ async fn test_remove_remote_target_rejects_missing_arn() -> Result<(), Box<dyn E
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let bucket = "replication-remove-missing-arn";
     let client = env.create_s3_client();
@@ -2179,7 +2397,8 @@ async fn test_remove_remote_target_rejects_invalid_bucket() -> Result<(), Box<dy
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let response = remove_replication_target_request(
         &env,
@@ -2242,7 +2461,9 @@ async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Bo
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2290,7 +2511,9 @@ async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<()
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2326,11 +2549,198 @@ async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<()
 
 #[tokio::test]
 #[serial]
-async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> TestResult {
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-delete-state-src";
+    let target_bucket = "replication-delete-state-dst";
+    let object_key = "versioned-object.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+
+    let first_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from_static(b"versioned replication payload v1"))
+        .send()
+        .await?;
+    let purged_version_id = first_put
+        .version_id()
+        .ok_or("first source PUT omitted version ID")?
+        .to_string();
+    let second_put = source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from_static(b"versioned replication payload v2"))
+        .send()
+        .await?;
+    let retained_version_id = second_put
+        .version_id()
+        .ok_or("second source PUT omitted version ID")?
+        .to_string();
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    let delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .send()
+        .await?;
+    let delete_marker_version_id = delete.version_id().ok_or("source DELETE omitted marker version ID")?;
+    assert_eq!(delete.delete_marker(), Some(true));
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+    assert!(
+        list_replication_state(&target_client, target_bucket)
+            .await?
+            .iter()
+            .any(|entry| entry.delete_marker && entry.version_id == delete_marker_version_id),
+        "target did not preserve the source delete-marker version ID"
+    );
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .version_id(&purged_version_id)
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+    let target_state = list_replication_state(&target_client, target_bucket).await?;
+    assert!(
+        target_state.iter().all(|entry| entry.version_id != purged_version_id),
+        "target retained the explicitly purged object version"
+    );
+    assert!(
+        target_state
+            .iter()
+            .any(|entry| !entry.delete_marker && entry.version_id == retained_version_id),
+        "target removed the non-selected object version: {target_state:?}"
+    );
+    let retained = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(object_key)
+        .version_id(&retained_version_id)
+        .send()
+        .await?;
+    assert_eq!(retained.body.collect().await?.into_bytes().as_ref(), b"versioned replication payload v2");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_disabled_delete_marker_does_not_propagate() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "replication-no-delete-marker-src";
+    let target_bucket = "replication-no-delete-marker-dst";
+    let object_key = "retained-object.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, source_bucket, &target_arn, "Disabled", None).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from_static(b"delete-marker replication disabled"))
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    let delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .send()
+        .await?;
+    let delete_marker_version_id = delete
+        .version_id()
+        .ok_or("source DELETE omitted marker version ID")?
+        .to_string();
+
+    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let target_state = list_replication_state(&target_client, target_bucket).await?;
+        assert!(
+            target_state.iter().all(|entry| !entry.delete_marker),
+            "disabled delete-marker replication unexpectedly created a target marker: {target_state:?}"
+        );
+        if tokio::time::Instant::now() >= observation_deadline {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let retained = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(object_key)
+        .send()
+        .await?;
+    assert_eq!(
+        retained.body.collect().await?.into_bytes().as_ref(),
+        b"delete-marker replication disabled"
+    );
+
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .version_id(delete_marker_version_id)
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    const PART_SIZE: usize = 5 * 1024 * 1024;
+    const PART_COUNT: usize = 3;
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env_a = RustFSTestEnvironment::new().await?;
     target_env_a.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2338,11 +2748,10 @@ async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result
     let mut target_env_b = RustFSTestEnvironment::new().await?;
     target_env_b.start_rustfs_server_without_cleanup(vec![]).await?;
 
-    let source_bucket = "replication-fanout-src";
-    let target_bucket_a = "replication-fanout-dst-a";
-    let target_bucket_b = "replication-fanout-dst-b";
-    let object_key = "fanout.txt";
-    let body = "payload-fanout";
+    let source_bucket = "replication-multipart-fanout-src";
+    let target_bucket_a = "replication-multipart-fanout-dst-a";
+    let target_bucket_b = "replication-multipart-fanout-dst-b";
+    let object_key = "multipart-fanout.bin";
 
     let source_client = source_env.create_s3_client();
     let target_client_a = target_env_a.create_s3_client();
@@ -2359,16 +2768,78 @@ async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result
     let target_arn_b = set_replication_target(&source_env, source_bucket, &target_env_b, target_bucket_b).await?;
     put_bucket_replication_rules(&source_env, source_bucket, &[target_arn_a.as_str(), target_arn_b.as_str()]).await?;
 
-    source_client
-        .put_object()
+    let created = source_client
+        .create_multipart_upload()
         .bucket(source_bucket)
         .key(object_key)
-        .body(ByteStream::from(body.as_bytes().to_vec()))
         .send()
         .await?;
+    let upload_id = created.upload_id().ok_or("missing multipart upload id")?.to_string();
+    let mut completed_parts = Vec::with_capacity(PART_COUNT);
+    let mut payload = Vec::with_capacity(PART_SIZE * PART_COUNT);
 
-    wait_for_replicated_object(&target_client_a, target_bucket_a, object_key, body).await?;
-    wait_for_replicated_object(&target_client_b, target_bucket_b, object_key, body).await?;
+    for part_number in 1..=PART_COUNT {
+        let part = vec![u8::try_from(part_number)?; PART_SIZE];
+        payload.extend_from_slice(&part);
+        let uploaded = source_client
+            .upload_part()
+            .bucket(source_bucket)
+            .key(object_key)
+            .upload_id(&upload_id)
+            .part_number(i32::try_from(part_number)?)
+            .body(ByteStream::from(part))
+            .send()
+            .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(i32::try_from(part_number)?)
+                .set_e_tag(uploaded.e_tag().map(str::to_string))
+                .build(),
+        );
+    }
+
+    let completed = source_client
+        .complete_multipart_upload()
+        .bucket(source_bucket)
+        .key(object_key)
+        .upload_id(&upload_id)
+        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .send()
+        .await?;
+    let source_etag = completed.e_tag().ok_or("completed multipart upload omitted ETag")?;
+    let multipart_suffix = format!("-{PART_COUNT}");
+    assert!(
+        source_etag.trim_matches('"').ends_with(&multipart_suffix),
+        "unexpected source multipart ETag: {source_etag}"
+    );
+
+    let expected_sha256: [u8; 32] = Sha256::digest(&payload).into();
+    tokio::try_join!(
+        wait_for_replicated_sha256(&target_client_a, target_bucket_a, object_key, expected_sha256),
+        wait_for_replicated_sha256(&target_client_b, target_bucket_b, object_key, expected_sha256),
+    )?;
+
+    let target_etag_a = target_client_a
+        .head_object()
+        .bucket(target_bucket_a)
+        .key(object_key)
+        .send()
+        .await?
+        .e_tag()
+        .ok_or("first target omitted ETag")?
+        .to_string();
+    let target_etag_b = target_client_b
+        .head_object()
+        .bucket(target_bucket_b)
+        .key(object_key)
+        .send()
+        .await?
+        .e_tag()
+        .ok_or("second target omitted ETag")?
+        .to_string();
+
+    assert_eq!(target_etag_a, source_etag);
+    assert_eq!(target_etag_b, source_etag);
 
     Ok(())
 }
@@ -2379,7 +2850,9 @@ async fn test_sequential_bucket_replication_succeeds_for_multiple_buckets() -> R
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2421,7 +2894,9 @@ async fn test_replication_recovers_after_runtime_target_cache_is_cleared() -> Re
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2463,21 +2938,22 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
 
     let source_bucket = "site-repl-resync-src";
-    let target_bucket = "site-repl-resync-dst";
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
 
-    source_client.create_bucket().bucket(source_bucket).send().await?;
-    target_client.create_bucket().bucket(target_bucket).send().await?;
-    enable_bucket_versioning(&source_env, source_bucket).await?;
-    enable_bucket_versioning(&target_env, target_bucket).await?;
+    // Seed only the joining site so its synchronous backfill must call the initiating
+    // site before the add handler has persisted its final enabled state.
+    target_client.create_bucket().bucket(source_bucket).send().await?;
+    enable_bucket_versioning(&target_env, source_bucket).await?;
 
     let add_status = site_replication_add(
         &source_env,
@@ -2507,8 +2983,10 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         .find(|peer| peer.endpoint == target_env.url)
         .ok_or("target peer missing from source site replication info")?;
 
-    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
-    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+    // Wait for the initiating site to accept the join callback and configure the
+    // backfilled bucket before driving resync in the normal source-to-target direction.
+    wait_for_bucket_on_target(&source_client, source_bucket).await?;
+    let target_arn = wait_for_remote_target_arn(&source_env, source_bucket).await?;
 
     for idx in 0..32 {
         source_client
@@ -2530,15 +3008,8 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         "source bucket start status missing: {:?}",
         started
     );
-
-    let started_target =
-        wait_for_replication_reset_target(&source_env, source_bucket, &target_arn, |target| !target.reset_id.is_empty()).await?;
-    let started_reset_id = started_target.reset_id.clone();
-    assert!(
-        matches!(started_target.status.as_str(), "Pending" | "Started" | "InProgress" | "Completed"),
-        "unexpected start status: {:?}",
-        started_target
-    );
+    assert!(!started.resync_id.is_empty(), "start response omitted the resync id: {:?}", started);
+    let started_reset_id = started.resync_id.clone();
 
     let canceled = site_replication_resync_op(&source_env, "cancel", &remote_peer).await?;
     assert_eq!(canceled.status, "success", "unexpected cancel result: {:?}", canceled);
@@ -2584,14 +3055,34 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
 
 #[tokio::test]
 #[serial]
-async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let mut relay_env = RustFSTestEnvironment::new().await?;
+    relay_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let relay_client = relay_env.create_s3_client();
+    let bucket = "site-repl-edit-endpoint";
+    let baseline_key = "before-edit.txt";
+    let baseline_payload = b"site replication before endpoint edit".to_vec();
+    let moved_key = "after-edit.txt";
+    let moved_payload = b"site replication after endpoint edit".to_vec();
+    let relayed_key = "after-edit-from-relay.txt";
+    let relayed_payload = b"site replication after endpoint edit from relay".to_vec();
 
     let add_status = site_replication_add(
         &source_env,
@@ -2608,57 +3099,132 @@ async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Re
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
             },
+            PeerSite {
+                name: "relay-site".to_string(),
+                endpoint: relay_env.url.clone(),
+                access_key: relay_env.access_key.clone(),
+                secret_key: relay_env.secret_key.clone(),
+            },
         ],
     )
     .await?;
     assert!(add_status.success, "unexpected site add result: {:?}", add_status);
 
-    let source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
-    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+    let source_info = wait_for_site_replication_enabled(&source_env, 3).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 3).await?;
+    let _relay_info = wait_for_site_replication_enabled(&relay_env, 3).await?;
     let mut remote_peer = source_info
         .sites
         .into_iter()
         .find(|peer| peer.endpoint == target_env.url)
         .ok_or("target peer missing from source site replication info")?;
 
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    wait_for_bucket_on_target(&relay_client, bucket).await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(baseline_key)
+        .body(ByteStream::from(baseline_payload.clone()))
+        .send()
+        .await?;
+    let replicated_baseline = wait_for_object_on_target(&target_client, bucket, baseline_key).await?;
+    assert_eq!(replicated_baseline, baseline_payload);
+
+    let old_target_address = target_env.address.clone();
+    let new_target_port = RustFSTestEnvironment::find_available_port().await?;
+    let new_target_address = format!("127.0.0.1:{new_target_port}");
+    let new_target_url = format!("http://{new_target_address}");
     remote_peer.sync_state = SyncStatus::Enable;
+    remote_peer.endpoint = new_target_url.clone();
     let edit_status = site_replication_edit(&source_env, "", &remote_peer).await?;
     assert!(edit_status.success, "unexpected site edit result: {:?}", edit_status);
 
     let source_after_sync = wait_for_site_replication_info(&source_env, |info| {
         info.sites
             .iter()
-            .any(|peer| peer.endpoint == target_env.url && peer.sync_state == SyncStatus::Enable)
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
     })
     .await?;
     let target_after_sync = wait_for_site_replication_info(&target_env, |info| {
         info.sites
             .iter()
-            .any(|peer| peer.endpoint == target_env.url && peer.sync_state == SyncStatus::Enable)
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
+    })
+    .await?;
+    let relay_after_sync = wait_for_site_replication_info(&relay_env, |info| {
+        info.sites
+            .iter()
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
     })
     .await?;
     assert!(
         source_after_sync
             .sites
             .iter()
-            .any(|peer| peer.endpoint == target_env.url && peer.sync_state == SyncStatus::Enable)
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
     );
     assert!(
         target_after_sync
             .sites
             .iter()
-            .any(|peer| peer.endpoint == target_env.url && peer.sync_state == SyncStatus::Enable)
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
     );
+    assert!(
+        relay_after_sync
+            .sites
+            .iter()
+            .any(|peer| peer.endpoint == new_target_url && peer.sync_state == SyncStatus::Enable)
+    );
+    assert_eq!(relay_after_sync.sites.len(), 3);
+
+    for (env, unchanged_endpoint) in [(&source_env, &relay_env.address), (&relay_env, &source_env.address)] {
+        let mut endpoints_replaced = false;
+        let mut last_targets = Vec::new();
+        for _ in 0..40 {
+            let response = list_replication_targets_request(env, Some(bucket)).await?;
+            if response.status() == StatusCode::OK {
+                let targets: Vec<serde_json::Value> = response.json().await?;
+                let mut endpoints = targets
+                    .iter()
+                    .filter_map(|target| target.get("endpoint").and_then(|endpoint| endpoint.as_str()))
+                    .collect::<Vec<_>>();
+                endpoints.sort_unstable();
+                let mut expected = vec![new_target_address.as_str(), unchanged_endpoint.as_str()];
+                expected.sort_unstable();
+                endpoints_replaced = endpoints == expected;
+                last_targets = targets;
+                if endpoints_replaced {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            endpoints_replaced,
+            "site edit did not replace the bucket target endpoint on {}: {last_targets:?}",
+            env.address
+        );
+    }
+
+    target_env.stop_server();
+    let old_endpoint_listener = tokio::net::TcpListener::bind(&old_target_address).await?;
+    target_env.address = new_target_address;
+    target_env.url = new_target_url.clone();
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    let moved_target_client = target_env.create_s3_client();
 
     let ilm_edit_status = site_replication_edit(&source_env, "enableILMExpiryReplication=true", &PeerInfo::default()).await?;
     assert!(ilm_edit_status.success, "unexpected ilm edit result: {:?}", ilm_edit_status);
 
     let source_after_ilm = wait_for_site_replication_info(&source_env, |info| {
-        info.sites.len() == 2 && info.sites.iter().all(|peer| peer.replicate_ilm_expiry)
+        info.sites.len() == 3 && info.sites.iter().all(|peer| peer.replicate_ilm_expiry)
     })
     .await?;
     let target_after_ilm = wait_for_site_replication_info(&target_env, |info| {
-        info.sites.len() == 2 && info.sites.iter().all(|peer| peer.replicate_ilm_expiry)
+        info.sites.len() == 3 && info.sites.iter().all(|peer| peer.replicate_ilm_expiry)
     })
     .await?;
     assert!(source_after_ilm.sites.iter().all(|peer| peer.replicate_ilm_expiry));
@@ -2666,26 +3232,26 @@ async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Re
 
     let status_query = "peer-state=true";
     let source_status = wait_for_site_replication_status(&source_env, status_query, |status| {
-        status.peer_states.len() == 2
+        status.peer_states.len() == 3
             && status
                 .peer_states
                 .values()
-                .all(|state| state.peers.len() == 2 && state.peers.values().all(|peer| peer.replicate_ilm_expiry))
+                .all(|state| state.peers.len() == 3 && state.peers.values().all(|peer| peer.replicate_ilm_expiry))
     })
     .await?;
     let target_status = wait_for_site_replication_status(&target_env, status_query, |status| {
-        status.peer_states.len() == 2
+        status.peer_states.len() == 3
             && status
                 .peer_states
                 .values()
-                .all(|state| state.peers.len() == 2 && state.peers.values().all(|peer| peer.replicate_ilm_expiry))
+                .all(|state| state.peers.len() == 3 && state.peers.values().all(|peer| peer.replicate_ilm_expiry))
     })
     .await?;
 
-    assert_eq!(source_status.peer_states.len(), 2);
-    assert_eq!(target_status.peer_states.len(), 2);
-    assert!(source_status.peer_states.values().all(|state| state.peers.len() == 2));
-    assert!(target_status.peer_states.values().all(|state| state.peers.len() == 2));
+    assert_eq!(source_status.peer_states.len(), 3);
+    assert_eq!(target_status.peer_states.len(), 3);
+    assert!(source_status.peer_states.values().all(|state| state.peers.len() == 3));
+    assert!(target_status.peer_states.values().all(|state| state.peers.len() == 3));
     assert!(
         source_status
             .peer_states
@@ -2699,6 +3265,35 @@ async fn test_site_replication_edit_and_status_peer_state_real_dual_node() -> Re
             .all(|state| state.peers.values().all(|peer| peer.replicate_ilm_expiry))
     );
 
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(moved_key)
+        .body(ByteStream::from(moved_payload.clone()))
+        .send()
+        .await?;
+    relay_client
+        .put_object()
+        .bucket(bucket)
+        .key(relayed_key)
+        .body(ByteStream::from(relayed_payload.clone()))
+        .send()
+        .await?;
+    let no_old_endpoint_connection = async {
+        match tokio::time::timeout(Duration::from_secs(3), old_endpoint_listener.accept()).await {
+            Err(_) => Ok::<(), Box<dyn Error + Send + Sync>>(()),
+            Ok(Ok((_, peer_address))) => Err(format!("source contacted the old site endpoint from {peer_address}").into()),
+            Ok(Err(err)) => Err(err.into()),
+        }
+    };
+    let (replicated_after_edit, replicated_from_relay, ()) = tokio::try_join!(
+        wait_for_object_on_target(&moved_target_client, bucket, moved_key),
+        wait_for_object_on_target(&moved_target_client, bucket, relayed_key),
+        no_old_endpoint_connection,
+    )?;
+    assert_eq!(replicated_after_edit, moved_payload);
+    assert_eq!(replicated_from_relay, relayed_payload);
+
     Ok(())
 }
 
@@ -2708,10 +3303,20 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let bucket = "site-repl-remove-all";
+    let baseline_key = "before-remove.txt";
+    let baseline_payload = b"site replication before remove all".to_vec();
+    let post_remove_key = "after-remove.txt";
+    let racing_bucket = "site-repl-remove-racing-create";
 
     let add_status = site_replication_add(
         &source_env,
@@ -2736,14 +3341,28 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
     let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
 
-    let remove_status = site_replication_remove(
-        &source_env,
-        &SRRemoveReq {
-            remove_all: true,
-            ..Default::default()
-        },
-    )
-    .await?;
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(baseline_key)
+        .body(ByteStream::from(baseline_payload.clone()))
+        .send()
+        .await?;
+    let replicated_baseline = wait_for_object_on_target(&target_client, bucket, baseline_key).await?;
+    assert_eq!(replicated_baseline, baseline_payload);
+
+    let create_racing_bucket = source_client.create_bucket().bucket(racing_bucket).send();
+    let remove_req = SRRemoveReq {
+        remove_all: true,
+        ..Default::default()
+    };
+    let remove_all = site_replication_remove(&source_env, &remove_req);
+    let (create_result, remove_status) = tokio::join!(create_racing_bucket, remove_all);
+    create_result?;
+    let remove_status = remove_status?;
     assert!(
         !remove_status.status.is_empty() && remove_status.err_detail.is_empty(),
         "unexpected site remove result: {:?}",
@@ -2758,6 +3377,39 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
     assert!(!target_after_remove.enabled);
     assert!(target_after_remove.sites.is_empty());
 
+    source_client.head_bucket().bucket(bucket).send().await?;
+    source_client.head_bucket().bucket(racing_bucket).send().await?;
+    target_client.head_bucket().bucket(bucket).send().await?;
+    assert_site_replication_bucket_detached(&source_env, bucket).await?;
+    assert_site_replication_bucket_detached(&source_env, racing_bucket).await?;
+    match target_client.head_bucket().bucket(racing_bucket).send().await {
+        Ok(_) => assert_site_replication_bucket_detached(&target_env, racing_bucket).await?,
+        Err(err) if matches!(err.code(), Some("NoSuchBucket" | "NotFound")) => {}
+        Err(err) => return Err(err.into()),
+    }
+    assert_site_replication_bucket_detached(&target_env, bucket).await?;
+
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(post_remove_key)
+        .body(ByteStream::from_static(b"site replication must stay stopped"))
+        .send()
+        .await?;
+    let absence_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match target_client.get_object().bucket(bucket).key(post_remove_key).send().await {
+            Ok(_) => return Err("object reached the removed site replication target".into()),
+            Err(err) if matches!(err.code(), Some("NoSuchKey" | "NotFound" | "NoSuchVersion")) => {
+                if tokio::time::Instant::now() >= absence_deadline {
+                    break;
+                }
+                sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
     Ok(())
 }
 
@@ -2767,7 +3419,9 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2870,7 +3524,9 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -2905,7 +3561,12 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
 
     source_client.create_bucket().bucket(bucket).send().await?;
-    enable_bucket_versioning(&source_env, bucket).await?;
+    let versioning = source_client.get_bucket_versioning().bucket(bucket).send().await?;
+    assert_eq!(
+        versioning.status(),
+        Some(&BucketVersioningStatus::Enabled),
+        "site replication did not enable source bucket versioning"
+    );
     let replication_response = signed_request(
         http::Method::GET,
         &format!("{}/{bucket}?replication", source_env.url),
@@ -2942,7 +3603,9 @@ async fn test_site_replication_replicates_policy_backed_user_access_real_dual_no
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -3025,7 +3688,9 @@ async fn test_site_replication_replicates_group_policy_backed_access_real_dual_n
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -3109,7 +3774,8 @@ async fn test_service_account_policy_from_accountinfo_round_trips_real_single_no
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server(vec![]).await?;
+    env.start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let account_info = get_account_info(&env, &env.access_key, &env.secret_key).await?;
     let policy_str = account_info
@@ -3160,7 +3826,9 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;
@@ -3260,7 +3928,9 @@ async fn test_site_replication_replicates_service_accounts_created_from_sts_sess
     }
 
     let mut source_env = RustFSTestEnvironment::new().await?;
-    source_env.start_rustfs_server(vec![]).await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
     target_env.start_rustfs_server_without_cleanup(vec![]).await?;

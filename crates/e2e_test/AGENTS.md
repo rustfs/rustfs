@@ -2,6 +2,11 @@
 
 Applies to `crates/e2e_test/`.
 
+Contributor guide (how to run suites, add a test, the harness/fixture
+inventory, `#[ignore]` classes, and the CI map) lives in
+[`README.md`](README.md). This file holds the crate rules that agents must
+follow.
+
 ## Test Reliability
 
 - Keep end-to-end tests deterministic and environment-aware.

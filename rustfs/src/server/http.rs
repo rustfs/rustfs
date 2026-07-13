@@ -34,7 +34,7 @@ use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::request_context::{RequestContext, extract_request_id_from_headers};
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 use crate::storage_api::server::http::tonic_service::make_server;
-use crate::storage_api::server::http::{TONIC_RPC_PREFIX, verify_rpc_signature};
+use crate::storage_api::server::http::{ServerContextSlot, TONIC_RPC_PREFIX, verify_rpc_signature};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper::body::Incoming;
@@ -90,6 +90,13 @@ const METRIC_HTTP_SERVER_REQUEST_BODY_BYTES_TOTAL: &str = "rustfs_http_server_re
 const METRIC_HTTP_SERVER_REQUEST_BODY_SIZE_BYTES: &str = "rustfs_http_server_request_body_size_bytes";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL: &str = "rustfs_http_server_response_body_bytes_total";
 const METRIC_HTTP_SERVER_RESPONSE_BODY_SIZE_BYTES: &str = "rustfs_http_server_response_body_size_bytes";
+
+/// Cached handle for the per-response-body-chunk byte counter. A streamed GET
+/// emits many chunks, so resolving the `counter!` registry entry once — the
+/// global recorder is installed at startup before any response streams — avoids
+/// a registry lookup on every chunk.
+static RESP_BODY_BYTES_COUNTER: std::sync::LazyLock<metrics::Counter> =
+    std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL));
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
@@ -331,7 +338,11 @@ fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, s
     }
 }
 
-pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalReadiness>) -> Result<(ShutdownHandle, SocketAddr)> {
+pub async fn start_http_server(
+    config: &config::Config,
+    readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<(ShutdownHandle, SocketAddr)> {
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
 
     // The listening address and port are obtained from the parameters
@@ -598,7 +609,10 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
     // Setup S3 service
     // This project uses the S3S library to implement S3 services
     let s3_service = {
-        let store = storage::ecfs::FS::new();
+        // Bind the S3 service to this server's context slot (backlog#1052 S2)
+        // so request dispatch resolves the server's own store.
+        let admin_server_ctx = server_ctx.clone();
+        let store = storage::ecfs::FS::with_server_ctx(server_ctx);
         let mut b = S3ServiceBuilder::new(store.clone());
 
         let access_key = config.access_key.clone();
@@ -630,7 +644,7 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store);
         b.set_route(storage::metadata_route::with_metadata_route(
-            admin::make_admin_route(config.console_enable)?,
+            admin::make_admin_route(config.console_enable, admin_server_ctx)?,
             metadata_route_host,
         ));
 
@@ -1313,7 +1327,7 @@ fn process_connection(
                         })
                         .on_response(trace_on_response)
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
+                            RESP_BODY_BYTES_COUNTER.increment(chunk.len() as u64);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();
@@ -1473,7 +1487,7 @@ fn process_connection(
                         })
                         .on_response(trace_on_response)
                         .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            counter!(METRIC_HTTP_SERVER_RESPONSE_BODY_BYTES_TOTAL).increment(chunk.len() as u64);
+                            RESP_BODY_BYTES_COUNTER.increment(chunk.len() as u64);
                             #[cfg(feature = "tracing-chunk-debug")]
                             {
                                 let _enter = span.enter();

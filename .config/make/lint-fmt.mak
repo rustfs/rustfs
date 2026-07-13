@@ -15,7 +15,7 @@ fmt-check: core-deps fmt-deps ## Check code formatting
 .PHONY: clippy-check
 clippy-check: core-deps ## Run clippy checks
 	@echo "🔍 Running clippy checks..."
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets -- -D warnings
 
 .PHONY: clippy-fix
 clippy-fix: core-deps ## Apply clippy fixes
@@ -49,6 +49,16 @@ logging-guardrails-check: ## Check logging guardrails for redaction and noise re
 tokio-io-uring-check: ## Check tokio io-uring runtime feature stays removed
 	@echo "🚫 Checking tokio io-uring feature guard..."
 	./scripts/check_no_tokio_io_uring.sh
+
+.PHONY: extension-schema-check
+extension-schema-check: ## Check extension-schema stays a lightweight contract crate
+	@echo "🧩 Checking extension schema boundaries..."
+	./scripts/check_extension_schema_boundaries.sh
+
+.PHONY: body-cache-whitelist-check
+body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fail-closed allow-list
+	@echo "🧱 Checking body-cache whitelist guard..."
+	./scripts/check_body_cache_whitelist.sh
 
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check

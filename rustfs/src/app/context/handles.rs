@@ -65,7 +65,10 @@ impl IamInterface for IamHandle {
     }
 
     fn is_ready(&self) -> bool {
-        runtime_sources::ready_iam_handle().is_ok()
+        // The handle owns a fully initialized system (contexts are only built
+        // after IAM bootstrap), so readiness is a property of the held Arc —
+        // not of the process singleton (backlog#1052 S3).
+        self.iam.is_ready()
     }
 
     fn token_signing_key(&self) -> Option<String> {
@@ -178,7 +181,7 @@ impl NotifyInterface for NotifyHandle {
 pub struct NotificationSystemHandle;
 
 impl NotificationSystemInterface for NotificationSystemHandle {
-    fn handle(&self) -> Option<&'static NotificationSys> {
+    fn handle(&self) -> Option<Arc<NotificationSys>> {
         runtime_sources::notification_system()
     }
 }
@@ -341,12 +344,37 @@ impl LocalNodeNameInterface for LocalNodeNameHandle {
 }
 
 /// Default action credentials interface adapter.
+///
+/// Holds this context's own copy of the action credentials (backlog#1052 S3).
+/// `publish` lands on the owning context *and* attempts to publish the process
+/// global; readers prefer the owned copy and fall back to the global — so
+/// ambient callers (iam, S3 auth) keep working, and two contexts that both
+/// published stay isolated even though the global remembers only the first.
 #[derive(Default)]
-pub struct ActionCredentialHandle;
+pub struct ActionCredentialHandle {
+    credentials: StdRwLock<Option<Credentials>>,
+}
 
 impl ActionCredentialInterface for ActionCredentialHandle {
     fn get(&self) -> Option<Credentials> {
+        if let Ok(guard) = self.credentials.read()
+            && let Some(credentials) = guard.as_ref()
+        {
+            return Some(credentials.clone());
+        }
         runtime_sources::action_credentials()
+    }
+
+    fn publish(&self, credentials: Credentials) -> bool {
+        let Ok(mut guard) = self.credentials.write() else {
+            return false;
+        };
+        let already_held = guard.is_some();
+        *guard = Some(credentials.clone());
+        let global_published =
+            rustfs_credentials::init_global_action_credentials(Some(credentials.access_key), Some(credentials.secret_key))
+                .is_ok();
+        !already_held || global_published
     }
 }
 
@@ -395,15 +423,31 @@ impl TransitionStateInterface for TransitionStateHandle {
 }
 
 /// Default server config interface adapter.
+///
+/// Holds this context's own copy of the server config (backlog#1052 S3): a
+/// `set` lands on the owning context *and* on the process global, so ambient
+/// readers (the config loader path, the scanner) keep working; a `get`
+/// prefers the owned copy and falls back to the process global while the
+/// initial load still publishes there — the single-instance legacy default.
 #[derive(Default)]
-pub struct ServerConfigHandle;
+pub struct ServerConfigHandle {
+    config: StdRwLock<Option<Config>>,
+}
 
 impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
+        if let Ok(guard) = self.config.read()
+            && guard.is_some()
+        {
+            return guard.clone();
+        }
         runtime_sources::server_config()
     }
 
     fn set(&self, config: Config) {
+        if let Ok(mut guard) = self.config.write() {
+            *guard = Some(config.clone());
+        }
         runtime_sources::set_server_config(config);
     }
 }
@@ -509,7 +553,7 @@ pub fn default_local_node_name_interface() -> Arc<dyn LocalNodeNameInterface> {
 }
 
 pub fn default_action_credential_interface() -> Arc<dyn ActionCredentialInterface> {
-    Arc::new(ActionCredentialHandle)
+    Arc::new(ActionCredentialHandle::default())
 }
 
 pub fn default_oidc_interface() -> Arc<dyn OidcInterface> {
@@ -537,7 +581,7 @@ pub fn default_transition_state_interface() -> Arc<dyn TransitionStateInterface>
 }
 
 pub fn default_server_config_interface() -> Arc<dyn ServerConfigInterface> {
-    Arc::new(ServerConfigHandle)
+    Arc::new(ServerConfigHandle::default())
 }
 
 pub fn default_storage_class_interface() -> Arc<dyn StorageClassInterface> {
@@ -546,4 +590,76 @@ pub fn default_storage_class_interface() -> Arc<dyn StorageClassInterface> {
 
 pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
     Arc::new(BufferConfigHandle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerConfigHandle, runtime_sources};
+    use crate::app::context::interfaces::ServerConfigInterface;
+    use rustfs_config::server_config::Config;
+    use std::collections::HashMap;
+
+    // backlog#1052 S3: each context's server-config handle keeps its own copy,
+    // so two handles that both published stay isolated even though the shared
+    // process global only remembers the last write.
+    #[test]
+    fn server_config_handle_prefers_its_own_copy_over_the_shared_global() {
+        let mut config_a = Config::new();
+        config_a.0.insert("handle-a-marker".to_string(), HashMap::new());
+        let mut config_b = Config::new();
+        config_b.0.insert("handle-b-marker".to_string(), HashMap::new());
+
+        let handle_a = ServerConfigHandle::default();
+        let handle_b = ServerConfigHandle::default();
+        handle_a.set(config_a.clone());
+        handle_b.set(config_b.clone());
+
+        assert_eq!(handle_a.get(), Some(config_a), "handle A must serve its own copy");
+        assert_eq!(handle_b.get(), Some(config_b), "handle B must serve its own copy");
+    }
+
+    // Before anything is published through the handle, it answers exactly like
+    // the ambient global — the single-instance legacy default.
+    #[test]
+    fn unset_server_config_handle_falls_back_to_the_ambient_global() {
+        let handle = ServerConfigHandle::default();
+        assert_eq!(handle.get(), runtime_sources::server_config());
+    }
+
+    // backlog#1052 S3: two contexts' credential handles keep their own copies,
+    // so they stay isolated even though the process global is init-once and
+    // will only remember the first publish.
+    #[test]
+    fn credential_handle_prefers_its_own_copy_over_the_shared_global() {
+        use super::ActionCredentialHandle;
+        use crate::app::context::interfaces::ActionCredentialInterface;
+        use rustfs_credentials::Credentials;
+
+        let cred_a = Credentials {
+            access_key: "handle-a-access".to_string(),
+            secret_key: "handle-a-secret".to_string(),
+            ..Default::default()
+        };
+        let cred_b = Credentials {
+            access_key: "handle-b-access".to_string(),
+            secret_key: "handle-b-secret".to_string(),
+            ..Default::default()
+        };
+
+        let handle_a = ActionCredentialHandle::default();
+        let handle_b = ActionCredentialHandle::default();
+        handle_a.publish(cred_a.clone());
+        handle_b.publish(cred_b.clone());
+
+        assert_eq!(
+            handle_a.get().map(|c| c.access_key),
+            Some(cred_a.access_key),
+            "handle A must serve its own credentials"
+        );
+        assert_eq!(
+            handle_b.get().map(|c| c.access_key),
+            Some(cred_b.access_key),
+            "handle B must serve its own credentials"
+        );
+    }
 }

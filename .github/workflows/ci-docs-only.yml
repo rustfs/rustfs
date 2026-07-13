@@ -56,5 +56,15 @@ jobs:
     name: Test and Lint
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      # Docs-only PRs skip the full code CI, but they are exactly where a
+      # planning-type document could be slipped in (git add -f bypasses
+      # .gitignore). Run the guard here so the required "Test and Lint" check
+      # stays meaningful for docs-only changes.
+      - name: Check no planning docs committed
+        run: ./scripts/check_no_planning_docs.sh
+
       - name: Satisfy required check for docs-only changes
-        run: echo "Docs-only change — code CI is skipped by paths-ignore; reporting success for the required 'Test and Lint' check."
+        run: echo "Docs-only change — code CI is skipped by paths-ignore; planning-docs guard passed, reporting success for the required 'Test and Lint' check."

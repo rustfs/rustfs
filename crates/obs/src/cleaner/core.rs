@@ -28,7 +28,7 @@ use crate::global::{
 };
 use crossbeam_channel::bounded;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use crossbeam_utils::thread;
+use crossbeam_utils::{Backoff, thread};
 use metrics::{counter, gauge, histogram};
 use rustfs_config::DEFAULT_LOG_KEEP_FILES;
 use std::path::PathBuf;
@@ -41,6 +41,11 @@ const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_LOG_CLEANER: &str = "log_cleaner";
 const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+/// Absolute ceiling on parallel compression workers, independent of config, so
+/// a misconfigured `parallel_workers` on a directory with thousands of rotated logs
+/// cannot spawn thousands of threads (each of which may also start codec
+/// threads).
+const MAX_PARALLEL_COMPRESS_WORKERS: usize = 64;
 const MAX_RETENTION_DAYS_BEFORE_SATURATION: u64 = u64::MAX / SECONDS_PER_DAY;
 
 fn compressed_file_retention_window(days: u64) -> Duration {
@@ -115,6 +120,16 @@ impl LogCleaner {
         LogCleanerBuilder::new(log_dir, file_pattern, active_filename)
     }
 
+    /// Effective gzip level after clamping — what compression actually uses.
+    pub fn effective_gzip_level(&self) -> u32 {
+        self.gzip_compression_level
+    }
+
+    /// Effective zstd level after clamping — what compression actually uses.
+    pub fn effective_zstd_level(&self) -> i32 {
+        self.zstd_compression_level
+    }
+
     /// Perform one full cleanup pass.
     pub fn cleanup(&self) -> Result<(usize, u64), std::io::Error> {
         if !self.log_dir.exists() {
@@ -175,10 +190,10 @@ impl LogCleaner {
             }
         }
 
-        if !compressed_archives.is_empty() && self.compressed_file_retention_days > 0 {
-            let expired = self.select_expired_compressed(&mut compressed_archives);
-            if !expired.is_empty() {
-                let (d, f) = self.delete_files(&expired)?;
+        if !compressed_archives.is_empty() {
+            let to_delete = self.select_archives_to_delete(&mut compressed_archives);
+            if !to_delete.is_empty() {
+                let (d, f) = self.delete_files(&to_delete)?;
                 total_deleted += d;
                 total_freed += f;
             }
@@ -235,8 +250,16 @@ impl LogCleaner {
         to_delete
     }
 
-    /// Select compressed archives whose age exceeds the archive retention window.
-    fn select_expired_compressed(&self, files: &mut [FileInfo]) -> Vec<FileInfo> {
+    /// Select compressed archives to delete: those older than the retention
+    /// window, plus — regardless of retention — the oldest archives needed to
+    /// bring the archive set back under `max_total_size_bytes`.
+    ///
+    /// The byte cap is the crucial part: with `compressed_file_retention_days`
+    /// set to 0 (retention disabled) and compression enabled, age-based expiry
+    /// never fires, so without this cap archives would grow without bound (the
+    /// cap on regular logs does not cover them). Bounding the archive set by the
+    /// same byte budget keeps disk usage finite even when retention is off.
+    fn select_archives_to_delete(&self, files: &mut [FileInfo]) -> Vec<FileInfo> {
         if self.compressed_file_retention_days > MAX_RETENTION_DAYS_BEFORE_SATURATION {
             warn!(
                 event = EVENT_LOG_CLEANER_STATE,
@@ -248,19 +271,54 @@ impl LogCleaner {
                 "log cleaner state changed"
             );
         }
-        let retention = compressed_file_retention_window(self.compressed_file_retention_days);
-        let now = SystemTime::now();
-        let mut expired = Vec::new();
 
-        for file in files {
-            if let Ok(age) = now.duration_since(file.modified)
-                && age > retention
-            {
-                expired.push(file.clone());
+        // Oldest first so both age expiry and the byte-cap trim evict the
+        // longest-retained archives before newer ones.
+        files.sort_by_key(|f| f.modified);
+        let now = SystemTime::now();
+        let retention = compressed_file_retention_window(self.compressed_file_retention_days);
+        let retention_active = self.compressed_file_retention_days > 0;
+
+        let mut selected = vec![false; files.len()];
+
+        // 1. Age-based expiry (only when retention is enabled).
+        if retention_active {
+            for (idx, file) in files.iter().enumerate() {
+                if let Ok(age) = now.duration_since(file.modified)
+                    && age > retention
+                {
+                    selected[idx] = true;
+                }
             }
         }
 
-        expired
+        // 2. Byte-cap trim: drop the oldest surviving archives until the set
+        //    fits under the configured total. 0 means "no cap".
+        if self.max_total_size_bytes > 0 {
+            let mut remaining: u64 = files
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !selected[*idx])
+                .map(|(_, file)| file.size)
+                .sum();
+            for (idx, file) in files.iter().enumerate() {
+                if remaining <= self.max_total_size_bytes {
+                    break;
+                }
+                if selected[idx] {
+                    continue;
+                }
+                selected[idx] = true;
+                remaining = remaining.saturating_sub(file.size);
+            }
+        }
+
+        files
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| selected[*idx])
+            .map(|(_, file)| file.clone())
+            .collect()
     }
 
     /// Parallel compressor with work stealing.
@@ -275,7 +333,7 @@ impl LogCleaner {
             return self.serial_compress_and_delete(files);
         }
 
-        let worker_count = self.parallel_workers.min(files.len()).max(1);
+        let worker_count = self.parallel_workers.min(files.len()).clamp(1, MAX_PARALLEL_COMPRESS_WORKERS);
         if worker_count <= 1 {
             return self.serial_compress_and_delete(files);
         }
@@ -317,6 +375,11 @@ impl LogCleaner {
                         .wrapping_mul(6364136223846793005)
                         .wrapping_add(1442695040888963407);
 
+                    // Escalating spin->yield backoff for the transient windows
+                    // where work is being redistributed, instead of a hot
+                    // `continue`/`yield_now` loop that burns CPU.
+                    let backoff = Backoff::new();
+
                     loop {
                         // Search order: local FIFO -> global injector batch ->
                         // random victim stealers.
@@ -327,7 +390,10 @@ impl LogCleaner {
                                 Steal::Success(file) => {
                                     Some(file)
                                 }
-                                Steal::Retry => continue,
+                                Steal::Retry => {
+                                    backoff.snooze();
+                                    continue;
+                                }
                                 Steal::Empty => {
                                     let stolen = Self::steal_from_victims(
                                         worker_id,
@@ -351,10 +417,13 @@ impl LogCleaner {
                         };
 
                         let Some(file) = task else {
-                            std::thread::yield_now();
+                            backoff.snooze();
                             continue;
                         };
 
+                        // Got work: reset the backoff so the next idle spell
+                        // starts from a cheap spin again.
+                        backoff.reset();
                         let mut file = file;
                         let compressed = match compress_file(&file.path, &options) {
                             Ok(output) => {
@@ -415,6 +484,11 @@ impl LogCleaner {
 
         let (deleted, freed) = self.delete_files(&deletable)?;
         let elapsed = started_at.elapsed().as_secs_f64();
+        // NOTE on metric scope: attempts/successes count only *victim* steals
+        // (not the injector `steal_batch_and_pop`), and a multi-task stolen
+        // batch counts as a single success. So this rate reflects inter-worker
+        // rebalancing efficiency, not total task acquisition — read it as a
+        // relative health signal, not an absolute throughput measure.
         let attempts = steal_attempts.load(Ordering::Relaxed);
         let successes = steal_successes.load(Ordering::Relaxed);
         let success_rate = if attempts == 0 {
@@ -603,6 +677,16 @@ impl LogCleaner {
             }
         }
 
+        // Durability: persist the directory entries so the unlinks cannot be
+        // reordered ahead of the archive data that justified them. Best-effort;
+        // opening a directory as a file is not portable (e.g. Windows).
+        if !self.dry_run
+            && deleted > 0
+            && let Ok(dir) = std::fs::File::open(&self.log_dir)
+        {
+            let _ = dir.sync_all();
+        }
+
         Ok((deleted, freed))
     }
 }
@@ -774,11 +858,40 @@ impl LogCleanerBuilder {
     /// Invalid glob patterns are ignored rather than failing construction, and
     /// codec-related numeric values are clamped into safe ranges.
     pub fn build(self) -> LogCleaner {
-        let patterns = self
-            .exclude_patterns
-            .into_iter()
-            .filter_map(|p| glob::Pattern::new(&p).ok())
-            .collect();
+        // Defense-in-depth for the active-file guard: the scanner protects the
+        // live log by exact filename equality against `active_filename`. An
+        // empty value silently disables that protection, so a non-empty
+        // `file_pattern` could then make the live log a deletion candidate.
+        // Warn instead of failing so misuse of the public builder is visible.
+        if self.active_filename.trim().is_empty() && !self.file_pattern.trim().is_empty() {
+            warn!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                result = "empty_active_filename",
+                "active log filename is empty; the active-file exclusion is disabled and the live log may become a deletion candidate"
+            );
+        }
+
+        // Surface, rather than silently drop, invalid exclude globs: a dropped
+        // pattern turns "protect this file" into "delete this file", so an
+        // operator's typo (or a literal comma splitting a char-class) must be
+        // visible instead of failing open.
+        let mut patterns = Vec::new();
+        for raw in self.exclude_patterns {
+            match glob::Pattern::new(&raw) {
+                Ok(pattern) => patterns.push(pattern),
+                Err(err) => warn!(
+                    event = EVENT_LOG_CLEANER_STATE,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                    result = "invalid_exclude_pattern",
+                    pattern = %raw,
+                    error = %err,
+                    "log cleaner state changed"
+                ),
+            }
+        }
 
         LogCleaner {
             log_dir: self.log_dir,
@@ -789,7 +902,9 @@ impl LogCleanerBuilder {
             max_total_size_bytes: self.max_total_size_bytes,
             max_single_file_size_bytes: self.max_single_file_size_bytes,
             compress_old_files: self.compress_old_files,
-            gzip_compression_level: self.gzip_compression_level.clamp(1, 9),
+            // gzip level 0 is a valid "store" (no compression) mode, so keep the
+            // lower bound at 0 rather than silently bumping it to 1.
+            gzip_compression_level: self.gzip_compression_level.clamp(0, 9),
             compressed_file_retention_days: self.compressed_file_retention_days,
             exclude_patterns: patterns,
             delete_empty_files: self.delete_empty_files,
@@ -798,7 +913,9 @@ impl LogCleanerBuilder {
             compression_algorithm: self.compression_algorithm,
             parallel_compress: self.parallel_compress,
             parallel_workers: self.parallel_workers.max(1),
-            zstd_compression_level: self.zstd_compression_level.clamp(1, 21),
+            // zstd level 0 means "codec default"; the real maximum is 22, not
+            // 21, so preserve both boundaries instead of silently narrowing.
+            zstd_compression_level: self.zstd_compression_level.clamp(0, 22),
             zstd_fallback_to_gzip: self.zstd_fallback_to_gzip,
             zstd_workers: self.zstd_workers.max(1),
         }

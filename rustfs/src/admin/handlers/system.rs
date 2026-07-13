@@ -15,9 +15,8 @@
 use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::current_object_store_handle;
 use crate::admin::runtime_sources::{
-    DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase,
+    DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase, object_store_from_req,
 };
 use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
@@ -527,7 +526,7 @@ impl Operation for InspectDataHandler {
             ));
         };
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             log_system_request_failed!("inspect_data", "object_store_unavailable", "not initialized");
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
         };

@@ -30,6 +30,20 @@ pub(crate) fn init_action_credentials(
     rustfs_credentials::init_global_action_credentials(Some(access_key), Some(secret_key))
 }
 
+/// Publish credentials tolerantly (backlog#1052 S5): treat AlreadyInitialized
+/// as success. Per-server contexts hold their own credentials via
+/// ActionCredentialHandle (S3), so the process global only needs to remember
+/// the first server's identity for ambient readers (iam token signing).
+pub(crate) fn publish_action_credentials_tolerant(
+    access_key: String,
+    secret_key: String,
+) -> Result<(), rustfs_credentials::CredentialsError> {
+    match rustfs_credentials::init_global_action_credentials(Some(access_key), Some(secret_key)) {
+        Ok(()) | Err(rustfs_credentials::CredentialsError::AlreadyInitialized) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 pub(crate) fn publish_region(instance_ctx: &Arc<InstanceContext>, region: s3s::region::Region) {
     instance_ctx.set_region(region);
 }
@@ -88,6 +102,10 @@ pub(crate) fn set_put_stage_metrics_enabled(enabled: bool) {
 
 pub(crate) fn set_get_stage_metrics_enabled(enabled: bool) {
     rustfs_io_metrics::set_get_stage_metrics_enabled(enabled);
+}
+
+pub(crate) fn set_metrics_enabled(enabled: bool) {
+    rustfs_io_metrics::set_metrics_enabled(enabled);
 }
 
 pub(crate) fn init_tls_metrics() {

@@ -306,7 +306,7 @@ pub(crate) async fn publish_object_store(store: Arc<ECStore>) {
     set_object_layer(store).await;
 }
 
-pub(crate) fn notification_sys() -> Option<&'static NotificationSys> {
+pub(crate) fn notification_sys() -> Option<Arc<NotificationSys>> {
     get_global_notification_sys()
 }
 
@@ -473,6 +473,17 @@ pub(crate) async fn local_disk_for_endpoint(endpoint: &Endpoint) -> Option<DiskS
 
 pub(crate) async fn local_disk_paths() -> Vec<String> {
     local_disk_map_handle().read().await.keys().cloned().collect()
+}
+
+/// Local disks registered on an explicit instance context (backlog#1052 S7).
+pub(crate) async fn local_disks_in(instance_ctx: &InstanceContext) -> Vec<DiskStore> {
+    instance_ctx
+        .local_disk_map()
+        .read()
+        .await
+        .values()
+        .filter_map(|v| v.as_ref().cloned())
+        .collect()
 }
 
 pub(crate) async fn local_disks() -> Vec<DiskStore> {

@@ -130,7 +130,9 @@ fn http_range_spec_from_object_info(oi: &ObjectInfo, part_number: usize) -> Opti
     HTTPRangeSpec::from_part_sizes(oi.size, part_number, oi.parts.iter().map(part_plaintext_size))
 }
 
-fn restore_request_active(opts: &ObjectOptions) -> bool {
+/// A restore read forces `ReadPlan::build` down the `Plain` branch, so it
+/// yields the STORED representation even for compressed or encrypted objects.
+pub(crate) fn restore_request_active(opts: &ObjectOptions) -> bool {
     let restore = &opts.transition.restore_request;
     restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
 }
@@ -273,10 +275,49 @@ impl PutObjReader {
     }
 }
 
+/// Provenance of a [`GetObjectReader`] with respect to the app-layer object
+/// data cache hook, so the app layer can avoid repeating the cache lookup the
+/// ecstore GET probe already ran after fresh metadata resolution (backlog#1121
+/// / ODC-16). One hook-served GET must record exactly one lookup, not two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GetObjectBodySource {
+    /// The cache hook did not probe this read: the hook is unregistered, or the
+    /// read is ineligible under the fail-closed allow-list. The app layer runs
+    /// its own cache lookup, as before.
+    #[default]
+    Unprobed,
+    /// The hook probed after fresh metadata resolution and did not serve a body
+    /// (a genuine miss, or a length-defensive rejection). Its miss is
+    /// authoritative, so the app layer must skip the lookup and only build a
+    /// plan to fill.
+    HookMissed,
+    /// `buffered_body` is exactly the body the hook served from the cache. The
+    /// app layer serves it directly as the object-data-cache source, with no
+    /// second lookup and no re-fill.
+    HookServed,
+}
+
 pub struct GetObjectReader {
     pub stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     pub object_info: ObjectInfo,
     pub buffered_body: Option<Bytes>,
+    /// Cache-hook provenance; defaults to [`GetObjectBodySource::Unprobed`] for
+    /// every reader that never passed through the app-layer cache probe.
+    pub body_source: GetObjectBodySource,
+}
+
+impl GetObjectReader {
+    /// True when `buffered_body` is the body the cache hook served. The app
+    /// layer serves it as the object-data-cache source without a second lookup.
+    pub fn is_cache_hook_served(&self) -> bool {
+        matches!(self.body_source, GetObjectBodySource::HookServed)
+    }
+
+    /// True when the cache hook probed this read (whether it served a body or
+    /// missed). The app layer must not repeat the lookup in either case.
+    pub fn cache_hook_probed(&self) -> bool {
+        !matches!(self.body_source, GetObjectBodySource::Unprobed)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -530,6 +571,7 @@ impl ReadPlan {
                     stream: reader,
                     object_info: oi.clone(),
                     buffered_body: None,
+                    body_source: GetObjectBodySource::Unprobed,
                 },
                 self.storage_offset,
                 self.storage_length,
@@ -584,6 +626,7 @@ impl ReadPlan {
                         stream: final_reader,
                         object_info,
                         buffered_body: None,
+                        body_source: GetObjectBodySource::Unprobed,
                     },
                     self.storage_offset,
                     self.storage_length,
@@ -685,6 +728,7 @@ impl ReadPlan {
                         stream: final_reader,
                         object_info,
                         buffered_body: None,
+                        body_source: GetObjectBodySource::Unprobed,
                     },
                     self.storage_offset,
                     self.storage_length,

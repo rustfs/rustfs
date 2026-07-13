@@ -292,6 +292,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/storageinfo", STORAGE_INFO, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS, RouteRiskLevel::Sensitive),
     admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/object-data-cache/stats",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/object-data-cache/flush",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/pools/decommission",
         DECOMMISSION,
@@ -584,6 +596,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Put,
         "/rustfs/admin/v3/site-replication/edit",
         SITE_REPLICATION_ADD,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/peer/edit-capabilities",
+        SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
     ),
     admin(

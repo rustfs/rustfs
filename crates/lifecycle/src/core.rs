@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_config::{DEFAULT_ILM_PROCESS_TIME_SECS, ENV_ILM_PROCESS_TIME, ENV_ILM_PROCESS_TIME_DEPRECATED};
+use rustfs_config::{DEFAULT_ILM_DAY_SECS, ENV_ILM_DEBUG_DAY_SECS, ENV_ILM_PROCESS_TIME, ENV_ILM_PROCESS_TIME_DEPRECATED};
 use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use time::macros::offset;
 use time::{self, Duration, OffsetDateTime};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::rule::{Filter, NoncurrentVersionTransitionOps, TransitionOps};
@@ -32,6 +32,7 @@ pub const TRANSITION_PENDING: &str = "pending";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_EXPIRY_COMPUTED: &str = "lifecycle_expiry_computed";
+const EVENT_LIFECYCLE_DEBUG_DAY_SECS: &str = "lifecycle_debug_day_secs";
 const ERR_LIFECYCLE_NO_RULE: &str = "Lifecycle configuration should have at least one rule";
 const ERR_LIFECYCLE_DUPLICATE_ID: &str = "Rule ID must be unique. Found same ID for more than one rule";
 const _ERR_XML_NOT_WELL_FORMED: &str =
@@ -39,10 +40,11 @@ const _ERR_XML_NOT_WELL_FORMED: &str =
 const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
     "ExpiredObjectAllVersions element and DelMarkerExpiration action cannot be used on an object locked bucket";
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
-const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "Lifecycle expiration days must not be negative";
-const ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS: &str = "Lifecycle noncurrent expiration days must not be negative";
+const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "'Days' for Expiration action must be a positive integer";
+const ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS: &str =
+    "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer";
 const ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS: &str =
-    "DaysAfterInitiation must be 0 or greater when used with AbortIncompleteMultipartUpload";
+    "'DaysAfterInitiation' for AbortIncompleteMultipartUpload action must be a positive integer";
 const ERR_LIFECYCLE_INVALID_EXPIRATION_DATE_NOT_MIDNIGHT: &str = "Expiration.Date must be at midnight UTC";
 const ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_DELETE_MARKER: &str =
     "ExpiredObjectDeleteMarker cannot be specified with Days or Date";
@@ -324,21 +326,29 @@ impl Lifecycle for BucketLifecycleConfiguration {
                         return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRATION_DATE_NOT_MIDNIGHT));
                     }
                 }
+                // S3 requires Expiration.Days to be a positive integer (>= 1). AWS and the
+                // ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with
+                // InvalidArgument; only Date-based rules may omit Days entirely.
                 if let Some(days) = expiration.days
-                    && days < 0
+                    && days < 1
                 {
                     return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS));
                 }
             }
+            // S3 requires NoncurrentVersionExpiration.NoncurrentDays to be a positive
+            // integer (>= 1); AWS rejects 0 with InvalidArgument.
             if let Some(noncurrent_version_expiration) = &r.noncurrent_version_expiration
                 && let Some(noncurrent_days) = noncurrent_version_expiration.noncurrent_days
-                && noncurrent_days < 0
+                && noncurrent_days < 1
             {
                 return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS));
             }
+            // S3 requires AbortIncompleteMultipartUpload.DaysAfterInitiation to be present
+            // and a positive integer (>= 1); AWS rejects 0 (and a missing value) with
+            // InvalidArgument.
             if let Some(abort_incomplete_multipart_upload) = &r.abort_incomplete_multipart_upload {
                 match abort_incomplete_multipart_upload.days_after_initiation {
-                    Some(days) if days >= 0 => {}
+                    Some(days) if days >= 1 => {}
                     _ => return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS)),
                 }
             }
@@ -829,12 +839,18 @@ pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTi
         );
         return OffsetDateTime::UNIX_EPOCH; // Return epoch time to ensure immediate expiry
     }
+    // One "day" is normally 86400 seconds; RUSTFS_ILM_DEBUG_DAY_SECS (test/debug
+    // only) can shrink it so Days-based rules become testable in seconds. Unset =>
+    // ilm_day_secs() == 86400, byte-identical to `Duration::days(days)`.
+    let offset_secs = i64::from(days).saturating_mul(i64::from(ilm_day_secs()));
     let t = mod_time
         .to_offset(offset!(-0:00:00))
-        .saturating_add(Duration::days(i64::from(days)));
+        .saturating_add(Duration::seconds(offset_secs));
 
     // Round up to the next processing boundary per S3-compatible Days semantics.
     // Canonical key: RUSTFS_ILM_PROCESS_TIME; deprecated alias: _RUSTFS_ILM_PROCESS_TIME.
+    // When RUSTFS_ILM_PROCESS_TIME is unset the boundary defaults to the (possibly
+    // debug-accelerated) day length, so RUSTFS_ILM_DEBUG_DAY_SECS scales rounding too.
     // TODO(GA): Remove ENV_ILM_PROCESS_TIME_DEPRECATED compatibility during GA release.
     let process_interval_secs = ilm_process_interval_secs();
 
@@ -850,14 +866,83 @@ pub fn expected_expiry_time(mod_time: OffsetDateTime, days: i32) -> OffsetDateTi
 }
 
 fn ilm_process_interval_secs() -> u32 {
-    let configured = std::env::var(ENV_ILM_PROCESS_TIME)
+    // An explicit RUSTFS_ILM_PROCESS_TIME (or its deprecated alias) always wins.
+    // Otherwise fall back to the lifecycle day length so the debug day-length
+    // override rescales the rounding boundary consistently with the deadline.
+    std::env::var(ENV_ILM_PROCESS_TIME)
         .ok()
         .or_else(|| std::env::var(ENV_ILM_PROCESS_TIME_DEPRECATED).ok())
         .and_then(|value| value.parse::<i32>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_ILM_PROCESS_TIME_SECS);
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_else(ilm_day_secs)
+}
 
-    u32::try_from(configured).unwrap_or_else(|_| u32::try_from(DEFAULT_ILM_PROCESS_TIME_SECS).unwrap_or(1))
+/// Number of seconds treated as one lifecycle "day".
+///
+/// **TEST/DEBUG ONLY override.** Returns [`DEFAULT_ILM_DAY_SECS`] (86400) unless
+/// the `RUSTFS_ILM_DEBUG_DAY_SECS` environment variable is set to a positive
+/// integer, modeled on Ceph RGW's `rgw_lc_debug_interval`. When set, one
+/// Days-based lifecycle "day" is compressed to that many seconds, making
+/// expiration / transition / noncurrent Days rules exercisable in seconds.
+///
+/// A missing / zero / non-numeric value falls back to 86400, so with the
+/// variable unset the behavior is byte-for-byte identical to production.
+/// Enabling it emits a `WARN` because it accelerates data deletion and must
+/// never be set in a production deployment. Only relative `Days` deadlines are
+/// rescaled; absolute `Date`-based rules are unaffected.
+///
+/// In production the value is parsed once (via `OnceLock`) so there is no
+/// per-object environment read on the scanner evaluation path. Under `#[cfg(test)]`
+/// the environment is re-read on every call so `temp_env`-style tests remain
+/// deterministic and cannot poison each other across a shared process.
+fn ilm_day_secs() -> u32 {
+    #[cfg(test)]
+    {
+        resolve_ilm_day_secs()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static CACHE: OnceLock<u32> = OnceLock::new();
+        *CACHE.get_or_init(resolve_ilm_day_secs)
+    }
+}
+
+fn resolve_ilm_day_secs() -> u32 {
+    match std::env::var(ENV_ILM_DEBUG_DAY_SECS) {
+        Ok(raw) => parse_ilm_day_secs(&raw),
+        Err(_) => DEFAULT_ILM_DAY_SECS,
+    }
+}
+
+/// Parse a `RUSTFS_ILM_DEBUG_DAY_SECS` value. Positive integers activate the
+/// override (with a `WARN`); anything else warns and falls back to 86400.
+fn parse_ilm_day_secs(raw: &str) -> u32 {
+    match raw.trim().parse::<u32>() {
+        Ok(secs) if secs > 0 => {
+            warn!(
+                event = EVENT_LIFECYCLE_DEBUG_DAY_SECS,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                day_secs = secs,
+                "RUSTFS_ILM_DEBUG_DAY_SECS is set: lifecycle Days are accelerated to {secs}s/day. \
+                 TEST/DEBUG ONLY - this accelerates object deletion and must never be enabled in production."
+            );
+            secs
+        }
+        _ => {
+            warn!(
+                event = EVENT_LIFECYCLE_DEBUG_DAY_SECS,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                raw = raw,
+                fallback_day_secs = DEFAULT_ILM_DAY_SECS,
+                "Ignoring invalid RUSTFS_ILM_DEBUG_DAY_SECS value; falling back to 86400s/day."
+            );
+            DEFAULT_ILM_DAY_SECS
+        }
+    }
 }
 
 pub async fn abort_incomplete_multipart_upload_due(
@@ -979,14 +1064,22 @@ mod tests {
     use time::macros::datetime;
 
     fn with_default_ilm_process_time(test: impl FnOnce()) {
-        temp_env::with_var_unset(ENV_ILM_PROCESS_TIME, || {
-            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, test);
+        // Also neutralize the debug day-length override so these boundary tests
+        // stay hermetic against an ambient RUSTFS_ILM_DEBUG_DAY_SECS.
+        temp_env::with_var_unset(ENV_ILM_DEBUG_DAY_SECS, || {
+            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME, || {
+                temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, test);
+            });
         });
     }
 
     #[tokio::test]
     #[serial]
-    async fn validate_accepts_zero_expiration_days() {
+    async fn validate_rejects_zero_expiration_days() {
+        // S3 compatibility: Expiration.Days must be a positive integer (>= 1). AWS and
+        // the ceph s3-tests `test_lifecycle_expiration_days0` case reject Days == 0 with
+        // InvalidArgument. The PutBucketLifecycleConfiguration path maps this io::Error
+        // to s3_error!(InvalidArgument) (see execute_put_bucket_lifecycle_configuration).
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -1006,9 +1099,12 @@ mod tests {
             }],
         };
 
-        lc.validate(&ObjectLockConfiguration::default())
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
             .await
-            .expect("zero-day expiration should be accepted");
+            .expect_err("zero-day expiration should be rejected");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS);
     }
 
     #[tokio::test]
@@ -1070,6 +1166,41 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn validate_accepts_one_day_boundary_values() {
+        // Pin the exact >= 1 boundary: a value of 1 is the smallest legal positive
+        // integer and must be accepted for every day-count field tightened for S3
+        // compatibility. This catches an off-by-one that would reject Days == 1.
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(1),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("one-day-boundary".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: Some("boundary/".to_string()),
+                transitions: None,
+            }],
+        };
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("one-day boundary values should be accepted");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn has_active_rules_accepts_zero_day_expiration() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1095,7 +1226,9 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn validate_accepts_zero_noncurrent_expiration_days() {
+    async fn validate_rejects_zero_noncurrent_expiration_days() {
+        // S3 compatibility: NoncurrentVersionExpiration.NoncurrentDays must be a positive
+        // integer (>= 1); AWS rejects 0 with InvalidArgument.
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -1115,9 +1248,12 @@ mod tests {
             }],
         };
 
-        lc.validate(&ObjectLockConfiguration::default())
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
             .await
-            .expect("zero-day noncurrent expiration should be accepted");
+            .expect_err("zero-day noncurrent expiration should be rejected");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS);
     }
 
     #[tokio::test]
@@ -1178,7 +1314,9 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn validate_accepts_zero_abort_incomplete_multipart_upload_days() {
+    async fn validate_rejects_zero_abort_incomplete_multipart_upload_days() {
+        // S3 compatibility: AbortIncompleteMultipartUpload.DaysAfterInitiation must be a
+        // positive integer (>= 1); AWS rejects 0 with InvalidArgument.
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
             rules: vec![LifecycleRule {
@@ -1197,9 +1335,12 @@ mod tests {
             }],
         };
 
-        lc.validate(&ObjectLockConfiguration::default())
+        let err = lc
+            .validate(&ObjectLockConfiguration::default())
             .await
-            .expect("zero-day abort incomplete multipart upload should be accepted");
+            .expect_err("zero-day abort incomplete multipart upload should be rejected");
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS);
     }
 
     #[tokio::test]
@@ -2798,6 +2939,263 @@ mod tests {
                 let result = expected_expiry_time(mod_time, 30);
                 assert_eq!(result, datetime!(2025-02-15 00:00:00 UTC));
             });
+        });
+    }
+
+    // --- ilm-5 tests: RUSTFS_ILM_DEBUG_DAY_SECS time-acceleration switch ---
+
+    // (a) Default path (env unset) is byte-identical: one day == 86400s.
+    #[test]
+    #[serial]
+    fn ilm_day_secs_defaults_to_86400_when_unset() {
+        temp_env::with_var_unset(ENV_ILM_DEBUG_DAY_SECS, || {
+            assert_eq!(ilm_day_secs(), DEFAULT_ILM_DAY_SECS);
+            assert_eq!(ilm_day_secs(), 86400);
+        });
+    }
+
+    // (b) Pure parse: positive integers activate the override.
+    #[test]
+    fn parse_ilm_day_secs_accepts_positive_values() {
+        assert_eq!(parse_ilm_day_secs("1"), 1);
+        assert_eq!(parse_ilm_day_secs("2"), 2);
+        assert_eq!(parse_ilm_day_secs("  10 "), 10);
+        assert_eq!(parse_ilm_day_secs("3600"), 3600);
+    }
+
+    // (c) Pure parse: invalid / zero / negative fall back to 86400.
+    #[test]
+    fn parse_ilm_day_secs_rejects_invalid_and_zero() {
+        assert_eq!(parse_ilm_day_secs("0"), DEFAULT_ILM_DAY_SECS);
+        assert_eq!(parse_ilm_day_secs("-5"), DEFAULT_ILM_DAY_SECS);
+        assert_eq!(parse_ilm_day_secs("not-a-number"), DEFAULT_ILM_DAY_SECS);
+        assert_eq!(parse_ilm_day_secs(""), DEFAULT_ILM_DAY_SECS);
+        assert_eq!(parse_ilm_day_secs("1.5"), DEFAULT_ILM_DAY_SECS);
+    }
+
+    // (b) End-to-end env read scales the day length.
+    #[test]
+    #[serial]
+    fn ilm_day_secs_scales_when_env_set() {
+        temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("2"), || {
+            assert_eq!(ilm_day_secs(), 2);
+        });
+    }
+
+    // (c) Invalid env value falls back to 86400.
+    #[test]
+    #[serial]
+    fn ilm_day_secs_falls_back_on_invalid_env() {
+        temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("bogus"), || {
+            assert_eq!(ilm_day_secs(), DEFAULT_ILM_DAY_SECS);
+        });
+        temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("0"), || {
+            assert_eq!(ilm_day_secs(), DEFAULT_ILM_DAY_SECS);
+        });
+    }
+
+    // Deadline math scales: with a 1s day and PROCESS_TIME unset, a Days=1 rule is
+    // due 1s after mod_time (rounded up to the next 1s boundary => same instant).
+    #[test]
+    #[serial]
+    fn expected_expiry_time_scales_with_debug_day_secs() {
+        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+        temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("1"), || {
+            temp_env::with_var_unset(ENV_ILM_PROCESS_TIME, || {
+                temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, || {
+                    // 1 "day" == 1s; boundary also defaults to 1s so no extra rounding.
+                    assert_eq!(expected_expiry_time(mod_time, 1), mod_time + Duration::seconds(1));
+                    assert_eq!(expected_expiry_time(mod_time, 5), mod_time + Duration::seconds(5));
+                });
+            });
+        });
+    }
+
+    // days == 0 still yields the immediate-expiry sentinel regardless of the switch.
+    #[test]
+    #[serial]
+    fn expected_expiry_time_zero_days_ignores_debug_day_secs() {
+        let mod_time = datetime!(2025-06-01 12:00:00 UTC);
+        temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("2"), || {
+            assert_eq!(expected_expiry_time(mod_time, 0), OffsetDateTime::UNIX_EPOCH);
+        });
+    }
+
+    // (③) Interaction with an explicit RUSTFS_ILM_PROCESS_TIME: the deadline offset
+    // uses the accelerated day length, but the rounding boundary honors PROCESS_TIME.
+    #[test]
+    #[serial]
+    fn expected_expiry_time_debug_day_secs_respects_explicit_process_time() {
+        let mod_time = datetime!(2025-01-15 10:30:00 UTC);
+        // day == 10s, but round up to the next 60s (PROCESS_TIME) boundary.
+        temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("10"), || {
+            temp_env::with_var(ENV_ILM_PROCESS_TIME, Some("60"), || {
+                temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, || {
+                    // mod_time + 30s = 10:30:30, rounded up to next minute => 10:31:00.
+                    let result = expected_expiry_time(mod_time, 3);
+                    assert_eq!(result, datetime!(2025-01-15 10:31:00 UTC));
+                });
+            });
+        });
+    }
+
+    // (③) With the switch unset, an explicit PROCESS_TIME behaves exactly as before.
+    #[test]
+    #[serial]
+    fn expected_expiry_time_unset_debug_day_secs_matches_legacy_process_time() {
+        let mod_time = datetime!(2025-01-15 10:30:45 UTC);
+        temp_env::with_var_unset(ENV_ILM_DEBUG_DAY_SECS, || {
+            temp_env::with_var(ENV_ILM_PROCESS_TIME, Some("3600"), || {
+                temp_env::with_var_unset(ENV_ILM_PROCESS_TIME_DEPRECATED, || {
+                    assert_eq!(expected_expiry_time(mod_time, 1), datetime!(2025-01-16 11:00:00 UTC));
+                });
+            });
+        });
+    }
+
+    /// Run an async body inside a synchronous `temp_env` scope so the overridden
+    /// environment stays set across every `.await`. Uses a fresh current-thread
+    /// runtime (no outer runtime => `block_on` is safe) and keeps these tests off
+    /// the optional `async_closure` temp-env feature.
+    fn block_on_with_env<F: std::future::Future>(vars: &[(&str, Option<&str>)], fut_fn: impl FnOnce() -> F) -> F::Output {
+        temp_env::with_vars(vars, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            rt.block_on(fut_fn())
+        })
+    }
+
+    // The abort-incomplete-multipart deadline path also scales through the switch.
+    #[test]
+    #[serial]
+    fn abort_incomplete_multipart_due_scales_with_debug_day_secs() {
+        use s3s::dto::AbortIncompleteMultipartUpload;
+        let initiated = datetime!(2025-01-15 10:30:45 UTC);
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(3),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("abort-mpu".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(initiated),
+            is_latest: true,
+            ..Default::default()
+        };
+
+        block_on_with_env(
+            &[
+                (ENV_ILM_DEBUG_DAY_SECS, Some("1")),
+                (ENV_ILM_PROCESS_TIME, None),
+                (ENV_ILM_PROCESS_TIME_DEPRECATED, None),
+            ],
+            || async {
+                let (due, id) = abort_incomplete_multipart_upload_due(&lc, &opts).await.expect("due");
+                assert_eq!(due, initiated + Duration::seconds(3));
+                assert_eq!(id, "abort-mpu");
+            },
+        );
+    }
+
+    // (⑤ evaluator seam) A Days=1 rule fires under RUSTFS_ILM_DEBUG_DAY_SECS=1 once
+    // `now` advances a few seconds past a mod_time only ~seconds in the past.
+    #[test]
+    #[serial]
+    fn eval_inner_expires_days_one_rule_under_debug_day_secs() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire-days".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let mod_time = datetime!(2025-01-15 10:30:00 UTC);
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(mod_time),
+            is_latest: true,
+            ..Default::default()
+        };
+
+        block_on_with_env(
+            &[
+                (ENV_ILM_DEBUG_DAY_SECS, Some("1")),
+                (ENV_ILM_PROCESS_TIME, None),
+                (ENV_ILM_PROCESS_TIME_DEPRECATED, None),
+            ],
+            || async {
+                // Only 2s after mod_time: with a real day this would NOT be due, but a
+                // 1s day makes the Days=1 deadline (mod_time + 1s) already in the past.
+                let now = mod_time + Duration::seconds(2);
+                let event = lc.eval_inner(&opts, now, 0).await;
+                assert_eq!(event.action, IlmAction::DeleteAction);
+                assert_eq!(event.rule_id, "expire-days");
+                assert_eq!(event.due, Some(mod_time + Duration::seconds(1)));
+            },
+        );
+    }
+
+    // Absolute Date-based rules must NOT scale with the switch (regression guard).
+    #[test]
+    #[serial]
+    fn eval_inner_date_rule_ignores_debug_day_secs() {
+        let expiry_date = datetime!(2025-06-01 00:00:00 UTC);
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: Some(LifecycleExpiration {
+                    date: Some(expiry_date.into()),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire-date".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(datetime!(2025-01-15 10:30:00 UTC)),
+            is_latest: true,
+            ..Default::default()
+        };
+
+        block_on_with_env(&[(ENV_ILM_DEBUG_DAY_SECS, Some("1"))], || async {
+            // A few seconds after mod_time; the absolute June date is still far away.
+            let now = datetime!(2025-01-15 10:30:05 UTC);
+            let event = lc.eval_inner(&opts, now, 0).await;
+            assert_eq!(event.action, IlmAction::NoneAction);
         });
     }
 

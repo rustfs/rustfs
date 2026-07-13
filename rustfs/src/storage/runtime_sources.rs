@@ -22,7 +22,7 @@ use rustfs_kms::ObjectEncryptionService;
 use rustfs_lock::LockClient;
 use std::sync::Arc;
 
-pub(crate) use crate::runtime_sources::AppContext;
+pub(crate) use crate::runtime_sources::{AppContext, ServerContextSlot};
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     root_runtime_sources::current_app_context()

@@ -27,10 +27,11 @@ use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConf
 use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties, StorageInfo};
+use rustfs_utils::XHost;
 use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -71,18 +72,21 @@ impl PeerAdminCache {
 const SERVER_INFO_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 
 lazy_static! {
-    pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<NotificationSys> = OnceLock::new();
+    pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<Arc<NotificationSys>> = OnceLock::new();
 }
 
 pub async fn new_global_notification_sys(eps: EndpointServerPools) -> Result<()> {
     let _ = GLOBAL_NOTIFICATION_SYS
-        .set(NotificationSys::new(eps).await)
+        .set(Arc::new(NotificationSys::new(eps).await))
         .map_err(|_| Error::other("init notification_sys fail"));
     Ok(())
 }
 
-pub fn get_global_notification_sys() -> Option<&'static NotificationSys> {
-    GLOBAL_NOTIFICATION_SYS.get()
+// Owned handle rather than `&'static` (backlog#1052 S3): per-server contexts
+// need to hold their own notification system, which a process-lifetime
+// borrow cannot express.
+pub fn get_global_notification_sys() -> Option<Arc<NotificationSys>> {
+    GLOBAL_NOTIFICATION_SYS.get().cloned()
 }
 
 pub struct NotificationSys {
@@ -385,9 +389,13 @@ impl NotificationSys {
                     Err(_) => debug!("peer {host} server_info timed out (attempt 1/2) after {peer_timeout:?}"),
                 }
 
-                // Drop the suspect channel so the retry re-dials on a fresh
-                // connection instead of reusing the bad one.
-                client.evict_connection().await;
+                // Drop the suspect channel AND clear the offline gate so the
+                // retry actually re-dials. A network-like first failure runs
+                // through `finalize_result`, which sets the offline gate; a bare
+                // `evict_connection` would leave that gate up and the retry would
+                // fast-fail with "temporarily offline" instead of reconnecting
+                // (rustfs/backlog#1049 P1-B).
+                client.prepare_retry().await;
 
                 // Second and final attempt on the fresh channel.
                 match timeout(peer_timeout, client.server_info()).await {
@@ -1150,7 +1158,7 @@ async fn peer_disk_health(host: &str) -> Option<PeerDiskHealth> {
                 let Some(ep) = set.set_endpoints.get(idx) else {
                     continue;
                 };
-                if host != ep.host_port() {
+                if !endpoint_host_matches(host, &ep.host_port()) {
                     continue;
                 }
                 let online = match slot {
@@ -1376,7 +1384,7 @@ fn synthesized_disks(host: &str, endpoints: &EndpointServerPools, state: ItemSta
 
     for pool in endpoints.as_ref() {
         for ep in pool.endpoints.as_ref() {
-            if (host.is_empty() && ep.is_local) || host == ep.host_port() {
+            if (host.is_empty() && ep.is_local) || endpoint_host_matches(host, &ep.host_port()) {
                 disks.push(rustfs_madmin::Disk {
                     endpoint: ep.to_string(),
                     state: state.to_string().to_owned(),
@@ -1390,6 +1398,27 @@ fn synthesized_disks(host: &str, endpoints: &EndpointServerPools, state: ItemSta
     }
 
     disks
+}
+
+/// Whether `peer_host` refers to the same node as an endpoint whose
+/// `host_port()` is `ep_host_port`.
+///
+/// `PeerRestClient::host` is an `XHost`, which resolves names to an address on
+/// construction (`hosts_sorted` -> `XHost::try_from` -> `to_socket_addrs`), so
+/// `peer_host` is the resolved `IP:port`. An endpoint's `host_port()`, however,
+/// is `url.host():port` — still the raw `hostname:port` on hostname-based
+/// deployments. A plain string compare therefore misses on hostname clusters,
+/// leaving the synthesized/degraded drive list empty and `unknownDisks` at 0
+/// (rustfs/rustfs#4607 follow-up). Compare directly first (fast path / IP
+/// deployments), then canonicalize the endpoint side through the same `XHost`
+/// resolution and compare again.
+fn endpoint_host_matches(peer_host: &str, ep_host_port: &str) -> bool {
+    if peer_host == ep_host_port {
+        return true;
+    }
+    XHost::try_from(ep_host_port.to_string())
+        .map(|resolved| resolved.to_string() == peer_host)
+        .unwrap_or(false)
 }
 
 fn aggregate_notification_failures(operation: &str, failures: Vec<String>) -> Result<()> {
@@ -1699,6 +1728,29 @@ mod tests {
             .checked_sub(SERVER_INFO_CACHE_MAX_AGE + Duration::from_secs(1))
             .expect("test clock underflow");
         assert!(!cached_snapshot_is_fresh(Some(stale)), "an old success is stale");
+    }
+
+    #[test]
+    fn endpoint_host_matches_direct_and_canonicalized() {
+        // Direct match (IP deployment): peer host already equals host_port.
+        assert!(endpoint_host_matches("10.0.0.12:9000", "10.0.0.12:9000"));
+        // Different IPs must not match.
+        assert!(!endpoint_host_matches("10.0.0.12:9000", "10.0.0.99:9000"));
+
+        // Hostname deployment: `PeerRestClient::host` is the resolved `IP:port`,
+        // the endpoint keeps the raw `hostname:port`. Resolve "localhost" the
+        // same way `XHost` does (avoids depending on external DNS) and confirm
+        // the canonical compare matches — the regression this fixes is the
+        // synthesized/degraded drive list going empty on hostname clusters.
+        let resolved = XHost::try_from("localhost:9000".to_string())
+            .expect("localhost should resolve")
+            .to_string();
+        assert!(
+            endpoint_host_matches(&resolved, "localhost:9000"),
+            "resolved localhost ({resolved}) must match the hostname endpoint"
+        );
+        // A resolved address that is not localhost must not match.
+        assert!(!endpoint_host_matches("203.0.113.1:9000", "localhost:9000"));
     }
 
     #[test]

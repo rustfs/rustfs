@@ -12,15 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::OnceLock;
 use std::time::Duration;
 use sysinfo::{RefreshKind, System};
 
-// Import TelemetryGuard from rustfs_obs re-export
-use rustfs_obs::dial9::TelemetryGuard;
-
-// Global storage for TelemetryGuard to keep it alive for the program duration
-static DIAL9_TELEMETRY_GUARD: OnceLock<TelemetryGuard> = OnceLock::new();
+use rustfs_obs::dial9::Dial9SessionGuard;
 
 #[inline]
 fn compute_default_thread_stack_size() -> usize {
@@ -166,56 +161,43 @@ fn print_tokio_thread_enable() -> bool {
     rustfs_utils::get_env_bool(rustfs_config::ENV_THREAD_PRINT_ENABLED, rustfs_config::DEFAULT_THREAD_PRINT_ENABLED)
 }
 
-/// Build Tokio runtime with optional dial9 telemetry support.
+/// Build the Tokio runtime, attaching dial9 telemetry when it is enabled.
 ///
-/// If dial9 is enabled via environment variables, creates a TracedRuntime
-/// and stores the TelemetryGuard globally to keep it alive for the
-/// duration of the program.
+/// The returned [`Dial9SessionGuard`] owns the telemetry session. It **must**
+/// be dropped before the process exits: dropping it flushes buffered events and
+/// seals the final trace segment. Parking it in a `static` would mean it is
+/// never dropped and the last events — usually the ones that explain a stall —
+/// are lost.
+///
+/// When telemetry is requested but cannot be built, this falls back to a
+/// standard runtime and returns `None` for the guard rather than failing
+/// startup. The `rustfs_dial9_active_sessions` metric reports that outcome.
 ///
 /// # Returns
 ///
-/// * `Ok(runtime)` - Successfully created runtime
-/// * `Err(e)` - Failed to create runtime
+/// The runtime, plus `Some(guard)` when a telemetry session is recording.
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - The Tokio runtime builder fails
-/// - Dial9 is enabled but fails to initialize (falls back to standard runtime)
-///
-/// # Examples
-///
-/// ```no_run
-/// // build_tokio_runtime is pub(crate) - call it from within the rustfs binary:
-/// // let runtime = build_tokio_runtime().expect("Failed to build runtime");
-/// // runtime.block_on(async { /* ... */ })
-/// ```
-pub fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildError> {
-    let mut builder = tokio_runtime_builder();
-
-    // Check if dial9 is enabled
-    if rustfs_obs::dial9::is_enabled() {
-        tracing::info!("Dial9 telemetry enabled, building TracedRuntime");
-
-        return match rustfs_obs::dial9::build_traced_runtime(builder) {
-            Ok((runtime, guard)) => {
-                // Store guard in global static to keep it alive for the program duration
-                let _ = DIAL9_TELEMETRY_GUARD.set(guard);
-                tracing::info!("TracedRuntime created successfully, guard stored globally");
-                Ok(runtime)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to build TracedRuntime: {}", e);
-                tracing::warn!("Falling back to standard Tokio runtime");
-                // Rebuild the builder for standard runtime
-                let mut builder = tokio_runtime_builder();
-                builder.build().map_err(BuildError::Runtime)
-            }
-        };
+/// Returns [`BuildError::Runtime`] if the Tokio runtime builder itself fails.
+pub fn build_tokio_runtime() -> Result<(tokio::runtime::Runtime, Option<Dial9SessionGuard>), BuildError> {
+    if !rustfs_obs::dial9::is_enabled() {
+        let runtime = tokio_runtime_builder().build().map_err(BuildError::Runtime)?;
+        return Ok((runtime, None));
     }
 
-    // Standard runtime
-    builder.build().map_err(BuildError::Runtime)
+    tracing::info!("Dial9 telemetry enabled, building TracedRuntime");
+    match rustfs_obs::dial9::build_traced_runtime(tokio_runtime_builder()) {
+        Ok((runtime, guard)) => {
+            tracing::info!("TracedRuntime created and recording");
+            Ok((runtime, Some(guard)))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to build TracedRuntime: {e}; falling back to standard Tokio runtime");
+            let runtime = tokio_runtime_builder().build().map_err(BuildError::Runtime)?;
+            Ok((runtime, None))
+        }
+    }
 }
 
 /// Error type for runtime building failures.

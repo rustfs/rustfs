@@ -20,9 +20,9 @@ use crate::disk::error::DiskError;
 use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
+use crate::runtime::instance::{InstanceContext, bootstrap_ctx};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
-use crate::store::all_local_disk;
 use crate::store::utils::is_reserved_or_invalid_bucket;
 use crate::{
     disk::{
@@ -93,19 +93,30 @@ pub struct S3PeerSys {
 
 impl S3PeerSys {
     pub fn new(eps: &EndpointServerPools) -> Self {
+        Self::new_with_instance_ctx(eps, bootstrap_ctx())
+    }
+
+    /// Build the peer system bound to an explicit instance context
+    /// (backlog#1052 S7): the local peer client operates on that instance's
+    /// disks. [`S3PeerSys::new`] keeps the ambient bootstrap default.
+    pub fn new_with_instance_ctx(eps: &EndpointServerPools, instance_ctx: Arc<InstanceContext>) -> Self {
         Self {
-            clients: Self::new_clients(eps),
+            clients: Self::new_clients(eps, instance_ctx),
             pools_count: eps.as_ref().len(),
         }
     }
 
-    fn new_clients(eps: &EndpointServerPools) -> Vec<Client> {
+    fn new_clients(eps: &EndpointServerPools, instance_ctx: Arc<InstanceContext>) -> Vec<Client> {
         let nodes = eps.get_nodes();
         let v: Vec<Client> = nodes
             .iter()
             .map(|e| {
                 if e.is_local {
-                    let cli: Box<dyn PeerS3Client> = Box::new(LocalPeerS3Client::new(Some(e.clone()), Some(e.pools.clone())));
+                    let cli: Box<dyn PeerS3Client> = Box::new(LocalPeerS3Client::new_with_instance_ctx(
+                        Some(e.clone()),
+                        Some(e.pools.clone()),
+                        instance_ctx.clone(),
+                    ));
                     Arc::new(cli)
                 } else {
                     let cli: Box<dyn PeerS3Client> = Box::new(RemotePeerS3Client::new(Some(e.clone()), Some(e.pools.clone())));
@@ -384,15 +395,24 @@ pub struct LocalPeerS3Client {
     local_disks: Option<Vec<DiskStore>>,
     // pub node: Node,
     pub pools: Option<Vec<usize>>,
+    /// The owning store's runtime context (backlog#1052 S7): local bucket
+    /// operations list/create/delete on THIS instance's registered disks, not
+    /// on whatever the ambient process default resolves to.
+    instance_ctx: Arc<InstanceContext>,
 }
 
 impl LocalPeerS3Client {
-    pub fn new(_node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
+    pub fn new(node: Option<Node>, pools: Option<Vec<usize>>) -> Self {
+        Self::new_with_instance_ctx(node, pools, bootstrap_ctx())
+    }
+
+    pub fn new_with_instance_ctx(_node: Option<Node>, pools: Option<Vec<usize>>, instance_ctx: Arc<InstanceContext>) -> Self {
         Self {
             #[cfg(test)]
             local_disks: None,
             // node,
             pools,
+            instance_ctx,
         }
     }
 
@@ -401,6 +421,7 @@ impl LocalPeerS3Client {
         Self {
             local_disks: Some(local_disks),
             pools,
+            instance_ctx: bootstrap_ctx(),
         }
     }
 
@@ -409,10 +430,10 @@ impl LocalPeerS3Client {
         let local_disks = if let Some(local_disks) = self.local_disks.as_ref() {
             local_disks.clone()
         } else {
-            all_local_disk().await
+            runtime_sources::local_disks_in(&self.instance_ctx).await
         };
         #[cfg(not(test))]
-        let local_disks = all_local_disk().await;
+        let local_disks = runtime_sources::local_disks_in(&self.instance_ctx).await;
         let Some(pools) = self.pools.as_ref() else {
             return local_disks;
         };

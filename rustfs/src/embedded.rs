@@ -40,12 +40,13 @@
 //! }
 //! ```
 //!
-//! # Limitations
+//! # Multi-instance support
 //!
-//! Only **one `RustFSServer`** may exist per process because the underlying
-//! storage engine uses process-global singletons (`OnceLock`). Attempting to
-//! start a second server will return an error. Removing this limitation is
-//! tracked in [backlog#1052](https://github.com/rustfs/backlog/issues/1052).
+//! Multiple `RustFSServer`s may coexist in one process on different ports and
+//! volumes (backlog#1052). Each server is fully isolated: its own storage
+//! layer, request-path dispatch, root credentials, IAM domain, and bucket
+//! namespace. Two servers with different credentials each authenticate their
+//! own clients, and neither can see the other's buckets or objects.
 
 use crate::server::ShutdownHandle;
 use crate::startup_embedded::{EmbeddedStartedServer, EmbeddedStartupArgs, EmbeddedStartupError, run_embedded_startup};
@@ -205,9 +206,10 @@ impl RustFSServerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError::AlreadyStarted`] if another server is already
-    /// running in this process, or if another startup attempt has already
-    /// entered irreversible global initialization.
+    /// Returns [`ServerError::AlreadyStarted`] only if another startup is
+    /// currently mid-flight in this process (the guard now serializes
+    /// concurrent startups instead of rejecting the second server). After the
+    /// first server finishes starting, subsequent servers are allowed.
     pub async fn build(self) -> Result<RustFSServer, ServerError> {
         self.do_build().await
     }

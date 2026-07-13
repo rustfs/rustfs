@@ -115,18 +115,29 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # ============================================================================
 # dial9 Tokio Runtime Telemetry Configuration
 # ============================================================================
-# dial9 provides low-overhead Tokio runtime-level telemetry for performance diagnostics.
-# It captures events like PollStart/End, WorkerPark/Unpark, QueueSample, TaskSpawn.
+# dial9 captures Tokio runtime-level events (poll start/end, worker park/unpark,
+# task spawn/terminate) into binary trace segments. It sees long polls that stall
+# a worker — something request-level metrics and spans cannot show.
 #
-# Features:
-# - CPU overhead < 5% (with sampling rate 1.0)
-# - Automatic file rotation (configurable size and count)
-# - Graceful degradation if initialization fails
+# It does NOT see a drive stall: RustFS does its disk I/O on the blocking pool
+# and via io_uring, never on an async worker, so a slow drive does not lengthen
+# any poll. Measured: injecting 200ms of drive latency cut throughput by 64% and
+# left the poll-duration distribution unchanged.
 #
-# Note: Disabled by default. Enable only when needed for runtime diagnostics.
-# Note: Requires build flag --cfg tokio_unstable (set in .cargo/config.toml).
+# This is an on-demand profiler, not always-on telemetry:
+#
+# - The stock binary does NOT support it. Build with `make build-profiling`,
+#   which enables the `dial9` feature and `--cfg tokio_unstable`. Setting the
+#   variables below on a stock binary logs a warning and changes nothing.
+# - Trace segments are written continuously, and the oldest are deleted once
+#   MAX_FILE_SIZE * ROTATION_COUNT bytes are retained. Measured at ~0.16 MiB/s
+#   under a 66 MiB/s warp workload, so the default 1 GiB budget wraps after
+#   roughly 108 minutes. Scale that by your event rate.
+# - Turn it off again when the investigation is over.
+#
+# See docs/operations/dial9-runtime-profiling.md.
 
-# Enable dial9 telemetry (default: false)
+# Enable dial9 telemetry (default: false; requires a `make build-profiling` binary)
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 
 # Output directory for trace files (default: /var/log/rustfs/telemetry)
@@ -138,33 +149,25 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # Maximum trace file size in bytes (default: 104857600 = 100MB)
 #export RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE=104857600
 
-# Number of rotated files to keep (default: 10)
+# Number of rotated files to keep (default: 10). Total disk budget is
+# MAX_FILE_SIZE * ROTATION_COUNT; older segments are evicted, not kept.
 #export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=10
 
-# Sampling rate: 0.0 to 1.0 (default: 1.0 = 100% sampling)
-# Lower values reduce CPU overhead. Recommended: 0.1-0.5 for production.
-#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
-
-# S3 upload settings (not yet implemented; reserved for future use):
+# S3 upload is NOT available: dial9's uploader depends on a rustls-webpki with
+# known CVEs, so the feature is not built. These are parsed and warned about,
+# never honoured. Collect segments from OUTPUT_DIR instead.
 #export RUSTFS_RUNTIME_DIAL9_S3_BUCKET=my-trace-bucket
 #export RUSTFS_RUNTIME_DIAL9_S3_PREFIX=telemetry/
 
-# --- Scenario 1: Development / Debugging ---
-# Full tracing with local storage, high sampling rate
+# --- Scenario 1: local development ---
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 #export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR="$current_dir/deploy/telemetry"
-#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
 
-# --- Scenario 2: Production Diagnostics ---
-# Reduced sampling rate to minimize overhead
-#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
-#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=0.1
-
-# --- Scenario 3: Performance Investigation ---
-# Short-term tracing with high detail, manual cleanup
+# --- Scenario 2: investigating a worker stall ---
+# Trace shows which task held a worker and for how long, but not where it was
+# stuck: task dumps need dial9's own spawner (see backlog#1157 D9-16).
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 #export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR=/tmp/rustfs-telemetry-investigation
-#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
 #export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=3
 
 export OTEL_INSTRUMENTATION_NAME="rustfs"

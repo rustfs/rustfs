@@ -43,7 +43,7 @@ use uuid::Uuid;
 use xxhash_rust::xxh64;
 
 // XL header specifies the format
-pub static XL_FILE_HEADER: [u8; 4] = [b'X', b'L', b'2', b' '];
+pub static XL_FILE_HEADER: [u8; 4] = *b"XL2 ";
 // pub static XL_FILE_VERSION_CURRENT: [u8; 4] = [0; 4];
 
 // Current version being written.

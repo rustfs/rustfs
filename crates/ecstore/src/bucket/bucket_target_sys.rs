@@ -78,7 +78,6 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
-const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
 const REDACTED_CREDENTIAL: &str = "<redacted>";
 
@@ -335,7 +334,9 @@ impl BucketTargetSys {
     }
 
     pub async fn heartbeat(&self) {
-        let mut interval = tokio::time::interval(DEFAULT_HEALTH_CHECK_DURATION);
+        // Probe interval: `RUSTFS_REPL_HEALTH_CHECK_INTERVAL_MS` (default 5000ms,
+        // clamped to >=10ms), read once when the heartbeat task starts.
+        let mut interval = tokio::time::interval(crate::bucket::replication::replication_timing::health_check_interval());
         loop {
             interval.tick().await;
 
@@ -965,13 +966,37 @@ fn has_custom_ca_pem(target: &BucketTarget) -> bool {
     !target.ca_cert_pem.trim().is_empty()
 }
 
+/// Env opt-in that re-enables loopback replication targets. Loopback (`127.0.0.1`,
+/// `::1`, `localhost`) is a classic SSRF vector and stays rejected by default, but
+/// single-host multi-instance dev setups and the e2e harness legitimately replicate
+/// over loopback. Never set this in production.
+const ALLOW_LOOPBACK_REPLICATION_TARGET_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
+
+fn loopback_replication_targets_allowed() -> bool {
+    std::env::var(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
 fn validate_replication_target_endpoint(url: &Url) -> Result<(), OutboundUrlError> {
+    validate_replication_target_endpoint_inner(url, loopback_replication_targets_allowed())
+}
+
+fn validate_replication_target_endpoint_inner(url: &Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
     match validate_outbound_url(url) {
         Ok(()) => Ok(()),
+        // Replication targets are trusted infrastructure the operator configures, and
+        // legitimately live on private networks, so private addresses are always allowed.
         Err(OutboundUrlError::ForbiddenHost {
             reason: "private address",
             ..
         }) => Ok(()),
+        // Loopback is far higher SSRF risk, so it is allowed only under the explicit,
+        // off-by-default opt-in above (single-host multi-instance / the e2e harness).
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "loopback address" | "loopback host",
+            ..
+        }) if allow_loopback => Ok(()),
         Err(err) => Err(err),
     }
 }
@@ -1903,6 +1928,76 @@ mod tests {
         assert!(replication_target_versioning_enabled(Some(&enabled)));
         assert!(!replication_target_versioning_enabled(Some(&suspended)));
         assert!(!replication_target_versioning_enabled(None));
+    }
+
+    fn parse_url(raw: &str) -> Url {
+        Url::parse(raw).expect("test URL should parse")
+    }
+
+    #[test]
+    fn replication_endpoint_always_allows_public_and_private() {
+        // Public hosts and private-network targets are allowed regardless of the
+        // loopback opt-in — replication commonly runs across trusted private infra.
+        for allow_loopback in [false, true] {
+            assert!(validate_replication_target_endpoint_inner(&parse_url("https://s3.example.com"), allow_loopback).is_ok());
+            assert!(validate_replication_target_endpoint_inner(&parse_url("http://10.0.0.5:9000"), allow_loopback).is_ok());
+            assert!(validate_replication_target_endpoint_inner(&parse_url("http://192.168.1.20"), allow_loopback).is_ok());
+        }
+    }
+
+    #[test]
+    fn replication_endpoint_rejects_loopback_without_opt_in() {
+        // Default (production) behaviour: loopback IP and localhost host both rejected.
+        let err = validate_replication_target_endpoint_inner(&parse_url("http://127.0.0.1:9000"), false)
+            .expect_err("loopback IP must be rejected by default");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "loopback address",
+                ..
+            }
+        ));
+        let err = validate_replication_target_endpoint_inner(&parse_url("http://localhost:9000"), false)
+            .expect_err("localhost must be rejected by default");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "loopback host",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replication_endpoint_allows_loopback_with_opt_in() {
+        // e2e harness / single-host multi-instance: opt-in re-enables loopback in
+        // both IP (127.0.0.1, ::1) and hostname (localhost) forms.
+        assert!(validate_replication_target_endpoint_inner(&parse_url("http://127.0.0.1:9000"), true).is_ok());
+        assert!(validate_replication_target_endpoint_inner(&parse_url("http://[::1]:9000"), true).is_ok());
+        assert!(validate_replication_target_endpoint_inner(&parse_url("http://localhost:9000"), true).is_ok());
+    }
+
+    #[test]
+    fn replication_endpoint_opt_in_does_not_open_other_ssrf_targets() {
+        // The loopback opt-in must not widen into link-local / metadata endpoints.
+        let err = validate_replication_target_endpoint_inner(&parse_url("http://169.254.169.254/latest/meta-data"), true)
+            .expect_err("metadata endpoint must stay rejected even with loopback opt-in");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "metadata endpoint",
+                ..
+            }
+        ));
+        let err = validate_replication_target_endpoint_inner(&parse_url("http://[fe80::1]:9000"), true)
+            .expect_err("link-local must stay rejected even with loopback opt-in");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "link-local address",
+                ..
+            }
+        ));
     }
 
     #[test]

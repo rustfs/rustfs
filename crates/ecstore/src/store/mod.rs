@@ -20,7 +20,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
 };
-use crate::bucket::metadata_sys::{self, set_bucket_metadata};
+use crate::bucket::metadata_sys;
 use crate::bucket::utils::check_abort_multipart_args;
 use crate::bucket::utils::check_complete_multipart_args;
 use crate::bucket::utils::check_copy_obj_args;
@@ -242,7 +242,7 @@ impl ECStore {
 /// service singletons. The globals remain the source of truth.
 impl ECStore {
     /// Get the notification system
-    pub fn notification_system(&self) -> Option<&'static crate::services::notification_sys::NotificationSys> {
+    pub fn notification_system(&self) -> Option<std::sync::Arc<crate::services::notification_sys::NotificationSys>> {
         runtime_sources::notification_sys()
     }
 
@@ -865,7 +865,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             disk_map: std::collections::HashMap::new(),
             pools: Vec::new(),
-            peer_sys: crate::cluster::rpc::S3PeerSys::new(&endpoint_pools),
+            peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, ctx.clone()),
             pool_meta: RwLock::new(PoolMeta::default()),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),

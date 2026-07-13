@@ -14,13 +14,14 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::current_object_store_handle;
+use crate::admin::runtime_sources::{object_store_from_extensions, object_store_from_req};
 use crate::admin::storage_api::access::spawn_traced;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
 use crate::admin::storage_api::contract::heal::HealOperations as _;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
+use crate::startup_background::{heal_enabled_from_env, scanner_enabled_from_env};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
@@ -203,11 +204,39 @@ struct HealTaskStatus {
 struct BackgroundHealStatus<'a> {
     #[serde(flatten)]
     info: &'a BackgroundHealInfo,
+    state: HealRuntimeState,
     heal_queue_length: u64,
     heal_active_tasks: u64,
     heal_operations: rustfs_heal::HealOperationsSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     progress: Option<BackgroundHealProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum HealRuntimeState {
+    Disabled,
+    Uninitialized,
+    Idle,
+    Active,
+}
+
+fn background_heal_runtime_state(
+    services_enabled: bool,
+    initialized: bool,
+    operations: &rustfs_heal::HealOperationsSnapshot,
+) -> HealRuntimeState {
+    if !services_enabled {
+        return HealRuntimeState::Disabled;
+    }
+    if !initialized {
+        return HealRuntimeState::Uninitialized;
+    }
+    if operations.queue_length > 0 || operations.active_tasks > 0 {
+        HealRuntimeState::Active
+    } else {
+        HealRuntimeState::Idle
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -366,11 +395,13 @@ fn heal_channel_response_progress(response: &rustfs_common::heal_channel::HealCh
 
 fn encode_background_heal_status(
     info: &BackgroundHealInfo,
+    state: HealRuntimeState,
     heal_operations: rustfs_heal::HealOperationsSnapshot,
     progress: Option<BackgroundHealProgress>,
 ) -> S3Result<Vec<u8>> {
     let status = BackgroundHealStatus {
         info,
+        state,
         heal_queue_length: heal_operations.queue_length,
         heal_active_tasks: heal_operations.active_tasks,
         heal_operations,
@@ -500,7 +531,7 @@ impl Operation for HealHandler {
         // The heal channel currently models bucket/object work. Root heal reuses the
         // existing format-heal path directly so `/v3/heal/` is accepted intentionally.
         if should_handle_root_heal_directly(&hip) {
-            let Some(store) = current_object_store_handle() else {
+            let Some(store) = object_store_from_extensions(&req.extensions) else {
                 warn!(
                     event = EVENT_ADMIN_REQUEST_FAILED,
                     component = LOG_COMPONENT_ADMIN_API,
@@ -736,7 +767,7 @@ impl Operation for BackgroundHealStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_heal_admin_request(&req).await?;
 
-        let Some(store) = current_object_store_handle() else {
+        let Some(store) = object_store_from_req(&req) else {
             warn!(
                 event = EVENT_ADMIN_REQUEST_FAILED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -751,10 +782,15 @@ impl Operation for BackgroundHealStatusHandler {
 
         let info = read_background_heal_info(store).await;
         let heal_operations = rustfs_heal::current_heal_operations_snapshot().await;
+        let state = background_heal_runtime_state(
+            scanner_enabled_from_env() || heal_enabled_from_env(),
+            rustfs_heal::heal_runtime_initialized(),
+            &heal_operations,
+        );
         let progress = rustfs_heal::current_heal_progress_snapshot()
             .await
             .map(BackgroundHealProgress::from);
-        let body = encode_background_heal_status(&info, heal_operations, progress)?;
+        let body = encode_background_heal_status(&info, state, heal_operations, progress)?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
             component = LOG_COMPONENT_ADMIN_API,
@@ -772,10 +808,11 @@ impl Operation for BackgroundHealStatusHandler {
 mod tests {
     use super::extract_heal_init_params;
     use super::{
-        BackgroundHealProgress, HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status,
-        encode_heal_start_success, encode_heal_task_status, heal_channel_response_items, heal_channel_response_progress,
-        heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status, should_handle_root_heal_directly,
-        validate_heal_request_mode, validate_heal_target,
+        BackgroundHealProgress, HealInitParams, HealResp, HealRuntimeState, background_heal_runtime_state,
+        build_heal_channel_request, encode_background_heal_status, encode_heal_start_success, encode_heal_task_status,
+        heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary, json_response,
+        map_heal_response, map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode,
+        validate_heal_target,
     };
     use crate::admin::storage_api::error::StorageError;
     use bytes::Bytes;
@@ -1225,7 +1262,8 @@ mod tests {
             ..Default::default()
         };
 
-        let encoded = encode_background_heal_status(&info, operations, None).expect("background heal info should serialize");
+        let encoded = encode_background_heal_status(&info, HealRuntimeState::Active, operations, None)
+            .expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
         assert_eq!(json["bitrotStartCycle"], 42);
@@ -1239,6 +1277,7 @@ mod tests {
         assert!(json["healOperations"]["queuedBySource"]["admin"].is_u64());
         assert!(json["healOperations"]["queuedByPriority"]["low"].is_u64());
         assert!(json["healOperations"]["queuedByPriority"]["high"].is_u64());
+        assert_eq!(json["state"], "active");
         assert!(json["progress"].is_null());
     }
 
@@ -1257,14 +1296,34 @@ mod tests {
             bytes_processed: 4096,
         };
 
-        let encoded = encode_background_heal_status(&info, rustfs_heal::HealOperationsSnapshot::default(), Some(progress))
-            .expect("background heal info should serialize");
+        let encoded = encode_background_heal_status(
+            &info,
+            HealRuntimeState::Idle,
+            rustfs_heal::HealOperationsSnapshot::default(),
+            Some(progress),
+        )
+        .expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
         assert_eq!(json["progress"]["objectsScanned"], 7);
         assert_eq!(json["progress"]["objectsHealed"], 3);
         assert_eq!(json["progress"]["objectsFailed"], 1);
         assert_eq!(json["progress"]["bytesProcessed"], 4096);
+    }
+
+    #[test]
+    fn test_background_heal_runtime_state_distinguishes_disabled_and_uninitialized() {
+        let operations = rustfs_heal::HealOperationsSnapshot::default();
+
+        assert_eq!(background_heal_runtime_state(false, false, &operations), HealRuntimeState::Disabled);
+        assert_eq!(background_heal_runtime_state(true, false, &operations), HealRuntimeState::Uninitialized);
+        assert_eq!(background_heal_runtime_state(true, true, &operations), HealRuntimeState::Idle);
+
+        let active = rustfs_heal::HealOperationsSnapshot {
+            active_tasks: 1,
+            ..operations
+        };
+        assert_eq!(background_heal_runtime_state(true, true, &active), HealRuntimeState::Active);
     }
 
     #[test]

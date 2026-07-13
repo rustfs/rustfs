@@ -172,6 +172,10 @@ pub struct ObjectInfo {
     pub parity_blocks: usize,
     pub data_blocks: usize,
     pub version_id: Option<Uuid>,
+    /// xl.meta directory UUID for this version, regenerated on every body write.
+    /// A write-unique token: the object data cache keys on it so an overwrite
+    /// cannot be served the previous body under an MD5 collision (backlog#1111).
+    pub data_dir: Option<Uuid>,
     pub delete_marker: bool,
     pub transitioned_object: TransitionedObject,
     pub restore_ongoing: bool,
@@ -211,6 +215,7 @@ impl Clone for ObjectInfo {
             parity_blocks: self.parity_blocks,
             data_blocks: self.data_blocks,
             version_id: self.version_id,
+            data_dir: self.data_dir,
             delete_marker: self.delete_marker,
             transitioned_object: self.transitioned_object.clone(),
             restore_ongoing: self.restore_ongoing,
@@ -515,6 +520,7 @@ impl ObjectInfo {
             parity_blocks: fi.erasure.parity_blocks,
             data_blocks: fi.erasure.data_blocks,
             version_id,
+            data_dir: fi.data_dir,
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
             size: fi.size,
@@ -884,6 +890,25 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version_id, None);
         assert_eq!(versions[1].version_id, Some(last_version));
+    }
+
+    #[test]
+    fn versions_after_marker_preserves_stale_marker_compatibility() {
+        let existing_version =
+            Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("existing version UUID should parse");
+        let deleted_marker = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("delete marker UUID should parse");
+        let file_infos = rustfs_filemeta::FileInfoVersions {
+            versions: vec![FileInfo {
+                version_id: Some(existing_version),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let versions = versions_after_marker(&file_infos, VersionMarker::Version(deleted_marker));
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id, Some(existing_version));
     }
 
     #[tokio::test]

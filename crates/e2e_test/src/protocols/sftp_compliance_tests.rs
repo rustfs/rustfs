@@ -192,6 +192,7 @@ pub(crate) async fn spawn_compliance_rustfs(
         .to_str()
         .ok_or_else(|| anyhow!("host key dir path is not utf-8: {}", host_key_dir.display()))?;
     let child = Command::new(&binary_path)
+        .env(ENV_CONSOLE_ENABLE, "false")
         .env(ENV_SFTP_ENABLE, "true")
         .env(ENV_SFTP_ADDRESS, sftp_address)
         .env(ENV_SFTP_HOST_KEY_DIR, host_key_dir_str)

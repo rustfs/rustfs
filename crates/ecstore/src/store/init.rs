@@ -339,7 +339,7 @@ impl ECStore {
             runtime_sources::record_local_disks(&instance_ctx, local_disks).await;
         }
 
-        let peer_sys = S3PeerSys::new(&endpoint_pools);
+        let peer_sys = S3PeerSys::new_with_instance_ctx(&endpoint_pools, instance_ctx.clone());
         let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
         pool_meta.dont_save = true;
 
@@ -572,6 +572,7 @@ mod tests {
                 stream: Box::new(Cursor::new(self.read_payload.clone())),
                 object_info: self.object_info(bucket, object, self.read_payload.len()),
                 buffered_body: None,
+                body_source: Default::default(),
             })
         }
 
@@ -783,17 +784,13 @@ mod tests {
         );
     }
 
-    // Phase 5 follow-up (backlog#1052): building a real store through the
-    // ctx-explicit constructor lands every construction-time write — object
-    // graph adoption, local-disk registry, deployment id — on the passed
-    // context, not on the process bootstrap one. This is the storage-layer
-    // seam a future second embedded server needs to stay isolated.
-    #[tokio::test]
-    async fn new_with_instance_ctx_threads_context_through_store_graph() {
-        use crate::runtime::instance::InstanceContext;
-
-        let temp_dir = tempfile::tempdir().expect("create temp store dir");
-        let disk_paths: Vec<_> = (1..=4).map(|i| temp_dir.path().join(format!("disk{i}"))).collect();
+    // Build a real 4-drive store over a temp dir around a fresh instance
+    // context — shared by the isolation tests below.
+    async fn build_isolated_test_store(
+        temp_dir: &std::path::Path,
+        cmd_line: &str,
+    ) -> (Arc<crate::runtime::instance::InstanceContext>, Arc<crate::store::ECStore>) {
+        let disk_paths: Vec<_> = (1..=4).map(|i| temp_dir.join(format!("disk{i}"))).collect();
         for path in &disk_paths {
             tokio::fs::create_dir_all(path).await.expect("create disk dir");
         }
@@ -811,11 +808,11 @@ mod tests {
             set_count: 1,
             drives_per_set: 4,
             endpoints: Endpoints::from(endpoints),
-            cmd_line: "instance-ctx-store-graph-test".to_string(),
+            cmd_line: cmd_line.to_string(),
             platform: "test".to_string(),
         }]);
 
-        let instance_ctx = Arc::new(InstanceContext::new());
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         crate::store::init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
             .await
             .expect("register local disks into the fresh context");
@@ -828,6 +825,19 @@ mod tests {
         )
         .await
         .expect("store should build around the fresh context");
+
+        (instance_ctx, store)
+    }
+
+    // Phase 5 follow-up (backlog#1052): building a real store through the
+    // ctx-explicit constructor lands every construction-time write — object
+    // graph adoption, local-disk registry, deployment id — on the passed
+    // context, not on the process bootstrap one. This is the storage-layer
+    // seam a future second embedded server needs to stay isolated.
+    #[tokio::test]
+    async fn new_with_instance_ctx_threads_context_through_store_graph() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (instance_ctx, store) = build_isolated_test_store(temp_dir.path(), "instance-ctx-store-graph-test").await;
 
         assert!(
             Arc::ptr_eq(&store.ctx, &instance_ctx),
@@ -861,5 +871,29 @@ mod tests {
                 "the bootstrap context must not absorb the fresh store's disks"
             );
         }
+    }
+
+    // backlog#1052 S3: two stores in one process each initialize their own
+    // bucket metadata system on their own instance context. Before this, the
+    // second `init_bucket_metadata_sys` panicked on the process-global
+    // OnceLock — the hard blocker for a second embedded server's services.
+    #[tokio::test]
+    async fn two_stores_initialize_their_own_bucket_metadata_sys() {
+        let temp_a = tempfile::tempdir().expect("create temp store dir a");
+        let temp_b = tempfile::tempdir().expect("create temp store dir b");
+        let (ctx_a, store_a) = build_isolated_test_store(temp_a.path(), "bucket-metadata-isolation-a").await;
+        let (ctx_b, store_b) = build_isolated_test_store(temp_b.path(), "bucket-metadata-isolation-b").await;
+
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
+        // The old process-global cell would panic right here.
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store_b.clone(), Vec::new()).await;
+
+        let sys_a = ctx_a
+            .bucket_metadata_sys()
+            .expect("store A's context must hold its metadata system");
+        let sys_b = ctx_b
+            .bucket_metadata_sys()
+            .expect("store B's context must hold its metadata system");
+        assert!(!Arc::ptr_eq(&sys_a, &sys_b), "each store must own a distinct bucket metadata system");
     }
 }

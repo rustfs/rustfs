@@ -19,6 +19,11 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+/// Background walks skip the total timeout, so the per-read stall budget is what
+/// catches a drive that stops answering. Keep it generous: rebalance is not
+/// latency-sensitive, and one slow read is not a dead drive.
+const BACKGROUND_WALKDIR_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(super) fn resolve_rebalance_worker_result<T>(
     set_idx: usize,
     worker_result: std::result::Result<Result<T>, tokio::task::JoinError>,
@@ -490,6 +495,7 @@ impl SetDisks {
                 recursive: true,
                 min_disks: listing_quorum,
                 skip_walkdir_total_timeout: true,
+                walkdir_stall_timeout: Some(BACKGROUND_WALKDIR_STALL_TIMEOUT),
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     debug!(
                         event = EVENT_REBALANCE_LISTING,

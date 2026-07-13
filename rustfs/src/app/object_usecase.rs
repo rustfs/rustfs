@@ -179,7 +179,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -200,13 +200,14 @@ use crate::app::object_data_cache::{
     fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
     invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
-    invalidate_object_data_cache_objects_before_mutation, lookup_get_object_body_cache_hit,
+    invalidate_object_data_cache_objects_before_mutation, invalidate_object_data_cache_prefix_after_delete,
+    invalidate_object_data_cache_prefix_before_mutation, lookup_get_object_body_cache_hit,
 };
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
-const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+pub(crate) const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
 const MEDIUM_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
 const HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
 const VERY_HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 1024 * 1024;
@@ -337,6 +338,12 @@ struct GetObjectReadSetup {
     info: ObjectInfo,
     final_stream: DynReader,
     buffered_body: Option<Bytes>,
+    /// ODC-16: `buffered_body` is the body the ecstore cache hook served, so the
+    /// app layer serves it as the object-data-cache source without a re-lookup.
+    cache_hook_served: bool,
+    /// ODC-16: the cache hook probed this read (served or missed), so the app
+    /// layer must skip its own lookup.
+    cache_hook_probed: bool,
     rs: Option<HTTPRangeSpec>,
     content_type: Option<ContentType>,
     last_modified: Option<Timestamp>,
@@ -1497,7 +1504,7 @@ where
     Ok(ChunkedBytesReader::new(chunks))
 }
 
-fn object_seek_support_threshold() -> usize {
+pub(crate) fn object_seek_support_threshold() -> usize {
     static OBJECT_SEEK_SUPPORT_THRESHOLD: OnceLock<usize> = OnceLock::new();
     *OBJECT_SEEK_SUPPORT_THRESHOLD.get_or_init(|| {
         rustfs_utils::get_env_usize(
@@ -2315,6 +2322,57 @@ async fn resolve_put_object_expiration(bucket: &str, obj_info: &ObjectInfo) -> O
     build_put_object_expiration_header(&event)
 }
 
+/// Cadence for the "I/O queue congestion detected" WARN. Under sustained
+/// overload (client concurrency at or above the disk-read permit pool) every
+/// GET observes >=80% utilization, so an unthrottled WARN floods the log
+/// from the already saturated hot path; congestion metrics stay per-request.
+const IO_QUEUE_CONGESTION_WARN_INTERVAL_MS: u64 = 5_000;
+
+/// At-most-one-WARN-per-interval limiter for the I/O queue congestion log.
+/// Callers supply monotonic milliseconds so tests can drive the clock.
+struct IoQueueCongestionWarnThrottle {
+    /// Timestamp of the last emitted WARN; `u64::MAX` until the first one.
+    last_warn_ms: AtomicU64,
+    /// Congested requests left unlogged since the last emitted WARN.
+    suppressed: AtomicU64,
+}
+
+impl IoQueueCongestionWarnThrottle {
+    const fn new() -> Self {
+        Self {
+            last_warn_ms: AtomicU64::new(u64::MAX),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// Claim the right to emit one WARN. Returns the number of events
+    /// suppressed since the previous emission, or `None` while the interval
+    /// window is still closed (the event is counted, not logged).
+    fn claim(&self, now_ms: u64) -> Option<u64> {
+        let last = self.last_warn_ms.load(Ordering::Relaxed);
+        let window_open = last == u64::MAX || now_ms.saturating_sub(last) >= IO_QUEUE_CONGESTION_WARN_INTERVAL_MS;
+        if window_open
+            && self
+                .last_warn_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            Some(self.suppressed.swap(0, Ordering::Relaxed))
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Monotonic milliseconds since the first call, for production callers.
+    fn now_ms() -> u64 {
+        static ANCHOR: OnceLock<std::time::Instant> = OnceLock::new();
+        ANCHOR.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+}
+
+static IO_QUEUE_CONGESTION_WARN_THROTTLE: IoQueueCongestionWarnThrottle = IoQueueCongestionWarnThrottle::new();
+
 #[derive(Clone, Default)]
 pub struct DefaultObjectUsecase {
     context: Option<Arc<AppContext>>,
@@ -2334,6 +2392,14 @@ impl DefaultObjectUsecase {
         Self {
             context: current_app_context(),
         }
+    }
+
+    /// Build the use-case bound to an explicit application context
+    /// (backlog#1052 S6): the per-server request path passes its own context
+    /// so the use-case resolves that server's store; `None` falls back to the
+    /// ambient default.
+    pub fn with_context(context: Option<std::sync::Arc<crate::runtime_sources::AppContext>>) -> Self {
+        Self { context }
     }
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
@@ -2579,16 +2645,22 @@ impl DefaultObjectUsecase {
         let queue_utilization = queue_snapshot.utilization_percent();
 
         if queue_snapshot.is_congested(80.0) {
-            warn!(
-                bucket = %bucket,
-                key = %key,
-                queue_utilization = format!("{:.1}%", queue_utilization),
-                permits_in_use = queue_status.permits_in_use,
-                total_permits = queue_status.total_permits,
-                "I/O queue congestion detected"
-            );
-
+            // Metrics count every congested request; only the WARN is rate
+            // limited, because under saturation every GET crosses the
+            // threshold and per-request WARNs flood the log.
             rustfs_io_metrics::record_io_queue_congestion();
+
+            if let Some(suppressed_warns) = IO_QUEUE_CONGESTION_WARN_THROTTLE.claim(IoQueueCongestionWarnThrottle::now_ms()) {
+                warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    queue_utilization = format!("{:.1}%", queue_utilization),
+                    permits_in_use = queue_status.permits_in_use,
+                    total_permits = queue_status.total_permits,
+                    suppressed_warns,
+                    "I/O queue congestion detected"
+                );
+            }
         }
 
         Self::ensure_get_object_not_timed_out(wrapper, timeout_config, bucket, key, GetObjectTimeoutStage::BeforeRead)?;
@@ -2722,6 +2794,11 @@ impl DefaultObjectUsecase {
             );
         }
 
+        // ODC-16: capture whether the ecstore cache hook already probed this
+        // read, so the app layer does not repeat the lookup it ran after fresh
+        // metadata resolution.
+        let cache_hook_served = reader.is_cache_hook_served();
+        let cache_hook_probed = reader.cache_hook_probed();
         let info = reader.object_info;
         let stream = reader.stream;
         let buffered_body = reader.buffered_body;
@@ -2835,6 +2912,8 @@ impl DefaultObjectUsecase {
             info,
             final_stream,
             buffered_body,
+            cache_hook_served,
+            cache_hook_probed,
             rs,
             content_type,
             last_modified,
@@ -3122,7 +3201,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body_with_cache<R>(
         cache_adapter: &ObjectDataCacheAdapter,
-        mut final_stream: R,
+        final_stream: R,
         info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
@@ -3132,6 +3211,8 @@ impl DefaultObjectUsecase {
         has_range: bool,
         encryption_applied: bool,
         buffered_body: Option<Bytes>,
+        cache_hook_served: bool,
+        cache_hook_probed: bool,
         bucket: &str,
         key: &str,
         mut lifecycle: GetObjectBodyLifecycle,
@@ -3150,20 +3231,53 @@ impl DefaultObjectUsecase {
         };
         let cache_plan = build_get_object_body_cache_plan(cache_adapter, cache_request);
 
-        match lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await {
-            GetObjectBodyCacheLookup::Hit(bytes) => {
-                return Ok(Self::build_memory_bytes_blob(
-                    bytes,
-                    response_content_length,
-                    GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
-                    lifecycle,
-                ));
+        // ODC-16 (backlog#1121): when the ecstore hook already served this body
+        // from the cache, serve it straight through as the object-data-cache
+        // source. Re-running the lookup here would record a second hit, double
+        // the hit_bytes, and do redundant moka work for one hook-served GET.
+        if cache_hook_served && let Some(bytes) = buffered_body.clone() {
+            return Ok(Self::build_memory_bytes_blob(
+                bytes,
+                response_content_length,
+                GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
+                lifecycle,
+            ));
+        }
+
+        // ODC-16: only look up when the hook did not probe this read. When it did
+        // probe (a served body handled above, or a miss), its result is
+        // authoritative because it ran after fresh metadata resolution, so the
+        // app layer skips its own lookup and only uses the plan to fill.
+        if !cache_hook_probed {
+            match lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await {
+                GetObjectBodyCacheLookup::Hit(bytes) => {
+                    return Ok(Self::build_memory_bytes_blob(
+                        bytes,
+                        response_content_length,
+                        GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
+                        lifecycle,
+                    ));
+                }
+                GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
             }
-            GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
         }
 
         if let Some(buffered_body) = buffered_body {
-            let _fill_result = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
+            // ODC-15: the body is already fully in hand, so keep the fill off the
+            // response's critical path. For a cacheable plan, run the fill in a
+            // detached task (Bytes is a cheap clone) and return immediately. For
+            // a non-cacheable plan the fill is a pure metric-only skip with no
+            // I/O, so record it inline to preserve observability.
+            if matches!(cache_plan, GetObjectBodyCachePlan::Cacheable(_)) {
+                let cache_adapter = cache_adapter.clone();
+                let cache_plan = cache_plan.clone();
+                let fill_bytes = buffered_body.clone();
+                tokio::spawn(async move {
+                    let _ = fill_get_object_body_cache_from_buffered_body(&cache_adapter, &cache_plan, &fill_bytes).await;
+                });
+            } else {
+                let _ = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
+            }
 
             return Ok(Self::build_memory_bytes_blob(
                 buffered_body,
@@ -3207,23 +3321,43 @@ impl DefaultObjectUsecase {
                 .await;
             };
             let mut buf = Vec::with_capacity(materialized_capacity);
+            // ODC-07: bound the read so a stream yielding more than the declared
+            // length cannot grow `buf` past the in-memory GET threshold. Reading
+            // one byte past the capacity is enough to detect an over-long stream.
+            let mut bounded_stream = tokio::io::AsyncReadExt::take(final_stream, materialized_capacity as u64 + 1);
             let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
+            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut bounded_stream, &mut buf).await;
             record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ, buffer_read_start);
 
             match read_result {
                 Ok(_) => {
+                    // ODC-07: treat a length mismatch as a hard error, matching
+                    // the direct-memory GET path. Serving a body whose decoded
+                    // length disagrees with the declared content length would
+                    // ship a truncated or over-long response.
                     if buf.len() != materialized_capacity {
-                        warn!(
+                        lifecycle.finish_err();
+                        error!(
                             expected = response_content_length,
                             actual = buf.len(),
-                            "Object size mismatch during materialize-fill read"
+                            "materialize-fill GET decoded length mismatch"
                         );
+                        return Err(ApiError::from(StorageError::other(format!(
+                            "materialize-fill GET decoded length mismatch: expected {response_content_length}, got {}",
+                            buf.len()
+                        )))
+                        .into());
                     }
 
                     let bytes = Bytes::from(buf);
-                    let _fill_result =
-                        fill_get_object_body_cache_from_materialized_body(cache_adapter, &cache_plan, &bytes).await;
+                    // ODC-15: fill off the response's critical path (see the
+                    // buffered-body branch above).
+                    let cache_adapter = cache_adapter.clone();
+                    let cache_plan = cache_plan.clone();
+                    let fill_bytes = bytes.clone();
+                    tokio::spawn(async move {
+                        let _ = fill_get_object_body_cache_from_materialized_body(&cache_adapter, &cache_plan, &fill_bytes).await;
+                    });
 
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,
@@ -4017,6 +4151,8 @@ impl DefaultObjectUsecase {
         event_info: Option<ObjectInfo>,
         final_stream: DynReader,
         buffered_body: Option<Bytes>,
+        cache_hook_served: bool,
+        cache_hook_probed: bool,
         rs: Option<HTTPRangeSpec>,
         content_type: Option<ContentType>,
         last_modified: Option<Timestamp>,
@@ -4069,6 +4205,8 @@ impl DefaultObjectUsecase {
             rs.is_some(),
             encryption_applied,
             buffered_body,
+            cache_hook_served,
+            cache_hook_probed,
             bucket,
             key,
             lifecycle,
@@ -4235,6 +4373,8 @@ impl DefaultObjectUsecase {
             info,
             final_stream,
             buffered_body,
+            cache_hook_served,
+            cache_hook_probed,
             rs,
             content_type,
             last_modified,
@@ -4267,6 +4407,8 @@ impl DefaultObjectUsecase {
                 event_info,
                 final_stream,
                 buffered_body,
+                cache_hook_served,
+                cache_hook_probed,
                 rs,
                 content_type,
                 last_modified,
@@ -5459,7 +5601,14 @@ impl DefaultObjectUsecase {
         };
 
         let cache_adapter = self.object_data_cache();
-        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        // A force (delete_prefix) delete removes every object under `key` as a
+        // prefix, so invalidating only the exact key would strand every cached
+        // body beneath it. Use the prefix primitive in that branch (ODC-27).
+        if force_delete {
+            let _ = invalidate_object_data_cache_prefix_before_mutation(&cache_adapter, &bucket, &key).await;
+        } else {
+            let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        }
 
         let obj_info = {
             match store.delete_object(&bucket, &key, opts.clone()).await {
@@ -5490,7 +5639,11 @@ impl DefaultObjectUsecase {
                 "failed to persist transitioned object cleanup journal"
             );
         }
-        let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
+        if force_delete {
+            let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;
+        } else {
+            let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
+        }
 
         // Fast in-memory update for immediate quota and admin usage consistency
         if delete_creates_delete_marker(&opts) {
@@ -6654,6 +6807,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
+
+    #[test]
+    fn io_queue_congestion_warn_throttle_emits_once_per_interval() {
+        let throttle = IoQueueCongestionWarnThrottle::new();
+        // The first congested request logs immediately.
+        assert_eq!(throttle.claim(0), Some(0));
+        // Requests inside the window are counted, not logged.
+        assert_eq!(throttle.claim(1), None);
+        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS - 1), None);
+        // The next emission reports how many stayed silent.
+        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS), Some(2));
+        assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS + 1), None);
+    }
+
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,
@@ -7067,6 +7234,34 @@ mod tests {
         ));
     }
 
+    /// Polls the cache until the detached fill (ODC-15) populates the entry, so
+    /// a follow-up GET is a deterministic hit rather than racing the fill task.
+    async fn wait_for_cache_hit(
+        adapter: &crate::app::object_data_cache::ObjectDataCacheAdapter,
+        bucket: &str,
+        object: &str,
+        etag: &str,
+        size: u64,
+    ) {
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket,
+            object,
+            version_id: None,
+            etag,
+            size,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        for _ in 0..400 {
+            if matches!(adapter.lookup_body(&plan).await, rustfs_object_data_cache::ObjectDataCacheLookup::Hit(_)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("detached fill did not populate the cache within the timeout");
+    }
+
     struct ReadProbeReader {
         reads: Arc<AtomicUsize>,
     }
@@ -7455,6 +7650,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("fill-enabled cache adapter should initialize");
@@ -7464,6 +7661,8 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"hello")).await;
@@ -7482,6 +7681,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7511,6 +7712,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("fill-enabled cache adapter should initialize");
@@ -7520,6 +7723,8 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"oops")).await;
@@ -7536,6 +7741,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7575,6 +7782,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("fill-enabled cache adapter should initialize");
@@ -7591,12 +7800,18 @@ mod tests {
             false,
             false,
             Some(Bytes::from_static(b"hello")),
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("buffered-body handoff should succeed");
+
+        // ODC-15: the fill is detached from the response path, so wait for it to
+        // populate the cache before the follow-up GET to keep the hit deterministic.
+        wait_for_cache_hit(&adapter, "test-bucket", "cached-object", "etag", 5).await;
 
         let _second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
@@ -7610,6 +7825,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7644,6 +7861,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("fill-enabled cache adapter should initialize");
@@ -7653,6 +7872,8 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
 
@@ -7668,6 +7889,8 @@ mod tests {
             false,
             false,
             Some(Bytes::from_static(b"oops")),
+            false,
+            false,
             "test-bucket",
             "cached-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7684,6 +7907,144 @@ mod tests {
         assert!(
             matches!(lookup, rustfs_object_data_cache::ObjectDataCacheLookup::Miss),
             "size-mismatched buffered body must not be filled into cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_hook_served_records_no_second_lookup() {
+        // ODC-16 (backlog#1121): a hook-served GET must record exactly one
+        // lookup — the ecstore hook's. The app layer, handed the cache body as
+        // buffered_body with cache_hook_served=true, must serve it directly
+        // without a second lookup (which would double the hits and hit_bytes).
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "test-bucket",
+            object: "hook-served",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let hit_body = Bytes::from_static(b"hello");
+        assert_eq!(
+            adapter.cache().fill_body(&plan, hit_body.clone()).await,
+            rustfs_object_data_cache::ObjectDataCacheFillResult::Inserted
+        );
+
+        // Simulate the ecstore hook: it performs exactly one lookup after fresh
+        // metadata resolution, hits, and hands the body forward as buffered_body.
+        assert!(matches!(
+            adapter.lookup_body(&plan).await,
+            rustfs_object_data_cache::ObjectDataCacheLookup::Hit(_)
+        ));
+        let lookups_after_hook = adapter.cache().stats().lookups;
+        assert_eq!(lookups_after_hook, 1, "the hook performs exactly one lookup");
+
+        let _body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(hit_body),
+            /* cache_hook_served */ true,
+            /* cache_hook_probed */ true,
+            "test-bucket",
+            "hook-served",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await
+        .expect("hook-served body handoff should succeed");
+
+        assert_eq!(
+            adapter.cache().stats().lookups,
+            lookups_after_hook,
+            "a hook-served GET must not record a second lookup in the app layer"
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "hook-served body handoff must not read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_hook_miss_skips_app_lookup() {
+        // ODC-16: when the hook probed and missed, its miss is authoritative
+        // (it ran after fresh metadata resolution), so the app layer must not
+        // run a second lookup — it only fills from the buffered body.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+
+        let lookups_before = adapter.cache().stats().lookups;
+        let _body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"hello")),
+            /* cache_hook_served */ false,
+            /* cache_hook_probed */ true,
+            "test-bucket",
+            "hook-missed",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await
+        .expect("hook-miss buffered-body handoff should succeed");
+
+        assert_eq!(
+            adapter.cache().stats().lookups,
+            lookups_before,
+            "a hook-probed miss must not trigger an app-layer lookup"
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "buffered-body handoff must not read from the fallback reader"
         );
     }
 
@@ -7707,6 +8068,8 @@ mod tests {
             crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
                 max_bytes: 8_388_608,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("materialize-fill cache adapter should initialize");
@@ -7723,12 +8086,18 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "materialized-object",
             GetObjectBodyLifecycle::disabled(),
         )
         .await
         .expect("materialize-fill handoff should succeed");
+
+        // ODC-15: the fill is detached from the response path, so wait for it to
+        // populate the cache before the follow-up GET to keep the hit deterministic.
+        wait_for_cache_hit(&adapter, "test-bucket", "materialized-object", "etag", 5).await;
 
         let _second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
             &adapter,
@@ -7742,6 +8111,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "materialized-object",
             GetObjectBodyLifecycle::disabled(),
@@ -7758,6 +8129,58 @@ mod tests {
             second_reads.load(AtomicOrdering::Relaxed),
             0,
             "cache hit after materialize-fill must not read from the fallback reader"
+        );
+    }
+
+    // ODC-07: a materialize read that yields more than the declared content
+    // length must be a hard error, not a warn-and-serve, matching the
+    // direct-memory GET path. The bounded `take` reads one byte past capacity so
+    // the over-long stream is detected without buffering it unbounded.
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_materialize_rejects_length_mismatch() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        // Declared content length is 5, but the stream yields 6 bytes.
+        let reader = DataProbeReader {
+            reads: Arc::clone(&reads),
+            data: std::io::Cursor::new(b"hello!".to_vec()),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                min_free_memory_percent: 0,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let result = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            false,
+            false,
+            "test-bucket",
+            "mismatch-object",
+            GetObjectBodyLifecycle::disabled(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an over-long materialize read must be a hard error, not a truncated served body"
         );
     }
 
@@ -7778,6 +8201,8 @@ mod tests {
                 mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
                 max_bytes: 8_388_608,
                 max_entry_bytes: 4,
+                // Fill must not depend on the live memory reading (host vs container).
+                min_free_memory_percent: 0,
                 ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
             })
             .expect("materialize-fill cache adapter should initialize");
@@ -7794,6 +8219,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             "test-bucket",
             "too-large-object",
             GetObjectBodyLifecycle::disabled(),
@@ -8541,6 +8968,8 @@ mod tests {
                 Some(info),
                 wrap_reader(tokio::io::empty()),
                 None,
+                false,
+                false,
                 None,
                 None,
                 None,

@@ -63,6 +63,42 @@ pub(crate) async fn invalidate_object_data_cache_after_complete_multipart_succes
         .await
 }
 
+/// Invalidates every cached body under a prefix before a force-prefix delete
+/// begins (ODC-27). The exact-key `..._before_mutation` helper only covers the
+/// prefix string itself, leaving every object beneath it cached.
+pub(crate) async fn invalidate_object_data_cache_prefix_before_mutation(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    prefix: &str,
+) -> ObjectDataCacheInvalidationResult {
+    adapter
+        .invalidate_prefix(bucket, prefix, ObjectDataCacheInvalidationReason::BeforeMutation)
+        .await
+}
+
+/// Invalidates every cached body under a prefix after a successful force-prefix
+/// delete (ODC-27).
+pub(crate) async fn invalidate_object_data_cache_prefix_after_delete(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    prefix: &str,
+) -> ObjectDataCacheInvalidationResult {
+    adapter
+        .invalidate_prefix(bucket, prefix, ObjectDataCacheInvalidationReason::AfterPrefixDelete)
+        .await
+}
+
+/// Invalidates every cached body in a bucket after the bucket is deleted
+/// (ODC-28).
+pub(crate) async fn invalidate_object_data_cache_bucket_after_delete(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+) -> ObjectDataCacheInvalidationResult {
+    adapter
+        .invalidate_bucket(bucket, ObjectDataCacheInvalidationReason::AfterBucketDelete)
+        .await
+}
+
 /// Invalidates a single object identity through the app-layer cache adapter.
 pub(crate) async fn invalidate_object_data_cache_object(
     adapter: &ObjectDataCacheAdapter,
@@ -128,6 +164,8 @@ mod tests {
         let config = ObjectDataCacheConfig {
             mode: ObjectDataCacheMode::FillMaterializeEnabled,
             max_bytes: 8_388_608,
+            // Fill must not depend on the live memory reading (host vs container).
+            min_free_memory_percent: 0,
             ..ObjectDataCacheConfig::default()
         };
         ObjectDataCacheAdapter::new(config).expect("enabled config should build adapter")
@@ -142,15 +180,22 @@ mod tests {
             version_id: None,
             etag: "etag",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.fill_body(&plan, Bytes::from_static(b"hello")).await;
-        let _ = invalidate_object_data_cache_before_mutation(&adapter, "bucket", "object").await;
-        let invalidation = invalidate_object_data_cache_after_delete_success(&adapter, "bucket", "object").await;
+        let before_mutation = invalidate_object_data_cache_before_mutation(&adapter, "bucket", "object").await;
+        let after_delete = invalidate_object_data_cache_after_delete_success(&adapter, "bucket", "object").await;
         let lookup = adapter.lookup_body(&plan).await;
 
         assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
-        assert_eq!(invalidation, ObjectDataCacheInvalidationResult::Success);
+        // The two-phase invalidation is deliberate hygiene, and the outcomes must
+        // distinguish real churn from its no-op half: the first call evicts the
+        // cached body, the second finds the identity already empty. Dashboards
+        // read that split (backlog#1141).
+        assert_eq!(before_mutation, ObjectDataCacheInvalidationResult::Removed { keys: 1 });
+        assert_eq!(after_delete, ObjectDataCacheInvalidationResult::NoOp);
         assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
     }
 
@@ -163,6 +208,8 @@ mod tests {
             version_id: None,
             etag: "etag-a",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let plan_b = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
@@ -171,6 +218,8 @@ mod tests {
             version_id: None,
             etag: "etag-b",
             size: 5,
+            data_dir_u128: None,
+            mod_time_unix_nanos: 0,
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let _ = adapter.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;

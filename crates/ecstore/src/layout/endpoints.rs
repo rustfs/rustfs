@@ -19,8 +19,12 @@ use crate::{
     },
     runtime::sources as runtime_sources,
 };
-use rustfs_config::{DEFAULT_UNSAFE_BYPASS_DISK_CHECK, ENV_MINIO_CI, ENV_UNSAFE_BYPASS_DISK_CHECK};
-use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
+use rustfs_config::{
+    DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS, DEFAULT_STARTUP_TOPOLOGY_WAIT_TIMEOUT_SECS, DEFAULT_UNSAFE_BYPASS_DISK_CHECK,
+    ENV_KUBERNETES_SERVICE_HOST, ENV_MINIO_CI, ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY, ENV_STARTUP_TOPOLOGY_WAIT_MODE,
+    ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT, ENV_UNSAFE_BYPASS_DISK_CHECK,
+};
+use rustfs_utils::{XHost, check_local_server_addr, get_env_opt_str, get_host_ip, is_local_host};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
     future::Future,
@@ -209,6 +213,17 @@ impl PoolEndpointList {
     /// creates a list of endpoints per pool, resolves their relevant
     /// hostnames and discovers those are local or remote.
     async fn create_pool_endpoints(server_addr: &str, disks_layout: &DisksLayout) -> Result<Self> {
+        Self::create_pool_endpoints_with(server_addr, disks_layout, None).await
+    }
+
+    /// Same as [`create_pool_endpoints`] but lets tests inject an explicit
+    /// startup topology convergence policy instead of resolving it from the
+    /// environment.
+    async fn create_pool_endpoints_with(
+        server_addr: &str,
+        disks_layout: &DisksLayout,
+        policy_override: Option<StartupTopologyPolicy>,
+    ) -> Result<Self> {
         if disks_layout.is_empty_layout() {
             return Err(Error::other("invalid number of endpoints"));
         }
@@ -268,64 +283,95 @@ impl PoolEndpointList {
             setup_type: SetupType::Unknown,
         };
 
-        let dns_retry_deadline = DnsRetryDeadline::new(DNS_RETRY_TOTAL_TIMEOUT);
+        // Startup topology convergence: recoverable DNS/local-host resolution
+        // failures while peers are still coming up are handled per policy
+        // (orchestrated waits, bounded times out, fail-fast exits). Only
+        // distributed (URL) endpoints resolve hostnames; path-style endpoints
+        // are always local and never wait.
+        let distributed = pool_endpoint_list
+            .inner
+            .first()
+            .and_then(|eps| eps.as_ref().first())
+            .is_some_and(|ep| ep.get_type() == EndpointType::Url);
+        let policy = policy_override.unwrap_or_else(|| StartupTopologyPolicy::resolve(distributed));
+        info!(
+            target: "rustfs::ecstore::endpoints",
+            mode = ?policy.mode,
+            wait_timeout = ?policy.wait_timeout,
+            retry_max_delay = ?policy.retry_max_delay,
+            distributed,
+            "resolved startup topology convergence policy"
+        );
+
+        let convergence_started = Instant::now();
+        let dns_retry_deadline = DnsRetryDeadline::new(policy.wait_timeout, policy.retry_max_delay);
         pool_endpoint_list
             .update_is_local(server_addr.port(), &dns_retry_deadline)
             .await?;
 
+        // Collapse divergent local/remote verdicts for the same host:port that
+        // orchestrated DNS churn can produce during startup, before any check
+        // relies on the local flag.
+        normalize_same_host_local_state(pool_endpoint_list.as_mut());
+
         for endpoints in pool_endpoint_list.inner.iter_mut() {
             // Check whether same path is not used in endpoints of a host on different port.
-            let mut path_ip_map: HashMap<String, HashSet<IpAddr>> = HashMap::new();
-            let mut host_ip_cache: HashMap<Host<&str>, HashSet<IpAddr>> = HashMap::new();
-            for ep in endpoints.as_ref() {
-                let Some(host) = ep.url.host() else {
-                    continue;
-                };
-
-                let host_ip_set = if let Some(set) = host_ip_cache.get(&host) {
-                    info!(
-                        target: "rustfs::ecstore::endpoints",
-                        host = %host,
-                        endpoint = %ep.to_string(),
-                        from = "cache",
-                        "Create pool endpoints host '{}' found in cache for endpoint '{}'", host, ep.to_string()
-                    );
-                    set.clone()
-                } else {
-                    let ips = match resolve_host_ips_with_retry(host.clone(), &ep.to_string(), &dns_retry_deadline).await {
-                        Ok(ips) => ips,
-                        Err(e) => {
-                            error!("Create pool endpoints host {} not found, error:{}", host, e);
-                            return Err(e);
-                        }
+            // This relies on resolving every host to its IP set, which can flap while a
+            // Kubernetes headless service is still publishing records; defer it in
+            // orchestrated mode and re-run the DNS-independent checks below.
+            if !policy.is_orchestrated() {
+                let mut path_ip_map: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+                let mut host_ip_cache: HashMap<Host<&str>, HashSet<IpAddr>> = HashMap::new();
+                for ep in endpoints.as_ref() {
+                    let Some(host) = ep.url.host() else {
+                        continue;
                     };
-                    info!(
-                        target: "rustfs::ecstore::endpoints",
-                        host = %host,
-                        endpoint = %ep.to_string(),
-                        from = "get_host_ip",
-                        "Create pool endpoints host '{}' resolved to ips {:?} for endpoint '{}'",
-                        host,
-                        ips,
-                        ep.to_string()
-                    );
-                    host_ip_cache.insert(host.clone(), ips.clone());
-                    ips
-                };
 
-                let path = ep.get_file_path();
-                match path_ip_map.entry(path) {
-                    Entry::Occupied(mut e) => {
-                        if e.get().intersection(&host_ip_set).count() > 0 {
-                            let path_key = e.key().clone();
-                            return Err(Error::other(format!(
-                                "same path '{path_key}' can not be served by different port on same address"
-                            )));
+                    let host_ip_set = if let Some(set) = host_ip_cache.get(&host) {
+                        info!(
+                            target: "rustfs::ecstore::endpoints",
+                            host = %host,
+                            endpoint = %ep.to_string(),
+                            from = "cache",
+                            "Create pool endpoints host '{}' found in cache for endpoint '{}'", host, ep.to_string()
+                        );
+                        set.clone()
+                    } else {
+                        let ips = match resolve_host_ips_with_retry(host.clone(), &ep.to_string(), &dns_retry_deadline).await {
+                            Ok(ips) => ips,
+                            Err(e) => {
+                                error!("Create pool endpoints host {} not found, error:{}", host, e);
+                                return Err(e);
+                            }
+                        };
+                        info!(
+                            target: "rustfs::ecstore::endpoints",
+                            host = %host,
+                            endpoint = %ep.to_string(),
+                            from = "get_host_ip",
+                            "Create pool endpoints host '{}' resolved to ips {:?} for endpoint '{}'",
+                            host,
+                            ips,
+                            ep.to_string()
+                        );
+                        host_ip_cache.insert(host.clone(), ips.clone());
+                        ips
+                    };
+
+                    let path = ep.get_file_path();
+                    match path_ip_map.entry(path) {
+                        Entry::Occupied(mut e) => {
+                            if e.get().intersection(&host_ip_set).count() > 0 {
+                                let path_key = e.key().clone();
+                                return Err(Error::other(format!(
+                                    "same path '{path_key}' can not be served by different port on same address"
+                                )));
+                            }
+                            e.get_mut().extend(host_ip_set.iter());
                         }
-                        e.get_mut().extend(host_ip_set.iter());
-                    }
-                    Entry::Vacant(e) => {
-                        e.insert(host_ip_set.clone());
+                        Entry::Vacant(e) => {
+                            e.insert(host_ip_set.clone());
+                        }
                     }
                 }
             }
@@ -403,6 +449,23 @@ impl PoolEndpointList {
 
         pool_endpoint_list.setup_type = setup_type;
 
+        let total_endpoints: usize = pool_endpoint_list.inner.iter().map(|eps| eps.as_ref().len()).sum();
+        let local_endpoints = pool_endpoint_list
+            .inner
+            .iter()
+            .flat_map(|eps| eps.as_ref())
+            .filter(|ep| ep.is_local)
+            .count();
+        info!(
+            target: "rustfs::ecstore::endpoints",
+            mode = ?policy.mode,
+            elapsed_ms = convergence_started.elapsed().as_millis() as u64,
+            total_endpoints,
+            local_endpoints,
+            setup_type = ?pool_endpoint_list.setup_type,
+            "startup topology converged"
+        );
+
         Ok(pool_endpoint_list)
     }
 
@@ -437,26 +500,34 @@ impl PoolEndpointList {
     }
 }
 
-const DNS_RETRY_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 const DNS_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const DNS_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 const DNS_RETRY_JITTER_PERCENT: u64 = 20;
+/// Minimum spacing between "still retrying" warnings so a long orchestrated
+/// wait does not flood the log with one line per backoff tick.
+const TOPOLOGY_WARN_THROTTLE: Duration = Duration::from_secs(30);
 
 struct DnsRetryDeadline {
     started: Instant,
     timeout: Duration,
+    max_delay: Duration,
 }
 
 impl DnsRetryDeadline {
-    fn new(timeout: Duration) -> Self {
+    fn new(timeout: Duration, max_delay: Duration) -> Self {
         Self {
             started: Instant::now(),
             timeout,
+            max_delay,
         }
     }
 
     fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 
     fn bounded_delay(&self, delay: Duration) -> Option<Duration> {
@@ -484,9 +555,10 @@ where
     SleepFut: Future<Output = ()>,
     PermanentError: FnMut(Error) -> Error,
     TimeoutError: FnMut(u32, Duration, Error) -> Error,
-    RetryLog: FnMut(u32, Duration, &Error),
+    RetryLog: FnMut(u32, Duration, Duration, &Error),
 {
     let mut attempts: u32 = 0;
+    let mut last_warn: Option<Instant> = None;
 
     loop {
         match resolve().await {
@@ -497,16 +569,29 @@ where
                 }
 
                 attempts += 1;
-                let Some(delay) = dns_retry_deadline.bounded_delay(dns_retry_delay(attempts)) else {
+                let Some(delay) = dns_retry_deadline.bounded_delay(dns_retry_delay(attempts, dns_retry_deadline.max_delay))
+                else {
                     return Err(timeout_error(attempts, dns_retry_deadline.timeout(), err));
                 };
 
-                retry_log(attempts, delay, &err);
+                // Throttle "still retrying" warnings so a long orchestrated wait
+                // does not emit one line per backoff tick.
+                if attempts == 1 || last_warn.is_none_or(|t| t.elapsed() >= TOPOLOGY_WARN_THROTTLE) {
+                    last_warn = Some(Instant::now());
+                    retry_log(attempts, delay, dns_retry_deadline.elapsed(), &err);
+                }
                 sleep(delay).await;
             }
         }
     }
 }
+
+/// Action-oriented tail shared by topology convergence timeout errors so a
+/// bounded-mode failure tells the operator what to check and how to opt into
+/// waiting.
+const TOPOLOGY_TIMEOUT_HINT: &str = "check DNS and /etc/hosts resolution, the http/https scheme and port in RUSTFS_VOLUMES, \
+and that all peer nodes have started; on Kubernetes/orchestrated deployments set \
+RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE=orchestrated to keep waiting instead of exiting";
 
 async fn resolve_local_host_with_retry(
     host: Host<&str>,
@@ -525,17 +610,19 @@ async fn resolve_local_host_with_retry(
         |err| Error::other(format!("endpoint '{context}' local-host detection failed for host '{host}': {err}")),
         |attempts, timeout, err| {
             Error::other(format!(
-                "endpoint '{context}' local-host detection timed out after {attempts} attempts and {timeout:?}: {err}"
+                "endpoint '{context}' local-host detection did not converge for host '{host}' after {attempts} attempts \
+over {timeout:?} (stage=local_host_detection): {err}. {TOPOLOGY_TIMEOUT_HINT}"
             ))
         },
-        |attempts, delay, err| {
+        |attempts, delay, elapsed, err| {
             warn!(
                 target = "rustfs::ecstore::endpoints",
+                stage = "local_host_detection",
                 context = %context,
                 host = %host,
-                endpoint = %context,
                 attempt = attempts,
                 delay_ms = delay.as_millis(),
+                elapsed_ms = elapsed.as_millis(),
                 error = %err,
                 "retrying endpoint local-host detection after temporary DNS error"
             );
@@ -559,16 +646,19 @@ async fn resolve_host_ips_with_retry(
         |err| Error::other(format!("endpoint '{context}' host '{host}' cannot resolve: {err}")),
         |attempts, timeout, err| {
             Error::other(format!(
-                "endpoint '{context}' host '{host}' DNS resolution timed out after {attempts} attempts and {timeout:?}: {err}"
+                "endpoint '{context}' host '{host}' DNS resolution did not converge after {attempts} attempts over \
+{timeout:?} (stage=host_ip_resolution): {err}. {TOPOLOGY_TIMEOUT_HINT}"
             ))
         },
-        |attempts, delay, err| {
+        |attempts, delay, elapsed, err| {
             warn!(
                 target = "rustfs::ecstore::endpoints",
+                stage = "host_ip_resolution",
                 context = %context,
                 host = %host,
                 attempt = attempts,
                 delay_ms = delay.as_millis(),
+                elapsed_ms = elapsed.as_millis(),
                 error = %err,
                 "retrying endpoint DNS resolution after temporary error"
             );
@@ -596,15 +686,10 @@ fn is_retryable_dns_error(err: &Error) -> bool {
         || message.contains("nodename nor servname provided")
 }
 
-fn dns_retry_delay(attempt: u32) -> Duration {
+fn dns_retry_delay(attempt: u32, max_delay: Duration) -> Duration {
     let capped_attempt = attempt.saturating_sub(1).min(10);
     let raw_delay = DNS_RETRY_BASE_DELAY.saturating_mul(1_u32 << capped_attempt);
-    let bounded_delay = if raw_delay > DNS_RETRY_MAX_DELAY {
-        DNS_RETRY_MAX_DELAY
-    } else {
-        raw_delay
-    };
-    apply_jitter(bounded_delay)
+    apply_jitter(raw_delay.min(max_delay))
 }
 
 fn apply_jitter(delay: Duration) -> Duration {
@@ -627,6 +712,151 @@ fn apply_jitter(delay: Duration) -> Duration {
         delay + Duration::from_millis(jitter_ms - jitter_window_ms)
     } else {
         delay.saturating_sub(Duration::from_millis(jitter_window_ms - jitter_ms))
+    }
+}
+
+/// How startup treats recoverable DNS/local-host resolution failures while a
+/// multi-node cluster is still converging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupTopologyWaitMode {
+    /// Kubernetes/orchestrated: wait effectively indefinitely so the process
+    /// stays Running (readiness stays false) instead of exiting and driving a
+    /// pod restart loop. DNS-IP cross-validation is deferred here because
+    /// headless-service records can still be flapping.
+    Orchestrated,
+    /// Bare-metal/VM multi-node: wait for a bounded window then fail with an
+    /// actionable error, so a wrong host/port is not masked by endless waiting.
+    Bounded,
+    /// CI/local debugging: fail fast on the first non-transient resolution error.
+    FailFast,
+}
+
+/// Resolved startup topology convergence policy: the wait mode plus the derived
+/// timeout and per-attempt backoff cap.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StartupTopologyPolicy {
+    mode: StartupTopologyWaitMode,
+    wait_timeout: Duration,
+    retry_max_delay: Duration,
+}
+
+impl StartupTopologyPolicy {
+    /// Resolves the policy from the environment. `distributed` is true when the
+    /// endpoints are URL style (the only ones that resolve hostnames).
+    fn resolve(distributed: bool) -> Self {
+        // `KUBERNETES_SERVICE_HOST` is platform-injected, so probe it directly
+        // rather than through the RUSTFS/MINIO config alias helpers.
+        Self::resolve_from(
+            get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_MODE).as_deref(),
+            std::env::var_os(ENV_KUBERNETES_SERVICE_HOST).is_some(),
+            distributed,
+            get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT).as_deref(),
+            get_env_opt_str(ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY).as_deref(),
+        )
+    }
+
+    /// Pure resolution used by both [`resolve`](Self::resolve) and tests.
+    fn resolve_from(
+        mode_env: Option<&str>,
+        kubernetes: bool,
+        distributed: bool,
+        timeout_env: Option<&str>,
+        max_delay_env: Option<&str>,
+    ) -> Self {
+        let mode = match mode_env.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+            Some("orchestrated") => StartupTopologyWaitMode::Orchestrated,
+            Some("bounded") => StartupTopologyWaitMode::Bounded,
+            Some("fail-fast") | Some("failfast") | Some("strict") => StartupTopologyWaitMode::FailFast,
+            // "auto", unset, or unrecognized: derive from the environment.
+            // Only URL-style (distributed) endpoints resolve hostnames and need
+            // to wait for DNS/topology convergence; local path endpoints never
+            // do, so they fail fast regardless of the platform.
+            _ => {
+                if !distributed {
+                    StartupTopologyWaitMode::FailFast
+                } else if kubernetes {
+                    StartupTopologyWaitMode::Orchestrated
+                } else {
+                    StartupTopologyWaitMode::Bounded
+                }
+            }
+        };
+
+        let retry_max_delay = max_delay_env
+            .and_then(parse_wait_duration)
+            .unwrap_or(Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS));
+
+        let wait_timeout = match mode {
+            // Effectively unbounded unless the operator sets an explicit cap.
+            StartupTopologyWaitMode::Orchestrated => timeout_env.and_then(parse_wait_duration).unwrap_or(Duration::MAX),
+            StartupTopologyWaitMode::Bounded => timeout_env
+                .and_then(parse_wait_duration)
+                .unwrap_or(Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_WAIT_TIMEOUT_SECS)),
+            // Zero window: the first transient error fails immediately.
+            StartupTopologyWaitMode::FailFast => Duration::ZERO,
+        };
+
+        Self {
+            mode,
+            wait_timeout,
+            retry_max_delay,
+        }
+    }
+
+    fn is_orchestrated(&self) -> bool {
+        matches!(self.mode, StartupTopologyWaitMode::Orchestrated)
+    }
+}
+
+/// Parses a wait/delay duration such as `3m`, `90s`, `500ms`, `2h`, or a bare
+/// number of seconds. Returns `None` for empty or malformed input so callers
+/// fall back to their default.
+fn parse_wait_duration(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+
+    let split = raw.find(|c: char| c.is_ascii_alphabetic())?;
+    let value: u64 = raw[..split].trim().parse().ok()?;
+    match raw[split..].trim().to_ascii_lowercase().as_str() {
+        "ms" => Some(Duration::from_millis(value)),
+        "s" | "sec" | "secs" => Some(Duration::from_secs(value)),
+        "m" | "min" | "mins" => value.checked_mul(60).map(Duration::from_secs),
+        "h" | "hr" | "hrs" => value.checked_mul(3600).map(Duration::from_secs),
+        _ => None,
+    }
+}
+
+/// Collapses divergent local/remote verdicts for endpoints that share the same
+/// `host:port`. A `host:port` is a single network identity, so if any endpoint
+/// of the group resolved as local, all of them are local. This absorbs the
+/// transient inconsistency that orchestrated DNS churn can produce across the
+/// several drives exported by one host.
+fn normalize_same_host_local_state(pools: &mut [Endpoints]) {
+    let mut local_hosts: HashSet<String> = HashSet::new();
+    for endpoints in pools.iter() {
+        for ep in endpoints.as_ref() {
+            if ep.is_local && ep.url.has_host() {
+                local_hosts.insert(ep.host_port());
+            }
+        }
+    }
+
+    if local_hosts.is_empty() {
+        return;
+    }
+
+    for endpoints in pools.iter_mut() {
+        for ep in endpoints.as_mut() {
+            if !ep.is_local && ep.url.has_host() && local_hosts.contains(&ep.host_port()) {
+                ep.is_local = true;
+            }
+        }
     }
 }
 
@@ -691,11 +921,23 @@ impl EndpointServerPools {
         server_addr: &str,
         disks_layout: &DisksLayout,
     ) -> Result<(EndpointServerPools, SetupType)> {
+        Self::create_server_endpoints_with(server_addr, disks_layout, None).await
+    }
+
+    /// Same as [`create_server_endpoints`] but lets tests inject an explicit
+    /// startup topology convergence policy instead of resolving it from the
+    /// environment (which would otherwise vary with the CI runner's ambient
+    /// `KUBERNETES_SERVICE_HOST`).
+    async fn create_server_endpoints_with(
+        server_addr: &str,
+        disks_layout: &DisksLayout,
+        policy_override: Option<StartupTopologyPolicy>,
+    ) -> Result<(EndpointServerPools, SetupType)> {
         if disks_layout.pools.is_empty() {
             return Err(Error::other("Invalid arguments specified"));
         }
 
-        let pool_eps = PoolEndpointList::create_pool_endpoints(server_addr, disks_layout).await?;
+        let pool_eps = PoolEndpointList::create_pool_endpoints_with(server_addr, disks_layout, policy_override).await?;
 
         let mut ret: EndpointServerPools = Vec::with_capacity(pool_eps.as_ref().len()).into();
         for (i, eps) in pool_eps.inner.into_iter().enumerate() {
@@ -1064,18 +1306,150 @@ mod test {
 
     #[test]
     fn dns_retry_delay_starts_from_base_and_caps_at_max() {
-        let first = dns_retry_delay(1);
+        let first = dns_retry_delay(1, DNS_RETRY_MAX_DELAY);
         assert!(first >= DNS_RETRY_BASE_DELAY.saturating_sub(Duration::from_millis(100)));
         assert!(first <= DNS_RETRY_BASE_DELAY + Duration::from_millis(100));
 
-        let capped = dns_retry_delay(20);
+        let capped = dns_retry_delay(20, DNS_RETRY_MAX_DELAY);
         assert!(capped >= DNS_RETRY_MAX_DELAY.saturating_sub(Duration::from_millis(1600)));
         assert!(capped <= DNS_RETRY_MAX_DELAY + Duration::from_millis(1600));
     }
 
+    #[test]
+    fn dns_retry_delay_honors_lower_max_delay_cap() {
+        let cap = Duration::from_secs(2);
+        let capped = dns_retry_delay(20, cap);
+        // Jitter can widen the delay by up to DNS_RETRY_JITTER_PERCENT of the cap.
+        assert!(capped <= cap + Duration::from_millis(cap.as_millis() as u64 * DNS_RETRY_JITTER_PERCENT / 100));
+    }
+
+    #[test]
+    fn parse_wait_duration_supports_units_and_bare_seconds() {
+        assert_eq!(parse_wait_duration("300"), Some(Duration::from_secs(300)));
+        assert_eq!(parse_wait_duration("90s"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_wait_duration("3m"), Some(Duration::from_secs(180)));
+        assert_eq!(parse_wait_duration("2h"), Some(Duration::from_secs(7200)));
+        assert_eq!(parse_wait_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_wait_duration("  10m  "), Some(Duration::from_secs(600)));
+        assert_eq!(parse_wait_duration(""), None);
+        assert_eq!(parse_wait_duration("abc"), None);
+        assert_eq!(parse_wait_duration("10x"), None);
+    }
+
+    #[test]
+    fn startup_policy_auto_maps_environment_to_mode() {
+        // Kubernetes -> orchestrated (unbounded by default).
+        let k8s = StartupTopologyPolicy::resolve_from(None, true, true, None, None);
+        assert_eq!(k8s.mode, StartupTopologyWaitMode::Orchestrated);
+        assert_eq!(k8s.wait_timeout, Duration::MAX);
+        assert!(k8s.is_orchestrated());
+
+        // Distributed URL endpoints, non-Kubernetes -> bounded (default window).
+        let bounded = StartupTopologyPolicy::resolve_from(None, false, true, None, None);
+        assert_eq!(bounded.mode, StartupTopologyWaitMode::Bounded);
+        assert_eq!(bounded.wait_timeout, Duration::from_secs(DEFAULT_STARTUP_TOPOLOGY_WAIT_TIMEOUT_SECS));
+        assert!(!bounded.is_orchestrated());
+
+        // Local path endpoints -> fail-fast (zero wait window).
+        let local = StartupTopologyPolicy::resolve_from(None, false, false, None, None);
+        assert_eq!(local.mode, StartupTopologyWaitMode::FailFast);
+        assert_eq!(local.wait_timeout, Duration::ZERO);
+
+        // Local path endpoints stay fail-fast even under Kubernetes: they have
+        // no hostnames to resolve, so there is nothing to wait for.
+        let k8s_local = StartupTopologyPolicy::resolve_from(None, true, false, None, None);
+        assert_eq!(k8s_local.mode, StartupTopologyWaitMode::FailFast);
+        assert_eq!(k8s_local.wait_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn startup_policy_explicit_mode_overrides_auto_and_parses_durations() {
+        // Explicit mode wins even under Kubernetes auto-detection.
+        let forced = StartupTopologyPolicy::resolve_from(Some("bounded"), true, true, Some("2m"), Some("4s"));
+        assert_eq!(forced.mode, StartupTopologyWaitMode::Bounded);
+        assert_eq!(forced.wait_timeout, Duration::from_secs(120));
+        assert_eq!(forced.retry_max_delay, Duration::from_secs(4));
+
+        // Explicit orchestrated can still be capped by an explicit timeout.
+        let capped = StartupTopologyPolicy::resolve_from(Some("orchestrated"), false, false, Some("10m"), None);
+        assert_eq!(capped.mode, StartupTopologyWaitMode::Orchestrated);
+        assert_eq!(capped.wait_timeout, Duration::from_secs(600));
+
+        // Unrecognized mode falls back to auto (here: Kubernetes -> orchestrated).
+        let auto = StartupTopologyPolicy::resolve_from(Some("bogus"), true, true, None, None);
+        assert_eq!(auto.mode, StartupTopologyWaitMode::Orchestrated);
+
+        // fail-fast accepts a few spellings, trimmed and case-insensitive.
+        for alias in ["fail-fast", "failfast", "strict", "  Strict  "] {
+            assert_eq!(
+                StartupTopologyPolicy::resolve_from(Some(alias), false, true, None, None).mode,
+                StartupTopologyWaitMode::FailFast,
+                "alias {alias:?} should resolve to fail-fast"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_same_host_local_state_unifies_divergent_verdicts() {
+        let mut d1 = Endpoint::try_from("http://node1:9000/d1").unwrap();
+        let mut d2 = Endpoint::try_from("http://node1:9000/d2").unwrap();
+        d1.is_local = true;
+        d2.is_local = false; // divergent verdict for the same host:port
+        let mut remote = Endpoint::try_from("http://node2:9000/d1").unwrap();
+        remote.is_local = false;
+
+        let mut pools = vec![Endpoints::from(vec![d1, d2, remote])];
+        normalize_same_host_local_state(&mut pools);
+
+        let eps = pools[0].as_ref();
+        assert!(eps[0].is_local);
+        assert!(eps[1].is_local, "same host:port must inherit the local verdict");
+        assert!(!eps[2].is_local, "a genuinely remote host must stay remote");
+    }
+
+    #[tokio::test]
+    async fn orchestrated_policy_defers_dns_ip_same_path_check() {
+        // Two remote endpoints on the same address, same path, different ports
+        // trip the DNS-IP cross-port check in bounded mode but must be deferred
+        // (allowed) in orchestrated mode, where headless-service records can
+        // still be flapping.
+        let args = vec![
+            "http://192.0.2.10:9000/export",
+            "http://192.0.2.10:9001/export",
+            "http://192.0.2.11:9000/export",
+            "http://192.0.2.12:9000/export",
+        ];
+        let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
+
+        let bounded = StartupTopologyPolicy {
+            mode: StartupTopologyWaitMode::Bounded,
+            wait_timeout: Duration::from_secs(1),
+            retry_max_delay: DNS_RETRY_MAX_DELAY,
+        };
+        let bounded_err = PoolEndpointList::create_pool_endpoints_with("0.0.0.0:9000", &layout, Some(bounded))
+            .await
+            .unwrap_err();
+        assert!(
+            bounded_err
+                .to_string()
+                .contains("same path '/export' can not be served by different port"),
+            "bounded mode should run the DNS-IP cross-port check: {bounded_err}"
+        );
+
+        let orchestrated = StartupTopologyPolicy {
+            mode: StartupTopologyWaitMode::Orchestrated,
+            wait_timeout: Duration::MAX,
+            retry_max_delay: DNS_RETRY_MAX_DELAY,
+        };
+        let resolved = PoolEndpointList::create_pool_endpoints_with("0.0.0.0:9000", &layout, Some(orchestrated))
+            .await
+            .expect("orchestrated mode should defer the DNS-IP cross-port check");
+        assert_eq!(resolved.setup_type, SetupType::DistErasure);
+    }
+
     #[tokio::test]
     async fn retry_dns_operation_retries_with_backoff_without_real_sleep() {
-        let deadline = DnsRetryDeadline::new(Duration::from_secs(1));
+        let deadline = DnsRetryDeadline::new(Duration::from_secs(1), DNS_RETRY_MAX_DELAY);
         let mut calls = 0_u32;
         let mut sleeps = Vec::new();
 
@@ -1098,7 +1472,7 @@ mod test {
             &deadline,
             |err| Error::other(format!("permanent: {err}")),
             |attempts, timeout, err| Error::other(format!("timed out after {attempts} attempts and {timeout:?}: {err}")),
-            |_, _, _| {},
+            |_, _, _, _| {},
         )
         .await
         .unwrap();
@@ -1111,7 +1485,7 @@ mod test {
 
     #[tokio::test]
     async fn retry_dns_operation_does_not_retry_configuration_errors() {
-        let deadline = DnsRetryDeadline::new(Duration::from_secs(1));
+        let deadline = DnsRetryDeadline::new(Duration::from_secs(1), DNS_RETRY_MAX_DELAY);
         let mut calls = 0_u32;
         let mut sleeps = 0_u32;
 
@@ -1127,7 +1501,7 @@ mod test {
             &deadline,
             |err| Error::other(format!("permanent: {err}")),
             |attempts, timeout, err| Error::other(format!("timed out after {attempts} attempts and {timeout:?}: {err}")),
-            |_, _, _| {},
+            |_, _, _, _| {},
         )
         .await
         .unwrap_err();
@@ -1139,7 +1513,7 @@ mod test {
 
     #[tokio::test]
     async fn retry_dns_operation_times_out_with_context() {
-        let deadline = DnsRetryDeadline::new(Duration::ZERO);
+        let deadline = DnsRetryDeadline::new(Duration::ZERO, DNS_RETRY_MAX_DELAY);
         let mut calls = 0_u32;
         let mut sleeps = 0_u32;
 
@@ -1159,7 +1533,7 @@ mod test {
                     "endpoint 'endpoint-a' DNS resolution timed out after {attempts} attempts and {timeout:?}: {err}"
                 ))
             },
-            |_, _, _| {},
+            |_, _, _, _| {},
         )
         .await
         .unwrap_err();
@@ -1816,7 +2190,8 @@ mod test {
 
             match (
                 test_case.expected_err,
-                PoolEndpointList::create_pool_endpoints(test_case.server_addr, &disks_layout).await,
+                PoolEndpointList::create_pool_endpoints_with(test_case.server_addr, &disks_layout, Some(bounded_test_policy()))
+                    .await,
             ) {
                 (None, Err(err)) => panic!("Test {}: error: expected = <nil>, got = {}", test_case.num, err),
                 (Some(err), Ok(_)) => panic!("Test {}: error: expected = {}, got = <nil>", test_case.num, err),
@@ -1834,7 +2209,7 @@ mod test {
                     if Some(&pools.setup_type) != test_case.expected_setup_type.as_ref() {
                         panic!(
                             "Test {}: setupType: expected = {:?}, got = {:?}",
-                            test_case.num, test_case.expected_setup_type, &pools.setup_type
+                            test_case.num, test_case.expected_setup_type, pools.setup_type
                         )
                     }
 
@@ -1871,6 +2246,18 @@ mod test {
 
     fn must_url(s: &str) -> url::Url {
         url::Url::parse(s).unwrap()
+    }
+
+    /// Deterministic bounded policy for endpoint-resolution tests, so they run
+    /// the DNS-IP validation regardless of the CI runner's ambient
+    /// `KUBERNETES_SERVICE_HOST` (which would otherwise select orchestrated mode
+    /// and defer that validation).
+    fn bounded_test_policy() -> StartupTopologyPolicy {
+        StartupTopologyPolicy {
+            mode: StartupTopologyWaitMode::Bounded,
+            wait_timeout: Duration::from_secs(1),
+            retry_max_delay: DNS_RETRY_MAX_DELAY,
+        }
     }
 
     fn get_expected_endpoints(args: Vec<String>, prefix: String) -> (Vec<url::Url>, Vec<bool>) {
@@ -1920,7 +2307,8 @@ mod test {
                 }
             };
 
-            let ret = EndpointServerPools::create_server_endpoints(test_case.0, &disks_layout).await;
+            let ret =
+                EndpointServerPools::create_server_endpoints_with(test_case.0, &disks_layout, Some(bounded_test_policy())).await;
 
             if let Err(err) = ret {
                 if test_case.2 {

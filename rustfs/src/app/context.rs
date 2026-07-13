@@ -20,11 +20,13 @@ mod global;
 mod handles;
 mod interfaces;
 mod runtime_sources;
+mod server_slot;
 mod startup;
 
 pub use global::*;
 pub use handles::*;
 pub use interfaces::*;
+pub use server_slot::ServerContextSlot;
 
 use super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::storage_api::context::runtime::{
@@ -129,7 +131,7 @@ pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> 
 /// Resolve object data cache adapter using AppContext-first precedence.
 #[expect(
     dead_code,
-    reason = "ST-05 exposes the global resolver; app use sites start in later cache phases"
+    reason = "admin/app read sites resolve through the _for_context variant re-exported by runtime_sources"
 )]
 pub(crate) fn resolve_object_data_cache_handle() -> Option<Arc<ObjectDataCacheAdapter>> {
     let context = get_global_app_context();
@@ -153,12 +155,12 @@ pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Opt
 }
 
 /// Resolve notification system handle using AppContext-first precedence.
-pub fn resolve_notification_system() -> Option<&'static NotificationSys> {
+pub fn resolve_notification_system() -> Option<Arc<NotificationSys>> {
     resolve_notification_system_with(get_global_app_context())
 }
 
 /// Resolve notification system handle using an explicit AppContext.
-pub fn resolve_notification_system_for_context(context: Option<&AppContext>) -> Option<&'static NotificationSys> {
+pub fn resolve_notification_system_for_context(context: Option<&AppContext>) -> Option<Arc<NotificationSys>> {
     context.and_then(|context| context.notification_system().handle())
 }
 
@@ -351,7 +353,7 @@ fn resolve_bucket_metadata_handle_with(context: Option<Arc<AppContext>>) -> Opti
     context.and_then(|context| context.bucket_metadata().handle())
 }
 
-fn resolve_notification_system_with(context: Option<Arc<AppContext>>) -> Option<&'static NotificationSys> {
+fn resolve_notification_system_with(context: Option<Arc<AppContext>>) -> Option<Arc<NotificationSys>> {
     context.and_then(|context| context.notification_system().handle())
 }
 
@@ -780,6 +782,10 @@ mod tests {
     impl ActionCredentialInterface for TestActionCredentialInterface {
         fn get(&self) -> Option<Credentials> {
             self.credentials.clone()
+        }
+
+        fn publish(&self, _credentials: Credentials) -> bool {
+            false
         }
     }
 
@@ -1216,6 +1222,7 @@ mod tests {
         assert_eq!(context_server_config_published.load(Ordering::SeqCst), 1);
         assert!(publish_storage_class_config_with(Some(context.clone()), StorageClassConfig::default()));
         assert_eq!(context_storage_class_published.load(Ordering::SeqCst), 1);
+        let slot_context = context.clone();
         assert_eq!(
             resolve_buffer_config_with(Some(context))
                 .expect("context buffer config")
@@ -1258,5 +1265,19 @@ mod tests {
         assert!(!publish_server_config_with(None, Config::new()));
         assert!(!publish_storage_class_config_with(None, StorageClassConfig::default()));
         assert!(resolve_buffer_config_with(None).is_none());
+
+        // backlog#1052 S2: a per-server context slot resolves its *installed*
+        // context — not whatever another server installed — and the first
+        // installation wins.
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(slot_context.clone()), "first install must succeed");
+        assert!(!slot.install(slot_context.clone()), "the slot is install-once");
+        let resolved = slot.app_context().expect("installed slot must resolve its context");
+        assert!(Arc::ptr_eq(&resolved, &slot_context), "the slot must hand back the installed context");
+        let resolved_store = slot.object_store().expect("installed slot must resolve the store");
+        assert!(
+            Arc::ptr_eq(&resolved_store, &slot_context.object_store()),
+            "the slot must dispatch to the installed context's store"
+        );
     }
 }

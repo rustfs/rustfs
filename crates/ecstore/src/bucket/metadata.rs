@@ -813,6 +813,14 @@ impl BucketMetadata {
             return Err(Error::other("errServerNotInitialized"));
         };
 
+        self.save_with_store(store).await
+    }
+
+    /// Persist this metadata through an explicit store (backlog#1052 S7): the
+    /// owning instance's metadata system passes its own store so a second
+    /// server's bucket metadata lands in that server's `.rustfs.sys`, not the
+    /// ambient (first) one. [`BucketMetadata::save`] keeps the ambient default.
+    pub async fn save_with_store(&mut self, store: std::sync::Arc<crate::store::ECStore>) -> Result<()> {
         self.parse_all_configs()?;
 
         let mut buf: Vec<u8> = vec![0; 4];

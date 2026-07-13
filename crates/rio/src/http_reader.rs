@@ -156,13 +156,23 @@ impl std::fmt::Display for InternodeHttpRequestContext {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[error("{kind}: {context}")]
 pub struct InternodeHttpError {
     kind: InternodeHttpErrorKind,
     context: InternodeHttpRequestContext,
     #[source]
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Debug for InternodeHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternodeHttpError")
+            .field("kind", &self.kind)
+            .field("context", &self.context)
+            .field("source_present", &self.source.is_some())
+            .finish()
+    }
 }
 
 impl InternodeHttpError {
@@ -605,11 +615,8 @@ async fn get_http_client(url: &str) -> io::Result<Client> {
 fn internode_request_context(method: &Method, url: &str, operation: Option<&'static str>) -> InternodeHttpRequestContext {
     let target = reqwest::Url::parse(url)
         .ok()
-        .map(|parsed| match parsed.query() {
-            Some(query) => format!("{}?{query}", parsed.path()),
-            None => parsed.path().to_string(),
-        })
-        .unwrap_or_else(|| url.to_string());
+        .map(|parsed| parsed.path().to_string())
+        .unwrap_or_else(|| "<invalid-internode-url>".to_string());
     InternodeHttpRequestContext {
         method: method.to_string(),
         target,
@@ -723,6 +730,12 @@ fn internode_reqwest_error(method: &Method, url: &str, operation: Option<&'stati
     InternodeHttpError::with_source(classified, context, err).into_io_error()
 }
 
+fn internode_reqwest_body_error(method: &Method, url: &str, operation: Option<&'static str>, err: reqwest::Error) -> io::Error {
+    let context = internode_request_context(method, url, operation);
+    let classified = classify_transport_error(&err, err.is_timeout(), err.is_connect(), true);
+    InternodeHttpError::with_source(classified, context, err).into_io_error()
+}
+
 fn internode_classified_error(
     method: &Method,
     url: &str,
@@ -823,8 +836,9 @@ impl HttpReader {
         let stream_error_method = method.clone();
         let stream = resp.bytes_stream().map_err(move |e| {
             record_internode_error(track_internode_metrics, internode_operation);
-            record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
-            internode_reqwest_error(&stream_error_method, &stream_error_url, internode_operation, e)
+            let classified = classify_transport_error(&e, e.is_timeout(), e.is_connect(), true);
+            record_internode_classified_error(track_internode_metrics, internode_operation, classified);
+            internode_reqwest_body_error(&stream_error_method, &stream_error_url, internode_operation, e)
         });
 
         Ok(Self {
@@ -1653,6 +1667,16 @@ mod tests {
         (StatusCode::OK, Body::from_stream(body_stream))
     }
 
+    async fn get_failing_stream(State(state): State<TestState>) -> impl IntoResponse {
+        state.get_count.fetch_add(1, Ordering::SeqCst);
+        let body_stream =
+            stream::once(async { Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")) }).chain(stream::once(async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Err(io::Error::other("stream failed"))
+            }));
+        (StatusCode::OK, Body::from_stream(body_stream))
+    }
+
     async fn reject_head(State(state): State<TestState>) -> impl IntoResponse {
         state.head_count.fetch_add(1, Ordering::SeqCst);
         StatusCode::METHOD_NOT_ALLOWED
@@ -1684,6 +1708,7 @@ mod tests {
             .route("/reject-put", get(get_stream).put(reject_put))
             .route("/stall", get(get_stalling_stream))
             .route("/delayed-first", get(get_delayed_first_chunk))
+            .route("/fail-after-partial", get(get_failing_stream))
             .with_state(state);
 
         let handle = tokio::spawn(async move {
@@ -1918,6 +1943,37 @@ mod tests {
         assert!(source.context().target().contains("/stream"));
     }
 
+    #[tokio::test]
+    async fn http_reader_surfaces_body_error_after_partial_data() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/fail-after-partial");
+        let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None)
+            .await
+            .expect("reader should accept the successful response headers");
+        let mut partial = [0_u8; 7];
+
+        reader
+            .read_exact(&mut partial)
+            .await
+            .expect("partial response bytes should arrive before the terminal error");
+        let err = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("terminal body errors must not become clean EOF");
+
+        assert_eq!(&partial, b"partial");
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("body error should retain internode classification");
+        assert_eq!(source.kind(), InternodeHttpErrorKind::BodyStreamAborted);
+
+        handle.abort();
+    }
+
     #[test]
     fn classify_http_status_marks_retryable_gateway_errors() {
         let unavailable = classify_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE);
@@ -1961,7 +2017,36 @@ mod tests {
             InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE)
         );
         assert_eq!(source.context().method(), "PUT");
-        assert!(source.context().target().contains(PUT_FILE_STREAM_PATH));
+        assert_eq!(source.context().target(), PUT_FILE_STREAM_PATH);
+        assert!(!err.to_string().contains("disk-a"));
+    }
+
+    #[test]
+    fn internode_request_context_redacts_malformed_targets() {
+        let context =
+            internode_request_context(&Method::GET, "not a url?disk=/sensitive/path", Some(INTERNODE_OPERATION_READ_FILE_STREAM));
+
+        assert_eq!(context.target(), "<invalid-internode-url>");
+        assert!(!context.to_string().contains("sensitive"));
+    }
+
+    #[test]
+    fn internode_http_error_debug_redacts_source_details() {
+        let context = InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: WALK_DIR_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_WALK_DIR),
+        };
+        let error = InternodeHttpError::with_source(
+            InternodeHttpErrorKind::BodyStreamAborted,
+            context,
+            io::Error::other("http://node/rustfs/rpc/walk_dir?disk=/sensitive/path&token=private"),
+        );
+        let debug = format!("{error:?}");
+
+        assert!(debug.contains("source_present: true"));
+        assert!(!debug.contains("sensitive"));
+        assert!(!debug.contains("private"));
     }
 
     #[test]

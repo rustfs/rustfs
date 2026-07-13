@@ -24,8 +24,8 @@ ExecStart=/usr/local/bin/rustfs server
 
 # service log configuration
 LogsDirectory=rustfs
-StandardOutput=append:/var/log/rustfs/rustfs.log
-StandardError=append:/var/log/rustfs/rustfs-err.log
+StandardOutput=journal
+StandardError=journal
 
 # resource constraints
 LimitNOFILE=1048576

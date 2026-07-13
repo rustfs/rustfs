@@ -25,13 +25,33 @@ pub enum ObjectDataCacheConfigError {
     #[error("object data cache max_entry_bytes must be greater than 0")]
     ZeroMaxEntryBytes,
 
+    /// The configured entry size exceeds the moka weigher's u32 accounting range.
+    #[error("object data cache max_entry_bytes must stay below 4 GiB so the capacity weigher does not under-count entries")]
+    MaxEntryBytesTooLarge,
+
+    /// The configured entry size cannot fit inside the explicit byte capacity.
+    #[error("object data cache max_entry_bytes plus weigher overhead must not exceed max_bytes")]
+    MaxEntryBytesExceedsMaxBytes,
+
+    /// The configured entry size exceeds the resolved (derived) cache capacity.
+    #[error("object data cache max_entry_bytes must not exceed the resolved cache capacity")]
+    MaxEntryBytesExceedsCapacity,
+
     /// The configured time-to-live cannot be zero.
     #[error("object data cache ttl_secs must be greater than 0")]
     ZeroTimeToLiveSecs,
 
+    /// The configured time-to-live exceeds the supported upper bound.
+    #[error("object data cache ttl_secs must not exceed 2592000 seconds (30 days)")]
+    TimeToLiveTooLarge,
+
     /// The configured time-to-idle cannot be zero.
     #[error("object data cache time_to_idle_secs must be greater than 0")]
     ZeroTimeToIdleSecs,
+
+    /// The configured time-to-idle exceeds the supported upper bound.
+    #[error("object data cache time_to_idle_secs must not exceed 2592000 seconds (30 days)")]
+    TimeToIdleTooLarge,
 
     /// The configured minimum free memory percentage exceeded the supported range.
     #[error("object data cache min_free_memory_percent must be in 1..=100")]
@@ -52,6 +72,10 @@ pub enum ObjectDataCacheConfigError {
     /// The configured identity key-set cap exceeded the supported range.
     #[error("object data cache identity_keys_max must be greater than 0")]
     ZeroIdentityKeysMax,
+
+    /// A single-key identity budget evicts the previous key on every fill.
+    #[error("object data cache identity_keys_max must be at least 2")]
+    IdentityKeysMaxTooSmall,
 
     /// Failed to resolve a non-zero cache capacity from the runtime environment.
     #[error("object data cache could not resolve a positive max capacity")]

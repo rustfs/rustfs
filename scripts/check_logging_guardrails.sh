@@ -94,7 +94,8 @@ checked_files=(
   "crates/protocols/src/swift/quota.rs"
   "crates/protocols/src/swift/symlink.rs"
   "crates/protocols/src/common/gateway.rs"
-  "crates/obs/src/telemetry/dial9.rs"
+  "crates/obs/src/telemetry/dial9/config.rs"
+  "crates/obs/src/telemetry/dial9/enabled.rs"
   "crates/obs/src/telemetry/local.rs"
   "crates/obs/src/metrics/scheduler.rs"
   "crates/obs/src/cleaner/core.rs"
@@ -651,5 +652,50 @@ for pattern in "${forbidden_patterns[@]}"; do
     exit 1
   fi
 done
+
+systemd_unit="deploy/build/rustfs.service"
+if rg -n '^Standard(Output|Error)=append:.*rustfs.*\.log$' "$systemd_unit" >/dev/null; then
+  echo "❌ logging guardrail violation: systemd must not append stdout/stderr to a RustFS-managed rolling log" >&2
+  rg -n '^Standard(Output|Error)=append:.*rustfs.*\.log$' "$systemd_unit" >&2
+  exit 1
+fi
+
+for directive in 'StandardOutput=journal' 'StandardError=journal'; do
+  if ! rg -n -F -- "$directive" "$systemd_unit" >/dev/null; then
+    echo "❌ logging guardrail violation: missing '$directive' in $systemd_unit" >&2
+    exit 1
+  fi
+done
+
+disk_logging_files=(
+  "crates/ecstore/src/disk/mod.rs"
+  "crates/ecstore/src/disk/local.rs"
+  "crates/ecstore/src/cluster/rpc/remote_disk.rs"
+)
+
+for file in "${disk_logging_files[@]}"; do
+  unexpected_instrumentation="$(rg -n '#\[tracing::instrument' "$file" | rg -v 'level = "trace", skip_all' || true)"
+  if [[ -n "$unexpected_instrumentation" ]]; then
+    echo "❌ logging guardrail violation: disk instrumentation must be TRACE-only and skip all arguments in $file" >&2
+    echo "$unexpected_instrumentation" >&2
+    exit 1
+  fi
+done
+
+if rg -n -U 'debug!\([\s\S]{0,600}"Remote disk RPC started"' crates/ecstore/src/cluster/rpc/remote_disk.rs >/dev/null; then
+  echo "❌ logging guardrail violation: successful remote disk RPC events must not be emitted at DEBUG" >&2
+  exit 1
+fi
+
+if rg -n -F 'debug!("list_dir' crates/ecstore/src/cluster/rpc/remote_disk.rs >/dev/null; then
+  echo "❌ logging guardrail violation: RemoteDisk list_dir must not emit per-RPC DEBUG logs" >&2
+  exit 1
+fi
+
+stdout_sink_calls="$(rg -n -F 'validate_stdout_sink(&file_appender)' crates/obs/src/telemetry/local.rs crates/obs/src/telemetry/otel.rs | wc -l | tr -d ' ')"
+if [[ "$stdout_sink_calls" != "2" ]]; then
+  echo "❌ logging guardrail violation: local and OTLP file logging must both validate stdout sink ownership" >&2
+  exit 1
+fi
 
 echo "✅ Logging guardrails check passed"

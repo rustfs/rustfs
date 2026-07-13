@@ -1090,10 +1090,18 @@ struct TableMaintenanceHeartbeatRef<'a> {
     worker_id: &'a str,
 }
 
+struct TableMaintenancePreflightContext<'a> {
+    table_bucket: &'a str,
+    namespace: &'a Namespace,
+    table: &'a IdentifierSegment,
+    entry: &'a TableEntry,
+}
+
 struct TableMaintenanceWorkerControlReport<'a> {
     table_bucket: &'a str,
-    namespace: &'a str,
-    table: &'a str,
+    namespace: &'a Namespace,
+    table: &'a IdentifierSegment,
+    entry: &'a TableEntry,
     worker_id: String,
     effective: &'a TableMaintenanceEffectiveConfig,
     status: TableMetadataMaintenanceJobStatus,
@@ -1103,8 +1111,9 @@ struct TableMaintenanceWorkerControlReport<'a> {
 
 struct TableMaintenanceSchedulerControlReport<'a> {
     table_bucket: &'a str,
-    namespace: &'a str,
-    table: &'a str,
+    namespace: &'a Namespace,
+    table: &'a IdentifierSegment,
+    entry: &'a TableEntry,
     scheduler_id: String,
     effective: &'a TableMaintenanceEffectiveConfig,
     status: TableMetadataMaintenanceJobStatus,
@@ -4069,11 +4078,22 @@ where
             )));
         };
 
+        self.get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+            .await
+    }
+
+    async fn get_effective_table_maintenance_config_for_entry_unlocked(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        entry: &TableEntry,
+    ) -> TableCatalogStoreResult<TableMaintenanceEffectiveConfig> {
         let table_config_path = self
             .paths
-            .table_maintenance_config_path(table_bucket, &namespace, &table, &entry.table_id);
+            .table_maintenance_config_path(table_bucket, namespace, table, &entry.table_id);
         if let Some((config, _)) = self
-            .read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &table_config_path)
+            .read_entry_unlocked::<TableMaintenanceConfig>(self.catalog_bucket(), &table_config_path)
             .await?
         {
             validate_table_maintenance_config(&config)?;
@@ -4085,7 +4105,7 @@ where
 
         let bucket_config_path = self.paths.table_bucket_maintenance_config_path(table_bucket);
         if let Some((config, _)) = self
-            .read_entry::<TableMaintenanceConfig>(self.catalog_bucket(), &bucket_config_path)
+            .read_entry_unlocked::<TableMaintenanceConfig>(self.catalog_bucket(), &bucket_config_path)
             .await?
         {
             validate_table_maintenance_config(&config)?;
@@ -4175,22 +4195,46 @@ where
                 table.as_str()
             )));
         };
-        let job_path = match job_id {
+
+        self.get_table_metadata_maintenance_report_for_entry_unlocked(table_bucket, &namespace, &table, &entry.table_id, job_id)
+            .await
+    }
+
+    async fn get_table_metadata_maintenance_report_for_entry_unlocked(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+        job_id: &str,
+    ) -> TableCatalogStoreResult<Option<TableMetadataMaintenanceReport>> {
+        let job_path = self.table_metadata_maintenance_report_path(table_bucket, namespace, table, table_id, job_id);
+        self.read_entry_unlocked::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &job_path)
+            .await
+            .map(|entry| entry.map(|(report, _)| table_maintenance_report_with_recommended_actions(report)))
+    }
+
+    fn table_metadata_maintenance_report_path(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+        job_id: &str,
+    ) -> String {
+        match job_id {
             MAINTENANCE_JOB_ALIAS_LATEST => {
                 self.paths
-                    .table_maintenance_latest_job_path(table_bucket, &namespace, &table, &entry.table_id)
+                    .table_maintenance_latest_job_path(table_bucket, namespace, table, table_id)
             }
             MAINTENANCE_JOB_ALIAS_CURRENT => {
                 self.paths
-                    .table_maintenance_current_job_path(table_bucket, &namespace, &table, &entry.table_id)
+                    .table_maintenance_current_job_path(table_bucket, namespace, table, table_id)
             }
             _ => self
                 .paths
-                .table_maintenance_job_path(table_bucket, &namespace, &table, &entry.table_id, job_id),
-        };
-        self.read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &job_path)
-            .await
-            .map(|entry| entry.map(|(report, _)| table_maintenance_report_with_recommended_actions(report)))
+                .table_maintenance_job_path(table_bucket, namespace, table, table_id, job_id),
+        }
     }
 
     pub(crate) async fn get_table_maintenance_scheduler_report(
@@ -4319,22 +4363,40 @@ where
         let namespace_name = namespace.public_name();
         let table_name = table.as_str().to_string();
 
-        let effective = {
+        let preflight = {
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
-            match self
-                .table_metadata_maintenance_scheduler_preflight(table_bucket, &namespace_name, &table_name, &scheduler_id, now)
-                .await?
-            {
-                TableMaintenanceSchedulerPreflight::Ready(effective) => effective,
-                TableMaintenanceSchedulerPreflight::Complete(report) => {
-                    let scheduler = self
-                        .get_table_maintenance_scheduler_report_at(table_bucket, &namespace_name, &table_name, now)
-                        .await?;
-                    return Ok(TableMaintenanceSchedulerRunResult {
-                        report: *report,
-                        scheduler,
-                    });
-                }
+            let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket, namespace_name, table_name
+                )));
+            };
+            let effective = self
+                .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+                .await?;
+            self.table_metadata_maintenance_scheduler_preflight(
+                TableMaintenancePreflightContext {
+                    table_bucket,
+                    namespace: &namespace,
+                    table: &table,
+                    entry: &entry,
+                },
+                &scheduler_id,
+                now,
+                effective,
+            )
+            .await?
+        };
+        let effective = match preflight {
+            TableMaintenanceSchedulerPreflight::Ready(effective) => effective,
+            TableMaintenanceSchedulerPreflight::Complete(report) => {
+                let scheduler = self
+                    .get_table_maintenance_scheduler_report_at(table_bucket, &namespace_name, &table_name, now)
+                    .await?;
+                return Ok(TableMaintenanceSchedulerRunResult {
+                    report: *report,
+                    scheduler,
+                });
             }
         };
 
@@ -4349,8 +4411,27 @@ where
 
         let report = {
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+            let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket, namespace_name, table_name
+                )));
+            };
+            let effective = self
+                .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+                .await?;
             match self
-                .table_metadata_maintenance_scheduler_preflight(table_bucket, &namespace_name, &table_name, &scheduler_id, now)
+                .table_metadata_maintenance_scheduler_preflight(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &scheduler_id,
+                    now,
+                    effective,
+                )
                 .await?
             {
                 TableMaintenanceSchedulerPreflight::Ready(effective) => {
@@ -4359,12 +4440,6 @@ where
                             "maintenance config changed before scheduler claim".to_string(),
                         ));
                     }
-                    let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
-                        return Err(TableCatalogStoreError::NotFound(format!(
-                            "table {}/{}/{}",
-                            table_bucket, namespace_name, table_name
-                        )));
-                    };
                     if entry.metadata_location != report.current_metadata_location {
                         return Err(TableCatalogStoreError::Conflict(
                             "current metadata location changed before maintenance scheduler claim".to_string(),
@@ -4444,8 +4519,20 @@ where
                 })?
         } else {
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+            let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket, namespace_name, table_name
+                )));
+            };
             let Some(mut report) = self
-                .get_table_metadata_maintenance_report(table_bucket, &namespace_name, &table_name, MAINTENANCE_JOB_ALIAS_CURRENT)
+                .get_table_metadata_maintenance_report_for_entry_unlocked(
+                    table_bucket,
+                    &namespace,
+                    &table,
+                    &entry.table_id,
+                    MAINTENANCE_JOB_ALIAS_CURRENT,
+                )
                 .await?
             else {
                 return Err(TableCatalogStoreError::NotFound(format!(
@@ -4552,21 +4639,18 @@ where
 
     async fn table_metadata_maintenance_scheduler_preflight(
         &self,
-        table_bucket: &str,
-        namespace: &str,
-        table: &str,
+        context: TableMaintenancePreflightContext<'_>,
         scheduler_id: &str,
         now: OffsetDateTime,
+        effective: TableMaintenanceEffectiveConfig,
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerPreflight> {
-        let effective = self
-            .get_effective_table_maintenance_config(table_bucket, namespace, table)
-            .await?;
         if !effective.config.background_enabled {
             let report = self
                 .put_table_metadata_maintenance_scheduler_control_report(TableMaintenanceSchedulerControlReport {
-                    table_bucket,
-                    namespace,
-                    table,
+                    table_bucket: context.table_bucket,
+                    namespace: context.namespace,
+                    table: context.table,
+                    entry: context.entry,
                     scheduler_id: scheduler_id.to_string(),
                     effective: &effective,
                     status: TableMetadataMaintenanceJobStatus::Disabled,
@@ -4579,9 +4663,10 @@ where
         if effective.config.worker_paused {
             let report = self
                 .put_table_metadata_maintenance_scheduler_control_report(TableMaintenanceSchedulerControlReport {
-                    table_bucket,
-                    namespace,
-                    table,
+                    table_bucket: context.table_bucket,
+                    namespace: context.namespace,
+                    table: context.table,
+                    entry: context.entry,
                     scheduler_id: scheduler_id.to_string(),
                     effective: &effective,
                     status: TableMetadataMaintenanceJobStatus::Paused,
@@ -4593,7 +4678,13 @@ where
         }
 
         if let Some(current) = self
-            .get_table_metadata_maintenance_report(table_bucket, namespace, table, MAINTENANCE_JOB_ALIAS_CURRENT)
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                context.table_bucket,
+                context.namespace,
+                context.table,
+                &context.entry.table_id,
+                MAINTENANCE_JOB_ALIAS_CURRENT,
+            )
             .await?
         {
             if matches!(current.job.status, TableMetadataMaintenanceJobStatus::Running) {
@@ -4653,8 +4744,27 @@ where
 
         let (effective, queued) = {
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+            let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket, namespace_name, table_name
+                )));
+            };
+            let effective = self
+                .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+                .await?;
             match self
-                .table_metadata_maintenance_worker_preflight(table_bucket, &namespace_name, &table_name, &worker_id, now)
+                .table_metadata_maintenance_worker_preflight(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &worker_id,
+                    now,
+                    effective,
+                )
                 .await?
             {
                 TableMaintenanceWorkerPreflight::Ready { effective, queued } => (effective, queued),
@@ -4676,8 +4786,27 @@ where
 
         let (report, effective, delete) = {
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+            let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket, namespace_name, table_name
+                )));
+            };
+            let effective = self
+                .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+                .await?;
             let (effective, queued) = match self
-                .table_metadata_maintenance_worker_preflight(table_bucket, &namespace_name, &table_name, &worker_id, now)
+                .table_metadata_maintenance_worker_preflight(
+                    TableMaintenancePreflightContext {
+                        table_bucket,
+                        namespace: &namespace,
+                        table: &table,
+                        entry: &entry,
+                    },
+                    &worker_id,
+                    now,
+                    effective,
+                )
                 .await?
             {
                 TableMaintenanceWorkerPreflight::Ready { effective, queued } => (effective, queued),
@@ -4697,12 +4826,6 @@ where
                     "maintenance config changed before worker claim".to_string(),
                 ));
             }
-            let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
-                return Err(TableCatalogStoreError::NotFound(format!(
-                    "table {}/{}/{}",
-                    table_bucket, namespace_name, table_name
-                )));
-            };
             if entry.metadata_location != report.current_metadata_location {
                 return Err(TableCatalogStoreError::Conflict(
                     "current metadata location changed before maintenance worker claim".to_string(),
@@ -4755,21 +4878,18 @@ where
 
     async fn table_metadata_maintenance_worker_preflight(
         &self,
-        table_bucket: &str,
-        namespace: &str,
-        table: &str,
+        context: TableMaintenancePreflightContext<'_>,
         worker_id: &str,
         now: OffsetDateTime,
+        effective: TableMaintenanceEffectiveConfig,
     ) -> TableCatalogStoreResult<TableMaintenanceWorkerPreflight> {
-        let effective = self
-            .get_effective_table_maintenance_config(table_bucket, namespace, table)
-            .await?;
         if !effective.config.background_enabled {
             let report = self
                 .put_table_metadata_maintenance_worker_control_report(TableMaintenanceWorkerControlReport {
-                    table_bucket,
-                    namespace,
-                    table,
+                    table_bucket: context.table_bucket,
+                    namespace: context.namespace,
+                    table: context.table,
+                    entry: context.entry,
                     worker_id: worker_id.to_string(),
                     effective: &effective,
                     status: TableMetadataMaintenanceJobStatus::Disabled,
@@ -4782,9 +4902,10 @@ where
         if effective.config.worker_paused {
             let report = self
                 .put_table_metadata_maintenance_worker_control_report(TableMaintenanceWorkerControlReport {
-                    table_bucket,
-                    namespace,
-                    table,
+                    table_bucket: context.table_bucket,
+                    namespace: context.namespace,
+                    table: context.table,
+                    entry: context.entry,
                     worker_id: worker_id.to_string(),
                     effective: &effective,
                     status: TableMetadataMaintenanceJobStatus::Paused,
@@ -4796,7 +4917,13 @@ where
         }
 
         if let Some(current) = self
-            .get_table_metadata_maintenance_report(table_bucket, namespace, table, MAINTENANCE_JOB_ALIAS_CURRENT)
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                context.table_bucket,
+                context.namespace,
+                context.table,
+                &context.entry.table_id,
+                MAINTENANCE_JOB_ALIAS_CURRENT,
+            )
             .await?
         {
             if matches!(current.job.status, TableMetadataMaintenanceJobStatus::Running) {
@@ -4864,11 +4991,23 @@ where
         let table = parse_table_for_store(heartbeat.table)?;
         let table_path = self.paths.table_entry_path(heartbeat.table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
-        let Some(mut report) = self
-            .get_table_metadata_maintenance_report(
+        let Some((entry, _)) = self
+            .read_table_with_etag_unlocked(heartbeat.table_bucket, &namespace, &table)
+            .await?
+        else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
                 heartbeat.table_bucket,
-                &namespace.public_name(),
-                table.as_str(),
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        let Some(mut report) = self
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                heartbeat.table_bucket,
+                &namespace,
+                &table,
+                &entry.table_id,
                 MAINTENANCE_JOB_ALIAS_CURRENT,
             )
             .await?
@@ -4940,28 +5079,17 @@ where
         &self,
         control: TableMaintenanceSchedulerControlReport<'_>,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        let namespace = parse_namespace_for_store(control.namespace)?;
-        let table = parse_table_for_store(control.table)?;
-        let table_path = self.paths.table_entry_path(control.table_bucket, &namespace, &table);
-        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                control.table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
         let timestamp = maintenance_timestamp(control.now);
         let cleanup_watermark_unix_seconds =
             (control.now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS)).unix_timestamp();
-        let current_metadata_location = entry.metadata_location.clone();
+        let current_metadata_location = control.entry.metadata_location.clone();
         let report = TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
                 job_id: Uuid::new_v4().to_string(),
                 table_bucket: control.table_bucket.to_string(),
-                namespace: namespace.public_name(),
-                table: table.as_str().to_string(),
-                table_id: entry.table_id,
+                namespace: control.namespace.public_name(),
+                table: control.table.as_str().to_string(),
+                table_id: control.entry.table_id.clone(),
                 operation: TableMetadataMaintenanceOperation::DryRun,
                 status: control.status,
                 failure_reason: Some(control.reason.to_string()),
@@ -4981,7 +5109,7 @@ where
                 started_at: None,
                 finished_at: Some(timestamp),
                 current_metadata_location: current_metadata_location.clone(),
-                current_generation: entry.generation,
+                current_generation: control.entry.generation,
                 retain_recent_metadata_files: control.effective.config.retain_recent_metadata_files,
                 safety_window_seconds: TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS,
                 cleanup_watermark_unix_seconds,
@@ -5028,28 +5156,17 @@ where
         &self,
         control: TableMaintenanceWorkerControlReport<'_>,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        let namespace = parse_namespace_for_store(control.namespace)?;
-        let table = parse_table_for_store(control.table)?;
-        let table_path = self.paths.table_entry_path(control.table_bucket, &namespace, &table);
-        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                control.table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
         let timestamp = maintenance_timestamp(control.now);
         let cleanup_watermark_unix_seconds =
             (control.now - Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS)).unix_timestamp();
-        let current_metadata_location = entry.metadata_location.clone();
+        let current_metadata_location = control.entry.metadata_location.clone();
         let report = TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
                 job_id: Uuid::new_v4().to_string(),
                 table_bucket: control.table_bucket.to_string(),
-                namespace: namespace.public_name(),
-                table: table.as_str().to_string(),
-                table_id: entry.table_id,
+                namespace: control.namespace.public_name(),
+                table: control.table.as_str().to_string(),
+                table_id: control.entry.table_id.clone(),
                 operation: TableMetadataMaintenanceOperation::DryRun,
                 status: control.status,
                 failure_reason: Some(control.reason.to_string()),
@@ -5069,7 +5186,7 @@ where
                 started_at: Some(timestamp.clone()),
                 finished_at: Some(timestamp),
                 current_metadata_location: current_metadata_location.clone(),
-                current_generation: entry.generation,
+                current_generation: control.entry.generation,
                 retain_recent_metadata_files: control.effective.config.retain_recent_metadata_files,
                 safety_window_seconds: TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS,
                 cleanup_watermark_unix_seconds,

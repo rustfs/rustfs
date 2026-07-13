@@ -112,4 +112,9 @@ jobs:
         with:
           fail-on-severity: moderate
           allow-ghsas: GHSA-2f9f-gq7v-9h6m
+          # rustfs-uring is a first-party Apache-2.0 crate, now published on
+          # crates.io (backlog#1104) rather than pulled as a git dependency.
+          # Scope the allow to the exact pinned version so a version bump forces a
+          # conscious re-review of the license/provenance claim (backlog#1181).
+          allow-dependencies-licenses: pkg:cargo/rustfs-uring@0.1.0
           comment-summary-in-pr: always

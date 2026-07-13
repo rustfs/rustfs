@@ -150,6 +150,7 @@ pub fn new_getobjectreader<'a>(
                 object_info: oi.clone(),
                 stream: Box::new(input_reader),
                 buffered_body: None,
+                body_source: Default::default(),
             };
             r
             //})
