@@ -33,6 +33,15 @@ pub static AUDIT_FAILED_MESSAGES_MD: LazyLock<MetricDescriptor> = LazyLock::new(
     )
 });
 
+pub static AUDIT_FAILED_STORE_LENGTH_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::AuditFailedStoreLength,
+        "Number of audit messages held in the failed-events store for target",
+        &[TARGET_ID],
+        subsystems::AUDIT,
+    )
+});
+
 pub static AUDIT_TARGET_QUEUE_LENGTH_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::AuditTargetQueueLength,

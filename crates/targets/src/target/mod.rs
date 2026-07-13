@@ -14,7 +14,7 @@
 
 use crate::arn::TargetID;
 use crate::plugin::PluginEvent;
-use crate::store::{Key, QueueStore, Store};
+use crate::store::{FailedEventStore, Key, QueueStore, Store};
 use crate::{StoreError, TargetError, TargetLog};
 use async_trait::async_trait;
 use rustfs_s3_types::EventName;
@@ -58,6 +58,7 @@ pub(crate) fn redacted_optional_secret(value: Option<&str>) -> &'static str {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TargetDeliverySnapshot {
     pub failed_messages: u64,
+    pub failed_store_length: u64,
     pub queue_length: u64,
     pub total_messages: u64,
 }
@@ -83,9 +84,10 @@ impl TargetDeliveryCounters {
     }
 
     #[inline]
-    pub fn snapshot(&self, queue_length: u64) -> TargetDeliverySnapshot {
+    pub fn snapshot(&self, queue_length: u64, failed_store_length: u64) -> TargetDeliverySnapshot {
         TargetDeliverySnapshot {
             failed_messages: self.failed_messages.load(Ordering::Relaxed),
+            failed_store_length,
             queue_length,
             total_messages: self.total_messages.load(Ordering::Relaxed),
         }
@@ -159,6 +161,25 @@ where
     /// Returns the store associated with the target (if any)
     fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)>;
 
+    /// Returns the failed-events store capability when the target records terminal failures.
+    ///
+    /// The default is no capability, so a target that never parks a terminal entry runs no failed-store
+    /// maintenance and reports zero failed-store depth.
+    fn failed_store(&self) -> Option<&dyn FailedEventStore> {
+        None
+    }
+
+    /// Moves a terminally failed entry to the target's failed-events store, returning true when the entry was handled. A target without a terminal-failure store declines the move and the entry stays live.
+    async fn handle_terminal_failure(
+        &self,
+        _store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send),
+        _key: &Key,
+        _error: &TargetError,
+        _retry_count: u32,
+    ) -> bool {
+        false
+    }
+
     /// Returns the type of the target
     fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync>;
 
@@ -174,6 +195,7 @@ where
     /// Returns a read-only delivery snapshot for metrics collection.
     fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
         TargetDeliverySnapshot {
+            failed_store_length: self.failed_store().map_or(0, |failed_store| failed_store.failed_len() as u64),
             queue_length: self.store().map_or(0, |store| store.len() as u64),
             ..TargetDeliverySnapshot::default()
         }
@@ -202,6 +224,55 @@ pub struct QueuedPayloadMeta {
     pub content_type: String,
     pub queued_at_unix_ms: u64,
     pub payload_len: usize,
+    /// Stable per-entry deduplication identifier sent as the NATS JetStream Nats-Msg-Id header.
+    /// Empty for every non-JetStream target and for entries queued before JetStream was enabled, so
+    /// it is skipped on serialization and absent stored entries decode to an empty value. This keeps
+    /// the stored bytes identical to entries written without the field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dedup_id: String,
+
+    /// Set only on an entry written to the failed-events store. None on every live-queue entry, so it
+    /// is skipped on serialization and a live entry decodes with no failure metadata, keeping live
+    /// stored bytes identical to entries written without the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailedEntryMeta>,
+}
+
+/// The error class recorded on a failed-store entry. Only a non-retryable publish error reaches the
+/// failed store, so the class confirms a terminal cause for an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailedErrorClass {
+    /// A non-retryable publish error. Replaying it without fixing the underlying configuration repeats
+    /// the failure.
+    Terminal,
+}
+
+impl FailedErrorClass {
+    /// Stable lowercase tag used in structured logs and operator tooling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FailedErrorClass::Terminal => "terminal",
+        }
+    }
+}
+
+/// Failure metadata added to a queued payload when it is moved to the failed-events store, carried
+/// inside the existing QueuedPayload meta so the failed entry decodes through the same reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedEntryMeta {
+    /// The failure class recorded for operator triage. A failed-store entry is always terminal.
+    pub error_class: FailedErrorClass,
+    /// An allowlisted, credential-free summary of the failure for operator diagnosis. Never the raw
+    /// error rendering.
+    pub error_detail: String,
+    /// The stored dedup identifier, recording the id the publish attempted. A failed record is never
+    /// republished.
+    pub nats_msg_id: String,
+    /// The instant the entry entered the failed store, a diagnostic field for operator triage. Expiry
+    /// uses the filesystem modification time, not this value.
+    pub failed_at_unix_ms: u64,
+    /// The replay attempt count recorded at the terminal failure.
+    pub retry_count: u32,
 }
 
 impl QueuedPayloadMeta {
@@ -219,6 +290,8 @@ impl QueuedPayloadMeta {
             content_type: content_type.into(),
             queued_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             payload_len,
+            dedup_id: String::new(),
+            failure: None,
         }
     }
 
@@ -420,14 +493,13 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 
 /// Maps a target-id component to a filesystem-safe queue directory name.
 ///
-/// Path-unsafe characters are replaced with `_`. Because that replacement is
-/// lossy, two distinct ids (e.g. `a/b` and `a_b`) could otherwise collapse to
-/// the same directory and interleave their persisted events. To prevent that,
-/// whenever any character had to be replaced we append a short hash of the
-/// original component, guaranteeing distinct ids map to distinct directories.
+/// Path-unsafe characters are replaced with an underscore. That replacement is lossy, so two
+/// distinct ids (for example a/b and a_b) could otherwise collapse to the same directory and
+/// interleave their persisted events. A short hash of the original component is appended whenever any
+/// character was replaced, so distinct ids map to distinct directories.
 ///
-/// Ids that are already path-safe are returned unchanged, preserving the
-/// on-disk directory layout for existing deployments (no queue migration).
+/// Ids that are already path-safe are returned unchanged, preserving the on-disk directory layout for
+/// existing deployments.
 pub(crate) fn sanitize_queue_dir_component(component: &str) -> String {
     let mut sanitized = String::with_capacity(component.len());
     let mut lossy = false;
@@ -441,7 +513,7 @@ pub(crate) fn sanitize_queue_dir_component(component: &str) -> String {
     }
 
     if sanitized.is_empty() {
-        // An entirely non-safe id would otherwise all collapse to "_"; key it by
+        // An entirely non-safe id would otherwise collapse to a single underscore. Key it by
         // the original bytes so distinct ids stay distinct.
         return format!("_{:016x}", fnv1a_hash(component.as_bytes()));
     }
@@ -529,10 +601,20 @@ pub(crate) fn open_target_queue_store(
     target_id: &TargetID,
     open_context: &str,
 ) -> Result<Option<BoxedQueuedStore>, TargetError> {
-    fn boxed_queue_store(store: QueueStore<QueuedPayload>) -> BoxedQueuedStore {
-        Box::new(store)
-    }
+    let store = open_target_queue_store_typed(queue_dir, queue_limit, target_type, target_type_label, target_id, open_context)?;
+    Ok(store.map(|store| Box::new(store) as BoxedQueuedStore))
+}
 
+/// Opens the queue store and returns the concrete QueueStore, so a target that needs its typed
+/// failed-store capability holds it directly rather than through the type-erased Store handle.
+pub(crate) fn open_target_queue_store_typed(
+    queue_dir: &str,
+    queue_limit: u64,
+    target_type: TargetType,
+    target_type_label: &str,
+    target_id: &TargetID,
+    open_context: &str,
+) -> Result<Option<QueueStore<QueuedPayload>>, TargetError> {
     if queue_dir.is_empty() {
         return Ok(None);
     }
@@ -547,7 +629,7 @@ pub(crate) fn open_target_queue_store(
         .open()
         .map_err(|err| TargetError::Storage(format!("{open_context}: {err}")))?;
 
-    Ok(Some(boxed_queue_store(store)))
+    Ok(Some(store))
 }
 
 pub(crate) fn persist_queued_payload_to_store(
@@ -584,13 +666,103 @@ pub(crate) fn mark_target_disconnected_on_connectivity_error(connected: &AtomicB
 }
 
 pub(crate) fn delete_stored_payload(
-    store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync),
+    store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send),
     key: &Key,
 ) -> Result<(), TargetError> {
     match store.del(key) {
         Ok(()) | Err(StoreError::NotFound) => Ok(()),
         Err(err) => Err(TargetError::Storage(format!("Failed to delete event from store: {err}"))),
     }
+}
+
+/// Upper bound on the characters retained from a classified error so a failed-store entry and its
+/// alarm carry a diagnosable summary without an unbounded message.
+const FAILED_ERROR_DETAIL_MAX_LEN: usize = 256;
+
+/// Fallback label substituted for a JetStreamPublish detail that falls outside the fixed vocabulary.
+const UNRECOGNIZED_DETAIL_LABEL: &str = "unrecognized detail";
+
+/// Restricts a JetStreamPublish detail to the fixed vocabulary at the persistence boundary. A detail
+/// of lowercase letters, digits, space, underscore, and colon passes verbatim, any other content is
+/// replaced with a fixed fallback label.
+fn sanitize_failed_detail(detail: &str) -> &str {
+    let in_vocabulary = !detail.is_empty()
+        && detail.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, ' ' | '_' | ':')
+        });
+    if in_vocabulary { detail } else { UNRECOGNIZED_DETAIL_LABEL }
+}
+
+/// Builds a credential-free diagnostic string for a failed entry from a classified error. The
+/// publish-error detail passes through the persistence-boundary sanitizer, a non-publish error
+/// contributes only its variant category, and any embedded value is redacted. The result is
+/// length-bounded at a character boundary.
+pub(crate) fn build_failed_error_detail(error: &TargetError) -> String {
+    let summary = match error {
+        // The publish detail is sanitized to the fixed vocabulary at the persistence boundary.
+        TargetError::JetStreamPublish { detail, .. } => format!("jetstream_publish: {}", sanitize_failed_detail(detail)),
+        TargetError::Dropped(reason) => format!("dropped: {}", redacted_secret(reason)),
+        // Every other variant carries a free-form message that may name a host, path, or credential.
+        // Only the variant category is recorded, with any embedded value redacted.
+        TargetError::Network(value) => format!("network: {}", redacted_secret(value)),
+        TargetError::Request(value) => format!("request: {}", redacted_secret(value)),
+        TargetError::Timeout(value) => format!("timeout: {}", redacted_secret(value)),
+        TargetError::Storage(value) => format!("storage: {}", redacted_secret(value)),
+        TargetError::Authentication(_) => "authentication".to_string(),
+        TargetError::Configuration(_) => "configuration".to_string(),
+        other => format!("error: {}", redacted_secret(&other_error_category(other))),
+    };
+
+    let mut detail = summary;
+    truncate_to_char_boundary(&mut detail, FAILED_ERROR_DETAIL_MAX_LEN);
+    detail
+}
+
+/// Truncates the string to at most max_len bytes, stepping the cut down to the nearest character
+/// boundary so a multi-byte character straddling the cap is dropped whole rather than split.
+fn truncate_to_char_boundary(value: &mut String, max_len: usize) {
+    if value.len() <= max_len {
+        return;
+    }
+    let mut cut = max_len;
+    while !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    value.truncate(cut);
+}
+
+/// Names the category of an otherwise free-form error without revealing its message.
+fn other_error_category(error: &TargetError) -> String {
+    match error {
+        TargetError::Encoding(_) => "encoding".to_string(),
+        TargetError::Serialization(_) => "serialization".to_string(),
+        TargetError::Initialization(_) => "initialization".to_string(),
+        TargetError::Unknown(_) => "unknown".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
+/// Encodes a queued payload as a failed-store entry, extending its meta with the failure fields.
+///
+/// Reuses the QueuedPayload format so the failed entry decodes through the same reader, preserving the
+/// routing meta. The error_detail is the credential-free summary. The nats_msg_id is the resolved
+/// dedup id, so an operator sees the id the server saw even for a pre-enable entry.
+pub(crate) fn encode_failed_entry(
+    mut queued: QueuedPayload,
+    error_class: FailedErrorClass,
+    error: &TargetError,
+    retry_count: u32,
+    resolved_dedup_id: &str,
+) -> Result<Vec<u8>, TargetError> {
+    let failed_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    queued.meta.failure = Some(FailedEntryMeta {
+        error_class,
+        error_detail: build_failed_error_detail(error),
+        nats_msg_id: resolved_dedup_id.to_string(),
+        failed_at_unix_ms,
+        retry_count,
+    });
+    queued.encode()
 }
 
 /// Ensures a rustls crypto provider is installed before any TLS operation.
@@ -604,6 +776,97 @@ pub(crate) fn ensure_rustls_provider_installed() {
     }
     if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
         debug!("rustls provider already installed or unavailable: {err:?}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
+    use crate::arn::TargetID;
+    use crate::store::{FailedEventStore, Key, QueueStore, Store};
+    use crate::{StoreError, Target, TargetError};
+    use async_trait::async_trait;
+    use rustfs_s3_types::EventName;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use uuid::Uuid;
+
+    /// A minimal target for failed-store move tests: every delivery method succeeds, the optional
+    /// store backs the store and failed-store accessors, and final failures land on a shared counter.
+    #[derive(Clone)]
+    pub(crate) struct MoveTestTarget {
+        pub(crate) id: TargetID,
+        pub(crate) store: Option<Arc<QueueStore<QueuedPayload>>>,
+        pub(crate) failed: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl Target<String> for MoveTestTarget {
+        fn id(&self) -> TargetID {
+            self.id.clone()
+        }
+        async fn is_active(&self) -> Result<bool, TargetError> {
+            Ok(true)
+        }
+        async fn save(&self, _event: Arc<EntityTarget<String>>) -> Result<(), TargetError> {
+            Ok(())
+        }
+        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), TargetError> {
+            Ok(())
+        }
+        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
+            self.store
+                .as_deref()
+                .map(|store| store as &(dyn Store<_, Error = StoreError, Key = Key> + Send + Sync))
+        }
+        fn failed_store(&self) -> Option<&dyn FailedEventStore> {
+            self.store.as_deref().map(|store| store as &dyn FailedEventStore)
+        }
+        fn clone_dyn(&self) -> Box<dyn Target<String> + Send + Sync> {
+            Box::new(self.clone())
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn record_final_failure(&self) {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn move_test_target() -> Arc<dyn Target<String> + Send + Sync> {
+        Arc::new(MoveTestTarget {
+            id: TargetID::new("target-a".to_string(), "nats".to_string()),
+            store: None,
+            failed: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    pub(crate) fn move_test_target_with_store(store: Arc<QueueStore<QueuedPayload>>) -> Arc<dyn Target<String> + Send + Sync> {
+        Arc::new(MoveTestTarget {
+            id: TargetID::new("target-a".to_string(), "nats".to_string()),
+            store: Some(store),
+            failed: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    pub(crate) fn failed_store_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("rustfs-failed-{name}-{}", Uuid::new_v4()))
+    }
+
+    pub(crate) fn sample_queued(dedup_id: &str) -> QueuedPayload {
+        let mut meta = QueuedPayloadMeta::new(
+            EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            7,
+        );
+        meta.dedup_id = dedup_id.to_string();
+        QueuedPayload::new(meta, br#"{"x":1}"#.to_vec())
     }
 }
 
@@ -741,6 +1004,45 @@ mod tests {
     fn channel_target_type_amqp_uses_runtime_name() {
         assert_eq!(ChannelTargetType::Amqp.as_str(), "amqp");
         assert_eq!(ChannelTargetType::Amqp.to_string(), "amqp");
+    }
+
+    #[test]
+    fn queued_payload_meta_omits_empty_dedup_id_on_serialization() {
+        let meta = QueuedPayloadMeta::new(
+            EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            7,
+        );
+        assert!(meta.dedup_id.is_empty());
+
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !json.contains("dedup_id"),
+            "an empty dedup id is skipped so stored bytes match the pre-feature format"
+        );
+
+        // An entry written without the field decodes to an empty dedup id.
+        let decoded: QueuedPayloadMeta = serde_json::from_str(&json).unwrap();
+        assert!(decoded.dedup_id.is_empty());
+    }
+
+    #[test]
+    fn queued_payload_meta_round_trips_a_populated_dedup_id() {
+        let mut meta = QueuedPayloadMeta::new(
+            EventName::ObjectCreatedPut,
+            "bucket-a".to_string(),
+            "obj.txt".to_string(),
+            "application/json",
+            7,
+        );
+        meta.dedup_id = "minted-id".to_string();
+
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("dedup_id"));
+        let decoded: QueuedPayloadMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.dedup_id, "minted-id");
     }
 
     #[test]
@@ -1055,5 +1357,97 @@ mod tests {
         encoded.pop();
         let err = QueuedPayload::decode(&encoded).unwrap_err();
         assert!(err.to_string().contains("body length mismatch"), "unexpected error: {err}");
+    }
+
+    use super::test_support::sample_queued;
+
+    // The error_detail recorded on a failed entry is built from an allowlist of error categories and
+    // the fixed publish-error vocabulary, never the raw error rendering, so a credential embedded in
+    // a free-form error message is absent from the detail.
+    #[test]
+    fn build_failed_error_detail_redacts_credential_bearing_messages() {
+        let secret = "nats://user:supersecret@broker:4222";
+        let cases = [
+            TargetError::Network(secret.to_string()),
+            TargetError::Request(secret.to_string()),
+            TargetError::Timeout(secret.to_string()),
+            TargetError::Storage(secret.to_string()),
+            TargetError::Authentication(secret.to_string()),
+            TargetError::Configuration(secret.to_string()),
+            TargetError::Dropped(secret.to_string()),
+            TargetError::Unknown(secret.to_string()),
+        ];
+        for error in cases {
+            let detail = build_failed_error_detail(&error);
+            assert!(!detail.contains("supersecret"), "detail leaked a credential: {detail}");
+            assert!(!detail.contains("broker:4222"), "detail leaked a connection string: {detail}");
+        }
+    }
+
+    // The publish-error classifier sets the detail from its fixed vocabulary of kind labels and
+    // numeric codes, so the failed-entry detail names the cause without leaking a server-side
+    // message.
+    #[test]
+    fn build_failed_error_detail_uses_the_classified_publish_kind() {
+        let error = TargetError::JetStreamPublish {
+            retryable: false,
+            detail: "max payload exceeded".to_string(),
+        };
+        let detail = build_failed_error_detail(&error);
+        assert_eq!(detail, "jetstream_publish: max payload exceeded");
+    }
+
+    // The persistence-boundary sanitizer replaces a JetStreamPublish detail that carries anything
+    // outside the fixed vocabulary with the fallback label, while a vocabulary detail passes through
+    // verbatim.
+    #[test]
+    fn build_failed_error_detail_sanitizes_a_hostile_jetstream_detail() {
+        let hostile = TargetError::JetStreamPublish {
+            retryable: false,
+            detail: "Boom! nats://user:pass@host/DROP".to_string(),
+        };
+        assert_eq!(build_failed_error_detail(&hostile), "jetstream_publish: unrecognized detail");
+
+        let vocabulary = TargetError::JetStreamPublish {
+            retryable: false,
+            detail: "wrong last sequence".to_string(),
+        };
+        assert_eq!(build_failed_error_detail(&vocabulary), "jetstream_publish: wrong last sequence");
+    }
+
+    // A summary whose cap lands inside a multi-byte character truncates at the preceding character
+    // boundary instead of panicking on a split character. A three-byte character does not divide
+    // the 256-byte cap, so one character straddles the cap by construction.
+    #[test]
+    fn truncate_to_char_boundary_handles_multi_byte_characters_at_the_cap() {
+        let mut value = "\u{4e2d}".repeat(FAILED_ERROR_DETAIL_MAX_LEN);
+        assert!(!value.is_char_boundary(FAILED_ERROR_DETAIL_MAX_LEN), "a character straddles the cap");
+        truncate_to_char_boundary(&mut value, FAILED_ERROR_DETAIL_MAX_LEN);
+        assert!(value.len() <= FAILED_ERROR_DETAIL_MAX_LEN, "the result stays within the cap");
+        assert!(value.is_char_boundary(value.len()), "the result ends on a character boundary");
+    }
+
+    // A terminal move writes a failed entry carrying the full failure meta extension and preserves the
+    // original routing metadata and dedup id through the reused QueuedPayload format.
+    #[test]
+    fn encode_failed_entry_carries_full_failure_meta() {
+        let queued = sample_queued("minted-id");
+        let error = TargetError::JetStreamPublish {
+            retryable: false,
+            detail: "wrong last sequence".to_string(),
+        };
+        let encoded = encode_failed_entry(queued, FailedErrorClass::Terminal, &error, 0, "minted-id").unwrap();
+        let decoded = QueuedPayload::decode(&encoded).unwrap();
+
+        let failure = decoded.meta.failure.expect("a failed entry carries failure meta");
+        assert_eq!(failure.error_class, FailedErrorClass::Terminal);
+        assert_eq!(failure.error_detail, "jetstream_publish: wrong last sequence");
+        assert_eq!(failure.nats_msg_id, "minted-id");
+        assert_eq!(failure.retry_count, 0);
+        assert!(failure.failed_at_unix_ms > 0);
+        // The original routing metadata survives the move.
+        assert_eq!(decoded.meta.bucket_name, "bucket-a");
+        assert_eq!(decoded.meta.object_name, "obj.txt");
+        assert_eq!(decoded.body, br#"{"x":1}"#);
     }
 }

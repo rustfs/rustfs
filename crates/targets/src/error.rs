@@ -52,6 +52,9 @@ pub enum TargetError {
     #[error("Request error: {0}")]
     Request(String),
 
+    #[error("JetStream publish error ({}): {detail}", if *.retryable { "retryable" } else { "terminal" })]
+    JetStreamPublish { retryable: bool, detail: String },
+
     #[error("Timeout error: {0}")]
     Timeout(String),
 

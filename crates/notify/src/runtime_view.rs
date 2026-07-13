@@ -51,6 +51,7 @@ impl NotifyRuntimeView {
             .into_iter()
             .map(|snapshot| NotificationTargetMetricSnapshot {
                 failed_messages: snapshot.failed_messages,
+                failed_store_length: snapshot.failed_store_length,
                 queue_length: snapshot.queue_length,
                 target_id: snapshot.target_id,
                 target_type: snapshot.target_type,
@@ -90,6 +91,7 @@ mod tests {
         active: bool,
         enabled: bool,
         failed_messages: Arc<AtomicU64>,
+        failed_store_length: u64,
         id: TargetID,
         total_messages: Arc<AtomicU64>,
     }
@@ -100,6 +102,7 @@ mod tests {
                 active: true,
                 enabled: true,
                 failed_messages: Arc::new(AtomicU64::new(0)),
+                failed_store_length: 0,
                 id: TargetID::new(id.to_string(), name.to_string()),
                 total_messages: Arc::new(AtomicU64::new(0)),
             }
@@ -107,6 +110,11 @@ mod tests {
 
         fn with_active(mut self, active: bool) -> Self {
             self.active = active;
+            self
+        }
+
+        fn with_failed_store_length(mut self, failed_store_length: u64) -> Self {
+            self.failed_store_length = failed_store_length;
             self
         }
 
@@ -168,6 +176,7 @@ mod tests {
         fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
             TargetDeliverySnapshot {
                 failed_messages: self.failed_messages.load(Ordering::Relaxed),
+                failed_store_length: self.failed_store_length,
                 queue_length: 0,
                 total_messages: self.total_messages.load(Ordering::Relaxed),
             }
@@ -206,7 +215,7 @@ mod tests {
         let target_list = Arc::new(RwLock::new(TargetList::new()));
         let replay_workers = Arc::new(RwLock::new(ReplayWorkerManager::new()));
 
-        let online = Arc::new(TestTarget::new("primary", "webhook"));
+        let online = Arc::new(TestTarget::new("primary", "webhook").with_failed_store_length(7));
         online.record_successes(3);
         online.record_failures(1);
 
@@ -239,9 +248,11 @@ mod tests {
         assert_eq!(metric_snapshots.len(), 2);
         assert_eq!(metric_snapshots[0].target_id, "backup:mqtt");
         assert_eq!(metric_snapshots[0].failed_messages, 0);
+        assert_eq!(metric_snapshots[0].failed_store_length, 0);
         assert_eq!(metric_snapshots[0].total_messages, 2);
         assert_eq!(metric_snapshots[1].target_id, "primary:webhook");
         assert_eq!(metric_snapshots[1].failed_messages, 1);
+        assert_eq!(metric_snapshots[1].failed_store_length, 7);
         assert_eq!(metric_snapshots[1].total_messages, 3);
 
         let health_snapshots = runtime_view.snapshot_target_health().await;

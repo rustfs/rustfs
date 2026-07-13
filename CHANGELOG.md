@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Helm Ingress**: `customAnnotations` are now merged with class-specific annotations (nginx/traefik) instead of being ignored when `ingress.className` is set.
 
 ### Added
+- **NATS JetStream Publish Path**: Opt-in at-least-once delivery for the NATS notify and audit targets. A NATS Core publish flushes to the connection without awaiting a broker acknowledgement, so an event can be lost across a broker restart or a reconnect after the send queue has already cleared it. A queued event now clears only after the JetStream `PublishAck`, so bucket notifications survive those interruptions. Off by default and byte-identical to the NATS Core path when disabled.
+  - Three configuration keys per target: `JETSTREAM_ENABLE`, `JETSTREAM_STREAM_NAME`, and `JETSTREAM_ACK_TIMEOUT_SECS`, under the `RUSTFS_NOTIFY_NATS_` and `RUSTFS_AUDIT_NATS_` prefixes
+  - Durable store-and-forward with a stable dedup id sent as the `Nats-Msg-Id` header, so a replay after a crash is collapsed by the server duplicate window
+  - Pre-flight stream validation, and a bounded failed-events store (count and TTL). Only a non-retryable rejection is recorded in the failed-events store. A retryable condition keeps the entry on the live queue until it is delivered
+  - Operator guide at `docs/operations/nats-jetstream.md`
 - **OpenStack Keystone Authentication Integration**: Full support for OpenStack Keystone authentication via X-Auth-Token headers
   - Tower-based middleware (`KeystoneAuthLayer`) self-contained within `rustfs-keystone` crate
   - Task-local storage for async-safe credential passing between middleware and auth handlers
