@@ -85,7 +85,6 @@
 
             # Set environment variables for build
             PROTOC = "${pkgs.protobuf}/bin/protoc";
-            RUSTFLAGS = "--cfg tokio_unstable";
 
             doCheck = false;
 
@@ -123,7 +122,6 @@
             ];
 
             PROTOC = "${pkgs.protobuf}/bin/protoc";
-            RUSTFLAGS = "--cfg tokio_unstable";
           };
         }
       );

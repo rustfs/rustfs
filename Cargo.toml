@@ -353,15 +353,19 @@ debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 0
+split-debuginfo = "off"
+strip = "symbols"
 
 [profile.production]
 inherits = "release"
-lto = "fat"
-codegen-units = 1
 
 [profile.profiling]
 inherits = "release"
 debug = true
+strip = "none"
 
 # Pin hyper to a revision that carries the HTTP/1 "flush buffered data before
 # shutdown" fix (hyperium/hyper#4018, commit 72046cc7). This lands as a
