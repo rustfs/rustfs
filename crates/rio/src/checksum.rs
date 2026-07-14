@@ -1474,4 +1474,51 @@ mod tests {
             assert_eq!(full, ChecksumType::INVALID, "{alg} FULL_OBJECT must be rejected");
         }
     }
+
+    // Known-answer vectors (#1255). The empty-input digests are the OFFICIAL upstream
+    // xxHash / SHA-512 test vectors (seed 0), pinned in big-endian to guarantee the
+    // stored/echoed value byte-for-byte matches what AWS SDKs (awscrt) compute. If the
+    // finalize() byte order or seed ever drifts, these fail loudly.
+    fn raw_hex(t: ChecksumType, data: &[u8]) -> String {
+        let c = Checksum::new_from_data(t, data).expect("checksum");
+        assert_eq!(c.raw.len(), t.raw_byte_len(), "raw len mismatch for {t:?}");
+        c.raw.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn xxhash_sha512_known_answer_vectors_empty_input() {
+        // XXH3-64("") = 0x2D06800538D394C2 (official)
+        assert_eq!(raw_hex(ChecksumType::XXHASH3, b""), "2d06800538d394c2");
+        // XXH64("")   = 0xEF46DB3751D8E999 (official)
+        assert_eq!(raw_hex(ChecksumType::XXHASH64, b""), "ef46db3751d8e999");
+        // XXH3-128("") = 0x99AA06D3014798D86001C324468D497F (official)
+        assert_eq!(raw_hex(ChecksumType::XXHASH128, b""), "99aa06d3014798d86001c324468d497f");
+        // SHA-512("") (official)
+        assert_eq!(
+            raw_hex(ChecksumType::SHA512, b""),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+             47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+    }
+
+    // Regression lock for a non-empty payload: values are produced by this
+    // implementation and must stay stable across refactors. Base64 (S3 wire form) is
+    // asserted alongside the raw hex so both the digest and its encoding are pinned.
+    #[test]
+    fn xxhash_sha512_regression_lock_non_empty() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let data = b"The quick brown fox jumps over the lazy dog";
+
+        // XXH3-64(fox) = 0xce7d19a5418fb365 is the official upstream vector.
+        for (t, want_hex) in [
+            (ChecksumType::XXHASH3, "ce7d19a5418fb365"),
+            (ChecksumType::XXHASH64, "0b242d361fda71bc"),
+        ] {
+            let c = Checksum::new_from_data(t, data).expect("checksum");
+            let got_hex: String = c.raw.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got_hex, want_hex, "{t:?} raw hex drifted");
+            // encoded field must be the standard-base64 of raw (S3 wire form)
+            assert_eq!(c.encoded, STANDARD.encode(&c.raw), "{t:?} encoded field != base64(raw)");
+        }
+    }
 }
