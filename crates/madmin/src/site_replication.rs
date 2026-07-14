@@ -16,11 +16,12 @@ use crate::{GroupAddRemove, GroupDesc, SRSvcAccCreate, UserInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use time::OffsetDateTime;
 
 pub const SITE_REPL_API_VERSION: &str = "1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct PeerSite {
     #[serde(default)]
     pub name: String,
@@ -30,6 +31,21 @@ pub struct PeerSite {
     pub access_key: String,
     #[serde(rename = "secretKey", default)]
     pub secret_key: String,
+    #[serde(rename = "skipTlsVerify", default)]
+    pub skip_tls_verify: bool,
+    #[serde(rename = "caCertPem", default)]
+    pub ca_cert_pem: String,
+}
+
+impl fmt::Debug for PeerSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerSite")
+            .field("name", &self.name)
+            .field("endpoint", &self.endpoint)
+            .field("skip_tls_verify", &self.skip_tls_verify)
+            .field("has_custom_ca", &!self.ca_cert_pem.is_empty())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -106,7 +122,7 @@ pub enum SyncStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct PeerInfo {
     #[serde(default)]
     pub endpoint: String,
@@ -122,8 +138,24 @@ pub struct PeerInfo {
     pub replicate_ilm_expiry: bool,
     #[serde(rename = "objectNamingMode", default, skip_serializing_if = "String::is_empty")]
     pub object_naming_mode: String,
+    #[serde(rename = "skipTlsVerify", default)]
+    pub skip_tls_verify: bool,
+    #[serde(rename = "caCertPem", default)]
+    pub ca_cert_pem: String,
     #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+}
+
+impl fmt::Debug for PeerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerInfo")
+            .field("endpoint", &self.endpoint)
+            .field("name", &self.name)
+            .field("deployment_id", &self.deployment_id)
+            .field("skip_tls_verify", &self.skip_tls_verify)
+            .field("has_custom_ca", &!self.ca_cert_pem.is_empty())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1166,4 +1198,108 @@ pub struct SiteNetPerfNodeResult {
 pub struct SiteNetPerfResult {
     #[serde(rename = "nodeResults", default, skip_serializing_if = "Vec::is_empty")]
     pub node_results: Vec<SiteNetPerfNodeResult>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PeerInfo, PeerSite};
+    use serde_json::{Value, json};
+
+    const TEST_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----";
+
+    #[test]
+    fn peer_tls_fields_default_when_missing_from_legacy_json() {
+        let site: PeerSite = serde_json::from_value(json!({
+            "name": "site-a",
+            "endpoints": "https://site-a.example.com"
+        }))
+        .expect("legacy PeerSite JSON should deserialize");
+        let peer: PeerInfo = serde_json::from_value(json!({
+            "endpoint": "https://site-a.example.com",
+            "name": "site-a",
+            "deploymentID": "deployment-a"
+        }))
+        .expect("legacy PeerInfo JSON should deserialize");
+
+        assert!(!site.skip_tls_verify);
+        assert_eq!(site.ca_cert_pem, "");
+        assert!(!peer.skip_tls_verify);
+        assert_eq!(peer.ca_cert_pem, "");
+    }
+
+    #[test]
+    fn peer_tls_fields_round_trip_with_exact_json_names() {
+        let site_json = json!({
+            "name": "site-a",
+            "endpoints": "https://site-a.example.com",
+            "accessKey": "access-key",
+            "secretKey": "secret-key",
+            "skipTlsVerify": true,
+            "caCertPem": TEST_CA_CERT
+        });
+        let peer_json = json!({
+            "endpoint": "https://site-a.example.com",
+            "name": "site-a",
+            "deploymentID": "deployment-a",
+            "sync": "unknown",
+            "defaultbandwidth": {
+                "bandwidthLimitPerBucket": 0,
+                "set": false
+            },
+            "replicate-ilm-expiry": false,
+            "objectNamingMode": "path",
+            "skipTlsVerify": true,
+            "caCertPem": TEST_CA_CERT
+        });
+
+        let site: PeerSite = serde_json::from_value(site_json.clone()).expect("PeerSite JSON should deserialize");
+        let peer: PeerInfo = serde_json::from_value(peer_json.clone()).expect("PeerInfo JSON should deserialize");
+
+        assert_eq!(serde_json::to_value(site).expect("PeerSite should serialize"), site_json);
+        assert_eq!(serde_json::to_value(peer).expect("PeerInfo should serialize"), peer_json);
+    }
+
+    #[test]
+    fn peer_tls_false_and_empty_ca_are_still_serialized() {
+        let site = serde_json::to_value(PeerSite::default()).expect("PeerSite should serialize");
+        let peer = serde_json::to_value(PeerInfo::default()).expect("PeerInfo should serialize");
+
+        for value in [site, peer] {
+            let object = value.as_object().expect("peer JSON should be an object");
+            assert_eq!(object.get("skipTlsVerify"), Some(&Value::Bool(false)));
+            assert_eq!(object.get("caCertPem"), Some(&Value::String(String::new())));
+        }
+    }
+
+    #[test]
+    fn peer_debug_output_redacts_secrets_and_ca_contents() {
+        let site = PeerSite {
+            name: "site-a".to_owned(),
+            endpoint: "https://site-a.example.com".to_owned(),
+            access_key: "sensitive-access-key".to_owned(),
+            secret_key: "sensitive-secret-key".to_owned(),
+            skip_tls_verify: true,
+            ca_cert_pem: TEST_CA_CERT.to_owned(),
+        };
+        let peer = PeerInfo {
+            endpoint: "https://site-a.example.com".to_owned(),
+            name: "site-a".to_owned(),
+            deployment_id: "deployment-a".to_owned(),
+            skip_tls_verify: false,
+            ca_cert_pem: TEST_CA_CERT.to_owned(),
+            ..PeerInfo::default()
+        };
+
+        let site_debug = format!("{site:?}");
+        let peer_debug = format!("{peer:?}");
+
+        assert!(!site_debug.contains("BEGIN CERTIFICATE"));
+        assert!(!site_debug.contains("sensitive-access-key"));
+        assert!(!site_debug.contains("sensitive-secret-key"));
+        assert!(site_debug.contains("skip_tls_verify: true"));
+        assert!(site_debug.contains("has_custom_ca: true"));
+        assert!(!peer_debug.contains("BEGIN CERTIFICATE"));
+        assert!(peer_debug.contains("skip_tls_verify: false"));
+        assert!(peer_debug.contains("has_custom_ca: true"));
+    }
 }

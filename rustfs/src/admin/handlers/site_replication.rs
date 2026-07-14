@@ -1053,10 +1053,17 @@ fn non_negative_u64(value: i64) -> u64 {
     value.max(0) as u64
 }
 
+fn stored_peer_tls_settings(stored_peer: Option<&PeerInfo>) -> (bool, String) {
+    stored_peer
+        .map(|peer| (peer.skip_tls_verify, peer.ca_cert_pem.clone()))
+        .unwrap_or_default()
+}
+
 fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
     let endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
     let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
+    let (skip_tls_verify, ca_cert_pem) = stored_peer_tls_settings(stored_peer);
 
     PeerInfo {
         endpoint: endpoint.clone(),
@@ -1073,6 +1080,8 @@ fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> Pe
         default_bandwidth: stored_peer.map(|peer| peer.default_bandwidth.clone()).unwrap_or_default(),
         replicate_ilm_expiry: stored_peer.is_some_and(|peer| peer.replicate_ilm_expiry),
         object_naming_mode: stored_peer.map(|peer| peer.object_naming_mode.clone()).unwrap_or_default(),
+        skip_tls_verify,
+        ca_cert_pem,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
 }
@@ -1081,6 +1090,7 @@ fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
     let endpoint = current_local_runtime_endpoint();
     let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
+    let (skip_tls_verify, ca_cert_pem) = stored_peer_tls_settings(stored_peer);
 
     PeerInfo {
         endpoint: endpoint.clone(),
@@ -1097,6 +1107,8 @@ fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
         default_bandwidth: stored_peer.map(|peer| peer.default_bandwidth.clone()).unwrap_or_default(),
         replicate_ilm_expiry: stored_peer.is_some_and(|peer| peer.replicate_ilm_expiry),
         object_naming_mode: stored_peer.map(|peer| peer.object_naming_mode.clone()).unwrap_or_default(),
+        skip_tls_verify,
+        ca_cert_pem,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
 }
@@ -1141,6 +1153,8 @@ fn normalize_peer_site(site: PeerSite, replicate_ilm_expiry: bool) -> PeerInfo {
         default_bandwidth: BucketBandwidth::default(),
         replicate_ilm_expiry,
         object_naming_mode: String::new(),
+        skip_tls_verify: site.skip_tls_verify,
+        ca_cert_pem: site.ca_cert_pem,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     })
 }
@@ -1619,6 +1633,13 @@ fn build_join_peers(
     let mut seen_endpoints = HashSet::new();
 
     let mut normalized_local = local_peer.clone();
+    if let Some(local_site) = sites
+        .iter()
+        .find(|site| same_identity_endpoint(&site.endpoint, &normalized_local.endpoint))
+    {
+        normalized_local.skip_tls_verify = local_site.skip_tls_verify;
+        normalized_local.ca_cert_pem = local_site.ca_cert_pem.clone();
+    }
     normalized_local.replicate_ilm_expiry = replicate_ilm_expiry;
     normalized_local = normalize_peer_info(normalized_local);
     seen_endpoints.insert(site_identity_key(&normalized_local.endpoint));
@@ -1636,6 +1657,8 @@ fn build_join_peers(
         if !site.name.is_empty() {
             peer.name = site.name;
         }
+        peer.skip_tls_verify = site.skip_tls_verify;
+        peer.ca_cert_pem = site.ca_cert_pem;
         peer.replicate_ilm_expiry |= replicate_ilm_expiry;
         peer = normalize_peer_info(peer);
         peers.insert(peer.deployment_id.clone(), peer);
@@ -6417,8 +6440,100 @@ mod tests {
             default_bandwidth: BucketBandwidth::default(),
             replicate_ilm_expiry: false,
             object_naming_mode: String::new(),
+            skip_tls_verify: false,
+            ca_cert_pem: String::new(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         }
+    }
+
+    #[test]
+    fn test_stored_peer_tls_settings_preserve_configured_values() {
+        let stored_peer = PeerInfo {
+            skip_tls_verify: true,
+            ca_cert_pem: "custom-ca".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+
+        assert_eq!(stored_peer_tls_settings(Some(&stored_peer)), (true, "custom-ca".to_string()));
+        assert_eq!(stored_peer_tls_settings(None), (false, String::new()));
+    }
+
+    #[test]
+    fn test_normalize_peer_site_preserves_tls_settings() {
+        let peer = normalize_peer_site(
+            PeerSite {
+                name: "remote".to_string(),
+                endpoint: "https://remote.example.com".to_string(),
+                skip_tls_verify: true,
+                ca_cert_pem: "custom-ca".to_string(),
+                ..PeerSite::default()
+            },
+            false,
+        );
+
+        assert!(peer.skip_tls_verify);
+        assert_eq!(peer.ca_cert_pem, "custom-ca");
+    }
+
+    #[test]
+    fn test_build_join_peers_applies_local_site_tls_settings() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-deployment".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let peers = build_join_peers(
+            &SiteReplicationState::default(),
+            &local_peer,
+            vec![PeerSite {
+                name: "local".to_string(),
+                endpoint: "https://local.example.com/".to_string(),
+                skip_tls_verify: true,
+                ca_cert_pem: "local-ca".to_string(),
+                ..PeerSite::default()
+            }],
+            false,
+        );
+
+        let local = peers.get("local-deployment").expect("local peer should be present");
+        assert!(local.skip_tls_verify);
+        assert_eq!(local.ca_cert_pem, "local-ca");
+    }
+
+    #[test]
+    fn test_build_join_peers_explicitly_disables_existing_remote_tls_settings() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-deployment".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let existing_remote = PeerInfo {
+            deployment_id: "remote-deployment".to_string(),
+            skip_tls_verify: true,
+            ca_cert_pem: "old-remote-ca".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("remote-deployment".to_string(), existing_remote)]),
+            ..SiteReplicationState::default()
+        };
+
+        let peers = build_join_peers(
+            &state,
+            &local_peer,
+            vec![PeerSite {
+                name: "remote".to_string(),
+                endpoint: "https://remote.example.com".to_string(),
+                skip_tls_verify: false,
+                ca_cert_pem: String::new(),
+                ..PeerSite::default()
+            }],
+            false,
+        );
+
+        let remote = peers
+            .get("remote-deployment")
+            .expect("existing remote peer should be present");
+        assert!(!remote.skip_tls_verify);
+        assert_eq!(remote.ca_cert_pem, "");
     }
 
     #[derive(Clone, Default)]
@@ -6818,6 +6933,7 @@ mod tests {
                 endpoint: "https://remote.example.com".to_string(),
                 access_key: "remote-ak".to_string(),
                 secret_key: "remote-sk".to_string(),
+                ..PeerSite::default()
             }],
             "svc-ak".to_string(),
             "root".to_string(),
@@ -6842,12 +6958,14 @@ mod tests {
                     endpoint: "https://local.example.com/".to_string(),
                     access_key: "local-ak".to_string(),
                     secret_key: "local-sk".to_string(),
+                    ..PeerSite::default()
                 },
                 PeerSite {
                     name: "remote".to_string(),
                     endpoint: "https://remote.example.com".to_string(),
                     access_key: "remote-ak".to_string(),
                     secret_key: "remote-sk".to_string(),
+                    ..PeerSite::default()
                 },
             ],
             "svc-ak".to_string(),
