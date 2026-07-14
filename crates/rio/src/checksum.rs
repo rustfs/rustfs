@@ -1521,4 +1521,44 @@ mod tests {
             assert_eq!(c.encoded, STANDARD.encode(&c.raw), "{t:?} encoded field != base64(raw)");
         }
     }
+
+    // On-disk (xl.meta) serialization round-trip for the new algorithms (#1260):
+    // to_bytes() -> read_checksums() must recover the value under the Display key.
+    #[test]
+    fn on_disk_round_trip_new_algorithms() {
+        use super::read_checksums;
+        let data = b"rustfs on-disk checksum round-trip payload";
+
+        for (t, name) in [
+            (ChecksumType::XXHASH3, "XXHASH3"),
+            (ChecksumType::XXHASH64, "XXHASH64"),
+            (ChecksumType::XXHASH128, "XXHASH128"),
+            (ChecksumType::SHA512, "SHA512"),
+        ] {
+            let c = Checksum::new_from_data(t, data).expect("checksum");
+            let buf = c.to_bytes(&[]);
+            let (map, is_multipart) = read_checksums(&buf, 0);
+            assert!(!is_multipart, "{name} single-object must not be multipart");
+            assert_eq!(map.get(name), Some(&c.encoded), "{name} did not round-trip on-disk");
+        }
+    }
+
+    // Forward-compat / rolling-upgrade contract (#1260): a node that does not know a
+    // future base-type bit must DEGRADE SAFELY — skip the entry and return without
+    // panicking or mis-decoding a length — never crash or corrupt.
+    #[test]
+    fn unknown_future_type_bit_degrades_safely() {
+        use super::{encode_varint, read_checksums, read_part_checksums};
+
+        // A base-type bit far above any allocated one (append-only rule guarantees
+        // real bits stay below this), followed by 8 bytes of would-be digest.
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 1 << 20);
+        buf.extend_from_slice(&[0xAB; 8]);
+
+        let (map, is_multipart) = read_checksums(&buf, 0);
+        assert!(map.is_empty(), "unknown type must yield no checksum, got {map:?}");
+        assert!(!is_multipart);
+        assert!(read_part_checksums(&buf).is_empty());
+    }
 }
