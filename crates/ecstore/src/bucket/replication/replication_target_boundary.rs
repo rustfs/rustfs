@@ -585,4 +585,43 @@ mod tests {
 
         assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
     }
+
+    // T3 (#1264): the outbound replication path forwards a stored object checksum into
+    // user_metadata via decrypt_checksums, which is algorithm-agnostic. This locks that
+    // the AWS 2026-04 additional algorithms (XXHash3/64/128, SHA-512, MD5) are forwarded
+    // identically to the classic five — i.e. replication treats the new algorithms
+    // consistently, with no new-algorithm-specific gap on the outbound side.
+    #[test]
+    fn replication_put_object_options_forwards_new_algorithm_checksums_like_classic() {
+        use rustfs_rio::{Checksum, ChecksumType};
+
+        let payload = b"replication checksum consistency payload";
+        let cases = [
+            // classic five (baseline)
+            ("CRC32", ChecksumType::CRC32),
+            ("SHA256", ChecksumType::SHA256),
+            // AWS 2026-04 additional algorithms
+            ("XXHASH3", ChecksumType::XXHASH3),
+            ("XXHASH64", ChecksumType::XXHASH64),
+            ("XXHASH128", ChecksumType::XXHASH128),
+            ("SHA512", ChecksumType::SHA512),
+            ("MD5", ChecksumType::MD5),
+        ];
+
+        for (name, ty) in cases {
+            let checksum = Checksum::new_from_data(ty, payload).expect("compute checksum");
+            let object_info = ObjectInfo {
+                checksum: Some(checksum.to_bytes(&[])),
+                ..Default::default()
+            };
+
+            let (opts, _is_multipart) = replication_put_object_options("", &object_info).expect("build replication put options");
+
+            assert_eq!(
+                opts.user_metadata.get(name),
+                Some(&checksum.encoded),
+                "replication must forward the {name} checksum into user_metadata identically to the classic algorithms"
+            );
+        }
+    }
 }
