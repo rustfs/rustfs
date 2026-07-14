@@ -35,6 +35,10 @@ pub const CRC_32_C_NAME: &str = "crc32c";
 pub const CRC_64_NVME_NAME: &str = "crc64nvme";
 pub const SHA_1_NAME: &str = "sha1";
 pub const SHA_256_NAME: &str = "sha256";
+pub const SHA_512_NAME: &str = "sha512";
+pub const XXHASH_3_NAME: &str = "xxhash3";
+pub const XXHASH_64_NAME: &str = "xxhash64";
+pub const XXHASH_128_NAME: &str = "xxhash128";
 pub const MD5_NAME: &str = "md5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -46,6 +50,10 @@ pub enum ChecksumAlgorithm {
     Sha1,
     Sha256,
     Crc64Nvme,
+    Sha512,
+    Xxhash3,
+    Xxhash64,
+    Xxhash128,
 }
 
 impl FromStr for ChecksumAlgorithm {
@@ -62,6 +70,14 @@ impl FromStr for ChecksumAlgorithm {
             Ok(Self::Sha256)
         } else if checksum_algorithm.eq_ignore_ascii_case(CRC_64_NVME_NAME) {
             Ok(Self::Crc64Nvme)
+        } else if checksum_algorithm.eq_ignore_ascii_case(SHA_512_NAME) {
+            Ok(Self::Sha512)
+        } else if checksum_algorithm.eq_ignore_ascii_case(XXHASH_3_NAME) {
+            Ok(Self::Xxhash3)
+        } else if checksum_algorithm.eq_ignore_ascii_case(XXHASH_64_NAME) {
+            Ok(Self::Xxhash64)
+        } else if checksum_algorithm.eq_ignore_ascii_case(XXHASH_128_NAME) {
+            Ok(Self::Xxhash128)
         } else {
             Err(UnknownChecksumAlgorithmError::new(checksum_algorithm))
         }
@@ -76,6 +92,10 @@ impl ChecksumAlgorithm {
             Self::Crc64Nvme => Box::<Crc64Nvme>::default(),
             Self::Sha1 => Box::<Sha1>::default(),
             Self::Sha256 => Box::<Sha256>::default(),
+            Self::Sha512 => Box::<Sha512>::default(),
+            Self::Xxhash3 => Box::<Xxhash3>::default(),
+            Self::Xxhash64 => Box::<Xxhash64>::default(),
+            Self::Xxhash128 => Box::<Xxhash128>::default(),
         }
     }
 
@@ -86,6 +106,10 @@ impl ChecksumAlgorithm {
             Self::Crc64Nvme => CRC_64_NVME_NAME,
             Self::Sha1 => SHA_1_NAME,
             Self::Sha256 => SHA_256_NAME,
+            Self::Sha512 => SHA_512_NAME,
+            Self::Xxhash3 => XXHASH_3_NAME,
+            Self::Xxhash64 => XXHASH_64_NAME,
+            Self::Xxhash128 => XXHASH_128_NAME,
         }
     }
 }
@@ -285,6 +309,165 @@ impl Checksum for Sha256 {
         Self::size()
     }
 }
+
+#[derive(Debug, Default)]
+struct Sha512 {
+    hasher: sha2::Sha512,
+}
+
+impl Sha512 {
+    fn update(&mut self, bytes: &[u8]) {
+        use sha2::Digest;
+        self.hasher.update(bytes);
+    }
+
+    fn finalize(self) -> Bytes {
+        use sha2::Digest;
+        Bytes::copy_from_slice(self.hasher.finalize().as_slice())
+    }
+
+    fn size() -> u64 {
+        use sha2::Digest;
+        sha2::Sha512::output_size() as u64
+    }
+}
+
+impl Checksum for Sha512 {
+    fn update(&mut self, bytes: &[u8]) {
+        Self::update(self, bytes);
+    }
+    fn finalize(self: Box<Self>) -> Bytes {
+        Self::finalize(*self)
+    }
+    fn size(&self) -> u64 {
+        Self::size()
+    }
+}
+
+/// XXH3 (64-bit) hasher with the canonical seed of 0.
+///
+/// The raw digest is a `u64` serialized as 8 big-endian bytes so that the value
+/// matches the server-side (`rustfs-rio`) computation for the same algorithm.
+struct Xxhash3 {
+    hasher: xxhash_rust::xxh3::Xxh3,
+}
+
+impl Default for Xxhash3 {
+    fn default() -> Self {
+        Self {
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+        }
+    }
+}
+
+impl Xxhash3 {
+    fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    fn finalize(self) -> Bytes {
+        Bytes::copy_from_slice(self.hasher.digest().to_be_bytes().as_slice())
+    }
+
+    fn size() -> u64 {
+        8
+    }
+}
+
+impl Checksum for Xxhash3 {
+    fn update(&mut self, bytes: &[u8]) {
+        Self::update(self, bytes)
+    }
+    fn finalize(self: Box<Self>) -> Bytes {
+        Self::finalize(*self)
+    }
+    fn size(&self) -> u64 {
+        Self::size()
+    }
+}
+
+/// XXH3 (128-bit) hasher with the canonical seed of 0.
+///
+/// The raw digest is a `u128` serialized as 16 big-endian bytes.
+struct Xxhash128 {
+    hasher: xxhash_rust::xxh3::Xxh3,
+}
+
+impl Default for Xxhash128 {
+    fn default() -> Self {
+        Self {
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+        }
+    }
+}
+
+impl Xxhash128 {
+    fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    fn finalize(self) -> Bytes {
+        Bytes::copy_from_slice(self.hasher.digest128().to_be_bytes().as_slice())
+    }
+
+    fn size() -> u64 {
+        16
+    }
+}
+
+impl Checksum for Xxhash128 {
+    fn update(&mut self, bytes: &[u8]) {
+        Self::update(self, bytes)
+    }
+    fn finalize(self: Box<Self>) -> Bytes {
+        Self::finalize(*self)
+    }
+    fn size(&self) -> u64 {
+        Self::size()
+    }
+}
+
+/// XXH64 hasher with the canonical seed of 0.
+///
+/// The raw digest is a `u64` serialized as 8 big-endian bytes.
+struct Xxhash64 {
+    hasher: xxhash_rust::xxh64::Xxh64,
+}
+
+impl Default for Xxhash64 {
+    fn default() -> Self {
+        Self {
+            hasher: xxhash_rust::xxh64::Xxh64::new(0),
+        }
+    }
+}
+
+impl Xxhash64 {
+    fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    fn finalize(self) -> Bytes {
+        Bytes::copy_from_slice(self.hasher.digest().to_be_bytes().as_slice())
+    }
+
+    fn size() -> u64 {
+        8
+    }
+}
+
+impl Checksum for Xxhash64 {
+    fn update(&mut self, bytes: &[u8]) {
+        Self::update(self, bytes)
+    }
+    fn finalize(self: Box<Self>) -> Bytes {
+        Self::finalize(*self)
+    }
+    fn size(&self) -> u64 {
+        Self::size()
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Default)]
 struct Md5 {
@@ -454,5 +637,98 @@ mod tests {
 
         let error = "MD5".parse::<ChecksumAlgorithm>().expect_err("md5 should not parse");
         assert_eq!("MD5", error.checksum_algorithm());
+    }
+
+    #[test]
+    fn test_additional_algorithms_parse_and_round_trip() {
+        // The AWS 2026-04 additional checksum algorithms must be recognised
+        // (case-insensitively) and round-trip through as_str().
+        for (name, expected) in [
+            ("sha512", ChecksumAlgorithm::Sha512),
+            ("SHA512", ChecksumAlgorithm::Sha512),
+            ("xxhash3", ChecksumAlgorithm::Xxhash3),
+            ("XXHASH3", ChecksumAlgorithm::Xxhash3),
+            ("xxhash64", ChecksumAlgorithm::Xxhash64),
+            ("xxhash128", ChecksumAlgorithm::Xxhash128),
+        ] {
+            let parsed = name.parse::<ChecksumAlgorithm>().expect("algorithm should parse");
+            assert_eq!(parsed, expected);
+            assert_eq!(expected.as_str().parse::<ChecksumAlgorithm>().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_unknown_algorithm_never_panics_and_fails_closed() {
+        // Fail-closed contract: an unknown or garbage algorithm name must return
+        // an error instead of panicking or silently substituting another hasher.
+        for name in ["", "xxhash", "sha3", "crc16", "not-a-real-algo", "🦀"] {
+            assert!(name.parse::<ChecksumAlgorithm>().is_err(), "unknown algorithm {name:?} must fail closed");
+        }
+    }
+
+    #[test]
+    fn test_sha512_matches_direct_computation() {
+        use crate::Sha512;
+        use crate::http::SHA_512_HEADER_NAME;
+        use sha2::{Digest, Sha512 as Sha512Ref};
+
+        let mut checksum = Sha512::default();
+        checksum.update(TEST_DATA.as_bytes());
+        let header = Box::new(checksum).headers();
+        let encoded = header.get(SHA_512_HEADER_NAME).expect("sha512 header present");
+        let got = base64_encoded_checksum_to_hex_string(encoded);
+
+        let mut reference = Sha512Ref::new();
+        reference.update(TEST_DATA.as_bytes());
+        let expected = reference.finalize().iter().fold(String::from("0x"), |mut acc, b| {
+            write!(acc, "{b:02X?}").unwrap();
+            acc
+        });
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_xxhash3_matches_direct_computation_big_endian_seed0() {
+        use crate::Xxhash3;
+        use xxhash_rust::xxh3::Xxh3;
+
+        let mut checksum = Xxhash3::default();
+        checksum.update(TEST_DATA.as_bytes());
+        let raw = Box::new(checksum).finalize();
+
+        let mut reference = Xxh3::new();
+        reference.update(TEST_DATA.as_bytes());
+        assert_eq!(raw.len(), 8);
+        assert_eq!(&raw[..], reference.digest().to_be_bytes().as_slice());
+    }
+
+    #[test]
+    fn test_xxhash128_matches_direct_computation_big_endian_seed0() {
+        use crate::Xxhash128;
+        use xxhash_rust::xxh3::Xxh3;
+
+        let mut checksum = Xxhash128::default();
+        checksum.update(TEST_DATA.as_bytes());
+        let raw = Box::new(checksum).finalize();
+
+        let mut reference = Xxh3::new();
+        reference.update(TEST_DATA.as_bytes());
+        assert_eq!(raw.len(), 16);
+        assert_eq!(&raw[..], reference.digest128().to_be_bytes().as_slice());
+    }
+
+    #[test]
+    fn test_xxhash64_matches_direct_computation_big_endian_seed0() {
+        use crate::Xxhash64;
+        use xxhash_rust::xxh64::Xxh64;
+
+        let mut checksum = Xxhash64::default();
+        checksum.update(TEST_DATA.as_bytes());
+        let raw = Box::new(checksum).finalize();
+
+        let mut reference = Xxh64::new(0);
+        reference.update(TEST_DATA.as_bytes());
+        assert_eq!(raw.len(), 8);
+        assert_eq!(&raw[..], reference.digest().to_be_bytes().as_slice());
     }
 }
