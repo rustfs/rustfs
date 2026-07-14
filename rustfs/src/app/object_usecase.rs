@@ -4187,6 +4187,7 @@ impl DefaultObjectUsecase {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_get_object_response(
         helper: OperationHelper,
         bucket: &str,
