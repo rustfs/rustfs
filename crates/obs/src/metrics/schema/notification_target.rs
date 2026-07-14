@@ -31,6 +31,15 @@ pub static NOTIFICATION_TARGET_FAILED_MESSAGES_MD: LazyLock<MetricDescriptor> = 
     )
 });
 
+pub static NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::NotificationTargetFailedStoreLength,
+        "Number of notification messages held in the failed-events store for target",
+        &NOTIFICATION_TARGET_LABELS,
+        subsystems::NOTIFICATION,
+    )
+});
+
 pub static NOTIFICATION_TARGET_QUEUE_LENGTH_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::NotificationTargetQueueLength,

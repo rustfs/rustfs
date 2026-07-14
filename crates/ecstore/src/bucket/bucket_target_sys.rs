@@ -1023,20 +1023,49 @@ fn build_insecure_aws_s3_http_client() -> SharedHttpClient {
     http_client_fn(move |_settings, _components| connector.clone())
 }
 
-fn build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem: &str) -> Result<SharedHttpClient, BucketTargetError> {
-    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(ca_cert_pem.as_bytes())
+fn validate_ca_pem_bundle(ca_cert_pem: &[u8]) -> Result<(), String> {
+    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(ca_cert_pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))?;
+        .map_err(|err| format!("invalid PEM encoding: {err}"))?;
 
     if certs.is_empty() {
-        return Err(BucketTargetError::Io(std::io::Error::other(
-            "invalid target CA PEM: no certificates found",
-        )));
+        return Err("no certificates found".to_string());
     }
 
-    let mut trust_store = smithy_tls::TrustStore::empty();
-    trust_store.add_pem_certificate(ca_cert_pem.as_bytes());
+    // Smithy's rustls adapter defers parsing custom certificates and assumes
+    // they are valid when the HTTPS connector is built. Validate every DER
+    // certificate first so malformed configuration is reported rather than
+    // reaching an `expect` in the dependency.
+    let mut validation_store = rustls::RootCertStore::empty();
+    for cert in certs {
+        validation_store
+            .add(cert)
+            .map_err(|err| format!("invalid X.509 certificate: {err}"))?;
+    }
 
+    Ok(())
+}
+
+fn validate_target_ca_pem(ca_cert_pem: &str) -> Result<(), BucketTargetError> {
+    validate_ca_pem_bundle(ca_cert_pem.as_bytes())
+        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))
+}
+
+fn compose_replication_trust_store(certificate_bundles: impl IntoIterator<Item = Vec<u8>>) -> (smithy_tls::TrustStore, usize) {
+    // `TrustStore::default()` keeps the platform-native roots enabled. Target
+    // and RUSTFS_TLS_PATH certificates extend that baseline instead of
+    // replacing it with a target-specific trust island.
+    let mut trust_store = smithy_tls::TrustStore::default();
+    let mut custom_bundle_count = 0;
+    for pem in certificate_bundles {
+        trust_store.add_pem_certificate(pem);
+        custom_bundle_count += 1;
+    }
+
+    (trust_store, custom_bundle_count)
+}
+
+fn build_aws_s3_http_client_with_trust_store(trust_store: smithy_tls::TrustStore) -> Result<SharedHttpClient, BucketTargetError> {
     let tls_context = smithy_tls::TlsContext::builder()
         .with_trust_store(trust_store)
         .build()
@@ -1046,6 +1075,60 @@ fn build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem: &str) -> Result<Shar
         .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
         .tls_context(tls_context)
         .build_https())
+}
+
+async fn load_tls_path_ca_bundles(tls_dir: &Path, trust_leaf_cert_as_ca: bool) -> Vec<Vec<u8>> {
+    let mut certificate_bundles = Vec::new();
+
+    let ca_path = tls_dir.join(RUSTFS_CA_CERT);
+    match tokio::fs::read(&ca_path).await {
+        Ok(pem) => match validate_ca_pem_bundle(&pem) {
+            Ok(()) => certificate_bundles.push(pem),
+            Err(err) => warn!("ignoring invalid custom CA bundle {:?} for replication client: {}", ca_path, err),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("failed to read custom CA bundle {:?} for replication client: {}", ca_path, e),
+    }
+
+    if trust_leaf_cert_as_ca {
+        let leaf_cert_path = tls_dir.join(RUSTFS_TLS_CERT);
+        match tokio::fs::read(&leaf_cert_path).await {
+            Ok(pem) => match validate_ca_pem_bundle(&pem) {
+                Ok(()) => certificate_bundles.push(pem),
+                Err(err) => warn!(
+                    "ignoring invalid leaf certificate {:?} for replication client trust store: {}",
+                    leaf_cert_path, err
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("failed to read leaf cert {:?} for replication client trust store: {}", leaf_cert_path, e),
+        }
+    }
+
+    certificate_bundles
+}
+
+async fn load_configured_tls_ca_bundles() -> Vec<Vec<u8>> {
+    let tls_path = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
+    if tls_path.is_empty() {
+        return Vec::new();
+    }
+
+    load_tls_path_ca_bundles(
+        Path::new(&tls_path),
+        rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA),
+    )
+    .await
+}
+
+async fn build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem: &str) -> Result<SharedHttpClient, BucketTargetError> {
+    validate_target_ca_pem(ca_cert_pem)?;
+
+    let mut certificate_bundles = load_configured_tls_ca_bundles().await;
+    certificate_bundles.push(ca_cert_pem.as_bytes().to_vec());
+    let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
+
+    build_aws_s3_http_client_with_trust_store(trust_store)
 }
 
 async fn build_aws_s3_http_client_for_target(target: &BucketTarget) -> Result<Option<SharedHttpClient>, BucketTargetError> {
@@ -1058,62 +1141,28 @@ async fn build_aws_s3_http_client_for_target(target: &BucketTarget) -> Result<Op
     }
 
     if has_custom_ca_pem(target) {
-        return build_aws_s3_http_client_from_target_ca_pem(&target.ca_cert_pem).map(Some);
+        return build_aws_s3_http_client_from_target_ca_pem(&target.ca_cert_pem)
+            .await
+            .map(Some);
     }
 
     Ok(build_aws_s3_http_client_from_tls_path().await)
 }
 
 async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::SharedHttpClient> {
-    let tls_path = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
-    if tls_path.is_empty() {
+    let certificate_bundles = load_configured_tls_ca_bundles().await;
+    if certificate_bundles.is_empty() {
         return None;
     }
 
-    let tls_dir = Path::new(&tls_path);
-    let mut trust_store = smithy_tls::TrustStore::empty();
-    let mut has_custom_certs = false;
-
-    let ca_path = tls_dir.join(RUSTFS_CA_CERT);
-    match tokio::fs::read(&ca_path).await {
-        Ok(pem) => {
-            trust_store.add_pem_certificate(pem);
-            has_custom_certs = true;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!("failed to read custom CA bundle {:?} for replication client: {}", ca_path, e),
-    }
-
-    if rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA) {
-        let leaf_cert_path = tls_dir.join(RUSTFS_TLS_CERT);
-        match tokio::fs::read(&leaf_cert_path).await {
-            Ok(pem) => {
-                trust_store.add_pem_certificate(pem);
-                has_custom_certs = true;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!("failed to read leaf cert {:?} for replication client trust store: {}", leaf_cert_path, e),
-        }
-    }
-
-    if !has_custom_certs {
-        return None;
-    }
-
-    let tls_context = match smithy_tls::TlsContext::builder().with_trust_store(trust_store).build() {
-        Ok(ctx) => ctx,
+    let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
+    match build_aws_s3_http_client_with_trust_store(trust_store) {
+        Ok(client) => Some(client),
         Err(e) => {
             warn!("failed to build AWS SDK TLS context for replication client: {}", e);
-            return None;
+            None
         }
-    };
-
-    Some(
-        SmithyHttpClientBuilder::new()
-            .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
-            .tls_context(tls_context)
-            .build_https(),
-    )
+    }
 }
 
 fn should_force_path_style(target: &BucketTarget) -> bool {
@@ -1920,6 +1969,63 @@ mod tests {
     use super::*;
     use rcgen::generate_simple_self_signed;
 
+    fn spawn_single_request_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        ensure_rustls_crypto_provider();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test TLS listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("test TLS listener should have an address")
+            .port();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls_pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
+                    .expect("test TLS private key should convert"),
+            )
+            .expect("test TLS server config should build");
+
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("test TLS client should connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("test TLS read timeout should configure");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("test TLS write timeout should configure");
+            let connection = rustls::ServerConnection::new(Arc::new(server_config)).expect("test TLS connection should build");
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).expect("test TLS request should be readable");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("test TLS response should be written");
+            stream.flush().expect("test TLS response should flush");
+        });
+
+        (port, handle)
+    }
+
+    fn s3_client_with_http_client(port: u16, http_client: SharedHttpClient) -> S3Client {
+        let credentials = SdkCredentials::builder()
+            .access_key_id("test-access")
+            .secret_access_key("test-secret")
+            .provider_name("bucket_target_tls_test")
+            .build();
+        let config = S3Config::builder()
+            .endpoint_url(format!("https://localhost:{port}"))
+            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .region(SdkRegion::new("us-east-1"))
+            .force_path_style(true)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .http_client(http_client)
+            .build();
+
+        S3Client::from_conf(config)
+    }
+
     #[test]
     fn replication_target_versioning_enabled_requires_enabled_status() {
         let enabled = BucketVersioningStatus::Enabled;
@@ -2244,6 +2350,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replication_trust_store_composes_system_global_and_target_roots_for_real_tls() {
+        let tls_dir = tempfile::tempdir().expect("temporary TLS directory should be created");
+        let global_ca =
+            generate_simple_self_signed(vec!["localhost".to_string()]).expect("global CA certificate should generate");
+        let target_ca =
+            generate_simple_self_signed(vec!["localhost".to_string()]).expect("target CA certificate should generate");
+
+        tokio::fs::write(tls_dir.path().join(RUSTFS_CA_CERT), global_ca.cert.pem())
+            .await
+            .expect("global CA bundle should be written");
+
+        let mut certificate_bundles = load_tls_path_ca_bundles(tls_dir.path(), false).await;
+        certificate_bundles.push(target_ca.cert.pem().into_bytes());
+        let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
+        assert!(
+            format!("{trust_store:?}").contains("enable_native_roots: true"),
+            "per-target trust must retain the SDK's platform-native roots"
+        );
+        let http_client = build_aws_s3_http_client_with_trust_store(trust_store).expect("composed TLS client should build");
+
+        let (global_port, global_server) = spawn_single_request_https_server(&global_ca);
+        s3_client_with_http_client(global_port, http_client.clone())
+            .head_bucket()
+            .bucket("test-bucket")
+            .send()
+            .await
+            .expect("global RUSTFS_TLS_PATH CA should authenticate its TLS server");
+        global_server.join().expect("global CA TLS server should finish");
+
+        let (target_port, target_server) = spawn_single_request_https_server(&target_ca);
+        s3_client_with_http_client(target_port, http_client)
+            .head_bucket()
+            .bucket("test-bucket")
+            .send()
+            .await
+            .expect("per-target CA should authenticate its TLS server alongside global roots");
+        target_server.join().expect("target CA TLS server should finish");
+    }
+
+    #[tokio::test]
+    async fn tls_path_leaf_trust_remains_opt_in() {
+        let tls_dir = tempfile::tempdir().expect("temporary TLS directory should be created");
+        let global_ca =
+            generate_simple_self_signed(vec!["global-ca.example".to_string()]).expect("global CA certificate should generate");
+        let trusted_leaf =
+            generate_simple_self_signed(vec!["leaf.example".to_string()]).expect("trusted leaf certificate should generate");
+        tokio::fs::write(tls_dir.path().join(RUSTFS_CA_CERT), global_ca.cert.pem())
+            .await
+            .expect("global CA bundle should be written");
+        tokio::fs::write(tls_dir.path().join(RUSTFS_TLS_CERT), trusted_leaf.cert.pem())
+            .await
+            .expect("trusted leaf certificate should be written");
+
+        assert_eq!(load_tls_path_ca_bundles(tls_dir.path(), true).await.len(), 2);
+        assert_eq!(load_tls_path_ca_bundles(tls_dir.path(), false).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn skip_tls_verify_takes_priority_over_invalid_custom_ca_pem() {
+        let client = build_aws_s3_http_client_for_target(&BucketTarget {
+            secure: true,
+            skip_tls_verify: true,
+            ca_cert_pem: "not a pem".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("skip verification should bypass custom CA parsing");
+
+        assert!(client.is_some(), "secure targets with skip verification need a custom HTTP client");
+    }
+
+    #[tokio::test]
     async fn get_remote_target_client_internal_rejects_invalid_custom_ca_pem() {
         let sys = BucketTargetSys::default();
         let err = sys
@@ -2265,6 +2443,31 @@ mod tests {
             .expect_err("invalid custom CA PEM should be rejected");
 
         assert!(err.to_string().contains("invalid target CA PEM"));
+    }
+
+    #[test]
+    fn target_ca_rejects_pem_wrapped_invalid_der_before_smithy_builds() {
+        let err = validate_target_ca_pem("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n")
+            .expect_err("PEM-wrapped invalid DER must be rejected");
+
+        assert!(err.to_string().contains("invalid target CA PEM"));
+        assert!(err.to_string().contains("invalid X.509 certificate"));
+    }
+
+    #[tokio::test]
+    async fn invalid_global_ca_is_ignored_without_reaching_smithy() {
+        let tls_dir = tempfile::tempdir().expect("temporary TLS directory should be created");
+        tokio::fs::write(
+            tls_dir.path().join(RUSTFS_CA_CERT),
+            b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        )
+        .await
+        .expect("invalid global CA fixture should be written");
+
+        assert!(
+            load_tls_path_ca_bundles(tls_dir.path(), false).await.is_empty(),
+            "invalid global CA must fall back to default roots instead of reaching Smithy's panic path"
+        );
     }
 
     // backlog#806-16 regression tests for the rolling one-minute latency window.

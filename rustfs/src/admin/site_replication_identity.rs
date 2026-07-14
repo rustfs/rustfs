@@ -160,6 +160,8 @@ mod tests {
             default_bandwidth: BucketBandwidth::default(),
             replicate_ilm_expiry: false,
             object_naming_mode: String::new(),
+            skip_tls_verify: false,
+            ca_cert_pem: String::new(),
             api_version: None,
         }
     }
@@ -204,6 +206,8 @@ mod tests {
                 PeerInfo {
                     api_version: Some("v1".to_string()),
                     replicate_ilm_expiry: true,
+                    skip_tls_verify: true,
+                    ca_cert_pem: "fallback-ca".to_string(),
                     ..peer("remote-http", "http://node-a.example.com:9000")
                 },
             ),
@@ -226,6 +230,8 @@ mod tests {
         assert_eq!(peer.deployment_id, "remote-http");
         assert_eq!(peer.api_version.as_deref(), Some("v1"));
         assert!(peer.replicate_ilm_expiry);
+        assert!(!peer.skip_tls_verify);
+        assert_eq!(peer.ca_cert_pem, "");
     }
 
     #[test]

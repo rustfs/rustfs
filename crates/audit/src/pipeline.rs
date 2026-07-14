@@ -32,6 +32,7 @@ const EVENT_AUDIT_BATCH_DISPATCH_COMPLETED: &str = "audit_batch_dispatch_complet
 const EVENT_AUDIT_TARGET_STATE_CHANGED: &str = "audit_target_state_changed";
 const EVENT_AUDIT_REPLAY_DELIVERED: &str = "audit_replay_delivered";
 const EVENT_AUDIT_REPLAY_RETRY_SCHEDULED: &str = "audit_replay_retry_scheduled";
+const EVENT_AUDIT_REPLAY_RETRY_EXHAUSTED: &str = "audit_replay_retry_exhausted";
 const EVENT_AUDIT_REPLAY_DROPPED: &str = "audit_replay_dropped";
 const EVENT_AUDIT_REPLAY_STREAM_STATUS: &str = "audit_replay_stream_status";
 
@@ -281,6 +282,7 @@ impl AuditPipeline {
                 let delivery = target.delivery_snapshot();
                 AuditTargetMetricSnapshot {
                     failed_messages: delivery.failed_messages,
+                    failed_store_length: delivery.failed_store_length,
                     queue_length: delivery.queue_length,
                     target_id: target.id().to_string(),
                     total_messages: delivery.total_messages,
@@ -463,18 +465,16 @@ impl AuditRuntimeFacade {
                             target.record_final_failure();
                             observability::record_target_failure();
                         }
-                        ReplayEvent::RetryExhausted { key, target } => {
+                        ReplayEvent::RetryExhausted { detail, key, target } => {
                             warn!(
-                                event = EVENT_AUDIT_REPLAY_DROPPED,
+                                event = EVENT_AUDIT_REPLAY_RETRY_EXHAUSTED,
                                 component = LOG_COMPONENT_AUDIT,
                                 subsystem = LOG_SUBSYSTEM_PIPELINE,
                                 target_id = %target.id(),
                                 replay_key = %key,
-                                reason = "retry_exhausted",
-                                "audit replay delivery"
+                                error = %detail,
+                                "audit replay retry budget exhausted, entry stays queued and retries"
                             );
-                            target.record_final_failure();
-                            observability::record_target_failure();
                         }
                         ReplayEvent::UnreadableEntry { key, error, target } => {
                             warn!(

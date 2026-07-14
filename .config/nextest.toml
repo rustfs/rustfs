@@ -136,7 +136,7 @@ test-group = 'e2e-reliability'
 # the nightly profile derives its set as "the replication module MINUS this
 # allowlist", so any new replication test lands in nightly by default (never
 # silently unrun) until it is explicitly blessed as fast here. Keep the two
-# regexes byte-identical. Count invariant: 20 here + 18 nightly = 38 total
+# regexes byte-identical. Count invariant: 20 here + 20 nightly = 40 total
 # (authority: `cargo nextest list`; docs/testing/e2e-suite-inventory.md).
 # HISTORY (2026-07-11): the 20 fast tests were briefly pulled out of this lane
 # (#4724) because they set a loopback (127.0.0.1) replication target that the
@@ -162,7 +162,7 @@ fail-fast = false
 #
 #   * 8 bucket-replication data-plane tests — they PUT/delete objects and poll
 #     until source and target converge; two replicate over HTTPS.
-#   * 9 `_real_dual_node` site-replication tests — each spawns TWO full rustfs
+#   * 11 `_real_dual_node` site-replication tests — each spawns TWO full rustfs
 #     servers and drives the cross-process site-replication control plane.
 #   * 1 `_real_single_node` service-account round-trip test.
 #

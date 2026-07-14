@@ -175,6 +175,7 @@ pub enum MetricName {
 
     // Audit metrics
     AuditFailedMessages,
+    AuditFailedStoreLength,
     AuditTargetQueueLength,
     AuditTotalMessages,
 
@@ -221,6 +222,7 @@ pub enum MetricName {
     NotificationEventsSentTotal,
     NotificationEventsSkippedTotal,
     NotificationTargetFailedMessages,
+    NotificationTargetFailedStoreLength,
     NotificationTargetQueueLength,
     NotificationTargetTotalMessages,
 
@@ -581,6 +583,7 @@ impl MetricName {
             Self::ApiTrafficRecvBytes => "traffic_received_bytes".to_string(),
 
             Self::AuditFailedMessages => "failed_messages".to_string(),
+            Self::AuditFailedStoreLength => "failed_store_length".to_string(),
             Self::AuditTargetQueueLength => "target_queue_length".to_string(),
             Self::AuditTotalMessages => "total_messages".to_string(),
 
@@ -627,6 +630,7 @@ impl MetricName {
             Self::NotificationEventsSentTotal => "events_sent_total".to_string(),
             Self::NotificationEventsSkippedTotal => "events_skipped_total".to_string(),
             Self::NotificationTargetFailedMessages => "failed_messages".to_string(),
+            Self::NotificationTargetFailedStoreLength => "failed_store_length".to_string(),
             Self::NotificationTargetQueueLength => "target_queue_length".to_string(),
             Self::NotificationTargetTotalMessages => "total_messages".to_string(),
 

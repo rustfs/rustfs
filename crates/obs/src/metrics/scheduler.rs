@@ -1222,6 +1222,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             .into_iter()
                             .map(|snapshot| AuditTargetStats {
                                 failed_messages: snapshot.failed_messages,
+                                failed_store_length: snapshot.failed_store_length,
                                 queue_length: snapshot.queue_length,
                                 target_id: snapshot.target_id,
                                 total_messages: snapshot.total_messages,
@@ -1274,6 +1275,7 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             .into_iter()
                             .map(|snapshot| NotificationTargetStats {
                                 failed_messages: snapshot.failed_messages,
+                                failed_store_length: snapshot.failed_store_length,
                                 queue_length: snapshot.queue_length,
                                 target_id: snapshot.target_id,
                                 target_type: snapshot.target_type,

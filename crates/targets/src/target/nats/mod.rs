@@ -21,22 +21,36 @@ use crate::{
         ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
         validate_tls_material,
     },
-    store::{Key, Store},
+    store::{FailedEventStore, Key, QueueStore, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
         TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
-        open_target_queue_store, persist_queued_payload_to_store, redacted_secret,
+        open_target_queue_store_typed, persist_queued_payload_to_store, redacted_secret,
     },
 };
 use async_trait::async_trait;
-use rustfs_config::{NATS_CREDENTIALS_FILE, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY};
+use rustfs_config::{
+    NATS_CREDENTIALS_FILE, NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY,
+};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
+use uuid::Uuid;
+
+mod jetstream;
+mod publish_error;
+mod validation;
+
+use jetstream::{CachedJetStreamContext, drain_jetstream_context};
+use publish_error::{classify_nats_flush_error, classify_nats_publish_error};
+
+pub(crate) use jetstream::resolve_dedup_id;
+pub(crate) use validation::{validate_jetstream_settings, validate_jetstream_stream};
 
 #[derive(Clone)]
 pub struct NATSArgs {
@@ -53,6 +67,10 @@ pub struct NATSArgs {
     pub tls_required: bool,
     pub queue_dir: String,
     pub queue_limit: u64,
+    // JetStream publish settings. Absent maps to off and the defaults.
+    pub jetstream_enable: Option<bool>,
+    pub jetstream_stream_name: Option<String>,
+    pub jetstream_ack_timeout_secs: Option<u64>,
     pub target_type: TargetType,
 }
 
@@ -72,6 +90,9 @@ impl fmt::Debug for NATSArgs {
             .field("tls_required", &self.tls_required)
             .field("queue_dir", &self.queue_dir)
             .field("queue_limit", &self.queue_limit)
+            .field("jetstream_enable", &self.jetstream_enable)
+            .field("jetstream_stream_name", &self.jetstream_stream_name)
+            .field("jetstream_ack_timeout_secs", &self.jetstream_ack_timeout_secs)
             .field("target_type", &self.target_type)
             .finish()
     }
@@ -113,6 +134,13 @@ impl NATSArgs {
         if !self.queue_dir.is_empty() && !Path::new(&self.queue_dir).is_absolute() {
             return Err(TargetError::Configuration("NATS queue directory must be an absolute path".to_string()));
         }
+
+        validate_jetstream_settings(
+            self.jetstream_enable.unwrap_or(false),
+            self.jetstream_stream_name.as_deref().unwrap_or_default(),
+            &self.queue_dir,
+            self.jetstream_ack_timeout_secs,
+        )?;
 
         Ok(())
     }
@@ -160,12 +188,9 @@ fn validate_nats_auth(args: &NATSArgs) -> Result<(), TargetError> {
     Ok(())
 }
 
-/// Returns true when the target is configured to send credentials (token,
-/// username/password, or a credentials file) over a connection that does not
-/// require TLS, which would transmit the secrets in cleartext (backlog#983).
-///
-/// TLS is considered active when `tls_required` is set or the address uses the
-/// `tls://` scheme.
+/// Returns true when the target sends credentials over a connection that does not require TLS, which
+/// would transmit the secrets in cleartext (backlog#983). TLS is active when tls_required is set or
+/// the address uses the tls:// scheme.
 fn nats_sends_credentials_without_tls(args: &NATSArgs) -> bool {
     let has_auth = !args.token.is_empty() || !args.credentials_file.is_empty() || !args.username.is_empty();
     if !has_auth {
@@ -211,12 +236,16 @@ where
     id: TargetID,
     args: NATSArgs,
     client: Arc<Mutex<Option<async_nats::Client>>>,
+    /// Cached JetStream context, one per target shared across clones so a single acker and semaphore
+    /// serve every clone. Read out under the lock before each publish await, never held across it.
+    /// Carries the stream-validation verdict for the bound connection.
+    jetstream_context: Arc<Mutex<Option<CachedJetStreamContext>>>,
     tls_state: Arc<parking_lot::Mutex<TargetTlsState>>,
-    /// Adapter that bridges this target to the TLS reload coordinator.
-    /// When `Some`, the target uses coordinator-managed material; when `None`,
-    /// it falls back to inline fingerprint-based change detection.
+    /// When set, the coordinator drives TLS reload, otherwise inline fingerprint change detection.
     tls_adapter: Option<TlsReloadAdapter<async_nats::Client>>,
-    store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
+    /// The concrete queue store, held typed so the target projects both the generic Store handle and
+    /// its own failed-events capability from a single store. Shared across clones through the Arc.
+    store: Option<Arc<QueueStore<QueuedPayload>>>,
     connected: AtomicBool,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: std::marker::PhantomData<E>,
@@ -231,9 +260,10 @@ where
             id: self.id.clone(),
             args: self.args.clone(),
             client: Arc::clone(&self.client),
+            jetstream_context: Arc::clone(&self.jetstream_context),
             tls_state: Arc::clone(&self.tls_state),
             tls_adapter: self.tls_adapter.clone(),
-            store: self.store.as_ref().map(|s| s.boxed_clone()),
+            store: self.store.clone(),
             connected: AtomicBool::new(self.connected.load(Ordering::SeqCst)),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: std::marker::PhantomData,
@@ -251,19 +281,21 @@ where
             );
         }
         let target_id = TargetID::new(id, ChannelTargetType::Nats.as_str().to_string());
-        let queue_store = open_target_queue_store(
+        let queue_store = open_target_queue_store_typed(
             &args.queue_dir,
             args.queue_limit,
             args.target_type,
             ChannelTargetType::Nats.as_str(),
             &target_id,
             "Failed to open store for NATS target",
-        )?;
+        )?
+        .map(Arc::new);
 
         Ok(Self {
             id: target_id,
             args,
             client: Arc::new(Mutex::new(None)),
+            jetstream_context: Arc::new(Mutex::new(None)),
             tls_state: Arc::new(parking_lot::Mutex::new(TargetTlsState::default())),
             tls_adapter: None,
             store: queue_store,
@@ -299,7 +331,6 @@ where
         };
         if tls_changed {
             self.invalidate_cached_client_connection().await;
-            self.tls_state.lock().refresh(next_fingerprint);
         }
 
         {
@@ -316,13 +347,53 @@ where
             .map_err(|e| TargetError::Network(format!("Failed to flush NATS connection: {e}")))?;
         self.connected.store(true, Ordering::SeqCst);
 
-        let mut guard = self.client.lock().await;
-        let shared = guard.get_or_insert_with(|| client.clone()).clone();
+        let mut client_guard = self.client.lock().await;
+        let shared = client_guard.get_or_insert_with(|| client.clone()).clone();
+
+        // Swap in a context built from the winning client while the client lock is held, so client
+        // and context swap as a unit and no clone reads a context bound to the old client. Only the
+        // JetStream path caches a context. The previous context is drained after the locks release.
+        let previous_context = if tls_changed && self.jetstream_enabled() {
+            let ack_timeout = self.ack_timeout();
+            let mut context_guard = self.jetstream_context.lock().await;
+            let mut context = async_nats::jetstream::new(shared.clone());
+            context.set_timeout(ack_timeout);
+            context_guard.replace(CachedJetStreamContext::new(context))
+        } else {
+            None
+        };
+        drop(client_guard);
+
+        // Advance the recorded fingerprint only after the reconnect and flush succeed, so a rotation
+        // whose first reconnect fails stays detected and the next success still rebuilds the context.
+        if tls_changed {
+            self.tls_state.lock().refresh(next_fingerprint);
+        }
+
+        drain_jetstream_context(previous_context.map(|cached| cached.context)).await;
         Ok(shared)
     }
 
+    fn jetstream_enabled(&self) -> bool {
+        self.args.jetstream_enable.unwrap_or(false)
+    }
+
+    fn ack_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.args
+                .jetstream_ack_timeout_secs
+                .unwrap_or(NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS),
+        )
+    }
+
     fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        build_queued_payload_with_records(event, vec![event.clone()])
+        let mut queued = build_queued_payload_with_records(event, vec![event.clone()])?;
+        if self.jetstream_enabled() {
+            // Mint the dedup id once at enqueue so it is identical across every retry and replay and
+            // distinct across entries. The body-hash fallback only covers entries queued before enable.
+            queued.meta.dedup_id = Uuid::new_v4().to_string();
+        }
+        Ok(queued)
     }
 
     async fn send_body(&self, body: Vec<u8>) -> Result<(), TargetError> {
@@ -336,10 +407,8 @@ where
             return Err(err);
         }
 
-        // `publish` only enqueues the message on the client's outbound channel;
-        // it does not guarantee the broker received it. Flush to confirm the
-        // message reached the server before the caller treats delivery as
-        // successful and deletes the durable copy (backlog#971).
+        // publish only enqueues the message on the client's outbound channel. Flush to confirm the
+        // message reached the server before delivery is treated as successful (backlog#971).
         if let Err(e) = client.flush().await {
             let err = classify_nats_flush_error(&e);
             self.invalidate_cached_client_connection().await;
@@ -349,30 +418,6 @@ where
 
         self.delivery_counters.record_success();
         Ok(())
-    }
-}
-
-/// Classifies a NATS publish failure using the typed error kind rather than a
-/// substring match. `Send` means the outbound channel is closed (the connection
-/// is gone) and is retriable; payload/subject violations are permanent
-/// request-level errors (backlog#971, backlog#973).
-fn classify_nats_publish_error(err: &async_nats::PublishError) -> TargetError {
-    use async_nats::PublishErrorKind;
-    match err.kind() {
-        PublishErrorKind::Send => TargetError::NotConnected,
-        PublishErrorKind::MaxPayloadExceeded | PublishErrorKind::InvalidSubject => {
-            TargetError::Request(format!("Failed to publish NATS message: {err}"))
-        }
-    }
-}
-
-/// Classifies a NATS flush failure. Both flush error kinds indicate the message
-/// was not confirmed on the wire (a connectivity problem), so the event is kept
-/// for replay (backlog#971, backlog#973).
-fn classify_nats_flush_error(err: &async_nats::client::FlushError) -> TargetError {
-    use async_nats::client::FlushErrorKind;
-    match err.kind() {
-        FlushErrorKind::SendError | FlushErrorKind::FlushError => TargetError::NotConnected,
     }
 }
 
@@ -386,6 +431,13 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
+        // With JetStream enabled the health answer covers the stream as well as the connection, so a
+        // reachable broker with a failing stream reports the validation error. The verdict is cached
+        // and reset on a reconnect, TLS rotation, wrong-stream ack, or stream-not-found outcome, so a
+        // reset forces a live lookup on the next check.
+        if self.jetstream_enabled() {
+            self.validated_jetstream_context().await?;
+        }
         let client = self.get_or_connect().await?;
         client
             .flush()
@@ -418,11 +470,31 @@ where
         }
     }
 
-    async fn send_raw_from_store(&self, _key: Key, body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-        self.send_body(body).await
+    async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+        if self.jetstream_enabled() {
+            let dedup_id = resolve_dedup_id(&meta.dedup_id, &key);
+            self.publish_jetstream(body, &dedup_id).await
+        } else {
+            self.send_body(body).await
+        }
     }
 
     async fn close(&self) -> Result<(), TargetError> {
+        // Drain the cached context's in-flight acks before dropping it so the async-nats acker exits.
+        // Drain the context before the client, since the acker rides the client connection.
+        let context = {
+            let mut guard = self.jetstream_context.lock().await;
+            guard.take()
+        };
+        // Bound the drain by the ack timeout so an unresponsive broker cannot stall close. On elapse
+        // the client drain below still runs.
+        if tokio::time::timeout(self.ack_timeout(), drain_jetstream_context(context.map(|cached| cached.context)))
+            .await
+            .is_err()
+        {
+            warn!(target_id = %self.id, "Timed out draining JetStream acks on close, proceeding to close the client");
+        }
+
         let client = {
             let mut guard = self.client.lock().await;
             guard.take()
@@ -435,12 +507,49 @@ where
                 .await
                 .map_err(|e| TargetError::Network(format!("Failed to drain NATS client: {e}")))?;
         }
+        // The durable queue store stays on disk, so a queued entry survives close and replays. Close
+        // releases the cached handles, never the entries.
         info!(target_id = %self.id, "NATS target closed");
         Ok(())
     }
 
     fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-        self.store.as_deref()
+        self.store
+            .as_deref()
+            .map(|store| store as &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync))
+    }
+
+    fn failed_store(&self) -> Option<&dyn FailedEventStore> {
+        self.store.as_deref().map(|store| store as &dyn FailedEventStore)
+    }
+
+    async fn handle_terminal_failure(
+        &self,
+        store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send),
+        key: &Key,
+        error: &TargetError,
+        retry_count: u32,
+    ) -> bool {
+        let Some(failed_store) = self.failed_store() else {
+            error!(
+                target_id = %self.id,
+                replay_key = %key,
+                "NATS target has no failed-events store for the terminal move"
+            );
+            return false;
+        };
+        match jetstream::move_entry_to_failed_store(store, failed_store, &self.id, key, error, retry_count).await {
+            Ok(()) => true,
+            Err(move_err) => {
+                error!(
+                    target_id = %self.id,
+                    error = %move_err,
+                    replay_key = %key,
+                    "Failed to move event to the failed-events store"
+                );
+                false
+            }
+        }
     }
 
     fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
@@ -452,6 +561,13 @@ where
             return Ok(());
         }
         let _ = self.get_or_connect().await?;
+        if self.jetstream_enabled() {
+            let cached = self.jetstream_context().await?;
+            validate_jetstream_stream(&cached.context, &self.args, &self.id.to_string(), Some(&cached.validation_logged)).await?;
+            // Record the verdict on the context so the first publish does not repeat the stream
+            // lookup that just passed.
+            cached.stream_validated.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -460,8 +576,10 @@ where
     }
 
     fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
-        self.delivery_counters
-            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
+        self.delivery_counters.snapshot(
+            self.store.as_deref().map_or(0, |store| store.len() as u64),
+            self.failed_store().map_or(0, |failed_store| failed_store.failed_len() as u64),
+        )
     }
 
     fn record_final_failure(&self) {
@@ -510,11 +628,18 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::target::REDACTED_SECRET;
+    use async_nats::jetstream;
+    use rustfs_s3_types::EventName;
 
-    fn base_args() -> NATSArgs {
+    // Absolute on Linux, macOS, and Windows. temp_dir needs no filesystem to exist for a
+    // validation-only test, and Path::is_absolute stays true across platforms.
+    pub(crate) fn nats_queue_dir() -> String {
+        std::env::temp_dir().join("rustfs-nats-queue").to_string_lossy().into_owned()
+    }
+
+    pub(crate) fn base_args() -> NATSArgs {
         NATSArgs {
             enable: true,
             address: "nats://127.0.0.1:4222".to_string(),
@@ -529,9 +654,122 @@ mod tests {
             tls_required: false,
             queue_dir: String::new(),
             queue_limit: 0,
+            jetstream_enable: None,
+            jetstream_stream_name: None,
+            jetstream_ack_timeout_secs: None,
             target_type: TargetType::NotifyEvent,
         }
     }
+
+    pub(crate) fn jetstream_args(target_type: TargetType) -> NATSArgs {
+        NATSArgs {
+            jetstream_enable: Some(true),
+            jetstream_stream_name: Some("RUSTFS_EVENTS".to_string()),
+            jetstream_ack_timeout_secs: Some(30),
+            target_type,
+            ..base_args()
+        }
+    }
+
+    pub(crate) fn nats_target(args: NATSArgs) -> NATSTarget<String> {
+        NATSTarget::<String> {
+            id: TargetID::new("test-target".to_string(), ChannelTargetType::Nats.as_str().to_string()),
+            args,
+            client: Arc::new(Mutex::new(None)),
+            jetstream_context: Arc::new(Mutex::new(None)),
+            tls_state: Arc::new(parking_lot::Mutex::new(TargetTlsState::default())),
+            tls_adapter: None,
+            store: None,
+            connected: AtomicBool::new(false),
+            delivery_counters: Arc::new(TargetDeliveryCounters::default()),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn sample_event() -> EntityTarget<String> {
+        EntityTarget {
+            object_name: "folder/object.txt".to_string(),
+            bucket_name: "bucket-a".to_string(),
+            event_name: EventName::ObjectCreatedPut,
+            data: "payload-data".to_string(),
+        }
+    }
+
+    pub(crate) fn sample_stored_key(name: &str) -> Key {
+        Key {
+            name: name.to_string(),
+            extension: ".event".to_string(),
+            item_count: 1,
+            compress: false,
+        }
+    }
+
+    pub(crate) fn nats_target_with_store(args: NATSArgs, queue_dir: &str) -> NATSTarget<String> {
+        let mut configured = args;
+        configured.queue_dir = queue_dir.to_string();
+        NATSTarget::<String>::new("store-target".to_string(), configured).expect("target with store builds")
+    }
+
+    /// A stream configuration that passes every assertion: it captures the configured subject, returns
+    /// acks, accepts writes, and deduplicates well beyond the retry lifetime.
+    pub(crate) fn writable_stream_config(subject: &str) -> jetstream::stream::Config {
+        jetstream::stream::Config {
+            name: "RUSTFS_EVENTS".to_string(),
+            subjects: vec![subject.to_string()],
+            no_ack: false,
+            sealed: false,
+            duplicate_window: Duration::from_secs(600),
+            ..Default::default()
+        }
+    }
+
+    // Live-broker behaviour tests. They require a NATS server with JetStream enabled and are ignored by
+    // default. To run locally:
+    //
+    //     docker run -d --name rustfs-nats-test -p 4222:4222 nats:2 -js
+    //     cargo test -p rustfs-targets --lib -- --ignored nats::tests::tls_change
+    //
+    // Override the server URL with RUSTFS_TEST_NATS_URL.
+    pub(crate) fn broker_url() -> String {
+        std::env::var("RUSTFS_TEST_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string())
+    }
+
+    /// Log sink for asserting a specific line is written. The subscriber writes into a shared
+    /// buffer the assertion reads back.
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLog(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        pub(crate) fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::REDACTED_SECRET;
+    use crate::target::nats::test_support::*;
 
     #[test]
     fn debug_redacts_nats_secret_fields() {
@@ -575,8 +813,7 @@ mod tests {
 
     #[test]
     fn nats_credentials_without_tls_is_detected() {
-        // Token auth over a plaintext nats:// address without tls_required leaks
-        // the credential in cleartext (backlog#983).
+        // Token auth over a plaintext nats:// address without tls_required leaks the credential (backlog#983).
         let insecure = NATSArgs {
             token: "secret-token".to_string(),
             tls_required: false,
@@ -603,25 +840,17 @@ mod tests {
         assert!(!nats_sends_credentials_without_tls(&no_auth));
     }
 
-    #[test]
-    fn nats_publish_error_classification() {
-        use async_nats::PublishErrorKind;
-        // `Send` means the outbound channel is gone: retriable connectivity error.
-        let send_err = async_nats::PublishError::new(PublishErrorKind::Send);
-        assert!(matches!(classify_nats_publish_error(&send_err), TargetError::NotConnected));
+    #[tokio::test]
+    async fn flag_off_stored_meta_is_byte_identical_to_pre_feature() {
+        // With the flag off the payload carries no dedup id, so its encoded meta matches a pre-feature entry.
+        let disabled = nats_target(base_args());
+        let off_payload = disabled.build_queued_payload(&sample_event()).expect("payload builds");
+        assert!(off_payload.meta.dedup_id.is_empty(), "no dedup id is minted with the flag off");
 
-        // Payload/subject violations are permanent request-level errors.
-        let payload_err = async_nats::PublishError::new(PublishErrorKind::MaxPayloadExceeded);
-        assert!(matches!(classify_nats_publish_error(&payload_err), TargetError::Request(_)));
-        let subject_err = async_nats::PublishError::new(PublishErrorKind::InvalidSubject);
-        assert!(matches!(classify_nats_publish_error(&subject_err), TargetError::Request(_)));
-    }
+        let meta_json = serde_json::to_string(&off_payload.meta).expect("meta serializes");
+        assert!(!meta_json.contains("dedup_id"), "the absent dedup id is skipped on serialization");
 
-    #[test]
-    fn nats_flush_error_classification() {
-        use async_nats::client::{FlushError, FlushErrorKind};
-        for kind in [FlushErrorKind::SendError, FlushErrorKind::FlushError] {
-            assert!(matches!(classify_nats_flush_error(&FlushError::new(kind)), TargetError::NotConnected));
-        }
+        // No JetStream context is built on the flag-off path.
+        assert!(disabled.jetstream_context.lock().await.is_none(), "no context is built with the flag off");
     }
 }

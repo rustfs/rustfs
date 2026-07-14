@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use super::common::{
-    parse_target_bool, parse_url, validate_nats_server_config, validate_outbound_http_url, validate_pulsar_broker_config,
+    parse_jetstream_ack_timeout_secs, parse_jetstream_enable, parse_target_bool, parse_url, validate_nats_server_config,
+    validate_outbound_http_url, validate_pulsar_broker_config,
 };
 use crate::error::TargetError;
 use crate::target::{
@@ -38,17 +39,17 @@ use rustfs_config::{
     MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA,
     MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
     MQTT_WS_PATH_ALLOWLIST, MYSQL_DSN_STRING, MYSQL_FORMAT, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT,
-    MYSQL_TABLE, MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_PASSWORD,
-    NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED,
-    NATS_TOKEN, NATS_USERNAME, POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR, POSTGRES_QUEUE_LIMIT, POSTGRES_TABLE,
-    POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_TLS_REQUIRED, PULSAR_AUTH_TOKEN, PULSAR_BROKER,
-    PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
-    PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT,
-    REDIS_KEEP_ALIVE_INTERVAL, REDIS_MAX_RETRY_ATTEMPTS, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PASSWORD,
-    REDIS_PIPELINE_BUFFER_SIZE, REDIS_QUEUE_DIR, REDIS_QUEUE_LIMIT, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT,
-    REDIS_TLS_ALLOW_INSECURE, REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY, REDIS_URL,
-    REDIS_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT,
-    WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
+    MYSQL_TABLE, MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, NATS_ADDRESS, NATS_CREDENTIALS_FILE,
+    NATS_JETSTREAM_STREAM_NAME, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
+    NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN, NATS_USERNAME, POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR,
+    POSTGRES_QUEUE_LIMIT, POSTGRES_TABLE, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY,
+    POSTGRES_TLS_REQUIRED, PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_QUEUE_LIMIT,
+    PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC, PULSAR_USERNAME, REDIS_CHANNEL,
+    REDIS_CONNECTION_TIMEOUT, REDIS_KEEP_ALIVE_INTERVAL, REDIS_MAX_RETRY_ATTEMPTS, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY,
+    REDIS_PASSWORD, REDIS_PIPELINE_BUFFER_SIZE, REDIS_QUEUE_DIR, REDIS_QUEUE_LIMIT, REDIS_RECONNECT_RETRY_ATTEMPTS,
+    REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY,
+    REDIS_TLS_POLICY, REDIS_URL, REDIS_USERNAME, RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA,
+    WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT, WEBHOOK_SKIP_TLS_VERIFY,
 };
 use std::path::Path;
 use std::time::Duration;
@@ -315,6 +316,11 @@ pub fn build_nats_args(config: &KVS, default_queue_dir: &str, target_type: Targe
             .lookup(NATS_QUEUE_LIMIT)
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_LIMIT),
+        // Strict parse: an unparsable value is a configuration error, never a silent disable, so the
+        // durability guarantee the operator asked for cannot vanish over a typo.
+        jetstream_enable: parse_jetstream_enable(config)?,
+        jetstream_stream_name: config.lookup(NATS_JETSTREAM_STREAM_NAME).filter(|name| !name.is_empty()),
+        jetstream_ack_timeout_secs: parse_jetstream_ack_timeout_secs(config)?,
         target_type,
     })
 }
@@ -598,9 +604,9 @@ pub fn validate_mysql_config(config: &KVS, default_queue_dir: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::{
-        build_amqp_args, build_kafka_args, build_mysql_args, build_postgres_args, build_redis_args, build_webhook_args,
-        validate_amqp_config, validate_kafka_config, validate_mysql_config, validate_postgres_config, validate_redis_config,
-        validate_webhook_config,
+        build_amqp_args, build_kafka_args, build_mysql_args, build_nats_args, build_postgres_args, build_redis_args,
+        build_webhook_args, validate_amqp_config, validate_kafka_config, validate_mysql_config, validate_postgres_config,
+        validate_redis_config, validate_webhook_config,
     };
     use crate::target::{
         TargetType,
@@ -612,7 +618,8 @@ mod tests {
         AMQP_EXCHANGE, AMQP_MANDATORY, AMQP_PASSWORD, AMQP_PERSISTENT, AMQP_QUEUE_DIR, AMQP_ROUTING_KEY, AMQP_TLS_CLIENT_CERT,
         AMQP_TLS_CLIENT_KEY, AMQP_URL, AMQP_USERNAME, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_SASL_ENABLE, KAFKA_SASL_MECHANISM,
         KAFKA_SASL_PASSWORD, KAFKA_SASL_USERNAME, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MYSQL_DSN_STRING, MYSQL_MAX_OPEN_CONNECTIONS,
-        MYSQL_QUEUE_DIR, MYSQL_TABLE, MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, POSTGRES_DSN_STRING,
+        MYSQL_QUEUE_DIR, MYSQL_TABLE, MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, NATS_ADDRESS,
+        NATS_JETSTREAM_ACK_TIMEOUT_SECS, NATS_JETSTREAM_ENABLE, NATS_JETSTREAM_STREAM_NAME, NATS_SUBJECT, POSTGRES_DSN_STRING,
         POSTGRES_FORMAT, POSTGRES_QUEUE_DIR, POSTGRES_TABLE, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY,
         REDIS_CHANNEL, REDIS_CONNECTION_TIMEOUT, REDIS_MAX_RETRY_DELAY, REDIS_MIN_RETRY_DELAY, REDIS_PIPELINE_BUFFER_SIZE,
         REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_RESPONSE_TIMEOUT, REDIS_TLS_ALLOW_INSECURE, REDIS_URL, WEBHOOK_ENDPOINT,
@@ -1156,5 +1163,69 @@ mod tests {
         config.insert(POSTGRES_TLS_CLIENT_KEY.to_string(), "/etc/ssl/client.key".to_string());
         let err = validate_postgres_config(&config, "").expect_err("relative tls_client_cert should fail");
         assert!(err.to_string().contains("must be an absolute path"));
+    }
+
+    fn nats_base_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(NATS_ADDRESS.to_string(), "nats://127.0.0.1:4222".to_string());
+        config.insert(NATS_SUBJECT.to_string(), "rustfs.events".to_string());
+        config
+    }
+
+    // Absolute on Linux, macOS, and Windows. temp_dir needs no filesystem to exist for a
+    // validation-only test, and Path::is_absolute stays true across platforms.
+    fn nats_queue_dir() -> String {
+        std::env::temp_dir().join("rustfs-nats-queue").to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn build_nats_args_parses_jetstream_keys() {
+        let mut config = nats_base_config();
+        config.insert(NATS_JETSTREAM_ENABLE.to_string(), "on".to_string());
+        config.insert(NATS_JETSTREAM_STREAM_NAME.to_string(), "RUSTFS_EVENTS".to_string());
+        config.insert(NATS_JETSTREAM_ACK_TIMEOUT_SECS.to_string(), "45".to_string());
+
+        for target_type in [TargetType::NotifyEvent, TargetType::AuditLog] {
+            let args = build_nats_args(&config, &nats_queue_dir(), target_type).expect("jetstream keys parse");
+            assert_eq!(args.jetstream_enable, Some(true));
+            assert_eq!(args.jetstream_stream_name.as_deref(), Some("RUSTFS_EVENTS"));
+            assert_eq!(args.jetstream_ack_timeout_secs, Some(45));
+        }
+    }
+
+    #[test]
+    fn build_nats_args_rejects_an_invalid_jetstream_enable_value() {
+        // A typo in the enable flag is a configuration error naming the key, never a silent
+        // disable that drops the durability guarantee the operator asked for.
+        let mut config = nats_base_config();
+        config.insert(NATS_JETSTREAM_ENABLE.to_string(), "t".to_string());
+
+        let err = build_nats_args(&config, &nats_queue_dir(), TargetType::NotifyEvent)
+            .expect_err("an unparsable enable value fails the build");
+        assert!(err.to_string().contains(NATS_JETSTREAM_ENABLE), "the error names the key: {err}");
+    }
+
+    #[test]
+    fn build_nats_args_without_jetstream_keys_is_flag_off() {
+        let config = nats_base_config();
+        let args = build_nats_args(&config, &nats_queue_dir(), TargetType::NotifyEvent).expect("baseline config parses");
+
+        assert_eq!(args.jetstream_enable, None);
+        assert_eq!(args.jetstream_stream_name, None);
+        assert_eq!(args.jetstream_ack_timeout_secs, None);
+        assert_eq!(args.address, "nats://127.0.0.1:4222");
+        assert_eq!(args.subject, "rustfs.events");
+        assert_eq!(args.queue_dir, nats_queue_dir());
+        args.validate().expect("flag-off config validates");
+    }
+
+    #[test]
+    fn build_nats_args_rejects_non_integer_ack_timeout() {
+        let mut config = nats_base_config();
+        config.insert(NATS_JETSTREAM_ACK_TIMEOUT_SECS.to_string(), "soon".to_string());
+
+        let err = build_nats_args(&config, &nats_queue_dir(), TargetType::NotifyEvent)
+            .expect_err("non-integer ack timeout should be rejected");
+        assert!(err.to_string().contains("whole number of seconds"));
     }
 }
