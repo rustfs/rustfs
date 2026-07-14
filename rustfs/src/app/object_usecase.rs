@@ -373,6 +373,7 @@ struct GetObjectOutputContext {
     event_info: Option<ObjectInfo>,
     response_content_length: i64,
     optimal_buffer_size: usize,
+    extra_checksum_headers: Vec<(&'static str, String)>,
 }
 
 enum GetObjectTimeoutStage {
@@ -1672,6 +1673,47 @@ async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventS
     enqueue_transition_immediate(obj_info, src).await;
 }
 
+/// Inject additional-checksum response headers (XXHash3/64/128, SHA-512) that s3s
+/// cannot carry on its typed `*Output` structs. Centralized so that when s3s gains
+/// typed fields for these algorithms, only this one function changes (fill the typed
+/// field, drop the header insert) — and there is exactly one place that could ever
+/// emit a duplicate header. Header names come from `ChecksumType::key()`, so they are
+/// known-valid static strings.
+fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs: &[(&'static str, String)]) {
+    for (name, value) in pairs {
+        match HeaderValue::from_str(value) {
+            Ok(header_value) => {
+                headers.insert(http::HeaderName::from_static(name), header_value);
+            }
+            Err(_) => warn!("Failed to parse {name} checksum header value; skipping"),
+        }
+    }
+}
+
+/// Derive the response-header echo pairs for an additional-checksum algorithm
+/// (XXHash3/64/128, SHA-512) from the server-computed content checksum, for
+/// PutObject to echo back (#1256). Returns empty for the five s3s-typed algorithms
+/// (they are echoed via typed fields) and when the value is not yet materialized
+/// (e.g. a trailing checksum, whose value lands after the body — covered by e2e).
+fn additional_checksum_echo_pairs(want: &Option<rustfs_rio::Checksum>) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    if let Some(cs) = want {
+        let base = cs.checksum_type.base();
+        let is_s3s_typed = base == rustfs_rio::ChecksumType::CRC32
+            || base == rustfs_rio::ChecksumType::CRC32C
+            || base == rustfs_rio::ChecksumType::SHA1
+            || base == rustfs_rio::ChecksumType::SHA256
+            || base == rustfs_rio::ChecksumType::CRC64_NVME;
+        if !is_s3s_typed
+            && !cs.encoded.is_empty()
+            && let Some(name) = base.key()
+        {
+            out.push((name, cs.encoded.clone()));
+        }
+    }
+    out
+}
+
 /// Extract trailing-header checksum values, overriding the corresponding input fields.
 fn apply_trailing_checksums(
     algorithm: Option<&str>,
@@ -1715,6 +1757,9 @@ struct GetObjectChecksums {
     sha256: Option<String>,
     crc64nvme: Option<String>,
     checksum_type: Option<ChecksumType>,
+    /// XXHash3/64/128 and SHA-512, which s3s GetObjectOutput has no typed field for;
+    /// emitted as raw response headers via inject_additional_checksum_headers (#1257).
+    extra: Vec<(&'static str, String)>,
 }
 
 #[derive(Default)]
@@ -3056,13 +3101,18 @@ impl DefaultObjectUsecase {
                     continue;
                 }
 
-                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
+                match ct {
                     rustfs_rio::ChecksumType::CRC32 => checksums.crc32 = Some(checksum),
                     rustfs_rio::ChecksumType::CRC32C => checksums.crc32c = Some(checksum),
                     rustfs_rio::ChecksumType::SHA1 => checksums.sha1 = Some(checksum),
                     rustfs_rio::ChecksumType::SHA256 => checksums.sha256 = Some(checksum),
                     rustfs_rio::ChecksumType::CRC64_NVME => checksums.crc64nvme = Some(checksum),
-                    _ => (),
+                    other => {
+                        if let Some(name) = other.key() {
+                            checksums.extra.push((name, checksum));
+                        }
+                    }
                 }
             }
         }
@@ -3707,6 +3757,9 @@ impl DefaultObjectUsecase {
         let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
 
         let mut write_plan = WritePlan::new();
+        // Additional-checksum (XXHash3/64/128, SHA-512) values to echo on the PutObject
+        // response (#1256); captured at want_checksum set points before opts is moved.
+        let mut put_extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
         let mut reader = if should_compress {
             let body = tokio::io::BufReader::with_capacity(
                 buffer_size,
@@ -3724,6 +3777,7 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = hrd.checksum();
+            put_extra_checksum_headers = additional_checksum_echo_pairs(&opts.want_checksum);
             insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
@@ -3773,6 +3827,7 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = reader.checksum();
+            put_extra_checksum_headers = additional_checksum_echo_pairs(&opts.want_checksum);
         }
         rustfs_io_metrics::record_put_object_path(put_path);
         rustfs_io_metrics::record_put_object_stage_duration(
@@ -4006,7 +4061,11 @@ impl DefaultObjectUsecase {
         // For browser-based POST uploads (multipart/form-data), response status/body handling
         // is decided by s3s PostObject serializer (success_action_status / redirect semantics).
 
-        let result = Ok(S3Response::new(output));
+        let mut response = S3Response::new(output);
+        // Echo XXHash3/64/128 / SHA-512 checksums that s3s PutObjectOutput has no typed
+        // field for (#1256).
+        inject_additional_checksum_headers(&mut response.headers, &put_extra_checksum_headers);
+        let result = Ok(response);
         let _ = helper.complete(&result);
         rustfs_scanner::record_dirty_usage_bucket(&bucket);
 
@@ -4129,13 +4188,17 @@ impl DefaultObjectUsecase {
         event_info: Option<ObjectInfo>,
         version_id_for_event: String,
         output: GetObjectOutput,
+        extra_checksum_headers: Vec<(&'static str, String)>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let helper = match event_info {
             Some(event_info) => helper.object(event_info),
             None => helper,
         };
         let helper = helper.version_id(version_id_for_event);
-        let response = wrap_response_with_cors(bucket, method, headers, output).await;
+        let mut response = wrap_response_with_cors(bucket, method, headers, output).await;
+        // Emit XXHash3/64/128 and SHA-512 checksums that s3s GetObjectOutput cannot
+        // carry (#1257). This is the download-side integrity path AWS SDKs verify.
+        inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
         let result = Ok(response);
         let _ = helper.complete(&result);
         result
@@ -4280,6 +4343,7 @@ impl DefaultObjectUsecase {
             event_info,
             response_content_length,
             optimal_buffer_size,
+            extra_checksum_headers: checksums.extra,
         })
     }
 
@@ -4444,6 +4508,7 @@ impl DefaultObjectUsecase {
             event_info,
             response_content_length,
             optimal_buffer_size,
+            extra_checksum_headers,
         } = output_context;
 
         let total_duration = request_start.elapsed();
@@ -4455,8 +4520,17 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
         );
 
-        Self::finalize_get_object_response(helper, &bucket, &req.method, &req.headers, event_info, version_id_for_event, output)
-            .await
+        Self::finalize_get_object_response(
+            helper,
+            &bucket,
+            &req.method,
+            &req.headers,
+            event_info,
+            version_id_for_event,
+            output,
+            extra_checksum_headers,
+        )
+        .await
     }
 
     pub async fn execute_get_object_attributes(
@@ -6015,16 +6089,8 @@ impl DefaultObjectUsecase {
         let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
 
         // Emit additional-checksum headers (XXHash3/64/128, SHA-512) that s3s cannot
-        // carry on the typed HeadObjectOutput (#1257). Header names come from
-        // ChecksumType::key(), so they are known-valid static strings.
-        for (name, value) in extra_checksum_headers {
-            match HeaderValue::from_str(&value) {
-                Ok(header_value) => {
-                    response.headers.insert(http::HeaderName::from_static(name), header_value);
-                }
-                Err(_) => warn!("Failed to parse {name} checksum header value; skipping"),
-            }
-        }
+        // carry on the typed HeadObjectOutput (#1257).
+        inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
 
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
