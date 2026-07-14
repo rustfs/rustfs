@@ -280,14 +280,20 @@ async fn rejects_minio_generated_sse_s3_fixture_with_truncated_ciphertext() {
 
 async fn assert_fixture_round_trip(case_id: &str, expected_size: i64) {
     let (object_info, encrypted, expected_sha256) = load_fixture_reader_input(case_id).await;
-    let object_size = object_info.size;
+    // `ObjectInfo.size` is the on-disk size. For SSE objects that is the
+    // DARE-encrypted size (plaintext + 32 bytes per 64 KiB block), which is
+    // deliberately larger than the logical object size. The size a client sees
+    // (and what MinIO records via `x-*-internal-actual-size`) comes from
+    // `decrypted_size()`/`get_actual_size()`, so assert against that — the raw
+    // `size` field would never equal the plaintext length for encrypted objects.
+    let decrypted_size = object_info.decrypted_size().expect("decrypted size from MinIO metadata");
     let kms_key_b64 = minio_static_kms_key_b64();
 
     let plaintext = read_fixture_plaintext(encrypted, object_info, kms_key_b64)
         .await
         .expect("fixture must restore with the configured KMS key");
 
-    assert_eq!(object_size, expected_size);
+    assert_eq!(decrypted_size, expected_size);
     assert_eq!(plaintext.len(), expected_size as usize);
     assert_eq!(sha256_hex(&plaintext), expected_sha256);
 }
