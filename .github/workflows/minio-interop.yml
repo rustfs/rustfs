@@ -1,0 +1,70 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# MinIO on-disk interop: prove RustFS reads MinIO-written erasure-coded SSE
+# objects with byte-identical data and correct logical size.
+#
+# This is NOT a PR gate. The fixtures are real MinIO backend trees generated on
+# the fly (they are gitignored, never committed), so the job regenerates them
+# each run with Docker and then runs the `#[ignore]` reader tests in
+# crates/ecstore/tests/minio_generated_read_test.rs.
+#
+# Runner: GitHub-hosted `ubuntu-latest`. It reliably ships Docker + Python,
+# unlike the self-hosted fleet, whose pods drift in Docker/pip availability
+# (see the infra note in e2e-s3tests.yml). Nightly + manual only.
+name: minio-interop
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 03:17 UTC (offset from other nightly jobs).
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  minio-interop:
+    name: MinIO interop (EC + SSE read parity)
+    # Skip on forks: needs the repo's runners and is not a contributor gate.
+    if: github.repository == 'rustfs/rustfs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      # Fixed 32-byte test KMS key baked into the fixture lab; not a secret.
+      RUSTFS_MINIO_STATIC_KMS_KEY_B64: IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g=
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-minio-interop
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Generate real MinIO fixtures via Docker
+        run: bash crates/rio-v2/tests/minio_fixture_lab/capture_via_docker.sh
+
+      - name: Run MinIO interop reader tests
+        run: |
+          cargo nextest run --run-ignored ignored-only \
+            -p rustfs-ecstore --features rio-v2 \
+            -E 'binary(minio_generated_read_test)'
