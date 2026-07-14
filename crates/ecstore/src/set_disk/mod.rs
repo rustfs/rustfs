@@ -6734,6 +6734,7 @@ mod tests {
             rustfs_rio::ChecksumType::XXHASH64,
             rustfs_rio::ChecksumType::XXHASH128,
             rustfs_rio::ChecksumType::SHA512,
+            rustfs_rio::ChecksumType::MD5,
         ] {
             assert_eq!(complete_part_checksum(&CompletePart::default(), ct), Some(None), "{ct:?}");
         }

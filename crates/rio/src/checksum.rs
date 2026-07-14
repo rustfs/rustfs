@@ -80,6 +80,10 @@ impl ChecksumType {
     /// SHA-512 checksum.
     pub const SHA512: ChecksumType = ChecksumType(1 << 13);
 
+    /// MD5 as an ADDITIONAL checksum (x-amz-checksum-md5), distinct from the legacy
+    /// Content-MD5 / ETag path.
+    pub const MD5: ChecksumType = ChecksumType(1 << 14);
+
     /// No checksum
     pub const NONE: ChecksumType = ChecksumType(0);
 
@@ -119,6 +123,7 @@ impl ChecksumType {
             Self::XXHASH64 => Some("x-amz-checksum-xxhash64"),
             Self::XXHASH128 => Some("x-amz-checksum-xxhash128"),
             Self::SHA512 => Some("x-amz-checksum-sha512"),
+            Self::MD5 => Some("x-amz-checksum-md5"),
             _ => None,
         }
     }
@@ -133,6 +138,7 @@ impl ChecksumType {
             Self::XXHASH3 | Self::XXHASH64 => 8,
             Self::XXHASH128 => 16,
             Self::SHA512 => 64,
+            Self::MD5 => 16,
             _ => 0,
         }
     }
@@ -159,6 +165,7 @@ impl ChecksumType {
             Self::XXHASH64 => Some(Box::new(Xxh64Hasher::new())),
             Self::XXHASH128 => Some(Box::new(Xxh128Hasher::new())),
             Self::SHA512 => Some(Box::new(Sha512Hasher::new())),
+            Self::MD5 => Some(Box::new(Md5Hasher::new())),
             _ => None,
         }
     }
@@ -253,6 +260,12 @@ impl ChecksumType {
                 }
                 Self::SHA512
             }
+            "MD5" => {
+                if full != Self::NONE {
+                    return Self::INVALID;
+                }
+                Self::MD5
+            }
             "" => {
                 if full != Self::NONE {
                     return Self::INVALID;
@@ -276,6 +289,7 @@ impl std::fmt::Display for ChecksumType {
             Self::XXHASH64 => write!(f, "XXHASH64"),
             Self::XXHASH128 => write!(f, "XXHASH128"),
             Self::SHA512 => write!(f, "SHA512"),
+            Self::MD5 => write!(f, "MD5"),
             Self::NONE => write!(f, ""),
             _ => write!(f, "invalid"),
         }
@@ -295,6 +309,7 @@ pub const BASE_CHECKSUM_TYPES: &[ChecksumType] = &[
     ChecksumType::XXHASH64,
     ChecksumType::XXHASH128,
     ChecksumType::SHA512,
+    ChecksumType::MD5,
 ];
 
 /// Fold the base-type bits of `types` into a mask. Used to derive
@@ -1062,6 +1077,49 @@ impl ChecksumHasher for Sha512Hasher {
     }
 }
 
+/// MD5 hasher for the ADDITIONAL checksum (x-amz-checksum-md5). Separate from the
+/// legacy Content-MD5 / ETag machinery — this only serves the flexible-checksum path.
+pub struct Md5Hasher {
+    hasher: md5::Md5,
+}
+
+impl Default for Md5Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Md5Hasher {
+    pub fn new() -> Self {
+        use md5::Digest as _;
+        Self { hasher: md5::Md5::new() }
+    }
+}
+
+impl Write for Md5Hasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use md5::Digest as _;
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ChecksumHasher for Md5Hasher {
+    fn finalize(&mut self) -> Vec<u8> {
+        use md5::Digest as _;
+        self.hasher.clone().finalize().to_vec()
+    }
+
+    fn reset(&mut self) {
+        use md5::Digest as _;
+        self.hasher = md5::Md5::new();
+    }
+}
+
 /// Encode unsigned integer as varint
 fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -1465,7 +1523,7 @@ mod tests {
     // must never be routed through add_part()/can_merge().
     #[test]
     fn new_algorithms_are_composite_only() {
-        for alg in ["XXHASH3", "XXHASH64", "XXHASH128", "SHA512"] {
+        for alg in ["XXHASH3", "XXHASH64", "XXHASH128", "SHA512", "MD5"] {
             let composite = ChecksumType::from_string_with_obj_type(alg, "COMPOSITE");
             assert!(composite.is_set(), "{alg} COMPOSITE should be valid");
             assert!(!composite.can_merge(), "{alg} must not be mergeable (composite-only)");
@@ -1499,6 +1557,8 @@ mod tests {
             "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
              47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
         );
+        // MD5("") = d41d8cd98f00b204e9800998ecf8427e (official)
+        assert_eq!(raw_hex(ChecksumType::MD5, b""), "d41d8cd98f00b204e9800998ecf8427e");
     }
 
     // Regression lock for a non-empty payload: values are produced by this
@@ -1575,6 +1635,7 @@ mod tests {
             ChecksumType::XXHASH64,
             ChecksumType::XXHASH128,
             ChecksumType::SHA512,
+            ChecksumType::MD5,
         ] {
             let c1 = Checksum::new_from_data(t, part1).expect("part1");
             let c2 = Checksum::new_from_data(t, part2).expect("part2");
