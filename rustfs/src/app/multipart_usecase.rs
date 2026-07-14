@@ -73,7 +73,7 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
-    AMZ_CHECKSUM_TYPE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, get_source_scheme,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, get_source_scheme,
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
     insert_str,
 };

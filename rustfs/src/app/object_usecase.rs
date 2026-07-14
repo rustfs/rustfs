@@ -6881,6 +6881,97 @@ mod tests {
         assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS + 1), None);
     }
 
+    // classify_response_checksums is the single point that splits decrypted checksum
+    // pairs into the five s3s-typed fields and the additional-algorithm `extra`
+    // headers, replacing five copies of the loop. Lock its behaviour (#1252).
+    #[test]
+    fn classify_response_checksums_splits_typed_and_extra() {
+        // Typed algorithms fill named fields; nothing spills into extra.
+        let c = classify_response_checksums(vec![
+            ("CRC32".to_string(), "AAAAAA==".to_string()),
+            ("SHA256".to_string(), "c2hhMjU2".to_string()),
+            ("CRC64NVME".to_string(), "Zm9vYmFyCg==".to_string()),
+        ]);
+        assert_eq!(c.crc32.as_deref(), Some("AAAAAA=="));
+        assert_eq!(c.sha256.as_deref(), Some("c2hhMjU2"));
+        assert_eq!(c.crc64nvme.as_deref(), Some("Zm9vYmFyCg=="));
+        assert!(c.extra.is_empty(), "typed algorithms must not land in extra");
+
+        // Additional algorithms land in extra keyed by their response-header name.
+        let c = classify_response_checksums(vec![
+            ("XXHASH3".to_string(), "eHhoMw==".to_string()),
+            ("XXHASH64".to_string(), "eHhoNjQ=".to_string()),
+            ("XXHASH128".to_string(), "eHhoMTI4".to_string()),
+            ("SHA512".to_string(), "c2hhNTEy".to_string()),
+            ("MD5".to_string(), "bWQ1".to_string()),
+        ]);
+        assert!(c.crc32.is_none() && c.sha256.is_none() && c.crc64nvme.is_none());
+        let names: Vec<&str> = c.extra.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "x-amz-checksum-xxhash3",
+            "x-amz-checksum-xxhash64",
+            "x-amz-checksum-xxhash128",
+            "x-amz-checksum-sha512",
+            "x-amz-checksum-md5",
+        ] {
+            assert!(names.contains(&expected), "extra missing {expected}: {names:?}");
+        }
+        assert_eq!(c.extra.len(), 5);
+
+        // The checksum-type marker is captured as the type, not mistaken for an algorithm.
+        let c = classify_response_checksums(vec![(AMZ_CHECKSUM_TYPE.to_string(), "COMPOSITE".to_string())]);
+        assert!(c.checksum_type.is_some());
+        assert!(c.extra.is_empty() && c.crc32.is_none());
+
+        // Empty input yields an all-default result.
+        let c = classify_response_checksums(Vec::<(String, String)>::new());
+        assert!(c.crc32.is_none() && c.extra.is_empty() && c.checksum_type.is_none());
+    }
+
+    // additional_checksum_echo_pairs derives the PutObject/UploadPart response echo for
+    // additional algorithms from the server-computed checksum, and nothing for the
+    // five typed ones (those go through typed output fields).
+    #[test]
+    fn additional_checksum_echo_pairs_only_for_new_algorithms() {
+        // Typed algorithm → no echo pair.
+        let sha256 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, b"data");
+        assert!(additional_checksum_echo_pairs(&sha256).is_empty());
+
+        // Additional algorithm → exactly one (header, value) pair matching the digest.
+        let xxh3 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::XXHASH3, b"data");
+        let pairs = additional_checksum_echo_pairs(&xxh3);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "x-amz-checksum-xxhash3");
+        assert_eq!(pairs[0].1, xxh3.as_ref().unwrap().encoded);
+
+        // MD5 additional checksum is echoed too.
+        let md5 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::MD5, b"data");
+        let pairs = additional_checksum_echo_pairs(&md5);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "x-amz-checksum-md5");
+
+        // None → empty.
+        assert!(additional_checksum_echo_pairs(&None).is_empty());
+    }
+
+    #[test]
+    fn inject_additional_checksum_headers_writes_all_pairs() {
+        let mut headers = HeaderMap::new();
+        inject_additional_checksum_headers(
+            &mut headers,
+            &[
+                ("x-amz-checksum-xxhash3", "eHhoMw==".to_string()),
+                ("x-amz-checksum-md5", "bWQ1".to_string()),
+            ],
+        );
+        assert_eq!(headers.get("x-amz-checksum-xxhash3").unwrap(), "eHhoMw==");
+        assert_eq!(headers.get("x-amz-checksum-md5").unwrap(), "bWQ1");
+        // Empty input is a no-op.
+        let mut empty = HeaderMap::new();
+        inject_additional_checksum_headers(&mut empty, &[]);
+        assert!(empty.is_empty());
+    }
+
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
             input,

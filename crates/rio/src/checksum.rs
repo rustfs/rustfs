@@ -1658,4 +1658,34 @@ mod tests {
         assert_eq!(ChecksumType::from_string_with_obj_type("xxhash3", "FULL_OBJECT"), ChecksumType::INVALID);
         assert_eq!(ChecksumType::from_string_with_obj_type("crc32", "bogus"), ChecksumType::INVALID);
     }
+
+    // is_s3s_typed is the single source of truth for the "five typed fields" vs
+    // "additional algorithms carried as raw headers" split used across the handlers.
+    #[test]
+    fn is_s3s_typed_split_is_exhaustive() {
+        for t in [
+            ChecksumType::CRC32,
+            ChecksumType::CRC32C,
+            ChecksumType::SHA1,
+            ChecksumType::SHA256,
+            ChecksumType::CRC64_NVME,
+        ] {
+            assert!(t.is_s3s_typed(), "{t:?} must be s3s-typed");
+        }
+        for t in [
+            ChecksumType::XXHASH3,
+            ChecksumType::XXHASH64,
+            ChecksumType::XXHASH128,
+            ChecksumType::SHA512,
+            ChecksumType::MD5,
+        ] {
+            assert!(!t.is_s3s_typed(), "{t:?} must NOT be s3s-typed (additional algorithm)");
+        }
+        assert!(!ChecksumType::NONE.is_s3s_typed());
+        // Flags on top of a base type must not change the classification.
+        let crc32_full = ChecksumType(ChecksumType::CRC32.0 | ChecksumType::FULL_OBJECT.0);
+        assert!(crc32_full.is_s3s_typed());
+        let xxh3_multipart = ChecksumType(ChecksumType::XXHASH3.0 | ChecksumType::MULTIPART.0);
+        assert!(!xxh3_multipart.is_s3s_typed());
+    }
 }
