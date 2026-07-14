@@ -115,6 +115,7 @@ libc = { workspace = true }
 
 
 [dev-dependencies]
+metrics-util = { version = "0.20", features = ["debugging"] }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }

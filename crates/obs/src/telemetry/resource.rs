@@ -24,7 +24,9 @@ use opentelemetry::KeyValue;
 use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
-    attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
+    attribute::{
+        DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_INSTANCE_ID, SERVICE_VERSION as OTEL_SERVICE_VERSION,
+    },
 };
 use rustfs_config::{APP_NAME, ENVIRONMENT, SERVICE_VERSION};
 use rustfs_utils::get_local_ip_with_default;
@@ -44,21 +46,57 @@ use std::borrow::Cow;
 /// All attributes are attached to the resource using the semantic conventions
 /// schema URL to ensure compatibility with standard OTLP backends.
 pub(super) fn build_resource(config: &OtelConfig) -> Resource {
+    let mut attributes = vec![
+        KeyValue::new(
+            OTEL_SERVICE_VERSION,
+            Cow::Borrowed(config.service_version.as_deref().unwrap_or(SERVICE_VERSION)).to_string(),
+        ),
+        KeyValue::new(
+            DEPLOYMENT_ENVIRONMENT_NAME,
+            Cow::Borrowed(config.environment.as_deref().unwrap_or(ENVIRONMENT)).to_string(),
+        ),
+        KeyValue::new(NETWORK_LOCAL_ADDRESS, get_local_ip_with_default()),
+    ];
+    if let Some(instance_id) = config.instance_id.as_deref().filter(|value| !value.is_empty()) {
+        attributes.push(KeyValue::new(SERVICE_INSTANCE_ID, instance_id.to_string()));
+    }
+    if let Some(cluster_id) = config.cluster_id.as_deref().filter(|value| !value.is_empty()) {
+        attributes.push(KeyValue::new("rustfs.cluster.id", cluster_id.to_string()));
+    }
+
     Resource::builder()
         .with_service_name(Cow::Borrowed(config.service_name.as_deref().unwrap_or(APP_NAME)).to_string())
-        .with_schema_url(
-            [
-                KeyValue::new(
-                    OTEL_SERVICE_VERSION,
-                    Cow::Borrowed(config.service_version.as_deref().unwrap_or(SERVICE_VERSION)).to_string(),
-                ),
-                KeyValue::new(
-                    DEPLOYMENT_ENVIRONMENT_NAME,
-                    Cow::Borrowed(config.environment.as_deref().unwrap_or(ENVIRONMENT)).to_string(),
-                ),
-                KeyValue::new(NETWORK_LOCAL_ADDRESS, get_local_ip_with_default()),
-            ],
-            SCHEMA_URL,
-        )
+        .with_schema_url(attributes, SCHEMA_URL)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::Key;
+
+    #[test]
+    fn resource_uses_explicit_identity_without_fabricating_one() {
+        let resource = build_resource(&OtelConfig::default());
+        assert!(resource.get(&Key::new(SERVICE_INSTANCE_ID)).is_none());
+        assert!(resource.get(&Key::new("rustfs.cluster.id")).is_none());
+
+        let resource = build_resource(&OtelConfig {
+            instance_id: Some("node-a".to_string()),
+            cluster_id: Some("cluster-a".to_string()),
+            ..OtelConfig::default()
+        });
+        assert_eq!(
+            resource
+                .get(&Key::new(SERVICE_INSTANCE_ID))
+                .map(|value| value.as_str().to_string()),
+            Some("node-a".to_string())
+        );
+        assert_eq!(
+            resource
+                .get(&Key::new("rustfs.cluster.id"))
+                .map(|value| value.as_str().to_string()),
+            Some("cluster-a".to_string())
+        );
+    }
 }

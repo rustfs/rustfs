@@ -121,7 +121,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_LOGS_EXPORT_ENABLED`      | `true`    | Toggle OTLP log export                                     |
 | `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `false`   | Toggle profiling export                                    |
 | `RUSTFS_OBS_USE_STDOUT`               | `false`   | Mirror all signals to stdout alongside OTLP                |
-| `RUSTFS_OBS_SAMPLE_RATIO`             | `0.1`     | Trace sampling ratio `0.0`–`1.0`                           |
+| `RUSTFS_OBS_SAMPLE_RATIO`             | `1.0`     | Trace sampling ratio `0.0`–`1.0`                           |
 | `RUSTFS_OBS_METER_INTERVAL`           | `15`      | Metrics export interval (seconds)                          |
 
 ### Service identity
@@ -131,12 +131,14 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_SERVICE_NAME`    | `rustfs`          | OTel `service.name`                                     |
 | `RUSTFS_OBS_SERVICE_VERSION` | _(crate version)_ | OTel `service.version`                                  |
 | `RUSTFS_OBS_ENVIRONMENT`     | `development`     | Deployment environment (`production`, `development`, …) |
+| `RUSTFS_OBS_INSTANCE_ID`     | _(empty)_         | Stable OTel `service.instance.id`; omitted when unset    |
+| `RUSTFS_OBS_CLUSTER_ID`      | _(empty)_         | Stable RustFS deployment identity; omitted when unset    |
 
 ### Local logging
 
 | Variable                        | Default      | Description                                                                                                                                                                                                                                                                                                                                                           |
 |---------------------------------|--------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `RUSTFS_OBS_LOGGER_LEVEL`       | `info`       | Log level; `RUST_LOG` syntax supported                                                                                                                                                                                                                                                                                                                                |
+| `RUSTFS_OBS_LOGGER_LEVEL`       | `error`      | Log level; `RUST_LOG` syntax supported                                                                                                                                                                                                                                                                                                                               |
 | `RUSTFS_OBS_LOG_STDOUT_ENABLED` | `false`      | When file logging is active, also mirror to stdout                                                                                                                                                                                                                                                                                                                    |
 | `RUSTFS_OBS_LOG_DIRECTORY`      | _(empty)_    | **Directory for rolling log files. When empty, logs go to stdout only**                                                                                                                                                                                                                                                                                               |
 | `RUSTFS_OBS_LOG_FILENAME`       | `rustfs.log` | Base filename for rolling logs. Rotated archives include a high-precision timestamp and counter. With the default `RUSTFS_OBS_LOG_MATCH_MODE=suffix`, names look like `<timestamp>-<counter>.rustfs.log` (e.g., `20231027103001.123456-0.rustfs.log`); with `prefix`, they look like `rustfs.log.<timestamp>-<counter>` (e.g., `rustfs.log.20231027103001.123456-0`). |
@@ -164,6 +166,22 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`           | `3600`       | Minimum file age (seconds) before cleanup                   |
 | `RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS`       | `1800`       | How often the cleanup task runs (0.5 hours)                 |
 | `RUSTFS_OBS_LOG_DRY_RUN`                        | `false`      | Report deletions without actually removing files            |
+
+---
+
+## Local all-in-one
+
+After starting Grafana/Tempo/Loki/Prometheus from `/Users/tang/code/otel-all-in-one`, configure RustFS to export all three OTLP signals directly:
+
+```bash
+export RUSTFS_OBS_ENDPOINT=http://127.0.0.1:4318
+export RUSTFS_OBS_SERVICE_NAME=rustfs
+export RUSTFS_OBS_ENVIRONMENT=local
+export RUSTFS_OBS_SAMPLE_RATIO=1
+export RUSTFS_OBS_LOGGER_LEVEL=info
+```
+
+Do not also configure promtail to collect the same RustFS logs: OTLP logs can already be correlated from Tempo to Loki. When `RUSTFS_OBS_ENDPOINT` is unset, RustFS retains its existing local logging fallback.
 
 ---
 

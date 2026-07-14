@@ -187,7 +187,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::{debug, error, instrument, warn};
+use tracing::{Instrument as _, debug, error, instrument, warn};
 use uuid::Uuid;
 
 use super::storage_api::object_usecase::{
@@ -2784,6 +2784,7 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectReadSetup> {
         let reader = store
             .get_object_reader(bucket, key, rs.clone(), h, opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcRead))
             .await
             .map_err(map_get_object_reader_error)?;
         if let Some(read_stage_start) = read_stage_start {

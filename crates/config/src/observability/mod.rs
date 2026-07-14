@@ -37,6 +37,10 @@ pub const ENV_OBS_METER_INTERVAL: &str = "RUSTFS_OBS_METER_INTERVAL";
 pub const ENV_OBS_SERVICE_NAME: &str = "RUSTFS_OBS_SERVICE_NAME";
 pub const ENV_OBS_SERVICE_VERSION: &str = "RUSTFS_OBS_SERVICE_VERSION";
 pub const ENV_OBS_ENVIRONMENT: &str = "RUSTFS_OBS_ENVIRONMENT";
+/// Stable OpenTelemetry service instance identity for this RustFS process.
+pub const ENV_OBS_INSTANCE_ID: &str = "RUSTFS_OBS_INSTANCE_ID";
+/// Optional stable RustFS deployment identity used to correlate cluster telemetry.
+pub const ENV_OBS_CLUSTER_ID: &str = "RUSTFS_OBS_CLUSTER_ID";
 
 /// Per-signal enable/disable flags (default: true)
 pub const ENV_OBS_TRACES_EXPORT_ENABLED: &str = "RUSTFS_OBS_TRACES_EXPORT_ENABLED";
@@ -131,6 +135,8 @@ mod tests {
         assert_eq!(ENV_OBS_SERVICE_NAME, "RUSTFS_OBS_SERVICE_NAME");
         assert_eq!(ENV_OBS_SERVICE_VERSION, "RUSTFS_OBS_SERVICE_VERSION");
         assert_eq!(ENV_OBS_ENVIRONMENT, "RUSTFS_OBS_ENVIRONMENT");
+        assert_eq!(ENV_OBS_INSTANCE_ID, "RUSTFS_OBS_INSTANCE_ID");
+        assert_eq!(ENV_OBS_CLUSTER_ID, "RUSTFS_OBS_CLUSTER_ID");
         assert_eq!(ENV_OBS_LOGGER_LEVEL, "RUSTFS_OBS_LOGGER_LEVEL");
         assert_eq!(ENV_OBS_LOG_STDOUT_ENABLED, "RUSTFS_OBS_LOG_STDOUT_ENABLED");
         assert_eq!(ENV_OBS_LOG_DIRECTORY, "RUSTFS_OBS_LOG_DIRECTORY");

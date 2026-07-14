@@ -92,7 +92,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
-use tracing::{instrument, warn};
+use tracing::{Instrument as _, instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
 
@@ -484,6 +484,7 @@ impl DefaultMultipartUsecase {
         let obj_info = store
             .clone()
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcWrite))
             .await
             .map_err(ApiError::from)?;
         let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
@@ -967,6 +968,7 @@ impl DefaultMultipartUsecase {
 
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcWrite))
             .await
             .map_err(ApiError::from)?;
 
@@ -1333,6 +1335,7 @@ impl DefaultMultipartUsecase {
 
         let part_info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &dst_opts)
+            .instrument(rustfs_obs::stage_span(rustfs_obs::Stage::EcRead))
             .await
             .map_err(ApiError::from)?;
 

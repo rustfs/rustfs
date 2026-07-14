@@ -9592,6 +9592,7 @@ dependencies = [
  "jiff",
  "libc",
  "metrics",
+ "metrics-util",
  "num_cpus",
  "nvml-wrapper",
  "opentelemetry",

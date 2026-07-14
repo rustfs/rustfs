@@ -40,6 +40,7 @@ use http::StatusCode;
 use metrics::{counter, histogram};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
+use rustfs_obs::{Operation as ObsOperation, observe_operation};
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
@@ -267,7 +268,7 @@ impl S3 for FS {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         let usecase = s3_api::multipart_usecase_for(self);
-        usecase.execute_abort_multipart_upload(req).await
+        observe_operation(ObsOperation::AbortMultipartUpload, usecase.execute_abort_multipart_upload(req)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -277,7 +278,11 @@ impl S3 for FS {
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         crate::hp_guard!("S3::complete_multipart_upload");
         let usecase = s3_api::multipart_usecase_for(self);
-        Box::pin(usecase.execute_complete_multipart_upload(req)).await
+        observe_operation(
+            ObsOperation::CompleteMultipartUpload,
+            Box::pin(usecase.execute_complete_multipart_upload(req)),
+        )
+        .await
     }
 
     /// Copy an object from one location to another
@@ -294,7 +299,7 @@ impl S3 for FS {
     )]
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_create_bucket(req).await
+        observe_operation(ObsOperation::CreateBucket, usecase.execute_create_bucket(req)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -304,14 +309,14 @@ impl S3 for FS {
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         crate::hp_guard!("S3::create_multipart_upload");
         let usecase = s3_api::multipart_usecase_for(self);
-        usecase.execute_create_multipart_upload(req).await
+        observe_operation(ObsOperation::CreateMultipartUpload, usecase.execute_create_multipart_upload(req)).await
     }
 
     /// Delete a bucket
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket(req).await
+        observe_operation(ObsOperation::DeleteBucket, usecase.execute_delete_bucket(req)).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -396,7 +401,7 @@ impl S3 for FS {
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         crate::hp_guard!("S3::delete_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_delete_object(req)).await
+        observe_operation(ObsOperation::DeleteObject, Box::pin(usecase.execute_delete_object(req))).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -682,7 +687,7 @@ impl S3 for FS {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         crate::hp_guard!("S3::get_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_get_object(req)).await
+        observe_operation(ObsOperation::GetObject, Box::pin(usecase.execute_get_object(req))).await
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
@@ -960,14 +965,14 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self, req))]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_head_bucket(req).await
+        observe_operation(ObsOperation::HeadBucket, usecase.execute_head_bucket(req)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         crate::hp_guard!("S3::head_object");
         let usecase = s3_api::object_usecase_for(self);
-        usecase.execute_head_object(req).await
+        observe_operation(ObsOperation::HeadObject, usecase.execute_head_object(req)).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -975,7 +980,7 @@ impl S3 for FS {
         // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
         record_s3_op(S3Operation::ListBuckets);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_list_buckets(req).await
+        observe_operation(ObsOperation::ListBuckets, usecase.execute_list_buckets(req)).await
     }
 
     async fn list_multipart_uploads(
@@ -1000,7 +1005,7 @@ impl S3 for FS {
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         record_s3_op(S3Operation::ListObjects);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_list_objects(req).await
+        observe_operation(ObsOperation::ListObjects, usecase.execute_list_objects(req)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1008,7 +1013,7 @@ impl S3 for FS {
         crate::hp_guard!("S3::list_objects_v2");
         record_s3_op(S3Operation::ListObjectsV2);
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_list_objects_v2(req).await
+        observe_operation(ObsOperation::ListObjectsV2, usecase.execute_list_objects_v2(req)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -1215,7 +1220,7 @@ impl S3 for FS {
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         crate::hp_guard!("S3::put_object");
         let usecase = s3_api::object_usecase_for(self);
-        Box::pin(usecase.execute_put_object(self, req)).await
+        observe_operation(ObsOperation::PutObject, Box::pin(usecase.execute_put_object(self, req))).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
@@ -1577,7 +1582,7 @@ impl S3 for FS {
         crate::hp_guard!("S3::upload_part");
         record_s3_op(S3Operation::UploadPart);
         let usecase = s3_api::multipart_usecase_for(self);
-        usecase.execute_upload_part(req).await
+        observe_operation(ObsOperation::UploadPart, usecase.execute_upload_part(req)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
