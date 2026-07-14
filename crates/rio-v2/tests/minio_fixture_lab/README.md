@@ -121,6 +121,30 @@ uv run python D:\Github\rustfs\crates\rio-v2\tests\minio_fixture_lab\lab.py capt
 
 That is a runner smoke path only. Real compatibility fixtures should still prefer the intended multi-disk backend layout when the local environment can support it.
 
+## Via Docker (Linux/macOS, no local `minio` install)
+
+When you don't have a `minio` binary on the host, `capture_via_docker.sh`
+generates the fixtures the ignored round-trip tests consume using Docker only.
+It builds a throwaway image (the official MinIO server binary pulled from
+`minio/minio` plus this lab on a small Python base — `lab.py` drives MinIO's S3
+API directly, so no `mc` is needed) and runs `capture-matrix` inside it, writing
+fixtures under `crates/rio-v2/tests/fixtures/minio-generated/` (the root the Rust
+tests read):
+
+```bash
+# Default: the two 8 MiB multipart cases the round-trip tests need.
+# Pass case ids to override, or "all" for the full default matrix.
+./capture_via_docker.sh
+
+RUSTFS_MINIO_STATIC_KMS_KEY_B64=IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= \
+  cargo test -p rustfs-ecstore --features rio-v2 --test minio_generated_read_test -- --ignored
+```
+
+This is exactly what the nightly `minio-interop` GitHub Actions workflow runs
+(`.github/workflows/minio-interop.yml`), so the local and CI paths stay in sync.
+SSE-C cases still need the host-`minio` + TLS path above; the Docker helper
+targets the SSE-S3 / SSE-KMS multipart cases the interop tests assert on.
+
 ## Capture Guidance
 
 For each case, preserve these inputs when possible:
