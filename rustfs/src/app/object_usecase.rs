@@ -1679,7 +1679,7 @@ async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventS
 /// field, drop the header insert) — and there is exactly one place that could ever
 /// emit a duplicate header. Header names come from `ChecksumType::key()`, so they are
 /// known-valid static strings.
-fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs: &[(&'static str, String)]) {
+pub(crate) fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs: &[(&'static str, String)]) {
     for (name, value) in pairs {
         match HeaderValue::from_str(value) {
             Ok(header_value) => {
@@ -1695,7 +1695,7 @@ fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs: &[(&'stati
 /// PutObject to echo back (#1256). Returns empty for the five s3s-typed algorithms
 /// (they are echoed via typed fields) and when the value is not yet materialized
 /// (e.g. a trailing checksum, whose value lands after the body — covered by e2e).
-fn additional_checksum_echo_pairs(want: &Option<rustfs_rio::Checksum>) -> Vec<(&'static str, String)> {
+pub(crate) fn additional_checksum_echo_pairs(want: &Option<rustfs_rio::Checksum>) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     if let Some(cs) = want {
         let base = cs.checksum_type.base();

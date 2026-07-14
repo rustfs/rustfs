@@ -547,19 +547,27 @@ impl DefaultMultipartUsecase {
             .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
             .map_err(ApiError::from)?;
 
+        // XXHash3/64/128 and SHA-512 have no typed CompleteMultipartUploadOutput field;
+        // echoed as raw response headers via inject_additional_checksum_headers (#1261).
+        let mut complete_extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
         for (key, checksum) in checksums {
             if key == AMZ_CHECKSUM_TYPE {
                 checksum_type = Some(ChecksumType::from(checksum));
                 continue;
             }
 
-            match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+            let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
+            match ct {
                 rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
                 rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
                 rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
                 rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
                 rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                _ => (),
+                other => {
+                    if let Some(name) = other.key() {
+                        complete_extra_checksum_headers.push((name, checksum));
+                    }
+                }
             }
         }
 
@@ -596,7 +604,9 @@ impl DefaultMultipartUsecase {
             helper = helper.version_id(version_id.clone());
         }
 
-        let result = Ok(S3Response::new(output));
+        let mut response = S3Response::new(output);
+        crate::app::object_usecase::inject_additional_checksum_headers(&mut response.headers, &complete_extra_checksum_headers);
+        let result = Ok(response);
         let _ = helper.complete(&result);
         rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
@@ -1003,6 +1013,10 @@ impl DefaultMultipartUsecase {
             }
         }
 
+        // XXHash3/64/128 and SHA-512 have no typed UploadPartOutput field; echo the
+        // server-computed part checksum as a raw response header (#1261).
+        let upload_part_extra_checksum_headers = crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+
         let output = UploadPartOutput {
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
@@ -1017,7 +1031,12 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
 
-        Ok(S3Response::new(output))
+        let mut response = S3Response::new(output);
+        crate::app::object_usecase::inject_additional_checksum_headers(
+            &mut response.headers,
+            &upload_part_extra_checksum_headers,
+        );
+        Ok(response)
     }
 
     pub async fn execute_list_multipart_uploads(

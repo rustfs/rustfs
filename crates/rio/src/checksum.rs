@@ -1561,4 +1561,37 @@ mod tests {
         assert!(!is_multipart);
         assert!(read_part_checksums(&buf).is_empty());
     }
+
+    // Multipart COMPOSITE assembly for the composite-only algorithms (#1261). Mirrors
+    // set_disk complete_multipart_upload: the object checksum is H(concat of per-part
+    // raw digests), and these algorithms must NOT be routed through add_part().
+    #[test]
+    fn composite_multipart_assembly_new_algorithms() {
+        let part1 = b"first multipart chunk bytes";
+        let part2 = b"second multipart chunk bytes";
+
+        for t in [
+            ChecksumType::XXHASH3,
+            ChecksumType::XXHASH64,
+            ChecksumType::XXHASH128,
+            ChecksumType::SHA512,
+        ] {
+            let c1 = Checksum::new_from_data(t, part1).expect("part1");
+            let c2 = Checksum::new_from_data(t, part2).expect("part2");
+
+            // Concatenate raw part digests, then hash again with the same algorithm.
+            let mut combined = c1.raw.clone();
+            combined.extend_from_slice(&c2.raw);
+            let composite = Checksum::new_from_data(t, &combined).expect("composite");
+            assert_eq!(composite.raw.len(), t.raw_byte_len(), "{t:?} composite len");
+            assert!(!composite.encoded.is_empty());
+
+            // Composite-only: full-object merge must be refused.
+            let mut acc = Checksum {
+                checksum_type: t,
+                ..Default::default()
+            };
+            assert!(acc.add_part(&c1, part1.len() as i64).is_err(), "{t:?} must not be full-object mergeable");
+        }
+    }
 }

@@ -3518,6 +3518,13 @@ fn complete_part_checksum(part: &CompletePart, checksum_type: rustfs_rio::Checks
         rustfs_rio::ChecksumType::CRC32 => Some(part.checksum_crc32.clone()),
         rustfs_rio::ChecksumType::CRC32C => Some(part.checksum_crc32c.clone()),
         rustfs_rio::ChecksumType::CRC64_NVME => Some(part.checksum_crc64nvme.clone()),
+        // XXHash3/64/128 and SHA-512 (AWS 2026-04): s3s CompletePart has no typed
+        // field to carry a client-supplied per-part value in the
+        // CompleteMultipartUpload request, so accept the type with no double-check
+        // value (the part was already verified server-side at UploadPart). This
+        // mirrors the missing-value path of the five typed algorithms. Reject only
+        // genuinely unset/invalid types.
+        base if base.is_set() => Some(None),
         _ => None,
     }
 }
@@ -6718,6 +6725,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(complete_part_checksum(&part, full_object_crc32), Some(Some("AAAAAA==".to_string())));
+
+        // AWS 2026-04 additional algorithms have no CompletePart field, so they are
+        // accepted with no double-check value (verified at UploadPart) — Some(None),
+        // NOT the outer None that would fail the multipart completion (#1261).
+        for ct in [
+            rustfs_rio::ChecksumType::XXHASH3,
+            rustfs_rio::ChecksumType::XXHASH64,
+            rustfs_rio::ChecksumType::XXHASH128,
+            rustfs_rio::ChecksumType::SHA512,
+        ] {
+            assert_eq!(complete_part_checksum(&CompletePart::default(), ct), Some(None), "{ct:?}");
+        }
+
+        // Genuinely unset / invalid types must still be rejected (outer None).
+        assert_eq!(complete_part_checksum(&CompletePart::default(), rustfs_rio::ChecksumType::NONE), None);
+        assert_eq!(complete_part_checksum(&CompletePart::default(), rustfs_rio::ChecksumType::INVALID), None);
     }
 
     fn direct_memory_test_metadata(size: i64) -> (ObjectInfo, FileInfo, ObjectOptions) {
