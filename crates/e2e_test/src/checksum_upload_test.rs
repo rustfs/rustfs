@@ -19,8 +19,10 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
+    use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use base64::Engine;
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
     use serial_test::serial;
@@ -29,6 +31,25 @@ mod tests {
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
         env.create_s3_client()
+    }
+
+    /// Client with boto/SDK automatic checksum calculation disabled, so the ONLY
+    /// checksum on the wire is the one the test injects. Needed because the SDK's
+    /// default (crc32) would otherwise collide with the additional-algorithm header
+    /// we inject via `mutate_request` for XXHash/SHA-512/MD5 (which have no typed
+    /// SDK builder). Mirrors the boto3 `request_checksum_calculation=when_required`.
+    fn create_s3_client_no_auto_checksum(env: &RustFSTestEnvironment) -> Client {
+        let creds = Credentials::new(&env.access_key, &env.secret_key, None, None, "e2e-additional-checksum");
+        let config = aws_sdk_s3::Config::builder()
+            .credentials_provider(creds)
+            .region(Region::new("us-east-1"))
+            .endpoint_url(format!("http://{}", env.address))
+            .force_path_style(true)
+            .behavior_version_latest()
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .http_client(SmithyHttpClientBuilder::new().build_http())
+            .build();
+        Client::from_conf(config)
     }
 
     async fn create_bucket(client: &Client, bucket: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -458,5 +479,88 @@ mod tests {
             Some(full_checksum.as_str()),
             "Multipart object should report the same full-object CRC64NVME as direct upload"
         );
+    }
+
+    /// Integration test for the AWS 2026-04 additional checksum algorithms
+    /// (XXHash3/64/128, SHA-512, MD5). aws_sdk_s3 has no typed builder for these, so the
+    /// `x-amz-checksum-<algo>` header is injected via `mutate_request` (value computed by
+    /// rustfs-rio, which is byte-for-byte identical to awscrt). Verifies the server
+    /// verifies-on-write: a correct value is accepted and the object stored; a wrong
+    /// value is rejected with BadDigest and nothing is stored. Full HEAD/GET header
+    /// echo round-trip is additionally exercised by the boto3+awscrt e2e.
+    #[tokio::test]
+    #[serial]
+    async fn test_additional_checksums_verify_on_write() {
+        init_logging();
+        info!("TEST: additional checksums (XXHash3/64/128, SHA-512, MD5) verify-on-write");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client_no_auto_checksum(&env);
+        let bucket = "test-additional-checksums";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let content: &[u8] = b"additional-checksum verify-on-write payload for xxhash/sha512/md5";
+
+        for (ty, header) in [
+            (RioChecksumType::XXHASH3, "x-amz-checksum-xxhash3"),
+            (RioChecksumType::XXHASH64, "x-amz-checksum-xxhash64"),
+            (RioChecksumType::XXHASH128, "x-amz-checksum-xxhash128"),
+            (RioChecksumType::SHA512, "x-amz-checksum-sha512"),
+            (RioChecksumType::MD5, "x-amz-checksum-md5"),
+        ] {
+            // Correct checksum -> accepted, and the object is stored intact.
+            let good = Checksum::new_from_data(ty, content).expect("compute checksum").encoded;
+            let ok_key = format!("ok-{header}");
+            let put = client
+                .put_object()
+                .bucket(bucket)
+                .key(&ok_key)
+                .body(ByteStream::from_static(content))
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut().insert(header, good.clone());
+                })
+                .send()
+                .await;
+            assert!(put.is_ok(), "{header}: correct checksum must be accepted: {:?}", put.err());
+            let got = client
+                .get_object()
+                .bucket(bucket)
+                .key(&ok_key)
+                .send()
+                .await
+                .expect("GetObject");
+            let body = got.body.collect().await.expect("collect body").into_bytes();
+            assert_eq!(body.as_ref(), content, "{header}: stored body must match uploaded content");
+
+            // Wrong checksum -> rejected with BadDigest, and nothing is stored.
+            let bad = Checksum::new_from_data(ty, b"a totally different payload")
+                .expect("compute checksum")
+                .encoded;
+            let bad_key = format!("bad-{header}");
+            let put_bad = client
+                .put_object()
+                .bucket(bucket)
+                .key(&bad_key)
+                .body(ByteStream::from_static(content))
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut().insert(header, bad.clone());
+                })
+                .send()
+                .await;
+            assert!(put_bad.is_err(), "{header}: a mismatched checksum must be rejected");
+            let msg = format!("{:?}", put_bad.err().unwrap());
+            assert!(
+                msg.contains("BadDigest") || msg.to_lowercase().contains("digest") || msg.to_lowercase().contains("checksum"),
+                "{header}: expected a BadDigest/checksum error, got: {msg}"
+            );
+            let head = client.head_object().bucket(bucket).key(&bad_key).send().await;
+            assert!(head.is_err(), "{header}: nothing must be stored after a rejected PutObject");
+
+            info!("PASSED additional-checksum verify-on-write: {header}");
+        }
     }
 }

@@ -73,7 +73,7 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::{
-    AMZ_CHECKSUM_TYPE, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, get_source_scheme,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, get_source_scheme,
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING},
     insert_str,
 };
@@ -535,33 +535,21 @@ impl DefaultMultipartUsecase {
             None
         };
         let mpu_version_for_event = mpu_version.clone();
-        let mut checksum_crc32 = input.checksum_crc32;
-        let mut checksum_crc32c = input.checksum_crc32c;
-        let mut checksum_sha1 = input.checksum_sha1;
-        let mut checksum_sha256 = input.checksum_sha256;
-        let mut checksum_crc64nvme = input.checksum_crc64nvme;
-        let mut checksum_type = input.checksum_type;
-
-        // checksum
+        // checksum: stored (decrypted) values take precedence over the request input;
+        // additional algorithms (XXHash3/64/128, SHA-512, MD5), which have no typed
+        // CompleteMultipartUploadOutput field, are echoed as raw response headers (#1261).
         let (checksums, _is_multipart) = obj_info
             .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
             .map_err(ApiError::from)?;
 
-        for (key, checksum) in checksums {
-            if key == AMZ_CHECKSUM_TYPE {
-                checksum_type = Some(ChecksumType::from(checksum));
-                continue;
-            }
-
-            match rustfs_rio::ChecksumType::from_string(key.as_str()) {
-                rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
-                rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
-                rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                _ => (),
-            }
-        }
+        let classified = crate::app::object_usecase::classify_response_checksums(checksums);
+        let checksum_crc32 = classified.crc32.or(input.checksum_crc32);
+        let checksum_crc32c = classified.crc32c.or(input.checksum_crc32c);
+        let checksum_sha1 = classified.sha1.or(input.checksum_sha1);
+        let checksum_sha256 = classified.sha256.or(input.checksum_sha256);
+        let checksum_crc64nvme = classified.crc64nvme.or(input.checksum_crc64nvme);
+        let checksum_type = classified.checksum_type.or(input.checksum_type);
+        let complete_extra_checksum_headers = classified.extra;
 
         let location = build_complete_multipart_location(&req.headers, &req.uri, &bucket, &key);
         let output = CompleteMultipartUploadOutput {
@@ -596,7 +584,9 @@ impl DefaultMultipartUsecase {
             helper = helper.version_id(version_id.clone());
         }
 
-        let result = Ok(S3Response::new(output));
+        let mut response = S3Response::new(output);
+        crate::app::object_usecase::inject_additional_checksum_headers(&mut response.headers, &complete_extra_checksum_headers);
+        let result = Ok(response);
         let _ = helper.complete(&result);
         rustfs_scanner::record_dirty_usage_bucket(&bucket);
         result
@@ -1003,6 +993,10 @@ impl DefaultMultipartUsecase {
             }
         }
 
+        // XXHash3/64/128 and SHA-512 have no typed UploadPartOutput field; echo the
+        // server-computed part checksum as a raw response header (#1261).
+        let upload_part_extra_checksum_headers = crate::app::object_usecase::additional_checksum_echo_pairs(&opts.want_checksum);
+
         let output = UploadPartOutput {
             server_side_encryption: requested_sse,
             ssekms_key_id: requested_kms_key_id,
@@ -1017,7 +1011,12 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
 
-        Ok(S3Response::new(output))
+        let mut response = S3Response::new(output);
+        crate::app::object_usecase::inject_additional_checksum_headers(
+            &mut response.headers,
+            &upload_part_extra_checksum_headers,
+        );
+        Ok(response)
     }
 
     pub async fn execute_list_multipart_uploads(

@@ -9009,6 +9009,7 @@ dependencies = [
  "pretty_assertions",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -9787,6 +9788,7 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

@@ -16,13 +16,20 @@ use crate::base64;
 use http::header::{HeaderMap, HeaderValue};
 
 use crate::Crc64Nvme;
-use crate::{CRC_32_C_NAME, CRC_32_NAME, CRC_64_NVME_NAME, Checksum, Crc32, Crc32c, Md5, SHA_1_NAME, SHA_256_NAME, Sha1, Sha256};
+use crate::{
+    CRC_32_C_NAME, CRC_32_NAME, CRC_64_NVME_NAME, Checksum, Crc32, Crc32c, Md5, SHA_1_NAME, SHA_256_NAME, Sha1, Sha256, Sha512,
+    Xxhash3, Xxhash64, Xxhash128,
+};
 
 pub const CRC_32_HEADER_NAME: &str = "x-amz-checksum-crc32";
 pub const CRC_32_C_HEADER_NAME: &str = "x-amz-checksum-crc32c";
 pub const SHA_1_HEADER_NAME: &str = "x-amz-checksum-sha1";
 pub const SHA_256_HEADER_NAME: &str = "x-amz-checksum-sha256";
 pub const CRC_64_NVME_HEADER_NAME: &str = "x-amz-checksum-crc64nvme";
+pub const SHA_512_HEADER_NAME: &str = "x-amz-checksum-sha512";
+pub const XXHASH_3_HEADER_NAME: &str = "x-amz-checksum-xxhash3";
+pub const XXHASH_64_HEADER_NAME: &str = "x-amz-checksum-xxhash64";
+pub const XXHASH_128_HEADER_NAME: &str = "x-amz-checksum-xxhash128";
 
 #[allow(dead_code)]
 pub(crate) static MD5_HEADER_NAME: &str = "content-md5";
@@ -82,6 +89,30 @@ impl HttpChecksum for Sha1 {
 impl HttpChecksum for Sha256 {
     fn header_name(&self) -> &'static str {
         SHA_256_HEADER_NAME
+    }
+}
+
+impl HttpChecksum for Sha512 {
+    fn header_name(&self) -> &'static str {
+        SHA_512_HEADER_NAME
+    }
+}
+
+impl HttpChecksum for Xxhash3 {
+    fn header_name(&self) -> &'static str {
+        XXHASH_3_HEADER_NAME
+    }
+}
+
+impl HttpChecksum for Xxhash64 {
+    fn header_name(&self) -> &'static str {
+        XXHASH_64_HEADER_NAME
+    }
+}
+
+impl HttpChecksum for Xxhash128 {
+    fn header_name(&self) -> &'static str {
+        XXHASH_128_HEADER_NAME
     }
 }
 

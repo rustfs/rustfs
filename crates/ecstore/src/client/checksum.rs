@@ -71,7 +71,11 @@ impl ChecksumMode {
             8_u8 => ChecksumMode::ChecksumCRC32,
             16_u8 => ChecksumMode::ChecksumCRC32C,
             32_u8 => ChecksumMode::ChecksumCRC64NVME,
-            _ => panic!("enum err."),
+            // Fail closed: any mode without a concrete base algorithm (e.g. a
+            // bare ChecksumFullObject flag) is treated as "no checksum" rather
+            // than panicking. Callers already gate real work behind
+            // is_set()/can_composite()/hasher(), so this only removes a crash.
+            _ => ChecksumMode::ChecksumNone,
         }
     }
 
@@ -269,6 +273,33 @@ impl ChecksumMode {
         }
 
         self.composite_checksum(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChecksumMode;
+
+    #[test]
+    fn test_base_is_fail_closed_and_never_panics() {
+        // Every mode must resolve to a concrete base without panicking. The bare
+        // ChecksumFullObject flag has no base algorithm and must fall back to
+        // ChecksumNone instead of crashing (previously `panic!("enum err.")`).
+        assert_eq!(ChecksumMode::ChecksumFullObject.base(), ChecksumMode::ChecksumNone);
+        assert_eq!(ChecksumMode::ChecksumNone.base(), ChecksumMode::ChecksumNone);
+        assert_eq!(ChecksumMode::ChecksumCRC32.base(), ChecksumMode::ChecksumCRC32);
+        assert_eq!(ChecksumMode::ChecksumCRC32C.base(), ChecksumMode::ChecksumCRC32C);
+        assert_eq!(ChecksumMode::ChecksumSHA1.base(), ChecksumMode::ChecksumSHA1);
+        assert_eq!(ChecksumMode::ChecksumSHA256.base(), ChecksumMode::ChecksumSHA256);
+        assert_eq!(ChecksumMode::ChecksumCRC64NVME.base(), ChecksumMode::ChecksumCRC64NVME);
+    }
+
+    #[test]
+    fn test_hasher_fails_closed_for_unsupported_mode() {
+        // Modes without a real hasher must return an error, not panic.
+        assert!(ChecksumMode::ChecksumNone.hasher().is_err());
+        assert!(ChecksumMode::ChecksumFullObject.hasher().is_err());
+        assert!(ChecksumMode::ChecksumCRC32.hasher().is_ok());
     }
 }
 
