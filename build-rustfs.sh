@@ -217,7 +217,7 @@ setup_rust_environment() {
     # Set up environment variables for musl targets
     if [[ "$PLATFORM" == *"musl"* ]]; then
         print_message $YELLOW "Setting up environment for musl target..."
-        export RUSTFLAGS="--cfg tokio_unstable -C target-feature=-crt-static"
+        export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=-crt-static"
 
         # For cargo-zigbuild, set up additional environment variables
         if command -v cargo-zigbuild &> /dev/null; then
@@ -434,7 +434,7 @@ build_binary() {
         fi
     else
         # Native compilation
-        build_cmd="RUSTFLAGS='--cfg tokio_unstable -Clink-arg=-lm' cargo build"
+        build_cmd="RUSTFLAGS='${RUSTFLAGS:+$RUSTFLAGS }-Clink-arg=-lm' cargo build"
     fi
 
     if [ "$BUILD_TYPE" = "release" ]; then
