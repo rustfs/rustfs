@@ -8176,7 +8176,7 @@ mod tests {
             ..committed.clone()
         };
         let state = SiteReplicationState {
-            peers: BTreeMap::from([("remote".to_string(), committed.clone())]),
+            peers: BTreeMap::from([("remote".to_string(), committed)]),
             ..Default::default()
         };
         let pending = PendingEndpointRefresh {
@@ -8360,7 +8360,7 @@ mod tests {
         assert_eq!(generated.ca_cert_pem, "");
 
         let existing = BucketTarget {
-            arn: generated.arn.clone(),
+            arn: generated.arn,
             endpoint: "remote.example.com:9443".to_string(),
             secure: true,
             target_type: BucketTargetType::ReplicationService,
