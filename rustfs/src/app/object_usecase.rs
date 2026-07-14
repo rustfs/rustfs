@@ -5914,6 +5914,9 @@ impl DefaultObjectUsecase {
         let mut checksum_sha256 = None;
         let mut checksum_crc64nvme = None;
         let mut checksum_type = None;
+        // AWS 2026-04 additional algorithms (XXHash3/64/128, SHA-512) have no typed
+        // field on s3s HeadObjectOutput, so carry them out as raw response headers (#1257).
+        let mut extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
 
         // checksum
         if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
@@ -5930,13 +5933,18 @@ impl DefaultObjectUsecase {
                     continue;
                 }
 
-                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
+                match ct {
                     rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
                     rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
                     rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
                     rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
                     rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                    _ => (),
+                    other => {
+                        if let Some(name) = other.key() {
+                            extra_checksum_headers.push((name, checksum));
+                        }
+                    }
                 }
             }
         }
@@ -6005,6 +6013,18 @@ impl DefaultObjectUsecase {
         // CORS layer instead. In case both are applicable, this bucket-level CORS logic
         // takes precedence for these read operations.
         let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+
+        // Emit additional-checksum headers (XXHash3/64/128, SHA-512) that s3s cannot
+        // carry on the typed HeadObjectOutput (#1257). Header names come from
+        // ChecksumType::key(), so they are known-valid static strings.
+        for (name, value) in extra_checksum_headers {
+            match HeaderValue::from_str(&value) {
+                Ok(header_value) => {
+                    response.headers.insert(http::HeaderName::from_static(name), header_value);
+                }
+                Err(_) => warn!("Failed to parse {name} checksum header value; skipping"),
+            }
+        }
 
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
