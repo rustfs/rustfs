@@ -38,6 +38,9 @@ cat >"$BIN_DIR/cargo" <<'STUB'
 set -euo pipefail
 
 printf '%s\n' "$*" >>"${CARGO_LOG:?}"
+if [[ -n "${RUSTFLAGS_LOG:-}" ]]; then
+  printf 'RUSTFLAGS=<%s>\n' "${RUSTFLAGS:-}" >>"$RUSTFLAGS_LOG"
+fi
 if [[ -n "${CARGO_ARG_LOG:-}" ]]; then
   i=0
   for arg in "$@"; do
@@ -70,9 +73,10 @@ chmod +x "$BIN_DIR/rustup" "$BIN_DIR/git" "$BIN_DIR/cargo"
 
 run_log="$TMP_DIR/run.log"
 cargo_log="$TMP_DIR/cargo.log"
+rustflags_log="$TMP_DIR/rustflags.log"
 (
   cd "$PROJECT_DIR"
-  PATH="$BIN_DIR:$PATH" CARGO_LOG="$cargo_log" ./build-rustfs.sh \
+  PATH="$BIN_DIR:$PATH" CARGO_LOG="$cargo_log" RUSTFLAGS_LOG="$rustflags_log" ./build-rustfs.sh \
     --dev \
     --no-console \
     --skip-verification \
@@ -82,6 +86,10 @@ cargo_log="$TMP_DIR/cargo.log"
 
 grep -q -- "Features: webdav" "$run_log"
 grep -q -- "--features webdav" "$cargo_log"
+if grep -q -- "--cfg tokio_unstable" "$rustflags_log"; then
+  echo "Default build must not enable tokio_unstable" >&2
+  exit 1
+fi
 
 short_run_log="$TMP_DIR/run-short.log"
 short_cargo_log="$TMP_DIR/cargo-short.log"
