@@ -536,6 +536,7 @@ async fn start_https_rustfs_server(env: &mut RustFSTestEnvironment, tls_dir: &Pa
         .env("RUST_LOG", "rustfs=info,rustfs_notify=debug")
         .env("RUSTFS_TLS_PATH", tls_dir)
         .env("RUSTFS_CONSOLE_ENABLE", "false")
+        .env("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true")
         .args([
             "--address",
             &env.address,
@@ -649,7 +650,7 @@ async fn wait_for_replicated_object_over_https(
             }
             status if tokio::time::Instant::now() < deadline => {
                 let body = response.text().await.unwrap_or_default();
-                if body.contains("NoSuchKey") || body.contains("NotFound") {
+                if body.contains("NoSuchKey") || body.contains("NoSuchBucket") || body.contains("NotFound") {
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -2934,6 +2935,178 @@ async fn test_replication_recovers_after_runtime_target_cache_is_cleared() -> Re
 
 #[tokio::test]
 #[serial]
+async fn test_site_replication_allows_self_signed_https_with_skip_tls_verify_real_dual_node() -> TestResult {
+    init_logging();
+
+    let mut source_env = new_replication_source_env().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let mut target_env = new_replication_https_target_env().await?;
+    let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
+    let target_host = target_env
+        .url
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .ok_or_else(|| std::io::Error::other("target HTTPS URL missing host"))?
+        .to_string();
+    generate_self_signed_tls_material(&tls_dir, &target_host).await?;
+    start_https_rustfs_server(&mut target_env, &tls_dir).await?;
+    let https_client = insecure_https_client()?;
+    wait_for_https_server_ready(&https_client, &target_env).await?;
+
+    let source_site = PeerSite {
+        name: "source-site".to_string(),
+        endpoint: source_env.url.clone(),
+        access_key: source_env.access_key.clone(),
+        secret_key: source_env.secret_key.clone(),
+        ..Default::default()
+    };
+    let target_site = PeerSite {
+        name: "target-site".to_string(),
+        endpoint: target_env.url.clone(),
+        access_key: target_env.access_key.clone(),
+        secret_key: target_env.secret_key.clone(),
+        ..Default::default()
+    };
+
+    let add_error = site_replication_add(&source_env, &[source_site.clone(), target_site.clone()])
+        .await
+        .expect_err("site replication add must reject an untrusted self-signed HTTPS peer");
+    let add_error = add_error.to_string();
+    assert!(
+        add_error.contains("400 Bad Request"),
+        "unexpected untrusted self-signed peer error: {add_error}"
+    );
+    assert!(
+        add_error.to_ascii_lowercase().contains("tls") || add_error.to_ascii_lowercase().contains("certificate"),
+        "self-signed peer rejection did not report a TLS certificate error: {add_error}"
+    );
+    let disabled = wait_for_site_replication_disabled(&source_env).await?;
+    assert!(!disabled.enabled && disabled.sites.is_empty());
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            source_site,
+            PeerSite {
+                skip_tls_verify: true,
+                ..target_site
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {add_status:?}");
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+
+    let source_client = source_env.create_s3_client();
+    let bucket = "site-repl-self-signed-tls";
+    let key = "self-signed.txt";
+    let body = "site replication over self-signed https";
+    source_client.create_bucket().bucket(bucket).send().await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(body.as_bytes().to_vec()))
+        .send()
+        .await?;
+
+    wait_for_replicated_object_over_https(&https_client, &target_env, bucket, key, body).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dual_node() -> TestResult {
+    init_logging();
+
+    let mut source_env = new_replication_source_env().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let mut target_env = new_replication_https_target_env().await?;
+    let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
+    let target_host = target_env
+        .url
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .ok_or_else(|| std::io::Error::other("target HTTPS URL missing host"))?
+        .to_string();
+    let ca_cert_pem = generate_private_ca_tls_material(&tls_dir, &target_host).await?;
+    start_https_rustfs_server(&mut target_env, &tls_dir).await?;
+    let https_client = trusted_https_client(&ca_cert_pem)?;
+    wait_for_https_server_ready(&https_client, &target_env).await?;
+
+    let source_site = PeerSite {
+        name: "source-site".to_string(),
+        endpoint: source_env.url.clone(),
+        access_key: source_env.access_key.clone(),
+        secret_key: source_env.secret_key.clone(),
+        ..Default::default()
+    };
+    let target_site = PeerSite {
+        name: "target-site".to_string(),
+        endpoint: target_env.url.clone(),
+        access_key: target_env.access_key.clone(),
+        secret_key: target_env.secret_key.clone(),
+        ..Default::default()
+    };
+
+    let add_error = site_replication_add(&source_env, &[source_site.clone(), target_site.clone()])
+        .await
+        .expect_err("site replication add must reject a private CA HTTPS peer without caCertPem");
+    let add_error = add_error.to_string();
+    assert!(
+        add_error.contains("400 Bad Request"),
+        "unexpected untrusted private CA peer error: {add_error}"
+    );
+    assert!(
+        add_error.to_ascii_lowercase().contains("tls") || add_error.to_ascii_lowercase().contains("certificate"),
+        "private CA peer rejection did not report a TLS certificate error: {add_error}"
+    );
+    let disabled = wait_for_site_replication_disabled(&source_env).await?;
+    assert!(!disabled.enabled && disabled.sites.is_empty());
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            source_site,
+            PeerSite {
+                ca_cert_pem,
+                ..target_site
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {add_status:?}");
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+
+    let source_client = source_env.create_s3_client();
+    let bucket = "site-repl-private-ca-tls";
+    let key = "private-ca.txt";
+    let body = "site replication over private ca https";
+    source_client.create_bucket().bucket(bucket).send().await?;
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(body.as_bytes().to_vec()))
+        .send()
+        .await?;
+
+    wait_for_replicated_object_over_https(&https_client, &target_env, bucket, key, body).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 
@@ -2963,12 +3136,14 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )
@@ -3092,18 +3267,21 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "relay-site".to_string(),
                 endpoint: relay_env.url.clone(),
                 access_key: relay_env.access_key.clone(),
                 secret_key: relay_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )
@@ -3326,12 +3504,14 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )
@@ -3434,12 +3614,14 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )
@@ -3545,12 +3727,14 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )
@@ -3627,12 +3811,14 @@ async fn test_site_replication_replicates_policy_backed_user_access_real_dual_no
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )
@@ -3713,12 +3899,14 @@ async fn test_site_replication_replicates_group_policy_backed_access_real_dual_n
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )
@@ -3841,12 +4029,14 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )
@@ -3943,12 +4133,14 @@ async fn test_site_replication_replicates_service_accounts_created_from_sts_sess
                 endpoint: source_env.url.clone(),
                 access_key: source_env.access_key.clone(),
                 secret_key: source_env.secret_key.clone(),
+                ..Default::default()
             },
             PeerSite {
                 name: "target-site".to_string(),
                 endpoint: target_env.url.clone(),
                 access_key: target_env.access_key.clone(),
                 secret_key: target_env.secret_key.clone(),
+                ..Default::default()
             },
         ],
     )

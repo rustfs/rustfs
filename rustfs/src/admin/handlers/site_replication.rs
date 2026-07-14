@@ -77,6 +77,7 @@ use rustfs_policy::policy::{
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use rustfs_tls_runtime::GlobalPublishedOutboundTlsState;
+use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use rustfs_utils::http::get_source_scheme;
 use rustls_pki_types::pem::PemObject;
 use s3s::dto::{
@@ -87,10 +88,13 @@ use s3s::dto::{
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -115,6 +119,8 @@ const SITE_REPL_MAX_NETPERF_DURATION: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
+const MAX_PEER_CA_CERT_PEM_SIZE: usize = 256 * 1024;
+const ALLOW_LOOPBACK_REPLICATION_TARGET_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
 const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 const SITE_REPLICATION_RETRY_FAILED_AFTER: u32 = 3;
 const SITE_REPLICATION_PEER_BUCKET_OPS_PATH: &str = "/rustfs/admin/v3/site-replication/peer/bucket-ops";
@@ -126,6 +132,8 @@ const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_EDIT_CAPABILITY_PATH: &str =
     "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=endpoint-target-refresh";
+const SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH: &str =
+    "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=peer-tls-settings";
 const SITE_REPLICATION_PEER_EDIT_REFRESH_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit?refresh-targets=true";
 const SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH: &str = "internal:endpoint-target-refresh";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
@@ -198,6 +206,123 @@ enum SiteReplicationPeerClientCacheEntry {
 struct SiteReplicationPeerClientCache {
     generation: u64,
     entry: SiteReplicationPeerClientCacheEntry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerConnection {
+    endpoint: Url,
+    skip_tls_verify: bool,
+    ca_cert_pem: String,
+}
+
+#[derive(Deserialize, Default)]
+struct PeerTlsFieldPresence {
+    #[serde(rename = "skipTlsVerify")]
+    skip_tls_verify: Option<IgnoredAny>,
+    #[serde(rename = "caCertPem")]
+    ca_cert_pem: Option<IgnoredAny>,
+}
+
+impl PeerTlsFieldPresence {
+    fn has_skip_tls_verify(&self) -> bool {
+        self.skip_tls_verify.is_some()
+    }
+
+    fn has_ca_cert_pem(&self) -> bool {
+        self.ca_cert_pem.is_some()
+    }
+}
+
+#[derive(Clone)]
+struct PeerDnsResolver {
+    allow_loopback: bool,
+    #[cfg(test)]
+    overrides: Option<Arc<HashMap<String, Vec<IpAddr>>>>,
+}
+
+impl PeerDnsResolver {
+    fn new(allow_loopback: bool) -> Self {
+        Self {
+            allow_loopback,
+            #[cfg(test)]
+            overrides: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_overrides(allow_loopback: bool, overrides: HashMap<String, Vec<IpAddr>>) -> Self {
+        Self {
+            allow_loopback,
+            overrides: Some(Arc::new(overrides)),
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for PeerDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let allow_loopback = self.allow_loopback;
+        #[cfg(test)]
+        let overrides = self.overrides.clone();
+        Box::pin(async move {
+            #[cfg(test)]
+            let overridden = overrides.as_ref().and_then(|entries| entries.get(&host)).cloned();
+            #[cfg(not(test))]
+            let overridden: Option<Vec<IpAddr>> = None;
+
+            let ips = if let Some(ips) = overridden {
+                ips
+            } else {
+                tokio::net::lookup_host((host.as_str(), 0))
+                    .await?
+                    .map(|addr| addr.ip())
+                    .collect()
+            };
+            let addrs = ips
+                .into_iter()
+                .filter(|ip| resolved_peer_ip_allowed(&host, *ip, allow_loopback))
+                .map(|ip| SocketAddr::new(ip, 0))
+                .collect::<Vec<_>>();
+            if addrs.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("site replication DNS resolution for `{host}` returned no allowed addresses"),
+                )
+                .into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+impl PeerConnection {
+    fn new(endpoint: &str, skip_tls_verify: bool, ca_cert_pem: &str) -> S3Result<Self> {
+        validate_peer_connection_inner(endpoint, skip_tls_verify, ca_cert_pem, loopback_replication_targets_allowed())
+    }
+
+    fn endpoint(&self) -> &str {
+        self.endpoint.as_str().trim_end_matches('/')
+    }
+
+    fn uses_default_tls(&self) -> bool {
+        !self.skip_tls_verify && self.ca_cert_pem.is_empty()
+    }
+}
+
+impl TryFrom<&PeerInfo> for PeerConnection {
+    type Error = S3Error;
+
+    fn try_from(peer: &PeerInfo) -> Result<Self, Self::Error> {
+        Self::new(&peer.endpoint, peer.skip_tls_verify, &peer.ca_cert_pem)
+    }
+}
+
+impl TryFrom<&PeerSite> for PeerConnection {
+    type Error = S3Error;
+
+    fn try_from(site: &PeerSite) -> Result<Self, Self::Error> {
+        Self::new(&site.endpoint, site.skip_tls_verify, &site.ca_cert_pem)
+    }
 }
 
 static SITE_REPLICATION_PEER_CLIENT: LazyLock<Mutex<Option<SiteReplicationPeerClientCache>>> = LazyLock::new(|| Mutex::new(None));
@@ -682,13 +807,25 @@ async fn read_site_replication_json<T: DeserializeOwned>(
     secret_key: &str,
     compat_encrypted: bool,
 ) -> S3Result<T> {
+    let body = read_site_replication_body(req, secret_key, compat_encrypted).await?;
+    parse_site_replication_json(&body)
+}
+
+async fn read_site_replication_body(req: S3Request<Body>, secret_key: &str, compat_encrypted: bool) -> S3Result<Vec<u8>> {
     let body = if compat_encrypted {
         read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), secret_key).await?
     } else {
         read_plain_admin_body(req.input).await?
     };
+    Ok(body)
+}
 
-    serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))
+fn parse_site_replication_json<T: DeserializeOwned>(body: &[u8]) -> S3Result<T> {
+    serde_json::from_slice(body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))
+}
+
+fn parse_public_peer_edit(body: &[u8]) -> S3Result<(PeerInfo, PeerTlsFieldPresence)> {
+    Ok((parse_site_replication_json(body)?, parse_site_replication_json(body)?))
 }
 
 async fn load_site_replication_state() -> S3Result<SiteReplicationState> {
@@ -749,10 +886,20 @@ async fn persist_site_replication_state(state: &SiteReplicationState) -> S3Resul
 }
 
 fn build_site_replication_peer_client(outbound_tls: &GlobalPublishedOutboundTlsState) -> S3Result<reqwest::Client> {
+    build_site_replication_peer_client_with_resolver(outbound_tls, PeerDnsResolver::new(loopback_replication_targets_allowed()))
+}
+
+fn build_site_replication_peer_client_with_resolver(
+    outbound_tls: &GlobalPublishedOutboundTlsState,
+    resolver: PeerDnsResolver,
+) -> S3Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
         .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
-        .pool_idle_timeout(Some(Duration::from_secs(60)));
+        .pool_idle_timeout(Some(Duration::from_secs(60)))
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(resolver);
 
     if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
         let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
@@ -772,6 +919,62 @@ fn build_site_replication_peer_client(outbound_tls: &GlobalPublishedOutboundTlsS
                     format!("failed to load published site-replication CA cert: {e}"),
                 )
             })?;
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    builder
+        .build()
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build site replication peer client failed: {e}")))
+}
+
+fn build_custom_site_replication_peer_client(
+    outbound_tls: &GlobalPublishedOutboundTlsState,
+    connection: &PeerConnection,
+) -> S3Result<reqwest::Client> {
+    build_custom_site_replication_peer_client_with_resolver(
+        outbound_tls,
+        connection,
+        PeerDnsResolver::new(loopback_replication_targets_allowed()),
+    )
+}
+
+fn build_custom_site_replication_peer_client_with_resolver(
+    outbound_tls: &GlobalPublishedOutboundTlsState,
+    connection: &PeerConnection,
+    resolver: PeerDnsResolver,
+) -> S3Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(SITE_REPLICATION_PEER_REQUEST_TIMEOUT)
+        .connect_timeout(SITE_REPLICATION_PEER_CONNECT_TIMEOUT)
+        .pool_idle_timeout(Some(Duration::from_secs(60)))
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(resolver)
+        .danger_accept_invalid_certs(connection.skip_tls_verify);
+
+    if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
+        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
+        let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to parse published site-replication CA certs: {e}"),
+                )
+            })?;
+        for cert_der in certs_der {
+            let cert = reqwest::Certificate::from_der(cert_der.as_ref()).map_err(|e| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to load published site-replication CA cert: {e}"),
+                )
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    if !connection.ca_cert_pem.is_empty() {
+        for cert in parse_peer_ca_certificates(&connection.ca_cert_pem)? {
             builder = builder.add_root_certificate(cert);
         }
     }
@@ -805,6 +1008,43 @@ async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
     }
 
     built
+}
+
+async fn site_replication_client_for(connection: &PeerConnection) -> S3Result<reqwest::Client> {
+    // Revalidate at the client boundary so callers cannot bypass endpoint/TLS policy.
+    let connection = PeerConnection::new(connection.endpoint(), connection.skip_tls_verify, &connection.ca_cert_pem)?;
+    if connection.uses_default_tls() {
+        return site_replication_peer_client().await;
+    }
+    let outbound_tls = current_outbound_tls_state().await;
+    build_custom_site_replication_peer_client(&outbound_tls, &connection)
+}
+
+fn runtime_peer_connection(peer: &PeerInfo) -> S3Result<PeerConnection> {
+    PeerConnection::try_from(peer).map_err(|err| {
+        S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!("invalid persisted site replication peer `{}`: {err}", peer.endpoint),
+        )
+    })
+}
+
+struct PeerTransport {
+    connection: PeerConnection,
+    client: reqwest::Client,
+}
+
+impl PeerTransport {
+    async fn for_runtime_peer(peer: &PeerInfo) -> S3Result<Self> {
+        let connection = runtime_peer_connection(peer)?;
+        let client = site_replication_client_for(&connection).await.map_err(|err| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("initialize persisted site replication peer `{}` transport failed: {err}", peer.endpoint),
+            )
+        })?;
+        Ok(Self { connection, client })
+    }
 }
 
 fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::storage_api::runtime::EndpointServerPools>) -> bool {
@@ -1053,10 +1293,17 @@ fn non_negative_u64(value: i64) -> u64 {
     value.max(0) as u64
 }
 
+fn stored_peer_tls_settings(stored_peer: Option<&PeerInfo>) -> (bool, String) {
+    stored_peer
+        .map(|peer| (peer.skip_tls_verify, peer.ca_cert_pem.clone()))
+        .unwrap_or_default()
+}
+
 fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
     let endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
     let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
+    let (skip_tls_verify, ca_cert_pem) = stored_peer_tls_settings(stored_peer);
 
     PeerInfo {
         endpoint: endpoint.clone(),
@@ -1073,6 +1320,8 @@ fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> Pe
         default_bandwidth: stored_peer.map(|peer| peer.default_bandwidth.clone()).unwrap_or_default(),
         replicate_ilm_expiry: stored_peer.is_some_and(|peer| peer.replicate_ilm_expiry),
         object_naming_mode: stored_peer.map(|peer| peer.object_naming_mode.clone()).unwrap_or_default(),
+        skip_tls_verify,
+        ca_cert_pem,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
 }
@@ -1081,6 +1330,7 @@ fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
     let endpoint = current_local_runtime_endpoint();
     let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
+    let (skip_tls_verify, ca_cert_pem) = stored_peer_tls_settings(stored_peer);
 
     PeerInfo {
         endpoint: endpoint.clone(),
@@ -1097,6 +1347,8 @@ fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
         default_bandwidth: stored_peer.map(|peer| peer.default_bandwidth.clone()).unwrap_or_default(),
         replicate_ilm_expiry: stored_peer.is_some_and(|peer| peer.replicate_ilm_expiry),
         object_naming_mode: stored_peer.map(|peer| peer.object_naming_mode.clone()).unwrap_or_default(),
+        skip_tls_verify,
+        ca_cert_pem,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
 }
@@ -1111,6 +1363,28 @@ fn existing_peer_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> O
         .values()
         .find(|peer| same_identity_endpoint(&peer.endpoint, endpoint))
         .cloned()
+}
+
+fn existing_peer_for_edit<'a>(state: &'a SiteReplicationState, incoming: &PeerInfo) -> Option<&'a PeerInfo> {
+    state.peers.get(&incoming.deployment_id).or_else(|| {
+        state
+            .peers
+            .values()
+            .find(|peer| same_identity_endpoint(&peer.endpoint, &incoming.endpoint))
+    })
+}
+
+fn apply_public_peer_edit_tls_presence(state: &SiteReplicationState, incoming: &mut PeerInfo, presence: PeerTlsFieldPresence) {
+    let existing = existing_peer_for_edit(state, incoming);
+    let Some(existing) = existing else {
+        return;
+    };
+    if !presence.has_skip_tls_verify() {
+        incoming.skip_tls_verify = existing.skip_tls_verify;
+    }
+    if !presence.has_ca_cert_pem() {
+        incoming.ca_cert_pem = existing.ca_cert_pem.clone();
+    }
 }
 
 fn peer_deployment_id_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> Option<String> {
@@ -1141,11 +1415,111 @@ fn normalize_peer_site(site: PeerSite, replicate_ilm_expiry: bool) -> PeerInfo {
         default_bandwidth: BucketBandwidth::default(),
         replicate_ilm_expiry,
         object_naming_mode: String::new(),
+        skip_tls_verify: site.skip_tls_verify,
+        ca_cert_pem: site.ca_cert_pem,
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     })
 }
 
-fn validate_site_replication_peer_endpoint(endpoint: &str) -> S3Result<()> {
+fn loopback_replication_targets_allowed() -> bool {
+    std::env::var(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV)
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+}
+
+fn validate_peer_egress(url: &Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
+    match validate_outbound_url(url) {
+        Ok(()) => Ok(()),
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "private address",
+            ..
+        }) => Ok(()),
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "loopback address" | "loopback host",
+            ..
+        }) if allow_loopback && peer_url_has_canonical_loopback_host(url) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn peer_url_has_canonical_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+        None => false,
+    }
+}
+
+fn resolved_peer_ip_allowed(host: &str, ip: IpAddr, allow_loopback: bool) -> bool {
+    let Ok(ip_url) = (match ip {
+        IpAddr::V4(ip) => Url::parse(&format!("http://{ip}")),
+        IpAddr::V6(ip) => Url::parse(&format!("http://[{ip}]")),
+    }) else {
+        return false;
+    };
+    match validate_outbound_url(&ip_url) {
+        Ok(()) => true,
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "private address",
+            ..
+        }) => true,
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "loopback address",
+            ..
+        }) => {
+            allow_loopback
+                && host.eq_ignore_ascii_case("localhost")
+                && matches!(ip, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) | IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        }
+        Err(_) => false,
+    }
+}
+
+fn parse_peer_ca_certificates(ca_cert_pem: &str) -> S3Result<Vec<reqwest::Certificate>> {
+    if ca_cert_pem.len() > MAX_PEER_CA_CERT_PEM_SIZE {
+        return Err(s3_error!(InvalidRequest, "site replication CA certificate exceeds 256 KiB"));
+    }
+    if ca_cert_pem.contains("PRIVATE KEY-----") {
+        return Err(s3_error!(
+            InvalidRequest,
+            "site replication CA certificate must not contain a private key"
+        ));
+    }
+
+    let mut reader = std::io::BufReader::new(ca_cert_pem.as_bytes());
+    let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication CA certificate: {e}"))
+        })?;
+    if certs_der.is_empty() {
+        return Err(s3_error!(
+            InvalidRequest,
+            "site replication CA certificate must contain at least one certificate"
+        ));
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    certs_der
+        .into_iter()
+        .map(|cert| {
+            root_store.add(cert.clone()).map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication CA certificate: {e}"))
+            })?;
+            reqwest::Certificate::from_der(cert.as_ref()).map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication CA certificate: {e}"))
+            })
+        })
+        .collect()
+}
+
+fn validate_peer_connection_inner(
+    endpoint: &str,
+    skip_tls_verify: bool,
+    ca_cert_pem: &str,
+    allow_loopback: bool,
+) -> S3Result<PeerConnection> {
     let parsed = Url::parse(endpoint)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site endpoint `{endpoint}`: {e}")))?;
     match parsed.scheme() {
@@ -1163,7 +1537,88 @@ fn validate_site_replication_peer_endpoint(endpoint: &str) -> S3Result<()> {
             format!("invalid site endpoint `{endpoint}`: missing host"),
         ));
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(s3_error!(InvalidRequest, "invalid site endpoint `{endpoint}`: userinfo is not allowed"));
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(s3_error!(
+            InvalidRequest,
+            "invalid site endpoint `{endpoint}`: endpoint must be an origin"
+        ));
+    }
+    validate_peer_egress(&parsed, allow_loopback)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site endpoint `{endpoint}`: {e}")))?;
+
+    if ca_cert_pem.len() > MAX_PEER_CA_CERT_PEM_SIZE {
+        return Err(s3_error!(InvalidRequest, "site replication CA certificate exceeds 256 KiB"));
+    }
+    let ca_cert_pem = ca_cert_pem.trim();
+    if parsed.scheme() != "https" && (skip_tls_verify || !ca_cert_pem.is_empty()) {
+        return Err(s3_error!(InvalidRequest, "site replication TLS settings require an HTTPS endpoint"));
+    }
+    if skip_tls_verify && !ca_cert_pem.is_empty() {
+        return Err(s3_error!(InvalidRequest, "skipTLSVerify and caCertPem are mutually exclusive"));
+    }
+    if !ca_cert_pem.is_empty() {
+        parse_peer_ca_certificates(ca_cert_pem)?;
+    }
+
+    Ok(PeerConnection {
+        endpoint: parsed,
+        skip_tls_verify,
+        ca_cert_pem: ca_cert_pem.to_string(),
+    })
+}
+
+fn validate_proposed_peer(peer: &PeerInfo) -> S3Result<()> {
+    PeerConnection::try_from(peer).map(|_| ())
+}
+
+fn validate_join_peer_snapshot(peers: &BTreeMap<String, PeerInfo>) -> S3Result<()> {
+    for (deployment_id, peer) in peers {
+        validate_proposed_peer(peer).map_err(|err| {
+            S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("invalid site replication peer `{deployment_id}`: {err}"),
+            )
+        })?;
+    }
     Ok(())
+}
+
+fn peer_tls_is_non_default(skip_tls_verify: bool, ca_cert_pem: &str) -> bool {
+    skip_tls_verify || !ca_cert_pem.trim().is_empty()
+}
+
+fn add_peer_tls_capability_required(sites: &[PeerSite]) -> bool {
+    sites
+        .iter()
+        .any(|site| peer_tls_is_non_default(site.skip_tls_verify, &site.ca_cert_pem))
+}
+
+fn peer_tls_capability_probe_sites(sites: &[PeerSite]) -> Vec<&PeerSite> {
+    let mut seen = HashSet::new();
+    sites
+        .iter()
+        .filter(|site| seen.insert(site_identity_key(&site.endpoint)))
+        .collect()
+}
+
+fn edit_peer_tls_capability_required(existing: Option<&PeerInfo>, proposed: &PeerInfo) -> bool {
+    peer_tls_is_non_default(proposed.skip_tls_verify, &proposed.ca_cert_pem)
+        && existing.is_none_or(|existing| {
+            existing.skip_tls_verify != proposed.skip_tls_verify || existing.ca_cert_pem.trim() != proposed.ca_cert_pem.trim()
+        })
+}
+
+fn peer_tls_settings_changed(existing: Option<&PeerInfo>, proposed: &PeerInfo) -> bool {
+    existing.is_some_and(|existing| {
+        existing.skip_tls_verify != proposed.skip_tls_verify || existing.ca_cert_pem.trim() != proposed.ca_cert_pem.trim()
+    })
+}
+
+fn peer_edit_capability_supported(capability: &str) -> bool {
+    matches!(capability, "endpoint-target-refresh" | "peer-tls-settings")
 }
 
 fn validate_add_sites(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()> {
@@ -1177,7 +1632,7 @@ fn validate_add_sites(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()>
         if site.endpoint.trim().is_empty() {
             return Err(s3_error!(InvalidRequest, "site endpoint is required"));
         }
-        validate_site_replication_peer_endpoint(&site.endpoint)?;
+        PeerConnection::try_from(site)?;
         let endpoint_key = site_identity_key(&site.endpoint);
         if !seen.insert(endpoint_key) {
             return Err(s3_error!(InvalidRequest, "duplicate site endpoint `{}`", site.endpoint));
@@ -1234,8 +1689,11 @@ async fn local_add_preflight_info(
 }
 
 async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationAddPreflightInfo> {
-    let info_body = send_peer_admin_get_request(
-        &site.endpoint,
+    let connection = PeerConnection::try_from(site)?;
+    let client = site_replication_client_for(&connection).await?;
+    let info_body = send_peer_admin_get_request_with_client(
+        &client,
+        &connection,
         "/rustfs/admin/v3/site-replication/metainfo",
         &site.access_key,
         &site.secret_key,
@@ -1248,8 +1706,9 @@ async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationA
         )
     })?;
 
-    let idp_body = send_peer_admin_get_request(
-        &site.endpoint,
+    let idp_body = send_peer_admin_get_request_with_client(
+        &client,
+        &connection,
         "/rustfs/admin/v3/site-replication/peer/idp-settings",
         &site.access_key,
         &site.secret_key,
@@ -1619,6 +2078,13 @@ fn build_join_peers(
     let mut seen_endpoints = HashSet::new();
 
     let mut normalized_local = local_peer.clone();
+    if let Some(local_site) = sites
+        .iter()
+        .find(|site| same_identity_endpoint(&site.endpoint, &normalized_local.endpoint))
+    {
+        normalized_local.skip_tls_verify = local_site.skip_tls_verify;
+        normalized_local.ca_cert_pem = local_site.ca_cert_pem.clone();
+    }
     normalized_local.replicate_ilm_expiry = replicate_ilm_expiry;
     normalized_local = normalize_peer_info(normalized_local);
     seen_endpoints.insert(site_identity_key(&normalized_local.endpoint));
@@ -1636,6 +2102,8 @@ fn build_join_peers(
         if !site.name.is_empty() {
             peer.name = site.name;
         }
+        peer.skip_tls_verify = site.skip_tls_verify;
+        peer.ca_cert_pem = site.ca_cert_pem;
         peer.replicate_ilm_expiry |= replicate_ilm_expiry;
         peer = normalize_peer_info(peer);
         peers.insert(peer.deployment_id.clone(), peer);
@@ -1666,7 +2134,15 @@ fn normalize_join_peers_for_local(local_peer: &PeerInfo, peers: BTreeMap<String,
 }
 
 fn reconcile_peer_with_actual_identity(mut state: SiteReplicationState, actual_peer: PeerInfo) -> SiteReplicationState {
-    let actual_peer = normalize_peer_info(actual_peer);
+    let mut actual_peer = normalize_peer_info(actual_peer);
+    if let Some(requested_peer) = state
+        .peers
+        .values()
+        .find(|peer| same_identity_endpoint(&peer.endpoint, &actual_peer.endpoint))
+    {
+        actual_peer.skip_tls_verify = requested_peer.skip_tls_verify;
+        actual_peer.ca_cert_pem = requested_peer.ca_cert_pem.clone();
+    }
     state
         .peers
         .retain(|_, peer| !same_identity_endpoint(&peer.endpoint, &actual_peer.endpoint));
@@ -1791,17 +2267,41 @@ fn site_replication_peer_payload(path: &str, secret_key: &str, payload: Vec<u8>)
     }
 }
 
+fn site_replication_peer_url(connection: &PeerConnection, wire_path: &str) -> S3Result<Url> {
+    let path = wire_path.split_once('?').map_or(wire_path, |(path, _)| path);
+    if !path.starts_with('/') || path.starts_with("//") {
+        return Err(s3_error!(InvalidRequest, "invalid site replication peer path"));
+    }
+    connection
+        .endpoint
+        .join(wire_path)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication peer path: {e}")))
+}
+
+#[cfg(test)]
 async fn send_peer_admin_request_raw<T: Serialize>(
-    endpoint: &str,
+    connection: &PeerConnection,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: &T,
+) -> S3Result<(StatusCode, Vec<u8>)> {
+    let client = site_replication_client_for(connection).await?;
+    send_peer_admin_request_raw_with_client(&client, connection, path, access_key, secret_key, body).await
+}
+
+async fn send_peer_admin_request_raw_with_client<T: Serialize>(
+    client: &reqwest::Client,
+    connection: &PeerConnection,
     path: &str,
     access_key: &str,
     secret_key: &str,
     body: &T,
 ) -> S3Result<(StatusCode, Vec<u8>)> {
     let path = site_replication_peer_wire_path(path);
-    let base = endpoint.trim_end_matches('/');
-    let url = format!("{base}{path}");
+    let url = site_replication_peer_url(connection, &path)?;
     let uri = url
+        .as_str()
         .parse::<Uri>()
         .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {e}")))?;
     let authority = uri
@@ -1831,7 +2331,7 @@ async fn send_peer_admin_request_raw<T: Serialize>(
             .unwrap_or("us-east-1"),
     );
 
-    let mut req = site_replication_peer_client().await?.request(reqwest::Method::PUT, &url);
+    let mut req = client.request(reqwest::Method::PUT, url.clone());
     for (name, value) in signed.headers() {
         req = req.header(name, value);
     }
@@ -1862,13 +2362,25 @@ async fn send_peer_admin_request_raw<T: Serialize>(
 }
 
 async fn send_peer_admin_request<T: Serialize>(
-    endpoint: &str,
+    connection: &PeerConnection,
     path: &str,
     access_key: &str,
     secret_key: &str,
     body: &T,
 ) -> S3Result<Vec<u8>> {
-    let (status, body) = send_peer_admin_request_raw(endpoint, path, access_key, secret_key, body).await?;
+    let client = site_replication_client_for(connection).await?;
+    send_peer_admin_request_with_client(&client, connection, path, access_key, secret_key, body).await
+}
+
+async fn send_peer_admin_request_with_client<T: Serialize>(
+    client: &reqwest::Client,
+    connection: &PeerConnection,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: &T,
+) -> S3Result<Vec<u8>> {
+    let (status, body) = send_peer_admin_request_raw_with_client(client, connection, path, access_key, secret_key, body).await?;
     if status.is_success() {
         return Ok(body);
     }
@@ -1876,17 +2388,18 @@ async fn send_peer_admin_request<T: Serialize>(
     let detail = String::from_utf8_lossy(&body).into_owned();
     Err(S3Error::with_message(
         S3ErrorCode::InternalError,
-        format!("peer request to {endpoint}{path} failed with {status}: {detail}"),
+        format!("peer request to {}{path} failed with {status}: {detail}", connection.endpoint()),
     ))
 }
 
 async fn send_peer_admin_request_with_secret_candidates<T: Serialize>(
-    endpoint: &str,
+    connection: &PeerConnection,
     path: &str,
     access_key: &str,
     secret_candidates: &[String],
     body: &T,
 ) -> S3Result<Vec<u8>> {
+    let client = site_replication_client_for(connection).await?;
     let mut tried = HashSet::new();
     let mut errors = Vec::new();
 
@@ -1895,7 +2408,7 @@ async fn send_peer_admin_request_with_secret_candidates<T: Serialize>(
             continue;
         }
 
-        match send_peer_admin_request(endpoint, path, access_key, secret_key, body).await {
+        match send_peer_admin_request_with_client(&client, connection, path, access_key, secret_key, body).await {
             Ok(body) => return Ok(body),
             Err(err) => {
                 let detail = format!("{err}");
@@ -1911,7 +2424,8 @@ async fn send_peer_admin_request_with_secret_candidates<T: Serialize>(
     Err(S3Error::with_message(
         S3ErrorCode::InternalError,
         format!(
-            "peer request to {endpoint}{path} failed with all service-account secrets: {}",
+            "peer request to {}{path} failed with all service-account secrets: {}",
+            connection.endpoint(),
             errors.join("; ")
         ),
     ))
@@ -1926,11 +2440,27 @@ fn peer_error_may_be_secret_mismatch(detail: &str) -> bool {
         || detail.contains("403")
 }
 
-async fn send_peer_admin_get_request(endpoint: &str, path: &str, access_key: &str, secret_key: &str) -> S3Result<Vec<u8>> {
+async fn send_peer_admin_get_request(
+    connection: &PeerConnection,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> S3Result<Vec<u8>> {
+    let client = site_replication_client_for(connection).await?;
+    send_peer_admin_get_request_with_client(&client, connection, path, access_key, secret_key).await
+}
+
+async fn send_peer_admin_get_request_with_client(
+    client: &reqwest::Client,
+    connection: &PeerConnection,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> S3Result<Vec<u8>> {
     let path = site_replication_peer_wire_path(path);
-    let base = endpoint.trim_end_matches('/');
-    let url = format!("{base}{path}");
+    let url = site_replication_peer_url(connection, &path)?;
     let uri = url
+        .as_str()
         .parse::<Uri>()
         .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {e}")))?;
     let authority = uri
@@ -1956,7 +2486,7 @@ async fn send_peer_admin_get_request(endpoint: &str, path: &str, access_key: &st
             .unwrap_or("us-east-1"),
     );
 
-    let mut req = site_replication_peer_client().await?.request(reqwest::Method::GET, &url);
+    let mut req = client.request(reqwest::Method::GET, url.clone());
     for (name, value) in signed.headers() {
         req = req.header(name, value);
     }
@@ -2065,7 +2595,20 @@ async fn send_peer_admin_request_with_retry_event<T: Serialize>(
     secret_key: &str,
     body: &T,
 ) -> S3Result<Vec<u8>> {
-    match send_peer_admin_request(&peer.endpoint, path, access_key, secret_key, body).await {
+    let transport = PeerTransport::for_runtime_peer(peer).await?;
+    send_peer_admin_request_with_retry_event_transport(peer, &transport, path, access_key, secret_key, body).await
+}
+
+async fn send_peer_admin_request_with_retry_event_transport<T: Serialize>(
+    peer: &PeerInfo,
+    transport: &PeerTransport,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: &T,
+) -> S3Result<Vec<u8>> {
+    match send_peer_admin_request_with_client(&transport.client, &transport.connection, path, access_key, secret_key, body).await
+    {
         Ok(body) => {
             dequeue_site_replication_retry_event(peer, path).await;
             Ok(body)
@@ -2083,9 +2626,11 @@ async fn send_site_replication_bootstrap_plan(
     service_account_secret_key: &str,
     plan: &SiteReplicationBootstrapPlan,
 ) -> S3Result<()> {
+    let transport = PeerTransport::for_runtime_peer(peer).await?;
     for item in &plan.iam_items {
-        send_peer_admin_request_with_retry_event(
+        send_peer_admin_request_with_retry_event_transport(
             peer,
+            &transport,
             "/rustfs/admin/v3/site-replication/peer/iam-item",
             service_account_access_key,
             service_account_secret_key,
@@ -2096,13 +2641,21 @@ async fn send_site_replication_bootstrap_plan(
 
     let empty = serde_json::json!({});
     for path in &plan.bucket_make_ops {
-        send_peer_admin_request_with_retry_event(peer, path, service_account_access_key, service_account_secret_key, &empty)
-            .await?;
+        send_peer_admin_request_with_retry_event_transport(
+            peer,
+            &transport,
+            path,
+            service_account_access_key,
+            service_account_secret_key,
+            &empty,
+        )
+        .await?;
     }
 
     for item in &plan.bucket_items {
-        send_peer_admin_request_with_retry_event(
+        send_peer_admin_request_with_retry_event_transport(
             peer,
+            &transport,
             "/rustfs/admin/v3/site-replication/peer/bucket-meta",
             service_account_access_key,
             service_account_secret_key,
@@ -2112,8 +2665,15 @@ async fn send_site_replication_bootstrap_plan(
     }
 
     for path in &plan.bucket_configure_ops {
-        send_peer_admin_request_with_retry_event(peer, path, service_account_access_key, service_account_secret_key, &empty)
-            .await?;
+        send_peer_admin_request_with_retry_event_transport(
+            peer,
+            &transport,
+            path,
+            service_account_access_key,
+            service_account_secret_key,
+            &empty,
+        )
+        .await?;
     }
 
     Ok(())
@@ -2591,7 +3151,7 @@ async fn fetch_peer_sr_info(
     }
 
     let body = send_peer_admin_get_request(
-        &peer.endpoint,
+        &runtime_peer_connection(peer)?,
         &sr_metainfo_path(uri),
         &state.service_account_access_key,
         service_account_secret_key,
@@ -3227,8 +3787,51 @@ fn edit_state(mut state: SiteReplicationState, incoming: PeerInfo, ilm_expiry_ov
     state
 }
 
+fn peer_edit_identity_is_empty(peer: &PeerInfo) -> bool {
+    peer.deployment_id.is_empty() && peer.endpoint.is_empty() && peer.name.is_empty()
+}
+
+fn peer_edit_has_non_identity_payload(peer: &PeerInfo) -> bool {
+    peer.sync_state != SyncStatus::Unknown
+        || peer.default_bandwidth.limit != 0
+        || peer.default_bandwidth.set
+        || peer.default_bandwidth.updated_at.is_some()
+        || peer.replicate_ilm_expiry
+        || !peer.object_naming_mode.is_empty()
+        || peer.skip_tls_verify
+        || !peer.ca_cert_pem.is_empty()
+        || peer.api_version.is_some()
+}
+
+fn apply_internal_peer_edit(
+    state: SiteReplicationState,
+    local_peer: &PeerInfo,
+    incoming: PeerInfo,
+    ilm_expiry_override: Option<bool>,
+) -> S3Result<SiteReplicationState> {
+    if peer_edit_identity_is_empty(&incoming) {
+        if ilm_expiry_override.is_none() || peer_edit_has_non_identity_payload(&incoming) {
+            return Err(s3_error!(InvalidRequest, "peer identity is required"));
+        }
+        return Ok(edit_state(state, incoming, ilm_expiry_override));
+    }
+
+    validate_proposed_peer(&incoming)?;
+    Ok(sync_state_name_for_local_peer(
+        update_peer(state, incoming.clone(), ilm_expiry_override),
+        local_peer,
+        &incoming,
+    ))
+}
+
 fn peer_endpoint_edit_requested(state: &SiteReplicationState, incoming: &PeerInfo) -> bool {
     !incoming.deployment_id.is_empty() && !incoming.endpoint.is_empty() && state.peers.contains_key(&incoming.deployment_id)
+}
+
+fn peer_connection_settings_match(left: &PeerInfo, right: &PeerInfo) -> bool {
+    canonical_endpoint(&left.endpoint) == canonical_endpoint(&right.endpoint)
+        && left.skip_tls_verify == right.skip_tls_verify
+        && left.ca_cert_pem.trim() == right.ca_cert_pem.trim()
 }
 
 fn peer_endpoint_refresh_requested(state: &SiteReplicationState, incoming: &PeerInfo) -> bool {
@@ -3236,13 +3839,12 @@ fn peer_endpoint_refresh_requested(state: &SiteReplicationState, incoming: &Peer
         return false;
     }
     if let Some(pending) = pending_endpoint_refresh(state) {
-        return pending.peer.deployment_id == incoming.deployment_id
-            && canonical_endpoint(&pending.peer.endpoint) == canonical_endpoint(&incoming.endpoint);
+        return pending.peer.deployment_id == incoming.deployment_id && peer_connection_settings_match(&pending.peer, incoming);
     }
     state
         .peers
         .get(&incoming.deployment_id)
-        .is_some_and(|peer| canonical_endpoint(&peer.endpoint) != canonical_endpoint(&incoming.endpoint))
+        .is_some_and(|peer| !peer_connection_settings_match(peer, incoming))
 }
 
 fn pending_endpoint_refresh(state: &SiteReplicationState) -> Option<PendingEndpointRefresh> {
@@ -3255,9 +3857,38 @@ fn pending_endpoint_refresh(state: &SiteReplicationState) -> Option<PendingEndpo
     })
 }
 
+fn merge_pending_endpoint_refresh(
+    state: &SiteReplicationState,
+    candidate: &PendingEndpointRefresh,
+    acked_deployment_ids: impl IntoIterator<Item = String>,
+) -> S3Result<PendingEndpointRefresh> {
+    let mut merged = if let Some(latest) = pending_endpoint_refresh(state) {
+        if latest.id != candidate.id
+            || latest.peer.deployment_id != candidate.peer.deployment_id
+            || !peer_connection_settings_match(&latest.peer, &candidate.peer)
+        {
+            return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
+        }
+        latest
+    } else {
+        candidate.clone()
+    };
+    merged
+        .acked_deployment_ids
+        .extend(candidate.acked_deployment_ids.iter().cloned());
+    merged.acked_deployment_ids.extend(acked_deployment_ids);
+    Ok(merged)
+}
+
+fn internal_endpoint_refresh_already_committed(state: &SiteReplicationState, incoming: &PeerInfo) -> bool {
+    pending_endpoint_refresh(state).is_none()
+        && state
+            .peers
+            .get(&incoming.deployment_id)
+            .is_some_and(|committed| peer_connection_settings_match(committed, incoming))
+}
+
 fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: PendingEndpointRefresh) -> S3Result<()> {
-    let encoded = serde_json::to_string(&pending)
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize endpoint refresh state: {err}")))?;
     state
         .retry_queue
         .retain(|event| event.path != SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH);
@@ -3268,7 +3899,7 @@ fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: Pendi
         path: SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH.to_string(),
         retry_count: 0,
         failed: false,
-        last_error: encoded,
+        last_error: "endpoint target refresh pending".to_string(),
         updated_at: Some(OffsetDateTime::now_utc()),
     });
     state.pending_endpoint_refresh = Some(pending);
@@ -3280,6 +3911,13 @@ fn clear_pending_endpoint_refresh(state: &mut SiteReplicationState) {
     state
         .retry_queue
         .retain(|event| event.path != SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH);
+}
+
+fn endpoint_refresh_target_state(state: &SiteReplicationState, pending: &PendingEndpointRefresh) -> SiteReplicationState {
+    let mut target_state = state.clone();
+    let peer = normalize_peer_info(pending.peer.clone());
+    target_state.peers.insert(peer.deployment_id.clone(), peer);
+    target_state
 }
 
 fn parse_endpoint_refresh_status(peer: &PeerInfo, body: &[u8]) -> S3Result<()> {
@@ -3300,6 +3938,10 @@ fn parse_endpoint_refresh_status(peer: &PeerInfo, body: &[u8]) -> S3Result<()> {
 }
 
 fn endpoint_refresh_capability_supported(peer: &PeerInfo, status: StatusCode, body: &[u8]) -> S3Result<bool> {
+    peer_capability_response_supported(peer, status, body)
+}
+
+fn peer_capability_response_supported(peer: &PeerInfo, status: StatusCode, body: &[u8]) -> S3Result<bool> {
     if status.is_success() {
         return Ok(parse_endpoint_refresh_status(peer, body).is_ok());
     }
@@ -3309,22 +3951,171 @@ fn endpoint_refresh_capability_supported(peer: &PeerInfo, status: StatusCode, bo
 
     Err(S3Error::with_message(
         S3ErrorCode::InternalError,
-        format!(
-            "probe endpoint target refresh on peer {} failed with {status}: {}",
-            peer.endpoint,
-            String::from_utf8_lossy(body)
-        ),
+        format!("probe site replication capability on peer {} failed with {status}", peer.endpoint),
     ))
 }
 
-fn endpoint_refresh_route_endpoints(target: &PeerInfo, pending: &PendingEndpointRefresh) -> Vec<String> {
-    let mut endpoints = vec![target.endpoint.clone()];
-    if target.deployment_id == pending.peer.deployment_id
-        && canonical_endpoint(&target.endpoint) != canonical_endpoint(&pending.peer.endpoint)
-    {
-        endpoints.push(pending.peer.endpoint.clone());
+async fn require_add_peer_tls_capability(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()> {
+    if !add_peer_tls_capability_required(sites) {
+        return Ok(());
     }
-    endpoints
+
+    let remote_sites = peer_tls_capability_probe_sites(sites)
+        .into_iter()
+        .filter(|site| !same_identity_endpoint(&site.endpoint, &local_peer.endpoint))
+        .collect::<Vec<_>>();
+    let probes = futures::future::join_all(remote_sites.iter().map(|site| async move {
+        let connection = PeerConnection::try_from(*site)?;
+        let client = site_replication_client_for(&connection).await?;
+        send_peer_admin_request_raw_with_client(
+            &client,
+            &connection,
+            SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH,
+            &site.access_key,
+            &site.secret_key,
+            &(),
+        )
+        .await
+    }))
+    .await;
+    for (site, probe) in remote_sites.into_iter().zip(probes) {
+        let (status, body) = probe?;
+        let peer = normalize_peer_site(site.clone(), false);
+        if !peer_capability_response_supported(&peer, status, &body)? {
+            return Err(s3_error!(
+                InvalidRequest,
+                "site `{}` does not support site replication TLS settings",
+                site.endpoint
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn require_edit_peer_tls_capability(
+    state: &SiteReplicationState,
+    proposed: &PeerInfo,
+    local_peer: &PeerInfo,
+    access_key: &str,
+    secret_key: &str,
+) -> S3Result<()> {
+    let existing = existing_peer_for_edit(state, proposed);
+    if !edit_peer_tls_capability_required(existing, proposed) {
+        return Ok(());
+    }
+
+    let mut route_peer = proposed.clone();
+    if let Some(existing) = existing
+        && route_peer.deployment_id != existing.deployment_id
+    {
+        route_peer.deployment_id = existing.deployment_id.clone();
+    }
+    let routes = PendingEndpointRefresh {
+        peer: route_peer,
+        ..Default::default()
+    };
+    let targets = state
+        .peers
+        .values()
+        .filter(|target| target.deployment_id != local_peer.deployment_id)
+        .collect::<Vec<_>>();
+    let probes = futures::future::join_all(targets.iter().map(|target| {
+        send_endpoint_refresh_admin_request_raw(
+            target,
+            &routes,
+            SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH,
+            access_key,
+            secret_key,
+            &(),
+        )
+    }))
+    .await;
+    for (target, probe) in targets.into_iter().zip(probes) {
+        let (status, body) = probe?;
+        if !peer_capability_response_supported(target, status, &body)? {
+            return Err(s3_error!(
+                InvalidRequest,
+                "site `{}` does not support site replication TLS settings",
+                target.endpoint
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn probe_proposed_peer_tls_transport(peer: &PeerInfo, access_key: &str, secret_key: &str) -> S3Result<()> {
+    let connection = PeerConnection::try_from(peer)?;
+    let client = site_replication_client_for(&connection).await?;
+    let (status, body) = send_peer_admin_request_raw_with_client(
+        &client,
+        &connection,
+        SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH,
+        access_key,
+        secret_key,
+        &(),
+    )
+    .await?;
+    if peer_capability_response_supported(peer, status, &body)? {
+        Ok(())
+    } else {
+        Err(s3_error!(
+            InvalidRequest,
+            "site `{}` does not support site replication TLS settings",
+            peer.endpoint
+        ))
+    }
+}
+
+fn endpoint_refresh_route_endpoints(target: &PeerInfo, pending: &PendingEndpointRefresh) -> S3Result<Vec<PeerConnection>> {
+    let mut endpoints = Vec::new();
+    let mut invalid = None;
+    match runtime_peer_connection(target) {
+        Ok(connection) => endpoints.push(connection),
+        Err(err) => invalid = Some(err),
+    }
+    if target.deployment_id == pending.peer.deployment_id {
+        match runtime_peer_connection(&pending.peer) {
+            Ok(connection) if !endpoints.contains(&connection) => endpoints.push(connection),
+            Ok(_) => {}
+            Err(err) if invalid.is_none() => invalid = Some(err),
+            Err(_) => {}
+        }
+    }
+    if endpoints.is_empty() {
+        return Err(invalid.unwrap_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("site replication peer `{}` has no usable endpoint", target.endpoint),
+            )
+        }));
+    }
+    Ok(endpoints)
+}
+
+async fn endpoint_refresh_route_transports(target: &PeerInfo, pending: &PendingEndpointRefresh) -> S3Result<Vec<PeerTransport>> {
+    let mut transports = Vec::new();
+    let mut first_error = None;
+    for connection in endpoint_refresh_route_endpoints(target, pending)? {
+        match site_replication_client_for(&connection).await {
+            Ok(client) => transports.push(PeerTransport { connection, client }),
+            Err(err) if first_error.is_none() => {
+                first_error = Some(S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("initialize persisted site replication peer `{}` transport failed: {err}", target.endpoint),
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    if transports.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("site replication peer `{}` has no usable transport", target.endpoint),
+            )
+        }));
+    }
+    Ok(transports)
 }
 
 fn endpoint_refresh_remote_targets<'a>(
@@ -3350,6 +4141,23 @@ async fn send_endpoint_refresh_admin_request<T: Serialize>(
     body: &T,
 ) -> S3Result<Vec<u8>> {
     let (status, response) = send_endpoint_refresh_admin_request_raw(target, pending, path, access_key, secret_key, body).await?;
+    endpoint_refresh_response(target, status, response)
+}
+
+async fn send_endpoint_refresh_admin_request_with_transports<T: Serialize>(
+    target: &PeerInfo,
+    transports: &[PeerTransport],
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: &T,
+) -> S3Result<Vec<u8>> {
+    let (status, response) =
+        send_endpoint_refresh_admin_request_raw_with_transports(target, transports, path, access_key, secret_key, body).await?;
+    endpoint_refresh_response(target, status, response)
+}
+
+fn endpoint_refresh_response(target: &PeerInfo, status: StatusCode, response: Vec<u8>) -> S3Result<Vec<u8>> {
     if status.is_success() {
         return Ok(response);
     }
@@ -3372,10 +4180,31 @@ async fn send_endpoint_refresh_admin_request_raw<T: Serialize>(
     secret_key: &str,
     body: &T,
 ) -> S3Result<(StatusCode, Vec<u8>)> {
+    let transports = endpoint_refresh_route_transports(target, pending).await?;
+    send_endpoint_refresh_admin_request_raw_with_transports(target, &transports, path, access_key, secret_key, body).await
+}
+
+async fn send_endpoint_refresh_admin_request_raw_with_transports<T: Serialize>(
+    target: &PeerInfo,
+    transports: &[PeerTransport],
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: &T,
+) -> S3Result<(StatusCode, Vec<u8>)> {
     let mut last_error = None;
     let mut last_response = None;
-    for endpoint in endpoint_refresh_route_endpoints(target, pending) {
-        match send_peer_admin_request_raw(&endpoint, path, access_key, secret_key, body).await {
+    for transport in transports {
+        match send_peer_admin_request_raw_with_client(
+            &transport.client,
+            &transport.connection,
+            path,
+            access_key,
+            secret_key,
+            body,
+        )
+        .await
+        {
             Ok((status, response))
                 if matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::GONE)
                     || status.is_server_error() =>
@@ -3398,23 +4227,24 @@ async fn send_endpoint_refresh_admin_request_raw<T: Serialize>(
     }))
 }
 
-async fn legacy_peer_bucket_names(
+async fn legacy_peer_bucket_names_with_transports(
     target: &PeerInfo,
-    pending: &PendingEndpointRefresh,
+    transports: &[PeerTransport],
     access_key: &str,
     secret_key: &str,
 ) -> S3Result<Vec<String>> {
     let mut last_error = None;
-    for endpoint in endpoint_refresh_route_endpoints(target, pending) {
-        match send_peer_admin_get_request(
-            &endpoint,
+    for transport in transports {
+        match send_peer_admin_get_request_with_client(
+            &transport.client,
+            &transport.connection,
             "/rustfs/admin/v3/site-replication/metainfo?buckets=true",
             access_key,
             secret_key,
         )
         .await
         {
-            Ok(body) => return peer_bucket_names_from_metainfo(&endpoint, &body),
+            Ok(body) => return peer_bucket_names_from_metainfo(transport.connection.endpoint(), &body),
             Err(err) => last_error = Some(err),
         }
     }
@@ -3452,30 +4282,59 @@ async fn refresh_legacy_peer_bucket_targets(
     access_key: &str,
     secret_key: &str,
 ) -> S3Result<()> {
-    send_endpoint_refresh_admin_request(target, pending, SITE_REPLICATION_PEER_EDIT_PATH, access_key, secret_key, &pending.peer)
-        .await?;
+    let transports = endpoint_refresh_route_transports(target, pending).await?;
+    send_endpoint_refresh_admin_request_with_transports(
+        target,
+        &transports,
+        SITE_REPLICATION_PEER_EDIT_PATH,
+        access_key,
+        secret_key,
+        &pending.peer,
+    )
+    .await?;
 
-    let buckets = legacy_peer_bucket_names(target, pending, access_key, secret_key).await?;
+    let buckets = legacy_peer_bucket_names_with_transports(target, &transports, access_key, secret_key).await?;
     let mut configure_operation = None;
     for bucket in &buckets {
         if let Some(operation) = configure_operation {
             let path = bootstrap_bucket_op_path(bucket, operation);
-            send_endpoint_refresh_admin_request(target, pending, &path, access_key, secret_key, &serde_json::json!({})).await?;
+            send_endpoint_refresh_admin_request_with_transports(
+                target,
+                &transports,
+                &path,
+                access_key,
+                secret_key,
+                &serde_json::json!({}),
+            )
+            .await?;
             continue;
         }
 
         let minio_path = bootstrap_bucket_op_path(bucket, "ConfigureReplication");
-        let (status, _) =
-            send_endpoint_refresh_admin_request_raw(target, pending, &minio_path, access_key, secret_key, &serde_json::json!({}))
-                .await?;
+        let (status, _) = send_endpoint_refresh_admin_request_raw_with_transports(
+            target,
+            &transports,
+            &minio_path,
+            access_key,
+            secret_key,
+            &serde_json::json!({}),
+        )
+        .await?;
         if status.is_success() {
             configure_operation = Some("ConfigureReplication");
             continue;
         }
 
         let rustfs_path = bootstrap_bucket_op_path(bucket, SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION);
-        send_endpoint_refresh_admin_request(target, pending, &rustfs_path, access_key, secret_key, &serde_json::json!({}))
-            .await?;
+        send_endpoint_refresh_admin_request_with_transports(
+            target,
+            &transports,
+            &rustfs_path,
+            access_key,
+            secret_key,
+            &serde_json::json!({}),
+        )
+        .await?;
         configure_operation = Some(SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION);
     }
 
@@ -4047,6 +4906,8 @@ fn site_replication_bucket_target_for_peer(
         region,
         target_type: BucketTargetType::ReplicationService,
         deployment_id: peer.deployment_id.clone(),
+        skip_tls_verify: peer.skip_tls_verify,
+        ca_cert_pem: peer.ca_cert_pem.clone(),
         ..Default::default()
     }))
 }
@@ -4647,15 +5508,16 @@ async fn refresh_bucket_targets_after_endpoint_edit(pending_id: &str, service_ac
     for bucket in buckets {
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let state = load_site_replication_state().await?;
-        if pending_endpoint_refresh(&state).is_none_or(|pending| pending.id != pending_id) {
+        let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
-        }
-        let local_peer = current_local_runtime_peer(&state);
+        };
+        let target_state = endpoint_refresh_target_state(&state, &pending);
+        let local_peer = current_local_runtime_peer(&target_state);
         let _targets_guard = lock_bucket_targets_metadata(&bucket.name).await;
         let replication_config = bucket_replication_config_for_target_refresh(&bucket.name).await?;
         ensure_site_replication_bucket_targets_with_runtime(
             &bucket.name,
-            &state,
+            &target_state,
             &local_peer,
             replication_config.as_ref(),
             service_account_secret_key,
@@ -5239,7 +6101,7 @@ impl Operation for SiteReplicationAddHandler {
         reject_site_replicator_on_public_admin(&cred)?;
         let replicate_ilm_expiry = sr_add_replicate_ilm_expiry(&req.uri);
         let lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await;
-        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let current_state = load_site_replication_state().await?;
         if pending_endpoint_refresh(&current_state).is_some() {
             return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
@@ -5256,6 +6118,15 @@ impl Operation for SiteReplicationAddHandler {
             }
         }
         validate_add_preflight_topology(&preflight_infos, &local_peer)?;
+        let expected_updated_at = current_state.updated_at;
+        drop(state_guard);
+        require_add_peer_tls_capability(&sites, &local_peer).await?;
+        let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let latest_state = load_site_replication_state().await?;
+        if latest_state.updated_at != expected_updated_at || pending_endpoint_refresh(&latest_state).is_some() {
+            return Err(s3_error!(InvalidRequest, "site replication state changed during capability probe"));
+        }
+        let current_state = latest_state;
         let (service_account_access_key, service_account_secret_key) =
             ensure_site_replicator_service_account(&cred.access_key, false).await?;
         let bootstrap_buckets = preflight_infos
@@ -5292,9 +6163,9 @@ impl Operation for SiteReplicationAddHandler {
 
             let mut peer_join_req = join_req.clone();
             peer_join_req.svc_acct_parent = site.access_key.clone();
+            let connection = PeerConnection::try_from(site)?;
             let body =
-                send_peer_admin_request(&site.endpoint, &peer_join_path, &site.access_key, &site.secret_key, &peer_join_req)
-                    .await?;
+                send_peer_admin_request(&connection, &peer_join_path, &site.access_key, &site.secret_key, &peer_join_req).await?;
 
             let join_response: SRPeerJoinResponse = serde_json::from_slice(&body).map_err(|e| {
                 S3Error::with_message(
@@ -5303,6 +6174,18 @@ impl Operation for SiteReplicationAddHandler {
                 )
             })?;
             state = reconcile_peer_with_actual_identity(state, join_response.peer);
+            let reconciled_peer = existing_peer_for_endpoint(&state, &site.endpoint).ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("peer join response from {} did not identify the requested site", site.endpoint),
+                )
+            })?;
+            validate_proposed_peer(&reconciled_peer).map_err(|err| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    format!("invalid peer join response from {}: {err}", site.endpoint),
+                )
+            })?;
         }
 
         persist_site_replication_state(&state).await?;
@@ -5387,7 +6270,7 @@ impl Operation for SiteReplicationRemoveHandler {
                     continue;
                 }
                 if let Err(err) = send_peer_admin_request_with_secret_candidates(
-                    &peer.endpoint,
+                    &runtime_peer_connection(peer)?,
                     SITE_REPLICATION_PEER_REMOVE_PATH,
                     &pending_remove.service_account_access_key,
                     &secret_candidates,
@@ -5545,6 +6428,7 @@ impl Operation for SRPeerJoinHandler {
         let mut state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let join_req: SRPeerJoinReq = read_site_replication_json(req, &cred.secret_key, true).await?;
+        validate_join_peer_snapshot(&join_req.peers)?;
 
         if let Some(current_updated_at) = state.updated_at {
             let Some(incoming_updated_at) = join_req.updated_at else {
@@ -5781,9 +6665,14 @@ impl Operation for SiteReplicationEditHandler {
         let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
         reject_site_replicator_on_public_admin(&cred)?;
         let ilm_expiry_override = sr_edit_ilm_expiry_override(&req.uri);
-        let incoming: PeerInfo = read_site_replication_json(req, &cred.secret_key, true).await?;
-        let state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+        let body = read_site_replication_body(req, &cred.secret_key, true).await?;
+        let (mut incoming, tls_presence) = parse_public_peer_edit(&body)?;
+        let mut state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
         let current_state = load_site_replication_state().await?;
+        apply_public_peer_edit_tls_presence(&current_state, &mut incoming, tls_presence);
+        if !incoming.deployment_id.is_empty() || !incoming.endpoint.is_empty() || !incoming.name.is_empty() {
+            validate_proposed_peer(&incoming)?;
+        }
         if current_state.pending_rotation.is_some() || current_state.pending_remove.is_some() {
             return Err(s3_error!(InvalidRequest, "another site replication operation is pending"));
         }
@@ -5800,7 +6689,46 @@ impl Operation for SiteReplicationEditHandler {
                 acked_deployment_ids: BTreeSet::new(),
             })
         });
-        let mut state = edit_state(current_state.clone(), incoming.clone(), ilm_expiry_override);
+        let local_peer = current_local_runtime_peer(&current_state);
+        let existing_peer = existing_peer_for_edit(&current_state, &incoming);
+        let tls_capability_required = edit_peer_tls_capability_required(existing_peer, &incoming);
+        let tls_transport_probe_required = peer_tls_settings_changed(existing_peer, &incoming);
+        let mut service_account_secret_key = None;
+        if tls_capability_required || tls_transport_probe_required {
+            if current_state.service_account_access_key.is_empty() {
+                return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
+            }
+            let secret = site_replicator_service_account_secret(&current_state.service_account_access_key).await?;
+            let expected_updated_at = current_state.updated_at;
+            drop(state_guard.take());
+            if tls_capability_required {
+                require_edit_peer_tls_capability(
+                    &current_state,
+                    &incoming,
+                    &local_peer,
+                    &current_state.service_account_access_key,
+                    &secret,
+                )
+                .await?;
+            }
+            if tls_transport_probe_required {
+                probe_proposed_peer_tls_transport(&incoming, &current_state.service_account_access_key, &secret).await?;
+            }
+            state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
+            let latest_state = load_site_replication_state().await?;
+            if latest_state.updated_at != expected_updated_at
+                || pending_endpoint_refresh(&latest_state).as_ref().map(|pending| &pending.id)
+                    != persisted_pending.as_ref().map(|pending| &pending.id)
+            {
+                return Err(s3_error!(InvalidRequest, "site replication state changed during capability probe"));
+            }
+            service_account_secret_key = Some(secret);
+        }
+        let mut state = if endpoint_refresh_requested {
+            current_state.clone()
+        } else {
+            edit_state(current_state.clone(), incoming.clone(), ilm_expiry_override)
+        };
 
         if endpoint_refresh_requested && current_state.service_account_access_key.is_empty() {
             return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
@@ -5808,12 +6736,14 @@ impl Operation for SiteReplicationEditHandler {
         if current_state.service_account_access_key.is_empty() {
             save_site_replication_state(&state).await?;
         } else {
-            let service_account_secret_key =
-                site_replicator_service_account_secret(&current_state.service_account_access_key).await?;
-            let peers_to_send: Vec<PeerInfo> = if ilm_expiry_override.is_some() {
-                state.peers.values().cloned().collect()
-            } else if let Some(pending) = pending.as_ref() {
+            let service_account_secret_key = match service_account_secret_key {
+                Some(secret) => secret,
+                None => site_replicator_service_account_secret(&current_state.service_account_access_key).await?,
+            };
+            let peers_to_send: Vec<PeerInfo> = if let Some(pending) = pending.as_ref() {
                 vec![pending.peer.clone()]
+            } else if ilm_expiry_override.is_some() {
+                state.peers.values().cloned().collect()
             } else {
                 vec![normalize_peer_info(incoming)]
             };
@@ -5828,6 +6758,8 @@ impl Operation for SiteReplicationEditHandler {
                 let pending = pending.clone().ok_or_else(|| {
                     S3Error::with_message(S3ErrorCode::InternalError, "endpoint refresh state is missing".to_string())
                 })?;
+                let expected_updated_at = current_state.updated_at;
+                drop(state_guard.take());
                 let probes = futures::future::join_all(remote_targets.iter().map(|target| {
                     send_endpoint_refresh_admin_request_raw(
                         target,
@@ -5854,14 +6786,24 @@ impl Operation for SiteReplicationEditHandler {
                     }
                 }
 
+                state_guard = Some(SITE_REPLICATION_STATE_LOCK.lock().await);
+                let latest_state = load_site_replication_state().await?;
+                if latest_state.updated_at != expected_updated_at
+                    || pending_endpoint_refresh(&latest_state).as_ref().map(|pending| &pending.id)
+                        != persisted_pending.as_ref().map(|pending| &pending.id)
+                {
+                    return Err(s3_error!(InvalidRequest, "site replication state changed during capability probe"));
+                }
+                state = latest_state;
                 let pending_id = pending.id.clone();
                 let refresh_request = EndpointRefreshRequest {
                     id: pending.id.clone(),
                     peer: pending.peer.clone(),
                 };
+                let pending = merge_pending_endpoint_refresh(&state, &pending, std::iter::empty::<String>())?;
                 set_pending_endpoint_refresh(&mut state, pending.clone())?;
                 save_site_replication_state(&state).await?;
-                drop(state_guard);
+                drop(state_guard.take());
                 let responses = futures::future::join_all(remote_targets.iter().map(|target| async {
                     if legacy_deployment_ids.contains(&target.deployment_id) {
                         refresh_legacy_peer_bucket_targets(
@@ -5899,10 +6841,10 @@ impl Operation for SiteReplicationEditHandler {
 
                 let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
                 let mut state = load_site_replication_state().await?;
-                let Some(mut pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
+                let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
                 };
-                pending.acked_deployment_ids.extend(acked_deployment_ids);
+                let pending = merge_pending_endpoint_refresh(&state, &pending, acked_deployment_ids)?;
                 set_pending_endpoint_refresh(&mut state, pending)?;
                 save_site_replication_state(&state).await?;
                 if let Some(err) = refresh_error {
@@ -5914,16 +6856,19 @@ impl Operation for SiteReplicationEditHandler {
                 refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
                 let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
                 let mut state = load_site_replication_state().await?;
-                if pending_endpoint_refresh(&state).is_none_or(|pending| pending.id != pending_id) {
+                let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh state changed during update"));
-                }
+                };
+                state = edit_state(state, pending.peer, ilm_expiry_override);
                 clear_pending_endpoint_refresh(&mut state);
                 save_site_replication_state(&state).await?;
             } else {
                 for target in remote_targets {
+                    let transport = PeerTransport::for_runtime_peer(target).await?;
                     for peer in &peers_to_send {
-                        send_peer_admin_request_with_retry_event(
+                        send_peer_admin_request_with_retry_event_transport(
                             target,
+                            &transport,
                             SITE_REPLICATION_PEER_EDIT_PATH,
                             &current_state.service_account_access_key,
                             &service_account_secret_key,
@@ -5954,7 +6899,7 @@ impl Operation for SRPeerEditCapabilitiesHandler {
         json_response(&ReplicateEditStatus {
             success: query_pairs(&req.uri)
                 .get("capability")
-                .is_some_and(|value| value == "endpoint-target-refresh"),
+                .is_some_and(|value| peer_edit_capability_supported(value)),
             status: SITE_REPL_EDIT_SUCCESS.to_string(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
@@ -6015,9 +6960,21 @@ impl Operation for SRPeerEditHandler {
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
             });
         }
+        if endpoint_refresh_requested && internal_endpoint_refresh_already_committed(&state, &incoming) {
+            return json_response(&ReplicateEditStatus {
+                success: true,
+                status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            });
+        }
 
-        let mut state =
-            sync_state_name_for_local_peer(update_peer(state, incoming.clone(), ilm_expiry_override), &local_peer, &incoming);
+        let mut state = if endpoint_refresh_requested {
+            validate_proposed_peer(&incoming)?;
+            state
+        } else {
+            apply_internal_peer_edit(state, &local_peer, incoming.clone(), ilm_expiry_override)?
+        };
         if endpoint_refresh_requested {
             set_pending_endpoint_refresh(
                 &mut state,
@@ -6045,14 +7002,15 @@ impl Operation for SRPeerEditHandler {
             refresh_bucket_targets_after_endpoint_edit(&pending_id, &service_account_secret_key).await?;
             let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
             let mut state = load_site_replication_state().await?;
-            if pending_endpoint_refresh(&state).is_none_or(|pending| pending.id != pending_id) {
+            let Some(pending) = pending_endpoint_refresh(&state).filter(|pending| pending.id == pending_id) else {
                 return json_response(&ReplicateEditStatus {
                     success: false,
                     status: SITE_REPL_EDIT_SUCCESS.to_string(),
                     err_detail: "endpoint target refresh state changed during update".to_string(),
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 });
-            }
+            };
+            state = apply_internal_peer_edit(state, &local_peer, pending.peer, ilm_expiry_override)?;
             clear_pending_endpoint_refresh(&mut state);
             save_site_replication_state(&state).await?;
             return json_response(&ReplicateEditStatus {
@@ -6348,7 +7306,7 @@ impl Operation for SRRotateServiceAccountHandler {
                 continue;
             }
             if let Err(err) = send_peer_admin_request_with_secret_candidates(
-                &peer.endpoint,
+                &runtime_peer_connection(peer)?,
                 SITE_REPLICATION_PEER_JOIN_PATH,
                 &pending_rotation.access_key,
                 &secret_candidates,
@@ -6406,7 +7364,539 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use temp_env::with_var;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn valid_test_ca_pem(name: &str) -> String {
+        rcgen::generate_simple_self_signed(vec![name.to_string()])
+            .expect("generate test CA")
+            .cert
+            .pem()
+    }
+
+    fn empty_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
+        GlobalPublishedOutboundTlsState {
+            generation: rustfs_tls_runtime::TlsGeneration(0),
+            root_ca_pem: None,
+            mtls_identity: None,
+        }
+    }
+
+    struct TestTlsIdentity {
+        cert_pem: String,
+        cert_der: rustls_pki_types::CertificateDer<'static>,
+        key_der: rustls_pki_types::PrivateKeyDer<'static>,
+    }
+
+    fn test_tls_identity() -> TestTlsIdentity {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("generate TLS server certificate");
+        TestTlsIdentity {
+            cert_pem: certified.cert.pem(),
+            cert_der: certified.cert.der().clone(),
+            key_der: rustls_pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+                .expect("convert TLS server private key"),
+        }
+    }
+
+    async fn spawn_recording_tls_server(
+        identity: &TestTlsIdentity,
+        response: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<Option<String>>) {
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![identity.cert_der.clone()], identity.key_der.clone_key())
+            .expect("build recording TLS server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind recording TLS server");
+        let endpoint = format!("https://{}", listener.local_addr().expect("recording TLS server address"));
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.ok()?;
+            let mut stream = acceptor.accept(stream).await.ok()?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.ok()?;
+                if read == 0 {
+                    return None;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let method = std::str::from_utf8(&request).ok()?.split_whitespace().next()?.to_string();
+            stream.write_all(response).await.ok()?;
+            Some(method)
+        });
+        (endpoint, task)
+    }
+
+    async fn spawn_test_tls_server() -> (String, String, tokio::task::JoinHandle<bool>) {
+        spawn_test_tls_server_with_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok").await
+    }
+
+    async fn spawn_test_tls_server_with_response(response: &'static [u8]) -> (String, String, tokio::task::JoinHandle<bool>) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("generate TLS server certificate");
+        let ca_pem = certified.cert.pem();
+        let private_key = rustls_pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+            .expect("convert TLS server private key");
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], private_key)
+            .expect("build TLS server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS test server");
+        let endpoint = format!("https://{}", listener.local_addr().expect("TLS test server address"));
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return false;
+            };
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return false;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let Ok(read) = stream.read(&mut buffer).await else {
+                    return false;
+                };
+                if read == 0 {
+                    return false;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(response).await.is_ok()
+        });
+        (endpoint, ca_pem, task)
+    }
+
+    #[test]
+    fn peer_connection_validation_accepts_supported_combinations() {
+        let ca = valid_test_ca_pem("peer.example.com");
+
+        assert!(validate_peer_connection_inner("http://10.0.0.5:9000", false, "", false).is_ok());
+        assert!(validate_peer_connection_inner("https://peer.example.com", false, "", false).is_ok());
+        assert!(validate_peer_connection_inner("https://peer.example.com", true, "", false).is_ok());
+        assert!(validate_peer_connection_inner("https://peer.example.com", false, &ca, false).is_ok());
+    }
+
+    #[test]
+    fn peer_connection_validation_rejects_invalid_tls_combinations() {
+        let ca = valid_test_ca_pem("peer.example.com");
+
+        for (endpoint, skip_tls_verify, ca_cert_pem) in [
+            ("http://10.0.0.5:9000", true, ""),
+            ("http://10.0.0.5:9000", false, ca.as_str()),
+            ("https://peer.example.com", true, ca.as_str()),
+        ] {
+            assert!(validate_peer_connection_inner(endpoint, skip_tls_verify, ca_cert_pem, false).is_err());
+        }
+    }
+
+    #[test]
+    fn peer_connection_validation_requires_pure_origin() {
+        for endpoint in [
+            "ftp://peer.example.com",
+            "https://user@peer.example.com",
+            "https://peer.example.com/admin",
+            "https://peer.example.com/?query=1",
+            "https://peer.example.com/#fragment",
+        ] {
+            assert!(
+                validate_peer_connection_inner(endpoint, false, "", false).is_err(),
+                "endpoint should be rejected: {endpoint}"
+            );
+        }
+        assert!(validate_peer_connection_inner("https://peer.example.com/", false, "", false).is_ok());
+    }
+
+    #[test]
+    fn peer_connection_validation_matches_replication_egress_policy() {
+        assert!(validate_peer_connection_inner("http://10.0.0.5:9000", false, "", false).is_ok());
+        assert!(validate_peer_connection_inner("http://127.0.0.1:9000", false, "", false).is_err());
+        assert!(validate_peer_connection_inner("http://127.0.0.1:9000", false, "", true).is_ok());
+        assert!(validate_peer_connection_inner("http://[::1]:9000", false, "", true).is_ok());
+        assert!(validate_peer_connection_inner("http://localhost:9000", false, "", true).is_ok());
+
+        for endpoint in [
+            "http://169.254.169.254",
+            "http://[fe80::1]:9000",
+            "http://0.0.0.0:9000",
+            "http://[::ffff:127.0.0.1]:9000",
+            "http://[::127.0.0.1]:9000",
+            "http://[::ffff:169.254.169.254]:9000",
+        ] {
+            assert!(
+                validate_peer_connection_inner(endpoint, false, "", true).is_err(),
+                "endpoint should remain forbidden with loopback opt-in: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_connection_validation_accepts_multi_cert_ca_and_rejects_unsafe_pem() {
+        let multi_cert = format!("{}{}", valid_test_ca_pem("one.example.com"), valid_test_ca_pem("two.example.com"));
+        assert!(validate_peer_connection_inner("https://peer.example.com", false, &multi_cert, false).is_ok());
+
+        for pem in [
+            "not a certificate",
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----",
+            "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----\nsecret\n-----END RSA PRIVATE KEY-----",
+        ] {
+            assert!(validate_peer_connection_inner("https://peer.example.com", false, pem, false).is_err());
+        }
+
+        let oversized = "x".repeat(MAX_PEER_CA_CERT_PEM_SIZE + 1);
+        assert!(validate_peer_connection_inner("https://peer.example.com", false, &oversized, false).is_err());
+    }
+
+    #[test]
+    fn persisted_peer_connection_errors_are_internal_and_refresh_can_use_valid_candidate() {
+        let invalid_peer = PeerInfo {
+            endpoint: "https://peer.example.com/not-an-origin".to_string(),
+            deployment_id: "remote".to_string(),
+            ..Default::default()
+        };
+        let runtime_error = runtime_peer_connection(&invalid_peer).expect_err("invalid persisted peer must fail");
+        assert_eq!(runtime_error.code(), &S3ErrorCode::InternalError);
+
+        let input_site = PeerSite {
+            endpoint: invalid_peer.endpoint.clone(),
+            ..Default::default()
+        };
+        let input_error = PeerConnection::try_from(&input_site).expect_err("invalid input site must fail");
+        assert_eq!(input_error.code(), &S3ErrorCode::InvalidRequest);
+
+        let pending = PendingEndpointRefresh {
+            peer: PeerInfo {
+                endpoint: "https://replacement.example.com".to_string(),
+                deployment_id: "remote".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let candidates = endpoint_refresh_route_endpoints(&invalid_peer, &pending)
+            .expect("valid replacement endpoint must survive invalid persisted endpoint");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].endpoint(), "https://replacement.example.com");
+    }
+
+    #[tokio::test]
+    async fn peer_dns_resolver_filters_forbidden_addresses_and_reqwest_cannot_bypass() {
+        let resolver = PeerDnsResolver::with_overrides(
+            true,
+            HashMap::from([
+                ("public.test".to_string(), vec!["8.8.8.8".parse().expect("public IP")]),
+                ("private.test".to_string(), vec!["10.0.0.5".parse().expect("private IP")]),
+                ("metadata.test".to_string(), vec!["169.254.169.254".parse().expect("metadata IP")]),
+                ("alias.test".to_string(), vec!["127.0.0.1".parse().expect("loopback IP")]),
+                ("mapped.test".to_string(), vec!["::ffff:127.0.0.1".parse().expect("mapped loopback IP")]),
+                ("localhost".to_string(), vec!["127.0.0.1".parse().expect("localhost IP")]),
+            ]),
+        );
+
+        for host in ["public.test", "private.test", "localhost"] {
+            let address_count = reqwest::dns::Resolve::resolve(&resolver, host.parse().expect("resolver test hostname"))
+                .await
+                .expect("allowed resolver result")
+                .count();
+            assert_eq!(address_count, 1, "expected one allowed address for {host}");
+        }
+        for host in ["metadata.test", "alias.test", "mapped.test"] {
+            assert!(
+                reqwest::dns::Resolve::resolve(&resolver, host.parse().expect("resolver test hostname"))
+                    .await
+                    .is_err(),
+                "resolver must reject {host}"
+            );
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind resolver bypass listener");
+        let port = listener.local_addr().expect("resolver bypass listener address").port();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_by_server = accepted.clone();
+        let server = tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                accepted_by_server.store(true, Ordering::SeqCst);
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(resolver)
+            .build()
+            .expect("resolver bypass client");
+        assert!(client.get(format!("http://alias.test:{port}/")).send().await.is_err());
+        assert!(!accepted.load(Ordering::SeqCst));
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn production_peer_clients_ignore_environment_proxies_before_dns_filtering() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind observable proxy listener");
+        let proxy_url = format!("http://{}", proxy_listener.local_addr().expect("observable proxy listener address"));
+        let (proxy_hit_tx, mut proxy_hit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = tokio::spawn(async move {
+            while let Ok((_stream, _address)) = proxy_listener.accept().await {
+                if proxy_hit_tx.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        temp_env::async_with_vars(
+            [
+                ("HTTP_PROXY", Some(proxy_url.as_str())),
+                ("HTTPS_PROXY", Some(proxy_url.as_str())),
+                ("ALL_PROXY", Some(proxy_url.as_str())),
+                ("http_proxy", Some(proxy_url.as_str())),
+                ("https_proxy", Some(proxy_url.as_str())),
+                ("all_proxy", Some(proxy_url.as_str())),
+                ("NO_PROXY", Some("")),
+                ("no_proxy", Some("")),
+            ],
+            async {
+                let resolver = PeerDnsResolver::with_overrides(
+                    false,
+                    HashMap::from([("metadata.test".to_string(), vec!["169.254.169.254".parse().expect("metadata IP")])]),
+                );
+                let outbound_tls = empty_outbound_tls_state();
+                let default_connection =
+                    validate_peer_connection_inner("http://metadata.test", false, "", false).expect("default peer connection");
+                let custom_connection =
+                    validate_peer_connection_inner("https://metadata.test", true, "", false).expect("custom peer connection");
+                let default_client = build_site_replication_peer_client_with_resolver(&outbound_tls, resolver.clone())
+                    .expect("default production peer client");
+                let custom_client =
+                    build_custom_site_replication_peer_client_with_resolver(&outbound_tls, &custom_connection, resolver)
+                        .expect("custom production peer client");
+
+                for (client, connection) in [(&default_client, &default_connection), (&custom_client, &custom_connection)] {
+                    let result = send_peer_admin_get_request_with_client(
+                        client,
+                        connection,
+                        "/rustfs/admin/v3/site-replication/metainfo",
+                        "access-key",
+                        "secret-key",
+                    )
+                    .await;
+                    assert!(result.is_err(), "forbidden DNS result must fail closed");
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy_hit_rx.recv())
+                .await
+                .is_err(),
+            "site-replication peer traffic must never reach an environment proxy"
+        );
+        proxy.abort();
+    }
+
+    #[test]
+    fn peer_url_join_preserves_wire_path_and_query_encoding() {
+        let connection =
+            validate_peer_connection_inner("https://peer.example.com", false, "", false).expect("peer connection for URL join");
+        let url = site_replication_peer_url(
+            &connection,
+            "/minio/admin/v3/site-replication/peer/bucket-ops?bucket=a%2Fb&operation=configure-replication",
+        )
+        .expect("join peer wire URL");
+
+        assert_eq!(
+            url.as_str(),
+            "https://peer.example.com/minio/admin/v3/site-replication/peer/bucket-ops?bucket=a%2Fb&operation=configure-replication"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_clients_isolate_skip_and_custom_ca_trust() {
+        let outbound_tls = empty_outbound_tls_state();
+
+        let (ca_endpoint, ca_pem, ca_server) = spawn_test_tls_server().await;
+        let ca_connection =
+            validate_peer_connection_inner(&ca_endpoint, false, &ca_pem, true).expect("custom CA peer connection");
+        let ca_client = build_custom_site_replication_peer_client(&outbound_tls, &ca_connection).expect("custom CA peer client");
+        assert_eq!(
+            ca_client.get(&ca_endpoint).send().await.expect("custom CA request").status(),
+            StatusCode::OK
+        );
+        assert!(ca_server.await.expect("custom CA server task"));
+
+        let (untrusted_endpoint, _untrusted_ca, untrusted_server) = spawn_test_tls_server().await;
+        assert!(ca_client.get(&untrusted_endpoint).send().await.is_err());
+        assert!(!untrusted_server.await.expect("untrusted TLS server task"));
+
+        let (other_endpoint, other_ca, other_server) = spawn_test_tls_server().await;
+        let other_connection =
+            validate_peer_connection_inner(&other_endpoint, false, &other_ca, true).expect("second custom CA peer connection");
+        let other_client =
+            build_custom_site_replication_peer_client(&outbound_tls, &other_connection).expect("second custom CA peer client");
+        assert_eq!(
+            other_client
+                .get(&other_endpoint)
+                .send()
+                .await
+                .expect("second custom CA request")
+                .status(),
+            StatusCode::OK
+        );
+        assert!(other_server.await.expect("second custom CA server task"));
+
+        let (skip_endpoint, _skip_ca, skip_server) = spawn_test_tls_server().await;
+        let skip_connection =
+            validate_peer_connection_inner(&skip_endpoint, true, "", true).expect("skip-verify peer connection");
+        let skip_client =
+            build_custom_site_replication_peer_client(&outbound_tls, &skip_connection).expect("skip-verify peer client");
+        assert_eq!(
+            skip_client
+                .get(&skip_endpoint)
+                .send()
+                .await
+                .expect("skip-verify request")
+                .status(),
+            StatusCode::OK
+        );
+        assert!(skip_server.await.expect("skip-verify server task"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn peer_admin_transport_uses_full_connection_for_get_and_put() {
+        temp_env::async_with_vars([(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))], async {
+            let ca_identity = test_tls_identity();
+            let (ca_endpoint, ca_server) =
+                spawn_recording_tls_server(&ca_identity, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                    .await;
+            let ca_connection =
+                PeerConnection::new(&ca_endpoint, false, &ca_identity.cert_pem).expect("production custom-CA peer connection");
+            let get_body = send_peer_admin_get_request(&ca_connection, "/rustfs/admin/v3/site-replication/metainfo", "ak", "sk")
+                .await
+                .expect("production custom-CA GET");
+            assert_eq!(get_body, b"ok");
+            assert_eq!(ca_server.await.expect("custom-CA GET server task").as_deref(), Some("GET"));
+
+            let skip_identity = test_tls_identity();
+            let (skip_endpoint, skip_server) = spawn_recording_tls_server(
+                &skip_identity,
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+            )
+            .await;
+            let skip_connection = PeerConnection::new(&skip_endpoint, true, "").expect("production skip-verify peer connection");
+            let (status, put_body) = send_peer_admin_request_raw(
+                &skip_connection,
+                "/rustfs/admin/v3/site-replication/peer/edit",
+                "ak",
+                "sk",
+                &serde_json::json!({"peer": "test"}),
+            )
+            .await
+            .expect("production skip-verify PUT");
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(put_body, b"ok");
+            assert_eq!(skip_server.await.expect("skip-verify PUT server task").as_deref(), Some("PUT"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn custom_peer_client_composes_global_and_peer_roots_without_leaking_peer_root() {
+        let global_identity = test_tls_identity();
+        let peer_identity = test_tls_identity();
+        let unrelated_identity = test_tls_identity();
+        let outbound_tls = GlobalPublishedOutboundTlsState {
+            generation: rustfs_tls_runtime::TlsGeneration(1),
+            root_ca_pem: Some(global_identity.cert_pem.as_bytes().to_vec()),
+            mtls_identity: None,
+        };
+
+        let (peer_endpoint, peer_server) =
+            spawn_recording_tls_server(&peer_identity, b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        let peer_connection =
+            validate_peer_connection_inner(&peer_endpoint, false, &peer_identity.cert_pem, true).expect("peer-root connection");
+        let peer_client =
+            build_custom_site_replication_peer_client(&outbound_tls, &peer_connection).expect("composed peer client");
+        assert_eq!(
+            peer_client
+                .get(&peer_endpoint)
+                .send()
+                .await
+                .expect("peer-root request")
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(peer_server.await.expect("peer-root server task").as_deref(), Some("GET"));
+
+        let (global_endpoint, global_server) =
+            spawn_recording_tls_server(&global_identity, b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        assert_eq!(
+            peer_client
+                .get(&global_endpoint)
+                .send()
+                .await
+                .expect("global-root request through peer client")
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(global_server.await.expect("global-root server task").as_deref(), Some("GET"));
+
+        let unrelated_connection =
+            validate_peer_connection_inner("https://127.0.0.1:1", false, &unrelated_identity.cert_pem, true)
+                .expect("unrelated peer connection");
+        let unrelated_client =
+            build_custom_site_replication_peer_client(&outbound_tls, &unrelated_connection).expect("unrelated peer client");
+        let (peer_endpoint, peer_server) =
+            spawn_recording_tls_server(&peer_identity, b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        assert!(unrelated_client.get(&peer_endpoint).send().await.is_err());
+        assert!(peer_server.await.expect("unrelated peer isolation server task").is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_clients_do_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind redirect test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("redirect test server address"));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept redirect test request");
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).await.expect("read redirect test request");
+            assert!(read > 0);
+            stream
+                .write_all(b"HTTP/1.1 302 Found\r\nlocation: /followed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("write redirect response");
+        });
+
+        let client = build_site_replication_peer_client(&empty_outbound_tls_state()).expect("default peer client");
+        let response = client.get(&endpoint).send().await.expect("redirect test request");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        server.await.expect("redirect test server task");
+
+        let (tls_endpoint, _tls_ca, tls_server) = spawn_test_tls_server_with_response(
+            b"HTTP/1.1 302 Found\r\nlocation: /followed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let connection = validate_peer_connection_inner(&tls_endpoint, true, "", true).expect("custom redirect peer connection");
+        let client = build_custom_site_replication_peer_client(&empty_outbound_tls_state(), &connection)
+            .expect("custom redirect peer client");
+        let response = client.get(&tls_endpoint).send().await.expect("custom redirect test request");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(tls_server.await.expect("custom redirect TLS server task"));
+    }
 
     fn peer(name: &str, endpoint: &str) -> PeerInfo {
         PeerInfo {
@@ -6417,8 +7907,528 @@ mod tests {
             default_bandwidth: BucketBandwidth::default(),
             replicate_ilm_expiry: false,
             object_naming_mode: String::new(),
+            skip_tls_verify: false,
+            ca_cert_pem: String::new(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
         }
+    }
+
+    #[test]
+    fn test_stored_peer_tls_settings_preserve_configured_values() {
+        let stored_peer = PeerInfo {
+            skip_tls_verify: true,
+            ca_cert_pem: "custom-ca".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+
+        assert_eq!(stored_peer_tls_settings(Some(&stored_peer)), (true, "custom-ca".to_string()));
+        assert_eq!(stored_peer_tls_settings(None), (false, String::new()));
+    }
+
+    #[test]
+    fn test_normalize_peer_site_preserves_tls_settings() {
+        let peer = normalize_peer_site(
+            PeerSite {
+                name: "remote".to_string(),
+                endpoint: "https://remote.example.com".to_string(),
+                skip_tls_verify: true,
+                ca_cert_pem: "custom-ca".to_string(),
+                ..PeerSite::default()
+            },
+            false,
+        );
+
+        assert!(peer.skip_tls_verify);
+        assert_eq!(peer.ca_cert_pem, "custom-ca");
+    }
+
+    #[test]
+    fn test_build_join_peers_applies_local_site_tls_settings() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-deployment".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let peers = build_join_peers(
+            &SiteReplicationState::default(),
+            &local_peer,
+            vec![PeerSite {
+                name: "local".to_string(),
+                endpoint: "https://local.example.com/".to_string(),
+                skip_tls_verify: true,
+                ca_cert_pem: "local-ca".to_string(),
+                ..PeerSite::default()
+            }],
+            false,
+        );
+
+        let local = peers.get("local-deployment").expect("local peer should be present");
+        assert!(local.skip_tls_verify);
+        assert_eq!(local.ca_cert_pem, "local-ca");
+    }
+
+    #[test]
+    fn test_build_join_peers_explicitly_disables_existing_remote_tls_settings() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-deployment".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let existing_remote = PeerInfo {
+            deployment_id: "remote-deployment".to_string(),
+            skip_tls_verify: true,
+            ca_cert_pem: "old-remote-ca".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("remote-deployment".to_string(), existing_remote)]),
+            ..SiteReplicationState::default()
+        };
+
+        let peers = build_join_peers(
+            &state,
+            &local_peer,
+            vec![PeerSite {
+                name: "remote".to_string(),
+                endpoint: "https://remote.example.com".to_string(),
+                skip_tls_verify: false,
+                ca_cert_pem: String::new(),
+                ..PeerSite::default()
+            }],
+            false,
+        );
+
+        let remote = peers
+            .get("remote-deployment")
+            .expect("existing remote peer should be present");
+        assert!(!remote.skip_tls_verify);
+        assert_eq!(remote.ca_cert_pem, "");
+    }
+
+    #[test]
+    fn test_public_peer_edit_missing_tls_fields_preserves_existing_settings() {
+        let existing = PeerInfo {
+            deployment_id: "remote-deployment".to_string(),
+            skip_tls_verify: true,
+            ..peer("remote", "https://remote.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("remote-deployment".to_string(), existing)]),
+            ..Default::default()
+        };
+        let body = br#"{"deploymentID":"remote-deployment","endpoint":"https://remote.example.com","name":"renamed"}"#;
+        let (mut incoming, presence) = parse_public_peer_edit(body).expect("parse public peer edit");
+
+        apply_public_peer_edit_tls_presence(&state, &mut incoming, presence);
+
+        assert!(incoming.skip_tls_verify);
+        assert_eq!(incoming.ca_cert_pem, "");
+    }
+
+    #[test]
+    fn test_public_peer_edit_explicit_default_tls_settings_are_propagated() {
+        let existing = PeerInfo {
+            deployment_id: "remote-deployment".to_string(),
+            skip_tls_verify: true,
+            ca_cert_pem: "old-ca".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("remote-deployment".to_string(), existing)]),
+            ..Default::default()
+        };
+        let body = br#"{"deploymentID":"remote-deployment","endpoint":"https://remote.example.com","skipTlsVerify":false,"caCertPem":""}"#;
+        let (mut incoming, presence) = parse_public_peer_edit(body).expect("parse public peer edit");
+
+        apply_public_peer_edit_tls_presence(&state, &mut incoming, presence);
+        let propagated = serde_json::to_value(&incoming).expect("serialize propagated peer edit");
+
+        assert!(!incoming.skip_tls_verify);
+        assert_eq!(incoming.ca_cert_pem, "");
+        assert_eq!(propagated.get("skipTlsVerify"), Some(&serde_json::json!(false)));
+        assert_eq!(propagated.get("caCertPem"), Some(&serde_json::json!("")));
+    }
+
+    #[test]
+    fn test_reconcile_join_response_preserves_requested_tls_trust() {
+        let requested = PeerInfo {
+            deployment_id: "temporary-id".to_string(),
+            skip_tls_verify: true,
+            ..peer("requested-name", "https://remote.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("temporary-id".to_string(), requested)]),
+            ..Default::default()
+        };
+
+        let reconciled = reconcile_peer_with_actual_identity(
+            state,
+            PeerInfo {
+                deployment_id: "actual-id".to_string(),
+                api_version: Some("2".to_string()),
+                ..peer("actual-name", "https://remote.example.com/")
+            },
+        );
+        let actual = reconciled.peers.get("actual-id").expect("actual peer identity");
+
+        assert_eq!(actual.name, "actual-name");
+        assert_eq!(actual.api_version.as_deref(), Some("2"));
+        assert!(actual.skip_tls_verify);
+        assert_eq!(actual.ca_cert_pem, "");
+    }
+
+    #[test]
+    fn test_internal_join_and_edit_reject_invalid_peer_tls_settings() {
+        let invalid = PeerInfo {
+            deployment_id: "remote".to_string(),
+            skip_tls_verify: true,
+            ..peer("remote", "http://remote.example.com")
+        };
+
+        assert!(validate_proposed_peer(&invalid).is_err());
+        assert!(validate_join_peer_snapshot(&BTreeMap::from([("remote".to_string(), invalid)])).is_err());
+    }
+
+    #[test]
+    fn test_internal_ilm_only_edit_does_not_create_a_pseudo_peer() {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let remote = PeerInfo {
+            deployment_id: "remote".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let original_keys = BTreeSet::from(["local".to_string(), "remote".to_string()]);
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("local".to_string(), local.clone()), ("remote".to_string(), remote)]),
+            ..Default::default()
+        };
+
+        let updated = apply_internal_peer_edit(state, &local, PeerInfo::default(), Some(true)).expect("ILM-only edit");
+
+        assert_eq!(updated.peers.keys().cloned().collect::<BTreeSet<_>>(), original_keys);
+        assert!(updated.peers.values().all(|peer| peer.replicate_ilm_expiry));
+        assert!(!updated.peers.contains_key(&deployment_id_for_endpoint("")));
+    }
+
+    #[test]
+    fn test_internal_empty_identity_edit_requires_only_an_ilm_override() {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("local".to_string(), local.clone())]),
+            ..Default::default()
+        };
+
+        assert!(apply_internal_peer_edit(state.clone(), &local, PeerInfo::default(), None).is_err());
+        assert!(
+            apply_internal_peer_edit(
+                state,
+                &local,
+                PeerInfo {
+                    skip_tls_verify: true,
+                    ..Default::default()
+                },
+                Some(true),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_peer_tls_capability_gate_covers_full_topology_only_when_needed() {
+        let default_sites = vec![PeerSite {
+            endpoint: "https://remote.example.com".to_string(),
+            ..Default::default()
+        }];
+        assert!(!add_peer_tls_capability_required(&default_sites));
+
+        let custom_sites = vec![
+            default_sites[0].clone(),
+            PeerSite {
+                endpoint: "https://custom.example.com".to_string(),
+                skip_tls_verify: true,
+                ..Default::default()
+            },
+        ];
+        assert!(add_peer_tls_capability_required(&custom_sites));
+        assert_eq!(peer_tls_capability_probe_sites(&custom_sites).len(), 2);
+
+        let current = peer("remote", "https://remote.example.com");
+        let changed = PeerInfo {
+            skip_tls_verify: true,
+            ..current.clone()
+        };
+        assert!(edit_peer_tls_capability_required(Some(&current), &changed));
+        assert!(!edit_peer_tls_capability_required(Some(&changed), &changed));
+        assert!(!edit_peer_tls_capability_required(Some(&changed), &current));
+    }
+
+    #[test]
+    fn test_tls_only_edit_uses_pending_overlay_without_mutating_committed_peer() {
+        let committed = PeerInfo {
+            deployment_id: "remote".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let proposed = PeerInfo {
+            skip_tls_verify: true,
+            ..committed.clone()
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("remote".to_string(), committed)]),
+            ..Default::default()
+        };
+        let pending = PendingEndpointRefresh {
+            id: "refresh-tls".to_string(),
+            peer: proposed,
+            ..Default::default()
+        };
+
+        assert!(peer_endpoint_refresh_requested(&state, &pending.peer));
+        let target_state = endpoint_refresh_target_state(&state, &pending);
+        assert!(!state.peers["remote"].skip_tls_verify);
+        assert!(target_state.peers["remote"].skip_tls_verify);
+    }
+
+    #[test]
+    fn test_pending_endpoint_refresh_retry_summary_redacts_pem() {
+        let pem = "-----BEGIN CERTIFICATE-----\nsecret-marker\n-----END CERTIFICATE-----";
+        let mut state = SiteReplicationState::default();
+        set_pending_endpoint_refresh(
+            &mut state,
+            PendingEndpointRefresh {
+                id: "refresh-pem".to_string(),
+                peer: PeerInfo {
+                    deployment_id: "remote".to_string(),
+                    ca_cert_pem: pem.to_string(),
+                    ..peer("remote", "https://remote.example.com")
+                },
+                ..Default::default()
+            },
+        )
+        .expect("set pending endpoint refresh");
+
+        assert_eq!(
+            state
+                .pending_endpoint_refresh
+                .as_ref()
+                .expect("dedicated pending")
+                .peer
+                .ca_cert_pem,
+            pem
+        );
+        assert!(
+            state
+                .retry_queue
+                .iter()
+                .all(|event| !event.last_error.contains("secret-marker"))
+        );
+        state.pending_endpoint_refresh = None;
+        assert!(pending_endpoint_refresh(&state).is_none(), "safe summaries are not pending JSON");
+    }
+
+    #[test]
+    fn test_legacy_pending_retry_json_remains_readable() {
+        let legacy = PendingEndpointRefresh {
+            id: "legacy-refresh".to_string(),
+            peer: PeerInfo {
+                deployment_id: "remote".to_string(),
+                ..peer("remote", "https://remote.example.com")
+            },
+            ..Default::default()
+        };
+        let state = SiteReplicationState {
+            retry_queue: vec![SiteReplicationRetryEvent {
+                path: SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH.to_string(),
+                last_error: serde_json::to_string(&legacy).expect("serialize legacy pending"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            pending_endpoint_refresh(&state).map(|pending| pending.id).as_deref(),
+            Some("legacy-refresh")
+        );
+    }
+
+    #[test]
+    fn test_pending_endpoint_refresh_ack_merge_is_monotonic() {
+        let latest = PendingEndpointRefresh {
+            id: "refresh-acks".to_string(),
+            peer: PeerInfo {
+                deployment_id: "remote".to_string(),
+                ..peer("remote", "https://remote.example.com")
+            },
+            acked_deployment_ids: BTreeSet::from(["peer-a".to_string()]),
+            ..Default::default()
+        };
+        let stale = PendingEndpointRefresh {
+            acked_deployment_ids: BTreeSet::new(),
+            ..latest.clone()
+        };
+        let state = SiteReplicationState {
+            pending_endpoint_refresh: Some(latest),
+            ..Default::default()
+        };
+
+        let merged = merge_pending_endpoint_refresh(&state, &stale, ["peer-b".to_string()]).expect("merge ACKs");
+        assert_eq!(merged.acked_deployment_ids, BTreeSet::from(["peer-a".to_string(), "peer-b".to_string()]));
+    }
+
+    #[test]
+    fn test_internal_endpoint_refresh_retry_is_strictly_idempotent() {
+        let committed = PeerInfo {
+            deployment_id: "remote".to_string(),
+            skip_tls_verify: true,
+            ..peer("remote", "https://remote.example.com")
+        };
+        let state = SiteReplicationState {
+            peers: BTreeMap::from([("remote".to_string(), committed.clone())]),
+            ..Default::default()
+        };
+
+        assert!(internal_endpoint_refresh_already_committed(&state, &committed));
+        assert!(!internal_endpoint_refresh_already_committed(
+            &state,
+            &PeerInfo {
+                deployment_id: "other".to_string(),
+                ..committed.clone()
+            }
+        ));
+        assert!(!internal_endpoint_refresh_already_committed(
+            &state,
+            &PeerInfo {
+                skip_tls_verify: false,
+                ..committed
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_wrong_proposed_ca_fails_before_committed_state_changes() {
+        temp_env::async_with_vars([(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))], async {
+            let server_identity = test_tls_identity();
+            let wrong_identity = test_tls_identity();
+            let (endpoint, server) = spawn_recording_tls_server(
+                &server_identity,
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 16\r\nconnection: close\r\n\r\n{\"success\":true}",
+            )
+            .await;
+            let committed = PeerInfo {
+                deployment_id: "remote".to_string(),
+                ..peer("remote", &endpoint)
+            };
+            let proposed = PeerInfo {
+                ca_cert_pem: wrong_identity.cert_pem,
+                ..committed.clone()
+            };
+            let state = SiteReplicationState {
+                peers: BTreeMap::from([("remote".to_string(), committed.clone())]),
+                ..Default::default()
+            };
+
+            assert!(probe_proposed_peer_tls_transport(&proposed, "access", "secret").await.is_err());
+            assert_eq!(state.peers["remote"].ca_cert_pem, committed.ca_cert_pem);
+            assert!(state.pending_endpoint_refresh.is_none());
+            assert!(server.await.expect("wrong-CA server task").is_none());
+        })
+        .await;
+    }
+
+    #[test]
+    fn test_site_replication_bucket_target_replaces_tls_and_preserves_operational_fields() {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let remote = PeerInfo {
+            deployment_id: "remote".to_string(),
+            skip_tls_verify: true,
+            ..peer("remote", "https://remote.example.com:9443")
+        };
+        let state = SiteReplicationState {
+            service_account_access_key: "svc".to_string(),
+            peers: BTreeMap::from([("local".to_string(), local.clone()), ("remote".to_string(), remote.clone())]),
+            ..Default::default()
+        };
+        let generated = site_replication_bucket_target_for_peer("photos", &state, &remote, "secret", None)
+            .expect("build target")
+            .expect("target exists");
+        assert!(generated.skip_tls_verify);
+        assert_eq!(generated.ca_cert_pem, "");
+
+        let existing = BucketTarget {
+            arn: generated.arn,
+            endpoint: "remote.example.com:9443".to_string(),
+            secure: true,
+            target_type: BucketTargetType::ReplicationService,
+            deployment_id: "remote".to_string(),
+            skip_tls_verify: false,
+            ca_cert_pem: "old-ca".to_string(),
+            bandwidth_limit: 42,
+            disable_proxy: true,
+            ..Default::default()
+        };
+        let reconciled = reconcile_site_replication_bucket_targets(
+            BucketTargets { targets: vec![existing] },
+            "photos",
+            &state,
+            &local,
+            None,
+            "secret",
+        )
+        .expect("reconcile targets");
+        let target = reconciled.targets.first().expect("reconciled target");
+        assert!(target.skip_tls_verify);
+        assert_eq!(target.ca_cert_pem, "");
+        assert_eq!(target.bandwidth_limit, 42);
+        assert!(target.disable_proxy);
+    }
+
+    #[test]
+    fn test_peer_tls_capability_query_is_supported_and_legacy_response_fails_closed() {
+        let remote = peer("remote", "https://remote.example.com");
+
+        assert!(peer_edit_capability_supported("peer-tls-settings"));
+        assert!(peer_edit_capability_supported("endpoint-target-refresh"));
+        assert!(!peer_edit_capability_supported("unknown"));
+        assert!(peer_capability_response_supported(&remote, StatusCode::OK, br#"{"success":true}"#).expect("supported"));
+        assert!(!peer_capability_response_supported(&remote, StatusCode::NOT_FOUND, b"").expect("legacy peer"));
+    }
+
+    #[test]
+    fn test_tls_capability_gates_run_before_add_or_edit_state_side_effects() {
+        let src = include_str!("site_replication.rs");
+        let add = src
+            .split("impl Operation for SiteReplicationAddHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SiteReplicationRemoveHandler").next())
+            .expect("add handler block");
+        let edit = src
+            .split("impl Operation for SiteReplicationEditHandler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub struct SRPeerEditCapabilitiesHandler").next())
+            .expect("edit handler block");
+
+        assert!(
+            add.find("require_add_peer_tls_capability").expect("add capability gate")
+                < add
+                    .find("ensure_site_replicator_service_account")
+                    .expect("service-account creation"),
+            "add capability gate must run before service-account creation"
+        );
+        assert!(
+            edit.find("require_edit_peer_tls_capability").expect("edit capability gate")
+                < edit.find("set_pending_endpoint_refresh").expect("pending state write"),
+            "edit capability gate must run before pending state is recorded"
+        );
+        assert!(
+            edit.find("require_edit_peer_tls_capability").expect("edit capability gate")
+                < edit.find("save_site_replication_state").expect("state save"),
+            "edit capability gate must run before state is saved"
+        );
     }
 
     #[derive(Clone, Default)]
@@ -6455,7 +8465,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn legacy_endpoint_refresh_executes_peer_edit_and_bucket_repair() {
+        temp_env::async_with_vars(
+            [(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("true"))],
+            legacy_endpoint_refresh_executes_peer_edit_and_bucket_repair_inner(),
+        )
+        .await;
+    }
+
+    async fn legacy_endpoint_refresh_executes_peer_edit_and_bucket_repair_inner() {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -6818,6 +8837,7 @@ mod tests {
                 endpoint: "https://remote.example.com".to_string(),
                 access_key: "remote-ak".to_string(),
                 secret_key: "remote-sk".to_string(),
+                ..PeerSite::default()
             }],
             "svc-ak".to_string(),
             "root".to_string(),
@@ -6842,12 +8862,14 @@ mod tests {
                     endpoint: "https://local.example.com/".to_string(),
                     access_key: "local-ak".to_string(),
                     secret_key: "local-sk".to_string(),
+                    ..PeerSite::default()
                 },
                 PeerSite {
                     name: "remote".to_string(),
                     endpoint: "https://remote.example.com".to_string(),
                     access_key: "remote-ak".to_string(),
                     secret_key: "remote-sk".to_string(),
+                    ..PeerSite::default()
                 },
             ],
             "svc-ak".to_string(),
@@ -8065,7 +10087,7 @@ mod tests {
         .expect("set pending endpoint refresh");
         assert!(peer_endpoint_refresh_requested(&state, &retry_peer));
         state.pending_endpoint_refresh = None;
-        assert_eq!(pending_endpoint_refresh(&state).map(|pending| pending.id), Some("refresh-1".to_string()));
+        assert!(pending_endpoint_refresh(&state).is_none());
         clear_pending_endpoint_refresh(&mut state);
         assert!(pending_endpoint_refresh(&state).is_none());
         assert!(!peer_endpoint_refresh_requested(&state, &retry_peer));
@@ -8097,12 +10119,38 @@ mod tests {
             },
             ..Default::default()
         };
+        let route_endpoints = endpoint_refresh_route_endpoints(&old_target, &pending)
+            .expect("endpoint refresh routes")
+            .into_iter()
+            .map(|connection| connection.endpoint().to_string())
+            .collect::<Vec<_>>();
         assert_eq!(
-            endpoint_refresh_route_endpoints(&old_target, &pending),
+            route_endpoints,
             vec![
                 "http://old.example.com:9000".to_string(),
                 "https://new.example.com:9001".to_string()
             ]
+        );
+
+        let tls_changed = PendingEndpointRefresh {
+            peer: PeerInfo {
+                deployment_id: "remote".to_string(),
+                endpoint: "https://same.example.com".to_string(),
+                skip_tls_verify: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let old_tls_target = PeerInfo {
+            deployment_id: "remote".to_string(),
+            endpoint: "https://same.example.com".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            endpoint_refresh_route_endpoints(&old_tls_target, &tls_changed)
+                .expect("TLS-only endpoint refresh routes")
+                .len(),
+            2
         );
         let routing_peers = BTreeMap::from([
             (
