@@ -180,6 +180,14 @@ impl ChecksumType {
         (self.0 & Self::FULL_OBJECT.0) == Self::FULL_OBJECT.0 || self.is(Self::CRC64_NVME)
     }
 
+    /// True for the five algorithms s3s exposes as typed `*Output` fields
+    /// (CRC32/CRC32C/SHA1/SHA256/CRC64NVME). The AWS 2026-04 additional algorithms
+    /// (XXHash3/64/128, SHA-512, MD5) have no typed field and are carried as raw
+    /// response headers instead. Single source of truth for that split.
+    pub fn is_s3s_typed(self) -> bool {
+        matches!(self.base(), Self::CRC32 | Self::CRC32C | Self::SHA1 | Self::SHA256 | Self::CRC64_NVME)
+    }
+
     /// Get object type string for x-amz-checksum-type header
     pub fn obj_type(self) -> &'static str {
         if self.full_object_requested() {

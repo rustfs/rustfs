@@ -1697,19 +1697,12 @@ pub(crate) fn inject_additional_checksum_headers(headers: &mut HeaderMap, pairs:
 /// (e.g. a trailing checksum, whose value lands after the body — covered by e2e).
 pub(crate) fn additional_checksum_echo_pairs(want: &Option<rustfs_rio::Checksum>) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
-    if let Some(cs) = want {
-        let base = cs.checksum_type.base();
-        let is_s3s_typed = base == rustfs_rio::ChecksumType::CRC32
-            || base == rustfs_rio::ChecksumType::CRC32C
-            || base == rustfs_rio::ChecksumType::SHA1
-            || base == rustfs_rio::ChecksumType::SHA256
-            || base == rustfs_rio::ChecksumType::CRC64_NVME;
-        if !is_s3s_typed
-            && !cs.encoded.is_empty()
-            && let Some(name) = base.key()
-        {
-            out.push((name, cs.encoded.clone()));
-        }
+    if let Some(cs) = want
+        && !cs.checksum_type.is_s3s_typed()
+        && !cs.encoded.is_empty()
+        && let Some(name) = cs.checksum_type.key()
+    {
+        out.push((name, cs.encoded.clone()));
     }
     out
 }
@@ -1749,17 +1742,52 @@ fn apply_trailing_checksums(
     }
 }
 
+/// Checksums resolved from stored (decrypted) metadata for a response. The five
+/// s3s-typed algorithms fill named fields; the AWS 2026-04 additional algorithms
+/// (XXHash3/64/128, SHA-512, MD5), which s3s has no typed `*Output` field for, land
+/// in `extra` and are emitted as raw response headers via
+/// [`inject_additional_checksum_headers`]. Built by [`classify_response_checksums`]
+/// so the typed/extra split lives in exactly one place.
 #[derive(Default)]
-struct GetObjectChecksums {
-    crc32: Option<String>,
-    crc32c: Option<String>,
-    sha1: Option<String>,
-    sha256: Option<String>,
-    crc64nvme: Option<String>,
-    checksum_type: Option<ChecksumType>,
-    /// XXHash3/64/128 and SHA-512, which s3s GetObjectOutput has no typed field for;
-    /// emitted as raw response headers via inject_additional_checksum_headers (#1257).
-    extra: Vec<(&'static str, String)>,
+pub(crate) struct ResponseChecksums {
+    pub(crate) crc32: Option<String>,
+    pub(crate) crc32c: Option<String>,
+    pub(crate) sha1: Option<String>,
+    pub(crate) sha256: Option<String>,
+    pub(crate) crc64nvme: Option<String>,
+    pub(crate) checksum_type: Option<ChecksumType>,
+    pub(crate) extra: Vec<(&'static str, String)>,
+}
+
+/// Split decrypted checksum (key, value) pairs into the five s3s-typed fields and the
+/// additional-algorithm `extra` headers. Single source of truth for every response
+/// path (GetObject / HeadObject / GetObjectAttributes / CompleteMultipartUpload),
+/// replacing what used to be five copies of this match loop.
+pub(crate) fn classify_response_checksums<I>(pairs: I) -> ResponseChecksums
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut c = ResponseChecksums::default();
+    for (key, checksum) in pairs {
+        if key == AMZ_CHECKSUM_TYPE {
+            c.checksum_type = Some(ChecksumType::from(checksum));
+            continue;
+        }
+        let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
+        match ct.base() {
+            rustfs_rio::ChecksumType::CRC32 => c.crc32 = Some(checksum),
+            rustfs_rio::ChecksumType::CRC32C => c.crc32c = Some(checksum),
+            rustfs_rio::ChecksumType::SHA1 => c.sha1 = Some(checksum),
+            rustfs_rio::ChecksumType::SHA256 => c.sha256 = Some(checksum),
+            rustfs_rio::ChecksumType::CRC64_NVME => c.crc64nvme = Some(checksum),
+            _ => {
+                if let Some(name) = ct.key() {
+                    c.extra.push((name, checksum));
+                }
+            }
+        }
+    }
+    c
 }
 
 #[derive(Default)]
@@ -3082,9 +3110,7 @@ impl DefaultObjectUsecase {
         headers: &HeaderMap,
         part_number: Option<usize>,
         rs: Option<&HTTPRangeSpec>,
-    ) -> S3Result<GetObjectChecksums> {
-        let mut checksums = GetObjectChecksums::default();
-
+    ) -> S3Result<ResponseChecksums> {
         if let Some(checksum_mode) = headers.get(AMZ_CHECKSUM_MODE)
             && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
             && rs.is_none()
@@ -3095,29 +3121,10 @@ impl DefaultObjectUsecase {
                     ApiError::from(e)
                 })?;
 
-            for (key, checksum) in decrypted_checksums {
-                if key == AMZ_CHECKSUM_TYPE {
-                    checksums.checksum_type = Some(ChecksumType::from(checksum));
-                    continue;
-                }
-
-                let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
-                match ct {
-                    rustfs_rio::ChecksumType::CRC32 => checksums.crc32 = Some(checksum),
-                    rustfs_rio::ChecksumType::CRC32C => checksums.crc32c = Some(checksum),
-                    rustfs_rio::ChecksumType::SHA1 => checksums.sha1 = Some(checksum),
-                    rustfs_rio::ChecksumType::SHA256 => checksums.sha256 = Some(checksum),
-                    rustfs_rio::ChecksumType::CRC64_NVME => checksums.crc64nvme = Some(checksum),
-                    other => {
-                        if let Some(name) = other.key() {
-                            checksums.extra.push((name, checksum));
-                        }
-                    }
-                }
-            }
+            return Ok(classify_response_checksums(decrypted_checksums));
         }
 
-        Ok(checksums)
+        Ok(ResponseChecksums::default())
     }
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body<R>(
@@ -4620,27 +4627,19 @@ impl DefaultObjectUsecase {
 
         let checksum = if requested(ObjectAttributes::CHECKSUM) {
             let (checksums, _is_multipart) = info.decrypt_checksums(0, &req.headers).map_err(ApiError::from)?;
-            let mut checksum_crc32 = None;
-            let mut checksum_crc32c = None;
-            let mut checksum_sha1 = None;
-            let mut checksum_sha256 = None;
-            let mut checksum_crc64nvme = None;
-            let mut checksum_type = None;
-
-            for (k, v) in checksums {
-                if k == AMZ_CHECKSUM_TYPE {
-                    checksum_type = Some(ChecksumType::from(v));
-                    continue;
-                }
-                match rustfs_rio::ChecksumType::from_string(k.as_str()) {
-                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(v),
-                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(v),
-                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(v),
-                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(v),
-                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(v),
-                    _ => (),
-                }
-            }
+            // GetObjectAttributes returns checksums in the XML body, and s3s's Checksum
+            // type has no field for the additional algorithms, so `extra` cannot be
+            // surfaced here (unlike the header-based GET/HEAD paths) — an s3s limitation
+            // tracked for when it gains typed fields.
+            let ResponseChecksums {
+                crc32: checksum_crc32,
+                crc32c: checksum_crc32c,
+                sha1: checksum_sha1,
+                sha256: checksum_sha256,
+                crc64nvme: checksum_crc64nvme,
+                checksum_type,
+                ..
+            } = classify_response_checksums(checksums);
 
             Some(Checksum {
                 checksum_crc32,
@@ -4676,22 +4675,16 @@ impl DefaultObjectUsecase {
 
             for part in &info.parts[start_at..end] {
                 let (checksums, _is_multipart) = info.decrypt_checksums(part.number, &req.headers).map_err(ApiError::from)?;
-                let mut checksum_crc32 = None;
-                let mut checksum_crc32c = None;
-                let mut checksum_sha1 = None;
-                let mut checksum_sha256 = None;
-                let mut checksum_crc64nvme = None;
-
-                for (k, v) in checksums {
-                    match rustfs_rio::ChecksumType::from_string(k.as_str()) {
-                        rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(v),
-                        rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(v),
-                        rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(v),
-                        rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(v),
-                        rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(v),
-                        _ => (),
-                    }
-                }
+                // Additional algorithms cannot be surfaced in the ObjectPart XML body
+                // (s3s has no field); same limitation as the object-level attributes above.
+                let ResponseChecksums {
+                    crc32: checksum_crc32,
+                    crc32c: checksum_crc32c,
+                    sha1: checksum_sha1,
+                    sha256: checksum_sha256,
+                    crc64nvme: checksum_crc64nvme,
+                    ..
+                } = classify_response_checksums(checksums);
 
                 let part_size = if part.actual_size > 0 {
                     part.actual_size
@@ -5982,46 +5975,27 @@ impl DefaultObjectUsecase {
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
         let storage_class = response_storage_class(&info, &metadata_map);
-        let mut checksum_crc32 = None;
-        let mut checksum_crc32c = None;
-        let mut checksum_sha1 = None;
-        let mut checksum_sha256 = None;
-        let mut checksum_crc64nvme = None;
-        let mut checksum_type = None;
-        // AWS 2026-04 additional algorithms (XXHash3/64/128, SHA-512) have no typed
-        // field on s3s HeadObjectOutput, so carry them out as raw response headers (#1257).
-        let mut extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
-
-        // checksum
-        if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
+        // checksum: classify once; additional algorithms (XXHash3/64/128, SHA-512, MD5)
+        // land in `extra` and are emitted as raw headers below (s3s has no typed field).
+        let ResponseChecksums {
+            crc32: checksum_crc32,
+            crc32c: checksum_crc32c,
+            sha1: checksum_sha1,
+            sha256: checksum_sha256,
+            crc64nvme: checksum_crc64nvme,
+            checksum_type,
+            extra: extra_checksum_headers,
+        } = if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
             && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
             && rs.is_none()
         {
             let (checksums, _is_multipart) = info
                 .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
                 .map_err(ApiError::from)?;
-
-            for (key, checksum) in checksums {
-                if key == AMZ_CHECKSUM_TYPE {
-                    checksum_type = Some(ChecksumType::from(checksum));
-                    continue;
-                }
-
-                let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
-                match ct {
-                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
-                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
-                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
-                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
-                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                    other => {
-                        if let Some(name) = other.key() {
-                            extra_checksum_headers.push((name, checksum));
-                        }
-                    }
-                }
-            }
-        }
+            classify_response_checksums(checksums)
+        } else {
+            ResponseChecksums::default()
+        };
         // Extract standard HTTP headers from user_defined metadata
         // Note: These headers are stored with lowercase keys by extract_metadata_from_mime
         let cache_control = metadata_map.get("cache-control").cloned();

@@ -535,41 +535,21 @@ impl DefaultMultipartUsecase {
             None
         };
         let mpu_version_for_event = mpu_version.clone();
-        let mut checksum_crc32 = input.checksum_crc32;
-        let mut checksum_crc32c = input.checksum_crc32c;
-        let mut checksum_sha1 = input.checksum_sha1;
-        let mut checksum_sha256 = input.checksum_sha256;
-        let mut checksum_crc64nvme = input.checksum_crc64nvme;
-        let mut checksum_type = input.checksum_type;
-
-        // checksum
+        // checksum: stored (decrypted) values take precedence over the request input;
+        // additional algorithms (XXHash3/64/128, SHA-512, MD5), which have no typed
+        // CompleteMultipartUploadOutput field, are echoed as raw response headers (#1261).
         let (checksums, _is_multipart) = obj_info
             .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
             .map_err(ApiError::from)?;
 
-        // XXHash3/64/128 and SHA-512 have no typed CompleteMultipartUploadOutput field;
-        // echoed as raw response headers via inject_additional_checksum_headers (#1261).
-        let mut complete_extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
-        for (key, checksum) in checksums {
-            if key == AMZ_CHECKSUM_TYPE {
-                checksum_type = Some(ChecksumType::from(checksum));
-                continue;
-            }
-
-            let ct = rustfs_rio::ChecksumType::from_string(key.as_str());
-            match ct {
-                rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
-                rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
-                rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
-                rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
-                other => {
-                    if let Some(name) = other.key() {
-                        complete_extra_checksum_headers.push((name, checksum));
-                    }
-                }
-            }
-        }
+        let classified = crate::app::object_usecase::classify_response_checksums(checksums);
+        let checksum_crc32 = classified.crc32.or(input.checksum_crc32);
+        let checksum_crc32c = classified.crc32c.or(input.checksum_crc32c);
+        let checksum_sha1 = classified.sha1.or(input.checksum_sha1);
+        let checksum_sha256 = classified.sha256.or(input.checksum_sha256);
+        let checksum_crc64nvme = classified.crc64nvme.or(input.checksum_crc64nvme);
+        let checksum_type = classified.checksum_type.or(input.checksum_type);
+        let complete_extra_checksum_headers = classified.extra;
 
         let location = build_complete_multipart_location(&req.headers, &req.uri, &bucket, &key);
         let output = CompleteMultipartUploadOutput {
