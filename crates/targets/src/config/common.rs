@@ -13,13 +13,15 @@
 // limitations under the License.
 
 use crate::TargetError;
+use crate::target::nats::validate_jetstream_settings;
 use crate::target::pulsar::validate_pulsar_broker;
 use async_nats::ServerAddr;
 use rustfs_config::server_config::KVS;
 use rustfs_config::{
-    DEFAULT_DELIMITER, ENABLE_KEY, EnableState, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_SUBJECT, NATS_TLS_CA,
-    NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR,
-    PULSAR_TLS_CA, PULSAR_TOPIC, PULSAR_USERNAME,
+    DEFAULT_DELIMITER, ENABLE_KEY, EnableState, NATS_CREDENTIALS_FILE, NATS_JETSTREAM_ACK_TIMEOUT_SECS, NATS_JETSTREAM_ENABLE,
+    NATS_JETSTREAM_STREAM_NAME, NATS_PASSWORD, NATS_QUEUE_DIR, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT,
+    NATS_TLS_CLIENT_KEY, NATS_TOKEN, NATS_USERNAME, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, PULSAR_QUEUE_DIR, PULSAR_TLS_CA,
+    PULSAR_TOPIC, PULSAR_USERNAME,
 };
 use rustfs_utils::egress::validate_outbound_url;
 use std::collections::HashSet;
@@ -130,8 +132,40 @@ pub(super) fn validate_nats_server_config(server: &ServerAddr, config: &KVS, def
         return Err(TargetError::Configuration("NATS queue directory must be an absolute path".to_string()));
     }
 
+    let jetstream_enable = parse_jetstream_enable(config)?.unwrap_or(false);
+    let jetstream_stream_name = config.lookup(NATS_JETSTREAM_STREAM_NAME).unwrap_or_default();
+    let jetstream_ack_timeout_secs = parse_jetstream_ack_timeout_secs(config)?;
+    validate_jetstream_settings(jetstream_enable, &jetstream_stream_name, &queue_dir, jetstream_ack_timeout_secs)?;
+
     let _ = server;
     Ok(())
+}
+
+/// Parses the jetstream_enable flag, distinguishing an absent or blank key (None, disabled) from a
+/// key that is present but carries an unparsable value, which is a configuration error rather than
+/// a silent disable. Unwrapping an unparsable value to disabled would drop the durability guarantee
+/// the operator asked for with no signal.
+pub(super) fn parse_jetstream_enable(config: &KVS) -> Result<Option<bool>, TargetError> {
+    match config.lookup(NATS_JETSTREAM_ENABLE) {
+        Some(value) if !value.trim().is_empty() => parse_target_bool(Some(value.as_str())).map(Some).ok_or_else(|| {
+            TargetError::Configuration(format!(
+                "Invalid {NATS_JETSTREAM_ENABLE} boolean value: {value} (accepted values include on, off, true, false, yes, no, 1, 0)"
+            ))
+        }),
+        _ => Ok(None),
+    }
+}
+
+pub(super) fn parse_jetstream_ack_timeout_secs(config: &KVS) -> Result<Option<u64>, TargetError> {
+    match config.lookup(NATS_JETSTREAM_ACK_TIMEOUT_SECS) {
+        Some(value) if !value.trim().is_empty() => {
+            let secs = value.trim().parse::<u64>().map_err(|_| {
+                TargetError::Configuration(format!("{NATS_JETSTREAM_ACK_TIMEOUT_SECS} must be a whole number of seconds"))
+            })?;
+            Ok(Some(secs))
+        }
+        _ => Ok(None),
+    }
 }
 
 pub(super) fn validate_pulsar_broker_config(broker: &str, config: &KVS, default_queue_dir: &str) -> Result<(), TargetError> {
@@ -193,14 +227,25 @@ pub(super) fn validate_outbound_http_url(value: &Url, field_label: &str) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_nats_server_config, validate_pulsar_broker_config};
+    use super::{parse_jetstream_enable, validate_nats_server_config, validate_pulsar_broker_config};
     use async_nats::ServerAddr;
     use rustfs_config::server_config::KVS;
     use rustfs_config::{
-        NATS_PASSWORD, NATS_QUEUE_DIR, NATS_SUBJECT, NATS_TOKEN, NATS_USERNAME, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA,
-        PULSAR_TLS_HOSTNAME_VERIFICATION, PULSAR_TOPIC,
+        NATS_JETSTREAM_ACK_TIMEOUT_SECS, NATS_JETSTREAM_ENABLE, NATS_JETSTREAM_STREAM_NAME, NATS_PASSWORD, NATS_QUEUE_DIR,
+        NATS_SUBJECT, NATS_TOKEN, NATS_USERNAME, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_CA, PULSAR_TLS_HOSTNAME_VERIFICATION,
+        PULSAR_TOPIC,
     };
     use std::str::FromStr;
+
+    fn nats_server() -> ServerAddr {
+        ServerAddr::from_str("nats://127.0.0.1:4222").expect("valid nats address")
+    }
+
+    // Absolute on Linux, macOS, and Windows. temp_dir needs no filesystem to exist for a
+    // validation-only test, and Path::is_absolute stays true across platforms.
+    fn nats_queue_dir() -> String {
+        std::env::temp_dir().join("rustfs-nats-queue").to_string_lossy().into_owned()
+    }
 
     #[test]
     fn validate_nats_server_config_rejects_multiple_auth_methods() {
@@ -226,6 +271,131 @@ mod tests {
         let err = validate_nats_server_config(&server, &config, "").expect_err("relative queue_dir should be rejected");
 
         assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn validate_nats_server_config_rejects_jetstream_without_stream() {
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_QUEUE_DIR.to_string(), nats_queue_dir());
+        config.insert(NATS_JETSTREAM_ENABLE.to_string(), "on".to_string());
+
+        let err = validate_nats_server_config(&nats_server(), &config, "")
+            .expect_err("enabled jetstream without a stream should be rejected");
+        assert!(err.to_string().contains(NATS_JETSTREAM_STREAM_NAME));
+    }
+
+    #[test]
+    fn validate_nats_server_config_rejects_jetstream_without_queue_dir() {
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_JETSTREAM_ENABLE.to_string(), "on".to_string());
+        config.insert(NATS_JETSTREAM_STREAM_NAME.to_string(), "RUSTFS_EVENTS".to_string());
+
+        let err = validate_nats_server_config(&nats_server(), &config, "")
+            .expect_err("enabled jetstream without a queue_dir should be rejected");
+        assert!(err.to_string().contains(NATS_QUEUE_DIR));
+    }
+
+    #[test]
+    fn validate_nats_server_config_rejects_out_of_range_ack_timeout() {
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_JETSTREAM_ACK_TIMEOUT_SECS.to_string(), "5".to_string());
+
+        let err =
+            validate_nats_server_config(&nats_server(), &config, "").expect_err("out-of-range ack timeout should be rejected");
+        assert!(err.to_string().contains("between"));
+    }
+
+    #[test]
+    fn validate_nats_server_config_accepts_enabled_jetstream_with_stream_and_queue() {
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_QUEUE_DIR.to_string(), nats_queue_dir());
+        config.insert(NATS_JETSTREAM_ENABLE.to_string(), "on".to_string());
+        config.insert(NATS_JETSTREAM_STREAM_NAME.to_string(), "RUSTFS_EVENTS".to_string());
+
+        validate_nats_server_config(&nats_server(), &config, "").expect("a stream name and queue dir accept enabling jetstream");
+    }
+
+    #[test]
+    fn validate_nats_server_config_audit_parity_matches_notify() {
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_QUEUE_DIR.to_string(), nats_queue_dir());
+        config.insert(NATS_JETSTREAM_ENABLE.to_string(), "on".to_string());
+
+        // The same invalid combination (enabled, stream name missing) is rejected identically on the
+        // notify and the audit path, proving one shared validator with no drift.
+        let notify = validate_nats_server_config(&nats_server(), &config, "/opt/rustfs/events").expect_err("notify rejects");
+        let audit = validate_nats_server_config(&nats_server(), &config, "/opt/rustfs/audit").expect_err("audit rejects");
+        assert_eq!(notify.to_string(), audit.to_string());
+    }
+
+    #[test]
+    fn validate_nats_server_config_accepts_jetstream_absent() {
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_QUEUE_DIR.to_string(), nats_queue_dir());
+
+        validate_nats_server_config(&nats_server(), &config, "").expect("baseline config validates");
+    }
+
+    #[test]
+    fn parse_jetstream_enable_accepts_the_standard_boolean_forms() {
+        // An absent or blank key is None, legitimately disabled.
+        assert_eq!(parse_jetstream_enable(&KVS::new()).unwrap(), None, "an absent key parses as unset");
+        let mut blank = KVS::new();
+        blank.insert(NATS_JETSTREAM_ENABLE.to_string(), "  ".to_string());
+        assert_eq!(parse_jetstream_enable(&blank).unwrap(), None, "a blank value parses as unset");
+
+        for (value, expected) in [
+            ("on", true),
+            ("off", false),
+            ("true", true),
+            ("false", false),
+            ("yes", true),
+            ("no", false),
+            ("1", true),
+            ("0", false),
+            ("enabled", true),
+            ("disabled", false),
+        ] {
+            let mut config = KVS::new();
+            config.insert(NATS_JETSTREAM_ENABLE.to_string(), value.to_string());
+            assert_eq!(
+                parse_jetstream_enable(&config).unwrap(),
+                Some(expected),
+                "value {value} parses as {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_jetstream_enable_rejects_an_unparsable_value_naming_the_key() {
+        // A typo must fail validation rather than silently disabling the durability guarantee.
+        for value in ["y", "t", "enabl", "10"] {
+            let mut config = KVS::new();
+            config.insert(NATS_JETSTREAM_ENABLE.to_string(), value.to_string());
+            let err = parse_jetstream_enable(&config).expect_err("an unparsable value is rejected");
+            assert!(
+                err.to_string().contains(NATS_JETSTREAM_ENABLE),
+                "the error names the key for value {value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_nats_server_config_rejects_an_invalid_jetstream_enable_value() {
+        let mut config = KVS::new();
+        config.insert(NATS_SUBJECT.to_string(), "events".to_string());
+        config.insert(NATS_QUEUE_DIR.to_string(), nats_queue_dir());
+        config.insert(NATS_JETSTREAM_ENABLE.to_string(), "y".to_string());
+
+        let err = validate_nats_server_config(&nats_server(), &config, "")
+            .expect_err("an unparsable enable value fails validation instead of passing as disabled");
+        assert!(err.to_string().contains(NATS_JETSTREAM_ENABLE), "the error names the key: {err}");
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub struct AuditTargetStats {
     pub target_id: String,
     /// Number of messages that failed to send
     pub failed_messages: u64,
+    /// Number of messages held in the failed-events store
+    pub failed_store_length: u64,
     /// Number of unsent messages in queue
     pub queue_length: u64,
     /// Total number of messages sent
@@ -48,12 +50,16 @@ pub fn collect_audit_metrics(stats: &[AuditTargetStats]) -> Vec<PrometheusMetric
         return Vec::new();
     }
 
-    let mut metrics = Vec::with_capacity(stats.len() * 3);
+    let mut metrics = Vec::with_capacity(stats.len() * 4);
     for stat in stats {
         let target_id_label: Cow<'static, str> = Cow::Owned(stat.target_id.clone());
 
         metrics.push(
             PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_MD, stat.failed_messages as f64)
+                .with_label("target_id", target_id_label.clone()),
+        );
+        metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_FAILED_STORE_LENGTH_MD, stat.failed_store_length as f64)
                 .with_label("target_id", target_id_label.clone()),
         );
         metrics.push(
@@ -80,12 +86,14 @@ mod tests {
             AuditTargetStats {
                 target_id: "target-1".to_string(),
                 failed_messages: 5,
+                failed_store_length: 3,
                 queue_length: 10,
                 total_messages: 1000,
             },
             AuditTargetStats {
                 target_id: "target-2".to_string(),
                 failed_messages: 2,
+                failed_store_length: 1,
                 queue_length: 5,
                 total_messages: 500,
             },
@@ -93,12 +101,19 @@ mod tests {
 
         let metrics = collect_audit_metrics(&stats);
 
-        assert_eq!(metrics.len(), 6); // 2 targets * 3 metrics each
+        assert_eq!(metrics.len(), 8); // 2 targets * 4 metrics each
 
         let failed = metrics
             .iter()
             .find(|m| m.value == 5.0 && m.labels.iter().any(|(k, v)| *k == "target_id" && v == "target-1"));
         assert!(failed.is_some());
+
+        let failed_store = metrics.iter().find(|m| {
+            m.value == 3.0
+                && m.name == AUDIT_FAILED_STORE_LENGTH_MD.get_full_metric_name()
+                && m.labels.iter().any(|(k, v)| *k == "target_id" && v == "target-1")
+        });
+        assert!(failed_store.is_some());
     }
 
     #[test]
@@ -111,6 +126,7 @@ mod tests {
     #[test]
     fn audit_target_totals_are_exported_as_gauges() {
         assert_eq!(AUDIT_FAILED_MESSAGES_MD.metric_type, MetricType::Gauge);
+        assert_eq!(AUDIT_FAILED_STORE_LENGTH_MD.metric_type, MetricType::Gauge);
         assert_eq!(AUDIT_TARGET_QUEUE_LENGTH_MD.metric_type, MetricType::Gauge);
         assert_eq!(AUDIT_TOTAL_MESSAGES_MD.metric_type, MetricType::Gauge);
     }

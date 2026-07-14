@@ -19,12 +19,13 @@ use rustfs_targets::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
 const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
 const EVENT_NOTIFY_RUNTIME_SHUTDOWN_FAILED: &str = "notify_runtime_shutdown_failed";
+const EVENT_NOTIFY_REPLAY_RETRY_EXHAUSTED: &str = "notify_replay_retry_exhausted";
 
 #[derive(Clone)]
 pub struct NotifyRuntimeFacade {
@@ -48,9 +49,18 @@ impl NotifyRuntimeFacade {
                     match event {
                         ReplayEvent::Delivered { .. } => metrics.increment_processed(),
                         ReplayEvent::RetryableError { .. } => {}
-                        ReplayEvent::Dropped { target, .. }
-                        | ReplayEvent::PermanentFailure { target, .. }
-                        | ReplayEvent::RetryExhausted { target, .. } => {
+                        ReplayEvent::RetryExhausted { detail, key, target } => {
+                            warn!(
+                                event = EVENT_NOTIFY_REPLAY_RETRY_EXHAUSTED,
+                                component = LOG_COMPONENT_NOTIFY,
+                                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                                target_id = %target.id(),
+                                replay_key = %key,
+                                error = %detail,
+                                "notify replay retry budget exhausted, entry stays queued and retries"
+                            );
+                        }
+                        ReplayEvent::Dropped { target, .. } | ReplayEvent::PermanentFailure { target, .. } => {
                             target.record_final_failure();
                             metrics.increment_failed();
                         }

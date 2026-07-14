@@ -80,6 +80,7 @@ pub struct NotificationMetricSnapshot {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NotificationTargetMetricSnapshot {
     pub failed_messages: u64,
+    pub failed_store_length: u64,
     pub queue_length: u64,
     pub target_id: String,
     pub target_type: String,

@@ -100,11 +100,27 @@ pub async fn check_nats_server_available(args: &crate::target::nats::NATSArgs) -
             .flush()
             .await
             .map_err(|e| crate::TargetError::Network(format!("NATS connection check failed: {e}")))?;
+        // Validate the configured stream on the live connection before the drain closes it, so a
+        // missing or non-writable stream is rejected here rather than at first publish. The lookup is
+        // read-only and never creates a stream. The drain runs regardless of the validation outcome so
+        // the check connection is closed gracefully, and the validation error then propagates.
+        let validation = if args.jetstream_enable.unwrap_or(false) {
+            let mut context = async_nats::jetstream::new(client.clone());
+            // Match every other context construction site: the ack timeout is the per-operation await
+            // bound, so the validation get_stream lookup uses it rather than the library default.
+            context.set_timeout(std::time::Duration::from_secs(
+                args.jetstream_ack_timeout_secs
+                    .unwrap_or(rustfs_config::NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS),
+            ));
+            crate::target::nats::validate_jetstream_stream(&context, args, "nats-check", None).await
+        } else {
+            Ok(())
+        };
         client
             .drain()
             .await
             .map_err(|e| crate::TargetError::Network(format!("Failed to close NATS check connection: {e}")))?;
-        Ok(())
+        validation
     })
     .await
     .unwrap_or_else(|_| Err(crate::TargetError::Timeout("NATS connection timed out".to_string())))
