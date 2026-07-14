@@ -214,65 +214,37 @@ impl ChecksumType {
             _ => return Self::INVALID,
         };
 
-        match alg.to_uppercase().as_str() {
-            "CRC32" => ChecksumType(Self::CRC32.0 | full.0),
-            "CRC32C" => ChecksumType(Self::CRC32C.0 | full.0),
-            "SHA1" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::SHA1
-            }
-            "SHA256" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::SHA256
-            }
-            "CRC64NVME" => {
-                // AWS seems to ignore full value and just assume it
-                Self::CRC64_NVME
-            }
-            // XXHash / SHA-512 are COMPOSITE-only per AWS (they cannot be linearly
-            // combined into a full-object checksum the way CRCs can), so an explicit
-            // FULL_OBJECT request is rejected — same rule as SHA1/SHA256.
-            "XXHASH3" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::XXHASH3
-            }
-            "XXHASH64" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::XXHASH64
-            }
-            "XXHASH128" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::XXHASH128
-            }
-            "SHA512" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::SHA512
-            }
-            "MD5" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::MD5
-            }
-            "" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::NONE
-            }
-            _ => Self::INVALID,
+        // Case-insensitive matching WITHOUT allocating: to_uppercase() allocated a
+        // String on every checksummed request, and this path is hot. Composite-only
+        // algorithms reject an explicit FULL_OBJECT request — they cannot be linearly
+        // combined into a full-object checksum the way CRCs can (same rule as SHA1/256).
+        let composite_only = |ty: ChecksumType| -> ChecksumType { if full != Self::NONE { Self::INVALID } else { ty } };
+
+        if alg.eq_ignore_ascii_case("CRC32") {
+            ChecksumType(Self::CRC32.0 | full.0)
+        } else if alg.eq_ignore_ascii_case("CRC32C") {
+            ChecksumType(Self::CRC32C.0 | full.0)
+        } else if alg.eq_ignore_ascii_case("CRC64NVME") {
+            // AWS ignores the full-object flag here and just assumes it.
+            Self::CRC64_NVME
+        } else if alg.eq_ignore_ascii_case("SHA1") {
+            composite_only(Self::SHA1)
+        } else if alg.eq_ignore_ascii_case("SHA256") {
+            composite_only(Self::SHA256)
+        } else if alg.eq_ignore_ascii_case("SHA512") {
+            composite_only(Self::SHA512)
+        } else if alg.eq_ignore_ascii_case("XXHASH3") {
+            composite_only(Self::XXHASH3)
+        } else if alg.eq_ignore_ascii_case("XXHASH64") {
+            composite_only(Self::XXHASH64)
+        } else if alg.eq_ignore_ascii_case("XXHASH128") {
+            composite_only(Self::XXHASH128)
+        } else if alg.eq_ignore_ascii_case("MD5") {
+            composite_only(Self::MD5)
+        } else if alg.is_empty() {
+            composite_only(Self::NONE)
+        } else {
+            Self::INVALID
         }
     }
 }
@@ -1654,5 +1626,28 @@ mod tests {
             };
             assert!(acc.add_part(&c1, part1.len() as i64).is_err(), "{t:?} must not be full-object mergeable");
         }
+    }
+
+    // S11: from_string_with_obj_type dropped to_uppercase() (a per-request heap alloc)
+    // for eq_ignore_ascii_case. Lock that this did not change any behaviour.
+    #[test]
+    fn from_string_is_case_insensitive_and_behaviour_preserved() {
+        assert_eq!(ChecksumType::from_string("crc32").base(), ChecksumType::CRC32);
+        assert_eq!(ChecksumType::from_string("Crc32C").base(), ChecksumType::CRC32C);
+        assert_eq!(ChecksumType::from_string("xxHASH3").base(), ChecksumType::XXHASH3);
+        assert_eq!(ChecksumType::from_string("Md5").base(), ChecksumType::MD5);
+        assert_eq!(ChecksumType::from_string("sha512").base(), ChecksumType::SHA512);
+
+        // Unknown / empty preserved.
+        assert_eq!(ChecksumType::from_string("nope"), ChecksumType::INVALID);
+        assert_eq!(ChecksumType::from_string(""), ChecksumType::NONE);
+
+        // CRC64NVME still assumes full-object; CRC32 still accepts explicit FULL_OBJECT.
+        assert!(ChecksumType::from_string("crc64nvme").full_object_requested());
+        assert!(ChecksumType::from_string_with_obj_type("crc32", "FULL_OBJECT").full_object_requested());
+
+        // Composite-only algorithms still reject FULL_OBJECT; invalid obj_type still rejected.
+        assert_eq!(ChecksumType::from_string_with_obj_type("xxhash3", "FULL_OBJECT"), ChecksumType::INVALID);
+        assert_eq!(ChecksumType::from_string_with_obj_type("crc32", "bogus"), ChecksumType::INVALID);
     }
 }
