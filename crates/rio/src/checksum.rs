@@ -1585,7 +1585,7 @@ mod tests {
 
     // Forward-compat / rolling-upgrade contract (#1260): a node that does not know a
     // future base-type bit must DEGRADE SAFELY — skip the entry and return without
-    // panicking or mis-decoding a length — never crash or corrupt.
+    // panicking or decoding a wrong length — never crash or corrupt.
     #[test]
     fn unknown_future_type_bit_degrades_safely() {
         use super::{encode_varint, read_checksums, read_part_checksums};
