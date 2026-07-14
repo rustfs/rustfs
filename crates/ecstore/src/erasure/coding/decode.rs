@@ -1091,6 +1091,7 @@ where
         let mut completed = 0usize;
         let mut failed = 0usize;
         let mut first_shard_recorded = false;
+        let mut hedged = false;
         // Scope the reader borrow (held by `reader_iter`/`sets`) so it is released
         // before the retirement pass mutates `self.readers` below.
         {
@@ -1115,7 +1116,53 @@ where
                 ));
             }
 
-            while let Some((i, _read_cost, result, _should_retire)) = sets.next().await {
+            // Hedge the straggler. Once every healthy shard has had `hedge_delay`
+            // to return, stop waiting out the full per-shard `read_timeout` for a
+            // slow shard: cancel the still-pending reads and let the stripe-aligned
+            // parity substitution below cover their slots — but only when enough
+            // unengaged parity remains to reconstruct them, otherwise keep waiting.
+            // A slow shard here otherwise stalls the whole stripe (and the GET's
+            // first byte) until the 10s read timeout fires: the large-object GET
+            // first-byte tail seen in backlog#1156.
+            let hedge_delay = shard_read_hedge_delay(read_timeout);
+            let hedge_sleep = hedge_delay.map(tokio::time::sleep);
+            tokio::pin!(hedge_sleep);
+            loop {
+                let item = match hedge_sleep.as_mut().as_pin_mut() {
+                    Some(sleep) if !hedged => {
+                        tokio::select! {
+                            biased;
+                            item = sets.next() => item,
+                            _ = sleep => {
+                                hedged = true;
+                                // Stop waiting for the straggler(s) only once the stripe
+                                // can be finished without them: either every data shard
+                                // is already in (no reconstruction needed), or there are
+                                // at least `data_shards + 1` shards — decode quorum plus
+                                // a reconstruction-verification source, so a missing data
+                                // shard is reconstructed *and* verified, never settled at
+                                // exactly `data_shards` (which would silently skip
+                                // verification, erasure.rs). In the read-all default every
+                                // slot is engaged, so `sets` already holds data + parity
+                                // and this stops one slow shard from stalling the stripe
+                                // (and the GET's first byte) for the full read timeout
+                                // (backlog#1156). Otherwise keep waiting — the straggler
+                                // may be the verification source, or the only route to
+                                // quorum on a degraded stripe.
+                                let succeeded = shards.iter().filter(|shard| shard.is_some()).count();
+                                let data_missing = shards.iter().take(data_shards).any(|shard| shard.is_none());
+                                if !data_missing || succeeded > data_shards {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    _ => sets.next().await,
+                };
+                let Some((i, _read_cost, result, _should_retire)) = item else {
+                    break;
+                };
                 completed += 1;
                 if !first_shard_recorded {
                     if let Some(path) = metrics_path {
@@ -1134,14 +1181,46 @@ where
                         failed += 1;
                     }
                 }
+                // Once the hedge has fired, stop as soon as the stripe can finish
+                // (all data present, or the decode+verification quorum) rather than
+                // draining every straggler — a shard that resolves just after the
+                // hedge must not pull the first byte back out to the read timeout.
+                // Gated on `hedged` so a healthy stripe still reads every shard
+                // (the read-all default invariant, backlog#923 gate off).
+                if hedged {
+                    let succeeded = shards.iter().filter(|shard| shard.is_some()).count();
+                    let data_missing = shards.iter().take(data_shards).any(|shard| shard.is_none());
+                    if !data_missing || succeeded > data_shards {
+                        break;
+                    }
+                }
             }
         }
 
-        // A data shard may have died during this stripe's reads. The unengaged
+        // Retire any shard the hedge left in flight: dropping `sets` above
+        // cancelled its read, so the reader is now at an indeterminate stream
+        // position and can never be block-aligned again — the same reason a
+        // mid-block read error retires a reader. Its slot stays missing and is
+        // covered by the stripe-aligned parity substitution below.
+        if hedged {
+            for i in 0..num_readers {
+                if participating[i] && shards[i].is_none() && errs[i].is_none() {
+                    errs[i] = Some(Error::from(io::Error::new(ErrorKind::TimedOut, "shard read hedged after a slow shard")));
+                    retire_readers.push(i);
+                }
+            }
+        }
+
+        // A data shard may have died or been hedged this stripe. The unengaged
         // parity readers are still unopened, so they can be aligned to *this*
         // stripe and read now: engage them one at a time until the stripe has
         // `data_shards + 1` successful shards (decode quorum plus one
-        // reconstruction-verification source) or parity runs out.
+        // reconstruction-verification source) or parity runs out. In the read-all
+        // default (`RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE` off) every parity
+        // slot is already engaged, so `!self.engaged[idx]` finds nothing and this
+        // loop is a no-op — the hedged data shard is reconstructed from the parity
+        // already read above. It only substitutes deferred parity in the
+        // data-shards-only path (backlog#923).
         loop {
             let success_now = shards.iter().filter(|shard| shard.is_some()).count();
             let data_shard_missing = shards.iter().take(data_shards).any(|shard| shard.is_none());
@@ -3630,6 +3709,152 @@ mod tests {
         assert!(bufs[1].is_some());
         assert!(bufs[2].is_some());
         assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
+    /// Lockstep GET regression for the large-object first-byte tail (backlog#1156).
+    /// A single slow data shard must not stall the stripe for the full per-shard
+    /// `read_timeout`: once the hedge delay elapses and the stripe already holds a
+    /// decode-plus-verification quorum, the lockstep read retires the straggler and
+    /// returns in ~hedge_delay even though `read_timeout` is 60s. Before the hedge
+    /// the lockstep path waited for every launched read, so this completed in
+    /// ~read_timeout (the 10s stall observed on large-object GETs) instead of ~100ms.
+    #[tokio::test]
+    async fn test_lockstep_hedges_slow_shard_instead_of_waiting_read_timeout() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        // Two parity so data_shards + 1 shards are available without the slow one.
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            // Data shard 0 never resolves; without the hedge the stripe waits out
+            // the full 60s read timeout for it.
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![3_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        // Reconstruction verification selects the lockstep read path.
+        let mut parallel_reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            erasure,
+            0,
+            NUM_SHARDS * BLOCK_SIZE,
+            None,
+            vec![ShardReadCost::Unknown; 4],
+            Duration::from_secs(60),
+            true,
+        );
+        assert!(parallel_reader.verify_reconstruction, "test must exercise the lockstep read path");
+
+        let (bufs, errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
+            .await
+            .expect("lockstep read must hedge the slow shard instead of waiting out the 60s read timeout");
+
+        // The slow data shard was hedged: retired with a TimedOut error; the stripe
+        // reached data_shards + 1 shards from the healthy data + parity.
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(parallel_reader.readers[0].is_none());
+        assert!(bufs[0].is_none());
+        assert!(bufs[1].is_some());
+        assert!(bufs[2].is_some());
+        assert!(bufs[3].is_some());
+        assert_eq!(DATA_SHARDS + 1, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
+    /// Lockstep verification-quorum regression (backlog#1156). When a data shard is
+    /// missing, the hedge must settle only at `data_shards + 1` (decode quorum plus
+    /// a reconstruction-verification source), never at exactly `data_shards` — that
+    /// would silently skip reconstruction verification (erasure.rs verifies only
+    /// when `available_shards > data_shards`) and could stream a corrupt
+    /// reconstruction. Here `data1` and `parity2` are instant, `data0` is dead-slow,
+    /// and the verification-source `parity3` returns *after* the hedge delay. The
+    /// read must wait for `parity3` (reaching `data_shards + 1`) rather than settle
+    /// at `data_shards` and abandon it.
+    #[tokio::test]
+    async fn test_lockstep_hedge_waits_for_verification_quorum() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        // parity3 resolves 200ms in — after the 100ms hedge, but well under the
+        // 500ms test bound and the 60s read timeout.
+        let parity3_ready_at = TokioInstant::now() + Duration::from_millis(200);
+        let readers = vec![
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::ReadyAt {
+                    cursor: Cursor::new(vec![3_u8; SHARD_SIZE * NUM_SHARDS]),
+                    ready_at: parity3_ready_at,
+                    sleep: None,
+                },
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            erasure,
+            0,
+            NUM_SHARDS * BLOCK_SIZE,
+            None,
+            vec![ShardReadCost::Unknown; 4],
+            Duration::from_secs(60),
+            true,
+        );
+        assert!(parallel_reader.verify_reconstruction, "test must exercise the lockstep read path");
+
+        let (bufs, errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
+            .await
+            .expect("hedge must reach data_shards + 1, not stall to the 60s read timeout");
+
+        // data0 stays missing/retired; the verification-source parity3 was NOT
+        // abandoned at the hedge — the read waited for it to reach data_shards + 1.
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(parallel_reader.readers[0].is_none());
+        assert!(bufs[0].is_none());
+        assert!(bufs[1].is_some());
+        assert!(bufs[2].is_some());
+        assert!(bufs[3].is_some(), "verification-source parity must be used, not settled away");
+        assert!(parallel_reader.readers[3].is_some(), "verification-source parity must not be retired");
+        assert_eq!(DATA_SHARDS + 1, bufs.iter().filter(|buf| buf.is_some()).count());
     }
 
     #[tokio::test]
