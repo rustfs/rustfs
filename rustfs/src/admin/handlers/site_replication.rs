@@ -7604,11 +7604,11 @@ mod tests {
         );
 
         for host in ["public.test", "private.test", "localhost"] {
-            let addrs = reqwest::dns::Resolve::resolve(&resolver, host.parse().expect("resolver test hostname"))
+            let address_count = reqwest::dns::Resolve::resolve(&resolver, host.parse().expect("resolver test hostname"))
                 .await
                 .expect("allowed resolver result")
-                .collect::<Vec<_>>();
-            assert_eq!(addrs.len(), 1, "expected one allowed address for {host}");
+                .count();
+            assert_eq!(address_count, 1, "expected one allowed address for {host}");
         }
         for host in ["metadata.test", "alias.test", "mapped.test"] {
             assert!(
