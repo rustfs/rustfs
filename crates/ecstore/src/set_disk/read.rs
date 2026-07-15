@@ -4096,6 +4096,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bitrot_reader_setup_skips_deferred_slots_without_a_source() {
+        let setup = setup_inline_bitrot_readers_with_env(
+            vec![Some(b"aaaa"), Some(b"bbbb"), None, Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.deferred_shards(), 1);
+        assert!(setup.readers[2].is_none(), "a slot without inline data or a disk has no usable source");
+        assert!(matches!(setup.errors[2], Some(DiskError::DiskNotFound)));
+        assert!(setup.deferred_stripe_handles[2].is_none());
+        assert!(setup.readers[3].is_some(), "an inline shard remains available as a deferred fallback");
+        assert!(setup.deferred_stripe_handles[3].is_some());
+    }
+
+    #[tokio::test]
     async fn bitrot_reader_setup_preference_uses_data_blocks_first_without_env() {
         let setup = setup_inline_bitrot_readers_with_preference(
             vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
