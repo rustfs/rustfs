@@ -31,54 +31,15 @@
 
 mod ecstore_test_compat;
 
-use ecstore_test_compat::fixture::{
-    ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, SetupType, init_local_disks, update_erasure_type,
-};
+use ecstore_test_compat::fixture::{SetupType, update_erasure_type};
 use rustfs_iam::cache::Cache;
 use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::store::{GroupInfo, Store};
 use serial_test::serial;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 const TEST_GROUP: &str = "seq-restart-group";
 const TEST_MEMBERS: [&str; 2] = ["alice", "bob"];
-
-async fn build_local_ecstore(temp_dir: &std::path::Path) -> Arc<ECStore> {
-    let disk_paths: Vec<_> = (1..=4).map(|i| temp_dir.join(format!("disk{i}"))).collect();
-    for disk_path in &disk_paths {
-        tokio::fs::create_dir_all(disk_path).await.unwrap();
-    }
-
-    let mut endpoints = Vec::new();
-    for (i, disk_path) in disk_paths.iter().enumerate() {
-        let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(i);
-        endpoints.push(endpoint);
-    }
-
-    let pool_endpoints = PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: 4,
-        endpoints: Endpoints::from(endpoints),
-        cmd_line: "test".to_string(),
-        platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
-    };
-    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
-
-    init_local_disks(endpoint_pools.clone()).await.unwrap();
-
-    // Port 0 keeps this integration binary parallel-safe alongside other
-    // ECStore-backed tests.
-    let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
-        .await
-        .unwrap()
-}
 
 /// Restores single-node erasure mode even when an assertion panics, so a
 /// failing run cannot poison later `#[serial]` tests in this process.
@@ -97,7 +58,15 @@ async fn load_all_bypasses_namespace_lock_quorum() {
     // must be shortened before the first locked operation of this process.
     temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
         let temp_dir = tempfile::TempDir::with_prefix("rustfs_iam_no_lock_test_").unwrap();
-        let ecstore = build_local_ecstore(temp_dir.path()).await;
+        // Shared temp-disk ECStore env (rustfs-test-utils, backlog#1153 infra-1).
+        // base_dir keeps cleanup ownership with this TempDir; the historical
+        // bootstrap never initialized the bucket-metadata system, so opt out.
+        let ecstore = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp_dir.path())
+            .init_bucket_metadata(false)
+            .build()
+            .await
+            .ecstore;
         let store = ObjectStore::new(ecstore);
 
         // Seed IAM data while namespace locks still work (single-node mode).
