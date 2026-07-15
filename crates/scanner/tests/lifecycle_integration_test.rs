@@ -1752,4 +1752,262 @@ mod serial_tests {
 
         assert!(deleted, "background scanner should delete zero-day exact-key lifecycle targets");
     }
+
+    /// Read the full object body through the regular GET path.
+    async fn read_object_fully(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> Vec<u8> {
+        let mut reader = ecstore
+            .get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("Failed to open object reader");
+        let mut data = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut data)
+            .await
+            .expect("Failed to consume object stream");
+        data
+    }
+
+    /// backlog#1148 ilm-8: the full restore chain on a transitioned object.
+    ///
+    /// transition -> restore(days=1) -> the restored copy serves GET locally
+    /// (the mock tier records zero additional `get` calls) -> the scanner's
+    /// restore-expiry action (`DeleteRestoredAction`, driven directly like the
+    /// ilm-2 expiry test; the evaluator mapping from a past `restore_expires`
+    /// to this action is pinned by unit tests in crates/lifecycle) removes ONLY
+    /// the local restored copy -> the object is still transitioned, the remote
+    /// tier object is untouched (zero `remove` calls) -> GET streams from the
+    /// tier again -> a second restore succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
+    async fn test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-restore-chain-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "restore/report.bin";
+        // Position-dependent payload so a misaligned read is caught.
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("Failed to enqueue transition for existing objects");
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition before restore");
+        let remote_object = transitioned.transitioned_object.name.clone();
+
+        // Restore for one day.
+        let restore_opts = || ObjectOptions {
+            transition: TransitionOptions {
+                restore_request: RestoreRequest {
+                    days: Some(1),
+                    description: None,
+                    glacier_job_parameters: None,
+                    output_location: None,
+                    select_parameters: None,
+                    tier: None,
+                    type_: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ecstore
+            .clone()
+            .restore_transitioned_object(bucket_name.as_str(), object_name, &restore_opts())
+            .await
+            .expect("Failed to restore transitioned object");
+
+        let restored = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to load restored object info");
+        assert!(restored.restore_expires.is_some(), "restore must record an expiry date");
+        assert!(!restored.restore_ongoing, "restore must be complete");
+        assert_eq!(
+            restored.transitioned_object.status, "complete",
+            "restore must not clear the transitioned state"
+        );
+
+        // GET is served from the LOCAL restored copy: the mock tier records no
+        // further `get` calls.
+        let tier_gets_after_restore = backend.get_count().await;
+        let data = read_object_fully(&ecstore, bucket_name.as_str(), object_name).await;
+        assert_eq!(data, payload, "restored GET must return the original bytes");
+        assert_eq!(
+            backend.get_count().await,
+            tier_gets_after_restore,
+            "GET of a restored object must be served locally, not from the tier"
+        );
+
+        // The scanner's restore-expiry action removes only the local restored
+        // copy (same direct-drive pattern as the ilm-2 expiry test).
+        let lc_event = LcEvent {
+            action: IlmAction::DeleteRestoredAction,
+            ..Default::default()
+        };
+        expire_transitioned_object(ecstore.clone(), &restored, &lc_event, &LcEventSrc::Scanner)
+            .await
+            .expect("restore-expiry cleanup should succeed");
+
+        let after = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("object must still exist after restored-copy cleanup");
+        assert!(
+            after.restore_expires.is_none(),
+            "restore headers must be stripped by DeleteRestoredAction"
+        );
+        assert_eq!(
+            after.transitioned_object.status, "complete",
+            "the object must remain transitioned after restored-copy cleanup"
+        );
+        assert_eq!(backend.remove_count().await, 0, "restore-expiry must never remove the remote tier object");
+        assert!(
+            backend.contains(&remote_object).await,
+            "remote tier object must survive restored-copy cleanup"
+        );
+
+        // GET now streams from the tier again...
+        let tier_gets_before_remote_read = backend.get_count().await;
+        let data = read_object_fully(&ecstore, bucket_name.as_str(), object_name).await;
+        assert_eq!(data, payload, "post-cleanup GET must stream the original bytes from the tier");
+        assert!(
+            backend.get_count().await > tier_gets_before_remote_read,
+            "post-cleanup GET must hit the remote tier"
+        );
+
+        // ...and the object is restorable again.
+        ecstore
+            .clone()
+            .restore_transitioned_object(bucket_name.as_str(), object_name, &restore_opts())
+            .await
+            .expect("object must be restorable again after restored-copy cleanup");
+        let re_restored = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to load re-restored object info");
+        assert!(re_restored.restore_expires.is_some(), "second restore must record an expiry");
+    }
+
+    /// backlog#1148 ilm-8: restoring a transitioned MULTIPART object (>= 3
+    /// parts) must reassemble the exact part layout: part count and sizes,
+    /// the multipart ETag, and byte-identical content across part boundaries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
+    async fn test_multipart_restore_preserves_parts_and_etag() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let _backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-restore-mpu3-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "restore/multipart.bin";
+        // Three parts: 5 MiB + 5 MiB + small tail, with position-dependent
+        // bytes so any part-boundary mixup is caught.
+        let part_sizes = [5 * 1024 * 1024usize, 5 * 1024 * 1024, 4096];
+        let total: usize = part_sizes.iter().sum();
+        let expected: Vec<u8> = (0..total).map(|i| (i % 249) as u8).collect();
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let upload = ecstore
+            .new_multipart_upload(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to create multipart upload");
+        let mut completed = Vec::new();
+        let mut offset = 0usize;
+        for (idx, part_size) in part_sizes.iter().enumerate() {
+            let mut reader = PutObjReader::from_vec(expected[offset..offset + part_size].to_vec());
+            let part = ecstore
+                .put_object_part(
+                    bucket_name.as_str(),
+                    object_name,
+                    &upload.upload_id,
+                    idx + 1,
+                    &mut reader,
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("Failed to upload multipart part");
+            completed.push(CompletePart {
+                part_num: idx + 1,
+                etag: part.etag.clone(),
+                ..Default::default()
+            });
+            offset += part_size;
+        }
+        ecstore
+            .clone()
+            .complete_multipart_upload(bucket_name.as_str(), object_name, &upload.upload_id, completed, &ObjectOptions::default())
+            .await
+            .expect("Failed to complete multipart upload");
+
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("Failed to enqueue transition for existing objects");
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("multipart object should transition before restore");
+        assert_eq!(transitioned.parts.len(), part_sizes.len());
+        let etag_before = transitioned.etag.clone();
+        assert!(
+            etag_before.as_deref().is_some_and(|etag| etag.ends_with("-3")),
+            "expected a 3-part multipart etag, got {etag_before:?}"
+        );
+
+        ecstore
+            .clone()
+            .restore_transitioned_object(
+                bucket_name.as_str(),
+                object_name,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        restore_request: RestoreRequest {
+                            days: Some(1),
+                            description: None,
+                            glacier_job_parameters: None,
+                            output_location: None,
+                            select_parameters: None,
+                            tier: None,
+                            type_: None,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to restore transitioned multipart object");
+
+        let restored = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to load restored multipart object info");
+        assert!(restored.restore_expires.is_some());
+        assert!(!restored.restore_ongoing);
+        assert_eq!(restored.parts.len(), part_sizes.len(), "restore must preserve the part count");
+        for (idx, part_size) in part_sizes.iter().enumerate() {
+            assert_eq!(restored.parts[idx].size, *part_size, "restore must preserve the size of part {}", idx + 1);
+        }
+        assert_eq!(restored.etag, etag_before, "restore must preserve the multipart ETag");
+
+        let data = read_object_fully(&ecstore, bucket_name.as_str(), object_name).await;
+        assert_eq!(data.len(), expected.len(), "restored multipart read-back length mismatch");
+        assert_eq!(data, expected, "restored multipart read-back must be byte-identical");
+    }
 }
