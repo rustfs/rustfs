@@ -75,6 +75,14 @@ jobs:
     name: Build + cache baseline binary
     if: github.event_name == 'push'
     runs-on: sm-standard-2
+    # Latest-wins: consumers only ever restore the binary for the *current*
+    # origin/main tip, so when pushes land faster than the ~65min build, a
+    # superseded build's output is dead weight — cancel it instead of stacking
+    # hour-long jobs on the shared runner pool. A skipped intermediate SHA at
+    # most costs one same-commit self-heal in the A/B job.
+    concurrency:
+      group: perf-baseline-build-main
+      cancel-in-progress: true
     # #4806 put thin LTO + codegen-units=1 on [profile.release], pushing a
     # single release build past 60min on this runner — every cache build on
     # 2026-07-15 died on the old 60min ceiling ("exceeded the maximum execution
