@@ -965,7 +965,7 @@ pub async fn abort_incomplete_multipart_upload_due(
         .min_by_key(|(due, _)| due.unix_timestamp_nanos())
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ObjectOpts {
     pub name: String,
     pub user_tags: String,
@@ -3455,5 +3455,517 @@ mod tests {
         let event = lc.eval_inner(&opts, now, 0).await;
         // Without ExpiredObjectAllVersions, should use normal DeleteAction
         assert_eq!(event.action, IlmAction::DeleteAction);
+    }
+
+    /// Property-based tests for the rule evaluator (backlog#1148 ilm-14,
+    /// follow-up to backlog#1030 / rustfs#4455).
+    ///
+    /// backlog#1030 found that the old hand-written winner comparator was not a
+    /// strict weak ordering and could panic — proof that enumerated cases do
+    /// not cover the space of colliding events. These properties pin, over
+    /// randomized rule sets and object states:
+    ///
+    /// * `eval_inner` never panics and is deterministic for a fixed input;
+    /// * the winning event matches an independently recomputed candidate set:
+    ///   earliest `due` wins, ties break toward delete-class actions (the
+    ///   `min_by_key` selection that replaced the rustfs#4455 comparator);
+    /// * `expected_expiry_time` is monotonically non-decreasing in `days` and
+    ///   always lands on the processing boundary, both at production defaults
+    ///   and under an explicit `RUSTFS_ILM_PROCESS_TIME`.
+    ///
+    /// Case counts are tuned so the whole module runs in seconds inside the
+    /// default CI test job.
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+        use s3s::dto::{NoncurrentVersionExpiration, Tag};
+        use serial_test::serial;
+
+        const DAY_SECS: i64 = 86400;
+
+        /// Fixed positive anchor so generated instants stay in a realistic
+        /// range; strategies explore offsets around it.
+        fn base() -> OffsetDateTime {
+            datetime!(2025-01-01 00:00:00 UTC)
+        }
+
+        fn ts(offset_secs: i64) -> OffsetDateTime {
+            base() + Duration::seconds(offset_secs)
+        }
+
+        /// Pin the day length and processing boundary to production defaults
+        /// for the duration of `f`. `temp_env` also serializes environment
+        /// access against the other env-sensitive tests in this file.
+        fn with_production_time_env<T>(f: impl FnOnce() -> T) -> T {
+            temp_env::with_vars(
+                [
+                    (ENV_ILM_DEBUG_DAY_SECS, None::<&str>),
+                    (ENV_ILM_PROCESS_TIME, None),
+                    (ENV_ILM_PROCESS_TIME_DEPRECATED, None),
+                ],
+                f,
+            )
+        }
+
+        fn arb_opt_time(window_secs: i64) -> impl Strategy<Value = Option<OffsetDateTime>> {
+            prop_oneof![
+                2 => Just(None),
+                1 => Just(Some(OffsetDateTime::UNIX_EPOCH)),
+                5 => (-window_secs..window_secs).prop_map(|s| Some(ts(s))),
+            ]
+        }
+
+        fn arb_object_name() -> impl Strategy<Value = String> {
+            prop_oneof![
+                1 => Just(String::new()),
+                3 => Just("docs/report.txt".to_string()),
+                2 => Just("logs/app.log".to_string()),
+                1 => "[a-z]{1,12}",
+            ]
+        }
+
+        fn arb_user_tags() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just(String::new()),
+                Just("env=prod".to_string()),
+                Just("env=prod&team=storage".to_string()),
+                Just("team=storage".to_string()),
+            ]
+        }
+
+        fn arb_transition_status() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just(String::new()),
+                Just(TRANSITION_PENDING.to_string()),
+                Just(TRANSITION_COMPLETE.to_string()),
+            ]
+        }
+
+        prop_compose! {
+            fn arb_object_identity()(
+                name in arb_object_name(),
+                user_tags in arb_user_tags(),
+                mod_time in arb_opt_time(4 * DAY_SECS),
+                size in prop_oneof![Just(0usize), (1usize..1_048_576), Just(usize::MAX >> 1)],
+                version_id in prop_oneof![Just(None), Just(Some(Uuid::nil())), Just(Some(Uuid::from_u128(7)))],
+                is_latest in any::<bool>(),
+                delete_marker in any::<bool>(),
+            ) -> (String, String, Option<OffsetDateTime>, usize, Option<Uuid>, bool, bool) {
+                (name, user_tags, mod_time, size, version_id, is_latest, delete_marker)
+            }
+        }
+
+        prop_compose! {
+            /// Random object state across the version-chain dimensions: chain
+            /// position (`is_latest` / `num_versions` / `successor_mod_time`),
+            /// delete markers, suspension, and transition status.
+            fn arb_object_opts()(
+                (name, user_tags, mod_time, size, version_id, is_latest, delete_marker) in arb_object_identity(),
+                num_versions in 0usize..4,
+                successor_mod_time in arb_opt_time(4 * DAY_SECS),
+                transition_status in arb_transition_status(),
+                restore_ongoing in any::<bool>(),
+                restore_expires in arb_opt_time(2 * DAY_SECS),
+                versioned in any::<bool>(),
+                version_suspended in any::<bool>(),
+            ) -> ObjectOpts {
+                ObjectOpts {
+                    name,
+                    user_tags,
+                    mod_time,
+                    size,
+                    version_id,
+                    is_latest,
+                    delete_marker,
+                    num_versions,
+                    successor_mod_time,
+                    transition_status,
+                    restore_ongoing,
+                    restore_expires,
+                    versioned,
+                    version_suspended,
+                    ..Default::default()
+                }
+            }
+        }
+
+        fn arb_prefix() -> impl Strategy<Value = Option<String>> {
+            prop_oneof![
+                3 => Just(None),
+                1 => Just(Some(String::new())),
+                2 => Just(Some("docs/".to_string())),
+                1 => Just(Some("logs/".to_string())),
+            ]
+        }
+
+        fn arb_filter() -> impl Strategy<Value = Option<LifecycleRuleFilter>> {
+            prop_oneof![
+                4 => Just(None),
+                1 => Just(Some(LifecycleRuleFilter {
+                    prefix: Some("docs/".to_string()),
+                    ..Default::default()
+                })),
+                1 => Just(Some(LifecycleRuleFilter {
+                    tag: Some(Tag {
+                        key: Some("env".to_string()),
+                        value: Some("prod".to_string()),
+                    }),
+                    ..Default::default()
+                })),
+                1 => (0i64..2048).prop_map(|gt| Some(LifecycleRuleFilter {
+                    object_size_greater_than: Some(gt),
+                    ..Default::default()
+                })),
+            ]
+        }
+
+        prop_compose! {
+            fn arb_expiration()(
+                date_off in prop::option::of(-2 * DAY_SECS..2 * DAY_SECS),
+                days in prop::option::of(0i32..4),
+                delete_marker_flag in prop::option::of(any::<bool>()),
+                all_versions in prop::option::of(any::<bool>()),
+            ) -> LifecycleExpiration {
+                LifecycleExpiration {
+                    date: date_off.map(|s| ts(s).into()),
+                    days,
+                    expired_object_delete_marker: delete_marker_flag,
+                    expired_object_all_versions: all_versions,
+                }
+            }
+        }
+
+        prop_compose! {
+            fn arb_transition()(
+                date_off in prop::option::of(-2 * DAY_SECS..2 * DAY_SECS),
+                days in prop::option::of(0i32..4),
+                storage_class in prop_oneof![
+                    Just(None),
+                    Just(Some(TransitionStorageClass::from_static(""))),
+                    Just(Some(TransitionStorageClass::from_static("COLD"))),
+                ],
+            ) -> Transition {
+                Transition {
+                    date: date_off.map(|s| ts(s).into()),
+                    days,
+                    storage_class,
+                }
+            }
+        }
+
+        prop_compose! {
+            /// Fully random rule across every dimension the evaluator reads:
+            /// Days/Date expiration and transition, prefix, tag/size filters,
+            /// noncurrent actions, delete-marker actions, AllVersions.
+            fn arb_rule()(
+                enabled in prop::bool::weighted(0.8),
+                id in prop::option::of("[a-z]{1,6}"),
+                prefix in arb_prefix(),
+                filter in arb_filter(),
+                expiration in prop::option::of(arb_expiration()),
+                transitions in prop::option::of(prop::collection::vec(arb_transition(), 0..2)),
+                nc_exp in prop::option::of((prop::option::of(0i32..4), prop::option::of(0i32..3))),
+                nc_tr in prop::option::of((prop::option::of(0i32..4), any::<bool>())),
+                dme_days in prop::option::of(0i32..3),
+                abort_days in prop::option::of(0i32..3),
+            ) -> LifecycleRule {
+                LifecycleRule {
+                    status: if enabled {
+                        ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+                    } else {
+                        ExpirationStatus::from_static(ExpirationStatus::DISABLED)
+                    },
+                    id,
+                    prefix,
+                    filter,
+                    expiration,
+                    transitions,
+                    noncurrent_version_expiration: nc_exp.map(|(noncurrent_days, newer_noncurrent_versions)| {
+                        NoncurrentVersionExpiration {
+                            noncurrent_days,
+                            newer_noncurrent_versions,
+                        }
+                    }),
+                    noncurrent_version_transitions: nc_tr.map(|(noncurrent_days, has_sc)| {
+                        vec![NoncurrentVersionTransition {
+                            noncurrent_days,
+                            newer_noncurrent_versions: None,
+                            storage_class: has_sc.then(|| TransitionStorageClass::from_static("COLD")),
+                        }]
+                    }),
+                    del_marker_expiration: dme_days.map(|days| s3s::dto::DelMarkerExpiration { days: Some(days) }),
+                    abort_incomplete_multipart_upload: abort_days.map(|days| {
+                        s3s::dto::AbortIncompleteMultipartUpload {
+                            days_after_initiation: Some(days),
+                        }
+                    }),
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(96))]
+
+            /// `eval_inner` must never panic on any rule/object/now
+            /// combination, and must be deterministic: the same input
+            /// evaluated twice yields an identical event.
+            #[test]
+            #[serial]
+            fn eval_inner_never_panics_and_is_deterministic(
+                rules in prop::collection::vec(arb_rule(), 0..4),
+                obj in arb_object_opts(),
+                now_off in (-4 * DAY_SECS)..(8 * DAY_SECS),
+                newer_noncurrent in 0usize..4,
+            ) {
+                let lc = BucketLifecycleConfiguration {
+                    expiry_updated_at: None,
+                    rules,
+                };
+                let now = ts(now_off);
+                let (first, second) = block_on_with_env(&[], || async {
+                    let first = lc.eval_inner(&obj, now, newer_noncurrent).await;
+                    let second = lc.eval_inner(&obj, now, newer_noncurrent).await;
+                    (first, second)
+                });
+                prop_assert_eq!(first.action, second.action);
+                prop_assert_eq!(&first.rule_id, &second.rule_id);
+                prop_assert_eq!(first.due, second.due);
+                prop_assert_eq!(&first.storage_class, &second.storage_class);
+            }
+        }
+
+        /// One oracle candidate: `(due unix timestamp, action rank)` with rank
+        /// 0 for delete-class actions and 1 otherwise.
+        type Candidate = (i64, u8);
+
+        /// Independent re-statement of the delete-class rank. Deliberately NOT
+        /// `ilm_action_priority_rank`: the winner assertion classifies the
+        /// actual event with this copy, so a regression in the production rank
+        /// function cannot silently re-rank both sides of the comparison.
+        fn oracle_rank(action: &IlmAction) -> u8 {
+            match action {
+                IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction
+                | IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction => 0,
+                _ => 1,
+            }
+        }
+
+        /// Independently recompute the eligible event set `eval_inner` should
+        /// consider for a live current version under `selection`-shaped rules
+        /// (expiration and first-transition only, no filters): expiration
+        /// fires when `now >= due`, transition when `now > due` and the object
+        /// has not already transitioned. Selection semantics under test:
+        /// earliest due wins, ties prefer delete-class.
+        fn oracle_candidates(lc: &BucketLifecycleConfiguration, obj: &ObjectOpts, now: OffsetDateTime) -> Vec<Candidate> {
+            let mod_time = obj.mod_time.expect("selection strategy always sets mod_time");
+            let mut candidates = Vec::new();
+            for rule in &lc.rules {
+                if let Some(expiration) = &rule.expiration {
+                    // Mirrors the eval branches: a Date-based expiry needs a
+                    // non-zero date and fires when `now >= date`; a Days-based
+                    // expiry fires when `now >= expected_expiry_time`.
+                    if let Some(date) = &expiration.date {
+                        let due = OffsetDateTime::from(date.clone());
+                        if due.unix_timestamp() != 0 && now.unix_timestamp() >= due.unix_timestamp() {
+                            candidates.push((due.unix_timestamp(), 0));
+                        }
+                    } else if let Some(days) = expiration.days {
+                        let due = expected_expiry_time(mod_time, days);
+                        if now.unix_timestamp() >= due.unix_timestamp() {
+                            candidates.push((due.unix_timestamp(), 0));
+                        }
+                    }
+                }
+                if obj.transition_status != TRANSITION_COMPLETE
+                    && let Some(transition) = rule.transitions.as_ref().and_then(|transitions| transitions.first())
+                    && transition.storage_class.as_ref().is_some_and(|sc| !sc.as_str().is_empty())
+                {
+                    let due = if let Some(date) = &transition.date {
+                        Some(OffsetDateTime::from(date.clone()))
+                    } else {
+                        transition.days.map(|days| expected_expiry_time(mod_time, days))
+                    };
+                    if let Some(due) = due
+                        && now.unix_timestamp() > due.unix_timestamp()
+                    {
+                        candidates.push((due.unix_timestamp(), 1));
+                    }
+                }
+            }
+            candidates
+        }
+
+        prop_compose! {
+            /// Rules restricted to the shapes the selection oracle models:
+            /// enabled, unfiltered, with exactly one of Date/Days per action so
+            /// the Date-over-Days precedence inside one action never applies.
+            fn arb_selection_rule()(
+                kind in 0u8..3,
+                exp_by_date in any::<bool>(),
+                exp_date_off in (-2 * DAY_SECS)..(2 * DAY_SECS),
+                exp_days in 0i32..4,
+                all_versions in any::<bool>(),
+                tr_by_date in any::<bool>(),
+                tr_date_off in (-2 * DAY_SECS)..(2 * DAY_SECS),
+                tr_days in 0i32..4,
+                id in "[a-z]{1,6}",
+            ) -> LifecycleRule {
+                let expiration = (kind != 1).then(|| LifecycleExpiration {
+                    date: exp_by_date.then(|| ts(exp_date_off).into()),
+                    days: (!exp_by_date).then_some(exp_days),
+                    expired_object_delete_marker: None,
+                    expired_object_all_versions: all_versions.then_some(true),
+                });
+                let transitions = (kind != 0).then(|| {
+                    vec![Transition {
+                        date: tr_by_date.then(|| ts(tr_date_off).into()),
+                        days: (!tr_by_date).then_some(tr_days),
+                        storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                    }]
+                });
+                LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    id: Some(id),
+                    prefix: None,
+                    filter: None,
+                    expiration,
+                    transitions,
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    del_marker_expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            /// Differential test of winner selection (the rustfs#4455 fix):
+            /// for a live current version under randomized expiration and
+            /// transition rules, `eval_inner`'s winner must carry the
+            /// minimum `(due, rank)` of the independently recomputed
+            /// candidate set — earliest due wins, ties prefer delete-class —
+            /// and must be `NoneAction` exactly when that set is empty.
+            #[test]
+            #[serial]
+            fn eval_inner_winner_matches_selection_oracle(
+                rules in prop::collection::vec(arb_selection_rule(), 0..5),
+                mod_off in 0i64..(2 * DAY_SECS),
+                now_off in (-DAY_SECS)..(6 * DAY_SECS),
+                already_transitioned in any::<bool>(),
+            ) {
+                let lc = BucketLifecycleConfiguration {
+                    expiry_updated_at: None,
+                    rules,
+                };
+                let obj = ObjectOpts {
+                    name: "docs/report.txt".to_string(),
+                    mod_time: Some(ts(mod_off)),
+                    is_latest: true,
+                    transition_status: if already_transitioned {
+                        TRANSITION_COMPLETE.to_string()
+                    } else {
+                        String::new()
+                    },
+                    ..Default::default()
+                };
+                let now = ts(now_off);
+
+                // Oracle and evaluator must observe the same (pinned) time env.
+                let (event, expected) = with_production_time_env(|| {
+                    let expected = oracle_candidates(&lc, &obj, now).into_iter().min();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build runtime");
+                    let event = rt.block_on(lc.eval_inner(&obj, now, 0));
+                    (event, expected)
+                });
+
+                match expected {
+                    None => prop_assert_eq!(event.action, IlmAction::NoneAction),
+                    Some((due_ts, rank)) => {
+                        prop_assert_ne!(event.action, IlmAction::NoneAction);
+                        let actual_due = event.due.expect("winning event carries a due").unix_timestamp();
+                        prop_assert_eq!(actual_due, due_ts);
+                        prop_assert_eq!(oracle_rank(&event.action), rank);
+                    }
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// At production defaults `expected_expiry_time` is monotonically
+            /// non-decreasing in `days` (days == 0 maps to UNIX_EPOCH, below
+            /// any post-1970 deadline).
+            #[test]
+            #[serial]
+            fn expected_expiry_time_is_monotonic_in_days(
+                mod_off in 0i64..(3650 * DAY_SECS),
+                d1 in 0i32..2000,
+                d2 in 0i32..2000,
+            ) {
+                let (lo, hi) = if d1 <= d2 { (d1, d2) } else { (d2, d1) };
+                let mod_time = ts(mod_off);
+                let (e_lo, e_hi) = with_production_time_env(|| {
+                    (expected_expiry_time(mod_time, lo), expected_expiry_time(mod_time, hi))
+                });
+                prop_assert!(
+                    e_lo <= e_hi,
+                    "expected_expiry_time not monotonic: days={} -> {:?}, days={} -> {:?}",
+                    lo, e_lo, hi, e_hi
+                );
+            }
+
+            /// At production defaults every Days-based deadline is rounded up
+            /// to the next whole-day boundary: the result is day-aligned, not
+            /// before `mod_time + days`, and less than one boundary beyond it.
+            #[test]
+            #[serial]
+            fn expected_expiry_time_lands_on_default_day_boundary(
+                mod_off in 0i64..(3650 * DAY_SECS),
+                days in 1i32..2000,
+            ) {
+                let mod_time = ts(mod_off);
+                let result = with_production_time_env(|| expected_expiry_time(mod_time, days));
+                let boundary_nanos = i128::from(DAY_SECS) * 1_000_000_000;
+                prop_assert_eq!(result.unix_timestamp_nanos().rem_euclid(boundary_nanos), 0);
+                let raw = mod_time + Duration::seconds(i64::from(days) * DAY_SECS);
+                prop_assert!(result >= raw);
+                prop_assert!(result - raw < Duration::seconds(DAY_SECS));
+            }
+
+            /// With an explicit `RUSTFS_ILM_PROCESS_TIME`, deadlines round up
+            /// to that boundary instead: aligned to it, never early, and less
+            /// than one boundary late.
+            #[test]
+            #[serial]
+            fn expected_expiry_time_lands_on_explicit_process_boundary(
+                mod_off in 0i64..(365 * DAY_SECS),
+                days in 1i32..400,
+                boundary in 1u32..7200,
+            ) {
+                let mod_time = ts(mod_off);
+                let boundary_str = boundary.to_string();
+                let result = temp_env::with_vars(
+                    [
+                        (ENV_ILM_DEBUG_DAY_SECS, None::<&str>),
+                        (ENV_ILM_PROCESS_TIME, Some(boundary_str.as_str())),
+                        (ENV_ILM_PROCESS_TIME_DEPRECATED, None),
+                    ],
+                    || expected_expiry_time(mod_time, days),
+                );
+                let boundary_nanos = i128::from(boundary) * 1_000_000_000;
+                prop_assert_eq!(result.unix_timestamp_nanos().rem_euclid(boundary_nanos), 0);
+                let raw = mod_time + Duration::seconds(i64::from(days) * DAY_SECS);
+                prop_assert!(result >= raw);
+                prop_assert!(result - raw < Duration::seconds(i64::from(boundary)));
+            }
+        }
     }
 }
