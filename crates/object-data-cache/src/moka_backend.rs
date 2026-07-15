@@ -940,22 +940,28 @@ mod tests {
         const ITERS: usize = 400;
         const KEYS: usize = 6; // small pool → heavy contention on shared identities
 
+        let stress_plans: Arc<Vec<_>> = Arc::new(
+            (0..KEYS)
+                .map(|k| versioned_plan(&format!("object-{}", k % 3), &format!("v{k}"), &format!("etag-{k}")))
+                .collect(),
+        );
         let mut handles = Vec::new();
         for t in 0..TASKS {
             let backend = Arc::clone(&backend);
+            let stress_plans = Arc::clone(&stress_plans);
             handles.push(tokio::spawn(async move {
                 for i in 0..ITERS {
                     let k = (t + i) % KEYS;
                     let object = format!("object-{}", k % 3);
-                    let plan = versioned_plan(&object, &format!("v{k}"), &format!("etag-{k}"));
+                    let plan = &stress_plans[k];
                     // Deterministic per-(task,iter) mix: mostly fills, plus
                     // lookups and invalidations racing against them.
                     match (t + i) % 4 {
                         0 | 1 => {
-                            let _ = backend.fill_body(&plan, Bytes::from_static(b"hello")).await;
+                            let _ = backend.fill_body(plan, Bytes::from_static(b"hello")).await;
                         }
                         2 => {
-                            let _ = backend.lookup_body(&plan).await;
+                            let _ = backend.lookup_body(plan).await;
                         }
                         _ => {
                             let identity = ObjectDataCacheIdentity::new("bucket", object.as_str());
@@ -995,7 +1001,17 @@ mod tests {
         );
 
         let _ = backend.clear().await;
-        assert_eq!(backend.entry_count(), 0, "clear() must drop every entry");
+        for plan in stress_plans.iter().chain(std::iter::once(&clean)) {
+            assert!(
+                matches!(backend.lookup_body(plan).await, ObjectDataCacheLookup::Miss),
+                "clear() must make every exercised key unobservable"
+            );
+        }
+        assert!(
+            backend.cache.iter().next().is_none(),
+            "clear() must expose no entries through iteration (approximate entry count: {})",
+            backend.entry_count()
+        );
     }
 
     /// A memory-constrained container (low snapshot) must reject an entire
