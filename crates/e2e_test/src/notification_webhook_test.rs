@@ -537,15 +537,20 @@ async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     let client = env.create_s3_client();
     client.create_bucket().bucket(bucket).send().await?;
 
-    // Reserve a port but leave it unbound: the webhook endpoint is
-    // unreachable (connection refused -> retryable NotConnected), so the first
-    // delivery attempts fail and the event is persisted to the queue store.
-    let port = RustFSTestEnvironment::find_available_port().await?;
+    // Register the target while it is reachable, then stop the collector so the
+    // object event is persisted to the queue store while delivery is offline.
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let port = listener.local_addr()?.port();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let handle = serve_event_collector(listener, tx.clone());
     let endpoint_ip = local_ip()?;
     let endpoint = format!("http://{endpoint_ip}.nip.io:{port}/events");
     configure_webhook_target(&env, target, &endpoint).await?;
     wait_for_target_registered(&env, target).await?;
     put_notification_config(&client, bucket, target, "uploads/", ".dat").await?;
+
+    handle.abort();
+    let _ = handle.await;
 
     let key = "uploads/redeliver.dat";
     client
@@ -559,7 +564,6 @@ async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     // Bring the endpoint up on the reserved port; the replay worker retries with
     // exponential backoff and delivers the queued event.
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    let (tx, mut rx) = mpsc::unbounded_channel();
     let handle = serve_event_collector(listener, tx);
 
     let redelivered = wait_for_event(&mut rx, key, "s3:ObjectCreated:", Duration::from_secs(45)).await?;
