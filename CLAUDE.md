@@ -31,6 +31,8 @@ make build-docker BUILD_OS=ubuntu22.04
 - Architecture, layering, crate map: [ARCHITECTURE.md](ARCHITECTURE.md)
 - Migration guardrails & readiness contracts: [docs/architecture/](docs/architecture/README.md)
 - CI gates: `.github/workflows/ci.yml` (source of truth; never copy its steps into docs)
+- Test-layer taxonomy, per-layer entry commands, serial/nextest rules, flake
+  policy: [docs/testing/README.md](docs/testing/README.md)
 - Tier/ILM transition debugging (xl.meta inspection, versionId tracing):
   [docs/operations/tier-ilm-debugging.md](docs/operations/tier-ilm-debugging.md)
 
