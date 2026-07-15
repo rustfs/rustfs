@@ -41,6 +41,10 @@ on:
         type: boolean
   pull_request:
     types: [labeled, synchronize, reopened]
+  push:
+    # Every main commit pre-builds and caches its release binary (perf-3) so the
+    # nightly A/B restores a ready baseline instead of paying the double build.
+    branches: [main]
 
 permissions:
   contents: read
@@ -58,22 +62,67 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # perf-3: on every push to main, build the release binary once and cache it
+  # keyed by commit SHA (rustfs-baseline-<sha>). The nightly A/B (and, later, the
+  # perf-7 PR gate) restore this instead of paying the ~32min-per-side source
+  # build. That double build is what pushed the expanded 24-cell nightly past its
+  # ceiling — 2026-07-11..07-14 all cancelled on the 120min timeout. Incremental
+  # builds off the shared cargo cache keep each push cheap, and building on the
+  # same sm-standard-2 runner the A/B measures on guarantees the cached binary is
+  # ABI-identical. Do NOT source this from build.yml's per-merge artifact: those
+  # are cancelled ~7/8 of the time and are not a reliable baseline.
+  build-baseline-cache:
+    name: Build + cache baseline binary
+    if: github.event_name == 'push'
+    runs-on: sm-standard-2
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: warp-ab-${{ hashFiles('**/Cargo.lock') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build release rustfs
+        run: cargo build --release --bin rustfs
+
+      - name: Stage binary for cache
+        run: |
+          set -euo pipefail
+          mkdir -p baseline-bin
+          cp target/release/rustfs baseline-bin/rustfs
+
+      - name: Cache baseline binary by SHA
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: baseline-bin/rustfs
+          key: rustfs-baseline-${{ github.sha }}
+
   warp-ab:
     name: Warp A/B budget gate
-    # Opt-in on PRs: only run when the `perf-ab` label is present, and for
-    # `labeled` events only when the label being added is `perf-ab` itself —
-    # adding an unrelated label to an opted-in PR must not re-run the gate.
-    # Always run on schedule / manual dispatch.
+    # Always run on schedule / manual dispatch. Opt-in on PRs: only when the
+    # `perf-ab` label is present, and for `labeled` events only when the label
+    # being added is `perf-ab` itself (adding an unrelated label to an opted-in
+    # PR must not re-run the gate). Never on push — that event only feeds
+    # build-baseline-cache above.
     if: >-
-      github.event_name != 'pull_request' ||
-      (contains(github.event.pull_request.labels.*.name, 'perf-ab') &&
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'perf-ab') &&
        (github.event.action != 'labeled' || github.event.label.name == 'perf-ab'))
     runs-on: sm-standard-2
-    # Phase-0 stopgap: the baseline+candidate release double-build alone is
-    # ~65min on this runner, so 90min left no room for a real full-matrix
-    # measurement (the earlier nightly runs only ever failed *before*
-    # measuring). 120min gives the 24-cell short matrix headroom until perf-3
-    # caches the baseline binary and restores a tighter budget.
+    # With perf-3's cached baseline binary the common (cache-hit) nightly is
+    # measurement-only and finishes well under 50min. This ceiling stays
+    # generous only to absorb the rare cache-miss fallback, which reverts to the
+    # ~65min source double-build; a timeout there now surfaces via the
+    # alert-on-failure job (it fires on cancelled/timed-out, not just failure).
+    # perf-6 recalibrates the budget once the noise study lands.
     timeout-minutes: 120
     steps:
       - name: Checkout repository
@@ -110,21 +159,74 @@ jobs:
           fi
           echo "allow_regression=$allow" >> "$GITHUB_OUTPUT"
 
+      # perf-3: resolve the commits so the cache can be keyed by SHA. The
+      # baseline is origin/main; the candidate is the checked-out ref. On the
+      # nightly (checkout == main) they are the same commit, so one cached binary
+      # serves both phases and the run does zero source builds.
+      - name: Resolve baseline / candidate commits
+        id: commits
+        run: |
+          set -euo pipefail
+          baseline_sha="$(git rev-parse origin/main)"
+          candidate_sha="$(git rev-parse HEAD)"
+          echo "baseline_sha=$baseline_sha" >> "$GITHUB_OUTPUT"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "baseline commit: $baseline_sha"
+          echo "candidate commit: $candidate_sha"
+
+      # Exact-key restore of the baseline binary built by build-baseline-cache
+      # when origin/main last landed. A miss (binary evicted or not built yet)
+      # leaves cache-hit unset and the rig falls back to a source build.
+      - name: Restore cached baseline binary
+        id: baseline_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: baseline-bin/rustfs
+          key: rustfs-baseline-${{ steps.commits.outputs.baseline_sha }}
+
       - name: Run warp A/B and gate
         id: ab
         run: |
           set -euo pipefail
-          # Budget note: the baseline+candidate release double-build (~65 min,
-          # cached away later by perf-3) dominates the 90-min job, so the
-          # measurement runs a short warp matrix — duration/rounds/cooldown are
-          # kept small to fit all 24 cells (6 workloads x 2 phases x 2 drive-sync)
-          # under budget rather than dropping cells. --health-timeout 180 outlasts
-          # the server's own 120s startup-readiness budget, which is what the
-          # rig's previous 60s health poll undershot (the first two nightly
-          # failures). perf-6 will recalibrate these once the pipeline is green.
+          # Budget note: with perf-3's cached baseline the nightly does no source
+          # build on a cache hit, so the wall-clock is dominated by the short warp
+          # matrix — duration/rounds/cooldown are kept small to fit all 24 cells
+          # (6 workloads x 2 phases x 2 drive-sync) rather than dropping cells.
+          # --health-timeout 180 outlasts the server's own 120s startup-readiness
+          # budget, which the rig's previous 60s health poll undershot (the first
+          # two nightly failures). perf-6 recalibrates these once the noise study
+          # lands.
           duration="${{ github.event.inputs.duration || '12s' }}"
-          args=(--baseline-ref origin/main
-            --duration "$duration" --rounds 2 --cooldown 5 --health-timeout 180)
+          baseline_sha="${{ steps.commits.outputs.baseline_sha }}"
+          candidate_sha="${{ steps.commits.outputs.candidate_sha }}"
+          baseline_hit="${{ steps.baseline_cache.outputs.cache-hit }}"
+
+          args=(--duration "$duration" --rounds 2 --cooldown 5 --health-timeout 180)
+
+          if [[ "$baseline_hit" == "true" ]]; then
+            chmod +x baseline-bin/rustfs
+            base_bin="$PWD/baseline-bin/rustfs"
+            args+=(--baseline-bin "$base_bin")
+            base_src="actions-cache (rustfs-baseline-$baseline_sha)"
+            if [[ "$candidate_sha" == "$baseline_sha" ]]; then
+              # Nightly on main: the candidate is the same commit as the baseline,
+              # so reuse the one cached binary for both phases and skip all builds.
+              args+=(--candidate-bin "$base_bin" --skip-build)
+              cand_src="actions-cache (same commit as baseline)"
+            else
+              cand_src="source build of the checked-out ref"
+            fi
+          else
+            # Cache miss (binary evicted or not built for this SHA): fall back to
+            # the slow source double-build so the run still produces a result.
+            args+=(--baseline-ref origin/main)
+            base_src="source build of origin/main (cache miss)"
+            cand_src="source build of the checked-out ref"
+          fi
+
+          args+=(--provenance-note "baseline commit: $baseline_sha - $base_src")
+          args+=(--provenance-note "candidate commit: $candidate_sha - $cand_src")
+
           if [[ "${{ steps.exempt.outputs.allow_regression }}" == "true" ]]; then
             args+=(--allow-regression --exemption-reason "labeled perf-deliberate-tradeoff / dispatch override")
           fi
@@ -201,12 +303,8 @@ jobs:
         run: |
           gh pr comment "${{ github.event.pull_request.number }}" --body-file "${{ steps.ab.outputs.gate_md }}"
 
-      # TODO(ci-8/perf-2): scheduled/dispatch failures are currently silent. Once
-      # ci-8 lands the .github/actions/schedule-failure-issue composite action,
-      # perf-2 adds a step here guarded by
-      #   if: failure() && github.event_name != 'pull_request'
-      # that calls it (label perf-nightly-failure, append to an existing open
-      # issue) instead of hand-rolling gh CLI dedup. Do not implement it here.
+      # Scheduled failure alerting is handled by the alert-on-failure job below
+      # (perf-2 consuming ci-8's schedule-failure-issue composite action).
 
       - name: Enforce gate
         if: always()
@@ -224,7 +322,16 @@ jobs:
     # `always()` is required: without it this job is skipped when a needed
     # job fails. Alerts only for scheduled (nightly) runs (backlog#1149
     # ci-8); PR and manual dispatch failures are already watched by a human.
-    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    # `cancelled` is included alongside `failure` on purpose: a job that hits
+    # timeout-minutes ends as `cancelled`, and the 2026-07-11..07-14 nightly
+    # timeouts went silent precisely because the guard was failure-only. The
+    # composite action already reports cancelled/timed-out jobs in the issue
+    # body. (Scheduled runs get a unique concurrency group with
+    # cancel-in-progress off, so a cancellation here means a timeout/manual
+    # abort, never a superseding run.)
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
