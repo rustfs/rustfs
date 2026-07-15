@@ -63,6 +63,10 @@ Layer notes:
 - **Benchmarks** — Criterion benches live under each crate's `benches/`. They
   are not a gate; run them locally to compare before/after on a specific crate.
 
+Script inventory: every entry under `scripts/` — including the runners above —
+is indexed in [`scripts/README.md`](../../scripts/README.md) with its status
+(ci-gate / dev-tool / archived) and wiring.
+
 ### Security advisory regression tests
 
 Fixed GHSA advisories map to named, discoverable regression tests. The
