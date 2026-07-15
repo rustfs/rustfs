@@ -203,6 +203,12 @@ mod notification_webhook_test;
 #[cfg(test)]
 mod tls_hot_reload_test;
 
+// Console listener over-the-wire smoke (backlog#1154 peri-4): public console
+// endpoints answer without credentials or leaks, the SPA prefix never falls
+// through to the S3 API, and the protected surface stays authenticated.
+#[cfg(test)]
+mod console_smoke_test;
+
 // Replication extension end-to-end regression tests
 #[cfg(test)]
 mod replication_extension_test;
