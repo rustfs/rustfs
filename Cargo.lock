@@ -8886,6 +8886,7 @@ dependencies = [
  "rustfs-keystone",
  "rustfs-kms",
  "rustfs-lock",
+ "rustfs-log-analyzer",
  "rustfs-madmin",
  "rustfs-notify",
  "rustfs-object-capacity",
@@ -8939,6 +8940,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "zip",
+ "zstd",
 ]
 
 [[package]]
