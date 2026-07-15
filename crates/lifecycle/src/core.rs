@@ -3457,6 +3457,66 @@ mod tests {
         assert_eq!(event.action, IlmAction::DeleteAction);
     }
 
+    /// backlog#1148 ilm-8: once a restored copy's expiry passes, the evaluator
+    /// must emit `DeleteRestoredAction` for the current version (and the
+    /// `...Version` variant for a noncurrent one) so the scanner removes only
+    /// the local restored copy. The restore branch fires independently of any
+    /// configured rules.
+    #[tokio::test]
+    async fn eval_inner_emits_delete_restored_action_when_restore_expired() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![],
+        };
+        let now = datetime!(2025-06-01 12:00:00 UTC);
+
+        let current = ObjectOpts {
+            name: "docs/report.bin".to_string(),
+            mod_time: Some(datetime!(2025-05-01 00:00:00 UTC)),
+            is_latest: true,
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            restore_expires: Some(now - Duration::hours(1)),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&current, now, 0).await;
+        assert_eq!(event.action, IlmAction::DeleteRestoredAction);
+
+        let noncurrent = ObjectOpts {
+            name: "docs/report.bin".to_string(),
+            mod_time: Some(datetime!(2025-05-01 00:00:00 UTC)),
+            is_latest: false,
+            version_id: Some(Uuid::from_u128(9)),
+            successor_mod_time: Some(datetime!(2025-05-02 00:00:00 UTC)),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            restore_expires: Some(now - Duration::hours(1)),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&noncurrent, now, 0).await;
+        assert_eq!(event.action, IlmAction::DeleteRestoredVersionAction);
+    }
+
+    /// A restored copy whose expiry is still in the future must not be
+    /// scheduled for cleanup.
+    #[tokio::test]
+    async fn eval_inner_keeps_unexpired_restore_copy() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![],
+        };
+        let now = datetime!(2025-06-01 12:00:00 UTC);
+
+        let current = ObjectOpts {
+            name: "docs/report.bin".to_string(),
+            mod_time: Some(datetime!(2025-05-01 00:00:00 UTC)),
+            is_latest: true,
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            restore_expires: Some(now + Duration::hours(1)),
+            ..Default::default()
+        };
+        let event = lc.eval_inner(&current, now, 0).await;
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
     /// Property-based tests for the rule evaluator (backlog#1148 ilm-14,
     /// follow-up to backlog#1030 / rustfs#4455).
     ///
