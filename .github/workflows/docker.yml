@@ -247,13 +247,15 @@ jobs:
             esac
           fi
 
-          echo "should_build=$should_build" >> $GITHUB_OUTPUT
-          echo "should_push=$should_push" >> $GITHUB_OUTPUT
-          echo "build_type=$build_type" >> $GITHUB_OUTPUT
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
-          echo "is_prerelease=$is_prerelease" >> $GITHUB_OUTPUT
-          echo "create_latest=$create_latest" >> $GITHUB_OUTPUT
+          {
+            echo "should_build=$should_build"
+            echo "should_push=$should_push"
+            echo "build_type=$build_type"
+            echo "version=$version"
+            echo "short_sha=$short_sha"
+            echo "is_prerelease=$is_prerelease"
+            echo "create_latest=$create_latest"
+          } >> "$GITHUB_OUTPUT"
 
           echo "🐳 Docker Build Summary:"
           echo "  - Should build: $should_build"
@@ -320,7 +322,6 @@ jobs:
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
           VERSION="${{ needs.build-check.outputs.version }}"
-          SHORT_SHA="${{ needs.build-check.outputs.short_sha }}"
           CREATE_LATEST="${{ needs.build-check.outputs.create_latest }}"
           VARIANT_SUFFIX="${{ matrix.suffix }}"
 
@@ -343,8 +344,8 @@ jobs:
               ;;
           esac
 
-          echo "docker_release=$DOCKER_RELEASE" >> $GITHUB_OUTPUT
-          echo "docker_channel=$DOCKER_CHANNEL" >> $GITHUB_OUTPUT
+          echo "docker_release=$DOCKER_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "docker_channel=$DOCKER_CHANNEL" >> "$GITHUB_OUTPUT"
 
           echo "🐳 Docker build parameters:"
           echo "  - Original version: $VERSION"
@@ -376,7 +377,7 @@ jobs:
           fi
 
           # Output tags
-          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
           # Generate labels
           LABELS="org.opencontainers.image.title=RustFS"
@@ -387,7 +388,7 @@ jobs:
           LABELS="$LABELS,org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           LABELS="$LABELS,org.opencontainers.image.build-type=$BUILD_TYPE"
 
-          echo "labels=$LABELS" >> $GITHUB_OUTPUT
+          echo "labels=$LABELS" >> "$GITHUB_OUTPUT"
 
           echo "🐳 Generated Docker tags:"
           echo "$TAGS" | tr ',' '\n' | sed 's/^/  - /'

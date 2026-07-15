@@ -10296,8 +10296,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe1bd31748cb69848c2cf4028cecdadf5f8299ef3b02a83e21b20e7bda3aba9"
+source = "git+https://github.com/s3s-project/s3s.git?rev=ce69c3f10824535c7c24b2f71cdb2aaa4dffb5e0#ce69c3f10824535c7c24b2f71cdb2aaa4dffb5e0"
 dependencies = [
  "arc-swap",
  "arrayvec",
