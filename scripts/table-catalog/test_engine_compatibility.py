@@ -57,6 +57,7 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(config["spark.sql.catalog.rustfs.type"], "rest")
         self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "http://127.0.0.1:9000/iceberg")
         self.assertEqual(config["spark.sql.catalog.rustfs.warehouse"], "rustfs-s3table-smoke")
+        self.assertEqual(config["spark.sql.catalog.rustfs.prefix"], "rustfs-s3table-smoke")
         self.assertEqual(config["spark.sql.catalog.rustfs.io-impl"], "org.apache.iceberg.aws.s3.S3FileIO")
         self.assertEqual(config["spark.sql.catalog.rustfs.s3.endpoint"], "http://127.0.0.1:9000")
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3")

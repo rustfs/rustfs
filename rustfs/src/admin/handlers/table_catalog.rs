@@ -36,7 +36,7 @@ use rustfs_policy::{
         action::{Action, AdminAction},
     },
 };
-use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration as StdDuration, Instant};
@@ -50,6 +50,16 @@ const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
 const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const WAREHOUSE_PROPERTY: &str = "warehouse";
+const PREFIX_PROPERTY: &str = "prefix";
+const ICEBERG_ERROR_ALREADY_EXISTS: &str = "AlreadyExistsException";
+const ICEBERG_ERROR_BAD_REQUEST: &str = "BadRequestException";
+const ICEBERG_ERROR_COMMIT_FAILED: &str = "CommitFailedException";
+const ICEBERG_ERROR_NAMESPACE_NOT_EMPTY: &str = "NamespaceNotEmptyException";
+const ICEBERG_ERROR_NO_SUCH_NAMESPACE: &str = "NoSuchNamespaceException";
+const ICEBERG_ERROR_NO_SUCH_RESOURCE: &str = "NoSuchResourceException";
+const ICEBERG_ERROR_NO_SUCH_TABLE: &str = "NoSuchTableException";
+const ICEBERG_ERROR_NO_SUCH_VIEW: &str = "NoSuchViewException";
+const ICEBERG_ERROR_REST: &str = "RESTException";
 const CATALOG_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-endpoint-prefix";
 const CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY: &str = "rustfs.catalog-compat-endpoint-prefix";
 const CATALOG_BACKING_CONFIG_KEY: &str = "rustfs.catalog-backing";
@@ -199,8 +209,8 @@ static ROLLBACK_TABLE_CATALOG_HANDLER: RollbackTableCatalogHandler = RollbackTab
 
 #[derive(Debug, Serialize)]
 struct CatalogConfigResponse {
-    defaults: BTreeMap<&'static str, &'static str>,
-    overrides: BTreeMap<&'static str, &'static str>,
+    defaults: BTreeMap<String, String>,
+    overrides: BTreeMap<String, String>,
     endpoints: Vec<&'static str>,
     admin_discovery: CatalogAdminDiscovery,
 }
@@ -1031,20 +1041,30 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     Ok(())
 }
 
-fn catalog_config_response() -> S3Result<CatalogConfigResponse> {
+fn catalog_config_response(warehouse: Option<&str>) -> S3Result<CatalogConfigResponse> {
     let usecase = default_admin_usecase();
     let backing_mode = crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)?;
     let mut overrides = BTreeMap::new();
     if backing_mode != crate::table_catalog::TableCatalogBackingMode::ObjectBacked {
-        overrides.insert(CATALOG_BACKING_CONFIG_KEY, backing_mode.as_str());
+        overrides.insert(CATALOG_BACKING_CONFIG_KEY.to_string(), backing_mode.as_str().to_string());
+    }
+    let mut defaults = BTreeMap::from([
+        (WAREHOUSE_PROPERTY.to_string(), DEFAULT_WAREHOUSE_ID.to_string()),
+        (CATALOG_ENDPOINT_PREFIX_CONFIG_KEY.to_string(), TABLE_CATALOG_PREFIX.to_string()),
+        (
+            CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY.to_string(),
+            TABLE_CATALOG_COMPAT_PREFIX.to_string(),
+        ),
+        (
+            CATALOG_BACKING_CONFIG_KEY.to_string(),
+            crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT.to_string(),
+        ),
+    ]);
+    if let Some(warehouse) = warehouse {
+        defaults.insert(PREFIX_PROPERTY.to_string(), warehouse.to_string());
     }
     Ok(CatalogConfigResponse {
-        defaults: BTreeMap::from([
-            (WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID),
-            (CATALOG_ENDPOINT_PREFIX_CONFIG_KEY, TABLE_CATALOG_PREFIX),
-            (CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY, TABLE_CATALOG_COMPAT_PREFIX),
-            (CATALOG_BACKING_CONFIG_KEY, crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
-        ]),
+        defaults,
         overrides,
         endpoints: TABLE_CATALOG_ENDPOINTS.to_vec(),
         admin_discovery: CatalogAdminDiscovery {
@@ -1270,6 +1290,26 @@ fn warehouse_from_params(params: &Params<'_, '_>) -> S3Result<String> {
         return Err(s3_error!(InvalidRequest, "warehouse is required"));
     }
     Ok(warehouse.to_string())
+}
+
+fn warehouse_from_config_query(uri: &http::Uri) -> S3Result<Option<String>> {
+    let Some(query) = uri.query() else {
+        return Ok(None);
+    };
+    let mut warehouse = None;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key != WAREHOUSE_PROPERTY {
+            continue;
+        }
+        if warehouse.is_some() {
+            return Err(s3_error!(InvalidRequest, "warehouse query parameter must not be repeated"));
+        }
+        if value.is_empty() {
+            return Err(s3_error!(InvalidRequest, "warehouse query parameter must not be empty"));
+        }
+        warehouse = Some(value.into_owned());
+    }
+    Ok(warehouse)
 }
 
 fn namespace_from_params(params: &Params<'_, '_>) -> S3Result<crate::table_catalog::Namespace> {
@@ -3332,20 +3372,48 @@ fn namespace_entry_from_create_request(
     })
 }
 
-fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> s3s::S3Error {
+fn iceberg_rest_error(error_type: &str, status: StatusCode, message: impl Into<String>) -> S3Error {
+    let mut err = S3Error::with_message(S3ErrorCode::Custom(error_type.into()), message.into());
+    err.set_status_code(status);
+    err
+}
+
+fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
     match err {
         crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
-            s3_error!(InvalidRequest, "{message}")
+            iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_RESOURCE, StatusCode::NOT_FOUND, message)
         }
         crate::table_catalog::TableCatalogStoreError::Conflict(message) => {
-            s3_error!(PreconditionFailed, "{message}")
+            iceberg_rest_error(ICEBERG_ERROR_COMMIT_FAILED, StatusCode::CONFLICT, message)
         }
         crate::table_catalog::TableCatalogStoreError::Invalid(message) => {
-            s3_error!(InvalidRequest, "{message}")
+            iceberg_rest_error(ICEBERG_ERROR_BAD_REQUEST, StatusCode::BAD_REQUEST, message)
         }
         crate::table_catalog::TableCatalogStoreError::Internal(message) => {
-            s3_error!(InternalError, "{message}")
+            iceberg_rest_error(ICEBERG_ERROR_REST, StatusCode::INTERNAL_SERVER_ERROR, message)
         }
+    }
+}
+
+fn catalog_store_conflict_error(err: crate::table_catalog::TableCatalogStoreError, conflict_type: &'static str) -> S3Error {
+    match err {
+        crate::table_catalog::TableCatalogStoreError::Conflict(message) => {
+            iceberg_rest_error(conflict_type, StatusCode::CONFLICT, message)
+        }
+        err => catalog_store_error(err),
+    }
+}
+
+fn catalog_store_already_exists_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
+    catalog_store_conflict_error(err, ICEBERG_ERROR_ALREADY_EXISTS)
+}
+
+fn catalog_store_namespace_drop_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
+    match err {
+        crate::table_catalog::TableCatalogStoreError::NotFound(message) => {
+            iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_NAMESPACE, StatusCode::NOT_FOUND, message)
+        }
+        err => catalog_store_conflict_error(err, ICEBERG_ERROR_NAMESPACE_NOT_EMPTY),
     }
 }
 
@@ -3360,7 +3428,10 @@ where
 {
     let entry = namespace_entry_from_create_request(bucket, request)?;
     ensure_table_bucket_entry(store, bucket, table_bucket_enabled).await?;
-    store.create_namespace(entry.clone()).await.map_err(catalog_store_error)?;
+    store
+        .create_namespace(entry.clone())
+        .await
+        .map_err(catalog_store_already_exists_error)?;
     namespace_response_from_entry(entry)
 }
 
@@ -3385,7 +3456,11 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "namespace not found"));
+        return Err(iceberg_rest_error(
+            ICEBERG_ERROR_NO_SUCH_NAMESPACE,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        ));
     };
     namespace_response_from_entry(entry)
 }
@@ -3406,7 +3481,10 @@ async fn drop_namespace_in_store<S>(store: &S, bucket: &str, namespace: &str) ->
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
-    store.drop_namespace(bucket, namespace).await.map_err(catalog_store_error)
+    store
+        .drop_namespace(bucket, namespace)
+        .await
+        .map_err(catalog_store_namespace_drop_error)
 }
 
 async fn register_table_response<S>(
@@ -3425,7 +3503,10 @@ where
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &metadata)?;
     adopt_registered_metadata_identity(&mut entry, &metadata)?;
-    store.register_table(entry.clone()).await.map_err(catalog_store_error)?;
+    store
+        .register_table(entry.clone())
+        .await
+        .map_err(catalog_store_already_exists_error)?;
     Ok(load_table_response_from_entry(entry, metadata))
 }
 
@@ -3452,8 +3533,11 @@ where
             crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
         )
         .await
-        .map_err(catalog_store_error)?;
-    store.create_table(entry.clone()).await.map_err(catalog_store_error)?;
+        .map_err(catalog_store_already_exists_error)?;
+    store
+        .create_table(entry.clone())
+        .await
+        .map_err(catalog_store_already_exists_error)?;
     Ok(load_table_response_from_entry(entry, metadata))
 }
 
@@ -3480,8 +3564,11 @@ where
             crate::table_catalog::TableCatalogPutPrecondition::IfAbsent,
         )
         .await
-        .map_err(catalog_store_error)?;
-    store.create_view(entry.clone()).await.map_err(catalog_store_error)?;
+        .map_err(catalog_store_already_exists_error)?;
+    store
+        .create_view(entry.clone())
+        .await
+        .map_err(catalog_store_already_exists_error)?;
     Ok(load_view_response_from_entry(entry, metadata))
 }
 
@@ -3535,7 +3622,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     Ok(load_table_response_from_entry(entry, metadata))
@@ -3571,7 +3658,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "view not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_VIEW, StatusCode::NOT_FOUND, "view not found"));
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     Ok(load_view_response_from_entry(entry, metadata))
@@ -3610,7 +3697,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "view not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_VIEW, StatusCode::NOT_FOUND, "view not found"));
     };
     let current_metadata = read_table_metadata_json(metadata_backend, bucket, &current.metadata_location).await?;
     validate_view_commit_requirements(&current_metadata, &request.requirements)?;
@@ -3700,7 +3787,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     load_credentials_response_from_entry(&entry, issuer, principal).await
 }
@@ -3719,7 +3806,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     Ok(table_metadata_location_response_from_entry(entry))
 }
@@ -3740,7 +3827,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
@@ -3790,7 +3877,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
@@ -3822,7 +3909,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
         .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
@@ -4018,7 +4105,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     if report.table_id != current.table_id || report.current_metadata_location != current.metadata_location {
         return Err(s3_error!(PreconditionFailed, "snapshot expiration plan is stale"));
@@ -4099,7 +4186,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     let current_snapshot_id = metadata.get("current-snapshot-id").and_then(serde_json::Value::as_i64);
@@ -4213,7 +4300,7 @@ where
         .await
         .map_err(catalog_store_error)?
     else {
-        return Err(s3_error!(InvalidRequest, "table not found"));
+        return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     let reference = metadata
@@ -4662,7 +4749,7 @@ where
             .await
             .map_err(catalog_store_error)?
         else {
-            return Err(s3_error!(InvalidRequest, "table not found"));
+            return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
         };
         let table_name = crate::table_catalog::IdentifierSegment::parse(table.to_string())
             .map_err(|err| s3_error!(InvalidRequest, "invalid table name: {}", err))?;
@@ -4701,7 +4788,8 @@ pub struct GetCatalogConfigHandler {}
 impl Operation for GetCatalogConfigHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_table_catalog_request(&req, AdminAction::GetTableCatalogAction).await?;
-        build_json_response(StatusCode::OK, &catalog_config_response()?)
+        let warehouse = warehouse_from_config_query(&req.uri)?;
+        build_json_response(StatusCode::OK, &catalog_config_response(warehouse.as_deref())?)
     }
 }
 
@@ -5587,19 +5675,27 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn catalog_config_response_lists_standard_rest_endpoints() {
-        let response = temp_env::with_var_unset(crate::table_catalog::ENV_TABLE_CATALOG_BACKING, catalog_config_response)
-            .expect("catalog config should build");
+        let response =
+            temp_env::with_var_unset(crate::table_catalog::ENV_TABLE_CATALOG_BACKING, || catalog_config_response(None))
+                .expect("catalog config should build");
 
-        assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY), Some(&DEFAULT_WAREHOUSE_ID));
-        assert_eq!(response.defaults.get(CATALOG_ENDPOINT_PREFIX_CONFIG_KEY), Some(&TABLE_CATALOG_PREFIX));
+        assert_eq!(response.defaults.get(WAREHOUSE_PROPERTY).map(String::as_str), Some(DEFAULT_WAREHOUSE_ID));
         assert_eq!(
-            response.defaults.get(CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY),
-            Some(&TABLE_CATALOG_COMPAT_PREFIX)
+            response.defaults.get(CATALOG_ENDPOINT_PREFIX_CONFIG_KEY).map(String::as_str),
+            Some(TABLE_CATALOG_PREFIX)
         );
         assert_eq!(
-            response.defaults.get(CATALOG_BACKING_CONFIG_KEY),
-            Some(&crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT)
+            response
+                .defaults
+                .get(CATALOG_COMPAT_ENDPOINT_PREFIX_CONFIG_KEY)
+                .map(String::as_str),
+            Some(TABLE_CATALOG_COMPAT_PREFIX)
         );
+        assert_eq!(
+            response.defaults.get(CATALOG_BACKING_CONFIG_KEY).map(String::as_str),
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT)
+        );
+        assert!(!response.defaults.contains_key(PREFIX_PROPERTY));
         assert!(response.overrides.is_empty());
         assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
@@ -5710,14 +5806,58 @@ mod tests {
         let response = temp_env::with_var(
             crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
             Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG),
-            catalog_config_response,
+            || catalog_config_response(None),
         )
         .expect("catalog config should build");
 
         assert_eq!(
-            response.overrides.get(CATALOG_BACKING_CONFIG_KEY),
-            Some(&crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG)
+            response.overrides.get(CATALOG_BACKING_CONFIG_KEY).map(String::as_str),
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG)
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn catalog_config_response_uses_requested_warehouse_as_standard_prefix() {
+        let response = temp_env::with_var_unset(crate::table_catalog::ENV_TABLE_CATALOG_BACKING, || {
+            catalog_config_response(Some("analytics"))
+        })
+        .expect("catalog config should build");
+
+        assert_eq!(response.defaults.get(PREFIX_PROPERTY).map(String::as_str), Some("analytics"));
+    }
+
+    #[test]
+    fn warehouse_config_query_rejects_empty_and_repeated_values() {
+        let uri = "/iceberg/v1/config?warehouse=analytics".parse().expect("URI");
+        assert_eq!(warehouse_from_config_query(&uri).expect("warehouse query"), Some("analytics".to_string()));
+
+        let uri = "/iceberg/v1/config?warehouse=".parse().expect("URI");
+        assert!(warehouse_from_config_query(&uri).is_err());
+
+        let uri = "/iceberg/v1/config?warehouse=one&warehouse=two".parse().expect("URI");
+        assert!(warehouse_from_config_query(&uri).is_err());
+    }
+
+    #[test]
+    fn catalog_conflicts_use_operation_specific_iceberg_errors() {
+        let already_exists = catalog_store_already_exists_error(crate::table_catalog::TableCatalogStoreError::Conflict(
+            "table already exists".to_string(),
+        ));
+        assert_eq!(already_exists.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_ALREADY_EXISTS.into()));
+        assert_eq!(already_exists.status_code(), Some(StatusCode::CONFLICT));
+
+        let namespace_not_empty = catalog_store_namespace_drop_error(crate::table_catalog::TableCatalogStoreError::Conflict(
+            "namespace is not empty".to_string(),
+        ));
+        assert_eq!(namespace_not_empty.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NAMESPACE_NOT_EMPTY.into()));
+        assert_eq!(namespace_not_empty.status_code(), Some(StatusCode::CONFLICT));
+
+        let namespace_not_found = catalog_store_namespace_drop_error(crate::table_catalog::TableCatalogStoreError::NotFound(
+            "namespace not found".to_string(),
+        ));
+        assert_eq!(namespace_not_found.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
+        assert_eq!(namespace_not_found.status_code(), Some(StatusCode::NOT_FOUND));
     }
 
     #[test]
