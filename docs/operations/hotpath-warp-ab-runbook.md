@@ -37,14 +37,30 @@ Six workloads × the drive-sync on/off matrix × baseline/candidate = 24 cells:
 Sizes are passed to the load driver via `--sizes` (one size per cell); the
 driver's `DEFAULT_SIZES` covers 1KiB..10MiB, so any of those can be added by
 editing `WORKLOADS` in `scripts/run_hotpath_warp_ab.sh`. A 1KiB cell is left
-out for now to keep the nightly matrix under the 90-minute job budget (the
-baseline+candidate double build dominates until perf-3 caches it); re-enable it
-once that lands.
+out for now to keep the nightly matrix comfortably under budget; re-enable it
+(one line in `WORKLOADS`) once perf-6 recalibrates the warp params.
 
 CI runs a **short** warp matrix (`--duration`/`--rounds`/`--cooldown` tuned in
 `.github/workflows/performance-ab.yml`) so all 24 cells fit the budget without
 dropping cells. These params are deliberately noisy-but-fast for the Phase-0
 "keep the pipeline alive" goal; perf-6 recalibrates them.
+
+## Baseline binary cache (CI)
+
+The nightly no longer builds both binaries from source. Every push to `main`
+runs a `build-baseline-cache` job that builds the release binary once and stores
+it in the actions cache under `rustfs-baseline-<sha>` (perf-3). The A/B job
+restores the binary for `origin/main` by that key and passes it as
+`--baseline-bin`; on the nightly, where the candidate commit equals the baseline
+commit, the same cached binary serves both phases (`--skip-build`) and the run
+does zero source builds — the common path finishes well under 50 minutes. A
+cache miss (binary evicted, or not built for that SHA yet) transparently falls
+back to the source double-build via `--baseline-ref origin/main`.
+
+Each `gate.md` ends with a **Provenance** section recording the baseline and
+candidate commit SHAs and whether each binary came from the cache or a source
+build, plus the runner, warp version, and matrix params. `perf-5`/`perf-12`
+reuse this contract for their archived baselines.
 
 ## Local mode (quick / CI smoke)
 
