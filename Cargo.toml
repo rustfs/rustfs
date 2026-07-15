@@ -67,7 +67,7 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
 rust-version = "1.96.0"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
 keywords = ["RustFS", "Minio", "object-storage", "filesystem", "s3"]
@@ -84,50 +84,50 @@ redundant_clone = "warn"
 
 [workspace.dependencies]
 # RustFS Internal Crates
-rustfs = { path = "./rustfs", version = "1.0.0-beta.8" }
-rustfs-heal = { path = "crates/heal", version = "1.0.0-beta.8" }
-rustfs-audit = { path = "crates/audit", version = "1.0.0-beta.8" }
-rustfs-checksums = { path = "crates/checksums", version = "1.0.0-beta.8" }
-rustfs-common = { path = "crates/common", version = "1.0.0-beta.8" }
-rustfs-data-usage = { path = "crates/data-usage", version = "1.0.0-beta.8" }
-rustfs-config = { path = "./crates/config", version = "1.0.0-beta.8" }
-rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.0-beta.8" }
-rustfs-credentials = { path = "crates/credentials", version = "1.0.0-beta.8" }
-rustfs-crypto = { path = "crates/crypto", version = "1.0.0-beta.8" }
-rustfs-ecstore = { path = "crates/ecstore", version = "1.0.0-beta.8" }
-rustfs-filemeta = { path = "crates/filemeta", version = "1.0.0-beta.8" }
-rustfs-iam = { path = "crates/iam", version = "1.0.0-beta.8" }
-rustfs-keystone = { path = "crates/keystone", version = "1.0.0-beta.8" }
-rustfs-lifecycle = { path = "crates/lifecycle", version = "1.0.0-beta.8" }
-rustfs-kms = { path = "crates/kms", version = "1.0.0-beta.8" }
-rustfs-lock = { path = "crates/lock", version = "1.0.0-beta.8" }
-rustfs-madmin = { path = "crates/madmin", version = "1.0.0-beta.8" }
-rustfs-notify = { path = "crates/notify", version = "1.0.0-beta.8" }
-rustfs-io-metrics = { path = "crates/io-metrics", version = "1.0.0-beta.8" }
-rustfs-io-core = { path = "crates/io-core", version = "1.0.0-beta.8" }
-rustfs-object-capacity = { path = "crates/object-capacity", version = "1.0.0-beta.8" }
-rustfs-object-data-cache = { path = "crates/object-data-cache", version = "1.0.0-beta.8" }
-rustfs-obs = { path = "crates/obs", version = "1.0.0-beta.8" }
-rustfs-policy = { path = "crates/policy", version = "1.0.0-beta.8" }
-rustfs-protos = { path = "crates/protos", version = "1.0.0-beta.8" }
-rustfs-protocols = { path = "crates/protocols", version = "1.0.0-beta.8" }
-rustfs-replication = { path = "crates/replication", version = "1.0.0-beta.8" }
-rustfs-rio = { path = "crates/rio", version = "1.0.0-beta.8" }
-rustfs-rio-v2 = { path = "crates/rio-v2", version = "1.0.0-beta.8" }
-rustfs-s3-types = { path = "crates/s3-types", version = "1.0.0-beta.8" }
-rustfs-s3-ops = { path = "crates/s3-ops", version = "1.0.0-beta.8" }
-rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-beta.8" }
-rustfs-s3select-query = { path = "crates/s3select-query", version = "1.0.0-beta.8" }
-rustfs-scanner = { path = "crates/scanner", version = "1.0.0-beta.8" }
-rustfs-security-governance = { path = "crates/security-governance", version = "1.0.0-beta.8" }
-rustfs-extension-schema = { path = "crates/extension-schema", version = "1.0.0-beta.8" }
-rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.8" }
-rustfs-storage-api = { path = "crates/storage-api", version = "1.0.0-beta.8" }
-rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.8" }
-rustfs-targets = { path = "crates/targets", version = "1.0.0-beta.8" }
-rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.0-beta.8" }
-rustfs-utils = { path = "crates/utils", version = "1.0.0-beta.8" }
-rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.8" }
+rustfs = { path = "./rustfs", version = "1.0.0-beta.9" }
+rustfs-heal = { path = "crates/heal", version = "1.0.0-beta.9" }
+rustfs-audit = { path = "crates/audit", version = "1.0.0-beta.9" }
+rustfs-checksums = { path = "crates/checksums", version = "1.0.0-beta.9" }
+rustfs-common = { path = "crates/common", version = "1.0.0-beta.9" }
+rustfs-data-usage = { path = "crates/data-usage", version = "1.0.0-beta.9" }
+rustfs-config = { path = "./crates/config", version = "1.0.0-beta.9" }
+rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.0-beta.9" }
+rustfs-credentials = { path = "crates/credentials", version = "1.0.0-beta.9" }
+rustfs-crypto = { path = "crates/crypto", version = "1.0.0-beta.9" }
+rustfs-ecstore = { path = "crates/ecstore", version = "1.0.0-beta.9" }
+rustfs-filemeta = { path = "crates/filemeta", version = "1.0.0-beta.9" }
+rustfs-iam = { path = "crates/iam", version = "1.0.0-beta.9" }
+rustfs-keystone = { path = "crates/keystone", version = "1.0.0-beta.9" }
+rustfs-lifecycle = { path = "crates/lifecycle", version = "1.0.0-beta.9" }
+rustfs-kms = { path = "crates/kms", version = "1.0.0-beta.9" }
+rustfs-lock = { path = "crates/lock", version = "1.0.0-beta.9" }
+rustfs-madmin = { path = "crates/madmin", version = "1.0.0-beta.9" }
+rustfs-notify = { path = "crates/notify", version = "1.0.0-beta.9" }
+rustfs-io-metrics = { path = "crates/io-metrics", version = "1.0.0-beta.9" }
+rustfs-io-core = { path = "crates/io-core", version = "1.0.0-beta.9" }
+rustfs-object-capacity = { path = "crates/object-capacity", version = "1.0.0-beta.9" }
+rustfs-object-data-cache = { path = "crates/object-data-cache", version = "1.0.0-beta.9" }
+rustfs-obs = { path = "crates/obs", version = "1.0.0-beta.9" }
+rustfs-policy = { path = "crates/policy", version = "1.0.0-beta.9" }
+rustfs-protos = { path = "crates/protos", version = "1.0.0-beta.9" }
+rustfs-protocols = { path = "crates/protocols", version = "1.0.0-beta.9" }
+rustfs-replication = { path = "crates/replication", version = "1.0.0-beta.9" }
+rustfs-rio = { path = "crates/rio", version = "1.0.0-beta.9" }
+rustfs-rio-v2 = { path = "crates/rio-v2", version = "1.0.0-beta.9" }
+rustfs-s3-types = { path = "crates/s3-types", version = "1.0.0-beta.9" }
+rustfs-s3-ops = { path = "crates/s3-ops", version = "1.0.0-beta.9" }
+rustfs-s3select-api = { path = "crates/s3select-api", version = "1.0.0-beta.9" }
+rustfs-s3select-query = { path = "crates/s3select-query", version = "1.0.0-beta.9" }
+rustfs-scanner = { path = "crates/scanner", version = "1.0.0-beta.9" }
+rustfs-security-governance = { path = "crates/security-governance", version = "1.0.0-beta.9" }
+rustfs-extension-schema = { path = "crates/extension-schema", version = "1.0.0-beta.9" }
+rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.9" }
+rustfs-storage-api = { path = "crates/storage-api", version = "1.0.0-beta.9" }
+rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.9" }
+rustfs-targets = { path = "crates/targets", version = "1.0.0-beta.9" }
+rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.0-beta.9" }
+rustfs-utils = { path = "crates/utils", version = "1.0.0-beta.9" }
+rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.9" }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
