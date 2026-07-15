@@ -35,6 +35,7 @@ regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tar = { workspace = true }
+thiserror = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true }
 zstd = { workspace = true }

@@ -23,7 +23,9 @@
 pub mod ingest;
 pub mod model;
 pub mod parse;
+pub mod rules;
 
 pub use ingest::{IngestOptions, IngestReport, SkipReason, ingest_path, ingest_reader};
 pub use model::{EventKind, LogEvent, LogLevel, ParseStats, SourceRef};
 pub use parse::LineParser;
+pub use rules::{Finding, FindingsCollector, Matcher, Rule, RuleEngine, RuleSet, RuleSetError, Severity};

@@ -15,12 +15,12 @@
 //! Unified event model shared by every stage of the analyzer.
 
 use chrono::{DateTime, FixedOffset};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
 use std::sync::Arc;
 
 /// Log severity level, ordered: Trace < Debug < Info < Warn < Error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum LogLevel {
     Trace,

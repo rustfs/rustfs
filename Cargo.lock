@@ -9478,6 +9478,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tempfile",
+ "thiserror 2.0.18",
  "walkdir",
  "zip",
  "zstd",
