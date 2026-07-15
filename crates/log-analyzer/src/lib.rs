@@ -21,5 +21,7 @@
 //! - parse failures are data, not errors.
 
 pub mod model;
+pub mod parse;
 
 pub use model::{EventKind, LogEvent, LogLevel, ParseStats, SourceRef};
+pub use parse::LineParser;
