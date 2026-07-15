@@ -22,6 +22,15 @@ pub(crate) fn credentials_or_default() -> Credentials {
     credentials().unwrap_or_default()
 }
 
+/// The signing key for STS session tokens.
+///
+/// GHSA-m77q-r63m-pj89 (intentionally UNFIXED): this returns the root secret
+/// key, so STS JWTs are signed with the shared root secret and anyone holding
+/// it can forge session tokens. The behavior is pinned by
+/// `test_ghsa_m77q_sts_session_token_signed_with_root_secret` in `sys.rs`;
+/// fixing the advisory (a dedicated STS signing key distinct from the root
+/// secret) must update that test red -> green. See
+/// docs/testing/security-regressions.md.
 pub(crate) fn token_signing_key() -> Option<String> {
     credentials().map(|cred| cred.secret_key)
 }
