@@ -1,0 +1,12 @@
+# Committed floor for the number of security negative-auth tests selected by the
+# e2e-smoke PR profile (see scripts/check_security_smoke_count.sh, backlog#1151
+# sec-5).
+#
+# The floor equals the exact count of e2e_test cases whose name starts with a
+# security module prefix (negative_sigv4_test, presigned_negative_test,
+# admin_auth_test) that the [profile.e2e-smoke] default-filter in
+# .config/nextest.toml selects, at the time this file was last updated. CI fails
+# if the selected count drops below this number, so a rename or removal that
+# thins the security smoke gate must update this file in the same PR.
+# Adding tests does not require a bump, but bumping keeps the guard tight.
+16
