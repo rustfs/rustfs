@@ -42,7 +42,7 @@ use crate::client::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
 
-use crate::client::utils::{base64_encode, base64_encode_standard};
+use crate::client::utils::base64_encode;
 use rustfs_utils::path::trim_etag;
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
 
@@ -161,7 +161,6 @@ impl TransitionClient {
         let mut total_uploaded_size: i64 = 0;
 
         let mut parts_info = HashMap::<i64, ObjectPart>::new();
-        let mut buf = Vec::<u8>::with_capacity(part_size as usize);
 
         let mut md5_base64: String = "".to_string();
         for part_number in 1..=total_parts_count {
@@ -174,7 +173,7 @@ impl TransitionClient {
             // part empty, silently corrupting any multipart upload of a streamed
             // (`ObjectBody`) source — e.g. ILM transitions of >128 MiB objects,
             // which split into 128 MiB parts (rustfs/rustfs#4811).
-            buf = read_multipart_part(&mut reader, part_size as usize).await?;
+            let buf = read_multipart_part(&mut reader, part_size as usize).await?;
             let length = buf.len();
 
             if opts.send_content_md5 {
@@ -184,16 +183,14 @@ impl TransitionClient {
                     None => return Err(std::io::Error::other("MD5 hasher not initialized")),
                 };
                 let hash = md5_hash.hash_encode(&buf[..length]);
-                // Content-MD5 must be standard base64 for the remote to accept it.
-                md5_base64 = base64_encode_standard(hash.as_ref());
+                md5_base64 = base64_encode(hash.as_ref());
             } else if opts.auto_checksum.is_set() {
                 let mut crc = opts.auto_checksum.hasher()?;
                 crc.update(&buf[..length]);
                 let csum = crc.finalize();
 
                 if let Ok(header_name) = HeaderName::from_bytes(opts.auto_checksum.key().as_bytes()) {
-                    // x-amz-checksum-* header values are standard base64 too.
-                    if let Ok(header_value) = base64_encode_standard(csum.as_ref()).parse() {
+                    if let Ok(header_value) = base64_encode(csum.as_ref()).parse() {
                         custom_header.insert(header_name, header_value);
                     } else {
                         warn!("Failed to parse checksum value");
