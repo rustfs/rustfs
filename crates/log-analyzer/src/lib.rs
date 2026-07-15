@@ -20,8 +20,10 @@
 //!   time-sorted input;
 //! - parse failures are data, not errors.
 
+pub mod ingest;
 pub mod model;
 pub mod parse;
 
+pub use ingest::{IngestOptions, IngestReport, SkipReason, ingest_path, ingest_reader};
 pub use model::{EventKind, LogEvent, LogLevel, ParseStats, SourceRef};
 pub use parse::LineParser;

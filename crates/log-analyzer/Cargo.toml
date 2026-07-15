@@ -30,9 +30,17 @@ doctest = false
 
 [dependencies]
 chrono = { workspace = true }
+flate2 = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tar = { workspace = true }
+walkdir = { workspace = true }
+zip = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
