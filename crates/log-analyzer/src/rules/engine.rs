@@ -37,7 +37,7 @@ fn compile(matcher: &Matcher) -> CompiledMatcher {
     match matcher {
         Matcher::MessagePrefix(p) => CompiledMatcher::MessagePrefix(p.clone()),
         Matcher::MessageContains(c) => CompiledMatcher::MessageContains(c.clone()),
-        // RuleSet::new validated compilability; this cannot fail here.
+        // RuleSet::new already verified the regex compiles; this cannot fail here.
         Matcher::MessageRegex(re) => CompiledMatcher::MessageRegex(Regex::new(re).expect("validated by RuleSet::new")),
         Matcher::FieldEquals { name, value } => CompiledMatcher::FieldEquals {
             name: name.clone(),
