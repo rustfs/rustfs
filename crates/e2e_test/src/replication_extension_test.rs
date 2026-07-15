@@ -23,6 +23,12 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
 use aws_sdk_s3::{Client, Config};
 use http::header::{CONTENT_TYPE, HOST};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use local_ip_address::local_ip;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
@@ -36,15 +42,22 @@ use rustfs_madmin::{
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
+use s3s::header::X_AMZ_REPLICATION_STATUS;
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::error::Error;
 use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::fs;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
@@ -888,6 +901,8 @@ struct ReplicatedVersion {
     key: String,
     version_id: String,
     delete_marker: bool,
+    is_latest: bool,
+    last_modified: (i64, u32),
     e_tag: Option<String>,
 }
 
@@ -906,6 +921,7 @@ async fn list_replication_state(client: &Client, bucket: &str) -> Result<Vec<Rep
             .await?;
 
         for version in output.versions() {
+            let last_modified = version.last_modified().ok_or("listed object version omitted LastModified")?;
             state.push(ReplicatedVersion {
                 key: version.key().ok_or("listed object version omitted key")?.to_string(),
                 version_id: version
@@ -913,10 +929,13 @@ async fn list_replication_state(client: &Client, bucket: &str) -> Result<Vec<Rep
                     .ok_or("listed object version omitted version ID")?
                     .to_string(),
                 delete_marker: false,
+                is_latest: version.is_latest().unwrap_or(false),
+                last_modified: (last_modified.secs(), last_modified.subsec_nanos()),
                 e_tag: Some(version.e_tag().ok_or("listed object version omitted ETag")?.to_string()),
             });
         }
         for marker in output.delete_markers() {
+            let last_modified = marker.last_modified().ok_or("listed delete marker omitted LastModified")?;
             state.push(ReplicatedVersion {
                 key: marker.key().ok_or("listed delete marker omitted key")?.to_string(),
                 version_id: marker
@@ -924,6 +943,8 @@ async fn list_replication_state(client: &Client, bucket: &str) -> Result<Vec<Rep
                     .ok_or("listed delete marker omitted version ID")?
                     .to_string(),
                 delete_marker: true,
+                is_latest: marker.is_latest().unwrap_or(false),
+                last_modified: (last_modified.secs(), last_modified.subsec_nanos()),
                 e_tag: None,
             });
         }
@@ -969,6 +990,26 @@ async fn assert_replication_converged(
         }
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn get_version_body(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    Ok(client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .version_id(version_id)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes()
+        .to_vec())
 }
 
 /// Poll the source object until it reports a not-yet-replicated status.
@@ -1423,6 +1464,112 @@ async fn site_replication_status(env: &RustFSTestEnvironment, query: &str) -> Re
     }
 
     Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
+fn proxy_error_response(error: impl std::fmt::Display) -> Response<Full<bytes::Bytes>> {
+    Response::builder()
+        .status(reqwest::StatusCode::BAD_GATEWAY)
+        .body(Full::new(bytes::Bytes::from(error.to_string())))
+        .expect("static proxy response must be valid")
+}
+
+async fn forward_replication_proxy_request(
+    request: Request<Incoming>,
+    backend_url: &str,
+    client: &reqwest::Client,
+    request_count: &AtomicU64,
+    mut replication_enabled: watch::Receiver<bool>,
+) -> Response<Full<bytes::Bytes>> {
+    let (parts, body) = request.into_parts();
+    let is_replication = parts
+        .headers
+        .get(X_AMZ_REPLICATION_STATUS)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"REPLICA"));
+    if is_replication {
+        request_count.fetch_add(1, Ordering::Relaxed);
+        while !*replication_enabled.borrow() {
+            if replication_enabled.changed().await.is_err() {
+                return proxy_error_response("replication gate closed");
+            }
+        }
+    }
+
+    let Some(path_and_query) = parts.uri.path_and_query() else {
+        return proxy_error_response("request URI omitted path");
+    };
+    let body = match body.collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(error) => return proxy_error_response(error),
+    };
+    let mut forwarded = client.request(parts.method, format!("{backend_url}{path_and_query}"));
+    for (name, value) in &parts.headers {
+        forwarded = forwarded.header(name, value);
+    }
+    let response = match forwarded.body(body).send().await {
+        Ok(response) => response,
+        Err(error) => return proxy_error_response(error),
+    };
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(error) => return proxy_error_response(error),
+    };
+    let mut proxied = Response::builder().status(status);
+    for (name, value) in &headers {
+        proxied = proxied.header(name, value);
+    }
+    proxied.body(Full::new(body)).expect("upstream response must be valid")
+}
+
+async fn start_replication_counting_proxy(
+    backend_url: &str,
+    tasks: &mut JoinSet<()>,
+) -> Result<(String, Arc<AtomicU64>, watch::Sender<bool>), Box<dyn Error + Send + Sync>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_url = format!("http://{}", listener.local_addr()?);
+    let backend_url = backend_url.to_string();
+    let request_count = Arc::new(AtomicU64::new(0));
+    let task_request_count = request_count.clone();
+    let (replication_enabled, task_replication_enabled) = watch::channel(true);
+    tasks.spawn(async move {
+        let client = local_http_client();
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { break };
+                    let backend_url = backend_url.clone();
+                    let client = client.clone();
+                    let request_count = task_request_count.clone();
+                    let replication_enabled = task_replication_enabled.clone();
+                    connections.spawn(async move {
+                        let service = service_fn(move |request| {
+                            let backend_url = backend_url.clone();
+                            let client = client.clone();
+                            let request_count = request_count.clone();
+                            let replication_enabled = replication_enabled.clone();
+                            async move {
+                                Ok::<_, Infallible>(
+                                    forward_replication_proxy_request(
+                                        request,
+                                        &backend_url,
+                                        &client,
+                                        &request_count,
+                                        replication_enabled,
+                                    )
+                                    .await,
+                                )
+                            }
+                        });
+                        let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
+                    });
+                }
+                _ = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    Ok((proxy_url, request_count, replication_enabled))
 }
 
 async fn site_replication_remove(
@@ -4130,6 +4277,324 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
     assert_eq!(replicated, payload);
 
     Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_site_replication_active_active_converges_without_loops_real_dual_node() -> TestResult {
+    init_logging();
+
+    match tokio::time::timeout(Duration::from_secs(420), async {
+        let mut site_env = replication_fast_env();
+        site_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+
+        let mut site_a_env = RustFSTestEnvironment::new().await?;
+        site_a_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut site_b_env = RustFSTestEnvironment::new().await?;
+        site_b_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut proxy_tasks = JoinSet::new();
+        let (site_a_proxy, site_a_replication_requests, site_a_replication_enabled) =
+            start_replication_counting_proxy(&site_a_env.url, &mut proxy_tasks).await?;
+        let (site_b_proxy, site_b_replication_requests, site_b_replication_enabled) =
+            start_replication_counting_proxy(&site_b_env.url, &mut proxy_tasks).await?;
+
+        let site_a_client = site_a_env.create_s3_client();
+        let site_b_client = site_b_env.create_s3_client();
+        let bucket = "site-repl-active-active";
+
+        let add_status = site_replication_add(
+            &site_a_env,
+            &[
+                PeerSite {
+                    name: "active-site-a".to_string(),
+                    endpoint: site_a_env.url.clone(),
+                    access_key: site_a_env.access_key.clone(),
+                    secret_key: site_a_env.secret_key.clone(),
+                    ..Default::default()
+                },
+                PeerSite {
+                    name: "active-site-b".to_string(),
+                    endpoint: site_b_env.url.clone(),
+                    access_key: site_b_env.access_key.clone(),
+                    secret_key: site_b_env.secret_key.clone(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert!(add_status.success, "unexpected site add result: {add_status:?}");
+
+        let site_info = wait_for_site_replication_enabled(&site_a_env, 2).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+
+        let mut site_a_peer = site_info
+            .sites
+            .iter()
+            .find(|peer| peer.endpoint == site_a_env.url)
+            .ok_or("site A peer missing from replication info")?
+            .clone();
+        site_a_peer.endpoint = site_a_proxy.clone();
+        site_a_peer.sync_state = SyncStatus::Enable;
+        let site_a_edit = site_replication_edit(&site_a_env, "", &site_a_peer).await?;
+        assert!(site_a_edit.success, "unexpected site A endpoint edit: {site_a_edit:?}");
+
+        let mut site_b_peer = site_info
+            .sites
+            .iter()
+            .find(|peer| peer.endpoint == site_b_env.url)
+            .ok_or("site B peer missing from replication info")?
+            .clone();
+        site_b_peer.endpoint = site_b_proxy.clone();
+        site_b_peer.sync_state = SyncStatus::Enable;
+        let site_b_edit = site_replication_edit(&site_a_env, "", &site_b_peer).await?;
+        assert!(site_b_edit.success, "unexpected site B endpoint edit: {site_b_edit:?}");
+
+        for env in [&site_a_env, &site_b_env] {
+            wait_for_site_replication_info(env, |info| {
+                info.sites.iter().any(|peer| peer.endpoint == site_a_proxy)
+                    && info.sites.iter().any(|peer| peer.endpoint == site_b_proxy)
+            })
+            .await?;
+        }
+
+        site_a_client.create_bucket().bucket(bucket).send().await?;
+        wait_for_bucket_on_target(&site_b_client, bucket).await?;
+
+        let (site_a_put, site_b_put) = tokio::join!(
+            site_a_client
+                .put_object()
+                .bucket(bucket)
+                .key("from-a.txt")
+                .body(ByteStream::from_static(b"written on site A"))
+                .send(),
+            site_b_client
+                .put_object()
+                .bucket(bucket)
+                .key("from-b.txt")
+                .body(ByteStream::from_static(b"written on site B"))
+                .send(),
+        );
+        site_a_put?;
+        site_b_put?;
+        wait_for_replicated_object(&site_b_client, bucket, "from-a.txt", "written on site A").await?;
+        wait_for_replicated_object(&site_a_client, bucket, "from-b.txt", "written on site B").await?;
+
+        let pre_conflict_counts = (
+            site_a_replication_requests.load(Ordering::Relaxed),
+            site_b_replication_requests.load(Ordering::Relaxed),
+        );
+        assert_eq!(pre_conflict_counts, (1, 1));
+        site_a_replication_enabled.send(false)?;
+        site_b_replication_enabled.send(false)?;
+        let site_a_conflict_version = site_a_client
+            .put_object()
+            .bucket(bucket)
+            .key("conflict.txt")
+            .body(ByteStream::from_static(b"conflict from site A"))
+            .send()
+            .await?
+            .version_id()
+            .ok_or("site A conflict PUT omitted version ID")?
+            .to_string();
+        sleep(Duration::from_millis(10)).await;
+        let site_b_conflict_version = site_b_client
+            .put_object()
+            .bucket(bucket)
+            .key("conflict.txt")
+            .body(ByteStream::from_static(b"conflict from site B"))
+            .send()
+            .await?
+            .version_id()
+            .ok_or("site B conflict PUT omitted version ID")?
+            .to_string();
+        assert_ne!(site_a_conflict_version, site_b_conflict_version);
+        tokio::time::timeout(Duration::from_secs(70), async {
+            loop {
+                let counts = (
+                    site_a_replication_requests.load(Ordering::Relaxed),
+                    site_b_replication_requests.load(Ordering::Relaxed),
+                );
+                assert!(counts.0 <= pre_conflict_counts.0 + 1 && counts.1 <= pre_conflict_counts.1 + 1);
+                if counts == (pre_conflict_counts.0 + 1, pre_conflict_counts.1 + 1) {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| "replication requests did not reach both conflict gates")?;
+        let site_a_isolated_conflict = list_replication_state(&site_a_client, bucket)
+            .await?
+            .into_iter()
+            .filter(|version| version.key == "conflict.txt")
+            .collect::<Vec<_>>();
+        let site_b_isolated_conflict = list_replication_state(&site_b_client, bucket)
+            .await?
+            .into_iter()
+            .filter(|version| version.key == "conflict.txt")
+            .collect::<Vec<_>>();
+        assert_eq!(site_a_isolated_conflict.len(), 1);
+        assert_eq!(site_a_isolated_conflict[0].version_id, site_a_conflict_version);
+        assert_eq!(site_b_isolated_conflict.len(), 1);
+        assert_eq!(site_b_isolated_conflict[0].version_id, site_b_conflict_version);
+        let (api_expected_winner, api_expected_body) = match site_a_isolated_conflict[0]
+            .last_modified
+            .cmp(&site_b_isolated_conflict[0].last_modified)
+        {
+            std::cmp::Ordering::Greater => (&site_a_conflict_version, b"conflict from site A".as_slice()),
+            std::cmp::Ordering::Less => (&site_b_conflict_version, b"conflict from site B".as_slice()),
+            std::cmp::Ordering::Equal => return Err("staggered conflict writes received equal LastModified values".into()),
+        };
+        site_a_replication_enabled.send(true)?;
+        site_b_replication_enabled.send(true)?;
+        tokio::time::timeout(
+            Duration::from_secs(70),
+            assert_replication_converged(&site_a_client, bucket, &site_b_client, bucket),
+        )
+        .await??;
+
+        for (version_id, expected) in [
+            (site_a_conflict_version.as_str(), b"conflict from site A".as_slice()),
+            (site_b_conflict_version.as_str(), b"conflict from site B".as_slice()),
+        ] {
+            assert_eq!(get_version_body(&site_a_client, bucket, "conflict.txt", version_id).await?, expected);
+            assert_eq!(get_version_body(&site_b_client, bucket, "conflict.txt", version_id).await?, expected);
+        }
+
+        // Newer LastModified wins; the writes are staggered while replication is
+        // blocked so this test does not claim a tie-break for equal timestamps.
+        let site_a_current = site_a_client
+            .get_object()
+            .bucket(bucket)
+            .key("conflict.txt")
+            .send()
+            .await?
+            .body
+            .collect()
+            .await?
+            .into_bytes();
+        let site_b_current = site_b_client
+            .get_object()
+            .bucket(bucket)
+            .key("conflict.txt")
+            .send()
+            .await?
+            .body
+            .collect()
+            .await?
+            .into_bytes();
+        assert_eq!(site_a_current, site_b_current);
+        let observed_winner_version = if site_a_current.as_ref() == b"conflict from site A" {
+            &site_a_conflict_version
+        } else if site_a_current.as_ref() == b"conflict from site B" {
+            &site_b_conflict_version
+        } else {
+            return Err(format!("unexpected active-active winner: {site_a_current:?}").into());
+        };
+        assert_eq!(site_a_current.as_ref(), api_expected_body);
+        assert_eq!(observed_winner_version, api_expected_winner);
+
+        site_a_client
+            .put_object()
+            .bucket(bucket)
+            .key("deleted.txt")
+            .body(ByteStream::from_static(b"delete me"))
+            .send()
+            .await?;
+        site_a_client.delete_object().bucket(bucket).key("deleted.txt").send().await?;
+        tokio::time::timeout(
+            Duration::from_secs(70),
+            assert_replication_converged(&site_a_client, bucket, &site_b_client, bucket),
+        )
+        .await??;
+        let site_a_deleted = site_a_client
+            .get_object()
+            .bucket(bucket)
+            .key("deleted.txt")
+            .send()
+            .await
+            .expect_err("site A deleted object unexpectedly rebounded");
+        let site_b_deleted = site_b_client
+            .get_object()
+            .bucket(bucket)
+            .key("deleted.txt")
+            .send()
+            .await
+            .expect_err("site B deleted object unexpectedly exists");
+        assert_eq!(site_a_deleted.as_service_error().and_then(|error| error.code()), Some("NoSuchKey"));
+        assert_eq!(site_b_deleted.as_service_error().and_then(|error| error.code()), Some("NoSuchKey"));
+
+        let stable_state = list_replication_state(&site_a_client, bucket).await?;
+        assert_eq!(stable_state.iter().filter(|version| version.key == "from-a.txt").count(), 1);
+        assert_eq!(stable_state.iter().filter(|version| version.key == "from-b.txt").count(), 1);
+        assert_eq!(stable_state.iter().filter(|version| version.key == "conflict.txt").count(), 2);
+        assert_eq!(
+            stable_state
+                .iter()
+                .filter(|version| version.key == "conflict.txt" && version.is_latest)
+                .count(),
+            1
+        );
+        assert!(
+            stable_state.iter().any(|version| version.key == "conflict.txt"
+                && version.version_id == *observed_winner_version
+                && version.is_latest)
+        );
+        assert_eq!(stable_state.iter().filter(|version| version.key == "deleted.txt").count(), 2);
+        assert_eq!(
+            stable_state
+                .iter()
+                .filter(|version| version.key == "deleted.txt" && version.delete_marker)
+                .count(),
+            1
+        );
+        assert_eq!(
+            stable_state
+                .iter()
+                .filter(|version| version.key == "deleted.txt" && !version.delete_marker)
+                .count(),
+            1
+        );
+        assert_eq!(
+            stable_state
+                .iter()
+                .filter(|version| version.key == "deleted.txt" && version.delete_marker && version.is_latest)
+                .count(),
+            1
+        );
+        assert_eq!(
+            stable_state
+                .iter()
+                .filter(|version| version.key == "deleted.txt" && version.is_latest)
+                .count(),
+            1
+        );
+
+        let baseline_counts = (
+            site_a_replication_requests.load(Ordering::Relaxed),
+            site_b_replication_requests.load(Ordering::Relaxed),
+        );
+        assert_eq!(baseline_counts, (2, 4));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            (
+                site_a_replication_requests.load(Ordering::Relaxed),
+                site_b_replication_requests.load(Ordering::Relaxed),
+            ),
+            baseline_counts
+        );
+        assert_eq!(list_replication_state(&site_a_client, bucket).await?, stable_state);
+        assert_eq!(list_replication_state(&site_b_client, bucket).await?, stable_state);
+
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("active-active replication test timed out".into()),
+    }
 }
 
 #[tokio::test]

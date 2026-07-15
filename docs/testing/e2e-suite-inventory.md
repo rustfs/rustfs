@@ -9,7 +9,7 @@
 > (`.config/nextest.toml`); admission criteria: `crates/e2e_test/README.md`.
 > 🌙 marks tests in the scheduled `e2e-repl-nightly` profile (backlog#1147
 > repl-1): `replication_extension_test` splits 20 fast tests into the PR smoke
-> lane and 23 slow / `_real_dual_node` / `_real_single_node` tests into the
+> lane and 24 slow / `_real_dual_node` / `_real_three_node` / `_real_single_node` tests into the
 > nightly lane (`.github/workflows/e2e-replication-nightly.yml`).
 > Note: counts exclude `#[ignore]`d tests (nextest lists them separately).
 
@@ -59,7 +59,7 @@
 | quota_test | 13 |  |
 | reliability_disk_fault_test | 3 |  |
 | reliant | 9 | 3 ✅ |
-| replication_extension_test | 43 | 20 ✅ +23 🌙 |
+| replication_extension_test | 44 | 20 ✅ +24 🌙 |
 | security_boundary_test | 4 |  |
 | server_startup_failfast_test | 1 |  |
 | snowball_auto_extract_test | 6 |  |
@@ -68,4 +68,4 @@
 | tls_gen | 3 |  |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 424 tests across 52 modules · PR smoke subset: 93 tests / 20 modules** (18 full modules + 3 `reliant::lifecycle` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 23 tests** · generated 2026-07-15.
+**Total listed: 425 tests across 52 modules · PR smoke subset: 93 tests / 20 modules** (18 full modules + 3 `reliant::lifecycle` tests + 20 of `replication_extension_test`) **· nightly `e2e-repl-nightly`: 24 tests** · generated 2026-07-15.

@@ -54,6 +54,9 @@ async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }
 async-trait = { workspace = true }
 flate2.workspace = true
 http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 reqwest = { workspace = true }
 rustfs-signer.workspace = true
 tracing = { workspace = true }
