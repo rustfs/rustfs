@@ -22,20 +22,16 @@ use rustfs_heal::heal::{
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Once},
+    sync::Arc,
     time::Duration,
 };
 use tokio::fs;
-use tokio_util::sync::CancellationToken;
 use tracing::info;
 use walkdir::WalkDir;
 
 mod storage_api;
 
-use storage_api::integration::{
-    BucketOperations, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, ObjectIO as _, ObjectOperations as _,
-    PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
-};
+use storage_api::integration::{BucketOperations, ECStore, ObjectIO as _, ObjectOperations as _};
 
 const HEAL_FORMAT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const HEAL_FORMAT_WAIT_INTERVAL: Duration = Duration::from_millis(250);
@@ -58,89 +54,16 @@ async fn wait_for_path_exists(path: &Path, timeout: Duration, interval: Duration
     }
 }
 
-static INIT: Once = Once::new();
-
-pub fn init_tracing() {
-    INIT.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
-            .with_thread_names(true)
-            .try_init();
-    });
-}
-
-/// Test helper: Create test environment with ECStore
-async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
-    init_tracing();
-
-    // create temp dir as 4 disks with unique base dir
-    let test_base_dir = format!("/tmp/rustfs_heal_heal_test_{}", uuid::Uuid::new_v4());
-    let temp_dir = std::path::PathBuf::from(&test_base_dir);
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir).await.ok();
-    }
-    fs::create_dir_all(&temp_dir).await.unwrap();
-
-    // create 4 disk dirs
-    let disk_paths = vec![
-        temp_dir.join("disk1"),
-        temp_dir.join("disk2"),
-        temp_dir.join("disk3"),
-        temp_dir.join("disk4"),
-    ];
-
-    for disk_path in &disk_paths {
-        fs::create_dir_all(disk_path).await.unwrap();
-    }
-
-    // create EndpointServerPools
-    let mut endpoints = Vec::new();
-    for (i, disk_path) in disk_paths.iter().enumerate() {
-        let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
-        // set correct index
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(i);
-        endpoints.push(endpoint);
-    }
-
-    let pool_endpoints = PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: 4,
-        endpoints: Endpoints::from(endpoints),
-        cmd_line: "test".to_string(),
-        platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
-    };
-
-    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
-
-    // format disks (only first time)
-    init_local_disks(endpoint_pools.clone()).await.unwrap();
-
-    // Use port 0 so nextest can run this integration binary in parallel
-    // with other ECStore-backed tests without sharing a fixed peer port.
-    let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
-        .await
-        .unwrap();
-
-    // init bucket metadata system
-    let buckets_list = ecstore
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    init_bucket_metadata_sys(ecstore.clone(), buckets).await;
-
-    // Create heal storage layer
-    let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
-
-    (disk_paths, ecstore, heal_storage)
+/// Test helper: build the shared 4-disk temp-dir ECStore environment
+/// (rustfs-test-utils, backlog#1153 infra-1) and wrap it in the heal storage
+/// layer. Port 0 + uuid temp dirs keep this parallel-safe under nextest.
+async fn heal_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .prefix("rustfs_heal_heal_test")
+        .build()
+        .await;
+    let heal_storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+    (env.disk_paths, env.ecstore, heal_storage)
 }
 
 /// Test helper: Create a test bucket
@@ -169,7 +92,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_object_basic() {
-        let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
 
         // Create test bucket and object
         let bucket_name = "test-heal-object-basic";
@@ -238,7 +161,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_object_reclaims_orphan_data_dir_when_healthy() {
-        let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
 
         let bucket_name = "test-heal-reclaim-orphan";
         let object_name = "healthy-object.bin";
@@ -350,7 +273,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_bucket_basic() {
-        let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
 
         // Create test bucket
         let bucket_name = "test-heal-bucket-basic";
@@ -420,7 +343,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_format_basic() {
-        let (disk_paths, _ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, _ecstore, heal_storage) = heal_env().await;
 
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
@@ -446,7 +369,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_format_with_data() {
-        let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
 
         // Create test bucket and object
         let bucket_name = "test-heal-format-with-data";
@@ -535,7 +458,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_storage_api_direct() {
-        let (_disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (_disk_paths, ecstore, heal_storage) = heal_env().await;
 
         // Test direct heal storage API calls
 

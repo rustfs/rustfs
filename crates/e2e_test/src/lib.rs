@@ -197,6 +197,12 @@ mod object_lambda_test;
 #[cfg(test)]
 mod notification_webhook_test;
 
+// TLS certificate hot-reload live-listener e2e (backlog#1154 peri-5): swap
+// certificates without a restart, existing sessions survive, bad material is
+// fail-safe (old certificate keeps serving, failure is logged).
+#[cfg(test)]
+mod tls_hot_reload_test;
+
 // Replication extension end-to-end regression tests
 #[cfg(test)]
 mod replication_extension_test;

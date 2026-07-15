@@ -75,7 +75,20 @@ jobs:
     name: Build + cache baseline binary
     if: github.event_name == 'push'
     runs-on: sm-standard-2
-    timeout-minutes: 60
+    # Latest-wins: consumers only ever restore the binary for the *current*
+    # origin/main tip, so when pushes land faster than the ~65min build, a
+    # superseded build's output is dead weight — cancel it instead of stacking
+    # hour-long jobs on the shared runner pool. A skipped intermediate SHA at
+    # most costs one same-commit self-heal in the A/B job.
+    concurrency:
+      group: perf-baseline-build-main
+      cancel-in-progress: true
+    # #4806 put thin LTO + codegen-units=1 on [profile.release], pushing a
+    # single release build past 60min on this runner — every cache build on
+    # 2026-07-15 died on the old 60min ceiling ("exceeded the maximum execution
+    # time of 1h0m0s") and the cache never populated. The measured binary must
+    # keep the production profile, so the budget absorbs the build instead.
+    timeout-minutes: 100
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -119,10 +132,11 @@ jobs:
     runs-on: sm-standard-2
     # With perf-3's cached baseline binary the common (cache-hit) nightly is
     # measurement-only and finishes well under 50min. This ceiling stays
-    # generous only to absorb the rare cache-miss fallback, which reverts to the
-    # ~65min source double-build; a timeout there now surfaces via the
-    # alert-on-failure job (it fires on cancelled/timed-out, not just failure).
-    # perf-6 recalibrates the budget once the noise study lands.
+    # generous only to absorb the same-commit cache-miss self-heal (~65min
+    # single build with the post-#4806 LTO profile + measurement). A timeout
+    # surfaces via the alert-on-failure job (it fires on cancelled/timed-out,
+    # not just failure). perf-6 recalibrates the budget once the noise study
+    # lands.
     timeout-minutes: 120
     steps:
       - name: Checkout repository
@@ -184,6 +198,30 @@ jobs:
           path: baseline-bin/rustfs
           key: rustfs-baseline-${{ steps.commits.outputs.baseline_sha }}
 
+      # Self-heal: on a nightly/dispatch run where the candidate commit IS the
+      # baseline commit, a cache miss would make the rig build the same commit
+      # twice (~65min per side with the post-#4806 LTO profile — no job budget
+      # fits that). Build it once here, reuse it for both phases, and save it
+      # back to the cache so the next run hits.
+      - name: Build baseline on cache miss (same-commit self-heal)
+        id: selfheal
+        if: >-
+          steps.baseline_cache.outputs.cache-hit != 'true' &&
+          steps.commits.outputs.baseline_sha == steps.commits.outputs.candidate_sha
+        run: |
+          set -euo pipefail
+          cargo build --release --bin rustfs
+          mkdir -p baseline-bin
+          cp target/release/rustfs baseline-bin/rustfs
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save self-healed baseline to cache
+        if: steps.selfheal.outputs.built == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: baseline-bin/rustfs
+          key: rustfs-baseline-${{ steps.commits.outputs.baseline_sha }}
+
       - name: Run warp A/B and gate
         id: ab
         run: |
@@ -200,25 +238,33 @@ jobs:
           baseline_sha="${{ steps.commits.outputs.baseline_sha }}"
           candidate_sha="${{ steps.commits.outputs.candidate_sha }}"
           baseline_hit="${{ steps.baseline_cache.outputs.cache-hit }}"
+          selfheal_built="${{ steps.selfheal.outputs.built }}"
 
           args=(--duration "$duration" --rounds 2 --cooldown 5 --health-timeout 180)
 
-          if [[ "$baseline_hit" == "true" ]]; then
+          if [[ "$baseline_hit" == "true" || "$selfheal_built" == "true" ]]; then
             chmod +x baseline-bin/rustfs
             base_bin="$PWD/baseline-bin/rustfs"
             args+=(--baseline-bin "$base_bin")
-            base_src="actions-cache (rustfs-baseline-$baseline_sha)"
+            if [[ "$baseline_hit" == "true" ]]; then
+              base_src="actions-cache (rustfs-baseline-$baseline_sha)"
+            else
+              base_src="source build (cache self-heal, saved as rustfs-baseline-$baseline_sha)"
+            fi
             if [[ "$candidate_sha" == "$baseline_sha" ]]; then
               # Nightly on main: the candidate is the same commit as the baseline,
-              # so reuse the one cached binary for both phases and skip all builds.
+              # so reuse the one binary for both phases and skip all builds.
               args+=(--candidate-bin "$base_bin" --skip-build)
-              cand_src="actions-cache (same commit as baseline)"
+              cand_src="same binary as baseline (same commit)"
             else
               cand_src="source build of the checked-out ref"
             fi
           else
-            # Cache miss (binary evicted or not built for this SHA): fall back to
-            # the slow source double-build so the run still produces a result.
+            # Cache miss with candidate != baseline (opt-in PR gate only): fall
+            # back to the source double-build. With the post-#4806 LTO profile
+            # this will overrun the job budget and alert; rerun once the push
+            # cache build for origin/main has completed, or wait for perf-7's
+            # merge-base caching.
             args+=(--baseline-ref origin/main)
             base_src="source build of origin/main (cache miss)"
             cand_src="source build of the checked-out ref"

@@ -165,7 +165,7 @@ test-group = 'e2e-reliability'
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
-        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook)_test::/)
+        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_source_invalid_date|content_encoding|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload)_test::/)
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
     )
@@ -217,3 +217,79 @@ fail-fast = false
 # Emitted to target/nextest/e2e-repl-nightly/junit.xml; uploaded by the nightly
 # workflow as the failure-triage artifact.
 path = "junit.xml"
+
+# ---------------------------------------------------------------------------
+# e2e-full profile — merge-gate full single-node e2e lane (backlog#1149 ci-5)
+# ---------------------------------------------------------------------------
+# The merge gate (ci.yml `e2e-full` job: push main + merge_group +
+# workflow_dispatch). Runs the never-automated user-visible suites — KMS (40),
+# object_lock (33), multipart_auth (109), quota, checksum, encryption,
+# security-boundary, ... — that the fast PR `e2e-smoke` subset deliberately
+# skips. Budget <= 45 min; authority for the suite count is `cargo nextest list
+# --profile e2e-full` (see docs/testing/e2e-suite-inventory.md).
+#
+# The filter is "the whole e2e_test crate MINUS the sets owned by other lanes":
+#   * protocols:: — FTPS/SFTP/WebDAV, still pinned to --test-threads=1 by fixed
+#     ports; they join a scheduled lane once ci-6 randomises the ports (ci-7).
+#   * the 6 cluster suites that spin up a RustFSTestClusterEnvironment
+#     (cluster_concurrency, stale_multipart_cleanup_cluster,
+#     namespace_lock_quorum, heal_erasure_disk_rebuild, admin_timeout_regression,
+#     object_lambda) — too heavy for the merge budget; they run in ci-7's
+#     nightly 4-node lane.
+#   * replication_extension_test — repl-1 already splits it into the PR
+#     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (20 slow) lanes and reserves
+#     it for those, so e2e-full does not double-run it.
+#   * #[ignore]d tests — nextest skips them by default (no --run-ignored); the
+#     manual-localhost:9000 reliant/policy tests are ci-13's migration.
+#
+# Each e2e test spawns its own single-node rustfs server on a random port with
+# an isolated temp dir (crates/e2e_test/src/common.rs), so the set is
+# parallel-safe — the same property e2e-smoke relies on. The exception is the
+# 4-disk reliability / degraded-read fault-injection tests, serialized below
+# (identical to the ci profile) so several 4-disk servers never run at once.
+# KNOWN-FAILURE EXCLUSIONS (characterization run 29381309848, 2026-07-15:
+# 341 ran / 32 failed on the suites' first automated run ever). Deterministic
+# product failures cannot be quarantined away with retries, so each family is
+# excluded here with its tracking issue, under the same discipline as the
+# ci-profile quarantine (docs/testing/README.md): every entry MUST cite one
+# OPEN issue, and the fixing PR MUST delete the exclusion. The passing
+# negative-path siblings of each family stay in as regression guards.
+#   * rustfs#4842 — extract/snowball expand pipeline 500s (mtime=0
+#     OffsetDateTime deserialization + same-path failures).
+#   * rustfs#4843 — over-limit archive entry paths hard-reject the whole
+#     archive even under ignore-errors semantics.
+#   * rustfs#4844 — anonymous POST-object with SSE-S3 / bucket-default SSE
+#     returns 500.
+#   * rustfs#4845 — 403 on allowed anonymous POST object-lock fields and on
+#     the list metadata=true extension.
+#   * rustfs#4846 — distributed-lock quorum tests misclassify as timeout
+#     under parallel load (multi-node in-process clusters; natural home is
+#     ci-7's nightly cluster lane).
+[profile.e2e-full]
+default-filter = """
+    package(e2e_test)
+    & !test(/^protocols::/)
+    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+    & !test(/^replication_extension_test::/)
+    & !test(/^multipart_auth_test::test_signed_put_object_extract_(accepts_compat_header|expands_tar_entries_with_prefix_headers|expands_tar_gz_archive|expands_tbz2_archive|expands_tgz_archive|expands_txz_archive|expands_tzst_archive|normalizes_prefix_header_value|preserves_directory_markers_by_default|preserves_object_lock_legal_hold|preserves_object_lock_retention|preserves_pax_metadata_and_version_id|preserves_request_metadata_on_extracted_objects|preserves_sse_c|preserves_sse_s3_and_redirect|preserves_storage_class|uses_bucket_default_sse_s3)$/)
+    & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(prefers_exact_minio_prefix_over_suffix_fallback|supports_minio_prefix_and_directory_markers)$/)
+    & !test(/^multipart_auth_test::test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled$/)
+    & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(ignores_invalid_entries_when_requested|supports_standard_headers_with_combined_extract_options)$/)
+    & !test(/^multipart_auth_test::test_anonymous_post_object_(accepts_sse_s3|rejects_sse_s3_missing_from_policy_conditions|uses_bucket_default_sse_kms|uses_bucket_default_sse_s3)$/)
+    & !test(/^multipart_auth_test::test_anonymous_post_object_(accepts_object_lock_legal_hold_field|accepts_object_lock_retention_fields)$/)
+    & !test(/^list_object(s_v2|_versions)_metadata_extension_test::/)
+    & !test(/^reliant::lock::test_distributed_lock_(2_nodes_grpc_read_survives_failed_node|4_nodes_grpc_read_write_quorum_split_with_two_failed_nodes)$/)
+"""
+fail-fast = false
+
+[profile.e2e-full.junit]
+# Emitted to target/nextest/e2e-full/junit.xml; uploaded by the e2e-full job.
+path = "junit.xml"
+
+# Serialize the 4-disk reliability / degraded-read e2e tests under e2e-full too
+# (see the e2e-reliability test-group note near the top of this file). Not a
+# quarantine: no retries, just single-threaded so several 4-disk servers never
+# run concurrently.
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
+test-group = 'e2e-reliability'
