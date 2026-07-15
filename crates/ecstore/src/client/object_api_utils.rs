@@ -121,8 +121,11 @@ pub fn new_getobjectreader<'a>(
     let is_compressed = false; //oi.is_compressed_ok();
 
     let rs_;
-    if rs.is_none() && opts.part_number.is_some() && opts.part_number.expect("operation should succeed") > 0 {
-        rs_ = part_number_to_rangespec(oi.clone(), opts.part_number.expect("operation should succeed"));
+    if rs.is_none()
+        && let Some(part_number) = opts.part_number
+        && part_number > 0
+    {
+        rs_ = part_number_to_rangespec(oi.clone(), part_number);
     } else {
         rs_ = rs.clone();
     }
@@ -157,6 +160,16 @@ pub fn new_getobjectreader<'a>(
         });
 
         return Ok((get_fn, off as i64, length as i64));
+    }
+    if rs.is_none() && opts.part_number.is_none() && oi.size >= 0 {
+        get_fn = Arc::new(move |input_reader: BufReader<Cursor<Vec<u8>>>, _: HeaderMap| GetObjectReader {
+            object_info: oi.clone(),
+            stream: Box::new(input_reader),
+            buffered_body: None,
+            body_source: Default::default(),
+        });
+
+        return Ok((get_fn, 0, oi.size));
     }
     Err(ErrorResponse {
         code: S3ErrorCode::InvalidRange,
@@ -198,6 +211,57 @@ pub fn get_raw_etag(metadata: &HashMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn multipart_object_info() -> ObjectInfo {
+        ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 6 * 1024 * 1024,
+            actual_size: 6 * 1024 * 1024,
+            parts: Arc::new(vec![
+                ObjectPartInfo {
+                    number: 1,
+                    size: 5 * 1024 * 1024,
+                    actual_size: 5 * 1024 * 1024,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    number: 2,
+                    size: 1024 * 1024,
+                    actual_size: 1024 * 1024,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_new_getobjectreader_uses_full_range_for_unranged_multipart_object() {
+        let oi = multipart_object_info();
+        let opts = ObjectOptions::default();
+
+        let result = new_getobjectreader(&None, &oi, &opts, &HeaderMap::new())
+            .expect("unranged multipart object should build a full-object reader");
+
+        assert_eq!(result.1, 0);
+        assert_eq!(result.2, oi.size);
+    }
+
+    #[test]
+    fn test_new_getobjectreader_keeps_part_number_range_for_multipart_object() {
+        let oi = multipart_object_info();
+        let opts = ObjectOptions {
+            part_number: Some(2),
+            ..Default::default()
+        };
+
+        let result = new_getobjectreader(&None, &oi, &opts, &HeaderMap::new()).expect("part number should build that part range");
+
+        assert_eq!(result.1, 5 * 1024 * 1024);
+        assert_eq!(result.2, 1024 * 1024);
+    }
 
     #[test]
     fn test_to_s3s_etag() {

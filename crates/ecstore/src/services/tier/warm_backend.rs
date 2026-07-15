@@ -429,4 +429,19 @@ mod tests {
         assert!(!opts.user_metadata.contains_key(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str()));
         assert!(!opts.user_metadata.contains_key(X_AMZ_REPLICATION_STATUS.as_str()));
     }
+
+    #[test]
+    fn build_transition_put_options_requests_no_checksum_and_content_md5() {
+        // Regression for rustfs/rustfs#4811: transition uploads must leave the
+        // additional-checksum modes unset and rely on Content-MD5. If `checksum`
+        // were (incorrectly) reported as set, the >128 MiB multipart put path
+        // would call `ChecksumNone.hasher()` and fail with "unsupported checksum
+        // type". Objects <=128 MiB take the single-part path and only worked by
+        // silently dropping the checksum, so pin both invariants here.
+        let opts = build_transition_put_options("COLD".to_string(), HashMap::new());
+
+        assert!(!opts.checksum.is_set(), "transition put must not request an additional checksum");
+        assert!(!opts.auto_checksum.is_set(), "transition put must not preset auto_checksum");
+        assert!(opts.send_content_md5, "transition put must send Content-MD5");
+    }
 }

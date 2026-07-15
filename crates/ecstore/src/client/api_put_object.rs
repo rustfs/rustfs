@@ -120,7 +120,11 @@ impl Default for PutObjectOptions {
             storage_class: "".to_string(),
             website_redirect_location: "".to_string(),
             part_size: 0,
-            legalhold: ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF),
+            // Empty, not OFF: `header()` emits x-amz-object-lock-legal-hold for
+            // any non-empty status, and CompleteMultipartUpload rejects requests
+            // that carry object-lock headers, breaking multipart transitions
+            // (rustfs/rustfs#4811). Only send the header when a status is set.
+            legalhold: ObjectLockLegalHoldStatus::from_static(""),
             send_content_md5: false,
             disable_content_sha256: false,
             disable_multipart: false,

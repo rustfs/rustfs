@@ -1275,6 +1275,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             continue;
         }
 
+        if files[idx].data.is_none() && disks[idx].is_none() {
+            continue;
+        }
+
         let inline_data = files[idx].data.clone();
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
