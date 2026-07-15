@@ -982,6 +982,7 @@ pin_project! {
         method: Method,
         headers: HeaderMap,
         err_rx: tokio::sync::oneshot::Receiver<std::io::Error>,
+        start_tx: Option<tokio::sync::oneshot::Sender<()>>,
         sender: PollSender<Option<Bytes>>,
         handle: tokio::task::JoinHandle<std::io::Result<()>>,
         pending_chunk: BytesMut,
@@ -1007,8 +1008,14 @@ impl HttpWriter {
 
         let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(HTTP_WRITER_CHANNEL_CAPACITY);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel::<io::Error>();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
 
         let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return Ok(());
+            }
+            record_internode_outgoing_request(track_internode_metrics, internode_operation);
+
             let stream = ReceiverStream {
                 receiver,
                 track_internode_metrics,
@@ -1075,12 +1082,12 @@ impl HttpWriter {
         });
 
         // http_log!("[HttpWriter::new] connection established successfully");
-        record_internode_outgoing_request(track_internode_metrics, internode_operation);
         Ok(Self {
             url,
             method,
             headers,
             err_rx,
+            start_tx: Some(start_tx),
             sender: PollSender::new(sender),
             handle,
             pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
@@ -1266,6 +1273,12 @@ fn send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -
 }
 
 impl HttpWriter {
+    fn start_request(&mut self) {
+        if let Some(start_tx) = self.start_tx.take() {
+            let _ = start_tx.send(());
+        }
+    }
+
     fn take_background_error(&mut self) -> io::Result<()> {
         match self.err_rx.try_recv() {
             Ok(err) => Err(err),
@@ -1319,6 +1332,7 @@ impl AsyncWrite for HttpWriter {
                     this.sender
                         .send_item(Some(Bytes::copy_from_slice(buf)))
                         .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
+                    this.start_request();
                     return Poll::Ready(Ok(buf.len()));
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
@@ -1327,6 +1341,9 @@ impl AsyncWrite for HttpWriter {
         }
 
         this.pending_chunk.extend_from_slice(buf);
+        if !buf.is_empty() {
+            this.start_request();
+        }
 
         Poll::Ready(Ok(buf.len()))
     }
@@ -1365,6 +1382,7 @@ impl AsyncWrite for HttpWriter {
                     this.sender
                         .send_item(Some(Bytes::copy_from_slice(bufs[0].as_ref())))
                         .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
+                    this.start_request();
                     return Poll::Ready(Ok(total_len));
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
@@ -1374,6 +1392,9 @@ impl AsyncWrite for HttpWriter {
 
         for buf in bufs {
             this.pending_chunk.extend_from_slice(buf);
+        }
+        if total_len > 0 {
+            this.start_request();
         }
 
         Poll::Ready(Ok(total_len))
@@ -1387,6 +1408,7 @@ impl AsyncWrite for HttpWriter {
         // let url = self.url.clone();
         // let method = self.method.clone();
 
+        self.as_mut().get_mut().start_request();
         if let Err(err) = self.as_mut().get_mut().take_background_error() {
             record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
             return Poll::Ready(Err(err));
@@ -1843,6 +1865,49 @@ mod tests {
 
         assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
         assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"payload".to_vec()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_drop_before_first_write_does_not_send_put() {
+        let state = TestState::default();
+        let Some((url, server_handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+
+        let writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        let HttpWriter {
+            handle,
+            sender,
+            start_tx,
+            ..
+        } = writer;
+        drop(start_tx);
+        drop(sender);
+        handle
+            .await
+            .expect("HttpWriter background task should not panic")
+            .expect("an unstarted HttpWriter should stop cleanly");
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 0);
+        assert!(state.put_bodies.lock().await.is_empty());
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_shutdown_without_write_sends_empty_put() {
+        let state = TestState::default();
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[Vec::<u8>::new()]);
 
         handle.abort();
     }
