@@ -99,6 +99,54 @@ impl Error {
     pub fn transient_skip(message: impl Into<String>) -> Self {
         Error::TransientSkip { message: message.into() }
     }
+
+    /// Whether a heal operation can be retried without changing its inputs.
+    pub(crate) fn is_recoverable_heal(&self) -> bool {
+        match self {
+            Error::TaskCancelled => false,
+            Error::TaskTimeout | Error::TransientSkip { .. } => true,
+            Error::Storage(err) => {
+                err.is_quorum_error()
+                    || matches!(err, EcstoreError::SlowDown | EcstoreError::OperationCanceled | EcstoreError::Lock(_))
+                    || is_recoverable_heal_error_message(&err.to_string())
+            }
+            Error::Disk(err) => {
+                matches!(
+                    err,
+                    DiskError::ErasureReadQuorum
+                        | DiskError::ErasureWriteQuorum
+                        | DiskError::Timeout
+                        | DiskError::SourceStalled
+                        | DiskError::FaultyRemoteDisk
+                        | DiskError::FaultyDisk
+                ) || is_recoverable_heal_error_message(&err.to_string())
+            }
+            Error::TaskExecutionFailed { message } | Error::IO(message) | Error::Other(message) => {
+                is_recoverable_heal_error_message(message)
+            }
+            Error::Io(err) => is_recoverable_heal_error_message(&err.to_string()),
+            _ => false,
+        }
+    }
+}
+
+fn is_recoverable_heal_error_message(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "failed to acquire read lock",
+        "lock acquisition failed",
+        "lock acquisition timeout",
+        "remote lock rpc timed out",
+        "deadline has elapsed",
+        "timed out",
+        "transport error",
+        "network error",
+        "connection refused",
+        "operation canceled",
+        "quorum not reached",
+    ]
+    .iter()
+    .any(|pattern| error.contains(pattern))
 }
 
 impl From<Error> for std::io::Error {
