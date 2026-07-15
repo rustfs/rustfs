@@ -257,6 +257,7 @@ def spark_catalog_config(
             (f"{prefix}.type", "rest"),
             (f"{prefix}.uri", f"{endpoint}{rest_path}"),
             (f"{prefix}.warehouse", warehouse),
+            (f"{prefix}.prefix", warehouse),
             (f"{prefix}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO"),
             (f"{prefix}.s3.endpoint", endpoint),
             (f"{prefix}.s3.path-style-access", "true"),

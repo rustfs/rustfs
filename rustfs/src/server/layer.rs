@@ -37,6 +37,7 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::S3ErrorCode;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -625,6 +626,165 @@ where
 
             Ok(response)
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct IcebergRestErrorCompatLayer;
+
+impl<S> Layer<S> for IcebergRestErrorCompatLayer {
+    type Service = IcebergRestErrorCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        IcebergRestErrorCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct IcebergRestErrorCompatService<S> {
+    inner: S,
+}
+
+impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for IcebergRestErrorCompatService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
+    RestBody::Error: Into<S::Error> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        let catalog_path =
+            (req.method() != Method::HEAD && is_table_catalog_path(req.uri().path())).then(|| req.uri().path().to_string());
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let response = inner.call(req).await?;
+            let (parts, body) = response.into_parts();
+            let should_convert = catalog_path.is_some() && !parts.status.is_success() && is_xml_response(&parts.headers);
+
+            let response = match body {
+                HybridBody::Rest { rest_body } if should_convert => {
+                    let (rest_body, converted_status) = convert_iceberg_error_in_xml(
+                        rest_body,
+                        parts.status,
+                        catalog_path.as_deref().expect("catalog path was checked"),
+                    )
+                    .await
+                    .map_err(Into::into)?;
+                    let mut parts = parts;
+                    if let Some(status) = converted_status {
+                        parts.status = status;
+                        parts.headers.remove(http::header::CONTENT_LENGTH);
+                        parts
+                            .headers
+                            .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    }
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
+                }
+                HybridBody::Rest { rest_body } => Response::from_parts(parts, HybridBody::Rest { rest_body }),
+                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+            };
+
+            Ok(response)
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SerializedS3Error {
+    #[serde(rename = "Code")]
+    code: String,
+    #[serde(default, rename = "Message")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct IcebergRestErrorEnvelope {
+    error: IcebergRestError,
+}
+
+#[derive(Debug, Serialize)]
+struct IcebergRestError {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: String,
+    code: u16,
+}
+
+async fn convert_iceberg_error_in_xml<RestBody>(
+    body: RestBody,
+    status: StatusCode,
+    path: &str,
+) -> Result<(RestBody, Option<StatusCode>), RestBody::Error>
+where
+    RestBody: Body<Data = Bytes> + From<Bytes>,
+{
+    let bytes = BodyExt::collect(body).await?.to_bytes();
+    let Some(parsed) = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|xml| quick_xml::de::from_str::<SerializedS3Error>(xml).ok())
+    else {
+        return Ok((RestBody::from(bytes), None));
+    };
+    let status = iceberg_rest_status(status, &parsed.code);
+    let envelope = IcebergRestErrorEnvelope {
+        error: IcebergRestError {
+            message: parsed.message.unwrap_or_else(|| parsed.code.clone()),
+            error_type: iceberg_rest_error_type(&parsed.code, status, path),
+            code: status.as_u16(),
+        },
+    };
+    let Ok(json) = serde_json::to_vec(&envelope) else {
+        return Ok((RestBody::from(bytes), None));
+    };
+    Ok((RestBody::from(Bytes::from(json)), Some(status)))
+}
+
+fn iceberg_rest_status(status: StatusCode, error_code: &str) -> StatusCode {
+    if status == StatusCode::PRECONDITION_FAILED || error_code == "PreconditionFailed" {
+        StatusCode::CONFLICT
+    } else {
+        status
+    }
+}
+
+fn iceberg_rest_error_type(error_code: &str, status: StatusCode, path: &str) -> String {
+    if error_code.ends_with("Exception") {
+        return error_code.to_string();
+    }
+    match error_code {
+        "AccessDenied" | "SignatureDoesNotMatch" => "ForbiddenException".to_string(),
+        "InvalidAccessKeyId" => "NotAuthorizedException".to_string(),
+        "InvalidArgument" | "InvalidRequest" => "BadRequestException".to_string(),
+        "PreconditionFailed" => "CommitFailedException".to_string(),
+        _ => match status {
+            StatusCode::UNAUTHORIZED => "NotAuthorizedException".to_string(),
+            StatusCode::FORBIDDEN => "ForbiddenException".to_string(),
+            StatusCode::NOT_FOUND => iceberg_not_found_error_type(path).to_string(),
+            StatusCode::CONFLICT => "CommitFailedException".to_string(),
+            status if status.is_server_error() => "RESTException".to_string(),
+            _ => "BadRequestException".to_string(),
+        },
+    }
+}
+
+fn iceberg_not_found_error_type(path: &str) -> &'static str {
+    if path.contains("/views/") {
+        "NoSuchViewException"
+    } else if path.contains("/tables/") {
+        "NoSuchTableException"
+    } else {
+        "NoSuchNamespaceException"
     }
 }
 
@@ -2722,6 +2882,66 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(bytes, input);
+    }
+
+    #[tokio::test]
+    async fn iceberg_rest_error_conversion_returns_standard_json_envelope() {
+        let body = Full::from(Bytes::from_static(
+            b"<Error><Code>NoSuchTableException</Code><Message>table not found</Message></Error>",
+        ));
+
+        let (body, status) =
+            convert_iceberg_error_in_xml(body, StatusCode::NOT_FOUND, "/iceberg/v1/warehouse/namespaces/ns/tables/events")
+                .await
+                .expect("convert Iceberg error");
+        let value: serde_json::Value =
+            serde_json::from_slice(&BodyExt::collect(body).await.expect("collect converted body").to_bytes())
+                .expect("JSON error envelope");
+
+        assert_eq!(status, Some(StatusCode::NOT_FOUND));
+        assert_eq!(value["error"]["code"], 404);
+        assert_eq!(value["error"]["type"], "NoSuchTableException");
+        assert_eq!(value["error"]["message"], "table not found");
+    }
+
+    #[tokio::test]
+    async fn iceberg_rest_error_conversion_maps_precondition_to_commit_conflict() {
+        let body = Full::from(Bytes::from_static(
+            b"<Error><Code>PreconditionFailed</Code><Message>version token changed</Message></Error>",
+        ));
+
+        let (body, status) = convert_iceberg_error_in_xml(
+            body,
+            StatusCode::PRECONDITION_FAILED,
+            "/_iceberg/v1/warehouse/namespaces/ns/tables/events",
+        )
+        .await
+        .expect("convert Iceberg conflict");
+        let value: serde_json::Value =
+            serde_json::from_slice(&BodyExt::collect(body).await.expect("collect converted body").to_bytes())
+                .expect("JSON error envelope");
+
+        assert_eq!(status, Some(StatusCode::CONFLICT));
+        assert_eq!(value["error"]["code"], 409);
+        assert_eq!(value["error"]["type"], "CommitFailedException");
+    }
+
+    #[tokio::test]
+    async fn iceberg_rest_error_conversion_preserves_forbidden_status() {
+        let body = Full::from(Bytes::from_static(
+            b"<Error><Code>SignatureDoesNotMatch</Code><Message>signature mismatch</Message></Error>",
+        ));
+
+        let (body, status) = convert_iceberg_error_in_xml(body, StatusCode::FORBIDDEN, "/iceberg/v1/config")
+            .await
+            .expect("convert Iceberg auth error");
+        let value: serde_json::Value =
+            serde_json::from_slice(&BodyExt::collect(body).await.expect("collect converted body").to_bytes())
+                .expect("JSON error envelope");
+
+        assert_eq!(status, Some(StatusCode::FORBIDDEN));
+        assert_eq!(value["error"]["code"], 403);
+        assert_eq!(value["error"]["type"], "ForbiddenException");
     }
 
     #[test]
