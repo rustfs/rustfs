@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
+use crate::crash_inject::{self, CrashPoint};
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
 use crate::disk::{
@@ -1475,79 +1476,6 @@ fn should_fail_after_delete_data_staged(path: &str) -> bool {
 
 #[cfg(not(test))]
 fn should_fail_before_old_metadata_backup(_dst_path: &str) -> bool {
-    false
-}
-
-/// Commit-sequence points where the rename_data crash-consistency harness
-/// (rustfs/backlog#935, test plan in rustfs/backlog#896) can simulate an
-/// abrupt power loss.
-///
-/// Unlike [`should_fail_before_old_metadata_backup`], which exercises the
-/// graceful in-process rollback (delete the staged data dir, return an
-/// error), a crash point models a hard power loss: the commit sequence stops
-/// dead at the armed step with **no** cleanup, leaving the on-disk state
-/// exactly as the preceding steps left it. The harness then reopens the disk
-/// and asserts the raw state is coherent — the object reads back as either the
-/// old version or the new version, never a mixed or corrupt one — without any
-/// rollback code having run.
-///
-/// The variants are constructed at the real commit-path call sites in every
-/// build, but the arming static and [`should_crash_rename_data_at`] are
-/// `#[cfg(test)]`; in production the guard is a const-`false` no-op, so the
-/// injection points compile away to nothing.
-// The `After<step>` naming is deliberate: every crash point names the
-// commit-sequence step it fires immediately after, so the shared prefix is the
-// point, not noise.
-#[allow(clippy::enum_variant_names)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RenameDataCrashPoint {
-    /// After the data dir has been renamed into its destination but before the
-    /// old-metadata rollback backup is written. xl.meta has not been committed
-    /// yet, so a crash here must leave the object readable as the old version.
-    AfterDataRename,
-    /// After the rollback backup is persisted, immediately before the xl.meta
-    /// commit rename that makes the new version visible. Still pre-commit, so a
-    /// crash here must also leave the object readable as the old version.
-    AfterBackupBeforeMetaCommit,
-    /// After the xl.meta commit rename has made the new version visible, in the
-    /// same window the graceful [`should_fail_after_metadata_commit`] failpoint
-    /// covers — but as a hard power loss with **no** rollback. The commit rename
-    /// already landed on disk, so a crash here must leave the object readable as
-    /// the *new* version. This is the post-commit counterpart to the two
-    /// pre-commit points above, closing the "old or new, never mixed" invariant
-    /// (rustfs/backlog#878) from the new-version side.
-    AfterMetaCommit,
-}
-
-#[cfg(test)]
-static RENAME_DATA_CRASH_POINT: std::sync::Mutex<Option<(RenameDataCrashPoint, String)>> = std::sync::Mutex::new(None);
-
-/// Arm a one-shot crash injection: the next `rename_data` committing into
-/// `dst_path` stops at `point`. Consumed on the first match so it never leaks
-/// into an unrelated commit.
-#[cfg(test)]
-fn arm_rename_data_crash(point: RenameDataCrashPoint, dst_path: &str) {
-    *RENAME_DATA_CRASH_POINT
-        .lock()
-        .expect("test crash point lock should not be poisoned") = Some((point, dst_path.to_string()));
-}
-
-#[cfg(test)]
-fn should_crash_rename_data_at(point: RenameDataCrashPoint, dst_path: &str) -> bool {
-    let mut armed = RENAME_DATA_CRASH_POINT
-        .lock()
-        .expect("test crash point lock should not be poisoned");
-    if armed.as_ref().is_some_and(|(p, path)| *p == point && path == dst_path) {
-        armed.take();
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-fn should_crash_rename_data_at(_point: RenameDataCrashPoint, _dst_path: &str) -> bool {
     false
 }
 
@@ -4870,6 +4798,16 @@ impl LocalDisk {
         self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), tmp_sync, &tmp_volume_dir)
             .await?;
 
+        // Crash-consistency injection: hard power loss after the replacement
+        // xl.meta is staged in the tmp bucket but before the atomic rename that
+        // publishes it. The destination xl.meta is untouched, so a crash here
+        // must leave the object's metadata byte-for-byte the old version
+        // (rustfs/backlog#864); the staged tmp file is a harmless orphan swept by
+        // tmp-bucket GC. Compiles to a no-op outside `#[cfg(test)]`.
+        if crash_inject::should_crash_at(CrashPoint::MetaWriteAfterTmpBeforeRename, path) {
+            return Err(DiskError::Unexpected);
+        }
+
         rename_all(tmp_file_path, &file_path, volume_dir).await?;
 
         if sync
@@ -6853,7 +6791,7 @@ impl DiskAPI for LocalDisk {
             // is in place but before xl.meta commits. No cleanup — the harness
             // reopens the disk and asserts the object still reads as the old
             // version (the staged data dir is a harmless orphan for GC).
-            if should_crash_rename_data_at(RenameDataCrashPoint::AfterDataRename, dst_path) {
+            if crash_inject::should_crash_at(CrashPoint::RenameAfterDataRename, dst_path) {
                 return Err(DiskError::Unexpected);
             }
 
@@ -6911,7 +6849,7 @@ impl DiskAPI for LocalDisk {
             // backup is durable but before the xl.meta commit rename. No
             // cleanup — the harness asserts the object still reads as the old
             // version, since the destination xl.meta is untouched here.
-            if should_crash_rename_data_at(RenameDataCrashPoint::AfterBackupBeforeMetaCommit, dst_path) {
+            if crash_inject::should_crash_at(CrashPoint::RenameAfterBackupBeforeMetaCommit, dst_path) {
                 return Err(DiskError::Unexpected);
             }
 
@@ -6944,7 +6882,7 @@ impl DiskAPI for LocalDisk {
             // graceful failpoint above, no rollback runs — the commit rename is
             // already on disk, so the harness asserts the object reads back as
             // the new version.
-            if should_crash_rename_data_at(RenameDataCrashPoint::AfterMetaCommit, dst_path) {
+            if crash_inject::should_crash_at(CrashPoint::RenameAfterMetaCommit, dst_path) {
                 return Err(DiskError::Unexpected);
             }
 
@@ -8184,13 +8122,14 @@ mod test {
     /// old-or-new invariant, only with a wider (documented) power-loss window.
     mod crash_consistency {
         use super::*;
+        use crate::crash_inject::{self, CrashPoint};
         use tempfile::tempdir;
 
         const VERSION_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         const OLD_DATA_DIR: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
         const NEW_DATA_DIR: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 
-        async fn run_scenario(mode: DurabilityMode, crash: Option<RenameDataCrashPoint>, with_old_version: bool) {
+        async fn run_scenario(mode: DurabilityMode, crash: Option<CrashPoint>, with_old_version: bool) {
             // Serializes with every other durability-sensitive test and pins the
             // resolved tier for the whole scenario (held until dropped).
             let _mode = durability_mode_override::set(mode);
@@ -8241,7 +8180,7 @@ mod test {
                 .expect("new tmp data should be written");
 
             if let Some(point) = crash {
-                arm_rename_data_crash(point, object);
+                crash_inject::arm(point, object);
             }
             let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
             let result = disk
@@ -8256,7 +8195,7 @@ mod test {
                 .await;
 
             match crash {
-                Some(RenameDataCrashPoint::AfterMetaCommit) => {
+                Some(CrashPoint::RenameAfterMetaCommit) => {
                     // Hard power loss right after the xl.meta commit rename: the
                     // commit landed and no rollback ran, so the object must read
                     // back as the new version — whether or not an old version
@@ -8324,9 +8263,9 @@ mod test {
             }
         }
 
-        const CRASH_POINTS: [RenameDataCrashPoint; 2] = [
-            RenameDataCrashPoint::AfterDataRename,
-            RenameDataCrashPoint::AfterBackupBeforeMetaCommit,
+        const CRASH_POINTS: [CrashPoint; 2] = [
+            CrashPoint::RenameAfterDataRename,
+            CrashPoint::RenameAfterBackupBeforeMetaCommit,
         ];
 
         #[tokio::test]
@@ -8372,22 +8311,138 @@ mod test {
         // the same invariant.
         #[tokio::test]
         async fn overwrite_post_commit_crash_keeps_new_version_strict() {
-            run_scenario(DurabilityMode::Strict, Some(RenameDataCrashPoint::AfterMetaCommit), true).await;
+            run_scenario(DurabilityMode::Strict, Some(CrashPoint::RenameAfterMetaCommit), true).await;
         }
 
         #[tokio::test]
         async fn overwrite_post_commit_crash_keeps_new_version_relaxed() {
-            run_scenario(DurabilityMode::Relaxed, Some(RenameDataCrashPoint::AfterMetaCommit), true).await;
+            run_scenario(DurabilityMode::Relaxed, Some(CrashPoint::RenameAfterMetaCommit), true).await;
         }
 
         #[tokio::test]
         async fn fresh_post_commit_crash_keeps_new_version_strict() {
-            run_scenario(DurabilityMode::Strict, Some(RenameDataCrashPoint::AfterMetaCommit), false).await;
+            run_scenario(DurabilityMode::Strict, Some(CrashPoint::RenameAfterMetaCommit), false).await;
         }
 
         #[tokio::test]
         async fn fresh_post_commit_crash_keeps_new_version_relaxed() {
-            run_scenario(DurabilityMode::Relaxed, Some(RenameDataCrashPoint::AfterMetaCommit), false).await;
+            run_scenario(DurabilityMode::Relaxed, Some(CrashPoint::RenameAfterMetaCommit), false).await;
+        }
+    }
+
+    /// Crash-consistency for the in-place xl.meta update path — the atomic
+    /// temp+rename inside [`LocalDisk::write_all_meta`] shared by `update_metadata`
+    /// and `write_metadata` (delete markers, tag/metadata rewrites, decommission).
+    ///
+    /// rustfs/backlog#864: a fault that interrupts an in-place metadata rewrite
+    /// must not mutate the committed object. [`CrashPoint::MetaWriteAfterTmpBeforeRename`]
+    /// models a hard power loss after the replacement xl.meta is staged in the tmp
+    /// bucket but before the publishing rename. Both durability tiers are held to
+    /// the same rule: the destination xl.meta survives byte-for-byte, the object
+    /// still reads as the old version, the staged tmp file is a reclaimable orphan
+    /// confined to the tmp bucket, and a later un-injected rewrite publishes
+    /// cleanly (retryable). This path previously had only parser-level unit tests.
+    mod meta_write_crash_consistency {
+        use super::*;
+        use crate::crash_inject::{self, CrashPoint};
+        use tempfile::tempdir;
+
+        async fn run(mode: DurabilityMode) {
+            // Serialize with every other durability-sensitive test and pin the
+            // resolved tier for the whole scenario.
+            let _mode = durability_mode_override::set(mode);
+
+            let dir = tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+            let bucket = "bucket";
+            let object = "meta-write-crash-object";
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+            // Seed a committed object (version 1) by writing its xl.meta directly:
+            // read_data=false reads never touch the data dir, so no shard staging
+            // is needed to exercise the metadata commit window.
+            let object_dir = dir.path().join(bucket).join(object);
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            let meta_path = object_dir.join(STORAGE_FORMAT_FILE);
+            let v1 = Uuid::new_v4();
+            let old_meta = test_meta(test_file_info(object, v1, Some(Uuid::new_v4()), None));
+            fs::write(&meta_path, &old_meta)
+                .await
+                .expect("committed xl.meta should be written");
+
+            // Arm the crash, then attempt an in-place rewrite that adds version 2.
+            let meta_key = format!("{object}/{STORAGE_FORMAT_FILE}");
+            crash_inject::arm(CrashPoint::MetaWriteAfterTmpBeforeRename, &meta_key);
+            let v2 = Uuid::new_v4();
+            let result = disk
+                .write_metadata("", bucket, object, test_file_info(object, v2, Some(Uuid::new_v4()), None))
+                .await;
+            assert!(
+                matches!(result, Err(DiskError::Unexpected)),
+                "{mode:?}: the armed crash point must be the failure that surfaced, got {result:?}"
+            );
+
+            // Reopen the disk to model a process restart after the crash.
+            drop(disk);
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should reopen");
+
+            // rustfs/backlog#864: the committed xl.meta is byte-for-byte the old
+            // version — the interrupted rewrite never published.
+            let after = fs::read(&meta_path).await.expect("xl.meta must survive the crash");
+            assert_eq!(&after, &old_meta, "{mode:?}: xl.meta must remain the old version byte-for-byte");
+
+            // The old version still reads; the un-published new version is absent.
+            disk.read_version("", bucket, object, &v1.to_string(), &ReadOptions::default())
+                .await
+                .expect("the old version must remain readable after the crash");
+            let new_read = disk
+                .read_version("", bucket, object, &v2.to_string(), &ReadOptions::default())
+                .await;
+            assert!(
+                matches!(new_read, Err(DiskError::FileVersionNotFound)),
+                "{mode:?}: the interrupted update must not publish the new version, got {new_read:?}"
+            );
+
+            // The crash leaves no staging debris in the object directory; the
+            // staged replacement is a reclaimable orphan under the tmp bucket.
+            let mut object_entries = fs::read_dir(&object_dir).await.expect("object dir should list");
+            let mut object_files = Vec::new();
+            while let Some(entry) = object_entries
+                .next_entry()
+                .await
+                .expect("object dir entry should be readable")
+            {
+                object_files.push(entry.file_name().to_string_lossy().to_string());
+            }
+            assert_eq!(
+                object_files,
+                vec![STORAGE_FORMAT_FILE.to_string()],
+                "{mode:?}: the object directory must hold only its committed xl.meta"
+            );
+
+            // A retried rewrite (un-injected) publishes cleanly: the path is safely
+            // retryable after the crash.
+            crash_inject::disarm(CrashPoint::MetaWriteAfterTmpBeforeRename, &meta_key);
+            disk.write_metadata("", bucket, object, test_file_info(object, v2, Some(Uuid::new_v4()), None))
+                .await
+                .expect("a retried metadata rewrite must succeed after the crash");
+            disk.read_version("", bucket, object, &v2.to_string(), &ReadOptions::default())
+                .await
+                .expect("the retried version must be readable");
+        }
+
+        #[tokio::test]
+        async fn meta_write_crash_before_rename_keeps_old_version_strict() {
+            run(DurabilityMode::Strict).await;
+        }
+
+        #[tokio::test]
+        async fn meta_write_crash_before_rename_keeps_old_version_relaxed() {
+            run(DurabilityMode::Relaxed).await;
         }
     }
 

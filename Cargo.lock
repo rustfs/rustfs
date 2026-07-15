@@ -9276,6 +9276,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-madmin",
  "rustfs-storage-api",
+ "rustfs-test-utils",
  "rustfs-utils",
  "serde",
  "serde_json",
@@ -9313,6 +9314,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-policy",
  "rustfs-storage-api",
+ "rustfs-test-utils",
  "rustfs-utils",
  "serde",
  "serde_json",
@@ -9988,6 +9990,18 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "rustfs-test-utils"
+version = "1.0.0-beta.9"
+dependencies = [
+ "rustfs-ecstore",
+ "rustfs-storage-api",
+ "tokio",
+ "tokio-util",
+ "tracing-subscriber",
  "uuid",
 ]
 
