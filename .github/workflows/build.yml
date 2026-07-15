@@ -136,11 +136,13 @@ jobs:
             echo "⚡ Manual/scheduled build detected"
           fi
 
-          echo "should_build=$should_build" >> $GITHUB_OUTPUT
-          echo "build_type=$build_type" >> $GITHUB_OUTPUT
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "short_sha=$short_sha" >> $GITHUB_OUTPUT
-          echo "is_prerelease=$is_prerelease" >> $GITHUB_OUTPUT
+          {
+            echo "should_build=$should_build"
+            echo "build_type=$build_type"
+            echo "version=$version"
+            echo "short_sha=$short_sha"
+            echo "is_prerelease=$is_prerelease"
+          } >> "$GITHUB_OUTPUT"
 
           echo "📊 Build Summary:"
           echo "  - Should build: $should_build"
@@ -220,7 +222,7 @@ jobs:
     name: Build RustFS
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
-    runs-on: ${{ matrix.platform == 'linux' && fromJSON('["self-hosted","linux","sm-standard-2"]') || matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -493,7 +495,7 @@ jobs:
             if [[ "${{ matrix.platform }}" == "windows" ]]; then
               dir
             else
-              ls -lh ${PACKAGE_NAME}.zip
+              ls -lh "${PACKAGE_NAME}.zip"
             fi
           else
             echo "❌ Failed to create package: ${PACKAGE_NAME}.zip"
@@ -542,11 +544,13 @@ jobs:
             fi
           fi
 
-          echo "package_name=${PACKAGE_NAME}" >> $GITHUB_OUTPUT
-          echo "package_file=${PACKAGE_NAME}.zip" >> $GITHUB_OUTPUT
-          echo "latest_files=${LATEST_FILES}" >> $GITHUB_OUTPUT
-          echo "build_type=${BUILD_TYPE}" >> $GITHUB_OUTPUT
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          {
+            echo "package_name=${PACKAGE_NAME}"
+            echo "package_file=${PACKAGE_NAME}.zip"
+            echo "latest_files=${LATEST_FILES}"
+            echo "build_type=${BUILD_TYPE}"
+            echo "version=${VERSION}"
+          } >> "$GITHUB_OUTPUT"
 
           echo "📦 Package created: ${PACKAGE_NAME}.zip"
           if [[ -n "$LATEST_FILES" ]]; then
@@ -743,8 +747,8 @@ jobs:
             RELEASE_URL=$(gh release view "$TAG" --json url --jq '.url')
           fi
 
-          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
-          echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
           echo "Created release: $RELEASE_URL"
 
   # Prepare and upload release assets
@@ -793,9 +797,9 @@ jobs:
           cd ./release-assets
 
           # Generate checksums for all files (including latest versions)
-          if ls *.zip >/dev/null 2>&1; then
-            sha256sum *.zip > SHA256SUMS
-            sha512sum *.zip > SHA512SUMS
+          if compgen -G "*.zip" >/dev/null; then
+            sha256sum -- *.zip > SHA256SUMS
+            sha512sum -- *.zip > SHA512SUMS
           fi
 
           cd ..
