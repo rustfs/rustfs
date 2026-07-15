@@ -8822,7 +8822,6 @@ dependencies = [
  "chrono",
  "clap",
  "const-str",
- "criterion",
  "datafusion",
  "flatbuffers",
  "futures",
@@ -9244,7 +9243,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "uuid",
  "walkdir",
 ]
