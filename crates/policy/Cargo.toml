@@ -52,6 +52,7 @@ pollster.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true
+proptest = "1"
 test-case.workspace = true
 temp-env = { workspace = true }
 
