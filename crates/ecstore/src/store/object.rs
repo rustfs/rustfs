@@ -1308,11 +1308,19 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<()> {
         let object = encode_dir_object(object);
+        let mut opts = opts.clone();
+        let _object_lock_guard = self
+            .acquire_object_write_lock_if_needed("restore_transitioned_object", bucket, &object, &mut opts)
+            .await?;
+
         if self.single_pool() {
-            return self.pools[0].clone().restore_transitioned_object(bucket, &object, opts).await;
+            return self.pools[0]
+                .clone()
+                .restore_transitioned_object(bucket, &object, &opts)
+                .await;
         }
 
-        let opts = transition_restore_pool_opts(opts);
+        let opts = transition_restore_pool_opts(&opts);
         let (_, idx) = self
             .get_latest_accessible_object_info_with_idx(bucket, object.as_str(), &opts)
             .await?;
@@ -2169,6 +2177,31 @@ mod tests {
             !opts.metadata_cache_safe,
             "generic no_lock callers must stay ineligible for metadata cache unless explicitly marked safe"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_transitioned_object_waits_for_existing_reader() {
+        let store = Arc::new(new_read_lock_test_store().await);
+        let ns_lock = store
+            .handle_new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created");
+        let _reader = ns_lock
+            .get_read_lock(Duration::from_secs(1))
+            .await
+            .expect("reader should acquire the object lock");
+
+        let err = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            store
+                .clone()
+                .handle_restore_transitioned_object("bucket", "object", &ObjectOptions::default())
+                .await
+                .expect_err("restore must wait behind an existing reader")
+        })
+        .await;
+
+        assert!(matches!(err, StorageError::Lock(rustfs_lock::LockError::Timeout { .. })));
     }
 
     #[tokio::test]

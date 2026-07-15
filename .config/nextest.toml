@@ -152,7 +152,7 @@ test-group = 'ecstore-serial-flaky'
 # the nightly profile derives its set as "the replication module MINUS this
 # allowlist", so any new replication test lands in nightly by default (never
 # silently unrun) until it is explicitly blessed as fast here. Keep the two
-# regexes byte-identical. Count invariant: 20 here + 23 nightly = 43 total
+# regexes byte-identical. Count invariant: 20 here + 27 nightly = 47 total
 # (authority: `cargo nextest list`; docs/testing/e2e-suite-inventory.md).
 # HISTORY (2026-07-11): the 20 fast tests were briefly pulled out of this lane
 # (#4724) because they set a loopback (127.0.0.1) replication target that the
@@ -202,10 +202,14 @@ fail-fast = false
 # backlog#1147 repl-1 (deps: ci-4). Runs the SLOW / cross-process replication
 # tests that are unfit for the per-PR e2e-smoke gate:
 #
-#   * 8 bucket-replication data-plane tests — they PUT/delete objects and poll
-#     until source and target converge; two replicate over HTTPS.
+#   * 2 remote-target TLS validation tests.
+#   * 12 bucket-replication data-plane/helper tests — they PUT/delete objects
+#     and poll until source and target converge; two replicate over HTTPS, two
+#     pin active SSE failure contracts, and one guards event/history observers.
+#     The SSE-S3 contract remains ignored under backlog#1291.
 #   * 11 `_real_dual_node` site-replication tests — each spawns TWO full rustfs
 #     servers and drives the cross-process site-replication control plane.
+#   * 1 `_real_three_node` site-replication test.
 #   * 1 `_real_single_node` service-account round-trip test.
 #
 # The set is defined as "everything in replication_extension_test that is NOT
@@ -261,7 +265,7 @@ path = "junit.xml"
 #     object_lambda) — too heavy for the merge budget; they run in ci-7's
 #     nightly 4-node lane.
 #   * replication_extension_test — repl-1 already splits it into the PR
-#     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (20 slow) lanes and reserves
+#     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (27 slow) lanes and reserves
 #     it for those, so e2e-full does not double-run it.
 #   * #[ignore]d tests — nextest skips them by default (no --run-ignored); the
 #     manual-localhost:9000 reliant/policy tests are ci-13's migration.

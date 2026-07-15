@@ -15,20 +15,24 @@
 # Nightly full replication e2e lane (backlog#1147 repl-1, deps: ci-4).
 #
 # The per-PR gate (ci.yml `e2e-tests` job, `--profile e2e-smoke`) runs the 20
-# FAST bucket-replication tests. This scheduled lane runs the remaining 18
+# FAST replication tests. This scheduled lane runs the remaining 27
 # heavier replication e2e tests that are unfit for a per-PR gate:
 #
-#   * 8 bucket-replication data-plane tests (PUT/delete + poll for convergence;
-#     two replicate over HTTPS).
-#   * 9 `_real_dual_node` site-replication tests (each spawns TWO rustfs
+#   * 2 remote-target TLS validation tests.
+#   * 12 bucket-replication data-plane/helper tests (PUT/delete + poll for
+#     convergence; two replicate over HTTPS, two pin active SSE failure
+#     contracts, and one guards event/history observers). The SSE-S3 contract
+#     remains ignored under backlog#1291.
+#   * 11 `_real_dual_node` site-replication tests (each spawns TWO rustfs
 #     servers and drives the cross-process site-replication control plane).
+#   * 1 `_real_three_node` site-replication test.
 #   * 1 `_real_single_node` service-account round-trip test.
 #
 # The selection is the [profile.e2e-repl-nightly] default-filter in
 # .config/nextest.toml — the single wiring mechanism (repl-1 / ci-4). Do NOT
 # add ad-hoc cargo-test steps here; change the filterset instead.
 #
-# Explicit division of labor: these 18 tests run ONLY here, never double-run
+# Explicit division of labor: these 27 tests run ONLY here, never double-run
 # in ci-5's future e2e-full merge gate. TODO(ci-7): once the ci domain's
 # consolidated scheduled e2e workflow exists, fold this interim repl-owned lane
 # into it rather than growing a second scheduled entrypoint.
@@ -80,7 +84,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install awscurl
-        run: python3 -m pip install --user --upgrade pip awscurl
+        run: |
+          python3 -m pip install --user --upgrade pip awscurl
+          echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
+
+      - name: Verify awscurl
+        run: test -x "$AWSCURL_PATH"
 
       # Build the rustfs binary once up front. The e2e tests spawn it as a
       # child process (crates/e2e_test/src/common.rs) and will build it on
