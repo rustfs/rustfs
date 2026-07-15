@@ -159,7 +159,7 @@ impl TransitionClient {
                 };
                 let hash = md5_hash.hash_encode(&buf[..length]);
                 md5_base64 = base64_encode(hash.as_ref());
-            } else {
+            } else if opts.auto_checksum.is_set() {
                 let mut crc = opts.auto_checksum.hasher()?;
                 crc.update(&buf[..length]);
                 let csum = crc.finalize();
@@ -174,6 +174,10 @@ impl TransitionClient {
                     warn!("Invalid header name: {}", opts.auto_checksum.key());
                 }
             }
+            // else: neither MD5 nor a concrete additional checksum was requested,
+            // so upload the part without a per-part checksum header. Guarding the
+            // branch on `is_set()` avoids calling `hasher()` on `ChecksumNone`,
+            // which errors with "unsupported checksum type" (rustfs/rustfs#4811).
 
             let hooked = ReaderImpl::Body(Bytes::from(buf)); //newHook(BufferReader::new(buf), opts.progress);
             let mut p = UploadPartParams {

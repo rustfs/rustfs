@@ -181,6 +181,17 @@ impl ChecksumMode {
     }
 
     pub fn is_set(&self) -> bool {
+        // `ChecksumNone` is the zeroth enum variant, so it occupies bit 0 of the
+        // `EnumSet` repr and a naive `len() == 1` check reports "no checksum" as a
+        // configured checksum. A checksum is only "set" when a concrete algorithm
+        // (one with a real hasher) is selected; the bare `ChecksumFullObject` flag
+        // has no base algorithm and is likewise not set. Treating `ChecksumNone`
+        // as set made ILM transitions of >128 MiB objects fail with
+        // "unsupported checksum type" (rustfs/rustfs#4811): the multipart put path
+        // took the checksum branch and called `ChecksumNone.hasher()`.
+        if matches!(self, ChecksumMode::ChecksumNone) {
+            return false;
+        }
         let s = EnumSet::from(*self).intersection(*C_ChecksumMask);
         s.len() == 1
     }
@@ -300,6 +311,43 @@ mod tests {
         assert!(ChecksumMode::ChecksumNone.hasher().is_err());
         assert!(ChecksumMode::ChecksumFullObject.hasher().is_err());
         assert!(ChecksumMode::ChecksumCRC32.hasher().is_ok());
+    }
+
+    #[test]
+    fn test_is_set_is_false_for_none_and_bare_full_object() {
+        // Regression for rustfs/rustfs#4811: `ChecksumNone` must NOT be reported as
+        // a configured checksum. It is the zeroth enum variant (bit 0 of the
+        // EnumSet repr), so the old `len() == 1` check treated it as set and drove
+        // the multipart put path into `ChecksumNone.hasher()` → "unsupported
+        // checksum type". Every mode reported as set must also have a real hasher.
+        assert!(!ChecksumMode::ChecksumNone.is_set());
+        assert!(!ChecksumMode::ChecksumFullObject.is_set());
+
+        for mode in [
+            ChecksumMode::ChecksumCRC32,
+            ChecksumMode::ChecksumCRC32C,
+            ChecksumMode::ChecksumSHA1,
+            ChecksumMode::ChecksumSHA256,
+            ChecksumMode::ChecksumCRC64NVME,
+        ] {
+            assert!(mode.is_set(), "{mode:?} should be set");
+            assert!(mode.hasher().is_ok(), "{mode:?} reported set but has no hasher");
+        }
+    }
+
+    #[test]
+    fn test_set_default_upgrades_none() {
+        // With `is_set()` fixed, `set_default` must upgrade an unset mode to the
+        // provided default (previously `ChecksumNone` was seen as set and never
+        // upgraded).
+        let mut mode = ChecksumMode::ChecksumNone;
+        mode.set_default(ChecksumMode::ChecksumCRC32C);
+        assert_eq!(mode, ChecksumMode::ChecksumCRC32C);
+
+        // An already-set mode is left untouched.
+        let mut existing = ChecksumMode::ChecksumSHA256;
+        existing.set_default(ChecksumMode::ChecksumCRC32C);
+        assert_eq!(existing, ChecksumMode::ChecksumSHA256);
     }
 }
 
