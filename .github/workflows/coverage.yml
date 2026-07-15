@@ -1,0 +1,122 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Weekly workspace line-coverage baseline (backlog#1153 infra-5).
+#
+# NON-BLOCKING by design: this workflow only runs on schedule and manual
+# dispatch, so it never attaches a status to a PR and must never be made a
+# required check. It exists to give coverage a visible baseline and trend
+# (per-crate table in the job summary, lcov artifact kept 90 days) — the
+# per-crate ratchet for the security-critical crates builds on it later
+# (backlog#1153 infra-6, report-only first per the ci-11 ladder).
+#
+# Measurement scope matches the PR test gate (ci.yml "Run tests"):
+# `--workspace --exclude e2e_test` with the `ci` nextest profile. Doctests are
+# NOT measured (ci.yml runs them uninstrumented; `cargo llvm-cov` needs a
+# nightly toolchain to cover doctests). Trend-comparison workflow:
+# docs/testing/README.md "Coverage" section. `make coverage` is the local
+# equivalent. Scheduled failures alert via the ci-8 composite action.
+
+name: coverage
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 07:00 UTC Sunday — staggered clear of the other Sunday crons: ci (00:00),
+    # build (01:00), e2e-s3tests (02:00), audit (03:00), nix-flake-update
+    # (05:00), mint (06:00), and the daily fuzz (02:00), minio-interop (03:17),
+    # e2e-replication-nightly (04:00) and performance-ab (06:00) lanes.
+    - cron: "0 7 * * 0"
+
+# Only alert-on-failure needs more than read access; it declares its own
+# job-level `issues: write`.
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Workspace coverage (weekly)
+    runs-on: sm-standard-4
+    # The instrumented build cannot reuse the regular CI cache (different
+    # RUSTFLAGS), so a cold week rebuilds the workspace before running the
+    # full suite; give it double the test job's 60-minute budget.
+    timeout-minutes: 120
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      # Match the PR gate's nextest semantics (ci.yml runs `--profile ci`):
+      # retries=0 plus the quarantine list and the ecstore-serial-flaky
+      # serialization. Set via env because `cargo llvm-cov`'s own --profile
+      # flag selects the *cargo build* profile, not the nextest profile.
+      NEXTEST_PROFILE: ci
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-coverage
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Install llvm-tools component
+        run: rustup component add llvm-tools-preview
+
+      - name: Run instrumented test suite
+        run: cargo llvm-cov nextest --workspace --exclude e2e_test --no-report
+
+      - name: Generate lcov and JSON reports
+        run: |
+          mkdir -p target/llvm-cov
+          cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+          cargo llvm-cov report --json --output-path target/llvm-cov/coverage.json
+
+      - name: Write per-crate summary
+        run: python3 scripts/coverage_per_crate.py target/llvm-cov/coverage.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: coverage-lcov-${{ github.run_number }}
+          path: |
+            target/llvm-cov/lcov.info
+            target/llvm-cov/coverage.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [coverage]
+    # Only scheduled runs open/append the tracking issue (backlog#1149 ci-8);
+    # manual workflow_dispatch runs stay quiet so a debugging run never files a
+    # spurious alert.
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
