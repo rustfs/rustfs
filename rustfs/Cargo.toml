@@ -35,11 +35,6 @@ path = "src/lib.rs"
 name = "rustfs"
 path = "src/main.rs"
 
-[[bench]]
-name = "s3_operations"
-harness = false
-required-features = ["manual-test-runners"]
-
 [features]
 default = ["ftps", "webdav"]
 metrics-gpu = ["rustfs-obs/gpu"]

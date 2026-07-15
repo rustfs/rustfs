@@ -139,3 +139,10 @@ The gate logic is unit-validated across pass/warn/fail/exempt outcomes; the
 orchestrator and workflow are shellcheck- and `--dry-run`-validated. The first
 real warp measurement belongs on a Linux runner or the ansible cluster — there
 is no warp/multi-disk rig in the repo's local checkout.
+
+This warp A/B gate is the **only** entry point for S3-face (PutObject /
+GetObject / ListObjects) performance coverage. There is deliberately no
+in-process criterion benchmark for those operations: a criterion harness that
+stands up an embedded server measures the harness, not the S3 path, so it would
+report a number without guarding anything. Micro-benchmarks stay at the
+function level (EC encode, `xl.meta` parse, `rename_data`; perf-8).
