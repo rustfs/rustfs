@@ -9458,6 +9458,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-log-analyzer"
+version = "1.0.0-beta.9"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustfs-madmin"
 version = "1.0.0-beta.9"
 dependencies = [

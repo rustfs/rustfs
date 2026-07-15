@@ -31,6 +31,7 @@ members = [
     "crates/lifecycle", # Lifecycle rule evaluation contracts
     "crates/kms", # Key Management Service
     "crates/lock", # Distributed locking implementation
+    "crates/log-analyzer", # Offline log fault-analysis core (rustfs diagnose)
     "crates/madmin", # Management dashboard and admin API interface
     "crates/notify", # Notification system for events
     "crates/obs", # Observability utilities
