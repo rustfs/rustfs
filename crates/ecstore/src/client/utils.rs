@@ -95,6 +95,39 @@ pub fn base64_encode(input: &[u8]) -> String {
     base64_simd::URL_SAFE_NO_PAD.encode_to_string(input)
 }
 
+/// Standard base64 (with `+`/`/` and `=` padding), as required by S3 for the
+/// `Content-MD5` and `x-amz-checksum-*` request headers. The URL-safe, unpadded
+/// [`base64_encode`] is only valid for internal round-trips; sending it as
+/// `Content-MD5` makes the remote reject the part with "Invalid content MD5:
+/// Base64Error" (rustfs/rustfs#4811).
+pub fn base64_encode_standard(input: &[u8]) -> String {
+    base64_simd::STANDARD.encode_to_string(input)
+}
+
 pub fn base64_decode(input: &[u8]) -> Result<Vec<u8>, base64_simd::Error> {
     base64_simd::URL_SAFE_NO_PAD.decode_to_vec(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64_encode_standard;
+
+    #[test]
+    fn base64_encode_standard_matches_s3_content_md5() {
+        // Standard base64 uses '+'/'/' and '=' padding and must round-trip
+        // through a standard decoder (which is what an S3 server uses to read
+        // Content-MD5). Regression for rustfs/rustfs#4811 ("Invalid content MD5:
+        // Base64Error"): the URL-safe, unpadded encoder produced values the
+        // remote could not decode.
+        // 16-byte MD5-length input chosen to force '=' padding.
+        let digest: [u8; 16] = [
+            0xfb, 0xff, 0xff, 0xef, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
+        ];
+        let encoded = base64_encode_standard(&digest);
+        assert!(encoded.ends_with('='), "16-byte input must be padded: {encoded}");
+        let decoded = base64_simd::STANDARD
+            .decode_to_vec(encoded.as_bytes())
+            .expect("standard decode");
+        assert_eq!(decoded, digest);
+    }
 }
