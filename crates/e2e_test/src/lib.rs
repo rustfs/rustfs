@@ -191,6 +191,12 @@ mod stale_multipart_cleanup_cluster_test;
 #[cfg(test)]
 mod object_lambda_test;
 
+// S3 event-notification webhook delivery end-to-end (backlog#1154 peri-1):
+// configure webhook target -> PutBucketNotificationConfiguration -> object
+// operation -> event delivered, plus filter negatives and store-queue redelivery.
+#[cfg(test)]
+mod notification_webhook_test;
+
 // Replication extension end-to-end regression tests
 #[cfg(test)]
 mod replication_extension_test;
