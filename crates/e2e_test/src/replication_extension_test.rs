@@ -16,12 +16,20 @@ use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
     replication_fast_env, rustfs_binary_path,
 };
+use crate::kms::common::{create_key_with_specific_id, sse_customer_key_md5_base64};
 use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DeleteMarkerEntry, ObjectVersion, ServerSideEncryption,
+    VersioningConfiguration,
+};
 use aws_sdk_s3::{Client, Config};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use http::header::{CONTENT_TYPE, HOST};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -58,7 +66,7 @@ use tokio::fs;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
@@ -94,6 +102,11 @@ const FAST_SCANNER_ENV: &[(&str, &str)] = &[
     ("RUSTFS_SCANNER_START_DELAY_SECS", "1"),
     ("RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES", "1"),
 ];
+
+const REPL17_KMS_KEY_ID: &str = "repl17-local-key";
+const REPL17_SSEC_KEY: &str = "01234567890123456789012345678901";
+const REPLICATION_FAILED_EVENT: &str = "s3:Replication:OperationFailedReplication";
+const REPLICATION_EVENT_MAX_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
@@ -606,6 +619,16 @@ async fn wait_for_https_server_ready(
     Err("RustFS HTTPS server failed to become ready within 30 seconds".into())
 }
 
+fn assert_untrusted_site_peer_rejected(error: &str, target_url: &str) {
+    let error_lower = error.to_ascii_lowercase();
+    let certificate_error =
+        error.contains("400 Bad Request") && (error_lower.contains("tls") || error_lower.contains("certificate"));
+    let https_connect_error =
+        error.contains("500 Internal Server Error") && error_lower.contains("failed (connect)") && error.contains(target_url);
+
+    assert!(certificate_error || https_connect_error, "unexpected untrusted HTTPS peer error: {error}");
+}
+
 async fn ensure_https_bucket_exists(
     client: &reqwest::Client,
     env: &RustFSTestEnvironment,
@@ -1037,6 +1060,275 @@ async fn wait_for_source_replication_pending_or_failed(
             }
         }
     }
+}
+
+async fn wait_for_source_replication_status(client: &Client, bucket: &str, key: &str, expected: &str, ssec: bool) -> TestResult {
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let wait = async {
+        loop {
+            let request = client.head_object().bucket(bucket).key(key);
+            let head = if ssec {
+                request
+                    .sse_customer_algorithm("AES256")
+                    .sse_customer_key(&customer_key)
+                    .sse_customer_key_md5(&customer_key_md5)
+                    .send()
+                    .await?
+            } else {
+                request.send().await?
+            };
+            if head.replication_status().map(|status| status.as_str()) == Some(expected) {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    };
+
+    match timeout(Duration::from_secs(30), wait).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("source object {key} did not reach replication status {expected} within 30 seconds").into()),
+    }
+}
+
+async fn wait_for_replication_failure_event_stream<S, E>(stream: S, expected_key: &str, max_wait: Duration) -> TestResult
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: Error + Send + Sync + 'static,
+{
+    let wait = async {
+        futures::pin_mut!(stream);
+        let mut pending = Vec::new();
+        loop {
+            let Some(chunk) = stream.next().await else {
+                return Err("replication failure event stream ended before the expected event".into());
+            };
+            let chunk = chunk.map_err(|err| -> Box<dyn Error + Send + Sync> { Box::new(err) })?;
+            if chunk.is_empty() {
+                continue;
+            }
+            if pending.len().saturating_add(chunk.len()) > REPLICATION_EVENT_MAX_BUFFER_BYTES {
+                return Err("replication failure event buffer exceeded 1 MiB".into());
+            }
+            pending.extend_from_slice(&chunk);
+
+            while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                let line = pending.drain(..=newline).collect::<Vec<_>>();
+                let payload = std::str::from_utf8(&line)?.trim();
+                if payload.is_empty() {
+                    continue;
+                }
+                let envelope: serde_json::Value = serde_json::from_str(payload)?;
+                let Some(records) = envelope["Records"].as_array() else {
+                    continue;
+                };
+                for record in records {
+                    let Some(object_key) = record["s3"]["object"]["key"].as_str() else {
+                        continue;
+                    };
+                    let form_decoded_key = object_key.replace('+', " ");
+                    let object_key = urlencoding::decode(&form_decoded_key)
+                        .map(|decoded| decoded.into_owned())
+                        .unwrap_or_else(|_| object_key.to_string());
+                    if object_key == expected_key && record["eventName"].as_str() == Some(REPLICATION_FAILED_EVENT) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
+
+    match timeout(max_wait, wait).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("replication failure event for {expected_key} was not received within {max_wait:?}").into()),
+    }
+}
+
+async fn wait_for_replication_failure_event(response: reqwest::Response, expected_key: &str) -> TestResult {
+    wait_for_replication_failure_event_stream(response.bytes_stream(), expected_key, Duration::from_secs(30)).await
+}
+
+fn target_history_contains_key(output: &ListObjectVersionsOutput, key: &str) -> bool {
+    output.versions().iter().any(|version| version.key() == Some(key))
+        || output.delete_markers().iter().any(|marker| marker.key() == Some(key))
+}
+
+async fn assert_failed_replication_stays_absent_for(
+    source_client: &Client,
+    source_bucket: &str,
+    target_client: &Client,
+    target_bucket: &str,
+    key: &str,
+    ssec: bool,
+    duration: Duration,
+) -> TestResult {
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let wait = async {
+        let deadline = tokio::time::Instant::now() + duration;
+        loop {
+            let source_request = source_client.head_object().bucket(source_bucket).key(key);
+            let source = if ssec {
+                source_request
+                    .sse_customer_algorithm("AES256")
+                    .sse_customer_key(&customer_key)
+                    .sse_customer_key_md5(&customer_key_md5)
+                    .send()
+                    .await?
+            } else {
+                source_request.send().await?
+            };
+            if source.replication_status().map(|status| status.as_str()) != Some("FAILED") {
+                return Err(format!("source replication status for {source_bucket}/{key} did not remain FAILED").into());
+            }
+
+            let output = target_client
+                .list_object_versions()
+                .bucket(target_bucket)
+                .prefix(key)
+                .send()
+                .await?;
+            if target_history_contains_key(&output, key) {
+                return Err(format!("failed replication created target history for {target_bucket}/{key}").into());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    };
+
+    match timeout(duration + Duration::from_secs(5), wait).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("timed out while checking failed replication stability for {target_bucket}/{key}").into()),
+    }
+}
+
+async fn subscribe_to_replication_failure(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    key: &str,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let url = format!(
+        "{}/{bucket}?events={}&prefix={}&ping=1",
+        env.url,
+        urlencoding::encode(REPLICATION_FAILED_EVENT),
+        urlencoding::encode(key)
+    );
+    let response = timeout(
+        Duration::from_secs(30),
+        signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None),
+    )
+    .await
+    .map_err(|_| "replication failure event subscription did not respond within 30 seconds")??;
+    if response.status() != StatusCode::OK {
+        return Err(format!("failed to subscribe to replication failure events: {}", response.status()).into());
+    }
+    Ok(response)
+}
+
+async fn build_sse_replication_pair(
+    label: &str,
+    enable_kms: bool,
+) -> Result<(RustFSTestEnvironment, RustFSTestEnvironment, String, String), Box<dyn Error + Send + Sync>> {
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    let source_kms_key_dir = format!("{}/kms-keys", source_env.temp_dir);
+    let target_kms_key_dir = format!("{}/kms-keys", target_env.temp_dir);
+    if enable_kms {
+        fs::create_dir_all(&source_kms_key_dir).await?;
+        fs::create_dir_all(&target_kms_key_dir).await?;
+        create_key_with_specific_id(&source_kms_key_dir, REPL17_KMS_KEY_ID).await?;
+        create_key_with_specific_id(&target_kms_key_dir, REPL17_KMS_KEY_ID).await?;
+    }
+
+    let mut source_process_env = replication_fast_env();
+    source_process_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_process_env.extend_from_slice(FAST_SCANNER_ENV);
+    source_process_env.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
+    if enable_kms {
+        source_process_env.extend_from_slice(&[
+            ("RUSTFS_KMS_ENABLE", "true"),
+            ("RUSTFS_KMS_BACKEND", "local"),
+            ("RUSTFS_KMS_KEY_DIR", source_kms_key_dir.as_str()),
+            ("RUSTFS_KMS_DEFAULT_KEY_ID", REPL17_KMS_KEY_ID),
+            ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
+        ]);
+    }
+    source_env.start_rustfs_server_with_env(vec![], &source_process_env).await?;
+
+    let mut target_process_env = vec![("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")];
+    if enable_kms {
+        target_process_env.extend_from_slice(&[
+            ("RUSTFS_KMS_ENABLE", "true"),
+            ("RUSTFS_KMS_BACKEND", "local"),
+            ("RUSTFS_KMS_KEY_DIR", target_kms_key_dir.as_str()),
+            ("RUSTFS_KMS_DEFAULT_KEY_ID", REPL17_KMS_KEY_ID),
+            ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
+        ]);
+    }
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(&target_process_env)
+        .await?;
+
+    let source_bucket = format!("repl17-{label}-src");
+    let target_bucket = format!("repl17-{label}-dst");
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    source_client.create_bucket().bucket(&source_bucket).send().await?;
+    target_client.create_bucket().bucket(&target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, &source_bucket).await?;
+    enable_bucket_versioning(&target_env, &target_bucket).await?;
+    let target_arn = set_replication_target(&source_env, &source_bucket, &target_env, &target_bucket).await?;
+    put_bucket_replication(&source_env, &source_bucket, &target_arn).await?;
+
+    Ok((source_env, target_env, source_bucket, target_bucket))
+}
+
+async fn assert_managed_sse_replication_fails_explicitly(label: &str, kms: bool) -> TestResult {
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair(label, true).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = format!("{label}-contract.txt");
+    let body = format!("repl-17 {label} payload").into_bytes();
+    let failure_events = subscribe_to_replication_failure(&source_env, &source_bucket, &key).await?;
+
+    let encryption = if kms {
+        ServerSideEncryption::AwsKms
+    } else {
+        ServerSideEncryption::Aes256
+    };
+    let request = source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(&key)
+        .body(ByteStream::from(body.clone()))
+        .server_side_encryption(encryption.clone());
+    let request = if kms {
+        request.ssekms_key_id(REPL17_KMS_KEY_ID)
+    } else {
+        request
+    };
+    request.send().await?;
+
+    let source = source_client.get_object().bucket(&source_bucket).key(&key).send().await?;
+    assert_eq!(source.server_side_encryption(), Some(&encryption));
+    assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body.as_slice());
+
+    wait_for_replication_failure_event(failure_events, &key).await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, &key, "FAILED", false).await?;
+    assert_failed_replication_stays_absent_for(
+        &source_client,
+        &source_bucket,
+        &target_client,
+        &target_bucket,
+        &key,
+        false,
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    Ok(())
 }
 
 /// Return the `LastModified` of the (single) delete marker for `key`, if present.
@@ -3077,6 +3369,148 @@ async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets()
     Ok(())
 }
 
+#[tokio::test]
+async fn test_repl17_failure_observation_helpers() -> TestResult {
+    let expected_key = "space + percent%.txt";
+    let payload = format!(
+        "{{\"note\":\"é\",\"Records\":[{{\"eventName\":\"{REPLICATION_FAILED_EVENT}\",\"s3\":{{\"object\":{{\"key\":\"space+%2B+percent%25.txt\"}}}}}}]}}\n"
+    );
+    let utf8_split = payload.find('é').expect("multibyte fixture must be present") + 1;
+    let encoded_plus_split = payload.find("%2B").expect("encoded plus must be present") + 1;
+    let chunks = vec![
+        Ok::<_, Infallible>(Bytes::copy_from_slice(&payload.as_bytes()[..utf8_split])),
+        Ok::<_, Infallible>(Bytes::copy_from_slice(&payload.as_bytes()[utf8_split..encoded_plus_split])),
+        Ok::<_, Infallible>(Bytes::copy_from_slice(&payload.as_bytes()[encoded_plus_split..])),
+    ];
+    wait_for_replication_failure_event_stream(futures::stream::iter(chunks), expected_key, Duration::from_millis(100)).await?;
+
+    let ping_only = futures::stream::unfold((), |_| async {
+        sleep(Duration::from_millis(5)).await;
+        Some((Ok::<_, Infallible>(Bytes::from_static(b"{}\n")), ()))
+    });
+    let timeout_error = wait_for_replication_failure_event_stream(ping_only, expected_key, Duration::from_millis(25))
+        .await
+        .expect_err("ping-only event stream must hit the global deadline");
+    assert!(timeout_error.to_string().contains("was not received within"));
+
+    let mut oversized_line = vec![b'x'; REPLICATION_EVENT_MAX_BUFFER_BYTES];
+    oversized_line.push(b'\n');
+    let oversized = futures::stream::once(async { Ok::<_, Infallible>(Bytes::from(oversized_line)) });
+    let oversized_error = wait_for_replication_failure_event_stream(oversized, expected_key, Duration::from_millis(100))
+        .await
+        .expect_err("oversized event lines must be rejected");
+    assert!(oversized_error.to_string().contains("buffer exceeded 1 MiB"));
+
+    let version_output = ListObjectVersionsOutput::builder()
+        .versions(ObjectVersion::builder().key(expected_key).build())
+        .build();
+    assert!(target_history_contains_key(&version_output, expected_key));
+    let marker_output = ListObjectVersionsOutput::builder()
+        .delete_markers(DeleteMarkerEntry::builder().key(expected_key).build())
+        .build();
+    assert!(target_history_contains_key(&marker_output, expected_key));
+    assert!(!target_history_contains_key(&marker_output, "other-key"));
+
+    Ok(())
+}
+
+/// backlog#1147 repl-17: SSE-C currently fails replication explicitly. Pin the
+/// observed contract: the source remains decryptable with its customer key,
+/// reports FAILED, emits the standard failure event, and leaves no target data.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_c_contract() -> TestResult {
+    init_logging();
+
+    let (source_env, target_env, source_bucket, target_bucket) = build_sse_replication_pair("ssec", false).await?;
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let key = "ssec-contract.txt";
+    let body = b"repl-17 SSE-C payload";
+    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
+    let failure_events = subscribe_to_replication_failure(&source_env, &source_bucket, key).await?;
+
+    source_client
+        .put_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+
+    let source = source_client
+        .get_object()
+        .bucket(&source_bucket)
+        .key(key)
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_key_md5)
+        .send()
+        .await?;
+    assert_eq!(source.body.collect().await?.into_bytes().as_ref(), body);
+
+    wait_for_replication_failure_event(failure_events, key).await?;
+    wait_for_source_replication_status(&source_client, &source_bucket, key, "FAILED", true).await?;
+    assert_failed_replication_stays_absent_for(
+        &source_client,
+        &source_bucket,
+        &target_client,
+        &target_bucket,
+        key,
+        true,
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    target_client
+        .put_object()
+        .bucket(&target_bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"observer negative-path fixture"))
+        .send()
+        .await?;
+    target_client.delete_object().bucket(&target_bucket).key(key).send().await?;
+    let history_error = assert_failed_replication_stays_absent_for(
+        &source_client,
+        &source_bucket,
+        &target_client,
+        &target_bucket,
+        key,
+        true,
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("target history must violate the failed replication contract");
+    assert!(history_error.to_string().contains("created target history"));
+
+    Ok(())
+}
+
+/// backlog#1147 repl-17 / backlog#1291: SSE-S3 must fail closed until managed
+/// encryption is supported on the target. The current plaintext replication is
+/// a known security bug, so this pins the required contract without blessing it.
+#[tokio::test]
+#[serial]
+#[ignore = "backlog#1291: SSE-S3 replication silently drops encryption"]
+async fn test_bucket_replication_sse_s3_contract() -> TestResult {
+    init_logging();
+    assert_managed_sse_replication_fails_explicitly("sse-s3", false).await
+}
+
+/// backlog#1147 repl-17: SSE-KMS currently fails closed rather than creating an
+/// unreadable replica; the shared helper verifies FAILED, the failure event,
+/// source readability, and a stable absence of all target versions.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_sse_kms_failure_contract() -> TestResult {
+    init_logging();
+    assert_managed_sse_replication_fails_explicitly("sse-kms", true).await
+}
+
 /// backlog#1147 repl-5, scenario (a) — target outage + recovery (rustfs#3421 / #2071).
 ///
 /// Kills the replication target mid-workload, asserts the source records the
@@ -3474,14 +3908,7 @@ async fn test_site_replication_allows_self_signed_https_with_skip_tls_verify_rea
         .await
         .expect_err("site replication add must reject an untrusted self-signed HTTPS peer");
     let add_error = add_error.to_string();
-    assert!(
-        add_error.contains("400 Bad Request"),
-        "unexpected untrusted self-signed peer error: {add_error}"
-    );
-    assert!(
-        add_error.to_ascii_lowercase().contains("tls") || add_error.to_ascii_lowercase().contains("certificate"),
-        "self-signed peer rejection did not report a TLS certificate error: {add_error}"
-    );
+    assert_untrusted_site_peer_rejected(&add_error, &target_env.url);
     let disabled = wait_for_site_replication_disabled(&source_env).await?;
     assert!(!disabled.enabled && disabled.sites.is_empty());
 
@@ -3560,14 +3987,7 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
         .await
         .expect_err("site replication add must reject a private CA HTTPS peer without caCertPem");
     let add_error = add_error.to_string();
-    assert!(
-        add_error.contains("400 Bad Request"),
-        "unexpected untrusted private CA peer error: {add_error}"
-    );
-    assert!(
-        add_error.to_ascii_lowercase().contains("tls") || add_error.to_ascii_lowercase().contains("certificate"),
-        "private CA peer rejection did not report a TLS certificate error: {add_error}"
-    );
+    assert_untrusted_site_peer_rejected(&add_error, &target_env.url);
     let disabled = wait_for_site_replication_disabled(&source_env).await?;
     assert!(!disabled.enabled && disabled.sites.is_empty());
 
@@ -3614,7 +4034,9 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_bucket = "site-repl-resync-src";
 
@@ -3889,7 +4311,9 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
     let old_endpoint_listener = tokio::net::TcpListener::bind(&old_target_address).await?;
     target_env.address = new_target_address;
     target_env.url = new_target_url.clone();
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
     let moved_target_client = target_env.create_s3_client();
 
     let ilm_edit_status = site_replication_edit(&source_env, "enableILMExpiryReplication=true", &PeerInfo::default()).await?;
@@ -3984,7 +4408,9 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -4102,7 +4528,9 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let add_status = site_replication_add(
         &source_env,
@@ -4209,7 +4637,9 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -4608,7 +5038,9 @@ async fn test_site_replication_replicates_policy_backed_user_access_real_dual_no
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -4695,7 +5127,9 @@ async fn test_site_replication_replicates_group_policy_backed_access_real_dual_n
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -4835,7 +5269,9 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let add_status = site_replication_add(
         &source_env,
@@ -4939,7 +5375,9 @@ async fn test_site_replication_replicates_service_accounts_created_from_sts_sess
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let add_status = site_replication_add(
         &source_env,
