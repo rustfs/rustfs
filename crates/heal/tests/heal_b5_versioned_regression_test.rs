@@ -37,7 +37,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::fs;
 use tracing::info;
 use walkdir::WalkDir;
 
