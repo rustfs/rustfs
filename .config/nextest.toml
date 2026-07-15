@@ -217,3 +217,53 @@ fail-fast = false
 # Emitted to target/nextest/e2e-repl-nightly/junit.xml; uploaded by the nightly
 # workflow as the failure-triage artifact.
 path = "junit.xml"
+
+# ---------------------------------------------------------------------------
+# e2e-full profile — merge-gate full single-node e2e lane (backlog#1149 ci-5)
+# ---------------------------------------------------------------------------
+# The merge gate (ci.yml `e2e-full` job: push main + merge_group +
+# workflow_dispatch). Runs the never-automated user-visible suites — KMS (40),
+# object_lock (33), multipart_auth (109), quota, checksum, encryption,
+# security-boundary, ... — that the fast PR `e2e-smoke` subset deliberately
+# skips. Budget <= 45 min; authority for the suite count is `cargo nextest list
+# --profile e2e-full` (see docs/testing/e2e-suite-inventory.md).
+#
+# The filter is "the whole e2e_test crate MINUS the sets owned by other lanes":
+#   * protocols:: — FTPS/SFTP/WebDAV, still pinned to --test-threads=1 by fixed
+#     ports; they join a scheduled lane once ci-6 randomises the ports (ci-7).
+#   * the 6 cluster suites that spin up a RustFSTestClusterEnvironment
+#     (cluster_concurrency, stale_multipart_cleanup_cluster,
+#     namespace_lock_quorum, heal_erasure_disk_rebuild, admin_timeout_regression,
+#     object_lambda) — too heavy for the merge budget; they run in ci-7's
+#     nightly 4-node lane.
+#   * replication_extension_test — repl-1 already splits it into the PR
+#     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (20 slow) lanes and reserves
+#     it for those, so e2e-full does not double-run it.
+#   * #[ignore]d tests — nextest skips them by default (no --run-ignored); the
+#     manual-localhost:9000 reliant/policy tests are ci-13's migration.
+#
+# Each e2e test spawns its own single-node rustfs server on a random port with
+# an isolated temp dir (crates/e2e_test/src/common.rs), so the set is
+# parallel-safe — the same property e2e-smoke relies on. The exception is the
+# 4-disk reliability / degraded-read fault-injection tests, serialized below
+# (identical to the ci profile) so several 4-disk servers never run at once.
+[profile.e2e-full]
+default-filter = """
+    package(e2e_test)
+    & !test(/^protocols::/)
+    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+    & !test(/^replication_extension_test::/)
+"""
+fail-fast = false
+
+[profile.e2e-full.junit]
+# Emitted to target/nextest/e2e-full/junit.xml; uploaded by the e2e-full job.
+path = "junit.xml"
+
+# Serialize the 4-disk reliability / degraded-read e2e tests under e2e-full too
+# (see the e2e-reliability test-group note near the top of this file). Not a
+# quarantine: no retries, just single-threaded so several 4-disk servers never
+# run concurrently.
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
+test-group = 'e2e-reliability'
