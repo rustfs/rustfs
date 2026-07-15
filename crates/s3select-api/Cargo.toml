@@ -31,7 +31,7 @@ async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 rustfs-common.workspace = true
-datafusion = { workspace = true }
+datafusion = { workspace = true, features = ["parquet", "recursive_protection", "sql"] }
 rustfs-ecstore.workspace = true
 rustfs-storage-api.workspace = true
 futures = { workspace = true }
