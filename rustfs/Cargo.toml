@@ -158,7 +158,7 @@ sha2 = { workspace = true }
 base64-simd.workspace = true
 clap = { workspace = true }
 const-str = { workspace = true }
-datafusion = { workspace = true }
+datafusion = { workspace = true, features = ["parquet", "recursive_protection", "sql"] }
 hex-simd.workspace = true
 matchit = { workspace = true }
 md5.workspace = true
