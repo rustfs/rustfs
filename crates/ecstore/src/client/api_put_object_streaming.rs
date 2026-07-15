@@ -25,6 +25,7 @@ use std::io::Error;
 use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use time::{OffsetDateTime, format_description};
+use tokio::io::AsyncReadExt;
 use tokio::{select, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -44,6 +45,33 @@ use crate::client::{
 use crate::client::utils::base64_encode;
 use rustfs_utils::path::trim_etag;
 use s3s::header::{X_AMZ_EXPIRATION, X_AMZ_VERSION_ID};
+
+/// Read exactly `want` bytes for a single multipart part, or fewer if the reader
+/// reaches EOF first. Advances the reader so the next call returns the following
+/// part. Replaces the previous per-part `read_all()`/`to_vec()`, which drained
+/// the entire source into the first part and left later parts empty
+/// (rustfs/rustfs#4811).
+async fn read_multipart_part(reader: &mut ReaderImpl, want: usize) -> Result<Vec<u8>, std::io::Error> {
+    match reader {
+        ReaderImpl::Body(content_body) => {
+            let take = content_body.len().min(want);
+            Ok(content_body.split_to(take).to_vec())
+        }
+        ReaderImpl::ObjectBody(content_body) => {
+            let mut buf = vec![0u8; want];
+            let mut filled = 0;
+            while filled < want {
+                let n = content_body.read(&mut buf[filled..]).await?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            buf.truncate(filled);
+            Ok(buf)
+        }
+    }
+}
 
 pub struct UploadedPartRes {
     pub error: std::io::Error,
@@ -141,14 +169,12 @@ impl TransitionClient {
                 part_size = lastpart_size;
             }
 
-            match &mut reader {
-                ReaderImpl::Body(content_body) => {
-                    buf = content_body.to_vec();
-                }
-                ReaderImpl::ObjectBody(content_body) => {
-                    buf = content_body.read_all().await?;
-                }
-            }
+            // Read exactly this part's bytes. Using `read_all()`/`to_vec()` here
+            // drained the whole source into the first part and left every later
+            // part empty, silently corrupting any multipart upload of a streamed
+            // (`ObjectBody`) source — e.g. ILM transitions of >128 MiB objects,
+            // which split into 128 MiB parts (rustfs/rustfs#4811).
+            buf = read_multipart_part(&mut reader, part_size as usize).await?;
             let length = buf.len();
 
             if opts.send_content_md5 {
@@ -187,7 +213,9 @@ impl TransitionClient {
                 reader: hooked,
                 part_number,
                 md5_base64: md5_base64.clone(),
-                size: part_size,
+                // Use the bytes actually read, not the planned part_size, so the
+                // uploaded Content-Length matches the body even on a short read.
+                size: length as i64,
                 //sse: opts.server_side_encryption,
                 stream_sha256: !opts.disable_content_sha256,
                 custom_header: custom_header.clone(),
@@ -198,7 +226,7 @@ impl TransitionClient {
 
             parts_info.entry(part_number).or_insert(obj_part);
 
-            total_uploaded_size += part_size as i64;
+            total_uploaded_size += length as i64;
         }
 
         if size > 0 && total_uploaded_size != size {
@@ -597,8 +625,78 @@ fn collect_complete_parts(parts_info: &HashMap<i64, ObjectPart>, total_parts_cou
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectPart, collect_complete_parts};
+    use super::{ObjectPart, ReaderImpl, collect_complete_parts, read_multipart_part};
+    use crate::object_api::GetObjectReader;
+    use bytes::Bytes;
     use std::collections::HashMap;
+
+    // Drive a reader through the same per-part loop the multipart stream uses and
+    // collect the size of every part. Regression for rustfs/rustfs#4811: the old
+    // `read_all()` per part drained the whole source into part 1.
+    async fn collect_part_sizes(mut reader: ReaderImpl, total: usize, part_size: usize, last_part_size: usize) -> Vec<usize> {
+        let parts = total.div_ceil(part_size);
+        let mut sizes = Vec::new();
+        for part_number in 1..=parts {
+            let want = if part_number == parts { last_part_size } else { part_size };
+            let buf = read_multipart_part(&mut reader, want).await.unwrap();
+            sizes.push(buf.len());
+        }
+        // Nothing must remain after the planned parts are consumed.
+        assert!(read_multipart_part(&mut reader, part_size).await.unwrap().is_empty());
+        sizes
+    }
+
+    #[tokio::test]
+    async fn read_multipart_part_splits_streamed_object_body_evenly() {
+        // 250 bytes at part_size 100 -> parts [100, 100, 50], mirroring the
+        // >128 MiB / 128 MiB split from the bug report on a small deterministic
+        // stream.
+        let total = 250usize;
+        let (mut w, r) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let data: Vec<u8> = (0..total).map(|i| i as u8).collect();
+            w.write_all(&data).await.unwrap();
+        });
+        let reader = ReaderImpl::ObjectBody(GetObjectReader {
+            stream: Box::new(r),
+            object_info: Default::default(),
+            buffered_body: None,
+            body_source: Default::default(),
+        });
+
+        let sizes = collect_part_sizes(reader, total, 100, 50).await;
+        assert_eq!(sizes, vec![100, 100, 50]);
+    }
+
+    #[tokio::test]
+    async fn read_multipart_part_splits_in_memory_body_evenly() {
+        let total = 250usize;
+        let data: Vec<u8> = (0..total).map(|i| i as u8).collect();
+        let reader = ReaderImpl::Body(Bytes::from(data));
+
+        let sizes = collect_part_sizes(reader, total, 100, 50).await;
+        assert_eq!(sizes, vec![100, 100, 50]);
+    }
+
+    #[tokio::test]
+    async fn read_multipart_part_stops_at_eof_without_overrun() {
+        // Reader shorter than the requested part size must return only what is
+        // available, not block or pad.
+        let (mut w, r) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            w.write_all(&[1u8; 30]).await.unwrap();
+        });
+        let mut reader = ReaderImpl::ObjectBody(GetObjectReader {
+            stream: Box::new(r),
+            object_info: Default::default(),
+            buffered_body: None,
+            body_source: Default::default(),
+        });
+        let buf = read_multipart_part(&mut reader, 100).await.unwrap();
+        assert_eq!(buf.len(), 30);
+    }
 
     fn parts_map(n: i64) -> HashMap<i64, ObjectPart> {
         let mut m = HashMap::new();
