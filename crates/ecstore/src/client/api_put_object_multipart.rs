@@ -18,6 +18,7 @@
 #![allow(clippy::all)]
 
 use http::{HeaderMap, HeaderName, StatusCode};
+use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use s3s::S3ErrorCode;
 use std::collections::HashMap;
@@ -244,7 +245,23 @@ impl TransitionClient {
             )));
         }
         //}
-        let initiate_multipart_upload_result = InitiateMultipartUploadResult::default();
+        // Parse the CreateMultipartUpload response for the UploadId. Returning a
+        // default (empty) result here made every multipart transition fail at the
+        // first UploadPart with "UploadID cannot be empty" (rustfs/rustfs#4811).
+        let mut body_vec = Vec::new();
+        let mut body = resp.into_body();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| std::io::Error::other(e.to_string()))?;
+            if let Some(data) = frame.data_ref() {
+                body_vec.extend_from_slice(data);
+            }
+        }
+        let initiate_multipart_upload_result =
+            quick_xml::de::from_str::<InitiateMultipartUploadResult>(&String::from_utf8_lossy(&body_vec))
+                .map_err(|e| std::io::Error::other(format!("failed to parse CreateMultipartUpload response: {e}")))?;
+        if initiate_multipart_upload_result.upload_id.is_empty() {
+            return Err(std::io::Error::other("CreateMultipartUpload response missing UploadId"));
+        }
         Ok(initiate_multipart_upload_result)
     }
 
@@ -431,4 +448,57 @@ pub struct UploadPartParams {
     pub stream_sha256: bool,
     pub custom_header: HeaderMap,
     pub trailer: HeaderMap,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::api_s3_datatypes::{CompleteMultipartUpload, CompletePart, InitiateMultipartUploadResult};
+
+    #[test]
+    fn complete_multipart_upload_serializes_s3_part_elements() {
+        // Regression for rustfs/rustfs#4811: without serde renames quick-xml emits
+        // <parts>/<part_num>/<etag>, so the remote parses zero <Part> elements and
+        // completes a 0-byte object (while still returning 200). The body must use
+        // S3 element names, and MD5-only transitions must not emit empty checksum
+        // elements.
+        let complete = CompleteMultipartUpload {
+            parts: vec![
+                CompletePart {
+                    part_num: 1,
+                    etag: "etag-one".to_string(),
+                    ..Default::default()
+                },
+                CompletePart {
+                    part_num: 2,
+                    etag: "etag-two".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        let xml = complete.marshal_msg().expect("marshal");
+        assert!(xml.contains("<Part>"), "missing <Part>: {xml}");
+        assert!(xml.contains("<PartNumber>1</PartNumber>"), "missing PartNumber: {xml}");
+        assert!(xml.contains("<ETag>etag-one</ETag>"), "missing ETag: {xml}");
+        assert!(xml.contains("<PartNumber>2</PartNumber>"), "missing part 2: {xml}");
+        assert!(!xml.contains("part_num"), "leaked rust field name: {xml}");
+        assert!(!xml.contains("<ChecksumCRC32>"), "emitted empty checksum: {xml}");
+    }
+
+    #[test]
+    fn parses_create_multipart_upload_response() {
+        // Regression for rustfs/rustfs#4811: `initiate_multipart_upload` used to
+        // return a default (empty) result, so every multipart transition failed
+        // the first UploadPart with "UploadID cannot be empty". The UploadId must
+        // be parsed out of the S3 XML response.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>bar</Bucket>
+  <Key>foo/payload.bin</Key>
+  <UploadId>a1b2c3-d4e5-f6</UploadId>
+</InitiateMultipartUploadResult>"#;
+        let parsed: InitiateMultipartUploadResult = quick_xml::de::from_str(xml).expect("parse");
+        assert_eq!(parsed.upload_id, "a1b2c3-d4e5-f6");
+        assert_eq!(parsed.bucket, "bar");
+        assert_eq!(parsed.key, "foo/payload.bin");
+    }
 }
