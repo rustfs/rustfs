@@ -20,12 +20,19 @@
 //!   time-sorted input;
 //! - parse failures are data, not errors.
 
+pub mod analyze;
 pub mod ingest;
 pub mod model;
 pub mod parse;
+mod redact;
+pub mod report;
 pub mod rules;
 
+pub use analyze::{AnalysisReport, AnalyzeOptions, Analyzer, Summary, TimeBucket, UnmatchedCluster};
 pub use ingest::{IngestOptions, IngestReport, SkipReason, ingest_path, ingest_reader};
 pub use model::{EventKind, LogEvent, LogLevel, ParseStats, SourceRef};
 pub use parse::LineParser;
-pub use rules::{Finding, FindingsCollector, Matcher, Rule, RuleEngine, RuleSet, RuleSetError, Severity};
+pub use report::{ReportFormat, render};
+pub use rules::{
+    Finding, FindingsCollector, Matcher, Rule, RuleEngine, RuleSet, RuleSetError, Severity, seed_rule_set, seed_rules,
+};
