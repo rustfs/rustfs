@@ -550,28 +550,37 @@ mod serial_tests {
         };
         let heal_manager = HealManager::new(heal_storage.clone(), Some(cfg));
         heal_manager.start().await.unwrap();
-        let request = HealRequest::new(
-            HealType::ErasureSet {
-                buckets: vec![bucket.to_string()],
-                set_disk_id: SET_DISK_ID.to_string(),
-            },
-            HealOptions {
-                recursive: true,
-                recreate_missing: true,
-                scan_mode: HealScanMode::Normal,
-                timeout: Some(Duration::from_secs(300)),
-                ..Default::default()
-            },
-            HealPriority::Normal,
-        );
-        let task_id = request.id.clone();
-        let admission = heal_manager
-            .submit_heal_request(request)
-            .await
-            .expect("failed to submit erasure-set heal");
-        assert!(admission.is_admitted(), "erasure-set heal must be admitted");
 
-        wait_for_task(&heal_manager, &task_id, Duration::from_secs(120)).await;
+        // The erasure-set healer defers any per-version heal that hits a
+        // transient error (unmet quorum, DiskNotFound, a slow-disk read under
+        // load) to a later heal cycle: it persists its resume/checkpoint state
+        // and returns a terminal `Failed { .. "retry scheduled" }` so a *fresh*
+        // heal run re-drives the still-unhealed versions (see the finalize step
+        // in `ErasureSetHealer::heal_bucket_with_resume`). In production the
+        // background scanner is that next run; here we supply it ourselves by
+        // re-submitting the idempotent heal. This keeps the e2e faithful to the
+        // resume design without making it hostage to a rare single-version
+        // transient hiccup — the strict data-restoration assertions below still
+        // run only after a genuine `Completed`.
+        let build_request = |force_start: bool| {
+            let mut request = HealRequest::new(
+                HealType::ErasureSet {
+                    buckets: vec![bucket.to_string()],
+                    set_disk_id: SET_DISK_ID.to_string(),
+                },
+                HealOptions {
+                    recursive: true,
+                    recreate_missing: true,
+                    scan_mode: HealScanMode::Normal,
+                    timeout: Some(Duration::from_secs(300)),
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            );
+            request.force_start = force_start;
+            request
+        };
+        drive_heal_to_completion(&heal_manager, build_request, Duration::from_secs(120), 3).await;
 
         // Every data version is readable end-to-end and physically restored on the
         // wiped disk. (Resume machinery drove the full per-version heal.)
@@ -597,20 +606,74 @@ mod serial_tests {
 
     /// Poll a heal task to a terminal state, panicking on failure/timeout.
     async fn wait_for_task(heal_manager: &HealManager, task_id: &str, timeout: Duration) {
+        match await_terminal_status(heal_manager, task_id, timeout).await {
+            HealTaskStatus::Completed => {}
+            HealTaskStatus::Failed { error } => panic!("heal task failed: {error}"),
+            HealTaskStatus::Cancelled => panic!("heal task was cancelled"),
+            other => panic!("heal task reached unexpected terminal state: {other:?}"),
+        }
+    }
+
+    /// Poll a heal task until it reaches a terminal state and return that state.
+    /// Panics only on timeout — callers decide how to treat each terminal state.
+    async fn await_terminal_status(heal_manager: &HealManager, task_id: &str, timeout: Duration) -> HealTaskStatus {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Ok(status) = heal_manager.get_task_status(task_id).await {
-                match status {
-                    HealTaskStatus::Completed => return,
-                    HealTaskStatus::Failed { ref error } => panic!("heal task failed: {error}"),
-                    HealTaskStatus::Cancelled => panic!("heal task was cancelled"),
-                    _ => {}
-                }
+            if let Ok(status) = heal_manager.get_task_status(task_id).await
+                && matches!(
+                    status,
+                    HealTaskStatus::Completed
+                        | HealTaskStatus::Failed { .. }
+                        | HealTaskStatus::Cancelled
+                        | HealTaskStatus::Timeout
+                )
+            {
+                return status;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("heal task {task_id} did not complete within {timeout:?}");
+                panic!("heal task {task_id} did not reach a terminal state within {timeout:?}");
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// Submit an erasure-set heal and drive it to a genuine `Completed`,
+    /// tolerating the healer's by-design "retry scheduled" deferral.
+    ///
+    /// When a per-version heal hits a transient error the erasure-set healer
+    /// persists its resume state and returns a terminal `Failed` carrying
+    /// `retry scheduled` (retry budget still remaining) — expecting a later heal
+    /// run to finish the job. We re-submit ourselves (an idempotent re-heal),
+    /// mirroring the production background scanner. A `Failed` WITHOUT that
+    /// marker (e.g. `exhausted retries`) or any other non-`Completed` terminal
+    /// state is a real failure and panics.
+    async fn drive_heal_to_completion(
+        heal_manager: &HealManager,
+        build_request: impl Fn(bool) -> HealRequest,
+        per_attempt_timeout: Duration,
+        max_redrives: usize,
+    ) {
+        for attempt in 0..=max_redrives {
+            let request = build_request(attempt > 0);
+            let task_id = request.id.clone();
+            let admission = heal_manager
+                .submit_heal_request(request)
+                .await
+                .expect("failed to submit erasure-set heal");
+            assert!(admission.is_admitted(), "erasure-set heal must be admitted");
+
+            match await_terminal_status(heal_manager, &task_id, per_attempt_timeout).await {
+                HealTaskStatus::Completed => return,
+                HealTaskStatus::Failed { error } if error.contains("retry scheduled") => {
+                    info!(attempt, error, "erasure-set heal deferred a transient version; re-driving to completion");
+                    // Brief settle before the next idempotent re-heal.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                HealTaskStatus::Failed { error } => panic!("heal task failed (non-retryable): {error}"),
+                HealTaskStatus::Cancelled => panic!("heal task was cancelled"),
+                other => panic!("heal task reached unexpected terminal state: {other:?}"),
+            }
+        }
+        panic!("erasure-set heal did not reach Completed within {} attempt(s)", max_redrives + 1);
     }
 }
