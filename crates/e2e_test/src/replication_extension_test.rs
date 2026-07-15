@@ -56,6 +56,32 @@ type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 /// fail-closed and every other e2e scenario keeps exercising the production SSRF policy.
 const LOOPBACK_REPLICATION_TARGET_ENV: &[(&str, &str)] = &[("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true")];
 
+/// Short data-scanner cycle for the failure-recovery tests (backlog#1147 repl-5).
+///
+/// When a replication target is unreachable, `replicate_object` marks the source
+/// object's status FAILED in `xl.meta` (it is NOT queued to the on-disk MRF
+/// overflow file, which only backstops worker-queue saturation). The mechanism
+/// that re-drives those persisted PENDING/FAILED objects — including after a
+/// source restart — is the data scanner's replication heal pass
+/// (`heal_replication` -> `queue_replication_heal`). The scanner cycle floors at
+/// 1s, so this pins it to the floor to keep convergence within seconds. Combine
+/// with [`replication_fast_env`] (health-check / MRF-flush / resync polling) so
+/// every recovery loop runs at its minimum interval and each scenario finishes
+/// well under the two-minute budget.
+///
+/// `RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=1` matters for changes to
+/// already-scanned objects (e.g. a delete marker stacked on a replicated key):
+/// existing compacted folders are hash-sharded across that many cycles before
+/// being rescanned (default 16, `scanner_folder.rs`), so on a long-lived source
+/// a failed delete-marker replication may otherwise wait 16 scan cycles before
+/// the heal pass revisits it. New keys are unaffected (new folders are always
+/// scanned), which is why only restart-free recovery of EXISTING keys needs it.
+const FAST_SCANNER_ENV: &[(&str, &str)] = &[
+    ("RUSTFS_SCANNER_CYCLE", "1"),
+    ("RUSTFS_SCANNER_START_DELAY_SECS", "1"),
+    ("RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES", "1"),
+];
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
     #[serde(rename = "Targets", default)]
@@ -940,6 +966,65 @@ async fn assert_replication_converged(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("replication did not converge in time; source={source:?}, target={target:?}").into());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Poll the source object until it reports a not-yet-replicated status.
+///
+/// A source object with a reachable replication config carries an
+/// `x-amz-replication-status` header (surfaced by the SDK as
+/// `replication_status()`). While the target is down it must read `PENDING` or
+/// `FAILED`; it can never be `COMPLETED`. Used by the failure-recovery tests to
+/// prove the outage was actually observed before recovery is driven.
+async fn wait_for_source_replication_pending_or_failed(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let head = client.head_object().bucket(bucket).key(key).send().await?;
+        match head.replication_status().map(|status| status.as_str()) {
+            Some("PENDING") | Some("FAILED") => return Ok(()),
+            other => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("source object {key} never reported PENDING/FAILED; last status={other:?}").into());
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// Return the `LastModified` of the (single) delete marker for `key`, if present.
+async fn delete_marker_last_modified(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<aws_sdk_s3::primitives::DateTime>, Box<dyn Error + Send + Sync>> {
+    let output = client.list_object_versions().bucket(bucket).prefix(key).send().await?;
+    Ok(output
+        .delete_markers()
+        .iter()
+        .filter(|marker| marker.key() == Some(key))
+        .find_map(|marker| marker.last_modified().cloned()))
+}
+
+/// Poll the target until a delete marker for `key` appears, returning its mtime.
+async fn wait_for_target_delete_marker(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<aws_sdk_s3::primitives::DateTime, Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(mtime) = delete_marker_last_modified(client, bucket, key).await? {
+            return Ok(mtime);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("target never received a delete marker for {key}").into());
         }
         sleep(Duration::from_millis(250)).await;
     }
@@ -2841,6 +2926,272 @@ async fn test_single_bucket_multipart_replication_fans_out_to_multiple_targets()
 
     assert_eq!(target_etag_a, source_etag);
     assert_eq!(target_etag_b, source_etag);
+
+    Ok(())
+}
+
+/// backlog#1147 repl-5, scenario (a) — target outage + recovery (rustfs#3421 / #2071).
+///
+/// Kills the replication target mid-workload, asserts the source records the
+/// undelivered objects as PENDING/FAILED, then recovers the target with its data
+/// directory intact and asserts both sides converge with no data loss. The
+/// still-running source's data scanner (short cycle via [`FAST_SCANNER_ENV`])
+/// re-drives the failed objects once the target is reachable again.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_recovers_after_target_outage() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env_vars.extend_from_slice(FAST_SCANNER_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "repl-outage-recovery-src";
+    let target_bucket = "repl-outage-recovery-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    // Baseline object replicated while the target is healthy; it must remain on
+    // both sides through the outage (no loss of already-replicated data).
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key("before-outage.txt")
+        .body(ByteStream::from_static(b"baseline written before the target outage"))
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    // Target outage: everything written now cannot replicate.
+    target_env.stop_server();
+
+    let outage_keys = ["during-outage-1.txt", "during-outage-2.txt"];
+    for key in outage_keys {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(key)
+            .body(ByteStream::from(format!("written while the target was down: {key}").into_bytes()))
+            .send()
+            .await?;
+    }
+
+    // The outage is observable on the source: the objects are not yet replicated.
+    wait_for_source_replication_pending_or_failed(&source_client, source_bucket, outage_keys[0]).await?;
+
+    // Recover the target in place; the source scanner re-drives the failures.
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    // Explicit no-loss check: baseline + every outage write reached the target.
+    let target_state = list_replication_state(&target_client, target_bucket).await?;
+    for key in ["before-outage.txt"].into_iter().chain(outage_keys) {
+        assert!(
+            target_state.iter().any(|entry| entry.key == key && !entry.delete_marker),
+            "target missing object {key} after outage recovery; state={target_state:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// backlog#1147 repl-5, scenario (b) — failure state survives a source restart
+/// (mirrors backlog#858 delete-decision re-derivation and #859 no-drop).
+///
+/// Several object writes plus a delete of an already-replicated object all fail
+/// while the target is down. The SOURCE is then restarted with the target still
+/// unreachable, so replication can only resume from the per-object status
+/// persisted in `xl.meta` — nothing in memory survives. Bringing the target back
+/// must converge every persisted failure, including the replayed delete marker
+/// (whose replication decision is re-derived from the live config).
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_replays_failed_entries_after_source_restart() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env_vars.extend_from_slice(FAST_SCANNER_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "repl-source-restart-src";
+    let target_bucket = "repl-source-restart-dst";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+
+    // Replicate an object before the outage so its later deletion produces a
+    // delete marker whose replay decision must be re-derived (backlog#858).
+    let deleted_key = "deleted-during-outage.txt";
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(deleted_key)
+        .body(ByteStream::from_static(b"exists on both sides before deletion"))
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    // Outage: two fresh objects plus a delete marker all fail to replicate.
+    target_env.stop_server();
+
+    let failed_keys = ["failed-1.txt", "failed-2.txt"];
+    for key in failed_keys {
+        source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(key)
+            .body(ByteStream::from(
+                format!("queued for replay while the target was down: {key}").into_bytes(),
+            ))
+            .send()
+            .await?;
+    }
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(deleted_key)
+        .send()
+        .await?;
+
+    wait_for_source_replication_pending_or_failed(&source_client, source_bucket, failed_keys[0]).await?;
+
+    // Restart the SOURCE while the target is still down: recovery must reload the
+    // failure state from disk, since no in-memory queue survives the restart.
+    source_env.restart_server_preserving_data(vec![], &source_env_vars).await?;
+
+    // Bring the target back; the restarted source re-drives every persisted
+    // failure to convergence.
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    // No entry dropped across the restart (backlog#859) and the delete marker
+    // replayed to the target (backlog#858).
+    let target_state = list_replication_state(&target_client, target_bucket).await?;
+    for key in failed_keys {
+        assert!(
+            target_state.iter().any(|entry| entry.key == key && !entry.delete_marker),
+            "source-restart replay dropped object {key}; state={target_state:?}"
+        );
+    }
+    assert!(
+        target_state
+            .iter()
+            .any(|entry| entry.key == deleted_key && entry.delete_marker),
+        "replayed delete marker for {deleted_key} did not reach the target (backlog#858); state={target_state:?}"
+    );
+
+    Ok(())
+}
+
+/// backlog#1147 repl-5, scenario (c) — replayed delete marker keeps the source
+/// mtime (mirrors backlog#867).
+///
+/// A delete marker is created while the target is down; the source is then
+/// restarted (data preserved) and the target brought back, so the marker
+/// replicates through the failure-replay path. The replayed marker must carry
+/// the SOURCE's `LastModified`, not the replay time. A deliberate gap before
+/// recovery makes any regression (replay-time stamping) obvious.
+///
+/// The source restart is load-bearing, not just paranoia: on a live
+/// (never-restarted) source, the failed delete-marker replication wedges the
+/// per-object `/[replicate]/<key>` namespace lock and the marker never
+/// replicates even after the target recovers — tracked as backlog#1278. Once
+/// that is fixed, a restart-free variant of this scenario should be added.
+#[tokio::test]
+#[serial]
+async fn test_bucket_replication_replayed_delete_marker_preserves_source_mtime() -> TestResult {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    let mut source_env_vars = replication_fast_env();
+    source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source_env_vars.extend_from_slice(FAST_SCANNER_ENV);
+    source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "repl-dm-mtime-src";
+    let target_bucket = "repl-dm-mtime-dst";
+    let object_key = "delete-marker-mtime.txt";
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication_with_delete_statuses(&source_env, source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from_static(b"object to be delete-marked during the outage"))
+        .send()
+        .await?;
+    assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
+
+    // Create the delete marker while the target is down so it replicates through
+    // the failure-replay path rather than the immediate path. (HEAD on the key
+    // now returns the delete marker, so the source status is read from the
+    // version listing instead of head_object.)
+    target_env.stop_server();
+    let delete = source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .send()
+        .await?;
+    assert_eq!(delete.delete_marker(), Some(true));
+
+    let source_mtime = delete_marker_last_modified(&source_client, source_bucket, object_key)
+        .await?
+        .ok_or("source has no delete marker after DELETE")?;
+
+    // Widen the gap so a replay-time-stamping regression is unmistakable.
+    sleep(Duration::from_secs(3)).await;
+
+    // Restart the source (see the doc comment: live-source replay is wedged by
+    // backlog#1278), then bring the target back; the restarted source's scanner
+    // heal pass replays the failed delete marker.
+    source_env.restart_server_preserving_data(vec![], &source_env_vars).await?;
+    target_env.restart_server_preserving_data(vec![], &[]).await?;
+
+    let target_mtime = wait_for_target_delete_marker(&target_client, target_bucket, object_key).await?;
+    assert_eq!(
+        target_mtime, source_mtime,
+        "replayed delete marker did not preserve the source mtime (backlog#867): source={source_mtime:?}, target={target_mtime:?}"
+    );
 
     Ok(())
 }
