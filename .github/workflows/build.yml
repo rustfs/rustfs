@@ -440,14 +440,6 @@ jobs:
             PACKAGE_NAME="${PACKAGE_BASENAME}-v${PACKAGE_VERSION}"
           fi
 
-          # Create zip packages for all platforms
-          # Ensure zip is available
-          if ! command -v zip &> /dev/null; then
-            if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-              sudo apt-get update && sudo apt-get install -y zip
-            fi
-          fi
-
           cd target/${{ matrix.target }}/release
           # Determine the binary name based on platform
           if [[ "${{ matrix.platform }}" == "windows" ]]; then
@@ -478,8 +470,31 @@ jobs:
               # Unix systems use zip command
               zip "$dst" "$src"
             else
-              echo "❌ No zip utility available"
-              exit 1
+              local python_bin="python3"
+              if ! command -v "$python_bin" >/dev/null 2>&1; then
+                python_bin="python"
+              fi
+              if ! command -v "$python_bin" >/dev/null 2>&1; then
+                echo "❌ No zip utility or Python fallback available"
+                exit 1
+              fi
+
+              "$python_bin" - "$src" "$dst" <<'PY'
+          import os
+          import stat
+          import sys
+          import zipfile
+
+          src, dst = sys.argv[1], sys.argv[2]
+          info = zipfile.ZipInfo(os.path.basename(src))
+          mode = os.stat(src).st_mode
+          info.external_attr = (mode & 0o777) << 16
+          if stat.S_ISREG(mode):
+              info.file_size = os.path.getsize(src)
+
+          with open(src, "rb") as source, zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              archive.writestr(info, source.read())
+          PY
             fi
           }
 
