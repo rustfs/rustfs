@@ -1574,7 +1574,7 @@ async fn restore_object_usecase_reports_ongoing_conflict_and_completion() {
         RestoreObjectInput::builder()
             .bucket(bucket.clone())
             .key(object.to_string())
-            .restore_request(restore_request())
+            .restore_request(Some(restore_request()))
             .build()
             .unwrap()
     };

@@ -1945,7 +1945,7 @@ mod serial_tests {
                 .await
                 .expect("Failed to upload multipart part");
             completed.push(CompletePart {
-                part_num: (idx + 1) as i64,
+                part_num: idx + 1,
                 etag: part.etag.clone(),
                 ..Default::default()
             });
