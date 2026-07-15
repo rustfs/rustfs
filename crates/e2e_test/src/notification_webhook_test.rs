@@ -35,6 +35,7 @@ use aws_sdk_s3::types::{
     NotificationConfiguration, NotificationConfigurationFilter, QueueConfiguration, S3KeyFilter, VersioningConfiguration,
 };
 use http::header::{CONTENT_TYPE, HOST};
+use local_ip_address::local_ip;
 use reqwest::StatusCode;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
@@ -138,14 +139,15 @@ fn serve_event_collector(listener: TcpListener, tx: mpsc::UnboundedSender<Value>
     })
 }
 
-/// Binds a fresh loopback collector on a random port. Returns its `/events`
+/// Binds a fresh collector on a random port. Returns its `/events`
 /// endpoint URL, a receiver of parsed event envelopes, and the serving task.
 async fn spawn_event_collector() -> Result<(String, mpsc::UnboundedReceiver<Value>, JoinHandle<()>), BoxError> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
     let port = listener.local_addr()?.port();
+    let endpoint_ip = local_ip()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = serve_event_collector(listener, tx);
-    Ok((format!("http://127.0.0.1:{port}/events"), rx, handle))
+    Ok((format!("http://{endpoint_ip}.nip.io:{port}/events"), rx, handle))
 }
 
 /// Decoded object key of the first record in an event envelope.
@@ -264,6 +266,21 @@ async fn signed_admin_request(
     Ok(request.send().await?)
 }
 
+async fn enable_notify_module(env: &RustFSTestEnvironment) -> TestResult {
+    let payload = serde_json::json!({
+        "notify_enabled": true,
+        "audit_enabled": false,
+    });
+    let url = format!("{}/rustfs/admin/v3/module-switches", env.url);
+    let response = signed_admin_request(env, http::Method::PUT, &url, Some(payload.to_string().into_bytes())).await?;
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("failed to enable notify module: {status} {text}").into());
+    }
+    Ok(())
+}
+
 /// Registers a webhook notification target with a persistent queue directory, so
 /// delivery goes through the durable store-and-forward path.
 async fn configure_webhook_target(env: &RustFSTestEnvironment, target_name: &str, endpoint: &str) -> TestResult {
@@ -360,8 +377,8 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
     let (endpoint, mut rx, handle) = spawn_event_collector().await?;
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "true")])
-        .await?;
+    env.start_rustfs_server(vec![]).await?;
+    enable_notify_module(&env).await?;
 
     let bucket = "peri1-events";
     let target = "peri1events";
@@ -512,19 +529,20 @@ async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_NOTIFY_ENABLE", "true")])
-        .await?;
+    env.start_rustfs_server(vec![]).await?;
+    enable_notify_module(&env).await?;
 
     let bucket = "peri1-redeliver";
     let target = "peri1redeliver";
     let client = env.create_s3_client();
     client.create_bucket().bucket(bucket).send().await?;
 
-    // Reserve a loopback port but leave it unbound: the webhook endpoint is
+    // Reserve a port but leave it unbound: the webhook endpoint is
     // unreachable (connection refused -> retryable NotConnected), so the first
     // delivery attempts fail and the event is persisted to the queue store.
     let port = RustFSTestEnvironment::find_available_port().await?;
-    let endpoint = format!("http://127.0.0.1:{port}/events");
+    let endpoint_ip = local_ip()?;
+    let endpoint = format!("http://{endpoint_ip}.nip.io:{port}/events");
     configure_webhook_target(&env, target, &endpoint).await?;
     wait_for_target_registered(&env, target).await?;
     put_notification_config(&client, bucket, target, "uploads/", ".dat").await?;
@@ -540,7 +558,7 @@ async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
 
     // Bring the endpoint up on the reserved port; the replay worker retries with
     // exponential backoff and delivers the queued event.
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let (tx, mut rx) = mpsc::unbounded_channel();
     let handle = serve_event_collector(listener, tx);
 
