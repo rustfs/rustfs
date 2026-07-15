@@ -20,11 +20,19 @@ mod engine;
 mod findings;
 mod model;
 mod rule_set;
+mod seed;
 
 pub use engine::RuleEngine;
 pub use findings::{EvidenceValues, Finding, FindingsCollector};
 pub use model::{Matcher, Rule, Severity};
 pub use rule_set::{RuleSet, RuleSetError};
+pub use seed::seed_rules;
+
+/// The built-in rule library as a validated set. Seed rules are validated
+/// by construction; a failure here is a bug in the seed tree itself.
+pub fn seed_rule_set() -> RuleSet {
+    RuleSet::new(seed_rules()).expect("seed rules must be valid")
+}
 
 #[cfg(test)]
 mod tests {
