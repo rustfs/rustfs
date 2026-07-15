@@ -152,6 +152,33 @@ and `advance`) or explicit event synchronization over fixed `sleep` race
 windows. The written convention and the `docs/testing/time-control.md` guide are
 added by backlog#1153 infra-4.
 
+## Coverage
+
+Line coverage is measured **weekly, not per-PR**, and is non-blocking: it
+exists for visibility and trend, never as a required check. Per-crate ratchets
+for the security-critical crates (iam / kms / policy / crypto) build on this
+baseline later (backlog#1153 infra-6, report-only first).
+
+- **CI**: `.github/workflows/coverage.yml` runs every Sunday and on manual
+  dispatch: `cargo llvm-cov nextest --workspace --exclude e2e_test` under the
+  `ci` nextest profile — the same scope and profile as the PR test gate. The
+  per-crate line-coverage table lands in the run's job summary; the lcov +
+  JSON exports are uploaded as a `coverage-lcov-<run>` artifact kept for
+  90 days. Scheduled failures open/append the `[scheduled-failure] coverage`
+  issue via the shared alert action (ci-8).
+- **Local**: `make coverage` is the equivalent (slow — instrumented rebuild
+  plus the full suite). It prints the same per-crate table via
+  `scripts/coverage_per_crate.py` and writes `target/llvm-cov/lcov.info` and
+  `coverage.json`.
+- **Trend comparison**: each run's job summary is the weekly per-crate
+  snapshot — open two runs from the Actions history (workflow "coverage") and
+  compare their tables. For line-level diffs, download the two runs'
+  `coverage-lcov-*` artifacts and compare the `lcov.info` files with your lcov
+  tooling of choice.
+- **Not measured**: doctests (ci.yml runs them uninstrumented; covering them
+  would require a nightly toolchain) and the `e2e_test` crate (excluded from
+  the unit gate; its lanes are described in the taxonomy above).
+
 ## Flake policy
 
 A flaky test is one that fails non-deterministically without a corresponding
