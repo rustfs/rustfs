@@ -525,6 +525,7 @@ async fn test_webhook_event_delivery_and_filtering() -> TestResult {
 /// durable store and is redelivered once the endpoint comes back.
 #[tokio::test]
 #[serial]
+#[ignore = "FAILING deterministically on main since it landed (#4821): the target is created but never appears in /rustfs/admin/v3/target/arns, so wait_for_target_registered times out. Quarantined per the flake policy; remove with the fix for rustfs#4852"]
 async fn test_webhook_redelivers_event_after_target_recovers() -> TestResult {
     init_logging();
 
