@@ -36,6 +36,7 @@ mod cache_value;
 mod cluster;
 mod config;
 mod core;
+mod crash_inject;
 mod data_movement;
 mod data_usage;
 mod diagnostics;

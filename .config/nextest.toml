@@ -45,6 +45,15 @@ e2e-reliability = { max-threads = 1 }
 filter = 'package(rustfs-ecstore) & (test(concurrent_resend_same_part_commits_one_generation) | test(/^store::bucket::tests::bucket_delete_(mark_delete_marks|purge_removes|default_s3_delete)/))'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the multipart crash-consistency scenarios (dist-2, backlog#1150):
+# each spawns a 4-disk hermetic erasure set and drives full staged-upload +
+# commit + GET cycles — the same cross-disk-commit IO shape that made
+# concurrent_resend load-sensitive. Preventive serialization only, no retries.
+# The matching ci-profile override is after [profile.ci].
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the 4-disk reliability / degraded-read e2e tests (see the
 # e2e-reliability test-group note above). The matching ci-profile override is at
 # the end of the file, after [profile.ci] is declared.
@@ -108,6 +117,13 @@ retries = 2
 [[profile.ci.overrides]]
 filter = 'package(e2e_test) & test(/^(reliability_disk_fault|degraded_read_eof_regression)_test::/)'
 test-group = 'e2e-reliability'
+
+# Serialize the multipart crash-consistency scenarios under the ci profile too
+# (see the matching default-profile override near the top). Not a quarantine:
+# no retries, just serialized 4-disk cross-disk-commit IO.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
+test-group = 'ecstore-serial-flaky'
 
 # ---------------------------------------------------------------------------
 # e2e-smoke profile — PR smoke subset of the e2e_test crate (backlog#1149 ci-4)
