@@ -20,7 +20,7 @@ forced to update its pinned test (red -> green).
 | --- | --- | --- | --- | --- |
 | [GHSA-3p3x-734c-h5vx](https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx) | Constant-time secret comparison on WebDAV/FTPS password login | rustfs/rustfs#4403 | `assert_ftps_ghsa_3p3x_wrong_credentials_rejected` (`crates/e2e_test/src/protocols/ftps_core.rs`); `GHSA-3p3x` auth-failure block in `test_webdav_core_operations` (`crates/e2e_test/src/protocols/webdav_core.rs`) | e2e (protocols suite) |
 | [GHSA-r5qv-rc46-hv8q](https://github.com/rustfs/rustfs/security/advisories/GHSA-r5qv-rc46-hv8q) | Internode RPC authentication must fail closed | rustfs/rustfs#4402 | `ghsa_r5qv_resolve_shared_secret_rejects_default_fallback`, `ghsa_r5qv_verify_rpc_signature_fails_closed_on_missing_or_invalid_auth` (`crates/ecstore/src/cluster/rpc/http_auth.rs`) | unit |
-| [GHSA-m77q-r63m-pj89](https://github.com/rustfs/rustfs/security/advisories/GHSA-m77q-r63m-pj89) | STS JWTs signed with shared root secret (intentionally unfixed) | n/a | `test_created_sts_credentials_authorize_with_session_token_claims` (`crates/iam/src/sys.rs`) — pins current behavior; sec-7 adds GHSA naming | unit |
+| [GHSA-m77q-r63m-pj89](https://github.com/rustfs/rustfs/security/advisories/GHSA-m77q-r63m-pj89) | STS JWTs signed with shared root secret (intentionally unfixed) | n/a | `test_ghsa_m77q_sts_session_token_signed_with_root_secret` (flow-level pin: signing key == root secret, root-only decode, authorizes) and `test_created_sts_credentials_authorize_with_session_token_claims` (`crates/iam/src/sys.rs`); `token_signing_key` doc (`crates/iam/src/root_credentials.rs`) — pin current by-design behavior; fixing m77q must update red -> green | unit |
 
 ## Where these run
 
