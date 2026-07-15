@@ -34,6 +34,12 @@ pub enum RuleSetError {
     },
     #[error("rule '{0}': empty all/any matcher group")]
     EmptyGroup(String),
+    #[error("rule '{rule}': bad anchor {anchor:?}: {reason}")]
+    BadAnchor {
+        rule: String,
+        anchor: String,
+        reason: &'static str,
+    },
     #[error("{} rule set problem(s):\n{}", .0.len(), .0.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n"))]
     Multiple(Vec<RuleSetError>),
 }
@@ -56,6 +62,27 @@ impl RuleSet {
                 problems.push(RuleSetError::DuplicateId(rule.id.clone()));
             }
             validate_matcher(&rule.matcher, &rule.id, &mut problems);
+            for anchor in &rule.anchors {
+                // Anchors feed a TSV dump consumed line-by-line by the CI
+                // guard (rustfs/backlog#1289); short anchors have no
+                // discriminating power and would always grep-match.
+                let reason = if anchor.contains('\t') || anchor.contains('\n') {
+                    Some("must not contain tabs or newlines")
+                } else if anchor.trim().is_empty() {
+                    Some("must not be blank")
+                } else if anchor.len() < 8 {
+                    Some("must be at least 8 bytes")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    problems.push(RuleSetError::BadAnchor {
+                        rule: rule.id.clone(),
+                        anchor: anchor.clone(),
+                        reason,
+                    });
+                }
+            }
         }
         if problems.is_empty() {
             Ok(Self { rules })

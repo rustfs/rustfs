@@ -115,7 +115,7 @@ pub(super) fn rules() -> Vec<Rule> {
             )
         },
         Rule {
-            anchors: strings(["[FATAL]"]),
+            anchors: strings(["[FATAL] "]),
             ..base(
                 "startup-fatal",
                 P1Unavailable,

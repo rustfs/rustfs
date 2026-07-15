@@ -28,6 +28,10 @@ documentation = "https://docs.rs/rustfs-log-analyzer/latest/rustfs_log_analyzer/
 [lib]
 doctest = false
 
+[[bin]]
+name = "la-dump-anchors"
+path = "src/bin/la_dump_anchors.rs"
+
 [dependencies]
 chrono = { workspace = true }
 flate2 = { workspace = true }
