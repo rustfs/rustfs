@@ -38,6 +38,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
 
 [dev-dependencies]
+proptest = "1"
 serial_test.workspace = true
 temp-env.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
