@@ -52,6 +52,7 @@ members = [
     "crates/extension-schema", # Extension schema contracts
     "crates/signer", # client signer
     "crates/storage-api", # Storage API contracts
+    "crates/test-utils", # Shared test bootstrap helpers (dev-dependency only)
     "crates/targets", # Target-specific configurations and utilities
     "crates/trusted-proxies", # Trusted proxies management
     "crates/tls-runtime", # Project-wide TLS runtime foundation
@@ -125,6 +126,7 @@ rustfs-signer = { path = "crates/signer", version = "1.0.0-beta.9" }
 rustfs-storage-api = { path = "crates/storage-api", version = "1.0.0-beta.9" }
 rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.0-beta.9" }
 rustfs-targets = { path = "crates/targets", version = "1.0.0-beta.9" }
+rustfs-test-utils = { path = "crates/test-utils", version = "1.0.0-beta.9" }
 rustfs-tls-runtime = { path = "crates/tls-runtime", version = "1.0.0-beta.9" }
 rustfs-utils = { path = "crates/utils", version = "1.0.0-beta.9" }
 rustfs-zip = { path = "./crates/zip", version = "1.0.0-beta.9" }
