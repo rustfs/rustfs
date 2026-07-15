@@ -36,6 +36,7 @@
 //!   2. IAM allow — if the identity policy allows, the request is permitted.
 //!   3. Bucket-policy allow fallback — if IAM did not allow, a bucket Allow can
 //!      still permit the request.
+//!
 //! Anonymous requests skip 1-3 and are governed by the bucket policy alone.
 //!
 //! ## Invariant surfaced by the matrix (read before changing an assertion)
@@ -107,10 +108,10 @@ async fn authorize(iam_policy: Option<&Policy>, bucket_policy: Option<&BucketPol
     }
 
     // (1) Bucket explicit-Deny gate: is_owner isolates Deny statements.
-    if let Some(bp) = bucket_policy {
-        if !bp.is_allowed(&bucket_args(true)).await {
-            return false;
-        }
+    if let Some(bp) = bucket_policy
+        && !bp.is_allowed(&bucket_args(true)).await
+    {
+        return false;
     }
 
     // (2) IAM allow.
@@ -134,10 +135,10 @@ async fn authorize(iam_policy: Option<&Policy>, bucket_policy: Option<&BucketPol
     }
 
     // (3) Bucket-policy allow fallback.
-    if let Some(bp) = bucket_policy {
-        if bp.is_allowed(&bucket_args(false)).await {
-            return true;
-        }
+    if let Some(bp) = bucket_policy
+        && bp.is_allowed(&bucket_args(false)).await
+    {
+        return true;
     }
 
     false
