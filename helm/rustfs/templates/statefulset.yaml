@@ -119,30 +119,56 @@ spec:
           env:
             - name: REPLICA_COUNT
               value: {{ $pool.replicaCount | quote }}
+            - name: DRIVES_PER_NODE
+              value: {{ $pool.storageclass.drivesPerNode | default 4 | quote }}
+            - name: SVC_HEADLESS
+              value: {{ $pool.fullname }}-headless.{{ $.Release.Namespace }}.svc.{{ include "rustfs.clusterDomain" $ }}
           command:
             - sh
             - -c
             - |
-              if [ "$REPLICA_COUNT" -eq 4 ]; then
-                for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
+              if [ "$DRIVES_PER_NODE" -eq 1 ]; then
+                mkdir -p /data
+              else
+                for i in $(seq 0 $(($DRIVES_PER_NODE - 1))); do
                   mkdir -p /data/rustfs$i
                 done;
-              elif [ "$REPLICA_COUNT" -eq 16 ]; then
-                mkdir -p /data
               fi
               {{- if $logDirEnabled }}
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
               {{- end }}
+              echo "Waiting for all peer DNS entries to resolve..."
+              for i in $(seq 0 $(($REPLICA_COUNT - 1))); do
+                peer="{{ $pool.fullname }}-${i}.${SVC_HEADLESS}"
+                until nslookup "$peer" > /dev/null 2>&1; do
+                  echo "Waiting for $peer..."
+                  sleep 2
+                done
+                echo "$peer resolved"
+              done
+              ORDINAL=$(hostname | rev | cut -d'-' -f1 | rev)
+              if [ "$ORDINAL" -gt 0 ]; then
+                echo "Waiting for lower-ordinal peers to be ready on port 9000..."
+                for i in $(seq 0 $(($ORDINAL - 1))); do
+                  peer="{{ $pool.fullname }}-${i}.${SVC_HEADLESS}"
+                  until wget -q -T 2 -O /dev/null "http://${peer}:9000/health" 2>/dev/null; do
+                    echo "Waiting for ${peer}:9000..."
+                    sleep 2
+                  done
+                  echo "${peer}:9000 is ready"
+                done
+              fi
+              echo "All peers resolved, starting rustfs"
           volumeMounts:
-            {{- if eq (int $pool.replicaCount) 4 }}
-            {{- range $i := until (int $pool.replicaCount) }}
+            {{- if eq (int ($pool.storageclass.drivesPerNode | default 4)) 1 }}
+            - name: data
+              mountPath: /data
+            {{- else }}
+            {{- range $i := until (int ($pool.storageclass.drivesPerNode | default 4)) }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int $pool.replicaCount) 16 }}
-            - name: data
-              mountPath: /data
             {{- end }}
             {{- if $logDirEnabled }}
             - name: logs
@@ -201,14 +227,14 @@ spec:
               mountPath: {{ $logDir }}
               subPath: logs
             {{- end }}
-            {{- if eq (int $pool.replicaCount) 4 }}
-            {{- range $i := until (int $pool.replicaCount) }}
+            {{- if eq (int ($pool.storageclass.drivesPerNode | default 4)) 1 }}
+            - name: data
+              mountPath: /data
+            {{- else }}
+            {{- range $i := until (int ($pool.storageclass.drivesPerNode | default 4)) }}
             - name: data-rustfs-{{ $i }}
               mountPath: /data/rustfs{{ $i }}
             {{- end }}
-            {{- else if eq (int $pool.replicaCount) 16 }}
-            - name: data
-              mountPath: /data
             {{- end }}
       {{- if or $.Values.mtls.enabled $.Values.extraVolumes }}
       volumes:
@@ -255,8 +281,23 @@ spec:
           requests:
             storage: {{ $pool.storageclass.logStorageSize }}
     {{- end }}
-    {{- if eq (int $pool.replicaCount) 4 }}
-    {{- range $i := until (int $pool.replicaCount) }}
+    {{- if eq (int ($pool.storageclass.drivesPerNode | default 4)) 1 }}
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: data
+        labels:
+          {{- toYaml $.Values.commonLabels | nindent 10 }}
+        annotations:
+          {{- toYaml $pool.storageclass.pvcAnnotations.data | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $pool.storageclass.name }}
+        resources:
+          requests:
+            storage: {{ $pool.storageclass.dataStorageSize }}
+    {{- else }}
+    {{- range $i := until (int ($pool.storageclass.drivesPerNode | default 4)) }}
     - apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
@@ -272,21 +313,6 @@ spec:
           requests:
             storage: {{ $pool.storageclass.dataStorageSize }}
     {{- end }}
-    {{- else if eq (int $pool.replicaCount) 16 }}
-    - apiVersion: v1
-      kind: PersistentVolumeClaim
-      metadata:
-        name: data
-        labels:
-          {{- toYaml $.Values.commonLabels | nindent 10 }}
-        annotations:
-          {{- toYaml $pool.storageclass.pvcAnnotations.data | nindent 10 }}
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ $pool.storageclass.name }}
-        resources:
-          requests:
-            storage: {{ $pool.storageclass.dataStorageSize }}
     {{- end }}
 {{- end }}
 {{- end }}

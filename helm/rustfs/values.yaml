@@ -378,6 +378,11 @@ topologySpreadConstraints:
 
 storageclass:
   name: local-path
+  # Number of data drives (PVCs) to create per pod.
+  # Total PVCs = replicaCount × drivesPerNode.
+  # Example: replicaCount=4, drivesPerNode=2 → 8 PVCs (recommended for EC:2).
+  # Set to 1 for a single /data mount per pod.
+  drivesPerNode: 4
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
   pvcAnnotations: {}

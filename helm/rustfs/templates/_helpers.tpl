@@ -206,9 +206,6 @@ so entries must never be removed or reordered.
 {{- range $i, $p := .Values.pools.list -}}
 {{- $p = default (dict) $p -}}
 {{- $replicas := int (default $.Values.replicaCount $p.replicaCount) -}}
-{{- if and (ne $replicas 4) (ne $replicas 16) -}}
-{{- fail (printf "pools.list[%d].replicaCount must be 4 or 16, got %d" $i $replicas) -}}
-{{- end -}}
 {{- $sc := mergeOverwrite (deepCopy $.Values.storageclass) (default (dict) $p.storageclass) -}}
 {{- $pools = append $pools (dict "index" $i "fullname" (include "rustfs.poolFullname" (dict "root" $ "index" $i)) "replicaCount" $replicas "storageclass" $sc) -}}
 {{- end -}}
@@ -235,10 +232,11 @@ RUSTFS_VOLUMES on spaces, one pool per expression).
 {{- $exprs := list -}}
 {{- range $pool := include "rustfs.pools" . | fromJsonArray -}}
 {{- $n := int $pool.replicaCount -}}
-{{- if eq $n 4 -}}
-{{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data/rustfs{0...%d}" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port (sub $n 1)) -}}
-{{- else if eq $n 16 -}}
+{{- $drives := int (default 4 $pool.storageclass.drivesPerNode) -}}
+{{- if eq $drives 1 -}}
 {{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port) -}}
+{{- else -}}
+{{- $exprs = append $exprs (printf "%s://%s-{0...%d}.%s.%s.svc.%s:%d/data/rustfs{0...%d}" $protocol $pool.fullname (sub $n 1) $headless $ns $domain $port (sub $drives 1)) -}}
 {{- end -}}
 {{- end -}}
 {{- join " " $exprs -}}
