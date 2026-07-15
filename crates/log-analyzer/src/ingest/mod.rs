@@ -86,6 +86,12 @@ pub fn ingest_path(path: &Path, opts: &IngestOptions, on_event: &mut dyn FnMut(L
     };
 
     if meta.is_dir() {
+        // Directory provenance is "<root-name>/<relative-path>" — readable in
+        // report samples, unlike a full absolute path.
+        let root_label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
         for entry in walkdir::WalkDir::new(path).follow_links(false).sort_by_file_name() {
             let entry = match entry {
                 Ok(e) => e,
@@ -101,7 +107,10 @@ pub fn ingest_path(path: &Path, opts: &IngestOptions, on_event: &mut dyn FnMut(L
             if !entry.file_type().is_file() {
                 continue;
             }
-            let provenance = entry.path().display().to_string();
+            let provenance = match entry.path().strip_prefix(path) {
+                Ok(rel) => format!("{root_label}/{}", rel.display()),
+                Err(_) => entry.path().display().to_string(),
+            };
             if ctx.byte_budget_exhausted {
                 ctx.skip(provenance, SkipReason::ByteCap);
                 continue;
@@ -591,7 +600,9 @@ mod tests {
 
             let (events, report) = collect(dir.path(), &IngestOptions::default());
             assert_eq!(events.len(), 1);
-            assert_eq!(report.skipped, vec![(locked.display().to_string(), SkipReason::Unreadable)]);
+            // Directory provenance is "<root-name>/<relative-path>".
+            let root_name = dir.path().file_name().expect("name").to_string_lossy();
+            assert_eq!(report.skipped, vec![(format!("{root_name}/locked.log"), SkipReason::Unreadable)]);
 
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).expect("chmod back");
         }
