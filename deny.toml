@@ -36,9 +36,10 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Custom S3 server library with minio compatibility patches not yet upstreamed.
-    # Pinned to a specific commit in workspace Cargo.toml.
-    # "https://github.com/rustfs/s3s",
+    # Official s3s repository. Temporarily pinned for generic REST SigV4
+    # payload-checksum compatibility while upstream PR 631 is reviewed.
+    # owner: marshawcoco  review: 2026-10
+    "https://github.com/s3s-project/s3s.git",
     "https://github.com/apache/datafusion.git",
     # hyper pinned (via [patch.crates-io]) to a rev carrying the HTTP/1
     # flush-before-shutdown fix (hyperium/hyper#4018, commit 72046cc7) that is

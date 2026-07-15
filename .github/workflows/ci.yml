@@ -435,6 +435,16 @@ jobs:
       - name: Make binary executable
         run: chmod +x ./target/debug/rustfs
 
+      # Guard the security negative-auth smoke subset (backlog#1151 sec-5)
+      # against a rename or deletion silently dropping it out of the e2e-smoke
+      # filter. The script lists what the profile selects and fails if the count
+      # of security auth-rejection tests falls below the committed floor in
+      # .config/security-smoke-floor.txt (infra-12 count-floor mechanism). Run
+      # before the smoke suite so a thinned gate fails fast; the `nextest list`
+      # here compiles the e2e_test binaries the run below reuses.
+      - name: Check security smoke subset count floor
+        run: ./scripts/check_security_smoke_count.sh check
+
       # PR smoke subset of the in-repo e2e suite (backlog#1149 ci-4). The
       # profile.e2e-smoke default-filter in .config/nextest.toml is the single
       # wiring mechanism for e2e tests in CI — extend that filter instead of
