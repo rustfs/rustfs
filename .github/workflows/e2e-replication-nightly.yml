@@ -82,7 +82,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install awscurl
-        run: python3 -m pip install --user --upgrade pip awscurl
+        run: |
+          python3 -m pip install --user --upgrade pip awscurl
+          echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
+
+      - name: Verify awscurl
+        run: test -x "$AWSCURL_PATH"
 
       # Build the rustfs binary once up front. The e2e tests spawn it as a
       # child process (crates/e2e_test/src/common.rs) and will build it on

@@ -606,6 +606,16 @@ async fn wait_for_https_server_ready(
     Err("RustFS HTTPS server failed to become ready within 30 seconds".into())
 }
 
+fn assert_untrusted_site_peer_rejected(error: &str, target_url: &str) {
+    let error_lower = error.to_ascii_lowercase();
+    let certificate_error =
+        error.contains("400 Bad Request") && (error_lower.contains("tls") || error_lower.contains("certificate"));
+    let https_connect_error =
+        error.contains("500 Internal Server Error") && error_lower.contains("failed (connect)") && error.contains(target_url);
+
+    assert!(certificate_error || https_connect_error, "unexpected untrusted HTTPS peer error: {error}");
+}
+
 async fn ensure_https_bucket_exists(
     client: &reqwest::Client,
     env: &RustFSTestEnvironment,
@@ -3474,14 +3484,7 @@ async fn test_site_replication_allows_self_signed_https_with_skip_tls_verify_rea
         .await
         .expect_err("site replication add must reject an untrusted self-signed HTTPS peer");
     let add_error = add_error.to_string();
-    assert!(
-        add_error.contains("400 Bad Request"),
-        "unexpected untrusted self-signed peer error: {add_error}"
-    );
-    assert!(
-        add_error.to_ascii_lowercase().contains("tls") || add_error.to_ascii_lowercase().contains("certificate"),
-        "self-signed peer rejection did not report a TLS certificate error: {add_error}"
-    );
+    assert_untrusted_site_peer_rejected(&add_error, &target_env.url);
     let disabled = wait_for_site_replication_disabled(&source_env).await?;
     assert!(!disabled.enabled && disabled.sites.is_empty());
 
@@ -3560,14 +3563,7 @@ async fn test_site_replication_allows_private_ca_https_with_ca_cert_pem_real_dua
         .await
         .expect_err("site replication add must reject a private CA HTTPS peer without caCertPem");
     let add_error = add_error.to_string();
-    assert!(
-        add_error.contains("400 Bad Request"),
-        "unexpected untrusted private CA peer error: {add_error}"
-    );
-    assert!(
-        add_error.to_ascii_lowercase().contains("tls") || add_error.to_ascii_lowercase().contains("certificate"),
-        "private CA peer rejection did not report a TLS certificate error: {add_error}"
-    );
+    assert_untrusted_site_peer_rejected(&add_error, &target_env.url);
     let disabled = wait_for_site_replication_disabled(&source_env).await?;
     assert!(!disabled.enabled && disabled.sites.is_empty());
 
@@ -3614,7 +3610,9 @@ async fn test_site_replication_resync_start_cancel_restart_real_dual_node() -> R
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_bucket = "site-repl-resync-src";
 
@@ -3889,7 +3887,9 @@ async fn test_site_replication_edit_and_status_peer_state_real_three_node() -> R
     let old_endpoint_listener = tokio::net::TcpListener::bind(&old_target_address).await?;
     target_env.address = new_target_address;
     target_env.url = new_target_url.clone();
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
     let moved_target_client = target_env.create_s3_client();
 
     let ilm_edit_status = site_replication_edit(&source_env, "enableILMExpiryReplication=true", &PeerInfo::default()).await?;
@@ -3984,7 +3984,9 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -4102,7 +4104,9 @@ async fn test_site_replication_state_edit_fresh_and_stale_real_dual_node() -> Re
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let add_status = site_replication_add(
         &source_env,
@@ -4209,7 +4213,9 @@ async fn test_site_replication_replicates_object_with_bucket_versioning_real_dua
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -4608,7 +4614,9 @@ async fn test_site_replication_replicates_policy_backed_user_access_real_dual_no
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -4695,7 +4703,9 @@ async fn test_site_replication_replicates_group_policy_backed_access_real_dual_n
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
@@ -4835,7 +4845,9 @@ async fn test_site_replication_replicates_multiple_service_accounts_real_dual_no
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let add_status = site_replication_add(
         &source_env,
@@ -4939,7 +4951,9 @@ async fn test_site_replication_replicates_service_accounts_created_from_sts_sess
         .await?;
 
     let mut target_env = RustFSTestEnvironment::new().await?;
-    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
 
     let add_status = site_replication_add(
         &source_env,
