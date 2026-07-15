@@ -260,7 +260,9 @@ pub(crate) fn replication_put_object_header_size(put_options: &PutObjectOptions)
 
 fn replication_source_object(object_info: &ObjectInfo) -> ReplicationSourceObject<'_> {
     ReplicationSourceObject {
-        mod_time: object_info.mod_time,
+        mod_time: object_info
+            .mod_time
+            .map(|mod_time| OffsetDateTime::from_unix_timestamp(mod_time.unix_timestamp()).unwrap_or(mod_time)),
         version_id: object_info.version_id.map(|version_id| version_id.to_string()),
         etag: object_info.etag.as_deref(),
         actual_size: object_info.get_actual_size().unwrap_or_default(),
@@ -461,6 +463,35 @@ mod tests {
             !content_matches_by_etag(&replication_source_object(&source), &replication_target_object(&target_no_etag)),
             "missing target ETag must not match"
         );
+    }
+
+    #[test]
+    fn replication_action_for_target_head_compares_http_date_precision() {
+        for (source_nanos, target_secs, expected) in [
+            (10_123_456_789, 10, ReplicationAction::None),
+            (-10_876_543_211, -11, ReplicationAction::None),
+            (10_600_000_000, 11, ReplicationAction::All),
+        ] {
+            let mod_time = OffsetDateTime::from_unix_timestamp_nanos(source_nanos).expect("valid timestamp");
+            let object_info = ObjectInfo {
+                mod_time: Some(mod_time),
+                version_id: Some(Uuid::new_v4()),
+                etag: Some("abc123".to_string()),
+                size: 10,
+                ..Default::default()
+            };
+            let target = HeadObjectOutput::builder()
+                .last_modified(DateTime::from_secs(target_secs))
+                .version_id(object_info.version_id.expect("version ID").to_string())
+                .e_tag("abc123")
+                .content_length(10)
+                .build();
+
+            assert_eq!(
+                replication_action_for_target_head(&object_info, &target, ReplicationType::Object),
+                expected
+            );
+        }
     }
 
     #[test]
