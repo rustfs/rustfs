@@ -218,7 +218,10 @@ For scanner pacing, cycle budgets, bitrot cadence, lifecycle transition status,
 and single-node single-disk idle CPU tuning, see
 [Scanner Runtime Controls](docs/operations/scanner-runtime-controls.md). For
 repeatable scanner-pressure validation, see
-[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md).
+[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md). For
+drive timeout knobs on slow storage — including the walk stall budget that
+governs `ListObjects` on large prefixes — see
+[Drive Timeout Tuning](docs/operations/drive-timeout-tuning.md).
 
 ### 5\. Nix Flake (Option 5)
 
