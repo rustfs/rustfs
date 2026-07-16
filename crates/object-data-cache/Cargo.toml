@@ -34,7 +34,7 @@ moka = { workspace = true, features = ["future"] }
 starshard = { workspace = true, features = ["rayon", "async", "serde"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "time", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "time", "fs", "rt-multi-thread"] }
 tracing.workspace = true
 
 [dev-dependencies]
@@ -43,7 +43,7 @@ metrics-util = { version = "0.20", features = ["debugging"] }
 # `rt-multi-thread` lets the concurrency stress tests run tasks on real worker
 # threads, so they exercise true parallelism on the shared singleflight/index
 # state rather than only cooperative interleaving.
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "fs"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "fs"] }
 
 [[bench]]
 name = "cache_bench"

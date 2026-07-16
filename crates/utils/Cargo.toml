@@ -63,7 +63,7 @@ temp-env = { workspace = true }
 proptest = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem"] }
 
 [lints]
 workspace = true

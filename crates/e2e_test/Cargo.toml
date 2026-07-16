@@ -49,7 +49,7 @@ bytes = { workspace = true, features = ["serde"] }
 serial_test = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }
-aws-smithy-http-client = { workspace = true, default-features = false, features = ["default-client", "rustls-aws-lc"] }
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }
 async-trait = { workspace = true }
 flate2.workspace = true
@@ -57,7 +57,7 @@ http.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "multipart"] }
 rustfs-signer.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
@@ -72,8 +72,8 @@ sha2 = { workspace = true }
 astral-tokio-tar = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
 zstd.workspace = true
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
-suppaftp = { workspace = true, features = ["tokio", "rustls-aws-lc-rs", "tokio-rustls-aws-lc-rs"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
+suppaftp = { workspace = true, features = ["rustls-aws-lc-rs", "tokio-rustls-aws-lc-rs"] }
 rcgen.workspace = true
 local-ip-address.workspace = true
 anyhow.workspace = true

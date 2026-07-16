@@ -35,7 +35,7 @@ hotpath = ["dep:hotpath", "hotpath/hotpath"]
 [dependencies]
 hotpath = { workspace = true, optional = true }
 arc-swap.workspace = true
-tokio = { workspace = true, features = ["full", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 rand = { workspace = true, features = ["serde"] }
 http.workspace = true
 aes-gcm = { workspace = true, features = ["rand_core"] }
@@ -43,7 +43,7 @@ crc-fast = { workspace = true }
 pin-project-lite.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bytes = { workspace = true, features = ["serde"] }
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy", "stream"] }
 rustls-pki-types.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 faster-hex.workspace = true

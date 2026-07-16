@@ -35,7 +35,7 @@ crc-fast = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
 tokio = { workspace = true, features = ["io-util", "macros", "sync", "fs", "rt-multi-thread"] }
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }

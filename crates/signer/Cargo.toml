@@ -29,7 +29,7 @@ documentation = "https://docs.rs/rustfs-signer/latest/rustfs_signer/"
 tracing.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 http.workspace = true
-time = { workspace = true, features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
 serde_urlencoded.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }

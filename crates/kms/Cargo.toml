@@ -30,7 +30,7 @@ workspace = true
 [dependencies]
 # Core dependencies
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["full", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 uuid = { workspace = true, features = ["serde", "v4", "fast-rng", "macro-diagnostics"] }
 jiff = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
@@ -60,7 +60,7 @@ rustfs-utils = { workspace = true }
 rustfs-security-governance = { workspace = true }
 
 # HTTP client for Vault
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy"] }
 vaultrs = { workspace = true }
 
 [dev-dependencies]

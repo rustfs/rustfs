@@ -30,9 +30,9 @@ workspace = true
 
 [dependencies]
 rustfs-credentials = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "opa"] }
-tokio = { workspace = true, features = ["full", "fs", "rt-multi-thread"] }
-time = { workspace = true, features = ["serde", "parsing", "formatting", "macros", "std"] }
+rustfs-config = { workspace = true, features = ["opa"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+time = { workspace = true, features = ["serde", "parsing", "formatting", "macros"] }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
@@ -42,7 +42,7 @@ ipnetwork = { workspace = true, features = ["serde"] }
 base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 regex = { workspace = true }
-reqwest = { workspace = true, default-features = false, features = ["rustls", "charset", "http2", "system-proxy", "stream", "json", "blocking", "query", "form"] }
+reqwest = { workspace = true, default-features = false, features = ["rustls", "http2", "system-proxy", "json"] }
 chrono = { workspace = true, features = ["serde"] }
 tracing.workspace = true
 moka = { workspace = true, features = ["future"] }
